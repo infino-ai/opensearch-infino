@@ -1,0 +1,15 @@
+# Rust build
+infino-capi/target/
+
+# Gradle/Java build
+plugin/build/
+plugin/.gradle/
+
+# Runtime data (on-disk Infino catalog)
+data/
+
+# Benchmark output
+bench/*.out
+
+# OS / editor
+.DS_Store
