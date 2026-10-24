@@ -24,7 +24,10 @@ buildscript {
 apply plugin: 'java'
 apply plugin: 'opensearch.opensearchplugin'
 apply plugin: 'opensearch.yaml-rest-test'
-apply plugin: 'opensearch.java-agent'
+// The Java agent replaced the security manager in 3.x; 2.x build tools have no such plugin.
+if (opensearch_version.startsWith('3.')) {
+    apply plugin: 'opensearch.java-agent'
+}
 
 java {
     targetCompatibility = JavaVersion.VERSION_21

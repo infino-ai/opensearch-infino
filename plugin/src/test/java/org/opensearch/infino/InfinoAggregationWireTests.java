@@ -10,6 +10,7 @@ import org.opensearch.search.SearchModule;
 import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.bucket.terms.DoubleTerms;
+import org.opensearch.search.aggregations.bucket.terms.Terms;
 import org.opensearch.search.aggregations.metrics.InternalCardinality;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -46,10 +47,12 @@ public class InfinoAggregationWireTests extends OpenSearchTestCase {
             List.of(new InfinoAggregationWire.DoubleBucket(1.5, 4, InternalAggregations.EMPTY), new InfinoAggregationWire.DoubleBucket(2.25, 2, null))
         );
         assertEquals("t", terms.getName());
-        assertEquals(2, terms.getBuckets().size());
-        assertEquals(1.5, terms.getBuckets().get(0).getKeyAsNumber().doubleValue(), 0.0);
-        assertEquals(4, terms.getBuckets().get(0).getDocCount());
-        assertEquals(2.25, terms.getBuckets().get(1).getKeyAsNumber().doubleValue(), 0.0);
+        // Through the public interface: the bucket class is not public in every release.
+        List<? extends Terms.Bucket> buckets = ((Terms) terms).getBuckets();
+        assertEquals(2, buckets.size());
+        assertEquals(1.5, buckets.get(0).getKeyAsNumber().doubleValue(), 0.0);
+        assertEquals(4, buckets.get(0).getDocCount());
+        assertEquals(2.25, buckets.get(1).getKeyAsNumber().doubleValue(), 0.0);
         assertEquals(7, terms.getSumOfOtherDocCounts());
     }
 
