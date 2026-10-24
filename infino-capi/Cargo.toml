@@ -8,7 +8,7 @@ description = "Thin C-ABI bridge over the Infino engine, for the OpenSearch-on-I
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-infino = { path = "../../infino" }
-serde_json = "1"
+infino = "0.11.11"
+# serde_json comes re-exported from infino, so the two never disagree.
 # Same major as infino so the delete-predicate Expr is the same type infino expects.
 datafusion = "54"
