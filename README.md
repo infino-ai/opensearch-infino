@@ -39,6 +39,9 @@ document the mapping cannot hold fails as its own bulk item.
 Needs a Rust toolchain, a JDK 21 and Gradle. No OpenSearch checkout: the
 plugin builds against the release named by `OPENSEARCH_VERSION` (default
 3.9.0), pulled from Maven, and the zip installs only into that exact version.
+One source tree builds for 2.19 through 3.9; the full check passes on
+2.19.6, 3.0.0, 3.3.2, 3.6.0 and 3.9.0 (the build tools of 2.19 want Gradle
+8.12.1, those of 3.0 want 8.14, 3.3 and later take 9.x).
 
 ```bash
 ./scripts/build.sh                      # infino-capi/target/release/libinfino_capi.{so,dylib} + plugin/build/distributions/infino-engine-<ver>.zip
