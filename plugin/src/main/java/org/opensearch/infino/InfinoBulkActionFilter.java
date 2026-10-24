@@ -129,7 +129,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
             ActionListener<BulkResponse> cast = (ActionListener<BulkResponse>) listener;
             ShardId shardId = new ShardId(md.getIndex(), 0);
             Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, bulk.requests(), writes), items, start, cast);
-            writes.submit(table, waiter, bulk.getRefreshPolicy());
+            writes.submit(table, waiter);
         } catch (Exception e) {
             log.warn("[infino] bulk failed", e);
             listener.onFailure(e);
