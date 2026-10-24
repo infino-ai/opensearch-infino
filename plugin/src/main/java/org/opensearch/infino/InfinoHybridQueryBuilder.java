@@ -1,3 +1,7 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 package org.opensearch.infino;
 
 import java.io.IOException;
@@ -19,8 +23,10 @@ import org.opensearch.index.query.QueryShardContext;
 /**
  * {@code infino_hybrid} query: native hybrid (BM25 + vector) search routed to
  * Infino's {@code hybrid_search}.
- * <pre>{"query":{"infino_hybrid":{"text_column":"text","query":"fox",
- *   "vector_column":"emb","vector":[...],"k":10}}}</pre>
+ * <pre>{"query":{"infino_hybrid":{"text_column":"title","query":"fox",
+ *   "vector_column":"embedding","vector":[...],"k":10}}}</pre>
+ * Both columns are named by the request: the text column must carry a text
+ * index and the vector column must be a mapped {@code knn_vector}.
  */
 public class InfinoHybridQueryBuilder extends AbstractQueryBuilder<InfinoHybridQueryBuilder> {
     public static final String NAME = "infino_hybrid";
@@ -37,9 +43,9 @@ public class InfinoHybridQueryBuilder extends AbstractQueryBuilder<InfinoHybridQ
     private final int k;
 
     public InfinoHybridQueryBuilder(String textColumn, String textQuery, String vectorColumn, float[] vector, int k) {
-        this.textColumn = textColumn == null ? "text" : textColumn;
+        this.textColumn = textColumn;
         this.textQuery = textQuery;
-        this.vectorColumn = vectorColumn == null ? "emb" : vectorColumn;
+        this.vectorColumn = vectorColumn;
         this.vector = vector;
         this.k = k;
     }
@@ -75,9 +81,9 @@ public class InfinoHybridQueryBuilder extends AbstractQueryBuilder<InfinoHybridQ
     }
 
     public static InfinoHybridQueryBuilder fromXContent(XContentParser parser) throws IOException {
-        String textColumn = "text";
+        String textColumn = null;
         String textQuery = "";
-        String vectorColumn = "emb";
+        String vectorColumn = null;
         int k = 10;
         List<Float> vec = new ArrayList<>();
         String current = null;

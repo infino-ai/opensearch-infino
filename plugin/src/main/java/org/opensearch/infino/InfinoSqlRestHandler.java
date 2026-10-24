@@ -1,3 +1,7 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 package org.opensearch.infino;
 
 import java.util.List;
@@ -30,7 +34,7 @@ public class InfinoSqlRestHandler extends BaseRestHandler {
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
         final String path = request.path();
         final String table = request.param("table", "");
-        final String column = request.param("column", path.endsWith("/knn") ? "emb" : "text");
+        final String column = request.param("column", "");
         final int k = Integer.parseInt(request.param("k", "10"));
         final String q = request.param("q", "");
         final String v = request.param("v", "[]");

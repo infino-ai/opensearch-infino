@@ -1,3 +1,7 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 package org.opensearch.infino;
 
 import java.io.IOException;
@@ -18,7 +22,8 @@ import org.opensearch.index.query.QueryShardContext;
 
 /**
  * {@code infino_knn} query: native vector search routed to Infino.
- * <pre>{"query":{"infino_knn":{"field":"emb","vector":[...],"k":10}}}</pre>
+ * <pre>{"query":{"infino_knn":{"field":"embedding","vector":[...],"k":10}}}</pre>
+ * The field must be a mapped {@code knn_vector}.
  */
 public class InfinoKnnQueryBuilder extends AbstractQueryBuilder<InfinoKnnQueryBuilder> {
     public static final String NAME = "infino_knn";
@@ -31,7 +36,7 @@ public class InfinoKnnQueryBuilder extends AbstractQueryBuilder<InfinoKnnQueryBu
     private final int k;
 
     public InfinoKnnQueryBuilder(String field, float[] vector, int k) {
-        this.field = field == null ? "emb" : field;
+        this.field = field;
         this.vector = vector;
         this.k = k;
     }
@@ -61,7 +66,7 @@ public class InfinoKnnQueryBuilder extends AbstractQueryBuilder<InfinoKnnQueryBu
     }
 
     public static InfinoKnnQueryBuilder fromXContent(XContentParser parser) throws IOException {
-        String field = "emb";
+        String field = null;
         int k = 10;
         List<Float> vec = new ArrayList<>();
         String current = null;

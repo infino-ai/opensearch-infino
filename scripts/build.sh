@@ -1,32 +1,27 @@
 #!/usr/bin/env bash
-# Build the Infino cdylib bridge and the OpenSearch plugin.
+# Build the Infino native bridge and the OpenSearch plugin zip.
 #
-# Layout assumed (siblings under one workspace dir):
-#   <ws>/infino/              public Apache-2.0 infino crate (path dep of infino-capi)
-#   <ws>/OpenSearch/          an OpenSearch source checkout (tag/branch 3.10.x)
-#   <ws>/opensearch-infino/   THIS repo
+# No OpenSearch checkout is needed: the plugin builds out of tree against a
+# released OpenSearch, pulled from Maven by the build. The zip installs only
+# into that exact version.
 #
 # Env you may override:
-#   OPENSEARCH_SRC   path to the OpenSearch checkout (default ../OpenSearch)
-#   JAVA21_HOME      JDK 21 home (OpenSearch build requires it)
+#   OPENSEARCH_VERSION  release to build against (default 3.9.0)
+#   JAVA_HOME           a JDK 21
+#   GRADLE              gradle launcher (default: gradle on PATH)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-WS="$(cd "$HERE/.." && pwd)"
-OPENSEARCH_SRC="${OPENSEARCH_SRC:-$WS/OpenSearch}"
-export JAVA21_HOME="${JAVA21_HOME:-/opt/homebrew/opt/openjdk@21}"
-export JAVA_HOME="$JAVA21_HOME"; export PATH="$JAVA_HOME/bin:$PATH"
+OPENSEARCH_VERSION="${OPENSEARCH_VERSION:-3.9.0}"
+GRADLE="${GRADLE:-gradle}"
 
-echo "==> building cdylib (infino-capi)"
+echo "==> building the native bridge (infino-capi)"
 ( cd "$HERE/infino-capi" && cargo build --release )
-echo "    dylib: $HERE/infino-capi/target/release/libinfino_capi.dylib"
+case "$(uname -s)" in
+  Darwin) LIB="$HERE/infino-capi/target/release/libinfino_capi.dylib" ;;
+  *)      LIB="$HERE/infino-capi/target/release/libinfino_capi.so" ;;
+esac
+echo "    bridge: $LIB"
 
-echo "==> syncing plugin sources into the OpenSearch checkout"
-PLUGIN_DST="$OPENSEARCH_SRC/plugins/examples/infino-engine"
-mkdir -p "$PLUGIN_DST/src/main/java/org/opensearch/infino"
-cp "$HERE"/plugin/build.gradle "$PLUGIN_DST/build.gradle"
-cp "$HERE"/plugin/src/main/java/org/opensearch/infino/*.java \
-   "$PLUGIN_DST/src/main/java/org/opensearch/infino/"
-
-echo "==> building the plugin zip"
-( cd "$OPENSEARCH_SRC" && ./gradlew :example-plugins:infino-engine:bundlePlugin )
-echo "    zip: $PLUGIN_DST/build/distributions/infino-engine-*.zip"
+echo "==> building the plugin zip for OpenSearch $OPENSEARCH_VERSION"
+( cd "$HERE/plugin" && "$GRADLE" -Dopensearch.version="$OPENSEARCH_VERSION" bundlePlugin )
+echo "    zip: $HERE/plugin/build/distributions/infino-engine-$OPENSEARCH_VERSION.zip"

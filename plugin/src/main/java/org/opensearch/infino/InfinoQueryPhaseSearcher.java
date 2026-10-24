@@ -1,56 +1,74 @@
-package org.opensearch.infino;
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.Term;
-import org.apache.lucene.search.BooleanClause;
-import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
-
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.index.mapper.IdFieldMapper;
 import org.opensearch.index.mapper.Uid;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.infino.InfinoNative.Column;
+import org.opensearch.infino.InfinoQueryTranslator.Translation;
 import org.opensearch.search.DocValueFormat;
+import org.opensearch.search.SearchExtBuilder;
 import org.opensearch.search.aggregations.AggregationProcessor;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.query.QueryCollectorContext;
 import org.opensearch.search.query.QueryPhaseSearcher;
 import org.opensearch.search.query.QueryPhaseSearcherWrapper;
+import org.opensearch.search.sort.FieldSortBuilder;
+import org.opensearch.search.sort.ScoreSortBuilder;
+import org.opensearch.search.sort.SortBuilder;
+import org.opensearch.search.sort.SortOrder;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Routes the native OpenSearch query phase to Infino for Infino-enabled shards.
  *
- * <p>Three hit paths: a {@link InfinoVectorQuery} → Infino kNN / hybrid; a pure
- * filter (translated to a SQL {@code WHERE} by {@link InfinoSqlWhere}) → a
- * {@code SELECT osid WHERE p} scan; a {@code term}/{@code match} → Infino BM25.
- * Returned {@code _id}s map back to Lucene docids so the fetch phase (served from
- * Infino by {@link InfinoFetchSubPhase}) loads {@code _source}. Aggregations are
- * served — query-scoped via the same {@code WHERE} — by
- * {@link InfinoAggregationProcessor}. Anything not translatable (sorts, unknown
- * queries, BM25+aggs) is delegated to the stock phase. Hits and aggs share one
- * {@link #canServe} decision so they never disagree.
+ * <p>Hits come one of three ways: an {@link InfinoVectorQuery} runs the
+ * engine's kNN / hybrid search; a request sorted by a field runs an ordered
+ * SQL scan over the translated filter (over the token-match set when the
+ * query has a full-text clause); a request ranked by a full-text clause
+ * runs the engine's BM25 table function with the filter applied to the
+ * ranked candidates; anything else is a filtered scan. The exact total is a
+ * {@code COUNT} over the same relation, not the fetched window. Returned
+ * {@code _id}s map to Lucene docids so the fetch phase (served from Infino
+ * by {@link InfinoFetchSubPhase}) loads {@code _source}.
+ *
+ * <p>Hits and aggregations share one {@link #plan} decision so they never
+ * disagree; a request the table cannot answer is delegated to the stock
+ * phase.
  */
 public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
 
     private static final Logger log = LogManager.getLogger(InfinoQueryPhaseSearcher.class);
-    private static final Pattern OSID = Pattern.compile("\"osid\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
-    private static final Pattern SCORE = Pattern.compile("\"score\"\\s*:\\s*(-?[0-9][0-9eE.+-]*)");
+    /**
+     * Candidates BM25 ranks before a filter narrows them, when a request has
+     * both: OpenSearch's own index.max_result_window. A filter that keeps few
+     * of the top-scored rows gives fewer hits than the total, as Lucene's
+     * windowed collection would.
+     */
+    private static final int RANK_WINDOW = 10_000;
 
     private final QueryPhaseSearcher fallback = new QueryPhaseSearcherWrapper();
+
+    /** What one request translates to, shared by the hit and aggregation paths. */
+    record Plan(String table, Map<String, Column> cols, Translation query, List<String> orderBy) {}
 
     @Override
     public boolean searchWith(
@@ -61,7 +79,8 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         boolean hasFilterCollector,
         boolean hasTimeout
     ) throws IOException {
-        if (canServe(searchContext) && fillHits(searchContext, searcher)) {
+        Plan plan = plan(searchContext);
+        if (plan != null && fillHits(searchContext, searcher, plan)) {
             return false;
         }
         return fallback.searchWith(searchContext, searcher, query, collectors, hasFilterCollector, hasTimeout);
@@ -74,16 +93,38 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
 
     // ---- shared gate ----
 
-    static boolean canServe(SearchContext context) {
-        if (!isInfinoShard(context)) return false;
-        if (context.sort() != null || context.suggest() != null) return false;
+    /** The plan for a request, or null when it is not an Infino shard or not translatable. */
+    static Plan plan(SearchContext context) {
+        if (!isInfinoShard(context)) {
+            return null;
+        }
+        if (context.suggest() != null || context.collapse() != null) {
+            return null;
+        }
         String table = tableOf(context);
-        Map<String, String> cols = InfinoNative.columns(table);
-        String where = InfinoSqlWhere.of(dslQuery(context), cols, table);
-        boolean hitsOk = context.query() instanceof InfinoVectorQuery
-            || bm25Translatable(context.query()) || where != null;
-        if (!hitsOk) return false;
-        return InfinoAggregationProcessor.aggsServable(context, cols, where);
+        Map<String, Column> cols = InfinoNative.columns(table);
+        if (cols.isEmpty()) {
+            return null;
+        }
+        Translation query = context.query() instanceof InfinoVectorQuery
+            ? new Translation(table, InfinoQueryTranslator.ALL, null)
+            // The shard context is frozen by now and refuses its clock; date math reads the wall clock.
+            : InfinoQueryTranslator.translate(dslQuery(context), cols, table, System.currentTimeMillis());
+        if (query == null) {
+            log.warn("[infino] query not translatable, falling back to Lucene: {}", dslQuery(context));
+            return null;
+        }
+        log.debug("[infino] columns {} query {} -> FROM {} WHERE {}", cols.keySet(), dslQuery(context), query.from(), query.where());
+        List<String> orderBy = orderBy(context, cols);
+        if (orderBy == null) {
+            log.warn("[infino] sort not translatable, falling back to Lucene: {}", sorts(context));
+            return null;
+        }
+        Plan plan = new Plan(table, cols, query, orderBy);
+        if (!InfinoAggregationProcessor.servable(context, plan)) {
+            return null;
+        }
+        return plan;
     }
 
     static boolean isInfinoShard(SearchContext context) {
@@ -95,34 +136,80 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
     }
 
     static String tableOf(SearchContext context) {
-        return InfinoNative.tableFor(
-            context.indexShard().shardId().getIndexName(), context.indexShard().shardId().id());
+        return InfinoNative.tableFor(context.indexShard().shardId().getIndexName(), context.indexShard().shardId().id());
     }
 
+    /** The query as the client wrote it (carried in {@code ext}), else the shard's rewritten one. */
     static QueryBuilder dslQuery(SearchContext context) {
         try {
-            return context.request() != null && context.request().source() != null
-                ? context.request().source().query() : null;
+            if (context.request() == null || context.request().source() == null) {
+                return null;
+            }
+            for (SearchExtBuilder ext : context.request().source().ext()) {
+                if (ext instanceof InfinoQueryExt original) {
+                    return original.query();
+                }
+            }
+            return context.request().source().query();
         } catch (Exception e) {
             return null;
         }
     }
 
-    private static boolean bm25Translatable(Query q) {
-        if (q instanceof TermQuery) return true;
-        if (q instanceof BooleanQuery bq) {
-            for (BooleanClause c : bq.clauses()) {
-                if (c.isProhibited() || !(c.query() instanceof TermQuery)) return false;
+    private static List<SortBuilder<?>> sorts(SearchContext context) {
+        try {
+            if (context.request() == null || context.request().source() == null || context.request().source().sorts() == null) {
+                return List.of();
             }
-            return !bq.clauses().isEmpty();
+            return context.request().source().sorts();
+        } catch (Exception e) {
+            return List.of();
         }
-        return false;
+    }
+
+    /**
+     * ORDER BY terms for the request's sort: field sorts over columns, in
+     * request order; {@code _score} and {@code _doc} add nothing. Null when a
+     * sort names something the table has no column for.
+     */
+    private static List<String> orderBy(SearchContext context, Map<String, Column> cols) {
+        List<String> out = new ArrayList<>();
+        for (SortBuilder<?> sort : sorts(context)) {
+            if (sort instanceof ScoreSortBuilder) {
+                continue;
+            }
+            if (!(sort instanceof FieldSortBuilder fs)) {
+                return null;
+            }
+            if (FieldSortBuilder.DOC_FIELD_NAME.equals(fs.getFieldName())) {
+                continue;
+            }
+            Column c = columnFor(cols, fs.getFieldName());
+            if (c == null) {
+                return null;
+            }
+            out.add(InfinoQueryTranslator.quoteIdent(c.name()) + (fs.order() == SortOrder.DESC ? " DESC" : " ASC") + " NULLS LAST");
+        }
+        return out;
+    }
+
+    static Column columnFor(Map<String, Column> cols, String field) {
+        Column c = cols.get(field);
+        if (c == null && field.endsWith(".keyword")) {
+            Column base = cols.get(field.substring(0, field.length() - ".keyword".length()));
+            if (base != null && base.isString()) {
+                return base;
+            }
+        }
+        return c;
     }
 
     private static String floatsToJson(float[] v) {
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < v.length; i++) {
-            if (i > 0) sb.append(',');
+            if (i > 0) {
+                sb.append(',');
+            }
             sb.append(v[i]);
         }
         return sb.append(']').toString();
@@ -130,67 +217,74 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
 
     // ---- hits ----
 
-    private boolean fillHits(SearchContext context, ContextIndexSearcher searcher) {
-        final String table = tableOf(context);
+    private boolean fillHits(SearchContext context, ContextIndexSearcher searcher, Plan plan) {
         final int from = Math.max(0, context.from());
         final int size = Math.max(0, context.size());
         final int fetch = from + size; // rows needed to fill the hit window
+        final Translation q = plan.query();
 
+        List<Map<String, Object>> rows;
         boolean knnDistance = false;
-        long total;          // accurate match count (not the fetched-row count)
-        final String rowsJson; // "[]" when size == 0 (no rows needed)
+        long total;
         try {
-            Query q = context.query();
-            if (q instanceof InfinoVectorQuery vq) {
+            if (context.query() instanceof InfinoVectorQuery vq) {
                 String emb = floatsToJson(vq.vector);
-                rowsJson = vq.hybrid
-                    ? InfinoNative.hybrid(table, vq.textColumn, vq.textQuery, vq.vectorColumn, emb, Math.max(fetch, 1))
-                    : InfinoNative.knn(table, vq.vectorColumn, emb, Math.max(fetch, 1));
+                String json = vq.hybrid
+                    ? InfinoNative.hybrid(plan.table(), vq.textColumn, vq.textQuery, vq.vectorColumn, emb, Math.max(fetch, 1))
+                    : InfinoNative.knn(plan.table(), vq.vectorColumn, emb, Math.max(fetch, 1));
+                rows = InfinoNative.rows(json);
                 knnDistance = !vq.hybrid;
-                total = -1; // kNN is inherently top-k; total set from parsed rows
-            } else if (bm25Translatable(q)) {
-                String terms = bm25Terms(q);
-                total = InfinoNative.tokenCount(table, "text", terms); // match count, osids not materialized
-                rowsJson = size == 0 ? "[]" : InfinoNative.bm25(table, "text", terms, fetch); // ranked window
+                total = rows.size(); // kNN is inherently top-k
             } else {
-                Map<String, String> cols = InfinoNative.columns(table);
-                String where = InfinoSqlWhere.of(dslQuery(context), cols, table);
-                if (where == null) return false;
-                total = count(InfinoNative.sql("SELECT COUNT(*) AS c FROM " + table + " WHERE " + where));
-                rowsJson = size == 0 ? "[]"
-                    : InfinoNative.sql("SELECT osid FROM " + table + " WHERE " + where + " LIMIT " + fetch);
+                String sql;
+                if (size == 0) {
+                    rows = List.of();
+                } else if (!plan.orderBy().isEmpty()) {
+                    sql = "SELECT " + InfinoQueryTranslator.OSID + " FROM " + q.from() + " WHERE " + q.where() + " ORDER BY "
+                        + String.join(", ", plan.orderBy()) + " LIMIT " + fetch;
+                    rows = InfinoNative.sqlRows(sql);
+                } else if (q.principal() != null) {
+                    boolean filtered = !InfinoQueryTranslator.ALL.equals(q.where());
+                    sql = "SELECT " + InfinoQueryTranslator.OSID + ", score FROM " + q.rankedFrom(filtered ? RANK_WINDOW : fetch)
+                        + " WHERE " + q.where() + " ORDER BY score DESC LIMIT " + fetch;
+                    rows = InfinoNative.sqlRows(sql);
+                } else {
+                    sql = "SELECT " + InfinoQueryTranslator.OSID + " FROM " + q.from() + " WHERE " + q.where() + " LIMIT " + fetch;
+                    rows = InfinoNative.sqlRows(sql);
+                }
+                total = count(q);
             }
         } catch (RuntimeException e) {
-            return false;
-        }
-        if (rowsJson == null || rowsJson.startsWith("{\"error\"")) {
-            if (rowsJson != null) log.warn("[infino] search error, falling back: {}", rowsJson);
+            log.warn("[infino] search failed, falling back to Lucene", e);
             return false;
         }
         try {
-            List<String> ids = allMatches(OSID, rowsJson);
-            List<Float> scores = new ArrayList<>();
-            Matcher m = SCORE.matcher(rowsJson);
-            while (m.find()) scores.add(Float.parseFloat(m.group(1)));
-            boolean haveScores = scores.size() == ids.size();
-            if (knnDistance) {
-                for (int i = 0; i < scores.size(); i++) scores.set(i, 1.0f / (1.0f + scores.get(i)));
-            }
-            if (total < 0) total = ids.size();
-
             List<ScoreDoc> hits = new ArrayList<>();
-            int end = size == 0 ? 0 : Math.min(ids.size(), fetch);
+            int end = Math.min(rows.size(), fetch);
             for (int i = from; i < end; i++) {
-                int docId = lookupDocId(searcher, ids.get(i));
-                if (docId < 0) continue;
-                hits.add(new ScoreDoc(docId, haveScores ? scores.get(i) : 1.0f));
+                Map<String, Object> row = rows.get(i);
+                int docId = lookupDocId(searcher, (String) row.get(InfinoQueryTranslator.OSID));
+                if (docId < 0) {
+                    continue;
+                }
+                float score = 1.0f;
+                Object s = row.get("score");
+                if (s instanceof Number n) {
+                    score = n.floatValue();
+                    if (knnDistance) {
+                        score = 1.0f / (1.0f + score);
+                    }
+                }
+                hits.add(new ScoreDoc(docId, score));
             }
             float maxScore = Float.NaN;
-            for (ScoreDoc d : hits) maxScore = Float.isNaN(maxScore) ? d.score : Math.max(maxScore, d.score);
+            for (ScoreDoc d : hits) {
+                maxScore = Float.isNaN(maxScore) ? d.score : Math.max(maxScore, d.score);
+            }
             ScoreDoc[] arr = hits.toArray(new ScoreDoc[0]);
             TopDocs topDocs = new TopDocs(new TotalHits(total, TotalHits.Relation.EQUAL_TO), arr);
             context.queryResult().topDocs(new TopDocsAndMaxScore(topDocs, maxScore), new DocValueFormat[0]);
-            log.info("[infino] query phase served {} hits (total {}) from {}", arr.length, total, table);
+            log.debug("[infino] query phase served {} hits (total {}) from {}", arr.length, total, plan.table());
             return true;
         } catch (Exception e) {
             log.warn("[infino] query-phase routing failed, falling back", e);
@@ -198,36 +292,22 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         }
     }
 
-    /** The term text of a term / bool-of-terms Lucene query, space-joined. */
-    private String bm25Terms(Query query) {
-        if (query instanceof TermQuery tq) return tq.getTerm().text();
-        BooleanQuery bq = (BooleanQuery) query;
-        StringBuilder terms = new StringBuilder();
-        for (BooleanClause c : bq.clauses()) {
-            if (terms.length() > 0) terms.append(' ');
-            terms.append(((TermQuery) c.query()).getTerm().text());
+    /** The exact number of rows the request matches. */
+    static long count(Translation q) {
+        List<Map<String, Object>> rows = InfinoNative.sqlRows("SELECT COUNT(*) AS c FROM " + q.from() + " WHERE " + q.where());
+        if (rows.isEmpty()) {
+            return 0;
         }
-        return terms.toString();
-    }
-
-    private static final Pattern FIRST_NUM = Pattern.compile("(\\d+)");
-
-    private long count(String json) {
-        if (json == null) return 0;
-        Matcher m = FIRST_NUM.matcher(json);
-        return m.find() ? Long.parseLong(m.group(1)) : 0;
+        Object c = rows.get(0).get("c");
+        return c instanceof Number n ? n.longValue() : 0;
     }
 
     private int lookupDocId(ContextIndexSearcher searcher, String osid) throws IOException {
+        if (osid == null) {
+            return -1;
+        }
         TermQuery q = new TermQuery(new Term(IdFieldMapper.NAME, Uid.encodeId(osid)));
         TopDocs td = searcher.search(q, 1);
         return td.scoreDocs.length == 0 ? -1 : td.scoreDocs[0].doc;
-    }
-
-    private static List<String> allMatches(Pattern p, String s) {
-        List<String> out = new ArrayList<>();
-        Matcher m = p.matcher(s);
-        while (m.find()) out.add(m.group(1));
-        return out;
     }
 }

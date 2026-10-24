@@ -1,0 +1,181 @@
+---
+"Plugin is installed":
+  - do:
+      cat.plugins:
+        local: true
+        h: component
+  - match:
+      $body: /infino-engine/
+
+---
+"Logs on an Infino index":
+  - do:
+      indices.create:
+        index: logs
+        body:
+          settings:
+            index.infino.enabled: true
+            number_of_shards: 1
+            number_of_replicas: 0
+            refresh_interval: -1
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              level: { type: keyword }
+              message: { type: text }
+              status: { type: long }
+              took: { type: float }
+              host:
+                properties:
+                  name: { type: keyword }
+
+  # One document the mapping cannot hold fails as its own bulk item; the rest index.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: logs, _id: a }
+          - { "@timestamp": "2026-10-24T10:00:00Z", level: error, message: "disk full on node-3", status: "500", took: 1.5, host: { name: n1 }, tags: [x, y] }
+          - index: { _index: logs, _id: b }
+          - { "@timestamp": "2026-10-24T10:01:00Z", level: info, message: "request served", status: 200, took: 3, host: { name: n2 }, tags: z }
+          - index: { _index: logs, _id: c }
+          - { "@timestamp": "2026-10-24T10:02:00Z", level: warn, message: "slow disk", status: "not-a-number" }
+          - index: { _index: logs, _id: d }
+          - { "@timestamp": "2026-10-24T10:03:00Z", level: info, message: "cache warm", status: 204, took: 0.5, host: { name: n1 } }
+  - match: { errors: true }
+  - match: { items.0.index.status: 201 }
+  - match: { items.1.index.status: 201 }
+  - match: { items.2.index.status: 400 }
+  - match: { items.2.index.error.reason: "/.*status.*/" }
+  - match: { items.3.index.status: 201 }
+
+  # Fetch serves the document as sent.
+  - do:
+      get:
+        index: logs
+        id: a
+  - match: { _source.message: "disk full on node-3" }
+  - match: { _source.tags: [x, y] }
+
+  # A time range with date math, newest first: the shape of every log view.
+  - do:
+      search:
+        index: logs
+        body:
+          query:
+            bool:
+              filter:
+                - range: { "@timestamp": { gte: "2026-10-24T10:00:30Z", lte: "now" } }
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d }
+  - match: { hits.hits.1._id: b }
+
+  # Field-scoped text search, with a filter on the ranked candidates.
+  - do:
+      search:
+        index: logs
+        body:
+          query:
+            bool:
+              must: [ { match: { message: disk } } ]
+              filter: [ { term: { level: error } } ]
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: a }
+
+  # A keyword term is an exact filter, not a text search; `.keyword` resolves to the column.
+  - do:
+      search:
+        index: logs
+        body:
+          query: { term: { "host.name.keyword": n1 } }
+          sort: [ { "@timestamp": asc } ]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: a }
+
+  - do:
+      search:
+        index: logs
+        body:
+          query: { exists: { field: took } }
+  - match: { hits.total.value: 3 }
+
+  - do:
+      search:
+        index: logs
+        body:
+          query: { prefix: { "host.name": n } }
+          size: 0
+  - match: { hits.total.value: 3 }
+
+  # The dashboard shape: a histogram over time with metrics in each bucket, and terms with sub-aggregations.
+  - do:
+      search:
+        index: logs
+        body:
+          size: 0
+          aggs:
+            over_time:
+              date_histogram: { field: "@timestamp", fixed_interval: 2m }
+              aggs:
+                avg_took: { avg: { field: took } }
+                max_status: { max: { field: status } }
+            by_level:
+              terms: { field: level }
+              aggs:
+                sum_status: { sum: { field: status } }
+            n_took: { value_count: { field: took } }
+  - match: { hits.total.value: 3 }
+  - length: { aggregations.over_time.buckets: 2 }
+  - match: { aggregations.over_time.buckets.0.key_as_string: "2026-10-24T10:00:00.000Z" }
+  - match: { aggregations.over_time.buckets.0.doc_count: 2 }
+  - match: { aggregations.over_time.buckets.0.avg_took.value: 2.25 }
+  - match: { aggregations.over_time.buckets.0.max_status.value: 500 }
+  - match: { aggregations.over_time.buckets.1.doc_count: 1 }
+  - match: { aggregations.by_level.buckets.0.key: info }
+  - match: { aggregations.by_level.buckets.0.doc_count: 2 }
+  - match: { aggregations.by_level.buckets.0.sum_status.value: 404 }
+  - match: { aggregations.by_level.buckets.1.key: error }
+  - match: { aggregations.n_took.value: 3 }
+
+  # A terms aggregation nested under the histogram.
+  - do:
+      search:
+        index: logs
+        body:
+          size: 0
+          query: { match: { message: disk } }
+          aggs:
+            over_time:
+              date_histogram: { field: "@timestamp", calendar_interval: 1h }
+              aggs:
+                by_host: { terms: { field: host.name } }
+  - length: { aggregations.over_time.buckets: 1 }
+  - match: { aggregations.over_time.buckets.0.doc_count: 1 }
+  - match: { aggregations.over_time.buckets.0.by_host.buckets.0.key: n1 }
+
+  # Updates and deletes reach the table.
+  - do:
+      index:
+        index: logs
+        id: b
+        refresh: true
+        body: { "@timestamp": "2026-10-24T10:01:00Z", level: info, message: "request served again", status: 201 }
+  - do:
+      delete:
+        index: logs
+        id: d
+        refresh: true
+  - do:
+      search:
+        index: logs
+        body:
+          query: { match_all: {} }
+          sort: [ { "@timestamp": asc } ]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.1._id: b }
+  - do:
+      get:
+        index: logs
+        id: b
+  - match: { _source.status: 201 }

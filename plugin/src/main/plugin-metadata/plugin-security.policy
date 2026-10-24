@@ -1,0 +1,12 @@
+grant {
+  // JNA loads the native bridge and calls into it.
+  permission java.lang.RuntimePermission "loadLibrary.*";
+  permission java.lang.RuntimePermission "accessDeclaredMembers";
+  permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
+  permission java.io.FilePermission "<<ALL FILES>>", "read,write";
+  // The engine talks to object storage.
+  permission java.net.SocketPermission "*", "connect,resolve";
+  permission java.util.PropertyPermission "*", "read,write";
+  permission java.lang.RuntimePermission "getenv.*";
+  permission java.lang.RuntimePermission "createClassLoader";
+};

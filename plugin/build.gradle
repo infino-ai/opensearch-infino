@@ -1,23 +1,83 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+// Standalone build against a released OpenSearch: no source checkout needed.
+// Pick the target with -Dopensearch.version=<release>; the plugin zip only
+// installs into that exact version.
+buildscript {
+    ext {
+        opensearch_version = System.getProperty("opensearch.version", "3.9.0")
+    }
+    repositories {
+        mavenLocal()
+        maven { url = "https://ci.opensearch.org/maven2/" }
+        maven { url = "https://ci.opensearch.org/m2/" }
+        mavenCentral()
+        maven { url = "https://plugins.gradle.org/m2/" }
+    }
+    dependencies {
+        classpath "org.opensearch.gradle:build-tools:${opensearch_version}"
+    }
+}
+
+apply plugin: 'java'
 apply plugin: 'opensearch.opensearchplugin'
+apply plugin: 'opensearch.yaml-rest-test'
+apply plugin: 'opensearch.java-agent'
+
+java {
+    targetCompatibility = JavaVersion.VERSION_21
+    sourceCompatibility = JavaVersion.VERSION_21
+}
 
 opensearchplugin {
-  name = 'infino-engine'
-  description = 'Spike: back OpenSearch shards with the Infino engine (JNA bridge)'
-  classname = 'org.opensearch.infino.InfinoPlugin'
-  licenseFile = rootProject.file('licenses/APACHE-LICENSE-2.0.txt')
-  noticeFile = rootProject.file('NOTICE.txt')
+    name = 'infino-engine'
+    description = 'Back OpenSearch shards with the Infino engine (JNA bridge)'
+    classname = 'org.opensearch.infino.InfinoPlugin'
+    licenseFile = rootProject.file('LICENSE.txt')
+    noticeFile = rootProject.file('NOTICE.txt')
+}
+
+repositories {
+    mavenLocal()
+    maven { url = "https://ci.opensearch.org/maven2/" }
+    maven { url = "https://ci.opensearch.org/m2/" }
+    mavenCentral()
+    maven { url = "https://plugins.gradle.org/m2/" }
 }
 
 dependencies {
-  compileOnly 'net.java.dev.jna:jna:5.16.0'
+    // OpenSearch ships JNA itself; compiling against it (not bundling) avoids jar hell.
+    compileOnly "net.java.dev.jna:jna:${versions.jna}"
 }
 
-// --- spike: relax the strict plugin-dev gates so we can iterate fast ---
-test.enabled = false
-tasks.configureEach { t ->
-  if (t.name in ['dependencyLicenses', 'thirdPartyAudit', 'forbiddenApisMain',
-                 'forbiddenApisTest', 'loggerUsageCheck', 'validateNebulaPom',
-                 'namingConventionsMain', 'licenseHeaders']) {
-    t.enabled = false
-  }
+configurations.all {
+    resolutionStrategy {
+        // The test framework and the server disagree on these annotation-only jars.
+        force "com.google.errorprone:error_prone_annotations:${versions.error_prone_annotations}"
+        force "org.jspecify:jspecify:1.0.1"
+    }
+}
+
+// Needs a jar that build-tools does not publish.
+loggerUsageCheck.enabled = false
+// No Maven publication of this plugin.
+validateNebulaPom.enabled = false
+
+test {
+    include '**/*Tests.class'
+}
+
+// Where the sibling Rust build leaves the native bridge, and a catalog on local
+// disk for the test cluster (memory:// tables cannot take deletes). Both can be
+// pointed elsewhere with -Dinfino.lib / -Dinfino.uri.
+def defaultLib = file("${projectDir}/../infino-capi/target/release/libinfino_capi.so").absolutePath
+def defaultUri = "file://${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog"
+
+testClusters.all {
+    systemProperty 'infino.lib', System.getProperty('infino.lib', defaultLib)
+    systemProperty 'infino.uri', System.getProperty('infino.uri', defaultUri)
+    // The SQL each request runs, in the node log, so a wrong answer can be read back.
+    setting 'logger.org.opensearch.infino', 'DEBUG'
 }
