@@ -241,7 +241,7 @@ final class InfinoAggregationWire {
     }
 
     private static NamedWriteableRegistry registry() {
-        NamedWriteableRegistry registry = InfinoPlugin.namedWriteableRegistry();
+        NamedWriteableRegistry registry = InfinoServices.namedWriteableRegistry();
         if (registry == null) {
             throw new IllegalStateException("the plugin's named writeable registry is not set");
         }

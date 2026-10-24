@@ -34,6 +34,10 @@ java {
     sourceCompatibility = JavaVersion.VERSION_21
 }
 
+// The node client moved packages in 3.0; the one handler that names it has
+// a copy per major, and the tree for the target release joins the build.
+sourceSets.main.java.srcDirs += opensearch_version.startsWith('3.') ? 'src/main/java3' : 'src/main/java2'
+
 opensearchplugin {
     name = 'infino-engine'
     description = 'Back OpenSearch shards with the Infino engine (JNA bridge)'

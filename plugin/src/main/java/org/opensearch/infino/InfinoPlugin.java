@@ -9,32 +9,24 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
-import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.lifecycle.LifecycleComponent;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.core.xcontent.NamedXContentRegistry;
-import org.opensearch.env.Environment;
-import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchPlugin;
-import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
-import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
-import org.opensearch.transport.client.Client;
-import org.opensearch.watcher.ResourceWatcherService;
 
 import java.util.Collection;
 import java.util.List;
@@ -69,9 +61,9 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
     );
 
     /**
-     * How often an index's table is compacted. Every bulk commits as its own
-     * superfile, so without this a steady stream of events leaves the table
-     * as thousands of small files.
+     * How often an index's table is compacted. Every append commits as its
+     * own superfile, so without this a steady stream of events leaves the
+     * table as thousands of small files.
      */
     public static final Setting<TimeValue> OPTIMIZE_INTERVAL = Setting.timeSetting(
         "index.infino.optimize_interval",
@@ -81,61 +73,27 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
         Setting.Property.Dynamic
     );
 
-    private static volatile NamedWriteableRegistry namedWriteableRegistry;
     private static final InfinoTables TABLES = new InfinoTables();
-    private ThreadPool threadPool;
-    private ClusterService clusterService;
-    private IndexNameExpressionResolver indexNameExpressionResolver;
-    private ScriptService scriptService;
-    private InfinoWriter writer;
     private final Map<ShardId, Scheduler.Cancellable> optimizers = new ConcurrentHashMap<>();
-
-    /** The node's registry, used to read aggregation objects back from their wire form. */
-    static NamedWriteableRegistry namedWriteableRegistry() {
-        return namedWriteableRegistry;
-    }
-
-    /** For tests that build aggregation objects without a node. */
-    static void namedWriteableRegistry(NamedWriteableRegistry registry) {
-        namedWriteableRegistry = registry;
-    }
 
     /** The tables behind the node's Infino-backed indices. */
     static InfinoTables tables() {
         return TABLES;
     }
 
+    /** The node services arrive by injection (see {@link InfinoServices}). */
     @Override
-    public Collection<Object> createComponents(
-        Client client,
-        ClusterService clusterService,
-        ThreadPool threadPool,
-        ResourceWatcherService resourceWatcherService,
-        ScriptService scriptService,
-        NamedXContentRegistry xContentRegistry,
-        Environment environment,
-        NodeEnvironment nodeEnvironment,
-        NamedWriteableRegistry namedWriteableRegistry,
-        IndexNameExpressionResolver indexNameExpressionResolver,
-        Supplier<RepositoriesService> repositoriesServiceSupplier
-    ) {
-        InfinoPlugin.namedWriteableRegistry = namedWriteableRegistry;
-        this.threadPool = threadPool;
-        this.clusterService = clusterService;
-        this.indexNameExpressionResolver = indexNameExpressionResolver;
-        this.scriptService = scriptService;
-        this.writer = new InfinoWriter(threadPool);
-        return List.of();
+    public Collection<Class<? extends LifecycleComponent>> getGuiceServiceClasses() {
+        return List.of(InfinoServices.class);
     }
 
     @Override
     public List<ActionFilter> getActionFilters() {
-        // The filters are asked for before createComponents runs; they read the
-        // services lazily through the plugin.
+        // The filters are asked for before the services are injected; they read them lazily.
         return List.of(
-            new InfinoBulkActionFilter(() -> clusterService, TABLES, () -> writer),
-            new InfinoSearchActionFilter(() -> clusterService, () -> indexNameExpressionResolver, () -> scriptService),
-            new InfinoGetActionFilter(() -> clusterService, TABLES)
+            new InfinoBulkActionFilter(InfinoServices::clusterService, TABLES, InfinoServices::writer),
+            new InfinoSearchActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, InfinoServices::scriptService),
+            new InfinoGetActionFilter(InfinoServices::clusterService, TABLES)
         );
     }
 
@@ -192,6 +150,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
     }
 
     private void scheduleOptimize(IndexShard shard, String table) {
+        ThreadPool threadPool = InfinoServices.threadPool();
         if (threadPool == null) {
             return;
         }
