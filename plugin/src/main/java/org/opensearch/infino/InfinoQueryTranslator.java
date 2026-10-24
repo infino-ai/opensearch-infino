@@ -56,6 +56,8 @@ import java.util.Map;
 final class InfinoQueryTranslator {
     /** The OpenSearch {@code _id} column. */
     static final String OSID = "osid";
+    /** The reserved column holding each document's JSON source. */
+    static final String SOURCE = "source";
     /** Mapping suffix OpenSearch clients use for the exact form of a text field. */
     private static final String KEYWORD_SUFFIX = ".keyword";
     /** How a date range or histogram bound is read when the request names no format. */

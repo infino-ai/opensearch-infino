@@ -294,7 +294,13 @@ public final class InfinoNative {
         return Long.parseLong(takeOrThrow(lib.infino_count(conn, n, c, q, mode)).trim());
     }
 
-    /** Sources for one page of ids in one statement, kept for the fetch phase that follows the query phase. */
+    /**
+     * Sources for one page of ids in one statement, kept for the fetch phase
+     * that follows the query phase. The table has no index on ids, so this
+     * scans the id column; the SQL hit paths carry the source in the hit
+     * statement instead and call {@link #keepSources}. Used by the vector
+     * paths, whose entry points return ids and scores only.
+     */
     public static void prefetchSources(String name, List<String> osids) {
         if (osids.isEmpty()) {
             return;
@@ -303,11 +309,16 @@ public final class InfinoNative {
         for (String id : osids) {
             lits.add(InfinoQueryTranslator.literal(id));
         }
-        String sql = "SELECT " + InfinoQueryTranslator.OSID + ", source FROM " + InfinoQueryTranslator.quoteIdent(name) + " WHERE "
-            + InfinoQueryTranslator.OSID + " IN (" + String.join(", ", lits) + ")";
-        for (Map<String, Object> row : sqlRows(sql)) {
+        String sql = "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM "
+            + InfinoQueryTranslator.quoteIdent(name) + " WHERE " + InfinoQueryTranslator.OSID + " IN (" + String.join(", ", lits) + ")";
+        keepSources(name, sqlRows(sql));
+    }
+
+    /** Keep the sources of rows a hit statement returned (id and source columns), for the fetch phase. */
+    public static void keepSources(String name, List<Map<String, Object>> rows) {
+        for (Map<String, Object> row : rows) {
             Object id = row.get(InfinoQueryTranslator.OSID);
-            Object source = row.get("source");
+            Object source = row.get(InfinoQueryTranslator.SOURCE);
             if (id != null && source != null) {
                 SOURCES.put(name + "\u0000" + id, source.toString());
             }

@@ -234,32 +234,27 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
                 knnDistance = !vq.hybrid;
                 total = rows.size(); // kNN is inherently top-k
             } else {
+                // The hit statement carries each hit's source: the fetch phase reads it
+                // from the cache, and a lookup by id afterwards would scan the id column.
+                String hit = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE;
                 String sql;
                 if (size == 0) {
                     rows = List.of();
                 } else if (!plan.orderBy().isEmpty()) {
-                    sql = "SELECT " + InfinoQueryTranslator.OSID + " FROM " + q.from() + " WHERE " + q.where() + " ORDER BY "
+                    sql = "SELECT " + hit + " FROM " + q.from() + " WHERE " + q.where() + " ORDER BY "
                         + String.join(", ", plan.orderBy()) + " LIMIT " + fetch;
                     rows = InfinoNative.sqlRows(sql);
                 } else if (q.principal() != null) {
                     boolean filtered = !InfinoQueryTranslator.ALL.equals(q.where());
-                    sql = "SELECT " + InfinoQueryTranslator.OSID + ", score FROM " + q.rankedFrom(filtered ? RANK_WINDOW : fetch)
+                    sql = "SELECT " + hit + ", score FROM " + q.rankedFrom(filtered ? RANK_WINDOW : fetch)
                         + " WHERE " + q.where() + " ORDER BY score DESC LIMIT " + fetch;
                     rows = InfinoNative.sqlRows(sql);
                 } else {
-                    sql = "SELECT " + InfinoQueryTranslator.OSID + " FROM " + q.from() + " WHERE " + q.where() + " LIMIT " + fetch;
+                    sql = "SELECT " + hit + " FROM " + q.from() + " WHERE " + q.where() + " LIMIT " + fetch;
                     rows = InfinoNative.sqlRows(sql);
                 }
                 total = count(plan.table(), q);
-                // The fetch phase reads each hit's source; get the page's in one statement now.
-                List<String> ids = new ArrayList<>();
-                for (int i = from; i < Math.min(rows.size(), fetch); i++) {
-                    Object id = rows.get(i).get(InfinoQueryTranslator.OSID);
-                    if (id != null) {
-                        ids.add(id.toString());
-                    }
-                }
-                InfinoNative.prefetchSources(plan.table(), ids);
+                InfinoNative.keepSources(plan.table(), rows.subList(Math.min(from, rows.size()), Math.min(rows.size(), fetch)));
             }
         } catch (RuntimeException e) {
             // An engine error is the request's error; Lucene has nothing to answer with.
