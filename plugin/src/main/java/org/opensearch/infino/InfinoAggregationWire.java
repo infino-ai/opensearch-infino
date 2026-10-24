@@ -16,6 +16,7 @@ import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.InternalOrder;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
 import org.opensearch.search.aggregations.bucket.histogram.LongBounds;
+import org.opensearch.search.aggregations.bucket.terms.DoubleTerms;
 import org.opensearch.search.aggregations.metrics.AbstractHyperLogLogPlusPlus;
 import org.opensearch.search.aggregations.metrics.InternalCardinality;
 
@@ -80,6 +81,53 @@ final class InfinoAggregationWire {
             out.writeList(buckets);
             try (StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), registry())) {
                 return new InternalDateHistogram(in);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** One bucket of a double-keyed terms aggregation, before it is written. */
+    record DoubleBucket(double key, long docCount, InternalAggregations subAggregations) {}
+
+    /**
+     * A {@code DoubleTerms}, as the reduce phase expects one from a shard. Its
+     * bucket class is not public in every OpenSearch release the plugin
+     * builds against, so the object comes through its stream constructor.
+     */
+    static DoubleTerms doubleTerms(
+        String name,
+        Map<String, Object> metadata,
+        BucketOrder order,
+        int requiredSize,
+        long minDocCount,
+        long otherDocCount,
+        List<DoubleBucket> buckets
+    ) {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            // InternalAggregation.writeTo
+            out.writeString(name);
+            out.writeGenericValue(metadata);
+            // InternalTerms.doWriteTo: reduce order, order, required size, min doc count
+            order.writeTo(out);
+            order.writeTo(out);
+            out.writeVInt(requiredSize);
+            out.writeVLong(minDocCount);
+            // InternalMappedTerms.writeTermTypeInfoTo
+            out.writeZLong(0L); // doc count error
+            out.writeNamedWriteable(DocValueFormat.RAW);
+            out.writeVInt(requiredSize); // shard size
+            out.writeBoolean(false); // show term doc count error
+            out.writeVLong(otherDocCount);
+            out.writeVInt(buckets.size());
+            for (DoubleBucket b : buckets) {
+                // InternalTerms.Bucket.writeTo, then DoubleTerms.Bucket.writeTermTo
+                out.writeVLong(b.docCount());
+                (b.subAggregations() == null ? InternalAggregations.EMPTY : b.subAggregations()).writeTo(out);
+                out.writeDouble(b.key());
+            }
+            try (StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), registry())) {
+                return new DoubleTerms(in);
             }
         } catch (IOException e) {
             throw new UncheckedIOException(e);

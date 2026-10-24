@@ -135,6 +135,19 @@
   - match: { aggregations.slow_hosts.buckets.0.key: n2 }
   - match: { aggregations.slow_hosts.buckets.0.max_took.value: 8.0 }
 
+  # Terms over a float column: double keys, every value its own bucket.
+  - do:
+      search:
+        index: events
+        body:
+          size: 0
+          aggs:
+            by_took: { terms: { field: took, size: 3 } }
+  - length: { aggregations.by_took.buckets: 3 }
+  - match: { aggregations.by_took.buckets.0.key: 1.0 }
+  - match: { aggregations.by_took.buckets.0.doc_count: 1 }
+  - match: { aggregations.by_took.sum_other_doc_count: 5 }
+
   # What the table cannot serve is refused with the reason, not answered empty.
   - do:
       catch: bad_request

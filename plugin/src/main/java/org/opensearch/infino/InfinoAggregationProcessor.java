@@ -35,7 +35,6 @@ import org.opensearch.search.aggregations.bucket.range.InternalDateRange;
 import org.opensearch.search.aggregations.bucket.range.InternalRange;
 import org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.range.RangeAggregator;
-import org.opensearch.search.aggregations.bucket.terms.DoubleTerms;
 import org.opensearch.search.aggregations.bucket.terms.LongTerms;
 import org.opensearch.search.aggregations.bucket.terms.StringTerms;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
@@ -663,7 +662,7 @@ public class InfinoAggregationProcessor {
             long sumTop = 0;
             List<StringTerms.Bucket> sBuckets = new ArrayList<>();
             List<LongTerms.Bucket> lBuckets = new ArrayList<>();
-            List<DoubleTerms.Bucket> dBuckets = new ArrayList<>();
+            List<InfinoAggregationWire.DoubleBucket> dBuckets = new ArrayList<>();
             for (Map<String, Object> row : rows) {
                 Object key = row.get(keyAlias);
                 if (key == null) {
@@ -675,7 +674,7 @@ public class InfinoAggregationProcessor {
                 switch (keyKind) {
                     case STR, BOOL -> sBuckets.add(new StringTerms.Bucket(new BytesRef(key.toString()), docCount, subs, false, 0L, DocValueFormat.RAW));
                     case LONG, DATE -> lBuckets.add(new LongTerms.Bucket(asLong(key), docCount, subs, false, 0L, DocValueFormat.RAW));
-                    case DOUBLE -> dBuckets.add(new DoubleTerms.Bucket(asDouble(key, 0.0), docCount, subs, false, 0L, DocValueFormat.RAW));
+                    case DOUBLE -> dBuckets.add(new InfinoAggregationWire.DoubleBucket(asDouble(key, 0.0), docCount, subs));
                 }
             }
             long otherDocCount = Math.max(0, parentTotal - sumTop);
@@ -683,7 +682,8 @@ public class InfinoAggregationProcessor {
             return switch (keyKind) {
                 case STR, BOOL -> new StringTerms(t.getName(), t.order(), t.order(), t.getMetadata(), DocValueFormat.RAW, t.shardSize(), false, otherDocCount, sBuckets, 0L, thresholds);
                 case LONG, DATE -> new LongTerms(t.getName(), t.order(), t.order(), t.getMetadata(), DocValueFormat.RAW, t.shardSize(), false, otherDocCount, lBuckets, 0L, thresholds);
-                case DOUBLE -> new DoubleTerms(t.getName(), t.order(), t.order(), t.getMetadata(), DocValueFormat.RAW, t.shardSize(), false, otherDocCount, dBuckets, 0L, thresholds);
+                // The double bucket class is not public in every release built against; the object comes through its stream form.
+                case DOUBLE -> InfinoAggregationWire.doubleTerms(t.getName(), t.getMetadata(), t.order(), t.size(), t.minDocCount(), otherDocCount, dBuckets);
             };
         }
 

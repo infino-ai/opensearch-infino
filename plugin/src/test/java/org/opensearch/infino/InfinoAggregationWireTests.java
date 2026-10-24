@@ -7,6 +7,9 @@ package org.opensearch.infino;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.search.SearchModule;
+import org.opensearch.search.aggregations.BucketOrder;
+import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.aggregations.bucket.terms.DoubleTerms;
 import org.opensearch.search.aggregations.metrics.InternalCardinality;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -30,6 +33,24 @@ public class InfinoAggregationWireTests extends OpenSearchTestCase {
             InternalCardinality c = InfinoAggregationWire.cardinality("u", Map.of(), count);
             assertEquals("count " + count, count, c.getValue());
         }
+    }
+
+    public void testDoubleTermsReadsBackItsBuckets() {
+        DoubleTerms terms = InfinoAggregationWire.doubleTerms(
+            "t",
+            Map.of(),
+            BucketOrder.count(false),
+            10,
+            1,
+            7,
+            List.of(new InfinoAggregationWire.DoubleBucket(1.5, 4, InternalAggregations.EMPTY), new InfinoAggregationWire.DoubleBucket(2.25, 2, null))
+        );
+        assertEquals("t", terms.getName());
+        assertEquals(2, terms.getBuckets().size());
+        assertEquals(1.5, terms.getBuckets().get(0).getKeyAsNumber().doubleValue(), 0.0);
+        assertEquals(4, terms.getBuckets().get(0).getDocCount());
+        assertEquals(2.25, terms.getBuckets().get(1).getKeyAsNumber().doubleValue(), 0.0);
+        assertEquals(7, terms.getSumOfOtherDocCounts());
     }
 
     public void testCardinalityTracksTheCountPastIt() {
