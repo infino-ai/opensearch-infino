@@ -158,9 +158,13 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
         ShardId shardId = shard.shardId();
         Scheduler.Cancellable task = threadPool.scheduleWithFixedDelay(() -> {
             try {
+                long start = System.nanoTime();
                 int rc = InfinoNative.optimize(table);
+                long millis = (System.nanoTime() - start) / 1_000_000L;
                 if (rc != 0) {
-                    log.warn("[infino] optimize of {} returned {}", table, rc);
+                    log.warn("[infino] optimize of {} returned {} after {} ms", table, rc, millis);
+                } else {
+                    log.info("[infino] optimized {} in {} ms", table, millis);
                 }
             } catch (Throwable t) {
                 log.warn("[infino] scheduled optimize of {} failed", table, t);
