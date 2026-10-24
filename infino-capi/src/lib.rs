@@ -37,6 +37,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::{Arc, RwLock};
 
+use datafusion::arrow::compute::concat_batches;
 use datafusion::prelude::{col, lit};
 use infino::arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch,
@@ -764,72 +765,231 @@ pub unsafe extern "C" fn infino_index_batch_buf(
         if buf.is_null() || id_ends.is_null() || src_ends.is_null() || count <= 0 {
             return err_json("empty batch");
         }
-        let n = count as usize;
-        let bytes = unsafe { std::slice::from_raw_parts(buf, buf_len) };
-        let id_ends = unsafe { std::slice::from_raw_parts(id_ends, n) };
-        let src_ends = unsafe { std::slice::from_raw_parts(src_ends, n) };
+        let prepared = match unsafe { prepare(conn, name, buf, buf_len, id_ends, src_ends, count as usize) } {
+            Ok(p) => p,
+            Err(why) => return err_json(&why),
+        };
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
-        let table_schema = match conn.conn.schema(name) {
-            Ok(s) => s,
-            Err(e) => return err_json(&e.to_string()),
-        };
-        let schema = table.schema();
-
-        // Each row's id and source as borrowed slices of the buffer.
-        let mut rows_in: Vec<(&str, &str)> = Vec::with_capacity(n);
-        let mut start = 0usize;
-        for i in 0..n {
-            let (id_end, src_end) = (id_ends[i] as usize, src_ends[i] as usize);
-            if id_end < start || src_end < id_end || src_end > buf_len {
-                return err_json("offsets out of range");
-            }
-            let id = std::str::from_utf8(&bytes[start..id_end]).unwrap_or("");
-            let src = std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}");
-            rows_in.push((id, src));
-            start = src_end;
-        }
-
-        let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
-            .par_iter()
-            .map(|(id, src)| {
-                conform_doc(src, &schema).map(|mut flat| {
-                    flat.insert(OSID.into(), Value::String((*id).to_string()));
-                    flat.insert(SOURCE.into(), Value::String((*src).to_string()));
-                    flat
-                })
-            })
+        let n = prepared.n;
+        let failed = append_prepared(&table, vec![prepared]);
+        let failed: Vec<Value> = failed
+            .into_iter()
+            .map(|(_, i, reason)| json!({ "i": i, "reason": reason }))
             .collect();
-        let mut failed: Vec<Value> = Vec::new();
-        let mut index_of: Vec<usize> = Vec::with_capacity(n);
-        let mut rows: Vec<Map<String, Value>> = Vec::with_capacity(n);
-        for (i, r) in parsed.into_iter().enumerate() {
-            match r {
-                Ok(flat) => {
-                    index_of.push(i);
-                    rows.push(flat);
-                }
-                Err(why) => failed.push(json!({ "i": i, "reason": why })),
-            }
-        }
-        unify_new_paths(&mut rows, &schema);
-        let values: Vec<Value> = rows.into_iter().map(Value::Object).collect();
-        // One batch, one append; only a refused batch falls back to the
-        // halving append that names each refused document.
-        let appended = match rows_to_batch(&values, &table_schema) {
-            Ok(batch) => table.append(&batch).is_ok(),
-            Err(_) => false,
-        };
-        if !appended {
-            let indexed: Vec<(usize, Value)> = index_of.into_iter().zip(values).collect();
-            append_checked(&table, &indexed, &mut failed);
-        }
         let ok = n - failed.len();
         out_json(json!({ "ok": ok, "failed": failed }))
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// A batch parsed, conformed and converted to Arrow ahead of its append, so
+/// that work runs while the previous append commits. Every row of the
+/// batch is accounted for: in `batch` (or `values`, when the Arrow
+/// conversion refused the batch) or in `failed`.
+pub struct Prepared {
+    n: usize,
+    batch: Option<RecordBatch>,
+    values: Vec<Value>,
+    index_of: Vec<usize>,
+    failed: Vec<(usize, String)>,
+}
+
+/// Parse the buffer's documents in parallel and convert them to one Arrow batch.
+unsafe fn prepare(
+    conn: &Bridge,
+    name: &str,
+    buf: *const u8,
+    buf_len: usize,
+    id_ends: *const u32,
+    src_ends: *const u32,
+    n: usize,
+) -> Result<Prepared, String> {
+    let bytes = unsafe { std::slice::from_raw_parts(buf, buf_len) };
+    let id_ends = unsafe { std::slice::from_raw_parts(id_ends, n) };
+    let src_ends = unsafe { std::slice::from_raw_parts(src_ends, n) };
+    let table = conn.table(name).map_err(|e| e.to_string())?;
+    let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
+    let schema = table.schema();
+
+    // Each row's id and source as borrowed slices of the buffer.
+    let mut rows_in: Vec<(&str, &str)> = Vec::with_capacity(n);
+    let mut start = 0usize;
+    for i in 0..n {
+        let (id_end, src_end) = (id_ends[i] as usize, src_ends[i] as usize);
+        if id_end < start || src_end < id_end || src_end > buf_len {
+            return Err("offsets out of range".into());
+        }
+        let id = std::str::from_utf8(&bytes[start..id_end]).unwrap_or("");
+        let src = std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}");
+        rows_in.push((id, src));
+        start = src_end;
+    }
+
+    let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
+        .par_iter()
+        .map(|(id, src)| {
+            conform_doc(src, &schema).map(|mut flat| {
+                flat.insert(OSID.into(), Value::String((*id).to_string()));
+                flat.insert(SOURCE.into(), Value::String((*src).to_string()));
+                flat
+            })
+        })
+        .collect();
+    let mut failed: Vec<(usize, String)> = Vec::new();
+    let mut index_of: Vec<usize> = Vec::with_capacity(n);
+    let mut rows: Vec<Map<String, Value>> = Vec::with_capacity(n);
+    for (i, r) in parsed.into_iter().enumerate() {
+        match r {
+            Ok(flat) => {
+                index_of.push(i);
+                rows.push(flat);
+            }
+            Err(why) => failed.push((i, why)),
+        }
+    }
+    unify_new_paths(&mut rows, &schema);
+    let values: Vec<Value> = rows.into_iter().map(Value::Object).collect();
+    let batch = if values.is_empty() {
+        None
+    } else {
+        rows_to_batch(&values, &table_schema).ok()
+    };
+    Ok(Prepared {
+        n,
+        batch,
+        values,
+        index_of,
+        failed,
+    })
+}
+
+/// Append prepared batches as one commit when their schemas agree (a batch
+/// that added an unmapped path has its own), else one commit each; a batch
+/// the engine refuses falls back to the halving append that names each
+/// refused document. Returns every refused document as (batch index,
+/// document index, reason).
+fn append_prepared(table: &Supertable, prepared: Vec<Prepared>) -> Vec<(usize, usize, String)> {
+    let mut failed: Vec<(usize, usize, String)> = Vec::new();
+    for (b, p) in prepared.iter().enumerate() {
+        for (i, why) in &p.failed {
+            failed.push((b, *i, why.clone()));
+        }
+    }
+    let batches: Vec<&RecordBatch> = prepared.iter().filter_map(|p| p.batch.as_ref()).collect();
+    let same_schema = batches.len() == prepared.len()
+        && batches.windows(2).all(|w| w[0].schema() == w[1].schema());
+    if same_schema && !batches.is_empty() {
+        let joined = if batches.len() == 1 {
+            Ok(batches[0].clone())
+        } else {
+            concat_batches(&batches[0].schema(), batches.iter().copied())
+        };
+        if let Ok(batch) = joined {
+            if table.append(&batch).is_ok() {
+                return failed;
+            }
+        }
+    }
+    // Per batch: its Arrow form, else its rows one halving at a time.
+    for (b, p) in prepared.into_iter().enumerate() {
+        if let Some(batch) = &p.batch {
+            if table.append(batch).is_ok() {
+                continue;
+            }
+        }
+        let indexed: Vec<(usize, Value)> = p.index_of.into_iter().zip(p.values).collect();
+        let mut refused: Vec<Value> = Vec::new();
+        append_checked(table, &indexed, &mut refused);
+        for r in refused {
+            let i = r["i"].as_u64().unwrap_or(0) as usize;
+            failed.push((b, i, r["reason"].as_str().unwrap_or("refused").to_string()));
+        }
+    }
+    failed
+}
+
+/// Parse and convert a batch ahead of its append; see [`Prepared`]. The
+/// buffer layout is that of [`infino_index_batch_buf`]. Returns null when
+/// the table is unknown or the offsets do not fit the buffer; otherwise a
+/// handle that [`infino_append_prepared`] consumes or
+/// [`infino_free_prepared`] releases.
+#[no_mangle]
+pub unsafe extern "C" fn infino_prepare_batch(
+    h: *mut Bridge,
+    name: *const c_char,
+    buf: *const u8,
+    buf_len: usize,
+    id_ends: *const u32,
+    src_ends: *const u32,
+    count: c_int,
+) -> *mut Prepared {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
+            return ptr::null_mut();
+        };
+        if buf.is_null() || id_ends.is_null() || src_ends.is_null() || count <= 0 {
+            return ptr::null_mut();
+        }
+        match unsafe { prepare(conn, name, buf, buf_len, id_ends, src_ends, count as usize) } {
+            Ok(p) => Box::into_raw(Box::new(p)),
+            Err(why) => {
+                eprintln!("[capi] prepare: {why}");
+                ptr::null_mut()
+            }
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Append prepared batches in one commit (see [`append_prepared`]) and
+/// release them. Returns `{"ok":n,"failed":[{"b":batch,"i":doc,"reason":..}]}`,
+/// where `b` indexes `prepared` and `i` the documents of that batch, or
+/// `{"error":..}` when nothing ran (the handles are released either way).
+#[no_mangle]
+pub unsafe extern "C" fn infino_append_prepared(
+    h: *mut Bridge,
+    name: *const c_char,
+    prepared: *const *mut Prepared,
+    count: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        if prepared.is_null() || count <= 0 {
+            return err_json("empty batch");
+        }
+        let handles = unsafe { std::slice::from_raw_parts(prepared, count as usize) };
+        let owned: Vec<Prepared> = handles
+            .iter()
+            .filter(|p| !p.is_null())
+            .map(|p| *unsafe { Box::from_raw(*p) })
+            .collect();
+        let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
+            return err_json("null argument");
+        };
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let n: usize = owned.iter().map(|p| p.n).sum();
+        let failed = append_prepared(&table, owned);
+        let ok = n - failed.len();
+        let failed: Vec<Value> = failed
+            .into_iter()
+            .map(|(b, i, reason)| json!({ "b": b, "i": i, "reason": reason }))
+            .collect();
+        out_json(json!({ "ok": ok, "failed": failed }))
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Release a prepared batch that will not be appended.
+#[no_mangle]
+pub unsafe extern "C" fn infino_free_prepared(p: *mut Prepared) {
+    if !p.is_null() {
+        drop(unsafe { Box::from_raw(p) });
+    }
 }
 
 /// Tombstone every row whose `osid` is in the list, in one mutation. Backs the

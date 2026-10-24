@@ -256,6 +256,71 @@ public final class InfinoNative {
         return why == null || why.isEmpty() ? null : why;
     }
 
+    /** The ids and sources of a batch as one UTF-8 buffer with the end offset of each id and each source. */
+    private record Packed(byte[] buf, int[] idEnds, int[] srcEnds) {
+        static Packed of(List<String> osids, List<String> sources) {
+            int n = osids.size();
+            int[] idEnds = new int[n];
+            int[] srcEnds = new int[n];
+            byte[][] idBytes = new byte[n][];
+            byte[][] srcBytes = new byte[n][];
+            int total = 0;
+            for (int i = 0; i < n; i++) {
+                idBytes[i] = osids.get(i).getBytes(StandardCharsets.UTF_8);
+                srcBytes[i] = sources.get(i).getBytes(StandardCharsets.UTF_8);
+                total += idBytes[i].length;
+                idEnds[i] = total;
+                total += srcBytes[i].length;
+                srcEnds[i] = total;
+            }
+            byte[] buf = new byte[total];
+            int at = 0;
+            for (int i = 0; i < n; i++) {
+                System.arraycopy(idBytes[i], 0, buf, at, idBytes[i].length);
+                at += idBytes[i].length;
+                System.arraycopy(srcBytes[i], 0, buf, at, srcBytes[i].length);
+                at += srcBytes[i].length;
+            }
+            return new Packed(buf, idEnds, srcEnds);
+        }
+    }
+
+    /** One refused document of a prepared batch: which batch, which document, why. */
+    public record PreparedFailure(int batch, int index, String reason) {}
+
+    /** Outcome of appending prepared batches. */
+    public record PreparedResult(int ok, List<PreparedFailure> failed) {}
+
+    /**
+     * Parse and convert a batch ahead of its append, so the work overlaps the
+     * append that is running. The handle must go to {@link #appendPrepared}
+     * or {@link #freePrepared}. Null when the table is unknown.
+     */
+    public static Pointer prepare(String name, List<String> osids, List<String> sources) {
+        init();
+        Packed p = Packed.of(osids, sources);
+        return lib.infino_prepare_batch(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), osids.size());
+    }
+
+    /** Append prepared batches in one commit; the handles are released by the call. */
+    @SuppressWarnings("unchecked")
+    public static PreparedResult appendPrepared(String name, List<Pointer> prepared) {
+        init();
+        COLUMNS.remove(name); // the batch may have added paths to the schema
+        Map<String, Object> out = object(takeOrThrow(lib.infino_append_prepared(conn, name, prepared.toArray(new Pointer[0]), prepared.size())));
+        List<PreparedFailure> failed = new ArrayList<>();
+        for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
+            failed.add(new PreparedFailure(((Number) f.get("b")).intValue(), ((Number) f.get("i")).intValue(), (String) f.get("reason")));
+        }
+        return new PreparedResult(((Number) out.get("ok")).intValue(), failed);
+    }
+
+    public static void freePrepared(Pointer prepared) {
+        if (prepared != null) {
+            lib.infino_free_prepared(prepared);
+        }
+    }
+
     /**
      * Index many documents in one append (parallel arrays of length n). The
      * ids and sources cross to the bridge as one UTF-8 buffer with end
@@ -266,28 +331,8 @@ public final class InfinoNative {
     public static BatchResult indexBatch(String name, String[] osids, String[] sources, int n) {
         init();
         COLUMNS.remove(name); // the batch may have added paths to the schema
-        int[] idEnds = new int[n];
-        int[] srcEnds = new int[n];
-        byte[][] idBytes = new byte[n][];
-        byte[][] srcBytes = new byte[n][];
-        int total = 0;
-        for (int i = 0; i < n; i++) {
-            idBytes[i] = osids[i].getBytes(StandardCharsets.UTF_8);
-            srcBytes[i] = sources[i].getBytes(StandardCharsets.UTF_8);
-            total += idBytes[i].length;
-            idEnds[i] = total;
-            total += srcBytes[i].length;
-            srcEnds[i] = total;
-        }
-        byte[] buf = new byte[total];
-        int at = 0;
-        for (int i = 0; i < n; i++) {
-            System.arraycopy(idBytes[i], 0, buf, at, idBytes[i].length);
-            at += idBytes[i].length;
-            System.arraycopy(srcBytes[i], 0, buf, at, srcBytes[i].length);
-            at += srcBytes[i].length;
-        }
-        Map<String, Object> out = object(takeOrThrow(lib.infino_index_batch_buf(conn, name, buf, buf.length, idEnds, srcEnds, n)));
+        Packed p = Packed.of(List.of(osids).subList(0, n), List.of(sources).subList(0, n));
+        Map<String, Object> out = object(takeOrThrow(lib.infino_index_batch_buf(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), n)));
         List<Failure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
             failed.add(new Failure(((Number) f.get("i")).intValue(), (String) f.get("reason")));

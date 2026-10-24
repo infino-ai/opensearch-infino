@@ -24,6 +24,14 @@ public interface InfinoLib extends Library {
     /** One buffer of ids and sources with their end offsets: three native arrays instead of one allocation per string. */
     Pointer infino_index_batch_buf(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
 
+    /** Parse and convert a batch ahead of its append; null when the table is unknown. */
+    Pointer infino_prepare_batch(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
+
+    /** Append prepared batches in one commit and release them. */
+    Pointer infino_append_prepared(Pointer h, String name, Pointer[] prepared, int count);
+
+    void infino_free_prepared(Pointer prepared);
+
     int infino_delete_osids(Pointer h, String name, String[] osids, int count);
 
     Pointer infino_get(Pointer h, String name, String osid);

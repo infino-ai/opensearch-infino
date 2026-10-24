@@ -4,6 +4,8 @@
 
 package org.opensearch.infino;
 
+import com.sun.jna.Pointer;
+
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.DocWriteRequest;
@@ -47,11 +49,17 @@ import java.util.concurrent.locks.ReentrantLock;
  * document and a byte threshold. The append runs on the write pool, never
  * on the thread that took the request.
  *
- * <p>Within a batch a later write of an id replaces an earlier one, and a
- * delete cancels a pending write. Before the append, one statement over the
- * id column's term index names the ids the table already holds; those are
- * tombstoned in one mutation, so an append of new documents (the shape of a
- * log stream) pays no lookup.
+ * <p>A bulk's documents are parsed, conformed and converted to Arrow on the
+ * thread that took the request, before they join the batch, so that work
+ * overlaps the append that is running; the append itself then only
+ * commits the prepared batches. When an id is written by more than one
+ * bulk of a batch, or a delete targets an id a bulk of the batch writes,
+ * the batch takes the slower path that folds the writes by id first.
+ *
+ * <p>Before the append, one statement over the id column's term index
+ * names the ids the table already holds; those are tombstoned in one
+ * mutation, so an append of new documents (the shape of a log stream) pays
+ * no lookup.
  */
 public final class InfinoWriter {
 
@@ -75,6 +83,9 @@ public final class InfinoWriter {
     /** One bulk's share of a batch: its outcomes and the listener that gets its response. */
     record Waiter(ShardId shardId, String indexName, List<Outcome> outcomes, BulkItemResponse[] items, long startNanos, ActionListener<BulkResponse> listener) {}
 
+    /** A bulk in its batch: the waiter, its prepared batch (null when it writes nothing), and the ids of the prepared rows in order. */
+    private record Staged(Waiter waiter, Pointer prepared, List<String> preparedIds, long bytes) {}
+
     /** What a flush did: the ids the engine refused with the reason, and the ids that already existed. */
     private record Applied(Map<String, String> refused, Set<String> existed) {}
 
@@ -83,8 +94,10 @@ public final class InfinoWriter {
         final Lock lock = new ReentrantLock();
         /** Signalled whenever the pending writes are taken by an append, for bulks held back by the bound. */
         final Condition taken = lock.newCondition();
-        final Map<String, Write> writes = new LinkedHashMap<>();
-        final List<Waiter> waiters = new ArrayList<>();
+        final List<Staged> staged = new ArrayList<>();
+        /** The latest source pending for each id, for an update in the same batch to merge into. */
+        final Map<String, String> pendingSources = new HashMap<>();
+        int docs = 0;
         long bytes = 0;
         boolean flushing = false;
     }
@@ -104,47 +117,58 @@ public final class InfinoWriter {
         }
         batch.lock.lock();
         try {
-            Write w = batch.writes.get(id);
-            return w == null ? null : w.source();
+            return batch.pendingSources.get(id);
         } finally {
             batch.lock.unlock();
         }
     }
 
     /**
-     * Stage one bulk's writes to a table. Items answered up front carry their
-     * response; the rest are answered when their append commits, and the
-     * listener gets the whole bulk's response then.
+     * Stage one bulk's writes to a table: its documents are prepared here,
+     * on the caller's thread, then join the batch. Items answered up front
+     * carry their response; the rest are answered when their append
+     * commits, and the listener gets the whole bulk's response then.
      */
     void submit(String table, Waiter waiter) {
+        List<String> ids = new ArrayList<>();
+        List<String> sources = new ArrayList<>();
+        long bytes = 0;
+        for (Outcome o : waiter.outcomes()) {
+            if (o.write() != null && o.write().source() != null) {
+                ids.add(o.write().id());
+                sources.add(o.write().source());
+                bytes += o.write().source().length();
+            }
+        }
+        Pointer prepared = ids.isEmpty() ? null : InfinoNative.prepare(table, ids, sources);
+        if (!ids.isEmpty() && prepared == null) {
+            waiter.listener().onFailure(new IllegalStateException("[infino] the bridge could not prepare the batch for " + table));
+            return;
+        }
+        Staged staged = new Staged(waiter, prepared, ids, bytes);
+
         Batch batch = batches.computeIfAbsent(table, t -> new Batch());
         boolean start;
         batch.lock.lock();
         try {
             // A batch past its bound waits for the running append to take it
             // before more is staged behind it.
-            while (batch.flushing && (batch.writes.size() >= MAX_BATCH_DOCS || batch.bytes >= MAX_BATCH_BYTES)) {
+            while (batch.flushing && (batch.docs >= MAX_BATCH_DOCS || batch.bytes >= MAX_BATCH_BYTES)) {
                 try {
                     batch.taken.await();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    InfinoNative.freePrepared(prepared);
                     waiter.listener().onFailure(e);
                     return;
                 }
             }
-            for (Outcome o : waiter.outcomes()) {
-                if (o.write() == null) {
-                    continue;
-                }
-                Write previous = batch.writes.put(o.write().id(), o.write());
-                if (previous != null && previous.source() != null) {
-                    batch.bytes -= previous.source().length();
-                }
-                if (o.write().source() != null) {
-                    batch.bytes += o.write().source().length();
-                }
+            batch.staged.add(staged);
+            batch.docs += ids.size();
+            batch.bytes += bytes;
+            for (int i = 0; i < ids.size(); i++) {
+                batch.pendingSources.put(ids.get(i), sources.get(i));
             }
-            batch.waiters.add(waiter);
             start = !batch.flushing;
             if (start) {
                 batch.flushing = true;
@@ -160,76 +184,137 @@ public final class InfinoWriter {
     /** Append what is pending and answer the bulks it carries; repeat while more arrived meanwhile. */
     private void flush(String table, Batch batch) {
         while (true) {
-            Map<String, Write> writes;
-            List<Waiter> waiters;
+            List<Staged> staged;
             batch.lock.lock();
             try {
-                if (batch.waiters.isEmpty()) {
+                if (batch.staged.isEmpty()) {
                     batch.flushing = false;
                     batch.taken.signalAll();
                     return;
                 }
-                writes = new LinkedHashMap<>(batch.writes);
-                waiters = new ArrayList<>(batch.waiters);
-                batch.writes.clear();
-                batch.waiters.clear();
+                staged = new ArrayList<>(batch.staged);
+                batch.staged.clear();
+                batch.pendingSources.clear();
+                batch.docs = 0;
                 batch.bytes = 0;
                 batch.taken.signalAll();
             } finally {
                 batch.lock.unlock();
             }
             try {
-                Applied applied = apply(table, writes);
-                for (Waiter w : waiters) {
-                    answer(w, applied);
+                Applied applied = apply(table, staged);
+                for (Staged s : staged) {
+                    answer(s.waiter(), applied);
                 }
             } catch (Exception e) {
-                log.warn("[infino] append of {} writes to {} failed", writes.size(), table, e);
-                for (Waiter w : waiters) {
-                    w.listener().onFailure(e);
+                log.warn("[infino] append of {} bulks to {} failed", staged.size(), table, e);
+                for (Staged s : staged) {
+                    s.waiter().listener().onFailure(e);
                 }
             }
         }
     }
 
     /** Tombstone what exists, append the rest. */
-    private static Applied apply(String table, Map<String, Write> writes) {
+    private static Applied apply(String table, List<Staged> staged) {
         Set<String> lookups = new HashSet<>();
-        for (Write w : writes.values()) {
-            if (w.lookup()) {
-                lookups.add(w.id());
+        Set<String> written = new HashSet<>();
+        boolean collision = false;
+        for (Staged s : staged) {
+            for (Outcome o : s.waiter().outcomes()) {
+                Write w = o.write();
+                if (w == null) {
+                    continue;
+                }
+                if (w.lookup()) {
+                    lookups.add(w.id());
+                }
+                if (!written.add(w.id())) {
+                    collision = true; // the same id twice in one batch: written twice, or written and deleted
+                }
             }
         }
         Set<String> existed = lookups.isEmpty() ? Set.of() : InfinoNative.existingOsids(table, lookups);
         List<String> tombstones = new ArrayList<>();
-        List<String> ids = new ArrayList<>();
-        List<String> sources = new ArrayList<>();
-        for (Write w : writes.values()) {
-            if (existed.contains(w.id())) {
-                tombstones.add(w.id());
-            }
-            if (w.source() != null) {
-                ids.add(w.id());
-                sources.add(w.source());
+        for (String id : written) {
+            if (existed.contains(id)) {
+                tombstones.add(id);
             }
         }
         if (!tombstones.isEmpty()) {
             int rc = InfinoNative.deleteOsids(table, tombstones.toArray(new String[0]), tombstones.size());
             if (rc != 0) {
+                for (Staged s : staged) {
+                    InfinoNative.freePrepared(s.prepared());
+                }
                 throw new IllegalStateException("[infino] delete of " + tombstones.size() + " ids from " + table + " returned " + rc);
             }
         }
-        Map<String, String> refused = new HashMap<>();
-        if (!ids.isEmpty()) {
-            long start = System.nanoTime();
-            InfinoNative.BatchResult result = InfinoNative.indexBatch(table, ids.toArray(new String[0]), sources.toArray(new String[0]), ids.size());
-            long millis = (System.nanoTime() - start) / 1_000_000L;
-            for (InfinoNative.Failure f : result.failed()) {
-                refused.put(ids.get(f.index()), f.reason());
-            }
-            log.debug("[infino] appended {} of {} documents to {} in {} ms ({} tombstoned first)", result.ok(), ids.size(), table, millis, tombstones.size());
-        }
+        Map<String, String> refused = collision ? appendFolded(table, staged) : appendPrepared(table, staged);
         return new Applied(refused, existed);
+    }
+
+    /** The prepared batches as one commit; a refused document is reported under its id. */
+    private static Map<String, String> appendPrepared(String table, List<Staged> staged) {
+        List<Pointer> handles = new ArrayList<>();
+        List<Staged> withRows = new ArrayList<>();
+        for (Staged s : staged) {
+            if (s.prepared() != null) {
+                handles.add(s.prepared());
+                withRows.add(s);
+            }
+        }
+        Map<String, String> refused = new HashMap<>();
+        if (handles.isEmpty()) {
+            return refused;
+        }
+        long start = System.nanoTime();
+        InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, handles);
+        long millis = (System.nanoTime() - start) / 1_000_000L;
+        int docs = 0;
+        for (Staged s : withRows) {
+            docs += s.preparedIds().size();
+        }
+        for (InfinoNative.PreparedFailure f : result.failed()) {
+            refused.put(withRows.get(f.batch()).preparedIds().get(f.index()), f.reason());
+        }
+        log.debug("[infino] appended {} of {} documents to {} in {} ms ({} bulks)", result.ok(), docs, table, millis, handles.size());
+        return refused;
+    }
+
+    /**
+     * The batch's writes folded by id, last write winning and a delete
+     * cancelling an earlier write, then appended from the sources: the path
+     * for a batch in which one id appears twice.
+     */
+    private static Map<String, String> appendFolded(String table, List<Staged> staged) {
+        Map<String, Write> writes = new LinkedHashMap<>();
+        for (Staged s : staged) {
+            InfinoNative.freePrepared(s.prepared());
+            for (Outcome o : s.waiter().outcomes()) {
+                if (o.write() != null) {
+                    writes.put(o.write().id(), o.write());
+                }
+            }
+        }
+        List<String> ids = new ArrayList<>();
+        List<String> sources = new ArrayList<>();
+        for (Write w : writes.values()) {
+            if (w.source() != null) {
+                ids.add(w.id());
+                sources.add(w.source());
+            }
+        }
+        Map<String, String> refused = new HashMap<>();
+        if (ids.isEmpty()) {
+            return refused;
+        }
+        InfinoNative.BatchResult result = InfinoNative.indexBatch(table, ids.toArray(new String[0]), sources.toArray(new String[0]), ids.size());
+        for (InfinoNative.Failure f : result.failed()) {
+            refused.put(ids.get(f.index()), f.reason());
+        }
+        log.debug("[infino] appended {} of {} documents to {} (folded: an id appeared twice in the batch)", result.ok(), ids.size(), table);
+        return refused;
     }
 
     /** One bulk's response from what its batch did. */
