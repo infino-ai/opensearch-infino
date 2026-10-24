@@ -309,7 +309,11 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                 Field::new(OSID, DataType::LargeUtf8, false),
                 Field::new(SOURCE, DataType::LargeUtf8, true),
             ];
-            let mut spec = IndexSpec::new();
+            // The id column carries an FTS index: a GET by id is then a term
+            // lookup (`exact_match`) instead of a scan of the column, and the
+            // manifest's per-superfile term bloom skips the files that cannot
+            // hold the id. Scalar columns have only min/max per superfile.
+            let mut spec = IndexSpec::new().fts(FtsField::new(OSID.to_string()));
             for f in &mapped {
                 if f.path == OSID || f.path == SOURCE {
                     continue;
@@ -787,31 +791,36 @@ pub unsafe extern "C" fn infino_get(
         else {
             return ptr::null_mut();
         };
-        if conn.table(name).is_err() {
+        let Ok(table) = conn.table(name) else {
             return out_string(String::new());
-        }
-        // One equality on the id column: the manifest's per-superfile Bloom
-        // filter on `osid` skips every file that cannot hold it.
-        let esc = osid.replace('\'', "''");
-        let sql = format!("SELECT {SOURCE} FROM {name} WHERE {OSID} = '{esc}' LIMIT 1");
-        match conn.conn.query_sql(&sql) {
-            Ok(batches) => {
-                for b in &batches {
-                    if b.num_rows() > 0 {
-                        if let Some(a) = b.column(0).as_any().downcast_ref::<LargeStringArray>() {
-                            if !a.is_null(0) {
-                                return out_string(a.value(0).to_string());
-                            }
-                        }
+        };
+        // A term lookup through the id column's FTS index, projected to the
+        // source. A table declared before the id column carried that index
+        // refuses the lookup; it falls back to an equality on the column.
+        let batches = match table.exact_match(OSID, osid, Some(&[SOURCE])) {
+            Ok(batches) => batches,
+            Err(_) => {
+                let esc = osid.replace('\'', "''");
+                let sql = format!("SELECT {SOURCE} FROM {name} WHERE {OSID} = '{esc}' LIMIT 1");
+                match conn.conn.query_sql(&sql) {
+                    Ok(batches) => batches,
+                    Err(e) => {
+                        eprintln!("[capi] get: {e}");
+                        return out_string(String::new());
                     }
                 }
-                out_string(String::new())
             }
-            Err(e) => {
-                eprintln!("[capi] get: {e}");
-                out_string(String::new())
+        };
+        for b in &batches {
+            if b.num_rows() > 0 {
+                if let Some(a) = b.column(0).as_any().downcast_ref::<LargeStringArray>() {
+                    if !a.is_null(0) {
+                        return out_string(a.value(0).to_string());
+                    }
+                }
             }
         }
+        out_string(String::new())
     }))
     .unwrap_or(ptr::null_mut())
 }

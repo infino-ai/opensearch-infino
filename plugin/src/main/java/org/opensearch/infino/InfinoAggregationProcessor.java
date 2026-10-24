@@ -12,11 +12,10 @@ import org.opensearch.common.time.DateFormatter;
 import org.opensearch.index.mapper.DateFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
-import org.opensearch.infino.InfinoQueryPhaseSearcher.Plan;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
+import org.opensearch.infino.InfinoSearch.Plan;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.AggregationBuilder;
-import org.opensearch.search.aggregations.AggregationProcessor;
 import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
@@ -57,7 +56,6 @@ import org.opensearch.search.aggregations.metrics.SumAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.TDigestState;
 import org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
-import org.opensearch.search.internal.SearchContext;
 
 import java.time.Instant;
 import java.time.ZoneId;
@@ -66,6 +64,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
@@ -74,7 +73,7 @@ import static org.opensearch.infino.InfinoQueryTranslator.literal;
 import static org.opensearch.infino.InfinoQueryTranslator.quoteIdent;
 
 /**
- * Serves aggregations from Infino SQL for Infino-enabled shards, over the
+ * Serves aggregations from Infino SQL for Infino-backed indices, over the
  * table's typed columns, scoped by the same relation and predicate the hits
  * use (so a full-text query scopes its aggregations through the engine's
  * token index, never through a materialized id list).
@@ -93,11 +92,11 @@ import static org.opensearch.infino.InfinoQueryTranslator.quoteIdent;
  *       {@code date_range}): one query per bucket, the bucket's predicate
  *       added to the request's, since buckets may overlap.</li>
  * </ul>
- * Pipeline aggregations need nothing here: the coordinator computes them from
- * the buckets returned. A request with an aggregation outside this surface is
- * refused with the reason, rather than answered empty.
+ * Pipeline aggregations need nothing here: the final reduction computes them
+ * from the buckets returned. A request with an aggregation outside this
+ * surface is refused with the reason, rather than answered empty.
  */
-public class InfinoAggregationProcessor implements AggregationProcessor {
+public class InfinoAggregationProcessor {
 
     private static final Logger log = LogManager.getLogger(InfinoAggregationProcessor.class);
     /** Buckets a terms level may return; past this the window is not worth a GROUP BY. */
@@ -116,42 +115,27 @@ public class InfinoAggregationProcessor implements AggregationProcessor {
         }
     }
 
-    private final AggregationProcessor delegate;
-
-    public InfinoAggregationProcessor(AggregationProcessor delegate) {
-        this.delegate = delegate;
-    }
-
-    @Override
-    public void preProcess(SearchContext context) {
-        if (!served(context)) {
-            delegate.preProcess(context); // sets up Lucene collectors
-        }
-    }
-
-    @Override
-    public void postProcess(SearchContext context) {
-        if (!served(context)) {
-            delegate.postProcess(context);
-            return;
-        }
-        Plan plan = InfinoQueryPhaseSearcher.plan(context);
+    /**
+     * The requested aggregations over the plan's relation, in request order,
+     * as the stock response objects. {@code total} is the request's exact
+     * match count when the hit path already has it, else null.
+     */
+    public InternalAggregations evaluate(Collection<AggregationBuilder> builders, Plan plan, Long total) {
         Translation q = plan.query();
         List<Spec> specs = new ArrayList<>();
         int position = 0;
-        for (AggregationBuilder b : builders(context)) {
+        for (AggregationBuilder b : builders) {
             specs.add(Spec.of(b, plan.cols(), plan.table(), position++));
         }
-        Map<String, InternalAggregation> byName = new java.util.HashMap<>();
+        Map<String, InternalAggregation> byName = new HashMap<>();
         List<Metric> rootMetrics = new ArrayList<>();
-        Long total = null;
         for (Spec spec : specs) {
             if (spec instanceof Metric m) {
                 rootMetrics.add(m);
                 continue;
             }
             if (total == null) {
-                total = InfinoQueryPhaseSearcher.count(plan.table(), q);
+                total = InfinoSearch.count(plan.table(), q);
             }
             byName.put(spec.name(), evalBucket((BucketSpec) spec, q.from(), q.where(), total));
         }
@@ -163,35 +147,20 @@ public class InfinoAggregationProcessor implements AggregationProcessor {
         }
         // Keep the request's order of aggregations.
         List<InternalAggregation> ordered = new ArrayList<>();
-        for (AggregationBuilder b : builders(context)) {
+        for (AggregationBuilder b : builders) {
             ordered.add(byName.get(b.getName()));
         }
-        context.queryResult().aggregations(InternalAggregations.from(ordered));
         log.debug("[infino] served {} aggregation(s) from {}", ordered.size(), plan.table());
+        return InternalAggregations.from(ordered);
     }
 
-    private boolean served(SearchContext context) {
-        return !builders(context).isEmpty() && InfinoQueryPhaseSearcher.plan(context) != null;
-    }
-
-    // ---- servability (shared with the query phase's plan) ----
+    // ---- servability (shared with the hit path's plan) ----
 
     /** Plans every requested aggregation; throws {@link Unsupported} naming the first that cannot be served. */
-    static void check(SearchContext context, Plan plan) {
+    static void check(Collection<AggregationBuilder> builders, Plan plan) {
         int position = 0;
-        for (AggregationBuilder b : builders(context)) {
+        for (AggregationBuilder b : builders) {
             Spec.of(b, plan.cols(), plan.table(), position++);
-        }
-    }
-
-    static Collection<AggregationBuilder> builders(SearchContext context) {
-        try {
-            if (context.request() == null || context.request().source() == null || context.request().source().aggregations() == null) {
-                return List.of();
-            }
-            return context.request().source().aggregations().getAggregatorFactories();
-        } catch (Exception e) {
-            return List.of();
         }
     }
 
@@ -255,7 +224,7 @@ public class InfinoAggregationProcessor implements AggregationProcessor {
             if (b.field() == null) {
                 throw new Unsupported("aggregation [" + b.getName() + "] needs a field");
             }
-            Column c = InfinoQueryPhaseSearcher.columnFor(cols, b.field());
+            Column c = InfinoSearch.columnFor(cols, b.field());
             if (c == null) {
                 throw new Unsupported("aggregation [" + b.getName() + "] names field [" + b.field() + "], which the table has no column for");
             }

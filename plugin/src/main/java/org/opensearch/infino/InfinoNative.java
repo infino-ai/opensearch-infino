@@ -11,6 +11,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.index.Index;
@@ -21,11 +22,14 @@ import org.opensearch.core.xcontent.XContentParser;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -117,17 +121,27 @@ public final class InfinoNative {
     }
 
     /**
-     * Per-shard Infino table name: the index name for the reader of a bucket
-     * listing, the index UUID so that an index recreated under the same name
-     * (after a crash left the old table behind, or by a user) gets a table of
-     * its own instead of the old rows, and the shard. Must match on write and query.
+     * The Infino table of an index: the one named by {@code index.infino.table}
+     * when set (so an index recreated on a fresh cluster reattaches to the
+     * table its predecessor wrote), else the index name for the reader of a
+     * bucket listing plus the index UUID, so that an index recreated under
+     * the same name without that setting gets a table of its own.
      */
-    public static String tableFor(Index index, int shard) {
+    public static String tableFor(Index index, Settings indexSettings) {
+        String explicit = InfinoPlugin.INFINO_TABLE.get(indexSettings);
+        if (!explicit.isEmpty()) {
+            return explicit;
+        }
         // The engine's SQL layer folds table names to lower case, and the UUID is
         // base64url (mixed case, '-' and '_'); folded and with '-' replaced, the
         // name reads the same at declare time and in a statement.
         String uuid = index.getUUID().toLowerCase(Locale.ROOT).replace('-', '_');
-        return "os_" + index.getName() + "_" + uuid + "_" + shard;
+        return "os_" + index.getName() + "_" + uuid;
+    }
+
+    /** Whether the table name came from {@code index.infino.table}, in which case deleting the index leaves it. */
+    public static boolean tableIsExplicit(Settings indexSettings) {
+        return !InfinoPlugin.INFINO_TABLE.get(indexSettings).isEmpty();
     }
 
     private static String take(Pointer p) {
@@ -312,6 +326,44 @@ public final class InfinoNative {
         String sql = "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM "
             + InfinoQueryTranslator.quoteIdent(name) + " WHERE " + InfinoQueryTranslator.OSID + " IN (" + String.join(", ", lits) + ")";
         keepSources(name, sqlRows(sql));
+    }
+
+    /** Ids per statement when probing which of a batch's ids the table already holds. */
+    private static final int PROBE_IDS_PER_STATEMENT = 1_000;
+
+    /**
+     * Which of these ids the table already holds, through the id column's
+     * term index: one statement per thousand ids, a union of their postings,
+     * then an exact comparison, since an id with punctuation indexes as
+     * several terms and the union may name ids that only share one.
+     */
+    public static Set<String> existingOsids(String name, Collection<String> osids) {
+        Set<String> wanted = new HashSet<>(osids);
+        Set<String> found = new HashSet<>();
+        List<String> batch = new ArrayList<>(PROBE_IDS_PER_STATEMENT);
+        for (String id : wanted) {
+            batch.add(id);
+            if (batch.size() == PROBE_IDS_PER_STATEMENT) {
+                probe(name, batch, wanted, found);
+                batch.clear();
+            }
+        }
+        if (!batch.isEmpty()) {
+            probe(name, batch, wanted, found);
+        }
+        return found;
+    }
+
+    private static void probe(String name, List<String> ids, Set<String> wanted, Set<String> found) {
+        String terms = InfinoQueryTranslator.literal(String.join(" ", ids));
+        String sql = "SELECT " + InfinoQueryTranslator.OSID + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '"
+            + InfinoQueryTranslator.OSID + "', " + terms + ", 'or')";
+        for (Map<String, Object> row : sqlRows(sql)) {
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            if (id != null && wanted.contains(id.toString())) {
+                found.add(id.toString());
+            }
+        }
     }
 
     /** Keep the sources of rows a hit statement returned (id and source columns), for the fetch phase. */

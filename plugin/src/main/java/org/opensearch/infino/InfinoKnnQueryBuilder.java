@@ -10,6 +10,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 
+import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
 
 import org.opensearch.core.ParseField;
@@ -90,7 +91,8 @@ public class InfinoKnnQueryBuilder extends AbstractQueryBuilder<InfinoKnnQueryBu
 
     @Override
     protected Query doToQuery(QueryShardContext context) {
-        return new InfinoVectorQuery(false, null, null, field, vector, k);
+        // Served at the action layer from the table; a shard never runs it.
+        return new MatchNoDocsQuery(NAME + " is served by the Infino table");
     }
 
     String field() { return field; }

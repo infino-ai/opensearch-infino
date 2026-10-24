@@ -13,7 +13,6 @@ import org.opensearch.action.get.GetResponse;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.routing.OperationRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
@@ -27,11 +26,9 @@ import java.util.Map;
 import java.util.function.Supplier;
 
 /**
- * Serves {@code GET /index/_doc/id} for an Infino-enabled index from the
- * table. The shard-level get reads stored {@code _source} from Lucene, and an
- * Infino shard stores none, so the request is answered here, before it is
- * routed, with the document the engine holds. Version and sequence number are
- * not carried.
+ * Serves {@code GET /index/_doc/id} for an Infino-backed index from the
+ * table, through the id column's term index, before the request is routed to
+ * the shard that holds nothing. Version and sequence number are not carried.
  */
 public class InfinoGetActionFilter implements ActionFilter {
 
@@ -40,9 +37,11 @@ public class InfinoGetActionFilter implements ActionFilter {
     private static final long UNVERSIONED = 1L;
 
     private final Supplier<ClusterService> clusterService;
+    private final InfinoTables tables;
 
-    public InfinoGetActionFilter(Supplier<ClusterService> clusterService) {
+    public InfinoGetActionFilter(Supplier<ClusterService> clusterService, InfinoTables tables) {
         this.clusterService = clusterService;
+        this.tables = tables;
     }
 
     @Override
@@ -70,8 +69,7 @@ public class InfinoGetActionFilter implements ActionFilter {
             return;
         }
         try {
-            int shard = OperationRouting.generateShardId(index, get.id(), get.routing());
-            String table = InfinoNative.tableFor(index.getIndex(), shard);
+            String table = tables.ensure(index);
             String source = InfinoNative.getSource(table, get.id());
             boolean exists = source != null && !source.isEmpty();
             GetResult result = new GetResult(
