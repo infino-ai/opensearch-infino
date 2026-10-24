@@ -52,11 +52,11 @@ import java.util.function.Supplier;
  * Lucene: the index exists in cluster state as a name, a mapping and its
  * settings, and every row lives in the table.
  *
- * <p>Each item is checked here, synchronously: a document the declared
- * columns cannot hold is refused as its own item with the reason, as a
- * mapping parse failure would be; an update is merged into the document it
- * targets. The writes then go to the table's {@link InfinoWriter}, which
- * batches them across requests and answers the bulk once they are committed.
+ * <p>An update is merged here into the document it targets. The writes then
+ * go to the table's {@link InfinoWriter}, which batches them across requests
+ * and answers the bulk once they are committed; a document the declared
+ * columns cannot hold comes back from that append as its own item with the
+ * reason, as a mapping parse failure would be.
  *
  * <p>A bulk mixing Infino-backed and other indices is refused as a whole.
  */
@@ -147,12 +147,10 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 if (generated) {
                     index.id(UUIDs.base64UUID());
                 }
+                // The document is checked against the declared columns when its batch is
+                // appended, and a refused one comes back as its own item then; checking it
+                // here too would parse every document twice.
                 String source = sourceAsJson(index.source(), index.getContentType());
-                String why = InfinoNative.checkDoc(table, source);
-                if (why != null) {
-                    outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, new IllegalArgumentException("[infino] " + why), RestStatus.BAD_REQUEST)));
-                    continue;
-                }
                 // A generated id, or an explicit create, is new by definition; an index of an
                 // explicit id may replace a row, so its id is looked up at flush.
                 boolean lookup = !generated && index.opType() != DocWriteRequest.OpType.CREATE;

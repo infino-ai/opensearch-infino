@@ -12,3 +12,6 @@ infino = "0.11.11"
 # serde_json comes re-exported from infino, so the two never disagree.
 # Same major as infino so the delete-predicate Expr is the same type infino expects.
 datafusion = "54"
+# Documents of one batch are parsed and conformed in parallel before the
+# engine's single append; the engine's own build runs on rayon as well.
+rayon = "1"

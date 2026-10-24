@@ -46,9 +46,10 @@ use infino::arrow_array::{
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
 use infino::{
-    connect, Bm25SearchOptions, BoolMode, ColumnIndex, Connection, FieldPatch, FtsField, IndexSpec,
-    InfinoError, Metric, OptimizeOptions, SchemaPatch, Supertable,
+    connect, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, Connection, FieldPatch,
+    FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaPatch, Supertable,
 };
+use rayon::prelude::*;
 
 /// The OpenSearch `_id` of a row.
 const OSID: &str = "osid";
@@ -738,6 +739,99 @@ pub unsafe extern "C" fn infino_index_batch(
     .unwrap_or(ptr::null_mut())
 }
 
+/// Index many documents from one buffer, in one append. The buffer holds
+/// `id0 source0 id1 source1 ...` as UTF-8; `id_ends[i]` is where row i's id
+/// ends (its source starts there) and `src_ends[i]` where its source ends,
+/// as byte offsets into the buffer. One buffer and two offset arrays cross
+/// the boundary as three pointers, where an array of strings crosses as one
+/// allocation per string. The documents are parsed and conformed in
+/// parallel; the append is the engine's. Returns what
+/// [`infino_index_batch`] returns.
+#[no_mangle]
+pub unsafe extern "C" fn infino_index_batch_buf(
+    h: *mut Bridge,
+    name: *const c_char,
+    buf: *const u8,
+    buf_len: usize,
+    id_ends: *const u32,
+    src_ends: *const u32,
+    count: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
+            return err_json("null argument");
+        };
+        if buf.is_null() || id_ends.is_null() || src_ends.is_null() || count <= 0 {
+            return err_json("empty batch");
+        }
+        let n = count as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(buf, buf_len) };
+        let id_ends = unsafe { std::slice::from_raw_parts(id_ends, n) };
+        let src_ends = unsafe { std::slice::from_raw_parts(src_ends, n) };
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let table_schema = match conn.conn.schema(name) {
+            Ok(s) => s,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let schema = table.schema();
+
+        // Each row's id and source as borrowed slices of the buffer.
+        let mut rows_in: Vec<(&str, &str)> = Vec::with_capacity(n);
+        let mut start = 0usize;
+        for i in 0..n {
+            let (id_end, src_end) = (id_ends[i] as usize, src_ends[i] as usize);
+            if id_end < start || src_end < id_end || src_end > buf_len {
+                return err_json("offsets out of range");
+            }
+            let id = std::str::from_utf8(&bytes[start..id_end]).unwrap_or("");
+            let src = std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}");
+            rows_in.push((id, src));
+            start = src_end;
+        }
+
+        let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
+            .par_iter()
+            .map(|(id, src)| {
+                conform_doc(src, &schema).map(|mut flat| {
+                    flat.insert(OSID.into(), Value::String((*id).to_string()));
+                    flat.insert(SOURCE.into(), Value::String((*src).to_string()));
+                    flat
+                })
+            })
+            .collect();
+        let mut failed: Vec<Value> = Vec::new();
+        let mut index_of: Vec<usize> = Vec::with_capacity(n);
+        let mut rows: Vec<Map<String, Value>> = Vec::with_capacity(n);
+        for (i, r) in parsed.into_iter().enumerate() {
+            match r {
+                Ok(flat) => {
+                    index_of.push(i);
+                    rows.push(flat);
+                }
+                Err(why) => failed.push(json!({ "i": i, "reason": why })),
+            }
+        }
+        unify_new_paths(&mut rows, &schema);
+        let values: Vec<Value> = rows.into_iter().map(Value::Object).collect();
+        // One batch, one append; only a refused batch falls back to the
+        // halving append that names each refused document.
+        let appended = match rows_to_batch(&values, &table_schema) {
+            Ok(batch) => table.append(&batch).is_ok(),
+            Err(_) => false,
+        };
+        if !appended {
+            let indexed: Vec<(usize, Value)> = index_of.into_iter().zip(values).collect();
+            append_checked(&table, &indexed, &mut failed);
+        }
+        let ok = n - failed.len();
+        out_json(json!({ "ok": ok, "failed": failed }))
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// Tombstone every row whose `osid` is in the list, in one mutation. Backs the
 /// upsert path (translog replay, updates): delete the ids of a batch, then
 /// append the batch.
@@ -1401,6 +1495,119 @@ mod tests {
         let rows = sql(h, "SELECT COUNT(*) AS c FROM logs");
         assert_eq!(rows[0]["c"], 8, "{rows}");
         close(h);
+    }
+
+    /// Where a batch's time goes, stage by stage, on the bench's document
+    /// shape. Not a check; run with `--ignored --nocapture` and read the lines.
+    #[test]
+    #[ignore]
+    fn where_a_batch_spends_its_time() {
+        use std::time::Instant;
+        const DOCS: usize = 5_000;
+        const BATCHES: usize = 20;
+        let vocab = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima",
+            "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
+        ];
+        let mut seed: u64 = 42;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut batches: Vec<Vec<(String, String)>> = Vec::new();
+        for b in 0..BATCHES {
+            let mut docs = Vec::with_capacity(DOCS);
+            for i in 0..DOCS {
+                let words: Vec<&str> = (0..5).map(|_| vocab[(next() % 20) as usize]).collect();
+                let price = (next() % 100_000) as f64 / 100.0;
+                docs.push((
+                    (b * DOCS + i).to_string(),
+                    format!(
+                        r#"{{"text": "{}", "category": "cat{}", "price": {}}}"#,
+                        words.join(" "),
+                        next() % 8,
+                        price
+                    ),
+                ));
+            }
+            batches.push(docs);
+        }
+        let mapping = r#"{"properties":{"category":{"type":"keyword"},"price":{"type":"float"},"text":{"type":"text"}}}"#;
+
+        for id_index in [true, false] {
+            let h = open_logs();
+            let conn = unsafe { &*h };
+            if id_index {
+                take(unsafe { infino_ensure_table(h, c("bench").as_ptr(), c(mapping).as_ptr()) });
+            } else {
+                // The same columns, declared directly, with no term index on the id column.
+                let fields = vec![
+                    Field::new(OSID, DataType::LargeUtf8, false),
+                    Field::new(SOURCE, DataType::LargeUtf8, true),
+                    Field::new("category", DataType::LargeUtf8, true),
+                    Field::new("price", DataType::Float64, true),
+                    Field::new("text", DataType::LargeUtf8, true),
+                ];
+                conn.conn
+                    .create_table("bench", Arc::new(Schema::new(fields)), IndexSpec::new().fts(FtsField::new("text".to_string())))
+                    .unwrap();
+            }
+            let table = conn.table("bench").unwrap();
+            let schema = table.schema();
+            let table_schema = conn.conn.schema("bench").unwrap();
+            let (mut t_conform, mut t_unify, mut t_rows_to_batch, mut t_append, mut t_capi) = (0.0, 0.0, 0.0, 0.0, 0.0);
+            for (bi, docs) in batches.iter().enumerate() {
+                // Stage timings on the even batches, the whole C-ABI call on the odd ones.
+                if bi % 2 == 1 {
+                    let refs: Vec<(&str, &str)> = docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                    let ids: Vec<CString> = refs.iter().map(|(id, _)| c(id)).collect();
+                    let srcs: Vec<CString> = refs.iter().map(|(_, s)| c(s)).collect();
+                    let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+                    let sp: Vec<*const c_char> = srcs.iter().map(|x| x.as_ptr()).collect();
+                    let t = Instant::now();
+                    let out = take(unsafe {
+                        infino_index_batch(h, c("bench").as_ptr(), idp.as_ptr(), sp.as_ptr(), refs.len() as c_int)
+                    });
+                    t_capi += t.elapsed().as_secs_f64();
+                    assert!(out.contains("\"ok\":5000"), "{out}");
+                    continue;
+                }
+                let t = Instant::now();
+                let mut rows: Vec<Map<String, Value>> = docs
+                    .iter()
+                    .map(|(id, src)| {
+                        let mut flat = conform_doc(src, &schema).unwrap();
+                        flat.insert(OSID.into(), Value::String(id.clone()));
+                        flat.insert(SOURCE.into(), Value::String(src.clone()));
+                        flat
+                    })
+                    .collect();
+                t_conform += t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                unify_new_paths(&mut rows, &schema);
+                let values: Vec<Value> = rows.into_iter().map(Value::Object).collect();
+                t_unify += t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                let batch = rows_to_batch(&values, &table_schema).unwrap();
+                t_rows_to_batch += t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                table.append(&batch).unwrap();
+                t_append += t.elapsed().as_secs_f64();
+            }
+            let per = |x: f64| x / (BATCHES as f64 / 2.0) * 1000.0;
+            eprintln!(
+                "id index {}: per 5000-doc batch — conform {:.1} ms, unify+wrap {:.1} ms, rows_to_batch {:.1} ms, append(commit) {:.1} ms; whole C-ABI call {:.1} ms",
+                id_index,
+                per(t_conform),
+                per(t_unify),
+                per(t_rows_to_batch),
+                per(t_append),
+                per(t_capi)
+            );
+            close(h);
+        }
     }
 
     #[test]

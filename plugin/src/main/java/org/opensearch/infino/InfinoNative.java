@@ -21,6 +21,7 @@ import org.opensearch.core.xcontent.XContentParser;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -255,12 +256,38 @@ public final class InfinoNative {
         return why == null || why.isEmpty() ? null : why;
     }
 
-    /** Index many documents in one append (parallel arrays of length n). */
+    /**
+     * Index many documents in one append (parallel arrays of length n). The
+     * ids and sources cross to the bridge as one UTF-8 buffer with end
+     * offsets, so the call marshals three arrays rather than one native
+     * string per document.
+     */
     @SuppressWarnings("unchecked")
     public static BatchResult indexBatch(String name, String[] osids, String[] sources, int n) {
         init();
         COLUMNS.remove(name); // the batch may have added paths to the schema
-        Map<String, Object> out = object(takeOrThrow(lib.infino_index_batch(conn, name, osids, sources, n)));
+        int[] idEnds = new int[n];
+        int[] srcEnds = new int[n];
+        byte[][] idBytes = new byte[n][];
+        byte[][] srcBytes = new byte[n][];
+        int total = 0;
+        for (int i = 0; i < n; i++) {
+            idBytes[i] = osids[i].getBytes(StandardCharsets.UTF_8);
+            srcBytes[i] = sources[i].getBytes(StandardCharsets.UTF_8);
+            total += idBytes[i].length;
+            idEnds[i] = total;
+            total += srcBytes[i].length;
+            srcEnds[i] = total;
+        }
+        byte[] buf = new byte[total];
+        int at = 0;
+        for (int i = 0; i < n; i++) {
+            System.arraycopy(idBytes[i], 0, buf, at, idBytes[i].length);
+            at += idBytes[i].length;
+            System.arraycopy(srcBytes[i], 0, buf, at, srcBytes[i].length);
+            at += srcBytes[i].length;
+        }
+        Map<String, Object> out = object(takeOrThrow(lib.infino_index_batch_buf(conn, name, buf, buf.length, idEnds, srcEnds, n)));
         List<Failure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
             failed.add(new Failure(((Number) f.get("i")).intValue(), (String) f.get("reason")));

@@ -21,6 +21,9 @@ public interface InfinoLib extends Library {
 
     Pointer infino_index_batch(Pointer h, String name, String[] osids, String[] sources, int count);
 
+    /** One buffer of ids and sources with their end offsets: three native arrays instead of one allocation per string. */
+    Pointer infino_index_batch_buf(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
+
     int infino_delete_osids(Pointer h, String name, String[] osids, int count);
 
     Pointer infino_get(Pointer h, String name, String osid);

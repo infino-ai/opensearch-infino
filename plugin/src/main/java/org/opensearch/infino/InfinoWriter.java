@@ -221,11 +221,13 @@ public final class InfinoWriter {
         }
         Map<String, String> refused = new HashMap<>();
         if (!ids.isEmpty()) {
+            long start = System.nanoTime();
             InfinoNative.BatchResult result = InfinoNative.indexBatch(table, ids.toArray(new String[0]), sources.toArray(new String[0]), ids.size());
+            long millis = (System.nanoTime() - start) / 1_000_000L;
             for (InfinoNative.Failure f : result.failed()) {
                 refused.put(ids.get(f.index()), f.reason());
             }
-            log.debug("[infino] appended {} of {} documents to {} ({} tombstoned first)", result.ok(), ids.size(), table, tombstones.size());
+            log.debug("[infino] appended {} of {} documents to {} in {} ms ({} tombstoned first)", result.ok(), ids.size(), table, millis, tombstones.size());
         }
         return new Applied(refused, existed);
     }
