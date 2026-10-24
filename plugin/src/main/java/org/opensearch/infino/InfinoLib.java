@@ -33,7 +33,7 @@ public interface InfinoLib extends Library {
 
     Pointer infino_bm25(Pointer h, String name, String column, String query, int k);
 
-    Pointer infino_count(Pointer h, String name, String column, String query);
+    Pointer infino_count(Pointer h, String name, String column, String query, String mode);
 
     Pointer infino_token_match(Pointer h, String name, String column, String query);
 

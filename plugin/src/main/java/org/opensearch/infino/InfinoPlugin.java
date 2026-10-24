@@ -79,6 +79,11 @@ public class InfinoPlugin extends Plugin implements EnginePlugin, ActionPlugin, 
         return namedWriteableRegistry;
     }
 
+    /** For tests that build aggregation objects without a node. */
+    static void namedWriteableRegistry(NamedWriteableRegistry registry) {
+        namedWriteableRegistry = registry;
+    }
+
     @Override
     public Collection<Object> createComponents(
         Client client,
@@ -145,7 +150,7 @@ public class InfinoPlugin extends Plugin implements EnginePlugin, ActionPlugin, 
 
             @Override
             public void afterIndexShardDeleted(ShardId shardId, Settings indexSettings) {
-                String table = InfinoNative.tableFor(shardId.getIndexName(), shardId.id());
+                String table = InfinoNative.tableFor(shardId.getIndex(), shardId.id());
                 try {
                     InfinoNative.dropTable(table);
                     log.info("[infino] dropped table {} after shard delete", table);

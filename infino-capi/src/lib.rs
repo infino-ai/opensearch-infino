@@ -913,14 +913,16 @@ pub unsafe extern "C" fn infino_bm25(
     .unwrap_or(ptr::null_mut())
 }
 
-/// Number of rows matching a token query on one text column, without
-/// materializing them: the exact `hits.total` of a `match`.
+/// Number of rows matching a token query on one text column (`mode` is
+/// `"and"` or `"or"`), without materializing them: the exact `hits.total`
+/// of a `match`.
 #[no_mangle]
 pub unsafe extern "C" fn infino_count(
     h: *mut Bridge,
     name: *const c_char,
     column: *const c_char,
     query: *const c_char,
+    mode: *const c_char,
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name), Some(column), Some(query)) = (
@@ -931,11 +933,15 @@ pub unsafe extern "C" fn infino_count(
         ) else {
             return ptr::null_mut();
         };
+        let mode = match unsafe { cstr(mode) } {
+            Some("and") => BoolMode::And,
+            _ => BoolMode::Or,
+        };
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
-        match table.count(column, query, BoolMode::Or) {
+        match table.count(column, query, mode) {
             Ok(n) => out_string(n.to_string()),
             Err(e) => err_json(&e.to_string()),
         }
@@ -1230,7 +1236,7 @@ mod tests {
     }
 
     fn count(h: *mut Bridge, column: &str, query: &str) -> String {
-        take(unsafe { infino_count(h, c("logs").as_ptr(), c(column).as_ptr(), c(query).as_ptr()) })
+        take(unsafe { infino_count(h, c("logs").as_ptr(), c(column).as_ptr(), c(query).as_ptr(), c("or").as_ptr()) })
     }
 
     fn get(h: *mut Bridge, osid: &str) -> String {
@@ -1354,6 +1360,37 @@ mod tests {
         // Fetch returns the document as sent.
         let src = get(h, "a");
         assert!(src.contains("\"tags\":[\"x\",\"y\"]"), "{src}");
+        close(h);
+    }
+
+    #[test]
+    fn a_batch_lands_once() {
+        let h = open_logs();
+        let out = ensure(
+            h,
+            r#"{"properties":{"@timestamp":{"type":"date"},"host":{"type":"keyword"},"level":{"type":"keyword"},"region":{"type":"keyword"},"status":{"type":"long"},"took":{"type":"float"}}}"#,
+        );
+        assert!(out.contains("\"added\""), "{out}");
+        let docs: Vec<(String, String)> = (1..=8)
+            .map(|i| {
+                (
+                    i.to_string(),
+                    format!(
+                        r#"{{"@timestamp":"2026-10-24T10:0{}:00Z","host":"n{}","level":"info","region":"eu","status":{},"took":{}}}"#,
+                        i % 10,
+                        i % 3,
+                        200 + i,
+                        i
+                    ),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let out = index(h, &refs);
+        assert_eq!(out["ok"], 8, "{out}");
+        assert_eq!(out["failed"].as_array().unwrap().len(), 0, "{out}");
+        let rows = sql(h, "SELECT COUNT(*) AS c FROM logs");
+        assert_eq!(rows[0]["c"], 8, "{rows}");
         close(h);
     }
 

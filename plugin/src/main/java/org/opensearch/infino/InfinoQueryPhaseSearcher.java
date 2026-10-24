@@ -110,20 +110,18 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             ? new Translation(table, InfinoQueryTranslator.ALL, null)
             // The shard context is frozen by now and refuses its clock; date math reads the wall clock.
             : InfinoQueryTranslator.translate(dslQuery(context), cols, table, System.currentTimeMillis());
+        // Lucene holds no data for this index, so a request the table cannot answer is
+        // refused with the reason rather than handed to Lucene and answered empty.
         if (query == null) {
-            log.warn("[infino] query not translatable, falling back to Lucene: {}", dslQuery(context));
-            return null;
+            throw new IllegalArgumentException("[infino] query not served by the table: " + dslQuery(context));
         }
-        log.debug("[infino] columns {} query {} -> FROM {} WHERE {}", cols.keySet(), dslQuery(context), query.from(), query.where());
+        log.debug("[infino] query {} -> FROM {} WHERE {}", dslQuery(context), query.from(), query.where());
         List<String> orderBy = orderBy(context, cols);
         if (orderBy == null) {
-            log.warn("[infino] sort not translatable, falling back to Lucene: {}", sorts(context));
-            return null;
+            throw new IllegalArgumentException("[infino] sort not served by the table: " + sorts(context));
         }
         Plan plan = new Plan(table, cols, query, orderBy);
-        if (!InfinoAggregationProcessor.servable(context, plan)) {
-            return null;
-        }
+        InfinoAggregationProcessor.check(context, plan);
         return plan;
     }
 
@@ -136,7 +134,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
     }
 
     static String tableOf(SearchContext context) {
-        return InfinoNative.tableFor(context.indexShard().shardId().getIndexName(), context.indexShard().shardId().id());
+        return InfinoNative.tableFor(context.indexShard().shardId().getIndex(), context.indexShard().shardId().id());
     }
 
     /** The query as the client wrote it (carried in {@code ext}), else the shard's rewritten one. */
@@ -252,11 +250,20 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
                     sql = "SELECT " + InfinoQueryTranslator.OSID + " FROM " + q.from() + " WHERE " + q.where() + " LIMIT " + fetch;
                     rows = InfinoNative.sqlRows(sql);
                 }
-                total = count(q);
+                total = count(plan.table(), q);
+                // The fetch phase reads each hit's source; get the page's in one statement now.
+                List<String> ids = new ArrayList<>();
+                for (int i = from; i < Math.min(rows.size(), fetch); i++) {
+                    Object id = rows.get(i).get(InfinoQueryTranslator.OSID);
+                    if (id != null) {
+                        ids.add(id.toString());
+                    }
+                }
+                InfinoNative.prefetchSources(plan.table(), ids);
             }
         } catch (RuntimeException e) {
-            log.warn("[infino] search failed, falling back to Lucene", e);
-            return false;
+            // An engine error is the request's error; Lucene has nothing to answer with.
+            throw new IllegalStateException("[infino] search failed: " + e.getMessage(), e);
         }
         try {
             List<ScoreDoc> hits = new ArrayList<>();
@@ -286,14 +293,17 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             context.queryResult().topDocs(new TopDocsAndMaxScore(topDocs, maxScore), new DocValueFormat[0]);
             log.debug("[infino] query phase served {} hits (total {}) from {}", arr.length, total, plan.table());
             return true;
-        } catch (Exception e) {
-            log.warn("[infino] query-phase routing failed, falling back", e);
-            return false;
+        } catch (IOException e) {
+            throw new IllegalStateException("[infino] docid lookup failed", e);
         }
     }
 
     /** The exact number of rows the request matches. */
-    static long count(Translation q) {
+    static long count(String table, Translation q) {
+        if (q.principal() != null && InfinoQueryTranslator.ALL.equals(q.where())) {
+            // A bare text query: the engine counts its matches without materializing them.
+            return InfinoNative.count(table, q.principal().column(), q.principal().query(), q.principal().mode());
+        }
         List<Map<String, Object>> rows = InfinoNative.sqlRows("SELECT COUNT(*) AS c FROM " + q.from() + " WHERE " + q.where());
         if (rows.isEmpty()) {
             return 0;

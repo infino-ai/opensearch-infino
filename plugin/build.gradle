@@ -81,3 +81,10 @@ testClusters.all {
     // The SQL each request runs, in the node log, so a wrong answer can be read back.
     setting 'logger.org.opensearch.infino', 'DEBUG'
 }
+
+// A run that dies before its shards are deleted leaves their tables; each run starts clean.
+tasks.named('yamlRestTest').configure {
+    doFirst {
+        delete layout.buildDirectory.dir('infino-catalog')
+    }
+}

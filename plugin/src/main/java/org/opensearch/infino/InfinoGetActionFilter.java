@@ -71,7 +71,7 @@ public class InfinoGetActionFilter implements ActionFilter {
         }
         try {
             int shard = OperationRouting.generateShardId(index, get.id(), get.routing());
-            String table = InfinoNative.tableFor(index.getIndex().getName(), shard);
+            String table = InfinoNative.tableFor(index.getIndex(), shard);
             String source = InfinoNative.getSource(table, get.id());
             boolean exists = source != null && !source.isEmpty();
             GetResult result = new GetResult(

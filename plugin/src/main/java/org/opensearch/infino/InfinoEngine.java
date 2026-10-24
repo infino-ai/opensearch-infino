@@ -71,7 +71,7 @@ public class InfinoEngine extends InternalEngine {
     public InfinoEngine(EngineConfig config) {
         super(config);
         this.shardId = config.getShardId();
-        this.table = InfinoNative.tableFor(shardId.getIndexName(), shardId.id());
+        this.table = InfinoNative.tableFor(shardId.getIndex(), shardId.id());
         this.mapperService = config.getMapperService();
         try {
             ensureMapping();
@@ -221,6 +221,7 @@ public class InfinoEngine extends InternalEngine {
             sources.toArray(new String[0]),
             n
         );
+        log.debug("[infino] appended {} of {} documents to {} (first id {})", result.ok(), n, table, ids.get(0));
         if (!result.failed().isEmpty()) {
             InfinoNative.Failure first = result.failed().get(0);
             log.warn(
@@ -235,6 +236,7 @@ public class InfinoEngine extends InternalEngine {
     }
 
     private void tombstone(List<String> ids) {
+        log.debug("[infino] tombstoning {} ids in {} (first {})", ids.size(), table, ids.get(0));
         int rc = InfinoNative.deleteOsids(table, ids.toArray(new String[0]), ids.size());
         if (rc != 0) {
             log.warn("[infino] delete of {} ids from {} returned {}", ids.size(), table, rc);

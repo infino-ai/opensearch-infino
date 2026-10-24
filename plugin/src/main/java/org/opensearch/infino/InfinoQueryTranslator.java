@@ -123,6 +123,26 @@ final class InfinoQueryTranslator {
         return new Translation(table, where, t.principal);
     }
 
+    /**
+     * A query as a predicate alone, never as a FROM source: for a filter
+     * inside an aggregation, where text clauses become subqueries over the
+     * table's token index. Null when not answerable.
+     */
+    static String predicate(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis) {
+        InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis);
+        return t.predicate(qb, false);
+    }
+
+    /** Epoch milliseconds of a date, epoch number or date-math expression, or null when it is not a date. */
+    static Long dateMathMillis(String text, String format, boolean roundUp, ZoneId zone, long nowMillis) {
+        DateMathParser parser = DateFormatter.forPattern(format == null ? DEFAULT_DATE_FORMAT : format).toDateMathParser();
+        try {
+            return parser.parse(text, () -> nowMillis, roundUp, zone).toEpochMilli();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
     // ---- columns ----
 
     /** The column a query names, resolving {@code name.keyword} to the string column {@code name}. */

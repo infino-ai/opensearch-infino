@@ -9,7 +9,11 @@ import com.sun.jna.Pointer;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.common.cache.Cache;
+import org.opensearch.common.cache.CacheBuilder;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.json.JsonXContent;
+import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
@@ -20,6 +24,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -44,6 +49,22 @@ public final class InfinoNative {
     private static volatile InfinoLib lib;
     private static volatile Pointer conn;
     private static final Map<String, Map<String, Column>> COLUMNS = new ConcurrentHashMap<>();
+    /** How long a prefetched source waits for its fetch phase. */
+    private static final TimeValue SOURCE_PREFETCH_TTL = TimeValue.timeValueSeconds(30);
+    /** Bytes of prefetched sources held at once across requests. */
+    private static final long SOURCE_PREFETCH_BYTES = 64L << 20;
+    /**
+     * Sources the query phase fetched for its page, read back by the fetch
+     * phase one hit at a time: one statement per page instead of one per hit.
+     * Keyed by table and id; a source does not change under an id except
+     * through an update, which replays as its own write, so a stale entry
+     * can only be served inside the TTL.
+     */
+    private static final Cache<String, String> SOURCES = CacheBuilder.<String, String>builder()
+        .setExpireAfterWrite(SOURCE_PREFETCH_TTL)
+        .setMaximumWeight(SOURCE_PREFETCH_BYTES)
+        .weigher((key, value) -> key.length() + value.length())
+        .build();
 
     /** One column of a table, as the bridge describes it. */
     public record Column(String name, String type, boolean fts, boolean vector) {
@@ -95,9 +116,18 @@ public final class InfinoNative {
         }
     }
 
-    /** Per-shard Infino table name, e.g. os_myindex_0. Must match on write and query. */
-    public static String tableFor(String index, int shard) {
-        return "os_" + index + "_" + shard;
+    /**
+     * Per-shard Infino table name: the index name for the reader of a bucket
+     * listing, the index UUID so that an index recreated under the same name
+     * (after a crash left the old table behind, or by a user) gets a table of
+     * its own instead of the old rows, and the shard. Must match on write and query.
+     */
+    public static String tableFor(Index index, int shard) {
+        // The engine's SQL layer folds table names to lower case, and the UUID is
+        // base64url (mixed case, '-' and '_'); folded and with '-' replaced, the
+        // name reads the same at declare time and in a statement.
+        String uuid = index.getUUID().toLowerCase(Locale.ROOT).replace('-', '_');
+        return "os_" + index.getName() + "_" + uuid + "_" + shard;
     }
 
     private static String take(Pointer p) {
@@ -230,8 +260,13 @@ public final class InfinoNative {
         return lib.infino_delete_osids(conn, name, osids, n);
     }
 
+    /** The source of one id: the page prefetch when the query phase ran one, else a lookup. */
     public static String getSource(String name, String osid) {
         init();
+        String prefetched = SOURCES.get(name + "\u0000" + osid);
+        if (prefetched != null) {
+            return prefetched;
+        }
         return take(lib.infino_get(conn, name, osid));
     }
 
@@ -253,10 +288,30 @@ public final class InfinoNative {
         return takeOrThrow(lib.infino_bm25(conn, n, c, q, k));
     }
 
-    /** Count of rows matching a full-text query, without materializing them. */
-    public static long count(String n, String c, String q) {
+    /** Count of rows matching a full-text query ({@code mode} "and" / "or"), without materializing them. */
+    public static long count(String n, String c, String q, String mode) {
         init();
-        return Long.parseLong(takeOrThrow(lib.infino_count(conn, n, c, q)).trim());
+        return Long.parseLong(takeOrThrow(lib.infino_count(conn, n, c, q, mode)).trim());
+    }
+
+    /** Sources for one page of ids in one statement, kept for the fetch phase that follows the query phase. */
+    public static void prefetchSources(String name, List<String> osids) {
+        if (osids.isEmpty()) {
+            return;
+        }
+        List<String> lits = new ArrayList<>(osids.size());
+        for (String id : osids) {
+            lits.add(InfinoQueryTranslator.literal(id));
+        }
+        String sql = "SELECT " + InfinoQueryTranslator.OSID + ", source FROM " + InfinoQueryTranslator.quoteIdent(name) + " WHERE "
+            + InfinoQueryTranslator.OSID + " IN (" + String.join(", ", lits) + ")";
+        for (Map<String, Object> row : sqlRows(sql)) {
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            Object source = row.get("source");
+            if (id != null && source != null) {
+                SOURCES.put(name + "\u0000" + id, source.toString());
+            }
+        }
     }
 
     /** Osids of every row matching a full-text query (unranked), for query-scoped aggs. */

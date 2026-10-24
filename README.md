@@ -13,7 +13,8 @@ declared from the index **mapping** (dates are timestamp columns, text fields
 carry their own BM25 index, keywords are exact columns), the query phase
 serves date ranges with date math, field sorts, field-scoped text search with
 filters, and the aggregations dashboards ask for (`date_histogram`, `terms`,
-metrics, one level of nesting), writes are batched by size and compacted on a
+`histogram`, `filters`, `range`, metrics including `cardinality` and
+`percentiles`, nested to any depth), writes are batched by size and compacted on a
 schedule, and a document the mapping cannot hold fails as its own bulk item.
 
 ## What's here
@@ -78,14 +79,22 @@ minimum_should_match as "at least one"), `infino_knn`, `infino_hybrid`. A field
 named `x.keyword` resolves to the string column `x`. Sorting by fields;
 exact `hits.total`.
 
-Aggregations: `value_count`, `sum`, `avg`, `min`, `max`; `terms` over string,
-boolean, integer or date columns with size, min_doc_count and order; `date_histogram`
-with fixed or calendar intervals, time zone, offset (fixed), min_doc_count and
-numeric extended_bounds; one bucket aggregation nested under another.
+Aggregations: `value_count`, `sum`, `avg`, `min`, `max`, `cardinality`
+(exact, `COUNT(DISTINCT)`), `percentiles` (t-digest, from the engine's
+`approx_percentile_cont`); `terms` over string, boolean, integer, float or date
+columns with size, min_doc_count and order by count, key or a sibling metric;
+`date_histogram` with fixed or calendar intervals, time zone, offset (fixed),
+min_doc_count and numeric extended_bounds; `histogram` with interval and
+offset; `filters` (keyed and anonymous, with `other_bucket`), `range`,
+`date_range`; bucket aggregations nested to any depth, each level a `GROUP BY`
+over the parent's kept buckets.
 
-A request outside this surface is delegated to the stock query phase, which
-holds no data for an Infino index, and the node logs which clause was not
-servable.
+A request outside this surface fails with `400` and a reason naming the
+clause (`[infino] query not served: fuzzy on message`), never a silently empty
+answer: the stock query phase holds no data for an Infino index. Not served:
+`composite`, `top_hits`, `percentile_ranks`, HDR percentiles,
+`significant_terms`, pipeline aggregations; `fuzzy`, `nested`,
+`function_score`, `script` and geo queries; `mget`.
 
 ## License
 

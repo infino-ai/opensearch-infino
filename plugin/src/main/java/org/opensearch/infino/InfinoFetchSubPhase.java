@@ -39,7 +39,7 @@ public class InfinoFetchSubPhase implements FetchSubPhase {
             return null; // stock fetch
         }
         final String table = InfinoNative.tableFor(
-            fetchContext.getIndexName(), fetchContext.getQueryShardContext().getShardId());
+            fetchContext.getQueryShardContext().index(), fetchContext.getQueryShardContext().getShardId());
 
         return new FetchSubPhaseProcessor() {
             @Override

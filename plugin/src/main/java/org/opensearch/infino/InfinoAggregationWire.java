@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.opensearch.common.Rounding;
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -15,6 +16,8 @@ import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.InternalOrder;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
 import org.opensearch.search.aggregations.bucket.histogram.LongBounds;
+import org.opensearch.search.aggregations.metrics.AbstractHyperLogLogPlusPlus;
+import org.opensearch.search.aggregations.metrics.InternalCardinality;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -30,6 +33,20 @@ import java.util.Map;
  */
 final class InfinoAggregationWire {
     private InfinoAggregationWire() {}
+
+    /** HyperLogLog++ precision OpenSearch uses by default: 2^14 registers. */
+    private static final int HLL_PRECISION = 14;
+    private static final int HLL_REGISTERS = 1 << HLL_PRECISION;
+    /**
+     * Distinct values the linear-counting form holds before OpenSearch
+     * switches the sketch to registers: a quarter of the registers' bytes as
+     * ints, at the hash set's load factor.
+     */
+    private static final int LINEAR_COUNTING_MAX = (int) ((HLL_REGISTERS / 4) * 0.75);
+    /** The linear-counting hash space is 2^25 wide; a hash's top 25 bits index it. */
+    private static final int LINEAR_COUNTING_BITS = 25;
+    /** Iterations of the register search; the estimator is monotone in the register split. */
+    private static final int REGISTER_SEARCH_STEPS = 24;
 
     /** An {@code InternalDateHistogram}, as the reduce phase expects one from a shard. */
     static InternalDateHistogram dateHistogram(
@@ -63,6 +80,112 @@ final class InfinoAggregationWire {
             out.writeList(buckets);
             try (StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), registry())) {
                 return new InternalDateHistogram(in);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
+     * An {@code InternalCardinality} whose sketch estimates {@code count}.
+     *
+     * <p>OpenSearch's unique count is a HyperLogLog++ sketch, and the reduce
+     * phase merges sketches, so the shard must hand back one; the engine
+     * counts distinct values exactly. A count the linear-counting form can
+     * hold is written as that many distinct entries, which the sketch reads
+     * back exactly. A larger count is written as registers chosen so that
+     * OpenSearch's own estimator returns the count: the split of registers
+     * between two adjacent run lengths is searched against the estimator
+     * read back from the bytes, so the bias correction it applies is
+     * accounted for rather than modelled.
+     */
+    static InternalCardinality cardinality(String name, Map<String, Object> metadata, long count) {
+        if (count <= LINEAR_COUNTING_MAX) {
+            return readCardinality(name, metadata, linearCountingBytes(count));
+        }
+        double alpha = 0.7213 / (1 + 1.079 / HLL_REGISTERS);
+        double target = alpha * HLL_REGISTERS * (double) HLL_REGISTERS / count; // the inverse sum the estimator must see
+        // Registers all at run length a + 1 give the sum m * 2^-(a+1); all at a give m * 2^-a.
+        // Run length 0 is an empty register: below ~1.5m the estimator needs some of
+        // those (it counts them linearly, then corrects the raw estimate), so the split
+        // may start at 0.
+        int a = (int) Math.floor(Math.log(HLL_REGISTERS / target) / Math.log(2));
+        a = Math.max(0, Math.min(a, 60));
+        byte[] best = null;
+        long bestError = Long.MAX_VALUE;
+        for (int shift = 0; shift <= 1 && bestError > 0; shift++) {
+            int runLen = a + shift;
+            int lo = 0;
+            int hi = HLL_REGISTERS;
+            for (int step = 0; step < REGISTER_SEARCH_STEPS && lo < hi; step++) {
+                int mid = (lo + hi) >>> 1;
+                byte[] bytes = registerBytes(runLen, mid);
+                long estimate = estimate(bytes);
+                long error = estimate > count ? estimate - count : count - estimate;
+                if (error < bestError) {
+                    bestError = error;
+                    best = bytes;
+                }
+                if (estimate < count) {
+                    lo = mid + 1; // more registers at the longer run raise the estimate
+                } else {
+                    hi = mid;
+                }
+            }
+        }
+        return readCardinality(name, metadata, best);
+    }
+
+    /** Linear-counting form: {@code count} distinct encoded hashes with the plain (non-run-length) encoding. */
+    private static byte[] linearCountingBytes(long count) {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeVInt(HLL_PRECISION);
+            out.writeBoolean(AbstractHyperLogLogPlusPlus.LINEAR_COUNTING);
+            out.writeVLong(count);
+            // The encoding of a hash whose index bits below the precision are not all zero is
+            // its top 25 bits shifted left by one; keep bit 0 of the index set so that holds.
+            for (long i = 0; i < count; i++) {
+                long index = (i << (LINEAR_COUNTING_BITS - HLL_PRECISION - 10)) | 1L;
+                out.writeInt((int) (index << 1));
+            }
+            return out.bytes().toBytesRef().bytes.clone();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** Register form: {@code atLonger} registers at run length {@code runLen + 1}, the rest at {@code runLen}. */
+    private static byte[] registerBytes(int runLen, int atLonger) {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeVInt(HLL_PRECISION);
+            out.writeBoolean(AbstractHyperLogLogPlusPlus.HYPERLOGLOG);
+            for (int i = 0; i < HLL_REGISTERS; i++) {
+                out.writeByte((byte) (i < atLonger ? runLen + 1 : runLen));
+            }
+            return out.bytes().toBytesRef().bytes.clone();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private static long estimate(byte[] sketch) {
+        try (StreamInput in = StreamInput.wrap(sketch)) {
+            return AbstractHyperLogLogPlusPlus.readFrom(in, BigArrays.NON_RECYCLING_INSTANCE).cardinality(0);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private static InternalCardinality readCardinality(String name, Map<String, Object> metadata, byte[] sketch) {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeString(name);
+            out.writeGenericValue(metadata);
+            // InternalCardinality.doWriteTo
+            out.writeNamedWriteable(DocValueFormat.RAW);
+            out.writeBoolean(true);
+            out.writeBytes(sketch, 0, sketch.length);
+            try (StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), registry())) {
+                return new InternalCardinality(in);
             }
         } catch (IOException e) {
             throw new UncheckedIOException(e);
