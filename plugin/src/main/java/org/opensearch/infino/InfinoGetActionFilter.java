@@ -26,6 +26,8 @@ import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.tasks.Task;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
@@ -78,16 +80,47 @@ public class InfinoGetActionFilter implements ActionFilter {
             return;
         }
         try {
-            InfinoSecurity.refuseIfRestricted(InfinoServices.threadContext(), List.of(index.getIndex().getName()), "get");
+            // The document as the security plugin lets this user see it: under a
+            // document rule it is looked up through the rule, and its source is
+            // cut to the fields the user may read.
+            InfinoAccess access = InfinoSecurity.access(index.getIndex().getName(), "get");
             String table = tables.ensure(index);
-            String source = InfinoNative.getSource(table, get.id());
+            String source = access.restrictsDocuments()
+                ? restrictedSources(table, List.of(get.id()), access).get(get.id())
+                : InfinoNative.getSource(table, get.id());
             @SuppressWarnings("unchecked")
-            Response response = (Response) new GetResponse(result(index.getIndex().getName(), get.id(), source, get.fetchSourceContext()));
+            Response response = (Response) new GetResponse(
+                result(index.getIndex().getName(), get.id(), access.source(source), get.fetchSourceContext())
+            );
             listener.onResponse(response);
         } catch (Exception e) {
             log.warn("[infino] get of {} from {} failed", get.id(), get.index(), e);
             listener.onFailure(e);
         }
+    }
+
+    /**
+     * The sources of {@code ids} the document-level rule lets the user see,
+     * by id: one statement over the table with the rule as its predicate. An
+     * id the rule hides is absent, as a missing document is.
+     */
+    static Map<String, String> restrictedSources(String table, List<String> ids, InfinoAccess access) {
+        String rule = access.documentsWhere(InfinoNative.columns(table), table, System.currentTimeMillis());
+        List<String> literals = new ArrayList<>(ids.size());
+        for (String id : ids) {
+            literals.add(InfinoQueryTranslator.literal(id));
+        }
+        String sql = "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM " + InfinoQueryTranslator.quoteIdent(table)
+            + " WHERE " + InfinoQueryTranslator.OSID + " IN (" + String.join(", ", literals) + ") AND (" + rule + ")";
+        Map<String, String> out = new HashMap<>();
+        for (Map<String, Object> row : InfinoNative.sqlRows(sql)) {
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            Object source = row.get(InfinoQueryTranslator.SOURCE);
+            if (id != null && source != null) {
+                out.put(id.toString(), source.toString());
+            }
+        }
+        return out;
     }
 
     /** The Infino-backed index a request names, directly or through an alias; null when it names something else. */

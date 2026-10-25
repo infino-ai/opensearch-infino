@@ -124,17 +124,24 @@ final class InfinoQueryTranslator {
     private final Map<String, Column> cols;
     private final String table;
     private final long nowMillis;
+    /**
+     * Whether a terms lookup may be read from its index's table directly:
+     * true for a security rule, which is the security plugin's own; false
+     * for a user's query, whose lookup would pass no authorization here.
+     */
+    private final boolean trusted;
     private TextClause principal;
 
-    private InfinoQueryTranslator(Map<String, Column> cols, String table, long nowMillis) {
+    private InfinoQueryTranslator(Map<String, Column> cols, String table, long nowMillis, boolean trusted) {
         this.cols = cols;
         this.table = table;
         this.nowMillis = nowMillis;
+        this.trusted = trusted;
     }
 
     /** Translate, or {@code null} when the query is not answerable over the table's columns. */
     static Translation translate(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis) {
-        InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis);
+        InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, false);
         String where = t.predicate(qb, true);
         if (where == null) {
             return null;
@@ -148,7 +155,13 @@ final class InfinoQueryTranslator {
      * table's token index. Null when not answerable.
      */
     static String predicate(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis) {
-        InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis);
+        InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, false);
+        return t.predicate(qb, false);
+    }
+
+    /** A security plugin rule as a predicate: as {@link #predicate}, with a terms lookup read from its table. */
+    static String rulePredicate(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis) {
+        InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, true);
         return t.predicate(qb, false);
     }
 
@@ -211,6 +224,12 @@ final class InfinoQueryTranslator {
             return equality(t.fieldName(), t.value());
         }
         if (qb instanceof TermsQueryBuilder ts) {
+            if (ts.termsLookup() != null) {
+                if (!trusted) {
+                    throw new IllegalArgumentException("[infino] a terms lookup into [" + ts.termsLookup().index() + "] is not served by the table");
+                }
+                return inList(ts.fieldName(), InfinoTermsLookup.values(ts.termsLookup()));
+            }
             return inList(ts.fieldName(), ts.values());
         }
         if (qb instanceof RangeQueryBuilder r) {
@@ -773,7 +792,7 @@ final class InfinoQueryTranslator {
 
     /** A literal of {@code value} for the column's type, or null when it cannot be one: for a value a client hands back. */
     static String literalFor(Column c, Object value, long nowMillis) {
-        return new InfinoQueryTranslator(Map.of(), "", nowMillis).scalar(c, value, false);
+        return new InfinoQueryTranslator(Map.of(), "", nowMillis, false).scalar(c, value, false);
     }
 
     /** A literal of {@code value} for an expression's type, or null when it cannot be one. */
@@ -782,7 +801,7 @@ final class InfinoQueryTranslator {
             case STRING -> literal(value.toString());
             case BOOL -> Boolean.parseBoolean(value.toString()) ? "true" : "false";
             case INT, FLOAT -> number(value);
-            case DATE -> new InfinoQueryTranslator(Map.of(), "", nowMillis).dateLiteral(value, null, false, null);
+            case DATE -> new InfinoQueryTranslator(Map.of(), "", nowMillis, false).dateLiteral(value, null, false, null);
             default -> null;
         };
     }

@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.OpenSearchSecurityException;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
@@ -106,6 +107,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.UnaryOperator;
 
 import static org.opensearch.infino.InfinoQueryTranslator.literal;
 import static org.opensearch.infino.InfinoQueryTranslator.quoteIdent;
@@ -186,7 +188,7 @@ public class InfinoAggregationProcessor {
         List<Spec> specs = new ArrayList<>();
         int position = 0;
         for (AggregationBuilder b : builders) {
-            specs.add(Spec.of(b, plan.cols(), plan.table(), position++));
+            specs.add(Spec.of(b, plan.cols(), plan.table(), plan.access(), position++));
         }
         Map<String, InternalAggregation> byName = new HashMap<>();
         List<Metric> rootMetrics = new ArrayList<>();
@@ -225,8 +227,15 @@ public class InfinoAggregationProcessor {
     static void check(Collection<AggregationBuilder> builders, Plan plan) {
         int position = 0;
         for (AggregationBuilder b : builders) {
-            Spec.of(b, plan.cols(), plan.table(), position++);
+            Spec.of(b, plan.cols(), plan.table(), plan.access(), position++);
         }
+    }
+
+    /** An aggregation refused because it would read a field the user sees only masked. */
+    static OpenSearchSecurityException masked(AggregationBuilder b, Source c) {
+        return InfinoAccess.refused(
+            "aggregation [" + b.getName() + "] reads " + c.label() + ", a field masked for this user; only terms over it are served, keyed by its hash"
+        );
     }
 
     // ---- specs ----
@@ -244,7 +253,7 @@ public class InfinoAggregationProcessor {
         }
 
         /** The spec for a builder at {@code index} among its siblings, or an {@link Unsupported} reason. */
-        static Spec of(AggregationBuilder b, Map<String, Column> cols, String table, int index) {
+        static Spec of(AggregationBuilder b, Map<String, Column> cols, String table, InfinoAccess access, int index) {
             if (Metric.handles(b)) {
                 if (!b.getSubAggregations().isEmpty()) {
                     throw new Unsupported("metric aggregation [" + b.getName() + "] cannot have sub-aggregations");
@@ -252,14 +261,14 @@ public class InfinoAggregationProcessor {
                 return Metric.of(b, cols, index);
             }
             if (b instanceof TopHitsAggregationBuilder th) {
-                return TopHits.of(th, cols);
+                return TopHits.of(th, cols, access);
             }
             List<Metric> metrics = new ArrayList<>();
             List<TopHits> hits = new ArrayList<>();
             BucketSpec child = null;
             int i = 0;
             for (AggregationBuilder sub : b.getSubAggregations()) {
-                Spec s = of(sub, cols, table, i++);
+                Spec s = of(sub, cols, table, access, i++);
                 if (s instanceof Metric m) {
                     metrics.add(m);
                 } else if (s instanceof TopHits t) {
@@ -312,8 +321,10 @@ public class InfinoAggregationProcessor {
                 }
             }
             if (b.script() != null) {
-                Sql sql = InfinoScriptTranslator.translate(b.script(), cols, c, System.currentTimeMillis());
-                return new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]");
+                // A script reads values themselves, so it sees no masked column, the value script's included.
+                Column valueColumn = c != null && c.masked() ? null : c;
+                Sql sql = InfinoScriptTranslator.translate(b.script(), InfinoAccess.scriptColumns(cols), valueColumn, System.currentTimeMillis());
+                return new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]", null);
             }
             if (c == null) {
                 throw new Unsupported("aggregation [" + b.getName() + "] needs a field or a script");
@@ -322,10 +333,23 @@ public class InfinoAggregationProcessor {
         }
     }
 
-    /** What an aggregation reads, as a column expression with its type; {@code label} names it in a refusal. */
-    record Source(String expr, SqlType type, String label) {
+    /**
+     * What an aggregation reads, as a column expression with its type;
+     * {@code label} names it in a refusal, {@code mask} is how a key of it
+     * leaves the node when the field is masked for the user (null when not).
+     */
+    record Source(String expr, SqlType type, String label, UnaryOperator<String> mask) {
         static Source of(Column c) {
-            return new Source(quoteIdent(c.name()), InfinoScriptTranslator.typeOf(c), "[" + c.name() + "]");
+            return new Source(quoteIdent(c.name()), InfinoScriptTranslator.typeOf(c), "[" + c.name() + "]", c.mask());
+        }
+
+        boolean masked() {
+            return mask != null;
+        }
+
+        /** A key of this source as the user may see it. */
+        String shown(Object key) {
+            return mask == null ? key.toString() : mask.apply(key.toString());
         }
 
         boolean isNumeric() {
@@ -394,6 +418,9 @@ public class InfinoAggregationProcessor {
 
         static Metric of(AggregationBuilder b, Map<String, Column> cols, int index) {
             Source c = sourceOf((ValuesSourceAggregationBuilder<?>) b, cols);
+            if (c.masked()) {
+                throw masked(b, c); // a count, sum or bound would read the values themselves
+            }
             String alias = "m" + index;
             boolean numeric = c.isNumeric() || c.isTimestamp();
             if (b instanceof ValueCountAggregationBuilder) {
@@ -617,8 +644,16 @@ public class InfinoAggregationProcessor {
         final FetchSourceContext source;
         final List<FieldAndFormat> fields;
         final Map<String, Column> cols;
+        final InfinoAccess access;
 
-        private TopHits(TopHitsAggregationBuilder b, List<SortSpec> sorts, FetchSourceContext source, List<FieldAndFormat> fields, Map<String, Column> cols) {
+        private TopHits(
+            TopHitsAggregationBuilder b,
+            List<SortSpec> sorts,
+            FetchSourceContext source,
+            List<FieldAndFormat> fields,
+            Map<String, Column> cols,
+            InfinoAccess access
+        ) {
             super(b);
             this.from = Math.max(0, b.from());
             this.size = b.size() < 0 ? DEFAULT_TOP_HITS_SIZE : b.size();
@@ -626,9 +661,10 @@ public class InfinoAggregationProcessor {
             this.source = source;
             this.fields = fields;
             this.cols = cols;
+            this.access = access;
         }
 
-        static TopHits of(TopHitsAggregationBuilder b, Map<String, Column> cols) {
+        static TopHits of(TopHitsAggregationBuilder b, Map<String, Column> cols, InfinoAccess access) {
             if (b.size() > MAX_TOP_HITS) {
                 throw new Unsupported("aggregation [" + b.getName() + "] asks for " + b.size() + " hits per bucket; at most " + MAX_TOP_HITS + " are served");
             }
@@ -644,7 +680,7 @@ public class InfinoAggregationProcessor {
                 throw new Unsupported("aggregation [" + b.getName() + "] " + e.getMessage());
             }
             // docvalue_fields and fields are read from the hit's source; stored_fields adds nothing the source lacks.
-            return new TopHits(b, sorts, b.fetchSource(), InfinoSearch.requestedFields(b.docValueFields(), b.fetchFields()), cols);
+            return new TopHits(b, sorts, b.fetchSource(), InfinoSearch.requestedFields(b.docValueFields(), b.fetchFields()), cols, access);
         }
 
         /** The columns a hit row carries beyond the id and the source. */
@@ -670,7 +706,7 @@ public class InfinoAggregationProcessor {
 
         /** This aggregation over the bucket's rows (in order, at most {@link #fetch()} of them) and its row count; the hits name {@code index}. */
         InternalAggregation build(List<Map<String, Object>> rows, long bucketCount, Index index) {
-            return InfinoSearch.topHits((TopHitsAggregationBuilder) builder, from, size, sorts, source, fields, cols, rows, bucketCount, index);
+            return InfinoSearch.topHits((TopHitsAggregationBuilder) builder, from, size, sorts, source, fields, cols, access, rows, bucketCount, index);
         }
 
         InternalAggregation empty() {
@@ -789,6 +825,9 @@ public class InfinoAggregationProcessor {
                 throw new Unsupported("aggregation [" + t.getName() + "] asks for " + t.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
             }
             KeyKind kind = kindOf(c);
+            if (c.masked() && kind != KeyKind.STR && kind != KeyKind.BOOL) {
+                throw masked(t, c); // a numeric or date key would be the value itself
+            }
             String order = orderClause(t.order(), leaves.metrics());
             if (order == null) {
                 throw new Unsupported("aggregation [" + t.getName() + "] has an order the table cannot sort by: " + t.order());
@@ -798,6 +837,9 @@ public class InfinoAggregationProcessor {
 
         static Grouped dateHistogram(DateHistogramAggregationBuilder dh, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
             Source c = sourceOf(dh, cols);
+            if (c.masked()) {
+                throw masked(dh, c);
+            }
             ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
             DateExpr expr = dateExpr(dh.getName(), c, tz, dh.getFixedInterval(), dh.getCalendarInterval(), dh.offset());
             DocValueFormat format = dateFormat(dh.format(), tz);
@@ -819,6 +861,9 @@ public class InfinoAggregationProcessor {
 
         static Grouped histogram(HistogramAggregationBuilder h, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
             Source c = sourceOf(h, cols);
+            if (c.masked()) {
+                throw masked(h, c);
+            }
             String keyExpr = histExpr(h.getName(), c, h.interval(), h.offset());
             if (h.order() != null && !InternalOrder.isKeyOrder(h.order())) {
                 throw new Unsupported("aggregation [" + h.getName() + "] has an order other than by key");
@@ -973,7 +1018,7 @@ public class InfinoAggregationProcessor {
                 sumTop += docCount;
                 InternalAggregations subs = subsOf.apply(row);
                 switch (keyKind) {
-                    case STR, BOOL -> sBuckets.add(new StringTerms.Bucket(new BytesRef(key.toString()), docCount, subs, false, 0L, DocValueFormat.RAW));
+                    case STR, BOOL -> sBuckets.add(new StringTerms.Bucket(new BytesRef(source.shown(key)), docCount, subs, false, 0L, DocValueFormat.RAW));
                     case LONG, DATE -> lBuckets.add(new LongTerms.Bucket(asLong(key), docCount, subs, false, 0L, DocValueFormat.RAW));
                     case DOUBLE -> dBuckets.add(new InfinoAggregationWire.DoubleBucket(asDouble(key, 0.0), docCount, subs));
                 }
@@ -1235,6 +1280,9 @@ public class InfinoAggregationProcessor {
             if (kind == KeyKind.DOUBLE) {
                 throw new Unsupported("aggregation [" + st.getName() + "] needs a keyword, boolean, integer or date value, " + c.label() + " is " + c.typeName());
             }
+            if (c.masked() && kind != KeyKind.STR && kind != KeyKind.BOOL) {
+                throw masked(st, c);
+            }
             if (st.includeExclude() != null) {
                 throw new Unsupported("aggregation [" + st.getName() + "] has include/exclude, which is not served");
             }
@@ -1275,7 +1323,7 @@ public class InfinoAggregationProcessor {
                 for (int i = 0; i < candidates.size(); i++) {
                     Candidate c = candidates.get(i);
                     InternalAggregations subs = subs(c.row(), topHits.get(i), nested.get(i));
-                    out.add(new SignificantStringTerms.Bucket(new BytesRef(c.key().toString()), c.subsetDf(), subsetSize, c.supersetDf(), supersetSize, subs, DocValueFormat.RAW, 0.0));
+                    out.add(new SignificantStringTerms.Bucket(new BytesRef(source.shown(c.key())), c.subsetDf(), subsetSize, c.supersetDf(), supersetSize, subs, DocValueFormat.RAW, 0.0));
                 }
                 return new SignificantStringTerms(name, meta, DocValueFormat.RAW, subsetSize, supersetSize, heuristic, out, thresholds);
             }
@@ -1377,12 +1425,18 @@ public class InfinoAggregationProcessor {
             }
             Source c;
             if (s.script() != null) {
-                Sql sql = InfinoScriptTranslator.translate(s.script(), cols, column, System.currentTimeMillis());
-                c = new Source(sql.expr(), sql.type(), "script [" + s.script().getIdOrCode() + "]");
+                // A script reads values themselves, so it sees no masked column, the value script's included.
+                Column valueColumn = column != null && column.masked() ? null : column;
+                Sql sql = InfinoScriptTranslator.translate(s.script(), InfinoAccess.scriptColumns(cols), valueColumn, System.currentTimeMillis());
+                c = new Source(sql.expr(), sql.type(), "script [" + s.script().getIdOrCode() + "]", null);
             } else if (column != null) {
                 c = Source.of(column);
             } else {
                 throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] names no field or script");
+            }
+            if (c.masked()) {
+                // The after key would be the value itself, and the page after a hash cannot be found.
+                throw InfinoAccess.refused("aggregation [" + agg + "] source [" + s.name() + "] reads " + c.label() + ", a field masked for this user; composite pages by the value and is not served over it");
             }
             boolean desc = s.order() == SortOrder.DESC;
             MissingOrder missing = s.missingOrder() == null ? MissingOrder.DEFAULT : s.missingOrder();

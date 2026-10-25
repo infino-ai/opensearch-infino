@@ -32,6 +32,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.UnaryOperator;
+import java.util.regex.Pattern;
 
 /**
  * Loads the Infino cdylib once per node and holds a single connection.
@@ -71,8 +73,26 @@ public final class InfinoNative {
         .weigher((key, value) -> key.length() + value.length())
         .build();
 
-    /** One column of a table, as the bridge describes it. */
-    public record Column(String name, String type, boolean fts, boolean vector) {
+    /**
+     * One column of a table, as the bridge describes it. {@code mask} is the
+     * security plugin's field masking for the request, when the field is
+     * masked for the user: how a value of the column is hashed before it
+     * leaves the node (null when it is not).
+     */
+    public record Column(String name, String type, boolean fts, boolean vector, UnaryOperator<String> mask) {
+        public Column(String name, String type, boolean fts, boolean vector) {
+            this(name, type, fts, vector, null);
+        }
+
+        /** This column as the request sees it, its values masked by {@code mask}. */
+        Column masked(UnaryOperator<String> mask) {
+            return new Column(name, type, fts, vector, mask);
+        }
+
+        public boolean masked() {
+            return mask != null;
+        }
+
         public boolean isString() {
             return "str".equals(type);
         }
@@ -135,10 +155,16 @@ public final class InfinoNative {
         }
         // The engine's SQL layer folds table names to lower case, and the UUID is
         // base64url (mixed case, '-' and '_'); folded and with '-' replaced, the
-        // name reads the same at declare time and in a statement.
+        // name reads the same at declare time and in a statement. An index name
+        // may carry characters a table name may not (the security plugin's and
+        // Dashboards' own indices start with a dot); each becomes '_', and the
+        // UUID keeps two such names apart.
         String uuid = index.getUUID().toLowerCase(Locale.ROOT).replace('-', '_');
-        return "os_" + index.getName() + "_" + uuid;
+        return "os_" + TABLE_NAME_OTHER.matcher(index.getName()).replaceAll("_") + "_" + uuid;
     }
+
+    /** What the engine does not take in a table name: anything outside letters, digits, '_' and '-'. */
+    private static final Pattern TABLE_NAME_OTHER = Pattern.compile("[^A-Za-z0-9_-]");
 
     /** Whether the table name came from {@code index.infino.table}, in which case deleting the index leaves it. */
     public static boolean tableIsExplicit(Settings indexSettings) {

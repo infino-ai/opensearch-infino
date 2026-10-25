@@ -7,6 +7,7 @@ package org.opensearch.infino;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
+import org.opensearch.common.inject.Injector;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
@@ -36,7 +37,8 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         ThreadPool threadPool,
         ScriptService scriptService,
         NamedWriteableRegistry namedWriteableRegistry,
-        IndexNameExpressionResolver indexNameExpressionResolver
+        IndexNameExpressionResolver indexNameExpressionResolver,
+        Injector injector
     ) {
         InfinoServices.clusterService = clusterService;
         InfinoServices.threadPool = threadPool;
@@ -44,6 +46,8 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoServices.namedWriteableRegistry = namedWriteableRegistry;
         InfinoServices.indexNameExpressionResolver = indexNameExpressionResolver;
         InfinoServices.writer = new InfinoWriter(threadPool);
+        // The security plugin's components, when it runs, come from the same injector.
+        InfinoSecurity.bind(injector);
     }
 
     static ClusterService clusterService() {

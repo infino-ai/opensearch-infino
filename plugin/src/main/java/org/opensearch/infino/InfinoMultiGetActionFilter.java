@@ -85,27 +85,34 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             }
         }
         try {
-            List<String> concrete = new ArrayList<>();
-            for (IndexMetadata md : indices.values()) {
-                concrete.add(md.getIndex().getName());
-            }
-            InfinoSecurity.refuseIfRestricted(InfinoServices.threadContext(), concrete, "mget");
-            // One source fetch per index, over all of its ids.
+            // One source fetch per index, over all of its ids: through the
+            // document rule when the security plugin has one for this user.
             Map<String, List<String>> idsByIndex = new HashMap<>();
             for (MultiGetRequest.Item item : mget.getItems()) {
                 idsByIndex.computeIfAbsent(item.index(), k -> new ArrayList<>()).add(item.id());
             }
             Map<String, String> tableOf = new HashMap<>();
+            Map<String, InfinoAccess> accessOf = new HashMap<>();
+            Map<String, Map<String, String>> restricted = new HashMap<>();
             for (Map.Entry<String, List<String>> e : idsByIndex.entrySet()) {
-                String table = tables.ensure(indices.get(e.getKey()));
+                IndexMetadata md = indices.get(e.getKey());
+                InfinoAccess access = InfinoSecurity.access(md.getIndex().getName(), "mget");
+                accessOf.put(e.getKey(), access);
+                String table = tables.ensure(md);
                 tableOf.put(e.getKey(), table);
-                InfinoNative.prefetchSources(table, e.getValue());
+                if (access.restrictsDocuments()) {
+                    restricted.put(e.getKey(), InfinoGetActionFilter.restrictedSources(table, e.getValue(), access));
+                } else {
+                    InfinoNative.prefetchSources(table, e.getValue());
+                }
             }
             MultiGetItemResponse[] responses = new MultiGetItemResponse[mget.getItems().size()];
             for (int i = 0; i < responses.length; i++) {
                 MultiGetRequest.Item item = mget.getItems().get(i);
-                String source = InfinoNative.getSource(tableOf.get(item.index()), item.id());
-                GetResponse get = new GetResponse(InfinoGetActionFilter.result(indices.get(item.index()).getIndex().getName(), item.id(), source, item.fetchSourceContext()));
+                Map<String, String> byId = restricted.get(item.index());
+                String source = byId != null ? byId.get(item.id()) : InfinoNative.getSource(tableOf.get(item.index()), item.id());
+                String shown = accessOf.get(item.index()).source(source);
+                GetResponse get = new GetResponse(InfinoGetActionFilter.result(indices.get(item.index()).getIndex().getName(), item.id(), shown, item.fetchSourceContext()));
                 responses[i] = new MultiGetItemResponse(get, null);
             }
             @SuppressWarnings("unchecked")

@@ -35,12 +35,37 @@ java {
     sourceCompatibility = JavaVersion.VERSION_21
 }
 
+// The security plugin's document- and field-level rules are enforced from
+// its own evaluation, which the plugin reaches by extending it: from 3.6 the
+// security plugin is extensible and registers the component holding that
+// evaluation, so it becomes a dependency and its classes load for ours. On
+// 2.x the rules arrive as thread-context headers and a restricted request is
+// refused; on 3.0 to 3.5 the security plugin cannot be extended (3.0) or
+// keeps the evaluation where nothing can read it, so any user's request is
+// refused, the suites' admin included, so the test cluster runs the security
+// plugin only where requests from users are served.
+def securityVersion = "${opensearch_version}.0"
+def (versionMajor, versionMinor) = opensearch_version.tokenize('.')[0..1].collect { it as int }
+def extendsSecurity = versionMajor > 3 || (versionMajor == 3 && versionMinor >= 6)
+def securityOnTestCluster = extendsSecurity || versionMajor == 2
+
 opensearchplugin {
     name = 'infino-engine'
     description = 'Back OpenSearch shards with the Infino engine (JNA bridge)'
     classname = 'org.opensearch.infino.InfinoPlugin'
     licenseFile = rootProject.file('LICENSE.txt')
     noticeFile = rootProject.file('NOTICE.txt')
+    if (extendsSecurity) {
+        extendedPlugins = ['opensearch-security']
+    }
+}
+
+// The security plugin's classes differ between the majors; the tree for the
+// target release joins the build.
+sourceSets.main.java.srcDirs += extendsSecurity ? 'src/main/java3' : 'src/main/java2'
+
+configurations {
+    securityPlugin
 }
 
 repositories {
@@ -54,6 +79,20 @@ repositories {
 dependencies {
     // OpenSearch ships JNA itself; compiling against it (not bundling) avoids jar hell.
     compileOnly "net.java.dev.jna:jna:${versions.jna}"
+    // The security plugin of the target release: installed on the test cluster
+    // for every major, and on 3.x also compiled against (its jars, read out of
+    // the zip; at runtime they come from the plugin itself, extended).
+    securityPlugin "org.opensearch.plugin:opensearch-security:${securityVersion}@zip"
+    if (extendsSecurity) {
+        // The security plugin's own jar, and guava, whose immutable collections
+        // its rule objects hand back; the rest of its zip is not needed to compile.
+        compileOnly files({
+            zipTree(configurations.securityPlugin.singleFile).matching {
+                include 'opensearch-security-*.jar'
+                include 'guava-*.jar'
+            }
+        })
+    }
 }
 
 configurations.all {
@@ -80,6 +119,13 @@ def defaultLib = file("${projectDir}/../infino-capi/target/release/libinfino_cap
 def defaultData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog"
 def defaultUri = "file://${defaultData}"
 
+// The test cluster runs the security plugin, enabled, with the demo node
+// certificates on the transport layer and plain HTTP with basic
+// authentication: the suites run as admin, and the security suite sends
+// its requests as restricted users. The security plugin's own index is
+// Infino-backed like every other, which is part of what the suites verify.
+def securityResources = file("${projectDir}/src/yamlRestTest/resources/security")
+
 testClusters.all {
     systemProperty 'infino.lib', System.getProperty('infino.lib', defaultLib)
     systemProperty 'infino.uri', System.getProperty('infino.uri', defaultUri)
@@ -87,6 +133,28 @@ testClusters.all {
     systemProperty 'infino.data', System.getProperty('infino.data', defaultData)
     // The SQL each request runs, in the node log, so a wrong answer can be read back.
     setting 'logger.org.opensearch.infino', 'DEBUG'
+
+    if (securityOnTestCluster) {
+        plugin(layout.file(provider { configurations.securityPlugin.singleFile }))
+        // Plain HTTP with basic authentication; the build's own wait for cluster
+        // health sends no credentials, so the anonymous user may read it (see the
+        // cluster_health role in the security configuration).
+        setting 'plugins.security.disabled', 'false'
+        setting 'plugins.security.ssl.http.enabled', 'false'
+        setting 'plugins.security.ssl.transport.pemcert_filepath', 'esnode.pem'
+        setting 'plugins.security.ssl.transport.pemkey_filepath', 'esnode-key.pem'
+        setting 'plugins.security.ssl.transport.pemtrustedcas_filepath', 'root-ca.pem'
+        setting 'plugins.security.ssl.transport.enforce_hostname_verification', 'false'
+        setting 'plugins.security.allow_unsafe_democertificates', 'true'
+        setting 'plugins.security.allow_default_init_securityindex', 'true'
+        setting 'plugins.security.authcz.admin_dn', 'CN=kirk,OU=client,O=client,L=test,C=de'
+        extraConfigFile 'esnode.pem', file("${securityResources}/certs/esnode.pem")
+        extraConfigFile 'esnode-key.pem', file("${securityResources}/certs/esnode-key.pem")
+        extraConfigFile 'root-ca.pem', file("${securityResources}/certs/root-ca.pem")
+        fileTree("${securityResources}/opensearch-security").each { f ->
+            extraConfigFile "opensearch-security/${f.name}", f
+        }
+    }
 }
 
 // A run that dies before its shards are deleted leaves their tables; each run starts clean.

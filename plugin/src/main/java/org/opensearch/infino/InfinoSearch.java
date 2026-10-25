@@ -109,10 +109,14 @@ public final class InfinoSearch {
 
     /**
      * What one request translates to, shared by the hit and aggregation paths.
-     * {@code postWhere} is the post_filter's predicate (null when none): it
-     * narrows the hits and their total, never the aggregations. {@code collapse}
-     * is the column hits are collapsed on (null when none), {@code searchAfter}
-     * the sort values the page starts after (null when none).
+     * {@code cols} are the columns as the request may see them (see
+     * {@link InfinoAccess#columns}), {@code query} carries the document-level
+     * rule as part of its predicate. {@code postWhere} is the post_filter's
+     * predicate (null when none): it narrows the hits and their total, never
+     * the aggregations. {@code collapse} is the column hits are collapsed on
+     * (null when none), {@code searchAfter} the sort values the page starts
+     * after (null when none), {@code access} what the request may see of
+     * each document.
      */
     record Plan(
         String table,
@@ -123,7 +127,8 @@ public final class InfinoSearch {
         String postWhere,
         Column collapse,
         Object[] searchAfter,
-        List<ScriptedField> scriptFields
+        List<ScriptedField> scriptFields,
+        InfinoAccess access
     ) {
         List<String> orderBy() {
             return InfinoSearch.orderBy(sorts);
@@ -158,15 +163,23 @@ public final class InfinoSearch {
 
     // ---- plan ----
 
-    /** The plan for a request; throws naming the first clause the table cannot serve. */
+    /** The plan for a request the user may see whole; throws naming the first clause the table cannot serve. */
     static Plan plan(String table, SearchSourceBuilder source, long nowMillis) {
+        return plan(table, source, nowMillis, InfinoAccess.NONE);
+    }
+
+    /** The plan for a request under {@code access}; throws naming the first clause the table cannot serve. */
+    static Plan plan(String table, SearchSourceBuilder source, long nowMillis, InfinoAccess access) {
         if (source.suggest() != null) {
             throw new IllegalArgumentException("[infino] suggest is not served by the table");
         }
-        Map<String, Column> cols = InfinoNative.columns(table);
-        if (cols.isEmpty()) {
+        Map<String, Column> fullCols = InfinoNative.columns(table);
+        if (fullCols.isEmpty()) {
             throw new IllegalStateException("[infino] table " + table + " has not been declared");
         }
+        // The request sees the columns its access leaves it; a field it may not
+        // see is as if unmapped, a masked one carries its hash.
+        Map<String, Column> cols = access.columns(fullCols);
         QueryBuilder qb = source.query();
         VectorRequest vector = null;
         Translation query;
@@ -181,6 +194,18 @@ public final class InfinoSearch {
             if (query == null) {
                 throw new IllegalArgumentException("[infino] query not served by the table: " + qb);
             }
+        }
+        // The document-level rule is one more required predicate: hits, total
+        // and aggregations all run over the same relation, so one clause covers
+        // them. The rule may name fields the request may not, so it is read
+        // over the table's full columns.
+        String rule = access.documentsWhere(fullCols, table, nowMillis);
+        if (rule != null) {
+            if (vector != null) {
+                throw InfinoAccess.refused("a vector query under document-level security is not served; the engine's vector search takes no predicate");
+            }
+            String where = InfinoQueryTranslator.ALL.equals(query.where()) ? rule : "(" + query.where() + ") AND " + rule;
+            query = new Translation(query.table(), where, query.principal());
         }
         log.debug("[infino] query {} -> FROM {} WHERE {}", qb, query.from(), query.where());
         List<SortSpec> sorts = sorts(source.sorts(), cols);
@@ -207,14 +232,19 @@ public final class InfinoSearch {
             if (collapse == null) {
                 throw new IllegalArgumentException("[infino] collapse names field [" + cb.getField() + "], which the table has no column for");
             }
+            if (collapse.masked()) {
+                throw InfinoAccess.refused("collapse on [" + cb.getField() + "], a field masked for this user, is not served");
+            }
         }
         List<ScriptedField> scriptFields = new ArrayList<>();
         if (source.scriptFields() != null && !source.scriptFields().isEmpty()) {
             if (vector != null) {
                 throw new IllegalArgumentException("[infino] script_fields are not served with a vector query");
             }
+            // A script reads values themselves, so it sees no masked column.
+            Map<String, Column> scriptCols = InfinoAccess.scriptColumns(cols);
             for (SearchSourceBuilder.ScriptField sf : source.scriptFields()) {
-                Sql sql = InfinoScriptTranslator.translate(sf.script(), cols, null, nowMillis);
+                Sql sql = InfinoScriptTranslator.translate(sf.script(), scriptCols, null, nowMillis);
                 scriptFields.add(new ScriptedField(sf.fieldName(), sql.expr(), "sf" + scriptFields.size()));
             }
         }
@@ -242,7 +272,7 @@ public final class InfinoSearch {
                 throw new IllegalArgumentException("[infino] search_after is not served with a vector query");
             }
         }
-        Plan plan = new Plan(table, cols, query, sorts, vector, postWhere, collapse, searchAfter, scriptFields);
+        Plan plan = new Plan(table, cols, query, sorts, vector, postWhere, collapse, searchAfter, scriptFields, access);
         InfinoAggregationProcessor.check(builders(source), plan);
         return plan;
     }
@@ -262,8 +292,8 @@ public final class InfinoSearch {
                 continue;
             }
             if (sort instanceof ScriptSortBuilder ss) {
-                // A script sort orders by the script as a column expression.
-                Sql sql = InfinoScriptTranslator.translate(ss.script(), cols, null, System.currentTimeMillis());
+                // A script sort orders by the script as a column expression; a script sees no masked column.
+                Sql sql = InfinoScriptTranslator.translate(ss.script(), InfinoAccess.scriptColumns(cols), null, System.currentTimeMillis());
                 out.add(new SortSpec(sql.expr(), "sort" + out.size(), sql.type(), ss.order() == SortOrder.DESC));
                 continue;
             }
@@ -276,6 +306,10 @@ public final class InfinoSearch {
             Column c = columnFor(cols, fs.getFieldName());
             if (c == null) {
                 throw new IllegalArgumentException("[infino] sort names field [" + fs.getFieldName() + "], which the table has no column for");
+            }
+            if (c.masked()) {
+                // The order of the values would show through the hashes.
+                throw InfinoAccess.refused("sort on [" + fs.getFieldName() + "], a field masked for this user, is not served");
             }
             out.add(SortSpec.of(c, fs.order() == SortOrder.DESC));
         }
@@ -394,6 +428,8 @@ public final class InfinoSearch {
                 String src = plan.vector() != null
                     ? InfinoNative.getSource(plan.table(), id.toString())
                     : String.valueOf(row.get(InfinoQueryTranslator.SOURCE));
+                // The source as the user may see it: hidden fields gone, masked values hashed.
+                src = plan.access().source(src);
                 if (src != null && !src.isEmpty()) {
                     if (withSource) {
                         h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
@@ -555,6 +591,7 @@ public final class InfinoSearch {
         FetchSourceContext fetchSource,
         List<FieldAndFormat> fields,
         Map<String, Column> cols,
+        InfinoAccess access,
         List<Map<String, Object>> rows,
         long bucketCount,
         Index index
@@ -575,7 +612,7 @@ public final class InfinoSearch {
             }
             h.score(score);
             if (withSource || !fields.isEmpty()) {
-                String src = String.valueOf(row.get(InfinoQueryTranslator.SOURCE));
+                String src = access.source(String.valueOf(row.get(InfinoQueryTranslator.SOURCE)));
                 if (!src.isEmpty()) {
                     if (withSource) {
                         h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
@@ -730,14 +767,21 @@ public final class InfinoSearch {
      * (sort values, else score) and the aggregations reduce once, which is
      * also where pipeline aggregations are computed.
      */
-    static SearchResponse search(List<Index> indices, Function<Index, String> tableOf, SearchSourceBuilder source, ScriptService scripts, long startNanos) {
+    static SearchResponse search(
+        List<Index> indices,
+        Function<Index, String> tableOf,
+        Function<Index, InfinoAccess> accessOf,
+        SearchSourceBuilder source,
+        ScriptService scripts,
+        long startNanos
+    ) {
         long now = System.currentTimeMillis();
         List<Page> pages = new ArrayList<>();
         List<InternalAggregations> aggs = new ArrayList<>();
         Collection<AggregationBuilder> builders = builders(source);
         List<SortSpec> sorts = List.of();
         for (Index index : indices) {
-            Plan plan = plan(tableOf.apply(index), source, now);
+            Plan plan = plan(tableOf.apply(index), source, now, accessOf.apply(index));
             sorts = plan.sorts();
             Page page = page(index, plan, source);
             pages.add(page);

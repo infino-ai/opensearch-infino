@@ -1,0 +1,211 @@
+---
+"Security: the security plugin's document, field and masking rules are enforced from the table":
+  - skip:
+      version: " - 3.5.99"
+      reason: the rules are read through the security plugin's privileges configuration, which exists from 3.6
+      features: headers
+  - do:
+      indices.create:
+        index: sec1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              secret: { type: keyword }
+              ip: { type: keyword }
+              n: { type: long }
+              title: { type: text }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec1, _id: "s1" }
+          - { tag: x, secret: alpha, ip: "10.0.0.1", n: 1, title: "wool coat" }
+          - index: { _index: sec1, _id: "s2" }
+          - { tag: y, secret: beta, ip: "10.0.0.2", n: 2, title: "silk scarf" }
+          - index: { _index: sec1, _id: "s3" }
+          - { tag: x, secret: gamma, ip: "10.0.0.1", n: 3, title: "wool hat" }
+  - match: { errors: false }
+
+  # A user with plain read access sees the index whole.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      search:
+        index: sec1
+        body: { size: 0 }
+  - match: { hits.total.value: 3 }
+
+  # The document rule (tag is x) narrows hits, totals, aggregations, count, get and mget alike.
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec1
+        body:
+          sort: [ { n: asc } ]
+          aggs:
+            tags: { terms: { field: tag } }
+            total_n: { sum: { field: n } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "s1" }
+  - match: { hits.hits.1._id: "s3" }
+  - length: { aggregations.tags.buckets: 1 }
+  - match: { aggregations.tags.buckets.0.key: x }
+  - match: { aggregations.total_n.value: 4 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec1
+        body: { size: 0, query: { match: { title: silk } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      count:
+        index: sec1
+  - match: { count: 2 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      get:
+        index: sec1
+        id: s1
+  - match: { found: true }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      catch: missing
+      get:
+        index: sec1
+        id: s2
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      mget:
+        body: { docs: [ { _index: sec1, _id: "s2" }, { _index: sec1, _id: "s3" } ] }
+  - match: { docs.0.found: false }
+  - match: { docs.1.found: true }
+
+  # The field rule (no secret): the field leaves no source, no fields entry, matches nothing and cannot be aggregated.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec1
+        body:
+          sort: [ { n: asc } ]
+          fields: [ "*" ]
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._source.tag: x }
+  - is_false: hits.hits.0._source.secret
+  - is_false: hits.hits.0.fields.secret
+  - match: { hits.hits.0.fields.tag: [ x ] }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec1
+        body: { size: 0, query: { term: { secret: alpha } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      catch: bad_request
+      search:
+        index: sec1
+        body: { size: 0, aggs: { secrets: { terms: { field: secret } } } }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      get:
+        index: sec1
+        id: s1
+  - match: { _source.tag: x }
+  - is_false: _source.secret
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      mget:
+        body: { docs: [ { _index: sec1, _id: "s2" } ] }
+  - match: { docs.0._source.tag: y }
+  - is_false: docs.0._source.secret
+
+  # The masked field (ip) leaves as its hash, the same hash in hits, gets and bucket keys; a sort on it is refused.
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      search:
+        index: sec1
+        body:
+          sort: [ { n: asc } ]
+          aggs:
+            ips: { terms: { field: ip, order: { _count: desc } } }
+  - match:
+      hits.hits.0._source.ip: /^[0-9a-f]{64}$/
+  - set: { hits.hits.0._source.ip: masked }
+  - match: { hits.hits.2._source.ip: $masked }
+  - match: { hits.hits.0._source.tag: x }
+  - match: { aggregations.ips.buckets.0.key: $masked }
+  - match: { aggregations.ips.buckets.0.doc_count: 2 }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      get:
+        index: sec1
+        id: s1
+  - match: { _source.ip: $masked }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      search:
+        index: sec1
+        body: { size: 0, sort: [ { ip: asc } ] }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      search:
+        index: sec1
+        body: { size: 0, aggs: { ips: { cardinality: { field: ip } } } }
+
+  # The admin is unrestricted.
+  - do:
+      get:
+        index: sec1
+        id: s2
+  - match: { _source.secret: beta }
+  - match: { _source.ip: "10.0.0.2" }
+
+---
+"Security on 2.x: a request under a document- or field-level rule is refused, one without is served":
+  - skip:
+      version: "3.0.0 - "
+      reason: on 3.x the rules are enforced
+      features: headers
+  - do:
+      indices.create:
+        index: sec3
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              secret: { type: keyword }
+              ip: { type: keyword }
+  - do:
+      index:
+        index: sec3
+        id: t1
+        refresh: true
+        body: { tag: x, secret: alpha, ip: "10.0.0.1" }
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      search:
+        index: sec3
+        body: { size: 0 }
+  - match: { hits.total.value: 1 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      search:
+        index: sec3
+        body: { size: 0 }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      get:
+        index: sec3
+        id: t1
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      mget:
+        body: { docs: [ { _index: sec3, _id: "t1" } ] }

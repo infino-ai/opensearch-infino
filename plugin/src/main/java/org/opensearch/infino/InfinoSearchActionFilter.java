@@ -103,12 +103,13 @@ public class InfinoSearchActionFilter implements ActionFilter {
         }
         long start = System.nanoTime();
         try {
-            InfinoSecurity.refuseIfRestricted(InfinoServices.threadContext(), List.of(concrete), "search");
             SearchSourceBuilder source = search.source() == null ? new SearchSourceBuilder() : search.source();
             InfinoTables tables = InfinoPlugin.tables();
+            // Each index is read under what the security plugin lets this user see of it.
             SearchResponse response = InfinoSearch.search(
                 infino,
                 index -> tables.ensure(metadata.get(infino.indexOf(index))),
+                index -> InfinoSecurity.access(index.getName(), "search"),
                 source,
                 scripts.get(),
                 start

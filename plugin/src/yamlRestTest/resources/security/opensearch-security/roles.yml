@@ -1,0 +1,62 @@
+---
+# Roles for the security suite: the same read access to the sec* indices,
+# once plain, once under a document rule, once under a field rule, once
+# with a masked field.
+_meta:
+  type: "roles"
+  config_version: 2
+
+# What the build's unauthenticated wait for cluster health needs.
+cluster_health:
+  reserved: false
+  cluster_permissions:
+    - "cluster:monitor/health"
+
+sec_read:
+  reserved: false
+  cluster_permissions:
+    - "cluster_composite_ops_ro"
+  index_permissions:
+    - index_patterns:
+        - "sec*"
+      allowed_actions:
+        - "read"
+        - "indices:admin/mappings/get"
+
+sec_dls:
+  reserved: false
+  cluster_permissions:
+    - "cluster_composite_ops_ro"
+  index_permissions:
+    - index_patterns:
+        - "sec*"
+      dls: '{"term": {"tag": "x"}}'
+      allowed_actions:
+        - "read"
+        - "indices:admin/mappings/get"
+
+sec_fls:
+  reserved: false
+  cluster_permissions:
+    - "cluster_composite_ops_ro"
+  index_permissions:
+    - index_patterns:
+        - "sec*"
+      fls:
+        - "~secret"
+      allowed_actions:
+        - "read"
+        - "indices:admin/mappings/get"
+
+sec_mask:
+  reserved: false
+  cluster_permissions:
+    - "cluster_composite_ops_ro"
+  index_permissions:
+    - index_patterns:
+        - "sec*"
+      masked_fields:
+        - "ip"
+      allowed_actions:
+        - "read"
+        - "indices:admin/mappings/get"
