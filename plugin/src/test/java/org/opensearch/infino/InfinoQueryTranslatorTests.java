@@ -5,6 +5,7 @@
 package org.opensearch.infino;
 
 import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.MultiMatchQueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
@@ -53,6 +54,16 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         // An exclusive bound on a day rounds past the day.
         t = translate(QueryBuilders.rangeQuery("@timestamp").gt("2026-10-23"));
         assertEquals("(\"@timestamp\" > '2026-10-23T23:59:59.999Z')", t.where());
+    }
+
+    public void testPhrasesOnExactColumnsAreEqualities() {
+        // A match_phrase on a keyword column is the value as given (Dashboards' filter pills), never a quoted query.
+        assertEquals("\"level\" = 'error'", translate(QueryBuilders.matchPhraseQuery("level", "error")).where());
+        assertEquals("\"host.name\" = 'web-2'", translate(QueryBuilders.matchPhraseQuery("host.name", "web-2")).where());
+        // A multi_match phrase over a text and a keyword column: the phrase on the text column, the value on the keyword one.
+        Translation t = translate(QueryBuilders.multiMatchQuery("disk full", "message", "level").type(MultiMatchQueryBuilder.Type.PHRASE));
+        assertEquals("(\"level\" = 'disk full' OR osid IN (SELECT osid FROM token_match('os_logs_0', 'message', '\"disk full\"', 'or')))", t.where());
+        assertEquals("\"os_logs_0\"", t.from());
     }
 
     public void testTextClauseBecomesTheSource() {

@@ -20,9 +20,9 @@ import org.opensearch.action.support.AutoCreateIndex;
 import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.UUIDs;
-import org.opensearch.common.lucene.uid.Versions;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
@@ -35,9 +35,7 @@ import org.opensearch.core.xcontent.MediaType;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexNotFoundException;
-import org.opensearch.index.VersionType;
 import org.opensearch.index.engine.DocumentMissingException;
-import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.infino.InfinoWriter.Outcome;
 import org.opensearch.infino.InfinoWriter.Waiter;
 import org.opensearch.infino.InfinoWriter.Write;
@@ -119,8 +117,9 @@ public class InfinoBulkActionFilter implements ActionFilter {
         ActionListener<BulkResponse> cast = (ActionListener<BulkResponse>) listener;
         createMissing(missingIndices(clusters, bulk), ActionListener.wrap(created -> {
             Map<String, IndexMetadata> infino;
+            List<String> concrete = concreteIndices(clusters.state(), bulk);
             try {
-                infino = infinoIndices(clusters, bulk);
+                infino = infinoIndices(clusters, concrete);
             } catch (Exception e) {
                 listener.onFailure(e);
                 return;
@@ -129,8 +128,31 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 chain.proceed(task, action, request, listener);
                 return;
             }
-            serve(bulk, infino, writes, tables, cast);
+            serve(bulk, concrete, infino, writes, tables, cast);
         }, listener::onFailure));
+    }
+
+    /**
+     * The concrete index each item writes to, by slot: the name it gives, or
+     * for an alias the alias's write index, as the stock path resolves it.
+     * An alias that resolves to no single write index keeps its name, so the
+     * stock path reports it.
+     */
+    static List<String> concreteIndices(ClusterState state, BulkRequest bulk) {
+        IndexNameExpressionResolver resolver = InfinoServices.indexNameExpressionResolver();
+        List<String> out = new ArrayList<>(bulk.requests().size());
+        for (DocWriteRequest<?> item : bulk.requests()) {
+            String name = item.index();
+            if (resolver != null && name != null && state.metadata().hasAlias(name)) {
+                try {
+                    name = resolver.concreteWriteIndex(state, item).getName();
+                } catch (Exception e) {
+                    log.debug("[infino] alias {} resolves to no write index: {}", name, e.getMessage());
+                }
+            }
+            out.add(name);
+        }
+        return out;
     }
 
     /**
@@ -171,23 +193,24 @@ public class InfinoBulkActionFilter implements ActionFilter {
     }
 
     /**
-     * The Infino-backed indices a bulk's items target, by name; empty when
-     * none does. A bulk that mixes them with other indices is refused.
+     * The Infino-backed indices a bulk's items write to (the concrete names
+     * {@link #concreteIndices} gave, one per slot), by name; empty when none
+     * is. A bulk that mixes them with other indices is refused.
      */
-    static Map<String, IndexMetadata> infinoIndices(ClusterService clusters, BulkRequest bulk) {
+    static Map<String, IndexMetadata> infinoIndices(ClusterService clusters, List<String> concrete) {
         Map<String, IndexMetadata> infino = new LinkedHashMap<>();
         int infinoItems = 0;
-        for (DocWriteRequest<?> item : bulk.requests()) {
-            IndexMetadata md = clusters.state().metadata().index(item.index());
+        for (String name : concrete) {
+            IndexMetadata md = name == null ? null : clusters.state().metadata().index(name);
             if (md != null && md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
-                infino.put(item.index(), md);
+                infino.put(name, md);
                 infinoItems++;
             }
         }
         if (infinoItems == 0) {
             return Map.of();
         }
-        if (infinoItems != bulk.requests().size()) {
+        if (infinoItems != concrete.size()) {
             throw new IllegalArgumentException("[infino] a bulk mixing Infino-backed indices with others is not served");
         }
         return infino;
@@ -199,7 +222,14 @@ public class InfinoBulkActionFilter implements ActionFilter {
      * items go to their own waiter and the bulk is answered when every waiter
      * has, each item in the bulk's own slot.
      */
-    static void serve(BulkRequest bulk, Map<String, IndexMetadata> infino, InfinoWriter writes, InfinoTables tables, ActionListener<BulkResponse> listener) {
+    static void serve(
+        BulkRequest bulk,
+        List<String> concrete,
+        Map<String, IndexMetadata> infino,
+        InfinoWriter writes,
+        InfinoTables tables,
+        ActionListener<BulkResponse> listener
+    ) {
         long start = System.nanoTime();
         try {
             BulkItemResponse[] items = new BulkItemResponse[bulk.requests().size()];
@@ -213,7 +243,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
             }
             Map<String, List<Integer>> slotsByIndex = new LinkedHashMap<>();
             for (int slot = 0; slot < bulk.requests().size(); slot++) {
-                slotsByIndex.computeIfAbsent(bulk.requests().get(slot).index(), k -> new ArrayList<>()).add(slot);
+                slotsByIndex.computeIfAbsent(concrete.get(slot), k -> new ArrayList<>()).add(slot);
             }
             AtomicInteger pending = new AtomicInteger(slotsByIndex.size());
             AtomicReference<Exception> failure = new AtomicReference<>();
@@ -268,8 +298,8 @@ public class InfinoBulkActionFilter implements ActionFilter {
         List<Outcome> outcomes = new ArrayList<>(requests.size());
         for (int slot = 0; slot < requests.size(); slot++) {
             DocWriteRequest<?> item = requests.get(slot);
-            // The table keeps no versions or sequence numbers, so a write conditioned on
-            // them cannot be checked; it is refused rather than written unconditionally.
+            // The table keeps no versions or sequence numbers: a write conditioned on the
+            // constants it reports is served as unconditioned, one on anything else refused.
             String conditioned = conditioned(item);
             if (conditioned != null) {
                 outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, new IllegalArgumentException("[infino] " + conditioned), RestStatus.BAD_REQUEST)));
@@ -319,17 +349,9 @@ public class InfinoBulkActionFilter implements ActionFilter {
         return outcomes;
     }
 
-    /** Why a write conditioned on a version or sequence number cannot be served, or null when it is unconditioned. */
+    /** Why a write's condition cannot be served, or null when it is unconditioned or on the values the table reports (see {@link InfinoDocumentVersion}). */
     static String conditioned(DocWriteRequest<?> item) {
-        if (item.ifSeqNo() != SequenceNumbers.UNASSIGNED_SEQ_NO || item.ifPrimaryTerm() != SequenceNumbers.UNASSIGNED_PRIMARY_TERM) {
-            return "if_seq_no / if_primary_term are not served: the table keeps no sequence numbers";
-        }
-        // An op_type create carries the "match deleted" marker as its version; that is the create, not a condition.
-        boolean unversioned = item.version() == Versions.MATCH_ANY || item.version() == Versions.MATCH_DELETED;
-        if (!unversioned || item.versionType() != VersionType.INTERNAL) {
-            return "version and version_type are not served: the table keeps no per-document version";
-        }
-        return null;
+        return InfinoDocumentVersion.conditioned(item);
     }
 
     private static BulkItemResponse failure(int slot, DocWriteRequest<?> item, String index, Exception cause, RestStatus status) {

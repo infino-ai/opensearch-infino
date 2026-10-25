@@ -212,7 +212,9 @@
   - match: { _source.n: 11 }
   - match: { _source.extra: "later" }
 
-  # op_type create over an existing id conflicts and writes nothing; conditioned writes are refused.
+  # op_type create over an existing id conflicts and writes nothing. Every document reports
+  # version 1 at sequence number 0, primary term 1; a write conditioned on those values is
+  # served as unconditioned, one on any other value is refused.
   - do:
       catch: conflict
       create:
@@ -224,6 +226,9 @@
         index: rev1
         id: a1
   - match: { _source.n: 11 }
+  - match: { _version: 1 }
+  - match: { _seq_no: 0 }
+  - match: { _primary_term: 1 }
   - do:
       catch: bad_request
       index:
@@ -240,6 +245,27 @@
         if_seq_no: 1
         if_primary_term: 1
         body: { n: 99 }
+  - do:
+      index:
+        index: rev1
+        id: a1
+        if_seq_no: 0
+        if_primary_term: 1
+        refresh: true
+        body: { n: 12, extra: "later" }
+  - match: { _seq_no: 0 }
+  - match: { _primary_term: 1 }
+  - do:
+      get:
+        index: rev1
+        id: a1
+  - match: { _source.n: 12 }
+  - do:
+      search:
+        index: rev1
+        body: { size: 1, seq_no_primary_term: true, query: { term: { n: 12 } } }
+  - match: { hits.hits.0._seq_no: 0 }
+  - match: { hits.hits.0._primary_term: 1 }
 
   # get and mget through an alias, and get with a source filter.
   - do:

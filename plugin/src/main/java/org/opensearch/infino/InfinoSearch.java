@@ -101,8 +101,6 @@ public final class InfinoSearch {
     private static final int DEFAULT_SIZE = 10;
     /** The node name a hit's shard target carries; it only names the index in the response. */
     private static final String NODE = "infino";
-    /** Version reported for a hit when the request asks for one; the table keeps no per-document version. */
-    private static final long UNVERSIONED = 1L;
     /** How a date in a hit's source is read back before it is printed in a requested format. */
     private static final String READ_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
     /** The sort a scroll without one pages by: the document id, which {@link #columnFor} resolves to the id column. */
@@ -396,6 +394,7 @@ public final class InfinoSearch {
         boolean withSource = source.fetchSource() == null || source.fetchSource().fetchSource();
         List<FieldAndFormat> fields = requestedFields(source.docValueFields(), source.fetchFields());
         boolean version = Boolean.TRUE.equals(source.version());
+        boolean seqNoAndPrimaryTerm = Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
         SearchShardTarget target = target(index);
         List<SearchHit> hits = new ArrayList<>();
         float maxScore = Float.NaN;
@@ -424,8 +423,13 @@ public final class InfinoSearch {
             if (!Float.isNaN(score)) {
                 maxScore = Float.isNaN(maxScore) ? score : Math.max(maxScore, score);
             }
+            // The constants the table reports as a document's version (see InfinoDocumentVersion).
             if (version) {
-                h.version(UNVERSIONED);
+                h.version(InfinoDocumentVersion.VERSION);
+            }
+            if (seqNoAndPrimaryTerm) {
+                h.setSeqNo(InfinoDocumentVersion.SEQ_NO);
+                h.setPrimaryTerm(InfinoDocumentVersion.PRIMARY_TERM);
             }
             if (withSource || !fields.isEmpty()) {
                 String src = plan.vector() != null
@@ -916,6 +920,9 @@ public final class InfinoSearch {
         }
         if (Boolean.TRUE.equals(source.version())) {
             out.version(true);
+        }
+        if (Boolean.TRUE.equals(source.seqNoAndPrimaryTerm())) {
+            out.seqNoAndPrimaryTerm(true);
         }
         out.trackTotalHits(false);
         return out;

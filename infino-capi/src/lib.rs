@@ -453,7 +453,11 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
 
 /// Flatten a document to dot paths, the way the engine stores it: nested
 /// objects become `a.b` keys, everything else stays a leaf value. An empty
-/// object carries nothing and is dropped.
+/// object carries nothing and is dropped. An array of objects (an `object`
+/// or `nested` field holding several) is the multi-valued form of each
+/// member path, as OpenSearch indexes it: `a: [{b: 1}, {b: 2}]` becomes
+/// `a.b: [1, 2]`, so a declared `a.b` column takes the values rather than
+/// the objects; scalars beside the objects stay under the array's own path.
 fn flatten(obj: &Map<String, Value>, prefix: &str, out: &mut Map<String, Value>) {
     for (k, v) in obj {
         let path = if prefix.is_empty() {
@@ -464,6 +468,35 @@ fn flatten(obj: &Map<String, Value>, prefix: &str, out: &mut Map<String, Value>)
         match v {
             Value::Object(inner) if !inner.is_empty() => flatten(inner, &path, out),
             Value::Object(_) => {}
+            Value::Array(items) if items.iter().any(Value::is_object) => {
+                let mut per_path: Vec<(String, Vec<Value>)> = Vec::new();
+                let mut scalars = Vec::new();
+                for item in items {
+                    match item {
+                        Value::Object(inner) => {
+                            let mut member = Map::new();
+                            flatten(inner, &path, &mut member);
+                            for (member_path, member_value) in member {
+                                let values = match member_value {
+                                    Value::Array(list) => list,
+                                    other => vec![other],
+                                };
+                                match per_path.iter_mut().find(|(p, _)| *p == member_path) {
+                                    Some((_, existing)) => existing.extend(values),
+                                    None => per_path.push((member_path, values)),
+                                }
+                            }
+                        }
+                        other => scalars.push(other.clone()),
+                    }
+                }
+                for (member_path, values) in per_path {
+                    out.insert(member_path, Value::Array(values));
+                }
+                if !scalars.is_empty() {
+                    out.insert(path, Value::Array(scalars));
+                }
+            }
             other => {
                 out.insert(path, other.clone());
             }
@@ -1662,6 +1695,22 @@ mod tests {
             .iter()
             .all(|cc| cc["vector"] == false));
         close(h);
+    }
+
+    #[test]
+    fn an_array_of_objects_flattens_to_the_multi_valued_member_paths() {
+        let doc: Value = serde_json::from_str(
+            r#"{"references":[{"id":"a","type":"x"},{"id":"b"}],"tags":["t",{"k":1}],"plain":[1,2]}"#,
+        )
+        .unwrap();
+        let mut flat = Map::new();
+        flatten(doc.as_object().unwrap(), "", &mut flat);
+        assert_eq!(flat["references.id"], json!(["a", "b"]));
+        assert_eq!(flat["references.type"], json!(["x"]));
+        assert!(flat.get("references").is_none());
+        assert_eq!(flat["tags.k"], json!([1]));
+        assert_eq!(flat["tags"], json!(["t"]));
+        assert_eq!(flat["plain"], json!([1, 2]));
     }
 
     #[test]

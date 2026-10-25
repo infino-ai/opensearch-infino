@@ -42,8 +42,6 @@ import java.util.function.Supplier;
 public class InfinoGetActionFilter implements ActionFilter {
 
     private static final Logger log = LogManager.getLogger(InfinoGetActionFilter.class);
-    /** Version reported for a document served from the table, which keeps no per-document version. */
-    private static final long UNVERSIONED = 1L;
 
     private final Supplier<ClusterService> clusterService;
     private final Supplier<IndexNameExpressionResolver> resolver;
@@ -149,12 +147,13 @@ public class InfinoGetActionFilter implements ActionFilter {
             boolean excludes = fetch != null && fetch.excludes() != null && fetch.excludes().length > 0;
             bytes = includes || excludes ? InfinoSearch.filtered(source, fetch) : new BytesArray(source);
         }
+        // A found document carries the constants the table reports as its version (see InfinoDocumentVersion).
         return new GetResult(
             index,
             id,
-            SequenceNumbers.UNASSIGNED_SEQ_NO,
-            SequenceNumbers.UNASSIGNED_PRIMARY_TERM,
-            exists ? UNVERSIONED : -1L,
+            exists ? InfinoDocumentVersion.SEQ_NO : SequenceNumbers.UNASSIGNED_SEQ_NO,
+            exists ? InfinoDocumentVersion.PRIMARY_TERM : SequenceNumbers.UNASSIGNED_PRIMARY_TERM,
+            exists ? InfinoDocumentVersion.VERSION : -1L,
             exists,
             bytes,
             Map.of(),

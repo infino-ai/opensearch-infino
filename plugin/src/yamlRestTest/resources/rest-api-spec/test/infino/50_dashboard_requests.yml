@@ -152,3 +152,31 @@
   - match: { aggregations.2.buckets.2.key: US }
   - match: { aggregations.2.buckets.2.1.hits.hits.0._id: "3" }
   - match: { aggregations.2.buckets.2.1.hits.hits.0.fields.bytes: [128] }
+
+  # A filter pill on a keyword field is a match_phrase, beside the search bar's query_string.
+  - do:
+      search:
+        index: web
+        body:
+          size: 0
+          query:
+            bool:
+              must: [ { query_string: { query: "index.html", analyze_wildcard: true, time_zone: "America/New_York" } } ]
+              filter: [ { match_phrase: { host: n1 } } ]
+              should: []
+              must_not: []
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: web
+        body:
+          size: 0
+          query: { bool: { filter: [ { match_phrase: { host: n1 } } ] } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: web
+        body:
+          size: 0
+          query: { multi_match: { query: "n2", fields: [ "host", "message" ], type: phrase } }
+  - match: { hits.total.value: 1 }

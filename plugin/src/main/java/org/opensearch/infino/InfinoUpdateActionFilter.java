@@ -19,6 +19,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.tasks.Task;
 
+import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
 
@@ -72,8 +73,9 @@ public class InfinoUpdateActionFilter implements ActionFilter {
         BulkRequest bulk = new BulkRequest().add(update).setRefreshPolicy(update.getRefreshPolicy());
         InfinoBulkActionFilter.createMissing(InfinoBulkActionFilter.missingIndices(clusters, bulk), ActionListener.wrap(created -> {
             Map<String, IndexMetadata> infino;
+            List<String> concrete = InfinoBulkActionFilter.concreteIndices(clusters.state(), bulk);
             try {
-                infino = InfinoBulkActionFilter.infinoIndices(clusters, bulk);
+                infino = InfinoBulkActionFilter.infinoIndices(clusters, concrete);
             } catch (Exception e) {
                 listener.onFailure(e);
                 return;
@@ -82,7 +84,7 @@ public class InfinoUpdateActionFilter implements ActionFilter {
                 chain.proceed(task, action, request, listener);
                 return;
             }
-            InfinoBulkActionFilter.serve(bulk, infino, writes, tables, ActionListener.wrap(response -> {
+            InfinoBulkActionFilter.serve(bulk, concrete, infino, writes, tables, ActionListener.wrap(response -> {
                 BulkItemResponse item = response.getItems()[0];
                 if (item.isFailed()) {
                     listener.onFailure(item.getFailure().getCause());

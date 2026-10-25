@@ -70,10 +70,10 @@ public final class InfinoWriter {
     /** Source bytes a batch may hold while an append runs. */
     private static final long MAX_BATCH_BYTES = Long.getLong("infino.batch.bytes", 64L << 20);
     /** Version reported for every write; the table keeps no per-document version. */
-    private static final long VERSION = 1L;
+    private static final long VERSION = InfinoDocumentVersion.VERSION;
     /** Sequence number and primary term reported for every write; the table keeps neither. */
-    private static final long SEQ_NO = SequenceNumbers.UNASSIGNED_SEQ_NO;
-    private static final long PRIMARY_TERM = SequenceNumbers.UNASSIGNED_PRIMARY_TERM;
+    private static final long SEQ_NO = InfinoDocumentVersion.SEQ_NO;
+    private static final long PRIMARY_TERM = InfinoDocumentVersion.PRIMARY_TERM;
 
     /**
      * One write a bulk item asks for: the source to append (null for a

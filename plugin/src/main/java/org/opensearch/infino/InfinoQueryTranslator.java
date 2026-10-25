@@ -280,14 +280,11 @@ final class InfinoQueryTranslator {
         }
         if (qb instanceof MatchPhraseQueryBuilder mp) {
             // A quoted query is a phrase to the engine: the terms adjacent, in order.
-            return text(mp.fieldName(), phrase(String.valueOf(mp.value())), Operator.AND, positive);
+            return text(mp.fieldName(), String.valueOf(mp.value()), Operator.AND, positive, true);
         }
         if (qb instanceof MultiMatchQueryBuilder mm) {
-            String value = String.valueOf(mm.value());
-            if (mm.type() == MultiMatchQueryBuilder.Type.PHRASE) {
-                value = phrase(value);
-            }
-            return textOnFields(new ArrayList<>(mm.fields().keySet()), value, mm.operator(), positive);
+            boolean asPhrase = mm.type() == MultiMatchQueryBuilder.Type.PHRASE;
+            return textOnFields(new ArrayList<>(mm.fields().keySet()), String.valueOf(mm.value()), mm.operator(), positive, asPhrase, true);
         }
         if (qb instanceof QueryStringQueryBuilder qs) {
             return queryString(qs.queryString(), qs.defaultField(), new ArrayList<>(qs.fields().keySet()), qs.defaultOperator(), positive);
@@ -397,6 +394,16 @@ final class InfinoQueryTranslator {
     // ---- full text ----
 
     private String text(String field, String value, Operator op, boolean positive) {
+        return text(field, value, op, positive, false);
+    }
+
+    /**
+     * A match or, with {@code asPhrase}, a match_phrase on one field: on a
+     * text column the engine's token query (the phrase quoted, so its terms
+     * match adjacent and in order), on an exact column an equality of the
+     * value as given, which is what a phrase over a keyword means.
+     */
+    private String text(String field, String value, Operator op, boolean positive, boolean asPhrase) {
         Column c = column(field);
         if (c == null) {
             return NONE;
@@ -405,7 +412,7 @@ final class InfinoQueryTranslator {
             // A match on an exact column is an equality, whatever the column's type.
             return equality(field, value);
         }
-        return textClause(c.name(), value, op == Operator.AND ? "and" : "or", positive);
+        return textClause(c.name(), asPhrase ? phrase(value) : value, op == Operator.AND ? "and" : "or", positive);
     }
 
     private String textClause(String column, String query, String mode, boolean positive) {
@@ -433,26 +440,41 @@ final class InfinoQueryTranslator {
             + "))";
     }
 
-    private String textOnFields(List<String> fields, String value, Operator op, boolean positive) {
+    /**
+     * A clause over several {@code fields}: any of the text columns matching
+     * the query (as a phrase when {@code asPhrase}), or, with
+     * {@code exactToo}, any of the exact columns equal to the value as
+     * given (a multi_match or a bare query-string term reaches keyword
+     * fields that way; a composed engine query does not). A field the table
+     * has no column for matches nothing.
+     */
+    private String textOnFields(List<String> fields, String value, Operator op, boolean positive, boolean asPhrase, boolean exactToo) {
         List<String> indexed = new ArrayList<>();
+        List<String> exact = new ArrayList<>();
         for (String f : fields) {
             Column c = column(f);
-            if (c != null && c.fts()) {
+            if (c == null) {
+                continue;
+            }
+            if (c.fts()) {
                 indexed.add(c.name());
+            } else if (exactToo) {
+                exact.add(equality(f, value));
             }
         }
-        if (indexed.isEmpty()) {
+        if (indexed.isEmpty() && exact.isEmpty()) {
             return NONE;
         }
         String mode = op == Operator.AND ? "and" : "or";
-        if (indexed.size() == 1) {
-            return textClause(indexed.get(0), value, mode, positive);
+        String query = asPhrase ? phrase(value) : value;
+        if (indexed.size() == 1 && exact.isEmpty()) {
+            return textClause(indexed.get(0), query, mode, positive);
         }
-        List<String> or = new ArrayList<>();
+        List<String> or = new ArrayList<>(exact);
         for (String column : indexed) {
-            or.add(textClause(column, value, mode, false));
+            or.add(textClause(column, query, mode, false));
         }
-        return "(" + String.join(" OR ", or) + ")";
+        return or.size() == 1 ? or.get(0) : "(" + String.join(" OR ", or) + ")";
     }
 
     /** The query that matches {@code value} as a phrase: the engine reads a quoted run as adjacent terms in order. */
@@ -506,7 +528,7 @@ final class InfinoQueryTranslator {
         if (n instanceof Bool b) {
             String engine = engineQuery(b);
             if (engine != null) {
-                return textOnFields(targets, engine, Operator.OR, positive);
+                return textOnFields(targets, engine, Operator.OR, positive, false, false);
             }
             // Lucene's clause list: the required clauses match on their own, the
             // optional ones only when nothing is required, the prohibited never.
@@ -546,7 +568,7 @@ final class InfinoQueryTranslator {
                 throw new InfinoLuceneQuery.Malformed("[" + query + "] asks for proximity on [\"" + t.text() + "\"], which the token index does not serve; a phrase matches adjacent terms");
             }
             if (t.field() == null) {
-                return textOnFields(targets, t.quoted() ? phrase(t.text()) : t.text(), op, positive);
+                return textOnFields(targets, t.text(), op, positive, t.quoted(), true);
             }
             return fieldAtom(new Atom((char) 0, t.field(), t.text(), t.quoted()));
         }
