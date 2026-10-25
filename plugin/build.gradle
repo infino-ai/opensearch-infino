@@ -60,9 +60,12 @@ opensearchplugin {
     }
 }
 
-// The security plugin's classes differ between the majors; the tree for the
-// target release joins the build.
-sourceSets.main.java.srcDirs += extendsSecurity ? 'src/main/java3' : 'src/main/java2'
+// Two classes exist per release line: the one reading the security plugin's
+// rules (its own evaluation from 3.6, the thread context before) and the
+// one holding the node client (whose package moved in 3.0). The tree for
+// the target release joins the build.
+sourceSets.main.java.srcDirs += extendsSecurity ? 'src/main/security3' : 'src/main/security2'
+sourceSets.main.java.srcDirs += versionMajor >= 3 ? 'src/main/client3' : 'src/main/client2'
 
 configurations {
     securityPlugin

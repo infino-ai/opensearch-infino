@@ -1,0 +1,194 @@
+---
+"Scroll: pages in a fixed order, keeps its place per index, computes aggregations once, clears":
+  - do:
+      indices.create:
+        index: scr1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              n: { type: long }
+              title: { type: text }
+  - do:
+      indices.create:
+        index: scr2
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              n: { type: long }
+              title: { type: text }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: scr1, _id: "a1" }
+          - { tag: x, n: 1, title: "wool coat" }
+          - index: { _index: scr1, _id: "a2" }
+          - { tag: y, n: 2, title: "silk scarf" }
+          - index: { _index: scr1, _id: "a3" }
+          - { tag: x, n: 3, title: "wool hat" }
+          - index: { _index: scr1, _id: "a4" }
+          - { tag: y, n: 4, title: "felt hat" }
+          - index: { _index: scr1, _id: "a5" }
+          - { tag: x, n: 5, title: "wool scarf" }
+          - index: { _index: scr2, _id: "b1" }
+          - { tag: z, n: 10, title: "cotton coat" }
+          - index: { _index: scr2, _id: "b2" }
+          - { tag: z, n: 11, title: "cotton hat" }
+          - index: { _index: scr2, _id: "b3" }
+          - { tag: z, n: 12, title: "cotton scarf" }
+  - match: { errors: false }
+
+  # A scroll without a sort pages by id; the total is the first page's on every page; an exhausted scroll answers empty.
+  - do:
+      search:
+        index: scr1
+        scroll: 1m
+        body: { size: 2 }
+  - set: { _scroll_id: sid }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "a1" }
+  - match: { hits.hits.1._id: "a2" }
+  - do:
+      scroll:
+        body: { scroll_id: $sid, scroll: 1m }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "a3" }
+  - match: { hits.hits.1._id: "a4" }
+  - do:
+      scroll:
+        body: { scroll_id: $sid, scroll: 1m }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "a5" }
+  - do:
+      scroll:
+        body: { scroll_id: $sid, scroll: 1m }
+  - length: { hits.hits: 0 }
+  - match: { hits.total.value: 5 }
+  - do:
+      clear_scroll:
+        body: { scroll_id: $sid }
+  - match: { succeeded: true }
+  - match: { num_freed: 1 }
+  - do:
+      catch: missing
+      scroll:
+        body: { scroll_id: $sid, scroll: 1m }
+
+  # A sorted scroll over two indices merges the pages in order and keeps a place in each; the aggregation comes once.
+  - do:
+      search:
+        index: scr*
+        scroll: 1m
+        body:
+          size: 3
+          sort: [ { n: desc } ]
+          aggs: { total_n: { sum: { field: n } } }
+  - set: { _scroll_id: sid2 }
+  - match: { hits.total.value: 8 }
+  - match: { aggregations.total_n.value: 48 }
+  - match: { hits.hits.0._source.n: 12 }
+  - match: { hits.hits.1._source.n: 11 }
+  - match: { hits.hits.2._source.n: 10 }
+  - do:
+      scroll:
+        body: { scroll_id: $sid2, scroll: 1m }
+  - is_false: aggregations
+  - match: { hits.total.value: 8 }
+  - match: { hits.hits.0._source.n: 5 }
+  - match: { hits.hits.1._source.n: 4 }
+  - match: { hits.hits.2._source.n: 3 }
+  - do:
+      scroll:
+        body: { scroll_id: $sid2, scroll: 1m }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._source.n: 2 }
+  - match: { hits.hits.1._source.n: 1 }
+  - do:
+      clear_scroll:
+        body: { scroll_id: _all }
+  - match: { succeeded: true }
+
+  # A text query scrolls too, in id order, with the match count as its total.
+  - do:
+      search:
+        index: scr1
+        scroll: 1m
+        body: { size: 10, query: { match: { title: wool } } }
+  - set: { _scroll_id: sid3 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "a1" }
+  - match: { hits.hits.1._id: "a3" }
+  - match: { hits.hits.2._id: "a5" }
+  - do:
+      clear_scroll:
+        body: { scroll_id: $sid3 }
+  - match: { num_freed: 1 }
+
+---
+"The reindex family runs on the scroll: delete_by_query, update_by_query, reindex":
+  - skip:
+      version: " - 3.5.99"
+      reason: the test distributions before 3.6 ship without the reindex module, which registers these endpoints
+  - do:
+      indices.create:
+        index: rx1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: rx1, _id: "c1" }
+          - { tag: x, n: 1 }
+          - index: { _index: rx1, _id: "c2" }
+          - { tag: y, n: 2 }
+          - index: { _index: rx1, _id: "c3" }
+          - { tag: x, n: 3 }
+          - index: { _index: rx1, _id: "c4" }
+          - { tag: y, n: 4 }
+  - match: { errors: false }
+  - do:
+      delete_by_query:
+        index: rx1
+        refresh: true
+        body: { query: { term: { tag: y } } }
+  - match: { deleted: 2 }
+  - do:
+      count:
+        index: rx1
+  - match: { count: 2 }
+  - do:
+      update_by_query:
+        index: rx1
+        refresh: true
+        body: { script: { source: "ctx._source.n = ctx._source.n * 10", lang: painless } }
+  - match: { updated: 2 }
+  - do:
+      get:
+        index: rx1
+        id: c3
+  - match: { _source.n: 30 }
+  - do:
+      reindex:
+        refresh: true
+        body: { source: { index: rx1 }, dest: { index: rx2 } }
+  - match: { created: 2 }
+  - do:
+      count:
+        index: rx2
+  - match: { count: 2 }
+  - do:
+      get:
+        index: rx2
+        id: c1
+  - match: { _source.n: 10 }

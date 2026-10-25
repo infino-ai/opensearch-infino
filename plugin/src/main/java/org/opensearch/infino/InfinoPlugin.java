@@ -102,6 +102,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
             new InfinoBulkActionFilter(InfinoServices::clusterService, TABLES, InfinoServices::writer),
             new InfinoUpdateActionFilter(InfinoServices::clusterService, TABLES, InfinoServices::writer),
             new InfinoSearchActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, InfinoServices::scriptService),
+            new InfinoScrollActionFilter(InfinoServices::clusterService, InfinoServices::scriptService),
             new InfinoGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES),
             new InfinoMultiGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES)
         );

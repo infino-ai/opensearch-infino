@@ -16,7 +16,9 @@ import org.opensearch.action.delete.DeleteRequest;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
+import org.opensearch.action.support.AutoCreateIndex;
 import org.opensearch.action.update.UpdateRequest;
+import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.UUIDs;
@@ -32,6 +34,7 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaType;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.VersionType;
 import org.opensearch.index.engine.DocumentMissingException;
 import org.opensearch.index.seqno.SequenceNumbers;
@@ -44,16 +47,27 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /**
  * Serves {@code _bulk} (and so single index, delete and update requests,
  * which OpenSearch runs as one-item bulks) for Infino-backed indices from
- * the table, before the request is routed to any shard. Nothing reaches
+ * their tables, before the request is routed to any shard. Nothing reaches
  * Lucene: the index exists in cluster state as a name, a mapping and its
  * settings, and every row lives in the table.
+ *
+ * <p>An index a write names before it exists is created first, as a stock
+ * bulk would create it and under the cluster's rule for that, so the write
+ * lands in the table the new index is backed by rather than in the shard
+ * the stock path would have created it for. A bulk over several
+ * Infino-backed indices is served per index, the items answered in the
+ * bulk's own order.
  *
  * <p>An update is merged here into the document it targets. The writes then
  * go to the table's {@link InfinoWriter}, which batches them across requests
@@ -101,20 +115,64 @@ public class InfinoBulkActionFilter implements ActionFilter {
             chain.proceed(task, action, request, listener);
             return;
         }
-        Map<String, IndexMetadata> infino = infinoIndices(clusters, bulk);
-        if (infino.isEmpty()) {
-            chain.proceed(task, action, request, listener);
-            return;
-        }
         @SuppressWarnings("unchecked")
         ActionListener<BulkResponse> cast = (ActionListener<BulkResponse>) listener;
-        serve(bulk, infino, writes, tables, cast);
+        createMissing(missingIndices(clusters, bulk), ActionListener.wrap(created -> {
+            Map<String, IndexMetadata> infino;
+            try {
+                infino = infinoIndices(clusters, bulk);
+            } catch (Exception e) {
+                listener.onFailure(e);
+                return;
+            }
+            if (infino.isEmpty()) {
+                chain.proceed(task, action, request, listener);
+                return;
+            }
+            serve(bulk, infino, writes, tables, cast);
+        }, listener::onFailure));
+    }
+
+    /**
+     * The indices the bulk's items name that do not exist and the cluster
+     * would create for a stock bulk, in order; empty when none. When the
+     * cluster's rule forbids creating one, nothing is listed: the stock path
+     * reports the missing index.
+     */
+    static List<String> missingIndices(ClusterService clusters, BulkRequest bulk) {
+        ClusterState state = clusters.state();
+        AutoCreateIndex rule = InfinoServices.autoCreateIndex();
+        Set<String> missing = new LinkedHashSet<>();
+        for (DocWriteRequest<?> item : bulk.requests()) {
+            String name = item.index();
+            if (name == null || state.metadata().getIndicesLookup().containsKey(name) || missing.contains(name)) {
+                continue;
+            }
+            try {
+                if (rule != null && rule.shouldAutoCreate(name, state)) {
+                    missing.add(name);
+                }
+            } catch (IndexNotFoundException e) {
+                // The rule forbids creating it; the stock path answers the item.
+            }
+        }
+        return new ArrayList<>(missing);
+    }
+
+    /** Create the indices named, one after another, then tell {@code then}. */
+    static void createMissing(List<String> names, ActionListener<Void> then) {
+        if (names.isEmpty()) {
+            then.onResponse(null);
+            return;
+        }
+        String first = names.get(0);
+        List<String> rest = names.subList(1, names.size());
+        InfinoClient.createIndex(first, ActionListener.wrap(created -> createMissing(rest, then), then::onFailure));
     }
 
     /**
      * The Infino-backed indices a bulk's items target, by name; empty when
-     * none does. A bulk that mixes them with other indices, or spans more
-     * than one, is refused.
+     * none does. A bulk that mixes them with other indices is refused.
      */
     static Map<String, IndexMetadata> infinoIndices(ClusterService clusters, BulkRequest bulk) {
         Map<String, IndexMetadata> infino = new LinkedHashMap<>();
@@ -132,26 +190,76 @@ public class InfinoBulkActionFilter implements ActionFilter {
         if (infinoItems != bulk.requests().size()) {
             throw new IllegalArgumentException("[infino] a bulk mixing Infino-backed indices with others is not served");
         }
-        if (infino.size() != 1) {
-            throw new IllegalArgumentException("[infino] a bulk over more than one Infino-backed index is not served; send one bulk per index");
-        }
         return infino;
     }
 
-    /** Serve a bulk over one Infino-backed index: stage its items and hand them to the table's writer. */
+    /**
+     * Serve a bulk over Infino-backed indices: stage the items of each index
+     * and hand them to its table's writer. With several indices, each index's
+     * items go to their own waiter and the bulk is answered when every waiter
+     * has, each item in the bulk's own slot.
+     */
     static void serve(BulkRequest bulk, Map<String, IndexMetadata> infino, InfinoWriter writes, InfinoTables tables, ActionListener<BulkResponse> listener) {
         long start = System.nanoTime();
         try {
-            IndexMetadata md = infino.values().iterator().next();
-            String table = tables.ensure(md);
             BulkItemResponse[] items = new BulkItemResponse[bulk.requests().size()];
-            ShardId shardId = new ShardId(md.getIndex(), 0);
-            Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, bulk.requests(), writes), items, start, listener);
-            writes.submit(table, waiter);
+            if (infino.size() == 1) {
+                IndexMetadata md = infino.values().iterator().next();
+                String table = tables.ensure(md);
+                ShardId shardId = new ShardId(md.getIndex(), 0);
+                Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, bulk.requests(), writes), items, start, listener);
+                writes.submit(table, waiter);
+                return;
+            }
+            Map<String, List<Integer>> slotsByIndex = new LinkedHashMap<>();
+            for (int slot = 0; slot < bulk.requests().size(); slot++) {
+                slotsByIndex.computeIfAbsent(bulk.requests().get(slot).index(), k -> new ArrayList<>()).add(slot);
+            }
+            AtomicInteger pending = new AtomicInteger(slotsByIndex.size());
+            AtomicReference<Exception> failure = new AtomicReference<>();
+            for (Map.Entry<String, List<Integer>> group : slotsByIndex.entrySet()) {
+                IndexMetadata md = infino.get(group.getKey());
+                List<Integer> slots = group.getValue();
+                List<DocWriteRequest<?>> requests = new ArrayList<>(slots.size());
+                for (int slot : slots) {
+                    requests.add(bulk.requests().get(slot));
+                }
+                BulkItemResponse[] part = new BulkItemResponse[slots.size()];
+                ActionListener<BulkResponse> partListener = ActionListener.wrap(response -> {
+                    for (int i = 0; i < slots.size(); i++) {
+                        items[slots.get(i)] = reslot(response.getItems()[i], slots.get(i));
+                    }
+                    if (pending.decrementAndGet() == 0) {
+                        finish(items, failure.get(), start, listener);
+                    }
+                }, e -> {
+                    failure.compareAndSet(null, e);
+                    if (pending.decrementAndGet() == 0) {
+                        finish(items, failure.get(), start, listener);
+                    }
+                });
+                String table = tables.ensure(md);
+                ShardId shardId = new ShardId(md.getIndex(), 0);
+                Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, requests, writes), part, start, partListener);
+                writes.submit(table, waiter);
+            }
         } catch (Exception e) {
             log.warn("[infino] bulk failed", e);
             listener.onFailure(e);
         }
+    }
+
+    private static void finish(BulkItemResponse[] items, Exception failure, long start, ActionListener<BulkResponse> listener) {
+        if (failure != null) {
+            listener.onFailure(failure);
+            return;
+        }
+        listener.onResponse(new BulkResponse(items, (System.nanoTime() - start) / 1_000_000L));
+    }
+
+    /** An item's response under the slot it has in the whole bulk. */
+    private static BulkItemResponse reslot(BulkItemResponse r, int slot) {
+        return r.isFailed() ? new BulkItemResponse(slot, r.getOpType(), r.getFailure()) : new BulkItemResponse(slot, r.getOpType(), r.getResponse());
     }
 
     /** Check every item against the table and turn it into a write, or answer it now when it cannot be written. */

@@ -4,6 +4,7 @@
 
 package org.opensearch.infino;
 
+import org.opensearch.action.support.AutoCreateIndex;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
@@ -30,6 +31,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     private static volatile NamedWriteableRegistry namedWriteableRegistry;
     private static volatile IndexNameExpressionResolver indexNameExpressionResolver;
     private static volatile InfinoWriter writer;
+    private static volatile AutoCreateIndex autoCreateIndex;
 
     @Inject
     public InfinoServices(
@@ -46,8 +48,16 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoServices.namedWriteableRegistry = namedWriteableRegistry;
         InfinoServices.indexNameExpressionResolver = indexNameExpressionResolver;
         InfinoServices.writer = new InfinoWriter(threadPool);
+        // The node's own rule for creating an index a write names before it exists.
+        InfinoServices.autoCreateIndex = injector.getInstance(AutoCreateIndex.class);
+        InfinoClient.bind(injector);
         // The security plugin's components, when it runs, come from the same injector.
         InfinoSecurity.bind(injector);
+    }
+
+    /** Whether the cluster would create an index a write names before it exists, as it decides for a stock bulk. */
+    static AutoCreateIndex autoCreateIndex() {
+        return autoCreateIndex;
     }
 
     static ClusterService clusterService() {
@@ -85,10 +95,14 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     }
 
     @Override
-    protected void doStart() {}
+    protected void doStart() {
+        InfinoScrolls.start(threadPool);
+    }
 
     @Override
-    protected void doStop() {}
+    protected void doStop() {
+        InfinoScrolls.stop();
+    }
 
     @Override
     protected void doClose() throws IOException {}

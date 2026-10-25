@@ -60,6 +60,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -104,6 +105,8 @@ public final class InfinoSearch {
     private static final long UNVERSIONED = 1L;
     /** How a date in a hit's source is read back before it is printed in a requested format. */
     private static final String READ_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
+    /** The sort a scroll without one pages by: the document id, which {@link #columnFor} resolves to the id column. */
+    private static final String ID_SORT_FIELD = "_id";
 
     private InfinoSearch() {}
 
@@ -775,24 +778,63 @@ public final class InfinoSearch {
         ScriptService scripts,
         long startNanos
     ) {
+        return search(indices, tableOf, accessOf, source, null, null, null, scripts, startNanos).response();
+    }
+
+    /** A response and, for a scroll, the cursor it stopped at: the sort values of the last hit handed out from each index. */
+    record Searched(SearchResponse response, Map<Index, Object[]> after) {}
+
+    /**
+     * As {@link #search(List, Function, Function, SearchSourceBuilder, ScriptService, long)},
+     * and for a scroll: {@code after} is the cursor each index resumes from
+     * (an index absent from it starts at the top; null when not scrolling),
+     * {@code total} the hit count the first page established (null to count
+     * now), {@code scrollId} what the response carries.
+     */
+    static Searched search(
+        List<Index> indices,
+        Function<Index, String> tableOf,
+        Function<Index, InfinoAccess> accessOf,
+        SearchSourceBuilder source,
+        Map<Index, Object[]> after,
+        TotalHits total,
+        String scrollId,
+        ScriptService scripts,
+        long startNanos
+    ) {
         long now = System.currentTimeMillis();
         List<Page> pages = new ArrayList<>();
         List<InternalAggregations> aggs = new ArrayList<>();
         Collection<AggregationBuilder> builders = builders(source);
         List<SortSpec> sorts = List.of();
         for (Index index : indices) {
-            Plan plan = plan(tableOf.apply(index), source, now, accessOf.apply(index));
+            SearchSourceBuilder perIndex = after == null || after.get(index) == null ? source : withSearchAfter(source, after.get(index));
+            Plan plan = plan(tableOf.apply(index), perIndex, now, accessOf.apply(index));
             sorts = plan.sorts();
-            Page page = page(index, plan, source);
+            Page page = page(index, plan, perIndex);
             pages.add(page);
             if (!builders.isEmpty()) {
                 // Aggregations see the query, not the post_filter, so a post-filtered
                 // page's total is not theirs.
-                Long total = page.exact() && plan.vector() == null && plan.postWhere() == null ? page.total() : null;
-                aggs.add(new InfinoAggregationProcessor(index).evaluate(builders, plan, total));
+                Long pageTotal = page.exact() && plan.vector() == null && plan.postWhere() == null ? page.total() : null;
+                aggs.add(new InfinoAggregationProcessor(index).evaluate(builders, plan, pageTotal));
             }
         }
-        SearchHits hits = merge(pages, source, sorts);
+        SearchHits hits = merge(pages, source, sorts, total);
+        Map<Index, Object[]> cursor = null;
+        if (after != null) {
+            // Where each index stopped: the sort values of its last hit on this
+            // page, which carry the id as the last key, so the next page resumes
+            // between rows.
+            cursor = new HashMap<>(after);
+            for (SearchHit h : hits.getHits()) {
+                for (Index index : indices) {
+                    if (index.getName().equals(h.getIndex())) {
+                        cursor.put(index, h.getSortValues());
+                    }
+                }
+            }
+        }
         InternalAggregations reduced = null;
         if (!aggs.isEmpty()) {
             InternalAggregation.ReduceContext ctx = InternalAggregation.ReduceContext.forFinalReduction(
@@ -805,9 +847,9 @@ public final class InfinoSearch {
         }
         SearchResponseSections sections = new SearchResponseSections(hits, reduced, null, false, null, null, 1);
         long tookMillis = (System.nanoTime() - startNanos) / 1_000_000L;
-        return new SearchResponse(
+        SearchResponse response = new SearchResponse(
             sections,
-            null,
+            scrollId,
             indices.size(),
             indices.size(),
             0,
@@ -815,15 +857,78 @@ public final class InfinoSearch {
             ShardSearchFailure.EMPTY_ARRAY,
             SearchResponse.Clusters.EMPTY
         );
+        return new Searched(response, cursor);
+    }
+
+    /** The request with its page starting after {@code values}, the rest as it is. */
+    private static SearchSourceBuilder withSearchAfter(SearchSourceBuilder source, Object[] values) {
+        return source.shallowCopy().searchAfter(values);
+    }
+
+    /**
+     * The request a scroll's later pages run: the first page's query, sorts,
+     * window and fields, without its aggregations (a scroll computes them
+     * once) and without a count (the first page's total is repeated). A
+     * scroll pages in a fixed order, so a request that names no sort is
+     * ordered by the id; {@code _doc}, which the reindex family sends,
+     * reads the same way.
+     */
+    static SearchSourceBuilder scrollSource(SearchSourceBuilder source) {
+        SearchSourceBuilder out = new SearchSourceBuilder();
+        out.query(source.query());
+        if (source.postFilter() != null) {
+            out.postFilter(source.postFilter());
+        }
+        out.size(source.size() < 0 ? DEFAULT_SIZE : source.size());
+        boolean sorted = false;
+        if (source.sorts() != null) {
+            for (SortBuilder<?> sort : source.sorts()) {
+                if (sort instanceof FieldSortBuilder fs && FieldSortBuilder.DOC_FIELD_NAME.equals(fs.getFieldName())) {
+                    continue;
+                }
+                if (sort instanceof ScoreSortBuilder) {
+                    continue;
+                }
+                out.sort(sort);
+                sorted = true;
+            }
+        }
+        if (!sorted) {
+            out.sort(ID_SORT_FIELD);
+        }
+        if (source.fetchSource() != null) {
+            out.fetchSource(source.fetchSource());
+        }
+        if (source.docValueFields() != null) {
+            for (FieldAndFormat f : source.docValueFields()) {
+                out.docValueField(f.field, f.format);
+            }
+        }
+        if (source.fetchFields() != null) {
+            for (FieldAndFormat f : source.fetchFields()) {
+                out.fetchField(f.field, f.format);
+            }
+        }
+        if (source.scriptFields() != null) {
+            for (SearchSourceBuilder.ScriptField sf : source.scriptFields()) {
+                out.scriptField(sf.fieldName(), sf.script(), sf.ignoreFailure());
+            }
+        }
+        if (Boolean.TRUE.equals(source.version())) {
+            out.version(true);
+        }
+        out.trackTotalHits(false);
+        return out;
     }
 
     /**
      * The pages merged by sort values, else by score, then cut to the
      * request's window: each page carries every row up to the window's end,
      * and the window is applied once here, as a coordinator applies it over
-     * its shards.
+     * its shards. {@code fixedTotal} stands in for the pages' own count when
+     * given (a scroll's later pages repeat the first page's).
      */
-    private static SearchHits merge(List<Page> pages, SearchSourceBuilder source, List<SortSpec> sorts) {
+    private static SearchHits merge(List<Page> pages, SearchSourceBuilder source, List<SortSpec> sorts, TotalHits fixedTotal) {
         long total = 0;
         boolean exact = true;
         float maxScore = Float.NaN;
@@ -843,7 +948,9 @@ public final class InfinoSearch {
         int from = Math.max(0, source.from());
         int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
         all = all.subList(Math.min(from, all.size()), Math.min(all.size(), from + size));
-        TotalHits totalHits = new TotalHits(total, exact ? TotalHits.Relation.EQUAL_TO : TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+        TotalHits totalHits = fixedTotal != null
+            ? fixedTotal
+            : new TotalHits(total, exact ? TotalHits.Relation.EQUAL_TO : TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
         return new SearchHits(all.toArray(new SearchHit[0]), totalHits, maxScore);
     }
 

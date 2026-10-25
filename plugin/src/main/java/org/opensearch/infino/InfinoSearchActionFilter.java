@@ -24,15 +24,18 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
  * Serves {@code _search} (and so {@code _count} and each request of an
  * {@code _msearch}) for Infino-backed indices from their tables, before the
  * request is routed to any shard. A request over other indices proceeds as
- * usual; one mixing both is refused. Scroll requests are refused: the table
- * answers a page by its window.
+ * usual; one mixing both is refused. A scroll request opens a scroll (see
+ * {@link InfinoScrolls}) and answers its first page.
  */
 public class InfinoSearchActionFilter implements ActionFilter {
 
@@ -97,23 +100,19 @@ public class InfinoSearchActionFilter implements ActionFilter {
             listener.onFailure(new IllegalArgumentException("[infino] a search mixing Infino-backed indices with others is not served"));
             return;
         }
-        if (search.scroll() != null) {
-            listener.onFailure(new IllegalArgumentException("[infino] scroll is not served by the table; page with from and size"));
-            return;
-        }
         long start = System.nanoTime();
         try {
             SearchSourceBuilder source = search.source() == null ? new SearchSourceBuilder() : search.source();
             InfinoTables tables = InfinoPlugin.tables();
+            Function<Index, String> tableOf = index -> tables.ensure(metadata.get(infino.indexOf(index)));
             // Each index is read under what the security plugin lets this user see of it.
-            SearchResponse response = InfinoSearch.search(
-                infino,
-                index -> tables.ensure(metadata.get(infino.indexOf(index))),
-                index -> InfinoSecurity.access(index.getName(), "search"),
-                source,
-                scripts.get(),
-                start
-            );
+            Map<Index, InfinoAccess> access = new HashMap<>();
+            for (Index index : infino) {
+                access.put(index, InfinoSecurity.access(index.getName(), "search"));
+            }
+            SearchResponse response = search.scroll() == null
+                ? InfinoSearch.search(infino, tableOf, access::get, source, scripts.get(), start)
+                : InfinoScrollActionFilter.open(search, infino, tableOf, access, source, scripts.get(), start);
             @SuppressWarnings("unchecked")
             Response cast = (Response) response;
             listener.onResponse(cast);

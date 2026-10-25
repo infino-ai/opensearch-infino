@@ -28,7 +28,8 @@ import java.util.function.Supplier;
  * but an update as its own action that reads the document from the shard
  * first; the shard holds nothing, so the update is turned into a one-item
  * bulk here and served the same way as an update inside a bulk, its item's
- * response handed back as the update's.
+ * response handed back as the update's. An index the update names before
+ * it exists is created first, as for a bulk.
  */
 public class InfinoUpdateActionFilter implements ActionFilter {
 
@@ -69,29 +70,31 @@ public class InfinoUpdateActionFilter implements ActionFilter {
             return;
         }
         BulkRequest bulk = new BulkRequest().add(update).setRefreshPolicy(update.getRefreshPolicy());
-        Map<String, IndexMetadata> infino;
-        try {
-            infino = InfinoBulkActionFilter.infinoIndices(clusters, bulk);
-        } catch (Exception e) {
-            listener.onFailure(e);
-            return;
-        }
-        if (infino.isEmpty()) {
-            chain.proceed(task, action, request, listener);
-            return;
-        }
-        InfinoBulkActionFilter.serve(bulk, infino, writes, tables, ActionListener.wrap(response -> {
-            BulkItemResponse item = response.getItems()[0];
-            if (item.isFailed()) {
-                listener.onFailure(item.getFailure().getCause());
+        InfinoBulkActionFilter.createMissing(InfinoBulkActionFilter.missingIndices(clusters, bulk), ActionListener.wrap(created -> {
+            Map<String, IndexMetadata> infino;
+            try {
+                infino = InfinoBulkActionFilter.infinoIndices(clusters, bulk);
+            } catch (Exception e) {
+                listener.onFailure(e);
                 return;
             }
-            @SuppressWarnings("unchecked")
-            Response cast = (Response) item.getResponse();
-            listener.onResponse(cast);
-        }, e -> {
-            log.debug("[infino] update of {} in {} failed: {}", update.id(), update.index(), e.getMessage());
-            listener.onFailure(e);
-        }));
+            if (infino.isEmpty()) {
+                chain.proceed(task, action, request, listener);
+                return;
+            }
+            InfinoBulkActionFilter.serve(bulk, infino, writes, tables, ActionListener.wrap(response -> {
+                BulkItemResponse item = response.getItems()[0];
+                if (item.isFailed()) {
+                    listener.onFailure(item.getFailure().getCause());
+                    return;
+                }
+                @SuppressWarnings("unchecked")
+                Response cast = (Response) item.getResponse();
+                listener.onResponse(cast);
+            }, e -> {
+                log.debug("[infino] update of {} in {} failed: {}", update.id(), update.index(), e.getMessage());
+                listener.onFailure(e);
+            }));
+        }, listener::onFailure));
     }
 }
