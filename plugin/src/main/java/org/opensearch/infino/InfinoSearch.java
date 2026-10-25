@@ -28,6 +28,8 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
+import org.opensearch.infino.InfinoScriptTranslator.Sql;
+import org.opensearch.infino.InfinoScriptTranslator.SqlType;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
@@ -44,6 +46,7 @@ import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.search.sort.ScoreSortBuilder;
+import org.opensearch.search.sort.ScriptSortBuilder;
 import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.search.sort.SortOrder;
 
@@ -53,6 +56,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
 
@@ -106,7 +110,8 @@ public final class InfinoSearch {
         VectorRequest vector,
         String postWhere,
         Column collapse,
-        Object[] searchAfter
+        Object[] searchAfter,
+        List<ScriptedField> scriptFields
     ) {
         List<String> orderBy() {
             return InfinoSearch.orderBy(sorts);
@@ -118,8 +123,20 @@ public final class InfinoSearch {
         }
     }
 
-    /** One field sort of the request, over a column. */
-    record SortSpec(Column column, boolean desc) {}
+    /**
+     * One sort of the request: a column, or a script as a column expression.
+     * {@code expr} is what the statement orders by and selects, {@code name}
+     * the alias its value comes back under (the column's name, or one made
+     * for a script), {@code type} how a search_after value for it is written.
+     */
+    record SortSpec(String expr, String name, SqlType type, boolean desc) {
+        static SortSpec of(Column c, boolean desc) {
+            return new SortSpec(InfinoQueryTranslator.quoteIdent(c.name()), c.name(), InfinoScriptTranslator.typeOf(c), desc);
+        }
+    }
+
+    /** One scripted field of the request: its name and its expression, selected under {@code alias}. */
+    record ScriptedField(String name, String expr, String alias) {}
 
     /** A kNN or hybrid request, served by the engine's vector search instead of SQL. */
     record VectorRequest(boolean hybrid, String textColumn, String textQuery, String vectorColumn, float[] vector, int k) {}
@@ -179,6 +196,16 @@ public final class InfinoSearch {
                 throw new IllegalArgumentException("[infino] collapse names field [" + cb.getField() + "], which the table has no column for");
             }
         }
+        List<ScriptedField> scriptFields = new ArrayList<>();
+        if (source.scriptFields() != null && !source.scriptFields().isEmpty()) {
+            if (vector != null) {
+                throw new IllegalArgumentException("[infino] script_fields are not served with a vector query");
+            }
+            for (SearchSourceBuilder.ScriptField sf : source.scriptFields()) {
+                Sql sql = InfinoScriptTranslator.translate(sf.script(), cols, null, nowMillis);
+                scriptFields.add(new ScriptedField(sf.fieldName(), sql.expr(), "sf" + scriptFields.size()));
+            }
+        }
         Object[] searchAfter = source.searchAfter();
         if (searchAfter != null) {
             if (sorts.isEmpty()) {
@@ -199,7 +226,7 @@ public final class InfinoSearch {
                 }
             }
         }
-        Plan plan = new Plan(table, cols, query, sorts, vector, postWhere, collapse, searchAfter);
+        Plan plan = new Plan(table, cols, query, sorts, vector, postWhere, collapse, searchAfter, scriptFields);
         InfinoAggregationProcessor.check(builders(source), plan);
         return plan;
     }
@@ -218,6 +245,12 @@ public final class InfinoSearch {
             if (sort instanceof ScoreSortBuilder) {
                 continue;
             }
+            if (sort instanceof ScriptSortBuilder ss) {
+                // A script sort orders by the script as a column expression.
+                Sql sql = InfinoScriptTranslator.translate(ss.script(), cols, null, System.currentTimeMillis());
+                out.add(new SortSpec(sql.expr(), "sort" + out.size(), sql.type(), ss.order() == SortOrder.DESC));
+                continue;
+            }
             if (!(sort instanceof FieldSortBuilder fs)) {
                 throw new IllegalArgumentException("[infino] sort not served by the table: " + sort);
             }
@@ -228,16 +261,16 @@ public final class InfinoSearch {
             if (c == null) {
                 throw new IllegalArgumentException("[infino] sort names field [" + fs.getFieldName() + "], which the table has no column for");
             }
-            out.add(new SortSpec(c, fs.order() == SortOrder.DESC));
+            out.add(SortSpec.of(c, fs.order() == SortOrder.DESC));
         }
         return out;
     }
 
-    /** ORDER BY terms for field sorts: each column in its direction, missing values last. */
+    /** ORDER BY terms for the sorts: each expression in its direction, missing values last. */
     static List<String> orderBy(List<SortSpec> sorts) {
         List<String> out = new ArrayList<>(sorts.size());
         for (SortSpec s : sorts) {
-            out.add(InfinoQueryTranslator.quoteIdent(s.column().name()) + (s.desc() ? " DESC" : " ASC") + " NULLS LAST");
+            out.add(s.expr() + (s.desc() ? " DESC" : " ASC") + " NULLS LAST");
         }
         return out;
     }
@@ -346,7 +379,7 @@ public final class InfinoSearch {
                 Object[] values = new Object[plan.sorts().size()];
                 DocValueFormat[] formats = new DocValueFormat[values.length];
                 for (int k = 0; k < values.length; k++) {
-                    values[k] = row.get(plan.sorts().get(k).column().name());
+                    values[k] = row.get(plan.sorts().get(k).name());
                     formats[k] = DocValueFormat.RAW;
                 }
                 h.sortValues(values, formats);
@@ -356,6 +389,11 @@ public final class InfinoSearch {
                 String field = plan.collapse().name();
                 Object value = row.get(field);
                 h.setDocumentField(field, new DocumentField(field, value == null ? List.of() : List.of(value)));
+            }
+            for (ScriptedField sf : plan.scriptFields()) {
+                // A scripted field comes back under its name, as stock's fetch phase returns it.
+                Object value = row.get(sf.alias());
+                h.setDocumentField(sf.name(), new DocumentField(sf.name(), value == null ? List.of() : List.of(value)));
             }
             hits.add(h);
         }
@@ -375,10 +413,13 @@ public final class InfinoSearch {
         Translation q = plan.query();
         StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE);
         for (SortSpec s : plan.sorts()) {
-            hit.append(", ").append(InfinoQueryTranslator.quoteIdent(s.column().name()));
+            hit.append(", ").append(s.expr()).append(" AS ").append(InfinoQueryTranslator.quoteIdent(s.name()));
         }
-        if (plan.collapse() != null && plan.sorts().stream().noneMatch(s -> s.column().name().equals(plan.collapse().name()))) {
+        if (plan.collapse() != null && plan.sorts().stream().noneMatch(s -> s.name().equals(plan.collapse().name()))) {
             hit.append(", ").append(InfinoQueryTranslator.quoteIdent(plan.collapse().name()));
+        }
+        for (ScriptedField sf : plan.scriptFields()) {
+            hit.append(", ").append(sf.expr()).append(" AS ").append(sf.alias());
         }
         String where = plan.hitWhere();
         if (plan.searchAfter() != null) {
@@ -423,10 +464,10 @@ public final class InfinoSearch {
         long now = System.currentTimeMillis();
         for (int i = 0; i < plan.sorts().size(); i++) {
             SortSpec s = plan.sorts().get(i);
-            String col = InfinoQueryTranslator.quoteIdent(s.column().name());
-            String lit = InfinoQueryTranslator.literalFor(s.column(), plan.searchAfter()[i], now);
+            String col = s.expr();
+            String lit = InfinoQueryTranslator.literalForType(s.type(), plan.searchAfter()[i], now);
             if (lit == null) {
-                throw new IllegalArgumentException("[infino] search_after value [" + plan.searchAfter()[i] + "] is not a " + s.column().type());
+                throw new IllegalArgumentException("[infino] search_after value [" + plan.searchAfter()[i] + "] is not a " + s.type().name().toLowerCase(Locale.ROOT));
             }
             List<String> conj = new ArrayList<>(equal);
             conj.add(col + (s.desc() ? " < " : " > ") + lit);
@@ -499,7 +540,7 @@ public final class InfinoSearch {
                 Object[] values = new Object[sorts.size()];
                 DocValueFormat[] formats = new DocValueFormat[values.length];
                 for (int k = 0; k < values.length; k++) {
-                    values[k] = row.get(sorts.get(k).column().name());
+                    values[k] = row.get(sorts.get(k).name());
                     formats[k] = DocValueFormat.RAW;
                 }
                 h.sortValues(values, formats);

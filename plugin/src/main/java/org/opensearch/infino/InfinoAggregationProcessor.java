@@ -26,6 +26,8 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
 import org.opensearch.infino.InfinoSearch.Plan;
+import org.opensearch.infino.InfinoScriptTranslator.Sql;
+import org.opensearch.infino.InfinoScriptTranslator.SqlType;
 import org.opensearch.infino.InfinoSearch.SortSpec;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
@@ -100,6 +102,7 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
 
@@ -294,15 +297,55 @@ public class InfinoAggregationProcessor {
             throw new Unsupported("aggregation [" + b.getName() + "] of type [" + b.getType() + "] is not served");
         }
 
-        static Column columnOf(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols) {
-            if (b.field() == null) {
-                throw new Unsupported("aggregation [" + b.getName() + "] needs a field");
+        /**
+         * What the aggregation reads: its field's column, or its script as a
+         * column expression (a value script, one given beside a field, reads
+         * that field as {@code _value}).
+         */
+        static Source sourceOf(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols) {
+            Column c = null;
+            if (b.field() != null) {
+                c = InfinoSearch.columnFor(cols, b.field());
+                if (c == null) {
+                    throw new Unsupported("aggregation [" + b.getName() + "] names field [" + b.field() + "], which the table has no column for");
+                }
             }
-            Column c = InfinoSearch.columnFor(cols, b.field());
+            if (b.script() != null) {
+                Sql sql = InfinoScriptTranslator.translate(b.script(), cols, c, System.currentTimeMillis());
+                return new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]");
+            }
             if (c == null) {
-                throw new Unsupported("aggregation [" + b.getName() + "] names field [" + b.field() + "], which the table has no column for");
+                throw new Unsupported("aggregation [" + b.getName() + "] needs a field or a script");
             }
-            return c;
+            return Source.of(c);
+        }
+    }
+
+    /** What an aggregation reads, as a column expression with its type; {@code label} names it in a refusal. */
+    record Source(String expr, SqlType type, String label) {
+        static Source of(Column c) {
+            return new Source(quoteIdent(c.name()), InfinoScriptTranslator.typeOf(c), "[" + c.name() + "]");
+        }
+
+        boolean isNumeric() {
+            return type.isNumeric();
+        }
+
+        boolean isTimestamp() {
+            return type == SqlType.DATE;
+        }
+
+        boolean isString() {
+            return type == SqlType.STRING;
+        }
+
+        boolean isBoolean() {
+            return type == SqlType.BOOL;
+        }
+
+        /** The type's name for a refusal. */
+        String typeName() {
+            return type.name().toLowerCase(Locale.ROOT);
         }
     }
 
@@ -320,16 +363,16 @@ public class InfinoAggregationProcessor {
 
     /** A metric over one column: the SQL aggregate columns it needs and the result it builds. */
     static final class Metric extends Spec {
-        final Column column;
+        final Source source;
         final String alias;
         final MetricKind kind;
         final double[] percents;
         final boolean keyed;
         final double compression;
 
-        private Metric(AggregationBuilder b, Column column, String alias, MetricKind kind, double[] percents, boolean keyed, double compression) {
+        private Metric(AggregationBuilder b, Source source, String alias, MetricKind kind, double[] percents, boolean keyed, double compression) {
             super(b);
-            this.column = column;
+            this.source = source;
             this.alias = alias;
             this.kind = kind;
             this.percents = percents;
@@ -349,7 +392,7 @@ public class InfinoAggregationProcessor {
         }
 
         static Metric of(AggregationBuilder b, Map<String, Column> cols, int index) {
-            Column c = columnOf((ValuesSourceAggregationBuilder<?>) b, cols);
+            Source c = sourceOf((ValuesSourceAggregationBuilder<?>) b, cols);
             String alias = "m" + index;
             boolean numeric = c.isNumeric() || c.isTimestamp();
             if (b instanceof ValueCountAggregationBuilder) {
@@ -359,7 +402,7 @@ public class InfinoAggregationProcessor {
                 return new Metric(b, c, alias, MetricKind.CARDINALITY, null, false, 0);
             }
             if (!numeric) {
-                throw new Unsupported("aggregation [" + b.getName() + "] needs a numeric or date field, [" + c.name() + "] is " + c.type());
+                throw new Unsupported("aggregation [" + b.getName() + "] needs a numeric or date value, " + c.label() + " is " + c.typeName());
             }
             if (b instanceof SumAggregationBuilder || b instanceof AvgAggregationBuilder) {
                 if (c.isTimestamp()) {
@@ -400,7 +443,7 @@ public class InfinoAggregationProcessor {
 
         /** The SELECT list entries for this metric. */
         String columns() {
-            String f = quoteIdent(column.name());
+            String f = "(" + source.expr() + ")";
             return switch (kind) {
                 case VALUE_COUNT -> "COUNT(" + f + ") AS " + alias + "_c";
                 case SUM -> "SUM(" + f + ") AS " + alias + "_s";
@@ -607,7 +650,7 @@ public class InfinoAggregationProcessor {
         List<String> rowColumns() {
             List<String> out = new ArrayList<>();
             for (SortSpec s : sorts) {
-                out.add(quoteIdent(s.column().name()));
+                out.add(s.expr() + " AS " + quoteIdent(s.name()));
             }
             return out;
         }
@@ -700,7 +743,7 @@ public class InfinoAggregationProcessor {
 
     /** A grouped bucket level: terms, date_histogram or histogram. */
     static final class Grouped extends BucketSpec {
-        final Column column;
+        final Source source;
         final String keyExpr;
         final KeyKind keyKind;
         final boolean terms;
@@ -714,7 +757,7 @@ public class InfinoAggregationProcessor {
             AggregationBuilder b,
             Leaves leaves,
             BucketSpec child,
-            Column column,
+            Source source,
             String keyExpr,
             KeyKind keyKind,
             boolean terms,
@@ -725,7 +768,7 @@ public class InfinoAggregationProcessor {
             HistKey hist
         ) {
             super(b, leaves, child);
-            this.column = column;
+            this.source = source;
             this.keyExpr = keyExpr;
             this.keyKind = keyKind;
             this.terms = terms;
@@ -737,7 +780,7 @@ public class InfinoAggregationProcessor {
         }
 
         static Grouped terms(TermsAggregationBuilder t, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Column c = columnOf(t, cols);
+            Source c = sourceOf(t, cols);
             if (t.size() > MAX_TERMS_SIZE) {
                 throw new Unsupported("aggregation [" + t.getName() + "] asks for " + t.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
             }
@@ -746,11 +789,11 @@ public class InfinoAggregationProcessor {
             if (order == null) {
                 throw new Unsupported("aggregation [" + t.getName() + "] has an order the table cannot sort by: " + t.order());
             }
-            return new Grouped(t, leaves, child, c, quoteIdent(c.name()), kind, true, t.size(), t.minDocCount(), order, null, null);
+            return new Grouped(t, leaves, child, c, c.expr(), kind, true, t.size(), t.minDocCount(), order, null, null);
         }
 
         static Grouped dateHistogram(DateHistogramAggregationBuilder dh, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Column c = columnOf(dh, cols);
+            Source c = sourceOf(dh, cols);
             ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
             DateExpr expr = dateExpr(dh.getName(), c, tz, dh.getFixedInterval(), dh.getCalendarInterval(), dh.offset());
             DocValueFormat format = dateFormat(dh.format(), tz);
@@ -771,7 +814,7 @@ public class InfinoAggregationProcessor {
         }
 
         static Grouped histogram(HistogramAggregationBuilder h, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Column c = columnOf(h, cols);
+            Source c = sourceOf(h, cols);
             String keyExpr = histExpr(h.getName(), c, h.interval(), h.offset());
             if (h.order() != null && !InternalOrder.isKeyOrder(h.order())) {
                 throw new Unsupported("aggregation [" + h.getName() + "] has an order other than by key");
@@ -785,11 +828,11 @@ public class InfinoAggregationProcessor {
         record DateExpr(String keyExpr, Rounding rounding) {}
 
         /** The date bucket of {@code c} at the interval given, in the request's zone; the aggregation's name is for the refusal. */
-        static DateExpr dateExpr(String agg, Column c, ZoneId tz, DateHistogramInterval fixed, DateHistogramInterval calendar, long offset) {
+        static DateExpr dateExpr(String agg, Source c, ZoneId tz, DateHistogramInterval fixed, DateHistogramInterval calendar, long offset) {
             if (!c.isTimestamp()) {
-                throw new Unsupported("aggregation [" + agg + "] needs a date field, [" + c.name() + "] is " + c.type());
+                throw new Unsupported("aggregation [" + agg + "] needs a date value, " + c.label() + " is " + c.typeName());
             }
-            String source = quoteIdent(c.name());
+            String source = "(" + c.expr() + ")";
             if (!ZoneOffset.UTC.equals(tz) && !"UTC".equals(tz.getId())) {
                 // Bucket boundaries fall on local time in the request's zone; the
                 // epoch value of each boundary is unchanged.
@@ -828,34 +871,26 @@ public class InfinoAggregationProcessor {
         }
 
         /** The numeric bucket of {@code c} at the interval and offset given. */
-        static String histExpr(String agg, Column c, double interval, double offset) {
+        static String histExpr(String agg, Source c, double interval, double offset) {
             if (!c.isNumeric()) {
-                throw new Unsupported("aggregation [" + agg + "] needs a numeric field, [" + c.name() + "] is " + c.type());
+                throw new Unsupported("aggregation [" + agg + "] needs a numeric value, " + c.label() + " is " + c.typeName());
             }
             if (interval <= 0) {
                 throw new Unsupported("aggregation [" + agg + "] has an interval of no length");
             }
-            String f = quoteIdent(c.name());
+            String f = "(" + c.expr() + ")";
             return "floor((" + f + " - " + offset + ") / " + interval + ") * " + interval + " + " + offset;
         }
 
-        static KeyKind kindOf(Column c) {
-            if (c.isString()) {
-                return KeyKind.STR;
-            }
-            if (c.isBoolean()) {
-                return KeyKind.BOOL;
-            }
-            if (c.isTimestamp()) {
-                return KeyKind.DATE;
-            }
-            if ("i64".equals(c.type())) {
-                return KeyKind.LONG;
-            }
-            if ("f64".equals(c.type())) {
-                return KeyKind.DOUBLE;
-            }
-            throw new Unsupported("field [" + c.name() + "] of type " + c.type() + " cannot key buckets");
+        static KeyKind kindOf(Source c) {
+            return switch (c.type()) {
+                case STRING -> KeyKind.STR;
+                case BOOL -> KeyKind.BOOL;
+                case DATE -> KeyKind.DATE;
+                case INT -> KeyKind.LONG;
+                case FLOAT -> KeyKind.DOUBLE;
+                default -> throw new Unsupported(c.label() + " of type " + c.typeName() + " cannot key buckets");
+            };
         }
 
         /** The calendar unit `date_trunc` takes, or null for one it has no name for. */
@@ -1024,9 +1059,9 @@ public class InfinoAggregationProcessor {
         }
 
         static Explicit range(RangeAggregationBuilder r, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Column c = columnOf(r, cols);
+            Source c = sourceOf(r, cols);
             if (!c.isNumeric()) {
-                throw new Unsupported("aggregation [" + r.getName() + "] needs a numeric field, [" + c.name() + "] is " + c.type());
+                throw new Unsupported("aggregation [" + r.getName() + "] needs a numeric value, " + c.label() + " is " + c.typeName());
             }
             List<ExplicitBucket> buckets = new ArrayList<>();
             for (RangeAggregator.Range range : r.ranges()) {
@@ -1038,9 +1073,9 @@ public class InfinoAggregationProcessor {
         }
 
         static Explicit dateRange(DateRangeAggregationBuilder r, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Column c = columnOf(r, cols);
+            Source c = sourceOf(r, cols);
             if (!c.isTimestamp()) {
-                throw new Unsupported("aggregation [" + r.getName() + "] needs a date field, [" + c.name() + "] is " + c.type());
+                throw new Unsupported("aggregation [" + r.getName() + "] needs a date value, " + c.label() + " is " + c.typeName());
             }
             ZoneId tz = r.timeZone() == null ? ZoneOffset.UTC : r.timeZone();
             String fmt = r.format() == null ? DEFAULT_DATE_FORMAT : r.format();
@@ -1069,8 +1104,8 @@ public class InfinoAggregationProcessor {
         }
 
         /** {@code from <= f < to}, each side only when bounded. */
-        private static String between(Column c, double from, double to) {
-            String f = quoteIdent(c.name());
+        private static String between(Source c, double from, double to) {
+            String f = "(" + c.expr() + ")";
             List<String> parts = new ArrayList<>();
             if (!Double.isInfinite(from) && !Double.isNaN(from)) {
                 parts.add(f + " >= " + bound(c, from));
@@ -1081,7 +1116,7 @@ public class InfinoAggregationProcessor {
             return parts.isEmpty() ? InfinoQueryTranslator.ALL : "(" + String.join(" AND ", parts) + ")";
         }
 
-        private static String bound(Column c, double v) {
+        private static String bound(Source c, double v) {
             if (c.isTimestamp()) {
                 return literal(Instant.ofEpochMilli((long) v).toString());
             }
@@ -1144,7 +1179,7 @@ public class InfinoAggregationProcessor {
      */
     static final class Significant extends BucketSpec {
         final String table;
-        final Column column;
+        final Source source;
         final KeyKind keyKind;
         final String backgroundWhere;
         final int candidates;
@@ -1157,7 +1192,7 @@ public class InfinoAggregationProcessor {
             Leaves leaves,
             BucketSpec child,
             String table,
-            Column column,
+            Source source,
             KeyKind keyKind,
             String backgroundWhere,
             int candidates,
@@ -1167,7 +1202,7 @@ public class InfinoAggregationProcessor {
         ) {
             super(b, leaves, child);
             this.table = table;
-            this.column = column;
+            this.source = source;
             this.keyKind = keyKind;
             this.backgroundWhere = backgroundWhere;
             this.candidates = candidates;
@@ -1177,10 +1212,10 @@ public class InfinoAggregationProcessor {
         }
 
         static Significant of(SignificantTermsAggregationBuilder st, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
-            Column c = columnOf(st, cols);
+            Source c = sourceOf(st, cols);
             KeyKind kind = Grouped.kindOf(c);
             if (kind == KeyKind.DOUBLE) {
-                throw new Unsupported("aggregation [" + st.getName() + "] needs a keyword, boolean, integer or date field, [" + c.name() + "] is " + c.type());
+                throw new Unsupported("aggregation [" + st.getName() + "] needs a keyword, boolean, integer or date value, " + c.label() + " is " + c.typeName());
             }
             if (st.includeExclude() != null) {
                 throw new Unsupported("aggregation [" + st.getName() + "] has include/exclude, which is not served");
@@ -1206,7 +1241,7 @@ public class InfinoAggregationProcessor {
         }
 
         String keyExpr() {
-            return quoteIdent(column.name());
+            return "(" + source.expr() + ")";
         }
 
         /** One candidate term with both of its counts. */
@@ -1242,7 +1277,7 @@ public class InfinoAggregationProcessor {
     }
 
     /** One source of a composite aggregation: a key expression and how its values order and print. */
-    record CompositeSource(String name, Column column, String keyExpr, KeyKind keyKind, DocValueFormat format, boolean desc, boolean missingBucket, MissingOrder missingOrder) {
+    record CompositeSource(String name, Source source, String keyExpr, KeyKind keyKind, DocValueFormat format, boolean desc, boolean missingBucket, MissingOrder missingOrder) {
         /** Whether a missing key sorts before the present ones. */
         boolean nullsFirst() {
             return missingOrder == MissingOrder.FIRST || (missingOrder == MissingOrder.DEFAULT && !desc);
@@ -1315,15 +1350,21 @@ public class InfinoAggregationProcessor {
         }
 
         private static CompositeSource source(String agg, CompositeValuesSourceBuilder<?> s, Map<String, Column> cols) {
+            Column column = null;
+            if (s.field() != null) {
+                column = InfinoSearch.columnFor(cols, s.field());
+                if (column == null) {
+                    throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] names field [" + s.field() + "], which the table has no column for");
+                }
+            }
+            Source c;
             if (s.script() != null) {
-                throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] is a script, which is not served");
-            }
-            if (s.field() == null) {
-                throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] names no field");
-            }
-            Column c = InfinoSearch.columnFor(cols, s.field());
-            if (c == null) {
-                throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] names field [" + s.field() + "], which the table has no column for");
+                Sql sql = InfinoScriptTranslator.translate(s.script(), cols, column, System.currentTimeMillis());
+                c = new Source(sql.expr(), sql.type(), "script [" + s.script().getIdOrCode() + "]");
+            } else if (column != null) {
+                c = Source.of(column);
+            } else {
+                throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] names no field or script");
             }
             boolean desc = s.order() == SortOrder.DESC;
             MissingOrder missing = s.missingOrder() == null ? MissingOrder.DEFAULT : s.missingOrder();
@@ -1332,7 +1373,7 @@ public class InfinoAggregationProcessor {
                 DocValueFormat format = kind == KeyKind.DATE
                     ? Grouped.dateFormat(s.format(), ZoneOffset.UTC)
                     : kind == KeyKind.BOOL ? DocValueFormat.BOOLEAN : DocValueFormat.RAW;
-                return new CompositeSource(s.name(), c, quoteIdent(c.name()), kind, format, desc, s.missingBucket(), missing);
+                return new CompositeSource(s.name(), c, "(" + c.expr() + ")", kind, format, desc, s.missingBucket(), missing);
             }
             if (s instanceof DateHistogramValuesSourceBuilder dh) {
                 ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();

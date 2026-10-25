@@ -20,16 +20,20 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryStringQueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.RegexpQueryBuilder;
+import org.opensearch.index.query.ScriptQueryBuilder;
 import org.opensearch.index.query.SimpleQueryStringBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.index.query.WildcardQueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
+import org.opensearch.infino.InfinoScriptTranslator.Sql;
+import org.opensearch.infino.InfinoScriptTranslator.SqlType;
 
 import java.time.Instant;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -248,6 +252,14 @@ final class InfinoQueryTranslator {
         }
         if (qb instanceof BoolQueryBuilder b) {
             return bool(b, positive);
+        }
+        if (qb instanceof ScriptQueryBuilder sq) {
+            // The script as a column expression; it must yield a boolean to filter.
+            Sql s = InfinoScriptTranslator.translate(sq.script(), cols, null, nowMillis);
+            if (s.type() != SqlType.BOOL && s.type() != SqlType.UNKNOWN) {
+                throw new InfinoScriptTranslator.Unsupported("[" + sq.script().getIdOrCode() + "] yields a " + s.type().name().toLowerCase(Locale.ROOT) + ", not the boolean a script query needs");
+            }
+            return "(" + s.expr() + ")";
         }
         return null;
     }
@@ -650,6 +662,17 @@ final class InfinoQueryTranslator {
     /** A literal of {@code value} for the column's type, or null when it cannot be one: for a value a client hands back. */
     static String literalFor(Column c, Object value, long nowMillis) {
         return new InfinoQueryTranslator(Map.of(), "", nowMillis).scalar(c, value, false);
+    }
+
+    /** A literal of {@code value} for an expression's type, or null when it cannot be one. */
+    static String literalForType(SqlType type, Object value, long nowMillis) {
+        return switch (type) {
+            case STRING -> literal(value.toString());
+            case BOOL -> Boolean.parseBoolean(value.toString()) ? "true" : "false";
+            case INT, FLOAT -> number(value);
+            case DATE -> new InfinoQueryTranslator(Map.of(), "", nowMillis).dateLiteral(value, null, false, null);
+            default -> null;
+        };
     }
 
     /** A literal for the column's type, or null when the value cannot be one. */
