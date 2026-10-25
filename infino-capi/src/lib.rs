@@ -30,12 +30,14 @@
 // The safety contract is the same for every entry point and stated once above.
 #![allow(clippy::missing_safety_doc)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::prelude::{col, lit};
@@ -47,8 +49,9 @@ use infino::arrow_array::{
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
 use infino::{
-    connect, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, Connection, FieldPatch,
-    FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaPatch, Supertable,
+    connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions,
+    Connection, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaPatch,
+    Supertable,
 };
 use rayon::prelude::*;
 
@@ -60,6 +63,24 @@ const SOURCE: &str = "source";
 /// column: the values are joined so a text index sees every token. The
 /// original array is still in `source`.
 const MULTI_VALUE_SEPARATOR: &str = " ";
+/// The hosted service's trial route: the one call made without a key, since
+/// it is the call that asks for one.
+const TRIAL_PATH: &str = "/v1/trial";
+/// How long the trial call waits: a person is waiting on it, and a service
+/// that cannot provision an account in this time is a failure to report.
+const TRIAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// What the engine's hosted client puts before the HTTP status in the message
+/// of a refused call; the status is read back off it (see `status_in`).
+const STATUS_MARKER: &str = "server returned ";
+/// Digits of an HTTP status code.
+const STATUS_DIGITS: usize = 3;
+
+thread_local! {
+    /// Why the last `infino_open_with` on this thread returned null, as the
+    /// error JSON `infino_open_error` hands back. A connection is opened from
+    /// one thread, and the handle, not the reason, is what the open returns.
+    static OPEN_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 /// Arrow type of a mapped `date`: epoch milliseconds in UTC, which is what
 /// OpenSearch stores and what its date queries compare against.
@@ -91,6 +112,9 @@ fn out_json(v: Value) -> *mut c_char {
 pub struct Bridge {
     conn: Connection,
     tables: RwLock<HashMap<String, Supertable>>,
+    /// Whether the connection forwards to the hosted service (an `http(s)://`
+    /// URI) rather than running the engine over storage of its own.
+    hosted: bool,
 }
 
 impl Bridge {
@@ -125,30 +149,170 @@ fn bridge_ref<'a>(h: *mut Bridge) -> Option<&'a Bridge> {
     }
 }
 
+/// The HTTP status a refused hosted call carries, read off the engine's
+/// message: its hosted client keeps the code after `server returned ` for
+/// every status, and that message is all that reaches this side.
+fn status_in(message: &str) -> Option<u16> {
+    let rest = message.split(STATUS_MARKER).nth(1)?;
+    rest.get(..STATUS_DIGITS)?.parse().ok()
+}
+
+/// The error object every entry point answers with: the message, and the
+/// HTTP status when the hosted service refused the call, so the plugin can
+/// answer its own caller with the same one (a key refused, an account at a
+/// limit) rather than a generic failure.
+fn error_value(e: &str) -> Value {
+    let mut v = json!({ "error": e });
+    if let Some(status) = status_in(e) {
+        v["status"] = json!(status);
+    }
+    v
+}
+
 fn err_json(e: &str) -> *mut c_char {
-    out_json(json!({ "error": e }))
+    out_json(error_value(e))
 }
 
 // ---------------------------------------------------------------------------
 // Connection lifecycle
 // ---------------------------------------------------------------------------
 
+/// Whether `uri` names the hosted service rather than storage of the node's own.
+fn is_hosted(uri: &str) -> bool {
+    uri.starts_with("https://") || uri.starts_with("http://")
+}
+
+/// Open `uri`; `api_key` is the bearer key of a hosted URI (null or empty
+/// to take none, in which case the engine reads `INFINO_API_KEY`). A hosted
+/// connection is used once before it is handed back — the database's tables
+/// are listed — so a key the service refuses, or a service that cannot be
+/// reached, fails here where the caller can report it rather than on the
+/// first write; a database the account does not have yet is registered.
+fn open(uri: &str, api_key: Option<&str>) -> Result<Bridge, InfinoError> {
+    let mut options = ConnectOptions::new();
+    if let Some(key) = api_key {
+        options = options.with_api_key(key);
+    }
+    let hosted = is_hosted(uri);
+    let conn = connect_with(uri, options)?;
+    if hosted {
+        match conn.list_tables() {
+            Ok(_) => {}
+            Err(InfinoError::NotFound(_)) => conn.create_database()?,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Bridge {
+        conn,
+        tables: RwLock::new(HashMap::new()),
+        hosted,
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn infino_open(uri: *const c_char) -> *mut Bridge {
+    unsafe { infino_open_with(uri, ptr::null()) }
+}
+
+/// Open `uri` with `api_key` (see `open`). Null when the open failed; the
+/// reason is then in `infino_open_error`.
+#[no_mangle]
+pub unsafe extern "C" fn infino_open_with(
+    uri: *const c_char,
+    api_key: *const c_char,
+) -> *mut Bridge {
     catch_unwind(AssertUnwindSafe(|| {
         let uri = unsafe { cstr(uri) }.unwrap_or("memory://");
-        match connect(uri) {
-            Ok(conn) => Box::into_raw(Box::new(Bridge {
-                conn,
-                tables: RwLock::new(HashMap::new()),
-            })),
+        let api_key = unsafe { cstr(api_key) }.filter(|k| !k.is_empty());
+        match open(uri, api_key) {
+            Ok(bridge) => {
+                OPEN_ERROR.with(|slot| *slot.borrow_mut() = None);
+                Box::into_raw(Box::new(bridge))
+            }
             Err(e) => {
                 eprintln!("[capi] connect: {e}");
+                OPEN_ERROR.with(|slot| {
+                    *slot.borrow_mut() = Some(error_value(&e.to_string()).to_string())
+                });
                 ptr::null_mut()
             }
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// Why the last open on this thread returned null, as `{"error", "status"?}`;
+/// null when it did not fail. Read once: the slot is cleared.
+#[no_mangle]
+pub unsafe extern "C" fn infino_open_error() -> *mut c_char {
+    match OPEN_ERROR.with(|slot| slot.borrow_mut().take()) {
+        Some(json) => out_string(json),
+        None => ptr::null_mut(),
+    }
+}
+
+/// Whether the connection forwards to the hosted service (1) or runs the
+/// engine over storage of its own (0).
+#[no_mangle]
+pub unsafe extern "C" fn infino_hosted(h: *mut Bridge) -> c_int {
+    match bridge_ref(h) {
+        Some(bridge) if bridge.hosted => 1,
+        _ => 0,
+    }
+}
+
+/// Ask the hosted service at `base_url` for a trial account: `POST /v1/trial`
+/// with `database` as the account's first database when given. Answers the
+/// service's own response (`api_key`, `database`, `credit_cents`,
+/// `console_url`) or `{"error", "status"}` with the status it refused with:
+/// 501 when this service offers no trial, 409 when this address has had its
+/// trial already. Made without a key, since it is the call that asks for one.
+#[no_mangle]
+pub unsafe extern "C" fn infino_trial(
+    base_url: *const c_char,
+    database: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(base_url) = (unsafe { cstr(base_url) }) else {
+            return err_json("null argument");
+        };
+        let database = unsafe { cstr(database) }.filter(|d| !d.is_empty());
+        let url = format!("{}{TRIAL_PATH}", base_url.trim_end_matches('/'));
+        let body = match database {
+            Some(database) => json!({ "database": database }),
+            None => json!({}),
+        };
+        let agent = ureq::AgentBuilder::new().timeout(TRIAL_TIMEOUT).build();
+        match agent
+            .post(&url)
+            .set("Accept", "application/json")
+            .send_json(body)
+        {
+            Ok(response) => match response.into_json::<Value>() {
+                Ok(v) => out_json(v),
+                Err(e) => err_json(&format!("trial: parsing the response: {e}")),
+            },
+            Err(ureq::Error::Status(code, response)) => {
+                let text = response.into_string().unwrap_or_default();
+                out_json(json!({ "error": server_message(&text), "status": code }))
+            }
+            Err(ureq::Error::Transport(t)) => err_json(&format!("trial: {t}")),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// The service's message out of an error body: a JSON `{"error": "..."}`
+/// (or `message`), else the text as it came.
+fn server_message(body: &str) -> String {
+    if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(body) {
+        for key in ["error", "message"] {
+            if let Some(Value::String(s)) = obj.get(key) {
+                return s.clone();
+            }
+        }
+    }
+    body.trim().to_string()
 }
 
 #[no_mangle]
@@ -2256,5 +2420,72 @@ mod tests {
         assert_eq!(rows[0]["c"], 0, "{rows}");
         assert_eq!(optimize(h), 0);
         close(h);
+    }
+
+    /// A refused hosted call carries its status in the error object, read
+    /// off the engine's message; a message without one carries none.
+    #[test]
+    fn a_hosted_refusal_carries_its_status() {
+        let limited = error_value(
+            "append: server returned 403 (the key was refused for this call): free plan row limit reached",
+        );
+        assert_eq!(limited["status"], 403, "{limited}");
+        assert!(
+            limited["error"].as_str().unwrap().contains("row limit"),
+            "{limited}"
+        );
+        let unknown = error_value(
+            "append: server returned 401 (the key was refused for this call): no such key",
+        );
+        assert_eq!(unknown["status"], 401, "{unknown}");
+        let moved = error_value("query_sql: server returned 503: activating");
+        assert_eq!(moved["status"], 503, "{moved}");
+        let local = error_value("the mapping of logs cannot be applied to its table");
+        assert!(local.get("status").is_none(), "{local}");
+        assert_eq!(status_in("server returned abc"), None);
+    }
+
+    /// The service's refusal text comes out of a JSON body, or is the body itself.
+    #[test]
+    fn a_trial_refusal_is_read_off_the_body() {
+        assert_eq!(
+            server_message(r#"{"error":"this address has used its trial"}"#),
+            "this address has used its trial"
+        );
+        assert_eq!(
+            server_message(r#"{"message":"no trial here"}"#),
+            "no trial here"
+        );
+        assert_eq!(server_message("  plain text  "), "plain text");
+    }
+
+    /// A hosted URI is one that names a service rather than storage.
+    #[test]
+    fn hosted_uris_are_http() {
+        assert!(is_hosted("https://host/db"));
+        assert!(is_hosted("http://127.0.0.1:9100/db"));
+        assert!(!is_hosted("memory://"));
+        assert!(!is_hosted("file:///tmp/catalog"));
+        assert!(!is_hosted("s3://bucket/prefix"));
+    }
+
+    /// Opening a hosted URI nobody serves fails with the reason, and the
+    /// reason is read once.
+    #[test]
+    fn a_failed_open_reports_why_once() {
+        let uri = CString::new("http://127.0.0.1:1/nobody").unwrap();
+        let key = CString::new("ik_test").unwrap();
+        let h = unsafe { infino_open_with(uri.as_ptr(), key.as_ptr()) };
+        assert!(h.is_null());
+        let why = unsafe { infino_open_error() };
+        assert!(!why.is_null());
+        let text = unsafe { CStr::from_ptr(why) }.to_str().unwrap().to_string();
+        unsafe { infino_free_string(why) };
+        let why: Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            why["error"].as_str().unwrap().contains("list_tables"),
+            "{why}"
+        );
+        assert!(unsafe { infino_open_error() }.is_null(), "read once");
     }
 }

@@ -1,0 +1,83 @@
+---
+"Without an account the route says what is served and what accepting means":
+  - do:
+      infino.account: {}
+  - match: { configured: false }
+  - match:
+      serving: /^file:.*/
+  - match: { notice.0: "The hosted service holds every document of this cluster." }
+  - is_false: platform
+  - is_false: key_stored
+
+---
+"A trial is not asked for without an acceptance":
+  - do:
+      catch: bad_request
+      infino.account_trial:
+        body: { "platform": "https://nobody.invalid" }
+  - match: { created: false }
+  - match:
+      notice.1: /.*nobody\.invalid.*documents\sthemselves.*/
+
+  - do:
+      catch: bad_request
+      infino.account_trial:
+        body: { "accept": false }
+  - match: { created: false }
+
+---
+"Storing an account needs its key and a service URL":
+  - do:
+      catch: bad_request
+      infino.account_store:
+        body: { "platform": "https://nobody.invalid" }
+  - match:
+      error.reason: /.*api_key\sis\srequired.*/
+
+  - do:
+      catch: bad_request
+      infino.account_store:
+        body: { "platform": "ftp://nobody.invalid", "api_key": "ik_x" }
+  - match:
+      error.reason: /.*must\sbe\san\shttp.*URL.*/
+
+  - do:
+      catch: bad_request
+      infino.account_store:
+        body: { "platform": "https://nobody.invalid", "api_key": "ik_x", "database": "_bad name" }
+  - match:
+      error.reason: /.*database\smust\sbe.*/
+
+---
+"Forgetting with no account stored changes nothing":
+  - do:
+      infino.account_forget: {}
+  - match: { forgotten: false }
+  - do:
+      infino.account: {}
+  - match: { configured: false }
+
+---
+"The key never comes back through the settings API":
+  # The key alone configures nothing (a target needs the URL and the database
+  # too), so storing it this way exercises the filter and nothing else.
+  - do:
+      cluster.put_settings:
+        body:
+          persistent:
+            infino.platform.api_key: "ik_never_shown"
+
+  - do:
+      cluster.get_settings:
+        flat_settings: true
+  - is_false: persistent.infino\.platform\.api_key
+
+  - do:
+      infino.account: {}
+  - match: { configured: false }
+
+  - do:
+      cluster.put_settings:
+        body:
+          persistent:
+            infino.platform.api_key: null

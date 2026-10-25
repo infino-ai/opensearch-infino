@@ -11,6 +11,26 @@ import com.sun.jna.Pointer;
 public interface InfinoLib extends Library {
     Pointer infino_open(String uri);
 
+    /**
+     * Open {@code uri} with the bearer key of a hosted URI (null for none). A
+     * hosted connection is used once before it is handed back, so a refused key
+     * fails here; null then, with the reason in {@link #infino_open_error()}.
+     */
+    Pointer infino_open_with(String uri, String apiKey);
+
+    /** Why the last open on this thread returned null, as {@code {"error", "status"?}}; null when it did not fail. */
+    Pointer infino_open_error();
+
+    /** Whether the connection forwards to the hosted service (1) or runs the engine over storage of its own (0). */
+    int infino_hosted(Pointer h);
+
+    /**
+     * Ask the hosted service for a trial account, made without a key: the
+     * service's response ({@code api_key}, {@code database}, {@code credit_cents},
+     * {@code console_url}) or {@code {"error", "status"}}.
+     */
+    Pointer infino_trial(String baseUrl, String database);
+
     void infino_close(Pointer h);
 
     Pointer infino_ensure_table(Pointer h, String name, String mappingJson);

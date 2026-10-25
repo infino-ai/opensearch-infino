@@ -82,6 +82,39 @@ a schedule. JVM properties `infino.batch.docs` (50000) and
 `infino.batch.bytes` (64 MiB) bound the writes a batch may hold while an
 append runs.
 
+## Hosted account
+
+Instead of its own storage, the cluster's tables can live on the hosted
+service: every table operation then goes there through the engine's own
+hosted client, and the node holds no table data. What stays on the node is
+cluster state and nothing else: the index names, mappings and settings, and
+the account (the service URL, the database, the console URL, and the key as a
+filtered persistent setting that no settings API returns and every node
+reads). In the cloud: every document, the account, its credit and its
+limits. Nothing is kept in any shard either way.
+
+```bash
+curl localhost:9200/_plugins/_infino/account                       # what the tables are served from; the notice when no account is stored
+curl -XPOST localhost:9200/_plugins/_infino/account/trial -H 'Content-Type: application/json' -d '{"accept": true}'
+curl -XPUT  localhost:9200/_plugins/_infino/account -H 'Content-Type: application/json' -d '{"platform": "https://host", "api_key": "..."}'
+curl -XDELETE localhost:9200/_plugins/_infino/account              # forget the account; the tables stay on the service
+```
+
+An account is created only when a person accepts: the trial request must
+carry `"accept": true`, and the key is stored through a cluster-settings
+update under the caller's own identity, so whoever may not change cluster
+settings cannot accept. The trial creates a free account with credit, no
+email, no password and no card, and registers one database named after the
+cluster (`database` in the body names another). The service answers 501 when
+it offers no trial and 409 when the cluster's address has had one; the route
+passes each on with the next step. `infino.platform.default_url` (node
+setting) is the service a trial is asked from when the body names none.
+
+The service enforces the account's limits: at a ceiling or out of credit it
+refuses a write with a message naming the console where billing is added,
+and the bulk or request fails with that status and message. The node's own
+optimize schedule is off for hosted tables; the service compacts them.
+
 ## Writes
 
 Each engine append is a commit, and a bulk is acknowledged after the append

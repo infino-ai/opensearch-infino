@@ -1,0 +1,21 @@
+{
+  "infino.account_store": {
+    "documentation": {
+      "description": "Store a hosted account the operator already has: the service URL and the key."
+    },
+    "stability": "experimental",
+    "url": {
+      "paths": [
+        {
+          "path": "/_plugins/_infino/account",
+          "methods": ["PUT"]
+        }
+      ]
+    },
+    "params": {},
+    "body": {
+      "description": "platform, api_key, database, console_url",
+      "required": true
+    }
+  }
+}

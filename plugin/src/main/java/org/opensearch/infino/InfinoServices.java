@@ -53,6 +53,16 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoClient.bind(injector);
         // The security plugin's components, when it runs, come from the same injector.
         InfinoSecurity.bind(injector);
+        // The hosted account lives in the persistent cluster settings; the first
+        // state carries what was stored before, and storing or forgetting it
+        // later reopens the connection on every node. A listener, not a
+        // settings consumer: it is handed the state, so it runs where the
+        // state may not be read back (the appliers that start shards).
+        clusterService.addListener(event -> {
+            if (event.metadataChanged()) {
+                InfinoNative.configure(event.state().metadata().persistentSettings());
+            }
+        });
     }
 
     /** Whether the cluster would create an index a write names before it exists, as it decides for a stock bulk. */

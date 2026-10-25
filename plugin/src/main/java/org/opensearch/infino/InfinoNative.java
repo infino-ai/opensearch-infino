@@ -9,12 +9,14 @@ import com.sun.jna.Pointer;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.OpenSearchException;
 import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.index.Index;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
@@ -38,6 +40,12 @@ import java.util.regex.Pattern;
 /**
  * Loads the Infino cdylib once per node and holds a single connection.
  *
+ * <p>The connection goes to the hosted service when the cluster has an
+ * account stored (see {@link InfinoAccount}): every table operation then
+ * forwards there through the engine's own hosted client, and the node holds
+ * no table data. Without one it goes to the node's own URI. The persistent
+ * cluster settings decide, and a change to them reopens the connection.
+ *
  * <p>The engine and the bridge are thread-safe, so nothing here serializes
  * callers: a batch append and the queries on the node run concurrently.
  * Column descriptions are cached per table and dropped whenever the table's
@@ -48,13 +56,43 @@ public final class InfinoNative {
     // Path to the native bridge, set with -Dinfino.lib=/abs/path (see scripts/run.sh);
     // the bare name only resolves if it is on java.library.path.
     private static final String LIB = System.getProperty("infino.lib", "libinfino_capi.so");
-    // Catalog backend: one catalog, one table per index-shard (see tableFor). The
-    // default is in-process and non-persistent; set -Dinfino.uri=file:///abs/path
-    // or s3://bucket/prefix for a table that survives restart in lockstep with Lucene.
-    private static final String URI = System.getProperty("infino.uri", "memory://");
+    // Where the tables live when the cluster has no hosted account: the node's own
+    // URI, -Dinfino.uri=file:///abs/path or s3://bucket/prefix for tables that
+    // survive restart. The default is in-process and non-persistent.
+    private static final String NODE_URI = System.getProperty("infino.uri", "memory://");
+
+    /** What a connection is opened to: the URI, its bearer key (null for none), and how to name it in a message. */
+    record Target(String uri, String apiKey, boolean hosted, String name) {
+        /** The node's own URI, with no key. */
+        static Target node() {
+            return new Target(NODE_URI, null, false, NODE_URI);
+        }
+
+        /** The hosted account the persistent cluster settings hold, or null when they hold none. */
+        static Target hosted(Settings persistent) {
+            String url = InfinoPlugin.PLATFORM_URL.get(persistent);
+            String key = InfinoPlugin.PLATFORM_API_KEY.get(persistent);
+            String database = InfinoPlugin.PLATFORM_DATABASE.get(persistent);
+            if (url.isEmpty() || key.isEmpty() || database.isEmpty()) {
+                return null;
+            }
+            String base = InfinoAccount.baseUrl(url);
+            return new Target(base + "/" + database, key, true, base + " database " + database);
+        }
+
+        /** The account's target when the settings hold one, else the node's own. */
+        static Target of(Settings persistent) {
+            Target hosted = hosted(persistent);
+            return hosted == null ? node() : hosted;
+        }
+    }
 
     private static volatile InfinoLib lib;
     private static volatile Pointer conn;
+    /** The target {@link #conn} was opened to. */
+    private static volatile Target opened;
+    /** The target the cluster settings ask for; null until they have been read. */
+    private static volatile Target wanted;
     private static final Map<String, Map<String, Column>> COLUMNS = new ConcurrentHashMap<>();
     /** How long a prefetched source waits for its fetch phase. */
     private static final TimeValue SOURCE_PREFETCH_TTL = TimeValue.timeValueSeconds(30);
@@ -116,29 +154,173 @@ public final class InfinoNative {
     /** Outcome of a batch append. */
     public record BatchResult(int ok, List<Failure> failed) {}
 
-    /** The bridge answered with an error object. */
-    public static final class InfinoException extends RuntimeException {
+    /**
+     * The bridge answered with an error object. Carries the HTTP status a
+     * hosted refusal came with (a key refused, an account at a limit), so the
+     * caller is answered with the same one and the service's own message;
+     * anything else is an internal error.
+     */
+    public static final class InfinoException extends OpenSearchException {
+        private final RestStatus status;
+
         InfinoException(String message) {
+            this(message, RestStatus.INTERNAL_SERVER_ERROR);
+        }
+
+        InfinoException(String message, RestStatus status) {
             super(message);
+            this.status = status;
+        }
+
+        @Override
+        public RestStatus status() {
+            return status;
         }
     }
 
     private InfinoNative() {}
 
-    public static void init() {
-        if (lib == null) {
+    /** The bridge library, loaded once per node. */
+    private static InfinoLib lib() {
+        InfinoLib loaded = lib;
+        if (loaded == null) {
             synchronized (InfinoNative.class) {
-                if (lib == null) {
-                    InfinoLib loaded = Native.load(LIB, InfinoLib.class);
-                    Pointer opened = loaded.infino_open(URI);
-                    if (opened == null) {
-                        throw new IllegalStateException("infino_open(" + URI + ") returned null");
-                    }
-                    conn = opened;
+                loaded = lib;
+                if (loaded == null) {
+                    loaded = Native.load(LIB, InfinoLib.class);
                     lib = loaded;
                 }
             }
         }
+        return loaded;
+    }
+
+    /**
+     * Open the connection the cluster settings ask for, if it is not the one
+     * open. A connection in use is not closed when another replaces it: a
+     * call in flight on another thread still holds it, and an account
+     * changes a few times in a node's life at most.
+     *
+     * <p>The cluster state is never read here: this runs on the shard-start
+     * hook, a cluster-state applier, which may not read the state it is
+     * applying. {@link #configure} hands the persistent settings over from a
+     * cluster-state listener; before the first one the node's own URI is
+     * the target.
+     */
+    public static void init() {
+        Target target = wanted;
+        if (target == null) {
+            target = Target.node();
+            wanted = target;
+        }
+        if (conn != null && target.equals(opened)) {
+            return;
+        }
+        synchronized (InfinoNative.class) {
+            if (conn != null && target.equals(opened)) {
+                return;
+            }
+            InfinoLib loaded = lib();
+            Pointer p = loaded.infino_open_with(target.uri(), target.apiKey());
+            if (p == null) {
+                throw openFailure(loaded, target);
+            }
+            if (conn != null) {
+                log.info("[infino] tables are now served from {} (were from {})", target.name(), opened.name());
+            } else {
+                log.info("[infino] tables are served from {}", target.name());
+            }
+            COLUMNS.clear();
+            SOURCES.invalidateAll();
+            conn = p;
+            opened = target;
+        }
+    }
+
+    /** Why an open returned null, as the exception the caller gets. */
+    private static InfinoException openFailure(InfinoLib loaded, Target target) {
+        String why = take(loaded, loaded.infino_open_error());
+        if (why == null) {
+            return new InfinoException("cannot open " + target.name());
+        }
+        Map<String, Object> error = object(why);
+        return new InfinoException("cannot open " + target.name() + ": " + error.get("error"), statusOf(error));
+    }
+
+    /**
+     * The persistent cluster settings, as a cluster-state listener saw them:
+     * take the target they ask for, and reopen now when a connection is
+     * already in use and the target moved, so the next call finds the new
+     * one; a failure is logged and retried by that call.
+     */
+    static void configure(Settings persistent) {
+        Target target = Target.of(persistent);
+        if (target.equals(wanted)) {
+            return;
+        }
+        wanted = target;
+        if (conn == null) {
+            return;
+        }
+        try {
+            init();
+        } catch (RuntimeException e) {
+            log.warn("[infino] the connection the cluster settings ask for could not be opened", e);
+        }
+    }
+
+    /** Whether the tables are served from the hosted service rather than the node's own storage. */
+    public static boolean hosted() {
+        Target target = opened;
+        return target != null && target.hosted();
+    }
+
+    /** How the tables are served, for a status report. */
+    static String serving() {
+        Target target = opened;
+        if (target == null) {
+            target = wanted;
+        }
+        return target == null ? Target.node().name() : target.name();
+    }
+
+    /**
+     * Ask the hosted service at {@code baseUrl} for a trial account, with
+     * {@code database} as its first database: the service's response. A
+     * refusal is thrown with the service's status and message.
+     */
+    static Map<String, Object> trial(String baseUrl, String database) {
+        InfinoLib loaded = lib();
+        String out = take(loaded, loaded.infino_trial(baseUrl, database));
+        if (out == null) {
+            throw new InfinoException("the trial call returned nothing");
+        }
+        Map<String, Object> response = object(out);
+        if (response.containsKey("error")) {
+            throw new InfinoException(String.valueOf(response.get("error")), statusOf(response));
+        }
+        return response;
+    }
+
+    /**
+     * Open {@code database} on the hosted service with {@code apiKey} once and
+     * close it again: a key the service refuses fails here, with its status.
+     */
+    static void probe(String baseUrl, String database, String apiKey) {
+        InfinoLib loaded = lib();
+        String uri = InfinoAccount.baseUrl(baseUrl) + "/" + database;
+        Pointer p = loaded.infino_open_with(uri, apiKey);
+        if (p == null) {
+            throw openFailure(loaded, new Target(uri, apiKey, true, baseUrl + " database " + database));
+        }
+        loaded.infino_close(p);
+    }
+
+    /** The HTTP status an error object carries, else an internal error. */
+    private static RestStatus statusOf(Map<String, Object> error) {
+        Object status = error.get("status");
+        RestStatus known = status instanceof Number n ? RestStatus.fromCode(n.intValue()) : null;
+        return known == null ? RestStatus.INTERNAL_SERVER_ERROR : known;
     }
 
     /**
@@ -172,11 +354,15 @@ public final class InfinoNative {
     }
 
     private static String take(Pointer p) {
+        return take(lib, p);
+    }
+
+    private static String take(InfinoLib loaded, Pointer p) {
         if (p == null) {
             return null;
         }
         String s = p.getString(0, "UTF-8");
-        lib.infino_free_string(p);
+        loaded.infino_free_string(p);
         return s;
     }
 
@@ -186,8 +372,9 @@ public final class InfinoNative {
             throw new InfinoException("the bridge returned null");
         }
         if (s.startsWith("{\"error\"")) {
-            Object error = object(s).get("error");
-            throw new InfinoException(error == null ? s : error.toString());
+            Map<String, Object> error = object(s);
+            Object message = error.get("error");
+            throw new InfinoException(message == null ? s : message.toString(), statusOf(error));
         }
         return s;
     }

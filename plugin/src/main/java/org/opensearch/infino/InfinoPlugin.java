@@ -7,9 +7,14 @@ package org.opensearch.infino;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.support.ActionFilter;
+import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.common.lifecycle.LifecycleComponent;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexModule;
@@ -19,6 +24,8 @@ import org.opensearch.index.shard.IndexShard;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchPlugin;
+import org.opensearch.rest.RestController;
+import org.opensearch.rest.RestHandler;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -26,6 +33,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 
 /**
  * Backs an index with an Infino table at the action layer: bulk, search and
@@ -76,12 +84,42 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
      */
     public static final Setting<Boolean> INFINO_DEFAULT_ENABLED = Setting.boolSetting("infino.index.default_enabled", true, Setting.Property.NodeScope);
 
+    /**
+     * The hosted account the cluster's tables live on, in the persistent
+     * cluster settings so every node reads the same one and it survives
+     * restarts (see {@link InfinoAccount}). Stored by the account route;
+     * empty when the node runs over its own storage. The key is filtered
+     * (the property registers the settings filter itself): no settings API
+     * returns it, and nothing reads it back but the node.
+     */
+    public static final Setting<String> PLATFORM_URL = Setting.simpleString("infino.platform.url", Setting.Property.NodeScope, Setting.Property.Dynamic);
+    public static final Setting<String> PLATFORM_DATABASE = Setting.simpleString("infino.platform.database", Setting.Property.NodeScope, Setting.Property.Dynamic);
+    public static final Setting<String> PLATFORM_API_KEY = Setting.simpleString(
+        "infino.platform.api_key",
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Filtered
+    );
+    /** Where a person manages the account: usage, billing details, a card. Named by the service when the account was made. */
+    public static final Setting<String> PLATFORM_CONSOLE_URL = Setting.simpleString("infino.platform.console_url", Setting.Property.NodeScope, Setting.Property.Dynamic);
+    /** When, and as whom, the account was accepted or stored. */
+    public static final Setting<String> PLATFORM_ACCEPTED_AT = Setting.simpleString("infino.platform.accepted_at", Setting.Property.NodeScope, Setting.Property.Dynamic);
+    public static final Setting<String> PLATFORM_ACCEPTED_BY = Setting.simpleString("infino.platform.accepted_by", Setting.Property.NodeScope, Setting.Property.Dynamic);
+    /** The hosted service a trial is asked from when the request names none. */
+    public static final Setting<String> PLATFORM_DEFAULT_URL = Setting.simpleString(
+        "infino.platform.default_url",
+        InfinoAccount.DEFAULT_PLATFORM_URL,
+        Setting.Property.NodeScope
+    );
+
     private static final InfinoTables TABLES = new InfinoTables();
     private final Map<ShardId, Scheduler.Cancellable> optimizers = new ConcurrentHashMap<>();
     private final boolean defaultEnabled;
+    private final String defaultPlatformUrl;
 
     public InfinoPlugin(Settings settings) {
         this.defaultEnabled = INFINO_DEFAULT_ENABLED.get(settings);
+        this.defaultPlatformUrl = PLATFORM_DEFAULT_URL.get(settings);
     }
 
     /** The tables behind the node's Infino-backed indices. */
@@ -165,6 +203,10 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
         if (threadPool == null) {
             return;
         }
+        // A hosted table is compacted by the service's own optimizer; the node has no say.
+        if (InfinoNative.hosted()) {
+            return;
+        }
         TimeValue interval = shard.indexSettings().getValue(OPTIMIZE_INTERVAL);
         ShardId shardId = shard.shardId();
         Scheduler.Cancellable task = threadPool.scheduleWithFixedDelay(() -> {
@@ -213,7 +255,33 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
 
     @Override
     public List<Setting<?>> getSettings() {
-        return List.of(INFINO_DEFAULT_ENABLED, INFINO_ENABLED, INFINO_TABLE, OPTIMIZE_INTERVAL);
+        return List.of(
+            INFINO_DEFAULT_ENABLED,
+            INFINO_ENABLED,
+            INFINO_TABLE,
+            OPTIMIZE_INTERVAL,
+            PLATFORM_URL,
+            PLATFORM_DATABASE,
+            PLATFORM_API_KEY,
+            PLATFORM_CONSOLE_URL,
+            PLATFORM_ACCEPTED_AT,
+            PLATFORM_ACCEPTED_BY,
+            PLATFORM_DEFAULT_URL
+        );
+    }
+
+    /** The account route: what the cluster's tables are served from, and how to accept or store a hosted account. */
+    @Override
+    public List<RestHandler> getRestHandlers(
+        Settings settings,
+        RestController restController,
+        ClusterSettings clusterSettings,
+        IndexScopedSettings indexScopedSettings,
+        SettingsFilter settingsFilter,
+        IndexNameExpressionResolver indexNameExpressionResolver,
+        Supplier<DiscoveryNodes> nodesInCluster
+    ) {
+        return List.of(new InfinoAccountRestHandler(new InfinoAccount(defaultPlatformUrl)));
     }
 
     @Override
