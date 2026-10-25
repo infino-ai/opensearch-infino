@@ -80,7 +80,11 @@ APIs on top of each, and nothing in Lucene with any of them:
 - *In a bucket*: `-Dinfino.uri=s3://bucket/prefix` (`gs://`, `az://` too).
   Your storage, your credentials, the way any client reaches the bucket;
   any node pointed at it serves the same tables.
-- *On an Infino account*: the hosted service runs the engine; in
+- *On an Infino account*: the hosted service runs the engine and manages
+  the tables, with the enterprise features on top (compaction, the usage
+  and billing console, the agent and search APIs over the same data). The
+  account stores either in an Infino bucket or in your own bucket, and
+  customer-managed encryption keys (CMEK) are supported. In
   `config/opensearch.yml`
 
   ```yaml
