@@ -30,7 +30,6 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -40,11 +39,12 @@ import java.util.regex.Pattern;
 /**
  * Loads the Infino cdylib once per node and holds a single connection.
  *
- * <p>The connection goes to the hosted service when the cluster has an
- * account stored (see {@link InfinoAccount}): every table operation then
+ * <p>The connection goes to the hosted service when the node is configured
+ * with an account (see {@link InfinoAccount}): every table operation then
  * forwards there through the engine's own hosted client, and the node holds
- * no table data. Without one it goes to the node's own URI. The persistent
- * cluster settings decide, and a change to them reopens the connection.
+ * no table data. Without one it goes to the node's own URI. The node's own
+ * settings decide at boot; the account route can change it for the node's
+ * life, and a change reopens the connection.
  *
  * <p>The engine and the bridge are thread-safe, so nothing here serializes
  * callers: a batch append and the queries on the node run concurrently.
@@ -61,29 +61,21 @@ public final class InfinoNative {
     // survive restart. The default is in-process and non-persistent.
     private static final String NODE_URI = System.getProperty("infino.uri", "memory://");
 
-    /** What a connection is opened to: the URI, its bearer key (null for none), and how to name it in a message. */
+    /**
+     * What a connection is opened to: the URI, its bearer key (null for none:
+     * the engine then reads {@code INFINO_API_KEY}), and how to name it in a
+     * message, which never carries the key.
+     */
     record Target(String uri, String apiKey, boolean hosted, String name) {
         /** The node's own URI, with no key. */
         static Target node() {
             return new Target(NODE_URI, null, false, NODE_URI);
         }
 
-        /** The hosted account the persistent cluster settings hold, or null when they hold none. */
-        static Target hosted(Settings persistent) {
-            String url = InfinoPlugin.PLATFORM_URL.get(persistent);
-            String key = InfinoPlugin.PLATFORM_API_KEY.get(persistent);
-            String database = InfinoPlugin.PLATFORM_DATABASE.get(persistent);
-            if (url.isEmpty() || key.isEmpty() || database.isEmpty()) {
-                return null;
-            }
+        /** A hosted account: the service's base URL, the database, and the key. */
+        static Target hosted(String url, String database, String apiKey) {
             String base = InfinoAccount.baseUrl(url);
-            return new Target(base + "/" + database, key, true, base + " database " + database);
-        }
-
-        /** The account's target when the settings hold one, else the node's own. */
-        static Target of(Settings persistent) {
-            Target hosted = hosted(persistent);
-            return hosted == null ? node() : hosted;
+            return new Target(base + "/" + database, apiKey, true, base + " database " + database);
         }
     }
 
@@ -91,8 +83,8 @@ public final class InfinoNative {
     private static volatile Pointer conn;
     /** The target {@link #conn} was opened to. */
     private static volatile Target opened;
-    /** The target the cluster settings ask for; null until they have been read. */
-    private static volatile Target wanted;
+    /** The target the node is configured for: its own URI until the settings or the account route say otherwise. */
+    private static volatile Target wanted = Target.node();
     private static final Map<String, Map<String, Column>> COLUMNS = new ConcurrentHashMap<>();
     /** How long a prefetched source waits for its fetch phase. */
     private static final TimeValue SOURCE_PREFETCH_TTL = TimeValue.timeValueSeconds(30);
@@ -196,23 +188,13 @@ public final class InfinoNative {
     }
 
     /**
-     * Open the connection the cluster settings ask for, if it is not the one
+     * Open the connection the node is configured for, if it is not the one
      * open. A connection in use is not closed when another replaces it: a
      * call in flight on another thread still holds it, and an account
      * changes a few times in a node's life at most.
-     *
-     * <p>The cluster state is never read here: this runs on the shard-start
-     * hook, a cluster-state applier, which may not read the state it is
-     * applying. {@link #configure} hands the persistent settings over from a
-     * cluster-state listener; before the first one the node's own URI is
-     * the target.
      */
     public static void init() {
         Target target = wanted;
-        if (target == null) {
-            target = Target.node();
-            wanted = target;
-        }
         if (conn != null && target.equals(opened)) {
             return;
         }
@@ -248,40 +230,35 @@ public final class InfinoNative {
     }
 
     /**
-     * The persistent cluster settings, as a cluster-state listener saw them:
-     * take the target they ask for, and reopen now when a connection is
-     * already in use and the target moved, so the next call finds the new
-     * one; a failure is logged and retried by that call.
+     * Take {@code target} as what the node is configured for: from the node's
+     * settings at boot, or from the account route for the node's life. A
+     * connection already in use is reopened at once so the next call finds
+     * the new one; a failure there is reported to the caller and the next
+     * call retries.
      */
-    static void configure(Settings persistent) {
-        Target target = Target.of(persistent);
+    static void configure(Target target) {
         if (target.equals(wanted)) {
             return;
         }
         wanted = target;
-        if (conn == null) {
-            return;
-        }
-        try {
+        if (conn != null) {
             init();
-        } catch (RuntimeException e) {
-            log.warn("[infino] the connection the cluster settings ask for could not be opened", e);
         }
+    }
+
+    /** The target the node is configured for. */
+    static Target target() {
+        return wanted;
     }
 
     /** Whether the tables are served from the hosted service rather than the node's own storage. */
     public static boolean hosted() {
-        Target target = opened;
-        return target != null && target.hosted();
+        return wanted.hosted();
     }
 
     /** How the tables are served, for a status report. */
     static String serving() {
-        Target target = opened;
-        if (target == null) {
-            target = wanted;
-        }
-        return target == null ? Target.node().name() : target.name();
+        return wanted.name();
     }
 
     /**
@@ -325,28 +302,31 @@ public final class InfinoNative {
 
     /**
      * The Infino table of an index: the one named by {@code index.infino.table}
-     * when set (so an index recreated on a fresh cluster reattaches to the
-     * table its predecessor wrote), else the index name for the reader of a
-     * bucket listing plus the index UUID, so that an index recreated under
-     * the same name without that setting gets a table of its own.
+     * when set, else the index name. Named by the index and not by its UUID,
+     * so an index that comes back on a fresh node (see {@link InfinoRegistry})
+     * finds the rows its predecessor wrote; an index deleted on purpose drops
+     * its table, so a recreated one starts empty.
      */
     public static String tableFor(Index index, Settings indexSettings) {
         String explicit = InfinoPlugin.INFINO_TABLE.get(indexSettings);
         if (!explicit.isEmpty()) {
             return explicit;
         }
-        // The engine's SQL layer folds table names to lower case, and the UUID is
-        // base64url (mixed case, '-' and '_'); folded and with '-' replaced, the
-        // name reads the same at declare time and in a statement. An index name
-        // may carry characters a table name may not (the security plugin's and
-        // Dashboards' own indices start with a dot); each becomes '_', and the
-        // UUID keeps two such names apart.
-        String uuid = index.getUUID().toLowerCase(Locale.ROOT).replace('-', '_');
-        return "os_" + TABLE_NAME_OTHER.matcher(index.getName()).replaceAll("_") + "_" + uuid;
+        return tableFor(index.getName());
+    }
+
+    /** The table an index of this name is served from when none is named explicitly. */
+    public static String tableFor(String indexName) {
+        // An index name may carry characters a table name may not (the security
+        // plugin's and Dashboards' own indices start with a dot); each becomes '_'.
+        // Index names are lower case already, as the engine's SQL layer folds them.
+        return TABLE_PREFIX + TABLE_NAME_OTHER.matcher(indexName).replaceAll("_");
     }
 
     /** What the engine does not take in a table name: anything outside letters, digits, '_' and '-'. */
     private static final Pattern TABLE_NAME_OTHER = Pattern.compile("[^A-Za-z0-9_-]");
+    /** Every table behind an index starts with this, so the registry and the tables of other users of a database stay apart. */
+    private static final String TABLE_PREFIX = "os_";
 
     /** Whether the table name came from {@code index.infino.table}, in which case deleting the index leaves it. */
     public static boolean tableIsExplicit(Settings indexSettings) {

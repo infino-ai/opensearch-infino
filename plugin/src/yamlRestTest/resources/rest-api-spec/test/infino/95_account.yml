@@ -7,7 +7,7 @@
       serving: /^file:.*/
   - match: { notice.0: "The hosted service holds every document of this cluster." }
   - is_false: platform
-  - is_false: key_stored
+  - is_false: api_key
 
 ---
 "A trial is not asked for without an acceptance":
@@ -26,7 +26,7 @@
   - match: { created: false }
 
 ---
-"Storing an account needs its key and a service URL":
+"Using an account needs its key and a service URL":
   - do:
       catch: bad_request
       infino.account_store:
@@ -49,7 +49,7 @@
       error.reason: /.*database\smust\sbe.*/
 
 ---
-"Forgetting with no account stored changes nothing":
+"Forgetting with no account in use changes nothing":
   - do:
       infino.account_forget: {}
   - match: { forgotten: false }
@@ -58,26 +58,42 @@
   - match: { configured: false }
 
 ---
-"The key never comes back through the settings API":
-  # The key alone configures nothing (a target needs the URL and the database
-  # too), so storing it this way exercises the filter and nothing else.
+"The registry beside the tables names every index with its aliases, and forgets a deleted one":
   - do:
-      cluster.put_settings:
+      indices.create:
+        index: reg1
         body:
-          persistent:
-            infino.platform.api_key: "ik_never_shown"
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              message: { type: text }
+          aliases:
+            reg-read: {}
+            reg-write: { is_write_index: true }
+  - do:
+      cluster.health:
+        index: reg1
+        wait_for_status: green
+  - do:
+      index:
+        index: reg1
+        id: "1"
+        body: { "@timestamp": "2026-10-25T10:00:00Z", "message": "registered" }
 
   - do:
-      cluster.get_settings:
-        flat_settings: true
-  - is_false: persistent.infino\.platform\.api_key
+      infino.account_indices:
+        name: reg1
+  - match:
+      serving: /^file:.*/
+  - match: { registered: true }
+  - match: { table: os_reg1 }
+  - match: { aliases: ["reg-read", "reg-write"] }
 
   - do:
-      infino.account: {}
-  - match: { configured: false }
-
+      indices.delete:
+        index: reg1
   - do:
-      cluster.put_settings:
-        body:
-          persistent:
-            infino.platform.api_key: null
+      infino.account_indices:
+        name: reg1
+  - match: { registered: false }

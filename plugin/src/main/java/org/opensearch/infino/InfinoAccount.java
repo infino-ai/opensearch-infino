@@ -7,8 +7,6 @@ package org.opensearch.infino;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.service.ClusterService;
-import org.opensearch.common.settings.Settings;
-import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
@@ -24,22 +22,24 @@ import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
- * The cluster's hosted account: where its tables live when they live on the
- * hosted service, who accepted that, and how to accept it.
+ * The node's hosted account: where its tables live when they live on the
+ * hosted service, who set that up, and how to.
  *
- * <p>What is on the node and what is in the cloud is deliberate. On the node,
- * in cluster state and nowhere else: the index names, mappings and settings,
- * and this account — the service's URL, the database, the console URL, and
- * the key, as a filtered persistent setting that no settings API returns and
- * every node reads. In the cloud: every document, the account itself, its
+ * <p>A node is stateless. The account is node configuration — the service
+ * URL and the database in opensearch.yml, the key in the node's keystore —
+ * read at boot; nothing about it lives in the cluster, and a node with an
+ * empty data directory serves the account's tables as soon as it is up,
+ * its indices rebuilt from the registry kept beside the tables (see
+ * {@link InfinoRegistry}). In the cloud: every document, the account, its
  * credit and its limits. Nothing is kept in any shard.
  *
  * <p>An account is created only when a person accepts. The acceptance is a
- * request to this route carrying {@code "accept": true}, and the key is
- * stored through a cluster-settings update under the caller's own identity,
- * so whoever may not change cluster settings cannot accept, and nothing that
- * runs on its own can. The notice says what leaves the cluster in the words
- * that matter: the documents, not names or metrics.
+ * request to this route carrying {@code "accept": true}; the service answers
+ * with the key, exactly once, and this node uses the account from then on,
+ * for its life. The response carries the key and the configuration lines
+ * that make it the node's own after a restart; nothing here stores it. The
+ * notice says what leaves the cluster in the words that matter: the
+ * documents, not names or metrics.
  *
  * <p>The service, not the node, enforces the account's limits: at a ceiling
  * or out of credit it refuses a write with a message naming the console
@@ -47,10 +47,11 @@ import java.util.regex.Pattern;
  * same status. Nothing here takes a card.
  *
  * <pre>
- * GET    /_plugins/_infino/account         what the tables are served from; the notice when no account is stored
- * POST   /_plugins/_infino/account/trial   {"accept": true, "platform"?, "database"?}: create a free account and store it
- * PUT    /_plugins/_infino/account         {"platform", "api_key", "database"?, "console_url"?}: store an account you have
- * DELETE /_plugins/_infino/account         forget the account; the tables stay on the service
+ * GET    /_plugins/_infino/account          what the tables are served from; the notice when no account is set
+ * GET    /_plugins/_infino/account/indices  the indices the registry would bring back on a fresh cluster
+ * POST   /_plugins/_infino/account/trial    {"accept": true, "platform"?, "database"?}: create a free account and use it
+ * PUT    /_plugins/_infino/account          {"platform", "api_key", "database"?}: use an account you have
+ * DELETE /_plugins/_infino/account          stop using the account on this node; the tables stay on the service
  * </pre>
  */
 public final class InfinoAccount {
@@ -59,6 +60,7 @@ public final class InfinoAccount {
 
     public static final String ROUTE = "/_plugins/_infino/account";
     public static final String TRIAL_ROUTE = ROUTE + "/trial";
+    public static final String INDICES_ROUTE = ROUTE + "/indices";
 
     /** The hosted service a trial is asked from when neither the request nor the node settings name one. */
     static final String DEFAULT_PLATFORM_URL = "https://api.platform.infino.ws";
@@ -75,10 +77,23 @@ public final class InfinoAccount {
     /** This cluster's address has had its trial already. */
     private static final RestStatus TRIAL_USED = RestStatus.CONFLICT;
 
+    /** How the node came by its account. */
+    private static final String FROM_SETTINGS = "node settings";
+    private static final String FROM_ROUTE = "this route, for this node's life; the settings in `config` make it last";
+
+    /** The account in use, as this route reports it. Never the key. */
+    private record Live(String platform, String database, String consoleUrl, String since, String by, String source) {}
+
     private final String defaultPlatformUrl;
+    private volatile Live live;
 
     public InfinoAccount(String defaultPlatformUrl) {
         this.defaultPlatformUrl = defaultPlatformUrl;
+    }
+
+    /** The node's settings named an account at boot. */
+    void configuredAtBoot(String url, String database, boolean keyInKeystore) {
+        live = new Live(baseUrl(url), database, "", "", keyInKeystore ? "the keystore" : "the environment", FROM_SETTINGS);
     }
 
     /** The service's base URL, with no trailing slash and no database segment. */
@@ -105,13 +120,22 @@ public final class InfinoAccount {
     static List<String> notice(String platform) {
         return List.of(
             "The hosted service holds every document of this cluster.",
-            "With an account stored, every index this cluster creates is served from a table on " + platform
+            "With an account in use, every index this cluster creates is served from a table on " + platform
                 + ": the documents themselves, not names or metrics, leave the cluster on every write, and nothing is kept in any shard.",
-            "This cluster has no account, so one will be created for it: no email, no password and no card, with free credit to start on."
-                + " Its key is stored in the cluster's persistent settings, filtered from every settings API, and read by every node.",
+            "This node has no account, so one will be created for it: no email, no password and no card, with free credit to start on."
+                + " The key is returned once, to you; the node uses it for its life, and the configuration lines in the response make it the node's own after a restart.",
             "When the credit runs out, writes stop and say so; adding billing details then is a choice, not a renewal you have agreed to.",
-            "Nothing is uploaded until an account is stored. To accept: POST " + TRIAL_ROUTE + " {\"accept\": true}."
+            "Nothing is uploaded until an account is in use. To accept: POST " + TRIAL_ROUTE + " {\"accept\": true}."
                 + " To use an account you already have: PUT " + ROUTE + " {\"platform\": \"https://host\", \"api_key\": \"...\"}."
+        );
+    }
+
+    /** The lines that make {@code platform} and {@code database} the node's own account after a restart. */
+    static List<String> configLines(String platform, String database) {
+        return List.of(
+            "opensearch.yml: infino.platform.url: " + platform,
+            "opensearch.yml: infino.platform.database: " + database,
+            "keystore: opensearch-keystore add infino.platform.api_key (or INFINO_API_KEY in the node's environment)"
         );
     }
 
@@ -124,8 +148,15 @@ public final class InfinoAccount {
             }
         }
         boolean trial = request.path().endsWith("/trial");
+        boolean indices = request.path().endsWith("/indices");
         switch (request.method()) {
-            case GET -> status(channel);
+            case GET -> {
+                if (indices) {
+                    indices(request.param("name"), channel);
+                } else {
+                    status(channel);
+                }
+            }
             case POST -> {
                 if (trial) {
                     trial(body, channel);
@@ -143,44 +174,78 @@ public final class InfinoAccount {
         channel.sendResponse(new BytesRestResponse(RestStatus.METHOD_NOT_ALLOWED, request.method() + " " + request.path()));
     }
 
-    private static Settings persistent() {
-        ClusterService clusters = InfinoServices.clusterService();
-        return clusters == null ? Settings.EMPTY : clusters.state().metadata().persistentSettings();
-    }
-
-    private static boolean configured(Settings persistent) {
-        return !InfinoPlugin.PLATFORM_URL.get(persistent).isEmpty() && !InfinoPlugin.PLATFORM_API_KEY.get(persistent).isEmpty();
-    }
-
     /** GET: the account's non-secret facts, or the notice. Never the key. */
     private void status(RestChannel channel) throws IOException {
-        Settings s = persistent();
-        boolean configured = configured(s);
+        Live account = live;
         XContentBuilder b = channel.newBuilder().startObject();
-        b.field("configured", configured);
+        b.field("configured", account != null);
         b.field("serving", InfinoNative.serving());
-        if (configured) {
-            b.field("platform", InfinoPlugin.PLATFORM_URL.get(s));
-            b.field("database", InfinoPlugin.PLATFORM_DATABASE.get(s));
-            field(b, "console_url", InfinoPlugin.PLATFORM_CONSOLE_URL.get(s));
-            field(b, "accepted_at", InfinoPlugin.PLATFORM_ACCEPTED_AT.get(s));
-            field(b, "accepted_by", InfinoPlugin.PLATFORM_ACCEPTED_BY.get(s));
-            b.field("key_stored", true);
+        if (account != null) {
+            b.field("platform", account.platform());
+            b.field("database", account.database());
+            field(b, "console_url", account.consoleUrl());
+            field(b, "since", account.since());
+            field(b, "by", account.by());
+            b.field("source", account.source());
+            b.field("config", configLines(account.platform(), account.database()));
         } else {
             b.field("notice", notice(defaultPlatformUrl));
         }
         channel.sendResponse(new BytesRestResponse(RestStatus.OK, b.endObject()));
     }
 
+    /**
+     * GET indices: what the registry would bring back on a fresh cluster;
+     * with {@code name}, whether that one index is registered and how.
+     */
+    private void indices(String name, RestChannel channel) {
+        onGeneric(channel, () -> {
+            List<Map<String, Object>> rows = InfinoRegistry.rows();
+            XContentBuilder b = channel.newBuilder().startObject();
+            b.field("serving", InfinoNative.serving());
+            if (name != null) {
+                Map<String, Object> found = null;
+                for (Map<String, Object> row : rows) {
+                    if (name.equals(row.get("name"))) {
+                        found = row;
+                    }
+                }
+                b.field("name", name);
+                b.field("registered", found != null);
+                if (found != null) {
+                    index(b, found);
+                }
+            } else {
+                b.startArray("indices");
+                for (Map<String, Object> row : rows) {
+                    b.startObject();
+                    b.field("name", row.get("name"));
+                    index(b, row);
+                    b.endObject();
+                }
+                b.endArray();
+            }
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, b.endObject()));
+        });
+    }
+
+    private static void index(XContentBuilder b, Map<String, Object> row) throws IOException {
+        b.field("table", row.get("table"));
+        Object aliases = row.get("aliases");
+        if (aliases instanceof Map<?, ?> all) {
+            b.field("aliases", all.keySet().stream().map(Object::toString).sorted().toList());
+        }
+    }
+
     private static void field(XContentBuilder b, String name, String value) throws IOException {
-        if (!value.isEmpty()) {
+        if (value != null && !value.isEmpty()) {
             b.field(name, value);
         }
     }
 
     /**
      * POST trial: with {@code accept} true, ask the service for a free
-     * account and store it; without it, the notice and nothing else. The
+     * account and use it; without it, the notice and nothing else. The
      * service answers 501 when it offers no trial and 409 when this cluster's
      * address has had one; each is passed on with the next step named.
      */
@@ -192,10 +257,10 @@ public final class InfinoAccount {
             channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, b.endObject()));
             return;
         }
-        Settings s = persistent();
-        if (configured(s)) {
+        Live account = live;
+        if (account != null) {
             throw new IllegalArgumentException(
-                "[infino] this cluster already has an account on " + InfinoPlugin.PLATFORM_URL.get(s) + "; DELETE " + ROUTE + " first to start over"
+                "[infino] this node already uses an account on " + account.platform() + "; DELETE " + ROUTE + " first to start over"
             );
         }
         String platform = platformOf(body);
@@ -219,25 +284,20 @@ public final class InfinoAccount {
             String consoleUrl = console instanceof String c ? c : "";
             Object credit = response.get("credit_cents");
             long creditCents = credit instanceof Number n ? n.longValue() : 0L;
-            Settings stored = Settings.builder()
-                .put(InfinoPlugin.PLATFORM_URL.getKey(), platform)
-                .put(InfinoPlugin.PLATFORM_DATABASE.getKey(), registered)
-                .put(InfinoPlugin.PLATFORM_API_KEY.getKey(), key)
-                .put(InfinoPlugin.PLATFORM_CONSOLE_URL.getKey(), consoleUrl)
-                .put(InfinoPlugin.PLATFORM_ACCEPTED_AT.getKey(), Instant.now().toString())
-                .put(InfinoPlugin.PLATFORM_ACCEPTED_BY.getKey(), by)
-                .build();
-            InfinoClient.updateSettings(stored, ActionListener.wrap(ignored -> {
-                log.info("[infino] a free account was created on {} for database {} and stored, accepted by {}", platform, registered, by);
-                XContentBuilder b = channel.newBuilder().startObject();
-                b.field("created", true);
-                b.field("platform", platform);
-                b.field("database", registered);
-                b.field("credit_cents", creditCents);
-                field(b, "console_url", consoleUrl);
-                b.field("accepted_by", by);
-                channel.sendResponse(new BytesRestResponse(RestStatus.OK, b.endObject()));
-            }, e -> fail(channel, e)));
+            use(platform, registered, key, consoleUrl, by);
+            log.info("[infino] a free account was created on {} for database {} and is in use, accepted by {}", platform, registered, by);
+            XContentBuilder b = channel.newBuilder().startObject();
+            b.field("created", true);
+            b.field("platform", platform);
+            b.field("database", registered);
+            b.field("credit_cents", creditCents);
+            field(b, "console_url", consoleUrl);
+            b.field("accepted_by", by);
+            // Returned exactly once by the service and once here: it is not
+            // recoverable later, and nothing on the node keeps it past a restart.
+            b.field("api_key", key);
+            b.field("config", configLines(platform, registered));
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, b.endObject()));
         });
     }
 
@@ -251,7 +311,7 @@ public final class InfinoAccount {
         }
         if (e.status() == TRIAL_USED) {
             return new InfinoNative.InfinoException(
-                "this cluster's network address has already used its free account on " + platform + ". Store that account's key instead: PUT " + ROUTE
+                "this cluster's network address has already used its free account on " + platform + ". Use that account's key instead: PUT " + ROUTE
                     + " {\"platform\": \"" + platform + "\", \"api_key\": \"...\"}",
                 TRIAL_USED
             );
@@ -260,10 +320,9 @@ public final class InfinoAccount {
     }
 
     /**
-     * PUT: store an account the caller already has. The key is used once
-     * before it is stored — the database is opened on the service — so a key
-     * the service refuses fails here, in front of the person who can fix it,
-     * and nothing is stored.
+     * PUT: use an account the caller already has. The key is used once
+     * before it is taken — the database is opened on the service — so a key
+     * the service refuses fails here, in front of the person who can fix it.
      */
     private void store(Map<String, Object> body, RestChannel channel) {
         Object key = body.get("api_key");
@@ -279,49 +338,38 @@ public final class InfinoAccount {
             try {
                 InfinoNative.probe(platform, database, apiKey);
             } catch (InfinoNative.InfinoException e) {
-                throw new InfinoNative.InfinoException(platform + " refused that key for database " + database + "; nothing was stored: " + e.getMessage(), e.status());
+                throw new InfinoNative.InfinoException(platform + " refused that key for database " + database + "; nothing changed: " + e.getMessage(), e.status());
             }
-            Settings stored = Settings.builder()
-                .put(InfinoPlugin.PLATFORM_URL.getKey(), platform)
-                .put(InfinoPlugin.PLATFORM_DATABASE.getKey(), database)
-                .put(InfinoPlugin.PLATFORM_API_KEY.getKey(), apiKey)
-                .put(InfinoPlugin.PLATFORM_CONSOLE_URL.getKey(), consoleUrl)
-                .put(InfinoPlugin.PLATFORM_ACCEPTED_AT.getKey(), Instant.now().toString())
-                .put(InfinoPlugin.PLATFORM_ACCEPTED_BY.getKey(), by)
-                .build();
-            InfinoClient.updateSettings(stored, ActionListener.wrap(ignored -> {
-                log.info("[infino] an account on {} for database {} was stored by {}", platform, database, by);
-                XContentBuilder b = channel.newBuilder().startObject();
-                b.field("stored", true);
-                b.field("platform", platform);
-                b.field("database", database);
-                field(b, "console_url", consoleUrl);
-                b.field("accepted_by", by);
-                channel.sendResponse(new BytesRestResponse(RestStatus.OK, b.endObject()));
-            }, e -> fail(channel, e)));
+            use(platform, database, apiKey, consoleUrl, by);
+            log.info("[infino] an account on {} for database {} is in use, set by {}", platform, database, by);
+            XContentBuilder b = channel.newBuilder().startObject();
+            b.field("stored", true);
+            b.field("platform", platform);
+            b.field("database", database);
+            field(b, "console_url", consoleUrl);
+            b.field("accepted_by", by);
+            b.field("config", configLines(platform, database));
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, b.endObject()));
         });
     }
 
-    /** DELETE: forget the account. The tables stay on the service; storing the key again reaches them. */
-    private void forget(RestChannel channel) {
-        Settings s = persistent();
-        String platform = InfinoPlugin.PLATFORM_URL.get(s);
-        Settings cleared = Settings.builder()
-            .putNull(InfinoPlugin.PLATFORM_URL.getKey())
-            .putNull(InfinoPlugin.PLATFORM_DATABASE.getKey())
-            .putNull(InfinoPlugin.PLATFORM_API_KEY.getKey())
-            .putNull(InfinoPlugin.PLATFORM_CONSOLE_URL.getKey())
-            .putNull(InfinoPlugin.PLATFORM_ACCEPTED_AT.getKey())
-            .putNull(InfinoPlugin.PLATFORM_ACCEPTED_BY.getKey())
-            .build();
-        InfinoClient.updateSettings(cleared, ActionListener.wrap(ignored -> {
-            XContentBuilder b = channel.newBuilder().startObject();
-            b.field("forgotten", !platform.isEmpty());
-            if (!platform.isEmpty()) {
-                b.field("note", "the tables stay on " + platform + "; store the account's key again to reach them");
-            }
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, b.endObject()));
-        }, e -> fail(channel, e)));
+    /** Take the account into use on this node: the connection reopens to it. */
+    private void use(String platform, String database, String apiKey, String consoleUrl, String by) {
+        InfinoNative.configure(InfinoNative.Target.hosted(platform, database, apiKey));
+        live = new Live(platform, database, consoleUrl, Instant.now().toString(), by, FROM_ROUTE);
+    }
+
+    /** DELETE: stop using the account on this node. The tables stay on the service; a node configured with it keeps it after a restart. */
+    private void forget(RestChannel channel) throws IOException {
+        Live account = live;
+        live = null;
+        InfinoNative.configure(InfinoNative.Target.node());
+        XContentBuilder b = channel.newBuilder().startObject();
+        b.field("forgotten", account != null);
+        if (account != null) {
+            b.field("note", "the tables stay on " + account.platform() + "; use the account's key again to reach them");
+        }
+        channel.sendResponse(new BytesRestResponse(RestStatus.OK, b.endObject()));
     }
 
     private String platformOf(Map<String, Object> body) {
@@ -352,7 +400,7 @@ public final class InfinoAccount {
     }
 
     /** Run {@code work} on the generic pool, answering the channel with any failure. */
-    private static void onGeneric(RestChannel channel, Runnable work) {
+    private static void onGeneric(RestChannel channel, Work work) {
         ThreadPool threadPool = InfinoServices.threadPool();
         if (threadPool == null) {
             fail(channel, new IllegalStateException("[infino] the node is not ready"));
@@ -365,6 +413,12 @@ public final class InfinoAccount {
                 fail(channel, e);
             }
         });
+    }
+
+    /** Work that answers a channel and may fail with a checked exception. */
+    @FunctionalInterface
+    private interface Work {
+        void run() throws Exception;
     }
 
     private static void fail(RestChannel channel, Exception e) {

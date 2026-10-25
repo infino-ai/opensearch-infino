@@ -82,30 +82,50 @@ a schedule. JVM properties `infino.batch.docs` (50000) and
 `infino.batch.bytes` (64 MiB) bound the writes a batch may hold while an
 append runs.
 
-## Hosted account
+## Hosted account, and stateless nodes
 
-Instead of its own storage, the cluster's tables can live on the hosted
-service: every table operation then goes there through the engine's own
-hosted client, and the node holds no table data. What stays on the node is
-cluster state and nothing else: the index names, mappings and settings, and
-the account (the service URL, the database, the console URL, and the key as a
-filtered persistent setting that no settings API returns and every node
-reads). In the cloud: every document, the account, its credit and its
-limits. Nothing is kept in any shard either way.
+Instead of its own storage, a node's tables can live on the hosted service:
+every table operation then goes there through the engine's own hosted
+client, and the node holds no table data. The account is node configuration,
+read at boot:
+
+```yaml
+# opensearch.yml
+infino.platform.url: https://host          # the service
+infino.platform.database: logs             # the cluster's name, mapped, when unset
+```
+```bash
+opensearch-keystore add infino.platform.api_key   # or INFINO_API_KEY in the node's environment
+```
+
+Nothing about the account lives in the cluster, and nothing a node needs
+survives in it: the indices come back from a registry kept beside the tables
+(one row per index with its settings, mapping and aliases, written by the
+elected cluster manager as each index moves, deleted with the index). A node
+with an empty data directory boots, reads the registry and creates every
+index it names; the tables are named by the index, so the rows are there
+before the first request. Cluster state is a cache of this, rebuilt at boot,
+never the source. The security plugin's configuration index and Dashboards'
+saved objects come back the same way. The same holds for a `file://` or
+`s3://` catalog of the node's own. In the cloud: every document, the account,
+its credit and its limits. Nothing is kept in any shard either way.
 
 ```bash
-curl localhost:9200/_plugins/_infino/account                       # what the tables are served from; the notice when no account is stored
+curl localhost:9200/_plugins/_infino/account           # what the tables are served from; the notice when no account is in use
+curl localhost:9200/_plugins/_infino/account/indices   # what the registry would bring back on a fresh cluster (?name=<index> for one)
 curl -XPOST localhost:9200/_plugins/_infino/account/trial -H 'Content-Type: application/json' -d '{"accept": true}'
 curl -XPUT  localhost:9200/_plugins/_infino/account -H 'Content-Type: application/json' -d '{"platform": "https://host", "api_key": "..."}'
-curl -XDELETE localhost:9200/_plugins/_infino/account              # forget the account; the tables stay on the service
+curl -XDELETE localhost:9200/_plugins/_infino/account  # stop using the account on this node; the tables stay on the service
 ```
 
 An account is created only when a person accepts: the trial request must
-carry `"accept": true`, and the key is stored through a cluster-settings
-update under the caller's own identity, so whoever may not change cluster
-settings cannot accept. The trial creates a free account with credit, no
-email, no password and no card, and registers one database named after the
-cluster (`database` in the body names another). The service answers 501 when
+carry `"accept": true`. The trial creates a free account with credit, no
+email, no password and no card, registers one database named after the
+cluster (`database` in the body names another), answers with the key exactly
+once and the configuration lines above, and this node uses the account from
+then on, for its life; after a restart the node reads it from its
+configuration. `PUT` does the same for an account you already have, after
+using the key once so a refused key fails there. The service answers 501 when
 it offers no trial and 409 when the cluster's address has had one; the route
 passes each on with the next step. `infino.platform.default_url` (node
 setting) is the service a trial is asked from when the body names none.

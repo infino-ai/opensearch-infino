@@ -7,15 +7,18 @@ package org.opensearch.infino;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.support.ActionFilter;
+import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.common.lifecycle.LifecycleComponent;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.IndexScopedSettings;
+import org.opensearch.common.settings.SecureSetting;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.shard.IndexEventListener;
@@ -85,26 +88,18 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
     public static final Setting<Boolean> INFINO_DEFAULT_ENABLED = Setting.boolSetting("infino.index.default_enabled", true, Setting.Property.NodeScope);
 
     /**
-     * The hosted account the cluster's tables live on, in the persistent
-     * cluster settings so every node reads the same one and it survives
-     * restarts (see {@link InfinoAccount}). Stored by the account route;
-     * empty when the node runs over its own storage. The key is filtered
-     * (the property registers the settings filter itself): no settings API
-     * returns it, and nothing reads it back but the node.
+     * The hosted account the node's tables live on, in the node's own
+     * settings (see {@link InfinoAccount}): the service URL and the database
+     * in opensearch.yml, the key in the node's keystore. A node is configured
+     * and started; nothing about the account lives in the cluster, so a node
+     * with an empty data directory serves the account's tables as soon as it
+     * is up. Empty when the node runs over its own storage.
      */
-    public static final Setting<String> PLATFORM_URL = Setting.simpleString("infino.platform.url", Setting.Property.NodeScope, Setting.Property.Dynamic);
-    public static final Setting<String> PLATFORM_DATABASE = Setting.simpleString("infino.platform.database", Setting.Property.NodeScope, Setting.Property.Dynamic);
-    public static final Setting<String> PLATFORM_API_KEY = Setting.simpleString(
-        "infino.platform.api_key",
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Filtered
-    );
-    /** Where a person manages the account: usage, billing details, a card. Named by the service when the account was made. */
-    public static final Setting<String> PLATFORM_CONSOLE_URL = Setting.simpleString("infino.platform.console_url", Setting.Property.NodeScope, Setting.Property.Dynamic);
-    /** When, and as whom, the account was accepted or stored. */
-    public static final Setting<String> PLATFORM_ACCEPTED_AT = Setting.simpleString("infino.platform.accepted_at", Setting.Property.NodeScope, Setting.Property.Dynamic);
-    public static final Setting<String> PLATFORM_ACCEPTED_BY = Setting.simpleString("infino.platform.accepted_by", Setting.Property.NodeScope, Setting.Property.Dynamic);
+    public static final Setting<String> PLATFORM_URL = Setting.simpleString("infino.platform.url", Setting.Property.NodeScope);
+    /** The account's database; the cluster's name, mapped to the service's rule, when unset. */
+    public static final Setting<String> PLATFORM_DATABASE = Setting.simpleString("infino.platform.database", Setting.Property.NodeScope);
+    /** The account's key, from the keystore ({@code opensearch-keystore add infino.platform.api_key}); {@code INFINO_API_KEY} in the environment is read when unset. */
+    public static final Setting<SecureString> PLATFORM_API_KEY = SecureSetting.secureString("infino.platform.api_key", null);
     /** The hosted service a trial is asked from when the request names none. */
     public static final Setting<String> PLATFORM_DEFAULT_URL = Setting.simpleString(
         "infino.platform.default_url",
@@ -115,11 +110,27 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
     private static final InfinoTables TABLES = new InfinoTables();
     private final Map<ShardId, Scheduler.Cancellable> optimizers = new ConcurrentHashMap<>();
     private final boolean defaultEnabled;
-    private final String defaultPlatformUrl;
+    private final InfinoAccount account;
 
     public InfinoPlugin(Settings settings) {
         this.defaultEnabled = INFINO_DEFAULT_ENABLED.get(settings);
-        this.defaultPlatformUrl = PLATFORM_DEFAULT_URL.get(settings);
+        this.account = new InfinoAccount(PLATFORM_DEFAULT_URL.get(settings));
+        String url = PLATFORM_URL.get(settings);
+        if (url.isEmpty()) {
+            return;
+        }
+        // The keystore is open only while the plugins are constructed, so the
+        // key is read here and kept by the node for its life.
+        String key;
+        try (SecureString secure = PLATFORM_API_KEY.get(settings)) {
+            key = secure == null || secure.length() == 0 ? null : secure.toString();
+        }
+        String database = PLATFORM_DATABASE.get(settings);
+        if (database.isEmpty()) {
+            database = InfinoAccount.databaseNameFor(ClusterName.CLUSTER_NAME_SETTING.get(settings).value());
+        }
+        account.configuredAtBoot(url, database, key != null);
+        InfinoNative.configure(InfinoNative.Target.hosted(url, database, key));
     }
 
     /** The tables behind the node's Infino-backed indices. */
@@ -184,6 +195,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
             public void afterIndexShardDeleted(ShardId shardId, Settings indexSettings) {
                 String table = InfinoNative.tableFor(shardId.getIndex(), indexSettings);
                 TABLES.forget(table);
+                InfinoRegistry.forget(shardId.getIndexName());
                 if (InfinoNative.tableIsExplicit(indexSettings)) {
                     log.info("[infino] index {} deleted; its table {} was named explicitly and is kept", shardId.getIndexName(), table);
                     return;
@@ -263,9 +275,6 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
             PLATFORM_URL,
             PLATFORM_DATABASE,
             PLATFORM_API_KEY,
-            PLATFORM_CONSOLE_URL,
-            PLATFORM_ACCEPTED_AT,
-            PLATFORM_ACCEPTED_BY,
             PLATFORM_DEFAULT_URL
         );
     }
@@ -281,7 +290,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
-        return List.of(new InfinoAccountRestHandler(new InfinoAccount(defaultPlatformUrl)));
+        return List.of(new InfinoAccountRestHandler(account));
     }
 
     @Override

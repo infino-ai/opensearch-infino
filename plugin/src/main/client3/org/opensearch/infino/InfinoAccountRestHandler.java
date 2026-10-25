@@ -33,6 +33,7 @@ public final class InfinoAccountRestHandler extends BaseRestHandler {
     public List<Route> routes() {
         return List.of(
             new Route(RestRequest.Method.GET, InfinoAccount.ROUTE),
+            new Route(RestRequest.Method.GET, InfinoAccount.INDICES_ROUTE),
             new Route(RestRequest.Method.POST, InfinoAccount.TRIAL_ROUTE),
             new Route(RestRequest.Method.PUT, InfinoAccount.ROUTE),
             new Route(RestRequest.Method.DELETE, InfinoAccount.ROUTE)
@@ -41,6 +42,8 @@ public final class InfinoAccountRestHandler extends BaseRestHandler {
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
+        // Parameters count as recognised only when read before the consumer runs.
+        request.param("name");
         return channel -> account.handle(request, channel);
     }
 }
