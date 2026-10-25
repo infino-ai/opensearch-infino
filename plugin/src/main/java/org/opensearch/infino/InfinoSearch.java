@@ -15,6 +15,8 @@ import org.opensearch.action.search.SearchResponseSections;
 import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.common.document.DocumentField;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
+import org.opensearch.common.regex.Regex;
+import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
@@ -43,6 +45,7 @@ import org.opensearch.search.aggregations.metrics.TopHitsAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.collapse.CollapseBuilder;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
+import org.opensearch.search.fetch.subphase.FieldAndFormat;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.search.sort.ScoreSortBuilder;
@@ -52,12 +55,17 @@ import org.opensearch.search.sort.SortOrder;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 
 /**
@@ -92,6 +100,10 @@ public final class InfinoSearch {
     private static final int DEFAULT_SIZE = 10;
     /** The node name a hit's shard target carries; it only names the index in the response. */
     private static final String NODE = "infino";
+    /** Version reported for a hit when the request asks for one; the table keeps no per-document version. */
+    private static final long UNVERSIONED = 1L;
+    /** How a date in a hit's source is read back before it is printed in a requested format. */
+    private static final String READ_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
 
     private InfinoSearch() {}
 
@@ -341,6 +353,8 @@ public final class InfinoSearch {
 
         FetchSourceContext sourceFilter = sourceFilter(source.fetchSource());
         boolean withSource = source.fetchSource() == null || source.fetchSource().fetchSource();
+        List<FieldAndFormat> fields = requestedFields(source.docValueFields(), source.fetchFields());
+        boolean version = Boolean.TRUE.equals(source.version());
         SearchShardTarget target = target(index);
         List<SearchHit> hits = new ArrayList<>();
         float maxScore = Float.NaN;
@@ -367,12 +381,18 @@ public final class InfinoSearch {
             if (!Float.isNaN(score)) {
                 maxScore = Float.isNaN(maxScore) ? score : Math.max(maxScore, score);
             }
-            if (withSource) {
+            if (version) {
+                h.version(UNVERSIONED);
+            }
+            if (withSource || !fields.isEmpty()) {
                 String src = plan.vector() != null
                     ? InfinoNative.getSource(plan.table(), id.toString())
                     : String.valueOf(row.get(InfinoQueryTranslator.SOURCE));
                 if (src != null && !src.isEmpty()) {
-                    h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
+                    if (withSource) {
+                        h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
+                    }
+                    fillFields(h, src, fields, plan.cols());
                 }
             }
             if (!plan.sorts().isEmpty()) {
@@ -511,6 +531,8 @@ public final class InfinoSearch {
         int size,
         List<SortSpec> sorts,
         FetchSourceContext fetchSource,
+        List<FieldAndFormat> fields,
+        Map<String, Column> cols,
         List<Map<String, Object>> rows,
         long bucketCount,
         Index index
@@ -530,10 +552,13 @@ public final class InfinoSearch {
                 h.shard(target);
             }
             h.score(score);
-            if (withSource) {
+            if (withSource || !fields.isEmpty()) {
                 String src = String.valueOf(row.get(InfinoQueryTranslator.SOURCE));
                 if (!src.isEmpty()) {
-                    h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
+                    if (withSource) {
+                        h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
+                    }
+                    fillFields(h, src, fields, cols);
                 }
             }
             if (!sorts.isEmpty()) {
@@ -556,6 +581,88 @@ public final class InfinoSearch {
         TopDocsAndMaxScore topDocs = new TopDocsAndMaxScore(new TopDocs(total, docs), maxScore);
         SearchHits searchHits = new SearchHits(hits.toArray(new SearchHit[0]), total, maxScore);
         return new InternalTopHits(b.getName(), from, size, topDocs, searchHits, b.getMetadata());
+    }
+
+    /**
+     * The fields a request asks for beside the source ({@code docvalue_fields}
+     * and {@code fields}), each once; a pattern such as {@code *} stays a
+     * pattern and is matched against the source's paths per hit.
+     */
+    static List<FieldAndFormat> requestedFields(List<FieldAndFormat> docValues, List<FieldAndFormat> fetch) {
+        List<FieldAndFormat> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (List<FieldAndFormat> group : List.of(docValues == null ? List.<FieldAndFormat>of() : docValues, fetch == null ? List.<FieldAndFormat>of() : fetch)) {
+            for (FieldAndFormat f : group) {
+                if (seen.add(f.field)) {
+                    out.add(f);
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Each requested field on the hit under {@code fields}, read from the
+     * hit's source (the table holds what was sent, so a field's value is the
+     * source's value at that path): a date column in the requested format,
+     * everything else as it is. A missing path is left out, as stock does.
+     */
+    static void fillFields(SearchHit h, String src, List<FieldAndFormat> fields, Map<String, Column> cols) {
+        if (fields.isEmpty()) {
+            return;
+        }
+        Map<String, Object> flat = new LinkedHashMap<>();
+        flatten("", XContentHelper.convertToMap(new BytesArray(src), true, MediaTypeRegistry.JSON).v2(), flat);
+        for (FieldAndFormat f : fields) {
+            for (Map.Entry<String, Object> e : flat.entrySet()) {
+                if (!Regex.simpleMatch(f.field, e.getKey())) {
+                    continue;
+                }
+                List<Object> values = new ArrayList<>();
+                Column c = cols.get(e.getKey());
+                for (Object v : e.getValue() instanceof List<?> list ? list : List.of(e.getValue())) {
+                    values.add(c != null && c.isTimestamp() ? formatDate(v, f.format) : v);
+                }
+                h.setDocumentField(e.getKey(), new DocumentField(e.getKey(), values));
+            }
+        }
+    }
+
+    /** The source's leaves by dotted path; a list of scalars stays one value. */
+    private static void flatten(String prefix, Map<String, Object> map, Map<String, Object> out) {
+        for (Map.Entry<String, Object> e : map.entrySet()) {
+            String path = prefix.isEmpty() ? e.getKey() : prefix + "." + e.getKey();
+            if (e.getValue() instanceof Map<?, ?> nested) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> inner = (Map<String, Object>) nested;
+                flatten(path, inner, out);
+            } else if (e.getValue() != null) {
+                out.put(path, e.getValue());
+            }
+        }
+    }
+
+    /** A date value in the requested format: epoch milliseconds, or a named or patterned date format; unreadable values stay as they are. */
+    private static Object formatDate(Object v, String format) {
+        Instant at;
+        try {
+            at = v instanceof Number n
+                ? Instant.ofEpochMilli(n.longValue())
+                : DateFormatter.forPattern(READ_DATE_FORMAT).parse(v.toString()).query(Instant::from);
+        } catch (RuntimeException e) {
+            return v;
+        }
+        if (format == null || format.equals("use_field_mapping")) {
+            return v;
+        }
+        if (format.equals("epoch_millis")) {
+            return Long.toString(at.toEpochMilli());
+        }
+        try {
+            return DateFormatter.forPattern(format).format(at.atZone(ZoneOffset.UTC));
+        } catch (RuntimeException e) {
+            return v;
+        }
     }
 
     private static BytesReference filtered(String src, FetchSourceContext filter) {

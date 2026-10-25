@@ -89,6 +89,7 @@ import org.opensearch.search.aggregations.metrics.TopHitsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
+import org.opensearch.search.fetch.subphase.FieldAndFormat;
 import org.opensearch.search.sort.SortOrder;
 
 import java.io.IOException;
@@ -614,13 +615,17 @@ public class InfinoAggregationProcessor {
         final int size;
         final List<SortSpec> sorts;
         final FetchSourceContext source;
+        final List<FieldAndFormat> fields;
+        final Map<String, Column> cols;
 
-        private TopHits(TopHitsAggregationBuilder b, List<SortSpec> sorts, FetchSourceContext source) {
+        private TopHits(TopHitsAggregationBuilder b, List<SortSpec> sorts, FetchSourceContext source, List<FieldAndFormat> fields, Map<String, Column> cols) {
             super(b);
             this.from = Math.max(0, b.from());
             this.size = b.size() < 0 ? DEFAULT_TOP_HITS_SIZE : b.size();
             this.sorts = sorts;
             this.source = source;
+            this.fields = fields;
+            this.cols = cols;
         }
 
         static TopHits of(TopHitsAggregationBuilder b, Map<String, Column> cols) {
@@ -629,13 +634,8 @@ public class InfinoAggregationProcessor {
             }
             // The builder's collections are null until the request names them.
             boolean scripts = b.scriptFields() != null && !b.scriptFields().isEmpty();
-            if (b.highlighter() != null || b.explain() || b.version() || scripts || b.storedFields() != null) {
-                throw new Unsupported("aggregation [" + b.getName() + "] asks for highlight, explain, version, script or stored fields, which the table does not serve");
-            }
-            boolean docValues = b.docValueFields() != null && !b.docValueFields().isEmpty();
-            boolean fetchFields = b.fetchFields() != null && !b.fetchFields().isEmpty();
-            if (docValues || fetchFields) {
-                throw new Unsupported("aggregation [" + b.getName() + "] asks for docvalue or fetch fields; the source carries the row");
+            if (b.highlighter() != null || b.explain() || b.version() || scripts) {
+                throw new Unsupported("aggregation [" + b.getName() + "] asks for highlight, explain, version or script fields, which the table does not serve");
             }
             List<SortSpec> sorts;
             try {
@@ -643,7 +643,8 @@ public class InfinoAggregationProcessor {
             } catch (IllegalArgumentException e) {
                 throw new Unsupported("aggregation [" + b.getName() + "] " + e.getMessage());
             }
-            return new TopHits(b, sorts, b.fetchSource());
+            // docvalue_fields and fields are read from the hit's source; stored_fields adds nothing the source lacks.
+            return new TopHits(b, sorts, b.fetchSource(), InfinoSearch.requestedFields(b.docValueFields(), b.fetchFields()), cols);
         }
 
         /** The columns a hit row carries beyond the id and the source. */
@@ -666,7 +667,7 @@ public class InfinoAggregationProcessor {
 
         /** This aggregation over the bucket's rows (in order, at most {@link #fetch()} of them) and its row count; the hits name {@code index}. */
         InternalAggregation build(List<Map<String, Object>> rows, long bucketCount, Index index) {
-            return InfinoSearch.topHits((TopHitsAggregationBuilder) builder, from, size, sorts, source, rows, bucketCount, index);
+            return InfinoSearch.topHits((TopHitsAggregationBuilder) builder, from, size, sorts, source, fields, cols, rows, bucketCount, index);
         }
 
         InternalAggregation empty() {
