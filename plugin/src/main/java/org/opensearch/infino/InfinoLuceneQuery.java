@@ -103,6 +103,8 @@ final class InfinoLuceneQuery {
         List<Token> out = new ArrayList<>();
         int i = 0;
         int n = q.length();
+        // Inside a range's brackets a leading sign belongs to the bound, not a clause.
+        boolean inRange = false;
         while (i < n) {
             char c = q.charAt(i);
             if (Character.isWhitespace(c)) {
@@ -123,11 +125,13 @@ final class InfinoLuceneQuery {
                 }
                 case '[', '{' -> {
                     out.add(new Token(Kind.LBRACKET, String.valueOf(c), null));
+                    inRange = true;
                     i++;
                     continue;
                 }
                 case ']', '}' -> {
                     i++;
+                    inRange = false;
                     out.add(new Token(Kind.RBRACKET, String.valueOf(c), modifiers(q, i)));
                     i = skipModifiers(q, i);
                     continue;
@@ -177,7 +181,7 @@ final class InfinoLuceneQuery {
                 }
             }
             // A sigil at the start of a clause.
-            if ((c == '+' || c == '-' || c == '!') && i + 1 < n && !Character.isWhitespace(q.charAt(i + 1))) {
+            if (!inRange && (c == '+' || c == '-' || c == '!') && i + 1 < n && !Character.isWhitespace(q.charAt(i + 1))) {
                 out.add(new Token(c == '+' ? Kind.PLUS : c == '-' ? Kind.MINUS : Kind.NOT, String.valueOf(c), null));
                 i++;
                 continue;

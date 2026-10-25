@@ -20,6 +20,7 @@ import org.opensearch.action.update.UpdateResponse;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -74,8 +75,17 @@ public final class InfinoWriter {
     private static final long SEQ_NO = SequenceNumbers.UNASSIGNED_SEQ_NO;
     private static final long PRIMARY_TERM = SequenceNumbers.UNASSIGNED_PRIMARY_TERM;
 
-    /** One write a bulk item asks for: the source to append (null for a delete) and whether the id may already exist. */
-    record Write(String id, String source, boolean lookup) {}
+    /**
+     * One write a bulk item asks for: the source to append (null for a
+     * delete), whether the id may already exist (looked up at flush), and
+     * whether it must not ({@code op_type: create}, answered with a conflict
+     * when it does).
+     */
+    record Write(String id, String source, boolean lookup, boolean create) {
+        Write(String id, String source, boolean lookup) {
+            this(id, source, lookup, false);
+        }
+    }
 
     /** What one item of a bulk became: answered up front (refused), or by its write when the batch flushes. */
     record Outcome(int slot, DocWriteRequest<?> item, Write write, BulkItemResponse answered) {}
@@ -86,8 +96,12 @@ public final class InfinoWriter {
     /** A bulk in its batch: the waiter, its prepared batch (null when it writes nothing), and the ids of the prepared rows in order. */
     private record Staged(Waiter waiter, Pointer prepared, List<String> preparedIds, long bytes) {}
 
-    /** What a flush did: the ids the engine refused with the reason, and the ids that already existed. */
-    private record Applied(Map<String, String> refused, Set<String> existed) {}
+    /**
+     * What a flush did: the ids the engine refused with the reason, the ids
+     * that already existed, and the creates among those (not written, answered
+     * as conflicts).
+     */
+    private record Applied(Map<String, String> refused, Set<String> existed, Set<String> conflicts) {}
 
     /** The pending batch of one table, and whether an append is running for it. */
     private static final class Batch {
@@ -201,8 +215,12 @@ public final class InfinoWriter {
             } finally {
                 batch.lock.unlock();
             }
+            // The prepared handles are consumed by the append; on any other way out
+            // they are released here, so a failing backend leaks no native memory.
+            boolean consumed = false;
             try {
                 Applied applied = apply(table, staged);
+                consumed = true;
                 for (Staged s : staged) {
                     answer(s.waiter(), applied);
                 }
@@ -211,14 +229,28 @@ public final class InfinoWriter {
                 for (Staged s : staged) {
                     s.waiter().listener().onFailure(e);
                 }
+            } finally {
+                if (!consumed) {
+                    for (Staged s : staged) {
+                        InfinoNative.freePrepared(s.prepared());
+                    }
+                }
             }
         }
     }
 
-    /** Tombstone what exists, append the rest. */
+    /**
+     * Write the batch: the rows of ids the table already holds replace
+     * those rows in the same mutation as the append (so a failed write
+     * leaves the old rows), ids only deleted are tombstoned, and a create of
+     * an id that exists is a conflict, left out of the write. Consumes every
+     * prepared handle.
+     */
     private static Applied apply(String table, List<Staged> staged) {
         Set<String> lookups = new HashSet<>();
         Set<String> written = new HashSet<>();
+        Set<String> creates = new HashSet<>();
+        Set<String> deleted = new HashSet<>();
         boolean collision = false;
         for (Staged s : staged) {
             for (Outcome o : s.waiter().outcomes()) {
@@ -229,33 +261,54 @@ public final class InfinoWriter {
                 if (w.lookup()) {
                     lookups.add(w.id());
                 }
+                if (w.create()) {
+                    creates.add(w.id());
+                }
+                if (w.source() == null) {
+                    deleted.add(w.id());
+                }
                 if (!written.add(w.id())) {
                     collision = true; // the same id twice in one batch: written twice, or written and deleted
                 }
             }
         }
         Set<String> existed = lookups.isEmpty() ? Set.of() : InfinoNative.existingOsids(table, lookups);
+        Set<String> conflicts = new HashSet<>();
+        for (String id : creates) {
+            if (existed.contains(id)) {
+                conflicts.add(id);
+            }
+        }
+        List<String> replaced = new ArrayList<>();
         List<String> tombstones = new ArrayList<>();
         for (String id : written) {
-            if (existed.contains(id)) {
-                tombstones.add(id);
+            if (!existed.contains(id) || conflicts.contains(id)) {
+                continue;
             }
+            if (deleted.contains(id)) {
+                tombstones.add(id);
+            } else {
+                replaced.add(id);
+            }
+        }
+        Map<String, String> refused;
+        try {
+            refused = collision || !conflicts.isEmpty() ? appendFolded(table, staged, conflicts, replaced) : appendPrepared(table, staged, replaced);
+        } finally {
+            // A read after the write must see the table, not a prefetched copy.
+            InfinoNative.forgetSources(table, written);
         }
         if (!tombstones.isEmpty()) {
             int rc = InfinoNative.deleteOsids(table, tombstones.toArray(new String[0]), tombstones.size());
             if (rc != 0) {
-                for (Staged s : staged) {
-                    InfinoNative.freePrepared(s.prepared());
-                }
                 throw new IllegalStateException("[infino] delete of " + tombstones.size() + " ids from " + table + " returned " + rc);
             }
         }
-        Map<String, String> refused = collision ? appendFolded(table, staged) : appendPrepared(table, staged);
-        return new Applied(refused, existed);
+        return new Applied(refused, existed, conflicts);
     }
 
     /** The prepared batches as one commit; a refused document is reported under its id. */
-    private static Map<String, String> appendPrepared(String table, List<Staged> staged) {
+    private static Map<String, String> appendPrepared(String table, List<Staged> staged, List<String> replaced) {
         List<Pointer> handles = new ArrayList<>();
         List<Staged> withRows = new ArrayList<>();
         for (Staged s : staged) {
@@ -269,7 +322,7 @@ public final class InfinoWriter {
             return refused;
         }
         long start = System.nanoTime();
-        InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, handles);
+        InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, handles, replaced);
         long millis = (System.nanoTime() - start) / 1_000_000L;
         int docs = 0;
         for (Staged s : withRows) {
@@ -283,11 +336,12 @@ public final class InfinoWriter {
     }
 
     /**
-     * The batch's writes folded by id, last write winning and a delete
-     * cancelling an earlier write, then appended from the sources: the path
-     * for a batch in which one id appears twice.
+     * The batch's writes folded by id, last write winning, a delete
+     * cancelling an earlier write and a conflicting create left out, then
+     * prepared afresh and written as one mutation: the path for a batch in
+     * which one id appears twice or a create meets an existing id.
      */
-    private static Map<String, String> appendFolded(String table, List<Staged> staged) {
+    private static Map<String, String> appendFolded(String table, List<Staged> staged, Set<String> conflicts, List<String> replaced) {
         Map<String, Write> writes = new LinkedHashMap<>();
         for (Staged s : staged) {
             InfinoNative.freePrepared(s.prepared());
@@ -300,7 +354,7 @@ public final class InfinoWriter {
         List<String> ids = new ArrayList<>();
         List<String> sources = new ArrayList<>();
         for (Write w : writes.values()) {
-            if (w.source() != null) {
+            if (w.source() != null && !conflicts.contains(w.id())) {
                 ids.add(w.id());
                 sources.add(w.source());
             }
@@ -309,11 +363,15 @@ public final class InfinoWriter {
         if (ids.isEmpty()) {
             return refused;
         }
-        InfinoNative.BatchResult result = InfinoNative.indexBatch(table, ids.toArray(new String[0]), sources.toArray(new String[0]), ids.size());
-        for (InfinoNative.Failure f : result.failed()) {
+        Pointer prepared = InfinoNative.prepare(table, ids, sources);
+        if (prepared == null) {
+            throw new IllegalStateException("[infino] the bridge could not prepare the folded batch for " + table);
+        }
+        InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced);
+        for (InfinoNative.PreparedFailure f : result.failed()) {
             refused.put(ids.get(f.index()), f.reason());
         }
-        log.debug("[infino] appended {} of {} documents to {} (folded: an id appeared twice in the batch)", result.ok(), ids.size(), table);
+        log.debug("[infino] appended {} of {} documents to {} (folded: an id appeared twice in the batch, or a create met an existing id)", result.ok(), ids.size(), table);
         return refused;
     }
 
@@ -325,6 +383,15 @@ public final class InfinoWriter {
                 continue;
             }
             Write write = o.write();
+            if (write.create() && applied.conflicts().contains(write.id())) {
+                // op_type create over an id the table holds: the conflict stock reports, and no row written.
+                w.items()[o.slot()] = new BulkItemResponse(
+                    o.slot(),
+                    o.item().opType(),
+                    new BulkItemResponse.Failure(w.indexName(), write.id(), new VersionConflictEngineException(w.shardId(), write.id(), "document already exists"), RestStatus.CONFLICT)
+                );
+                continue;
+            }
             String why = applied.refused().get(write.id());
             if (why != null) {
                 w.items()[o.slot()] = new BulkItemResponse(

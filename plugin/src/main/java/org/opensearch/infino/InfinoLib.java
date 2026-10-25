@@ -27,8 +27,12 @@ public interface InfinoLib extends Library {
     /** Parse and convert a batch ahead of its append; null when the table is unknown. */
     Pointer infino_prepare_batch(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
 
-    /** Append prepared batches in one commit and release them. */
-    Pointer infino_append_prepared(Pointer h, String name, Pointer[] prepared, int count);
+    /**
+     * Append prepared batches in one commit and release them; the rows whose ids
+     * are in {@code replaced} replace the table's rows under those ids in the
+     * same mutation (null or zero for a plain append).
+     */
+    Pointer infino_append_prepared(Pointer h, String name, Pointer[] prepared, int count, String[] replaced, int replacedCount);
 
     void infino_free_prepared(Pointer prepared);
 

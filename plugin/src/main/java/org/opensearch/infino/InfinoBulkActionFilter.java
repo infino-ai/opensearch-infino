@@ -20,6 +20,7 @@ import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.UUIDs;
+import org.opensearch.common.lucene.uid.Versions;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
@@ -31,7 +32,9 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaType;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.VersionType;
 import org.opensearch.index.engine.DocumentMissingException;
+import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.infino.InfinoWriter.Outcome;
 import org.opensearch.infino.InfinoWriter.Waiter;
 import org.opensearch.infino.InfinoWriter.Write;
@@ -98,7 +101,22 @@ public class InfinoBulkActionFilter implements ActionFilter {
             chain.proceed(task, action, request, listener);
             return;
         }
-        // Which items target an Infino-backed index.
+        Map<String, IndexMetadata> infino = infinoIndices(clusters, bulk);
+        if (infino.isEmpty()) {
+            chain.proceed(task, action, request, listener);
+            return;
+        }
+        @SuppressWarnings("unchecked")
+        ActionListener<BulkResponse> cast = (ActionListener<BulkResponse>) listener;
+        serve(bulk, infino, writes, tables, cast);
+    }
+
+    /**
+     * The Infino-backed indices a bulk's items target, by name; empty when
+     * none does. A bulk that mixes them with other indices, or spans more
+     * than one, is refused.
+     */
+    static Map<String, IndexMetadata> infinoIndices(ClusterService clusters, BulkRequest bulk) {
         Map<String, IndexMetadata> infino = new LinkedHashMap<>();
         int infinoItems = 0;
         for (DocWriteRequest<?> item : bulk.requests()) {
@@ -109,26 +127,26 @@ public class InfinoBulkActionFilter implements ActionFilter {
             }
         }
         if (infinoItems == 0) {
-            chain.proceed(task, action, request, listener);
-            return;
+            return Map.of();
         }
         if (infinoItems != bulk.requests().size()) {
-            listener.onFailure(new IllegalArgumentException("[infino] a bulk mixing Infino-backed indices with others is not served"));
-            return;
+            throw new IllegalArgumentException("[infino] a bulk mixing Infino-backed indices with others is not served");
         }
         if (infino.size() != 1) {
-            listener.onFailure(new IllegalArgumentException("[infino] a bulk over more than one Infino-backed index is not served; send one bulk per index"));
-            return;
+            throw new IllegalArgumentException("[infino] a bulk over more than one Infino-backed index is not served; send one bulk per index");
         }
+        return infino;
+    }
+
+    /** Serve a bulk over one Infino-backed index: stage its items and hand them to the table's writer. */
+    static void serve(BulkRequest bulk, Map<String, IndexMetadata> infino, InfinoWriter writes, InfinoTables tables, ActionListener<BulkResponse> listener) {
         long start = System.nanoTime();
         try {
             IndexMetadata md = infino.values().iterator().next();
             String table = tables.ensure(md);
             BulkItemResponse[] items = new BulkItemResponse[bulk.requests().size()];
-            @SuppressWarnings("unchecked")
-            ActionListener<BulkResponse> cast = (ActionListener<BulkResponse>) listener;
             ShardId shardId = new ShardId(md.getIndex(), 0);
-            Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, bulk.requests(), writes), items, start, cast);
+            Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, bulk.requests(), writes), items, start, listener);
             writes.submit(table, waiter);
         } catch (Exception e) {
             log.warn("[infino] bulk failed", e);
@@ -142,6 +160,13 @@ public class InfinoBulkActionFilter implements ActionFilter {
         List<Outcome> outcomes = new ArrayList<>(requests.size());
         for (int slot = 0; slot < requests.size(); slot++) {
             DocWriteRequest<?> item = requests.get(slot);
+            // The table keeps no versions or sequence numbers, so a write conditioned on
+            // them cannot be checked; it is refused rather than written unconditionally.
+            String conditioned = conditioned(item);
+            if (conditioned != null) {
+                outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, new IllegalArgumentException("[infino] " + conditioned), RestStatus.BAD_REQUEST)));
+                continue;
+            }
             if (item instanceof IndexRequest index) {
                 boolean generated = index.id() == null;
                 if (generated) {
@@ -151,10 +176,10 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 // appended, and a refused one comes back as its own item then; checking it
                 // here too would parse every document twice.
                 String source = sourceAsJson(index.source(), index.getContentType());
-                // A generated id, or an explicit create, is new by definition; an index of an
-                // explicit id may replace a row, so its id is looked up at flush.
-                boolean lookup = !generated && index.opType() != DocWriteRequest.OpType.CREATE;
-                outcomes.add(new Outcome(slot, item, new Write(index.id(), source, lookup), null));
+                // A generated id is new by definition; an explicit id is looked up at flush,
+                // to replace its row, or to refuse a create that would duplicate it.
+                boolean create = index.opType() == DocWriteRequest.OpType.CREATE;
+                outcomes.add(new Outcome(slot, item, new Write(index.id(), source, !generated, create && !generated), null));
             } else if (item instanceof DeleteRequest delete) {
                 outcomes.add(new Outcome(slot, item, new Write(delete.id(), null, true), null));
             } else if (item instanceof UpdateRequest update) {
@@ -162,9 +187,11 @@ public class InfinoBulkActionFilter implements ActionFilter {
                     outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, new IllegalArgumentException("[infino] scripted updates are not served"), RestStatus.BAD_REQUEST)));
                     continue;
                 }
+                // The merge base is the pending write for the id, else the table itself;
+                // never a prefetched copy, which may predate an acknowledged write.
                 String current = writes.pendingSource(table, update.id());
                 if (current == null) {
-                    current = InfinoNative.getSource(table, update.id());
+                    current = InfinoNative.getSourceFresh(table, update.id());
                 }
                 String merged = merge(current, update);
                 if (merged == null) {
@@ -182,6 +209,19 @@ public class InfinoBulkActionFilter implements ActionFilter {
             }
         }
         return outcomes;
+    }
+
+    /** Why a write conditioned on a version or sequence number cannot be served, or null when it is unconditioned. */
+    static String conditioned(DocWriteRequest<?> item) {
+        if (item.ifSeqNo() != SequenceNumbers.UNASSIGNED_SEQ_NO || item.ifPrimaryTerm() != SequenceNumbers.UNASSIGNED_PRIMARY_TERM) {
+            return "if_seq_no / if_primary_term are not served: the table keeps no sequence numbers";
+        }
+        // An op_type create carries the "match deleted" marker as its version; that is the create, not a condition.
+        boolean unversioned = item.version() == Versions.MATCH_ANY || item.version() == Versions.MATCH_DELETED;
+        if (!unversioned || item.versionType() != VersionType.INTERNAL) {
+            return "version and version_type are not served: the table keeps no per-document version";
+        }
+        return null;
     }
 
     private static BulkItemResponse failure(int slot, DocWriteRequest<?> item, String index, Exception cause, RestStatus status) {

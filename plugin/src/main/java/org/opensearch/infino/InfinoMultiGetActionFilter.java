@@ -14,16 +14,14 @@ import org.opensearch.action.get.MultiGetRequest;
 import org.opensearch.action.get.MultiGetResponse;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
+import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
-import org.opensearch.core.common.bytes.BytesArray;
-import org.opensearch.index.get.GetResult;
-import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.tasks.Task;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -33,21 +31,22 @@ import java.util.function.Supplier;
 /**
  * Serves {@code _mget} for Infino-backed indices from their tables: the ids of
  * each index are looked up through the id column's term index in one
- * statement, and each item comes back as a get response. A request that
- * also names an index the plugin does not back goes on to the shards as it
- * is. Version and sequence number are not carried, as for a single get.
+ * statement, and each item comes back as a get response. An index may be
+ * named through an alias. A request that also names an index the plugin
+ * does not back goes on to the shards as it is. Version and sequence number
+ * are not carried, as for a single get.
  */
 public class InfinoMultiGetActionFilter implements ActionFilter {
 
     private static final Logger log = LogManager.getLogger(InfinoMultiGetActionFilter.class);
-    /** Version reported for a document served from the table, which keeps no per-document version. */
-    private static final long UNVERSIONED = 1L;
 
     private final Supplier<ClusterService> clusterService;
+    private final Supplier<IndexNameExpressionResolver> resolver;
     private final InfinoTables tables;
 
-    public InfinoMultiGetActionFilter(Supplier<ClusterService> clusterService, InfinoTables tables) {
+    public InfinoMultiGetActionFilter(Supplier<ClusterService> clusterService, Supplier<IndexNameExpressionResolver> resolver, InfinoTables tables) {
         this.clusterService = clusterService;
+        this.resolver = resolver;
         this.tables = tables;
     }
 
@@ -75,15 +74,22 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             return;
         }
         // Every item must be on an Infino-backed index for the table to answer the request whole.
+        ClusterState state = clusters.state();
+        IndexNameExpressionResolver names = resolver.get();
         Map<String, IndexMetadata> indices = new HashMap<>();
         for (MultiGetRequest.Item item : mget.getItems()) {
-            IndexMetadata index = indices.computeIfAbsent(item.index(), name -> clusters.state().metadata().index(name));
-            if (index == null || !index.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
+            IndexMetadata index = indices.computeIfAbsent(item.index(), name -> InfinoGetActionFilter.infinoIndex(state, names, name));
+            if (index == null) {
                 chain.proceed(task, action, request, listener);
                 return;
             }
         }
         try {
+            List<String> concrete = new ArrayList<>();
+            for (IndexMetadata md : indices.values()) {
+                concrete.add(md.getIndex().getName());
+            }
+            InfinoSecurity.refuseIfRestricted(InfinoServices.threadContext(), concrete, "mget");
             // One source fetch per index, over all of its ids.
             Map<String, List<String>> idsByIndex = new HashMap<>();
             for (MultiGetRequest.Item item : mget.getItems()) {
@@ -99,19 +105,8 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             for (int i = 0; i < responses.length; i++) {
                 MultiGetRequest.Item item = mget.getItems().get(i);
                 String source = InfinoNative.getSource(tableOf.get(item.index()), item.id());
-                boolean exists = source != null && !source.isEmpty();
-                GetResult result = new GetResult(
-                    indices.get(item.index()).getIndex().getName(),
-                    item.id(),
-                    SequenceNumbers.UNASSIGNED_SEQ_NO,
-                    SequenceNumbers.UNASSIGNED_PRIMARY_TERM,
-                    exists ? UNVERSIONED : -1L,
-                    exists,
-                    exists ? new BytesArray(source.getBytes(StandardCharsets.UTF_8)) : null,
-                    Map.of(),
-                    Map.of()
-                );
-                responses[i] = new MultiGetItemResponse(new GetResponse(result), null);
+                GetResponse get = new GetResponse(InfinoGetActionFilter.result(indices.get(item.index()).getIndex().getName(), item.id(), source, item.fetchSourceContext()));
+                responses[i] = new MultiGetItemResponse(get, null);
             }
             @SuppressWarnings("unchecked")
             Response response = (Response) new MultiGetResponse(responses);

@@ -218,12 +218,21 @@ public final class InfinoSearch {
                 scriptFields.add(new ScriptedField(sf.fieldName(), sql.expr(), "sf" + scriptFields.size()));
             }
         }
+        // A sorted request orders by the id last, so rows sharing a sort value
+        // have one order and a page boundary falls between rows, never through
+        // a value: the id is the tiebreak search_after needs, and the hit's sort
+        // values carry it for the next page.
+        Column idColumn = cols.get(InfinoQueryTranslator.OSID);
+        if (!sorts.isEmpty() && idColumn != null && sorts.stream().noneMatch(s -> s.name().equals(InfinoQueryTranslator.OSID))) {
+            sorts.add(SortSpec.of(idColumn, false));
+        }
         Object[] searchAfter = source.searchAfter();
         if (searchAfter != null) {
             if (sorts.isEmpty()) {
                 throw new IllegalArgumentException("[infino] search_after needs a sort on fields");
             }
-            if (searchAfter.length != sorts.size()) {
+            // The request's own sorts, or those plus the id the previous page handed back.
+            if (searchAfter.length != sorts.size() && searchAfter.length != sorts.size() - 1) {
                 throw new IllegalArgumentException("[infino] search_after has " + searchAfter.length + " values for " + sorts.size() + " sort fields");
             }
             if (source.from() > 0) {
@@ -231,11 +240,6 @@ public final class InfinoSearch {
             }
             if (vector != null) {
                 throw new IllegalArgumentException("[infino] search_after is not served with a vector query");
-            }
-            for (Object v : searchAfter) {
-                if (v == null) {
-                    throw new IllegalArgumentException("[infino] search_after with a null sort value is not served; sort with a tiebreaker such as _id");
-                }
             }
         }
         Plan plan = new Plan(table, cols, query, sorts, vector, postWhere, collapse, searchAfter, scriptFields);
@@ -358,8 +362,10 @@ public final class InfinoSearch {
         SearchShardTarget target = target(index);
         List<SearchHit> hits = new ArrayList<>();
         float maxScore = Float.NaN;
+        // Every row up to the window's end: the window itself is applied once,
+        // over the merged pages, as a coordinator applies it over its shards.
         int end = Math.min(rows.size(), fetch);
-        for (int i = from; i < end; i++) {
+        for (int i = 0; i < end; i++) {
             Map<String, Object> row = rows.get(i);
             Object id = row.get(InfinoQueryTranslator.OSID);
             if (id == null) {
@@ -433,6 +439,9 @@ public final class InfinoSearch {
         Translation q = plan.query();
         StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE);
         for (SortSpec s : plan.sorts()) {
+            if (s.name().equals(InfinoQueryTranslator.OSID)) {
+                continue; // the id is selected already
+            }
             hit.append(", ").append(s.expr()).append(" AS ").append(InfinoQueryTranslator.quoteIdent(s.name()));
         }
         if (plan.collapse() != null && plan.sorts().stream().noneMatch(s -> s.name().equals(plan.collapse().name()))) {
@@ -476,23 +485,36 @@ public final class InfinoSearch {
     /**
      * The rows after the search_after values in the request's sort order:
      * {@code (s1 > v1) OR (s1 = v1 AND s2 > v2) OR ...}, each comparison
-     * turned for a descending sort.
+     * turned for a descending sort. The order puts missing values last, so
+     * after a present value the missing rows still follow ({@code OR s IS
+     * NULL}), after a missing one only the deeper sorts decide, and a
+     * missing value compares equal to itself.
      */
     private static String keysetPredicate(Plan plan) {
         List<String> alternatives = new ArrayList<>();
         List<String> equal = new ArrayList<>();
         long now = System.currentTimeMillis();
-        for (int i = 0; i < plan.sorts().size(); i++) {
+        for (int i = 0; i < plan.searchAfter().length; i++) {
             SortSpec s = plan.sorts().get(i);
             String col = s.expr();
-            String lit = InfinoQueryTranslator.literalForType(s.type(), plan.searchAfter()[i], now);
-            if (lit == null) {
-                throw new IllegalArgumentException("[infino] search_after value [" + plan.searchAfter()[i] + "] is not a " + s.type().name().toLowerCase(Locale.ROOT));
+            Object value = plan.searchAfter()[i];
+            String strict;
+            String same;
+            if (value == null) {
+                strict = InfinoQueryTranslator.NONE;
+                same = col + " IS NULL";
+            } else {
+                String lit = InfinoQueryTranslator.literalForType(s.type(), value, now);
+                if (lit == null) {
+                    throw new IllegalArgumentException("[infino] search_after value [" + value + "] is not a " + s.type().name().toLowerCase(Locale.ROOT));
+                }
+                strict = "(" + col + (s.desc() ? " < " : " > ") + lit + " OR " + col + " IS NULL)";
+                same = col + " = " + lit;
             }
             List<String> conj = new ArrayList<>(equal);
-            conj.add(col + (s.desc() ? " < " : " > ") + lit);
+            conj.add(strict);
             alternatives.add("(" + String.join(" AND ", conj) + ")");
-            equal.add(col + " = " + lit);
+            equal.add(same);
         }
         return "(" + String.join(" OR ", alternatives) + ")";
     }
@@ -665,7 +687,7 @@ public final class InfinoSearch {
         }
     }
 
-    private static BytesReference filtered(String src, FetchSourceContext filter) {
+    static BytesReference filtered(String src, FetchSourceContext filter) {
         Map<String, Object> map = XContentHelper.convertToMap(new BytesArray(src), true, MediaTypeRegistry.JSON).v2();
         try (XContentBuilder b = XContentFactory.jsonBuilder()) {
             b.map(XContentMapValues.filter(map, filter.includes(), filter.excludes()));
@@ -713,8 +735,10 @@ public final class InfinoSearch {
         List<Page> pages = new ArrayList<>();
         List<InternalAggregations> aggs = new ArrayList<>();
         Collection<AggregationBuilder> builders = builders(source);
+        List<SortSpec> sorts = List.of();
         for (Index index : indices) {
             Plan plan = plan(tableOf.apply(index), source, now);
+            sorts = plan.sorts();
             Page page = page(index, plan, source);
             pages.add(page);
             if (!builders.isEmpty()) {
@@ -724,7 +748,7 @@ public final class InfinoSearch {
                 aggs.add(new InfinoAggregationProcessor(index).evaluate(builders, plan, total));
             }
         }
-        SearchHits hits = merge(pages, source);
+        SearchHits hits = merge(pages, source, sorts);
         InternalAggregations reduced = null;
         if (!aggs.isEmpty()) {
             InternalAggregation.ReduceContext ctx = InternalAggregation.ReduceContext.forFinalReduction(
@@ -749,8 +773,13 @@ public final class InfinoSearch {
         );
     }
 
-    /** One index's page as-is; several merged by sort values, else by score, then cut to the window. */
-    private static SearchHits merge(List<Page> pages, SearchSourceBuilder source) {
+    /**
+     * The pages merged by sort values, else by score, then cut to the
+     * request's window: each page carries every row up to the window's end,
+     * and the window is applied once here, as a coordinator applies it over
+     * its shards.
+     */
+    private static SearchHits merge(List<Page> pages, SearchSourceBuilder source, List<SortSpec> sorts) {
         long total = 0;
         boolean exact = true;
         float maxScore = Float.NaN;
@@ -765,22 +794,21 @@ public final class InfinoSearch {
         }
         if (pages.size() > 1) {
             boolean sorted = all.stream().anyMatch(h -> h.getSortValues().length > 0);
-            all.sort(sorted ? bySortValues(source) : Comparator.comparing(SearchHit::getScore, Comparator.reverseOrder()));
-            int from = Math.max(0, source.from());
-            int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
-            all = all.subList(Math.min(from, all.size()), Math.min(all.size(), from + size));
+            all.sort(sorted ? bySortValues(sorts) : Comparator.comparing(SearchHit::getScore, Comparator.reverseOrder()));
         }
+        int from = Math.max(0, source.from());
+        int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
+        all = all.subList(Math.min(from, all.size()), Math.min(all.size(), from + size));
         TotalHits totalHits = new TotalHits(total, exact ? TotalHits.Relation.EQUAL_TO : TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
         return new SearchHits(all.toArray(new SearchHit[0]), totalHits, maxScore);
     }
 
+    /** Hits by their sort values in the plan's order: field and script sorts alike, each in its direction. */
     @SuppressWarnings({ "unchecked", "rawtypes" })
-    private static Comparator<SearchHit> bySortValues(SearchSourceBuilder source) {
+    private static Comparator<SearchHit> bySortValues(List<SortSpec> sorts) {
         List<Boolean> desc = new ArrayList<>();
-        for (SortBuilder<?> sort : source.sorts()) {
-            if (sort instanceof FieldSortBuilder fs && !FieldSortBuilder.DOC_FIELD_NAME.equals(fs.getFieldName())) {
-                desc.add(fs.order() == SortOrder.DESC);
-            }
+        for (SortSpec s : sorts) {
+            desc.add(s.desc());
         }
         return (a, b) -> {
             Object[] va = a.getSortValues();

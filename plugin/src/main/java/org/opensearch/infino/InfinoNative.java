@@ -302,12 +302,17 @@ public final class InfinoNative {
         return lib.infino_prepare_batch(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), osids.size());
     }
 
-    /** Append prepared batches in one commit; the handles are released by the call. */
+    /**
+     * Append prepared batches in one commit; the handles are released by the
+     * call. The rows of {@code replaced} ids replace the table's rows under
+     * those ids in the same mutation, so a failed write leaves the old rows.
+     */
     @SuppressWarnings("unchecked")
-    public static PreparedResult appendPrepared(String name, List<Pointer> prepared) {
+    public static PreparedResult appendPrepared(String name, List<Pointer> prepared, Collection<String> replaced) {
         init();
         COLUMNS.remove(name); // the batch may have added paths to the schema
-        Map<String, Object> out = object(takeOrThrow(lib.infino_append_prepared(conn, name, prepared.toArray(new Pointer[0]), prepared.size())));
+        String[] ids = replaced.toArray(new String[0]);
+        Map<String, Object> out = object(takeOrThrow(lib.infino_append_prepared(conn, name, prepared.toArray(new Pointer[0]), prepared.size(), ids, ids.length)));
         List<PreparedFailure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
             failed.add(new PreparedFailure(((Number) f.get("b")).intValue(), ((Number) f.get("i")).intValue(), (String) f.get("reason")));
@@ -354,6 +359,19 @@ public final class InfinoNative {
             return prefetched;
         }
         return take(lib.infino_get(conn, name, osid));
+    }
+
+    /** The source of one id from the table, never from the prefetch: for a write that merges into it. */
+    public static String getSourceFresh(String name, String osid) {
+        init();
+        return take(lib.infino_get(conn, name, osid));
+    }
+
+    /** Drop the prefetched sources of ids a write just changed, so a read after the write sees the table. */
+    public static void forgetSources(String name, Collection<String> osids) {
+        for (String id : osids) {
+            SOURCES.invalidate(name + "\u0000" + id);
+        }
     }
 
     // ---- queries ----

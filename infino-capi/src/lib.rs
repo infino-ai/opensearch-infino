@@ -37,7 +37,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::{Arc, RwLock};
 
-use datafusion::arrow::compute::concat_batches;
+use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::prelude::{col, lit};
 use infino::arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch,
@@ -278,9 +278,12 @@ fn mapped_fields(mapping: &Value) -> Vec<MappedField> {
 
 /// Create the table from the mapping, or bring an existing table's schema up
 /// to it: a mapped field the table lacks is added with its mapped type. A
-/// text index can only be declared at creation (the engine's index
-/// description is not constructible from outside the crate), so a `text`
-/// field mapped later is an exact column.
+/// mapped field whose type disagrees with the column it already has, or a
+/// `text` field mapped after creation (a text index can only be declared
+/// at creation; the engine's index description is not constructible from
+/// outside the crate), is a conflict the mapping cannot express over this
+/// table: the call fails naming it, so the index answers with the reason
+/// instead of serving the column as something it is not.
 fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, String> {
     let mapped = mapped_fields(mapping);
     let conn = &bridge.conn;
@@ -289,6 +292,39 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
     match conn.open_table(name) {
         Ok(table) => {
             let schema = table.schema();
+            let table_schema = conn.schema(name).map_err(|e| e.to_string())?;
+            let mut conflicts: Vec<String> = Vec::new();
+            for f in &mapped {
+                let indexed = table_schema
+                    .fields()
+                    .iter()
+                    .any(|c| c.name == f.path && matches!(c.index, Some(ColumnIndex::Fts { .. })));
+                // A text index can only be declared at creation, so a text field the
+                // table lacks, or holds without one, cannot be served as text.
+                if f.fts && !indexed {
+                    conflicts.push(format!(
+                        "[{}] is mapped as text but the table has no text index on it; a text index can only be declared when the index is created",
+                        f.path
+                    ));
+                }
+                let Ok(existing) = schema.field_with_name(&f.path) else {
+                    continue;
+                };
+                let have = type_name(existing.data_type());
+                let want = type_name(&f.data_type);
+                if have != want {
+                    conflicts.push(format!(
+                        "[{}] is mapped as {want} but the table holds it as {have}",
+                        f.path
+                    ));
+                }
+            }
+            if !conflicts.is_empty() {
+                return Err(format!(
+                    "the mapping of {name} cannot be applied to its table: {}; recreate the index with the mapping it needs",
+                    conflicts.join("; ")
+                ));
+            }
             let patches: Vec<FieldPatch> = mapped
                 .iter()
                 .filter(|f| schema.field_with_name(&f.path).is_err())
@@ -777,7 +813,7 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             Err(e) => return err_json(&e.to_string()),
         };
         let n = prepared.n;
-        let failed = append_prepared(&table, vec![prepared]);
+        let failed = append_prepared(&table, vec![prepared], &[]);
         let failed: Vec<Value> = failed
             .into_iter()
             .map(|(_, i, reason)| json!({ "i": i, "reason": reason }))
@@ -869,18 +905,61 @@ unsafe fn prepare(
     })
 }
 
+/// The batch's rows whose `osid` is in `ids`, and the rest, as two batches;
+/// None when the batch has no readable id column.
+fn split_by_osid(batch: &RecordBatch, ids: &[String]) -> Option<(RecordBatch, RecordBatch)> {
+    let column = batch.column_by_name(OSID)?;
+    let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let mask: BooleanArray = if let Some(a) = column.as_any().downcast_ref::<LargeStringArray>() {
+        a.iter().map(|v| v.map(|s| wanted.contains(s))).collect()
+    } else if let Some(a) = column.as_any().downcast_ref::<StringArray>() {
+        a.iter().map(|v| v.map(|s| wanted.contains(s))).collect()
+    } else {
+        return None;
+    };
+    let other: BooleanArray = mask.iter().map(|v| Some(!v.unwrap_or(false))).collect();
+    let replacing = filter_record_batch(batch, &mask).ok()?;
+    let fresh = filter_record_batch(batch, &other).ok()?;
+    Some((replacing, fresh))
+}
+
 /// Append prepared batches as one commit when their schemas agree (a batch
 /// that added an unmapped path has its own), else one commit each; a batch
 /// the engine refuses falls back to the halving append that names each
-/// refused document. Returns every refused document as (batch index,
+/// refused document. When `replaced` names ids, the rows under those ids
+/// are replaced in the same mutation as the append (the engine's update:
+/// tombstone and append in one commit), so a write that fails leaves the
+/// old rows in place. Returns every refused document as (batch index,
 /// document index, reason).
-fn append_prepared(table: &Supertable, prepared: Vec<Prepared>) -> Vec<(usize, usize, String)> {
+fn append_prepared(
+    table: &Supertable,
+    prepared: Vec<Prepared>,
+    replaced: &[String],
+) -> Vec<(usize, usize, String)> {
     let mut failed: Vec<(usize, usize, String)> = Vec::new();
     for (b, p) in prepared.iter().enumerate() {
         for (i, why) in &p.failed {
             failed.push((b, *i, why.clone()));
         }
     }
+    let replace_pred =
+        || col(OSID).in_list(replaced.iter().map(|s| lit(s.clone())).collect(), false);
+    // The engine's update replaces the matched rows one for one with the rows
+    // given, so the batch is split: the rows under replaced ids go through the
+    // update (tombstone and new row in one commit), the rest are appended.
+    let write = |batch: &RecordBatch| -> bool {
+        if replaced.is_empty() {
+            return table.append(batch).is_ok();
+        }
+        let (replacing, fresh) = match split_by_osid(batch, replaced) {
+            Some(parts) => parts,
+            None => return false,
+        };
+        if replacing.num_rows() > 0 && table.update(replace_pred(), &replacing).is_err() {
+            return false;
+        }
+        fresh.num_rows() == 0 || table.append(&fresh).is_ok()
+    };
     let batches: Vec<&RecordBatch> = prepared.iter().filter_map(|p| p.batch.as_ref()).collect();
     let same_schema = batches.len() == prepared.len()
         && batches.windows(2).all(|w| w[0].schema() == w[1].schema());
@@ -891,9 +970,21 @@ fn append_prepared(table: &Supertable, prepared: Vec<Prepared>) -> Vec<(usize, u
             concat_batches(&batches[0].schema(), batches.iter().copied())
         };
         if let Ok(batch) = joined {
-            if table.append(&batch).is_ok() {
+            if write(&batch) {
                 return failed;
             }
+        }
+    }
+    // The replacement has to be one mutation with the rows that replace; past
+    // the joined batch the ids are tombstoned once, ahead of the per-batch path.
+    if !replaced.is_empty() {
+        if let Err(e) = table.delete(replace_pred()) {
+            for (b, p) in prepared.iter().enumerate() {
+                for i in &p.index_of {
+                    failed.push((b, *i, format!("replace: {e}")));
+                }
+            }
+            return failed;
         }
     }
     // Per batch: its Arrow form, else its rows one halving at a time.
@@ -948,7 +1039,9 @@ pub unsafe extern "C" fn infino_prepare_batch(
 }
 
 /// Append prepared batches in one commit (see [`append_prepared`]) and
-/// release them. Returns `{"ok":n,"failed":[{"b":batch,"i":doc,"reason":..}]}`,
+/// release them; the rows whose ids are among the `replaced_count` strings
+/// of `replaced` (null for none) replace the table's rows under those ids
+/// in the same mutation. Returns `{"ok":n,"failed":[{"b":batch,"i":doc,"reason":..}]}`,
 /// where `b` indexes `prepared` and `i` the documents of that batch, or
 /// `{"error":..}` when nothing ran (the handles are released either way).
 #[no_mangle]
@@ -957,6 +1050,8 @@ pub unsafe extern "C" fn infino_append_prepared(
     name: *const c_char,
     prepared: *const *mut Prepared,
     count: c_int,
+    replaced: *const *const c_char,
+    replaced_count: c_int,
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         if prepared.is_null() || count <= 0 {
@@ -971,12 +1066,21 @@ pub unsafe extern "C" fn infino_append_prepared(
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return err_json("null argument");
         };
+        let replaced: Vec<String> = if replaced.is_null() || replaced_count <= 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(replaced, replaced_count as usize) }
+                .iter()
+                .filter_map(|p| unsafe { cstr(*p) })
+                .map(str::to_owned)
+                .collect()
+        };
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
         let n: usize = owned.iter().map(|p| p.n).sum();
-        let failed = append_prepared(&table, owned);
+        let failed = append_prepared(&table, owned, &replaced);
         let ok = n - failed.len();
         let failed: Vec<Value> = failed
             .into_iter()
@@ -1930,6 +2034,144 @@ mod tests {
             );
             close(h);
         }
+    }
+
+    /// A prepared batch of ids and sources, as the plugin packs one: one buffer with end offsets.
+    fn prepared(h: *mut Bridge, docs: &[(&str, &str)]) -> *mut Prepared {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut id_ends: Vec<u32> = Vec::new();
+        let mut src_ends: Vec<u32> = Vec::new();
+        for (id, src) in docs {
+            buf.extend_from_slice(id.as_bytes());
+            id_ends.push(buf.len() as u32);
+            buf.extend_from_slice(src.as_bytes());
+            src_ends.push(buf.len() as u32);
+        }
+        let p = unsafe {
+            infino_prepare_batch(
+                h,
+                c("logs").as_ptr(),
+                buf.as_ptr(),
+                buf.len(),
+                id_ends.as_ptr(),
+                src_ends.as_ptr(),
+                docs.len() as c_int,
+            )
+        };
+        assert!(!p.is_null());
+        p
+    }
+
+    fn append_replacing(h: *mut Bridge, p: *mut Prepared, replaced: &[&str]) -> Value {
+        let ids: Vec<CString> = replaced.iter().map(|x| c(x)).collect();
+        let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+        let handles = [p];
+        let out = take(unsafe {
+            infino_append_prepared(
+                h,
+                c("logs").as_ptr(),
+                handles.as_ptr(),
+                1,
+                if idp.is_empty() {
+                    ptr::null()
+                } else {
+                    idp.as_ptr()
+                },
+                idp.len() as c_int,
+            )
+        });
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
+    #[test]
+    fn a_replacing_append_replaces_in_one_mutation_and_the_id_lookup_follows() {
+        let h = open_logs();
+        let out = index(
+            h,
+            &[
+                ("a1", r#"{"level":"info","status":1}"#),
+                ("a2", r#"{"level":"info","status":2}"#),
+            ],
+        );
+        assert_eq!(out["ok"], 2, "{out}");
+        // One batch replacing a1 and adding a9: a1's old row goes with its new one, a9 is appended.
+        let p = prepared(
+            h,
+            &[
+                ("a1", r#"{"level":"warn","status":11}"#),
+                ("a9", r#"{"level":"info","status":9}"#),
+            ],
+        );
+        let out = append_replacing(h, p, &["a1"]);
+        assert_eq!(out["ok"], 2, "{out}");
+        assert!(get(h, "a1").contains("\"status\":11"), "{}", get(h, "a1"));
+        assert!(get(h, "a9").contains("\"status\":9"));
+        let rows = sql(h, "SELECT osid FROM logs WHERE osid = 'a1'");
+        assert_eq!(rows.as_array().map(|r| r.len()), Some(1), "{rows}");
+        // A second replacement of the same id, as an update after an update.
+        let p = prepared(h, &[("a1", r#"{"level":"error","status":111}"#)]);
+        let out = append_replacing(h, p, &["a1"]);
+        assert_eq!(out["ok"], 1, "{out}");
+        assert!(get(h, "a1").contains("\"status\":111"), "{}", get(h, "a1"));
+        let rows = sql(h, "SELECT osid FROM logs WHERE osid = 'a1'");
+        assert_eq!(rows.as_array().map(|r| r.len()), Some(1), "{rows}");
+        close(h);
+    }
+
+    #[test]
+    fn a_replacing_append_over_a_prepared_table_keeps_the_id_lookup() {
+        let h = open_logs();
+        // The plugin's own write path: prepared batches, the first with no replacement.
+        let p = prepared(
+            h,
+            &[
+                (
+                    "a1",
+                    r#"{"@timestamp":"2026-10-24T10:00:00Z","level":"x","message":"wool coat","status":1}"#,
+                ),
+                (
+                    "a2",
+                    r#"{"@timestamp":"2026-10-24T10:00:00Z","level":"x","message":"coat of wool","status":3}"#,
+                ),
+                (
+                    "a3",
+                    r#"{"@timestamp":"2026-10-24T10:00:00Z","level":"y","message":"silk scarf","status":5}"#,
+                ),
+                (
+                    "a4",
+                    r#"{"@timestamp":"2026-10-24T10:00:00Z","message":"no tag here","status":7}"#,
+                ),
+            ],
+        );
+        assert_eq!(append_replacing(h, p, &[])["ok"], 4);
+        let rows = sql(
+            h,
+            "SELECT osid, source FROM logs WHERE osid IN ('a1', 'a2')",
+        );
+        assert_eq!(rows.as_array().map(|r| r.len()), Some(2), "{rows}");
+        let p = prepared(
+            h,
+            &[(
+                "a1",
+                r#"{"@timestamp":"2026-10-24T10:00:00Z","level":"x","message":"wool coat","status":11}"#,
+            )],
+        );
+        assert_eq!(append_replacing(h, p, &["a1"])["ok"], 1);
+        assert!(get(h, "a1").contains("\"status\":11"), "{}", get(h, "a1"));
+        let p = prepared(
+            h,
+            &[(
+                "a1",
+                r#"{"@timestamp":"2026-10-24T10:00:00Z","level":"x","message":"wool coat","status":11,"extra":"yes"}"#,
+            )],
+        );
+        assert_eq!(append_replacing(h, p, &["a1"])["ok"], 1);
+        assert!(
+            get(h, "a1").contains("\"extra\":\"yes\""),
+            "{}",
+            get(h, "a1")
+        );
+        close(h);
     }
 
     #[test]

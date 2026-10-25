@@ -651,6 +651,9 @@ public class InfinoAggregationProcessor {
         List<String> rowColumns() {
             List<String> out = new ArrayList<>();
             for (SortSpec s : sorts) {
+                if (s.name().equals(InfinoQueryTranslator.OSID)) {
+                    continue; // the id is selected already
+                }
                 out.add(s.expr() + " AS " + quoteIdent(s.name()));
             }
             return out;
@@ -834,10 +837,12 @@ public class InfinoAggregationProcessor {
                 throw new Unsupported("aggregation [" + agg + "] needs a date value, " + c.label() + " is " + c.typeName());
             }
             String source = "(" + c.expr() + ")";
-            if (!ZoneOffset.UTC.equals(tz) && !"UTC".equals(tz.getId())) {
+            boolean zoned = !ZoneOffset.UTC.equals(tz) && !"UTC".equals(tz.getId());
+            String zone = "'Timestamp(Millisecond, Some(\"" + tz.getId() + "\"))'";
+            if (zoned) {
                 // Bucket boundaries fall on local time in the request's zone; the
                 // epoch value of each boundary is unchanged.
-                source = "arrow_cast(" + source + ", 'Timestamp(Millisecond, Some(\"" + tz.getId() + "\"))')";
+                source = "arrow_cast(" + source + ", " + zone + ")";
             }
             String keyExpr;
             DateIntervalWrapper wrapper = new DateIntervalWrapper();
@@ -847,7 +852,15 @@ public class InfinoAggregationProcessor {
                     throw new Unsupported("aggregation [" + agg + "] has an interval of no length");
                 }
                 String origin = offset == 0 ? "" : ", TIMESTAMP '1970-01-01T00:00:00Z' + INTERVAL '" + offset + " milliseconds'";
-                keyExpr = "date_bin(INTERVAL '" + ms + " milliseconds', " + source + origin + ")";
+                if (zoned) {
+                    // date_bin counts from the epoch in UTC whatever the zone; binning the
+                    // wall-clock time and reading the result back in the zone puts the
+                    // boundaries on local time, where the request (and the empty-bucket
+                    // rounding) puts them.
+                    keyExpr = "arrow_cast(date_bin(INTERVAL '" + ms + " milliseconds', to_local_time(" + source + ")" + origin + "), " + zone + ")";
+                } else {
+                    keyExpr = "date_bin(INTERVAL '" + ms + " milliseconds', " + source + origin + ")";
+                }
                 wrapper.fixedInterval(fixed);
             } else if (calendar != null) {
                 if (offset != 0) {
@@ -965,7 +978,11 @@ public class InfinoAggregationProcessor {
                     case DOUBLE -> dBuckets.add(new InfinoAggregationWire.DoubleBucket(asDouble(key, 0.0), docCount, subs));
                 }
             }
-            long otherDocCount = Math.max(0, parentTotal - sumTop);
+            // The rows with a value under this parent (the window statement counts
+            // them as keyed_total), less those in the buckets returned; the rows
+            // without the field are in no bucket, as stock counts it.
+            long keyed = rows.isEmpty() || rows.get(0).get("keyed_total") == null ? parentTotal : asLong(rows.get(0).get("keyed_total"));
+            long otherDocCount = Math.max(0, keyed - sumTop);
             TermsAggregator.BucketCountThresholds thresholds = new TermsAggregator.BucketCountThresholds(t.minDocCount(), t.shardMinDocCount(), t.size(), t.shardSize());
             return switch (keyKind) {
                 case STR, BOOL -> new StringTerms(t.getName(), t.order(), t.order(), t.getMetadata(), DocValueFormat.RAW, t.shardSize(), false, otherDocCount, sBuckets, 0L, thresholds);
@@ -1722,11 +1739,14 @@ public class InfinoAggregationProcessor {
             }
             String select = String.join(", ", keyCols) + ", COUNT(*) AS doc_count" + (level.metrics.isEmpty() ? "" : ", " + metricColumns(level.metrics));
             String restriction = kept == null ? "" : " AND " + tupleRestriction(chain, kept, i);
+            // A terms level has no bucket for the missing value, so rows without
+            // one leave before the window: they take no slot and count as other to no one.
+            String present = level.terms ? " AND " + level.keyExpr + " IS NOT NULL" : "";
             StringBuilder positions = new StringBuilder();
             for (int j = 1; j <= i + 1; j++) {
                 positions.append(j == 1 ? "" : ", ").append(j);
             }
-            String inner = "SELECT " + select + " FROM " + from + " WHERE " + where + restriction + " GROUP BY " + positions;
+            String inner = "SELECT " + select + " FROM " + from + " WHERE " + where + restriction + present + " GROUP BY " + positions;
             if (level.minDocCount > 1) {
                 inner += " HAVING COUNT(*) >= " + level.minDocCount;
             }
@@ -1734,8 +1754,10 @@ public class InfinoAggregationProcessor {
             String sql;
             if (level.terms) {
                 String partition = i == 0 ? "" : "PARTITION BY " + parents + " ";
-                sql = "SELECT * FROM (SELECT t.*, ROW_NUMBER() OVER (" + partition + "ORDER BY " + level.order("k" + i) + ") AS rn FROM (" + inner
-                    + ") t) WHERE rn <= " + level.size + " ORDER BY " + (i == 0 ? "rn" : parents + ", rn");
+                // keyed_total: the rows with a value under this parent, so what the
+                // window drops is counted exactly, without the field-less rows.
+                sql = "SELECT * FROM (SELECT t.*, ROW_NUMBER() OVER (" + partition + "ORDER BY " + level.order("k" + i) + ") AS rn, SUM(doc_count) OVER ("
+                    + partition.trim() + ") AS keyed_total FROM (" + inner + ") t) WHERE rn <= " + level.size + " ORDER BY " + (i == 0 ? "rn" : parents + ", rn");
             } else {
                 sql = "SELECT * FROM (" + inner + ") t ORDER BY " + String.join(", ", aliases);
             }

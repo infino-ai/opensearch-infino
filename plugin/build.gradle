@@ -24,8 +24,9 @@ buildscript {
 apply plugin: 'java'
 apply plugin: 'opensearch.opensearchplugin'
 apply plugin: 'opensearch.yaml-rest-test'
-// The Java agent replaced the security manager in 3.x; 2.x build tools have no such plugin.
-if (opensearch_version.startsWith('3.')) {
+// The Java agent replaced the security manager in 3.x; 2.x build tools have no such
+// plugin, and every later major is taken to have it.
+if (!opensearch_version.startsWith('2.')) {
     apply plugin: 'opensearch.java-agent'
 }
 
@@ -33,10 +34,6 @@ java {
     targetCompatibility = JavaVersion.VERSION_21
     sourceCompatibility = JavaVersion.VERSION_21
 }
-
-// The node client moved packages in 3.0; the one handler that names it has
-// a copy per major, and the tree for the target release joins the build.
-sourceSets.main.java.srcDirs += opensearch_version.startsWith('3.') ? 'src/main/java3' : 'src/main/java2'
 
 opensearchplugin {
     name = 'infino-engine'
@@ -80,11 +77,14 @@ test {
 // disk for the test cluster (memory:// tables cannot take deletes). Both can be
 // pointed elsewhere with -Dinfino.lib / -Dinfino.uri.
 def defaultLib = file("${projectDir}/../infino-capi/target/release/libinfino_capi.so").absolutePath
-def defaultUri = "file://${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog"
+def defaultData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog"
+def defaultUri = "file://${defaultData}"
 
 testClusters.all {
     systemProperty 'infino.lib', System.getProperty('infino.lib', defaultLib)
     systemProperty 'infino.uri', System.getProperty('infino.uri', defaultUri)
+    // The security policy grants the file catalog's directory by this property.
+    systemProperty 'infino.data', System.getProperty('infino.data', defaultData)
     // The SQL each request runs, in the node log, so a wrong answer can be read back.
     setting 'logger.org.opensearch.infino', 'DEBUG'
 }

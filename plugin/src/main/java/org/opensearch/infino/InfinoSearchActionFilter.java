@@ -103,6 +103,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
         }
         long start = System.nanoTime();
         try {
+            InfinoSecurity.refuseIfRestricted(InfinoServices.threadContext(), List.of(concrete), "search");
             SearchSourceBuilder source = search.source() == null ? new SearchSourceBuilder() : search.source();
             InfinoTables tables = InfinoPlugin.tables();
             SearchResponse response = InfinoSearch.search(

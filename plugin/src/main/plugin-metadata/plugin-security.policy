@@ -1,12 +1,23 @@
 grant {
-  // JNA loads the native bridge and calls into it.
+  // JNA loads the native bridge (-Dinfino.lib) and calls into it; it unpacks its
+  // own dispatch stub under the JVM's temporary directory.
   permission java.lang.RuntimePermission "loadLibrary.*";
   permission java.lang.RuntimePermission "accessDeclaredMembers";
   permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
-  permission java.io.FilePermission "<<ALL FILES>>", "read,write";
-  // The engine talks to object storage.
+  permission java.io.FilePermission "${infino.lib}", "read";
+  permission java.io.FilePermission "${java.io.tmpdir}", "read,write";
+  permission java.io.FilePermission "${java.io.tmpdir}${/}-", "read,write,delete";
+  // The engine talks to the object store over HTTPS; the hosts are the catalog's,
+  // not known to the policy, so connects are allowed and listening is not.
   permission java.net.SocketPermission "*", "connect,resolve";
-  permission java.util.PropertyPermission "*", "read,write";
+  permission java.util.PropertyPermission "infino.*", "read";
+  permission java.util.PropertyPermission "jna.*", "read,write";
   permission java.lang.RuntimePermission "getenv.*";
-  permission java.lang.RuntimePermission "createClassLoader";
+};
+
+// A file:// catalog lives on the node's disk under the directory -Dinfino.data
+// names; without that property this block does not apply.
+grant {
+  permission java.io.FilePermission "${infino.data}", "read,write,delete";
+  permission java.io.FilePermission "${infino.data}${/}-", "read,write,delete";
 };

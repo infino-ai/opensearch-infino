@@ -154,7 +154,8 @@
           sort: [ { price: asc } ]
   - match: { hits.hits.0._id: "6" }
   - match: { hits.hits.2._id: "7" }
-  - length: { hits.hits.2.sort: 1 }
+  # The sort values carry the id as a tiebreak for the next page.
+  - length: { hits.hits.2.sort: 2 }
   - do:
       search:
         index: shop

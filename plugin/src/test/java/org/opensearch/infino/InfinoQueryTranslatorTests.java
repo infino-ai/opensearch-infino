@@ -112,7 +112,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         // A group of terms stays one engine query; a prohibited field clause is a NOT.
         Translation t = translate(QueryBuilders.queryStringQuery("(disk OR cache) AND NOT level:info"));
         assertEquals("token_match('os_logs_0', 'message', 'disk cache', 'or')", t.from());
-        assertEquals("(1=1 AND NOT (\"level\" = 'info'))", t.where());
+        assertEquals("(1=1 AND NOT COALESCE((\"level\" = 'info'), FALSE))", t.where());
         // Ranges and comparisons, with date math on a date column.
         assertEquals("(\"status\" >= 200 AND \"status\" <= 299)", translate(QueryBuilders.queryStringQuery("status:[200 TO 299]")).where());
         assertEquals("(\"status\" > 499)", translate(QueryBuilders.queryStringQuery("status:>499")).where());
@@ -120,7 +120,8 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("\"status\" IS NOT NULL", translate(QueryBuilders.queryStringQuery("status:*")).where());
         // A field's group distributes the field; a lone prohibited clause excludes from everything.
         assertEquals("((\"level\" = 'error' OR \"level\" = 'warn'))", translate(QueryBuilders.queryStringQuery("level:(error OR warn)")).where());
-        assertEquals("(NOT (\"level\" = 'info'))", translate(QueryBuilders.queryStringQuery("-level:info")).where());
+        assertEquals("(NOT COALESCE((\"level\" = 'info'), FALSE))", translate(QueryBuilders.queryStringQuery("-level:info")).where());
+        assertEquals("(\"status\" >= -10 AND \"status\" <= 3)", translate(QueryBuilders.queryStringQuery("status:[-10 TO 3]")).where());
         // Wildcards and regular expressions: a term of a text column, the whole value of an exact one.
         assertEquals("regexp_like(\"message\", '\\bdis[^\\s]*', 'i')", translate(QueryBuilders.queryStringQuery("message:dis*")).where());
         assertEquals("regexp_like(\"message\", '\\bdis[^\\s]*', 'i')", translate(QueryBuilders.queryStringQuery("dis*")).where());
@@ -138,6 +139,38 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         Translation t = translate(QueryBuilders.matchQuery("level", "error"));
         assertNull(t.principal());
         assertEquals("\"level\" = 'error'", t.where());
+        // On a numeric column the same: an equality, not a refusal.
+        assertEquals("\"status\" = 500", translate(QueryBuilders.matchQuery("status", "500")).where());
+    }
+
+    public void testBoolSeams() {
+        // should beside must_not with no must or filter: the should still filters.
+        BoolQueryBuilder b = QueryBuilders.boolQuery().should(QueryBuilders.termQuery("level", "a")).mustNot(QueryBuilders.termQuery("level", "b"));
+        assertEquals("((\"level\" = 'a') AND NOT COALESCE((\"level\" = 'b'), FALSE))", translate(b).where());
+        // minimum_should_match counts the clauses that hold.
+        b = QueryBuilders.boolQuery()
+            .should(QueryBuilders.termQuery("level", "a"))
+            .should(QueryBuilders.termQuery("status", 1))
+            .should(QueryBuilders.termQuery("host.name", "n"))
+            .minimumShouldMatch(2);
+        assertEquals(
+            "(((CASE WHEN \"level\" = 'a' THEN 1 ELSE 0 END + CASE WHEN \"status\" = 1 THEN 1 ELSE 0 END + CASE WHEN \"host.name\" = 'n' THEN 1 ELSE 0 END) >= 2))",
+            translate(b).where()
+        );
+        // Two required text clauses on one column under all-terms join the ranked query.
+        b = QueryBuilders.boolQuery()
+            .must(QueryBuilders.matchQuery("message", "disk").operator(org.opensearch.index.query.Operator.AND))
+            .must(QueryBuilders.matchQuery("message", "full").operator(org.opensearch.index.query.Operator.AND));
+        Translation t = translate(b);
+        assertEquals("token_match('os_logs_0', 'message', 'disk full', 'and')", t.from());
+        assertEquals("(1=1 AND 1=1)", t.where());
+    }
+
+    public void testPatternsOnTextColumnsMatchTerms() {
+        assertEquals("regexp_like(\"message\", '\\bdis', 'i')", translate(QueryBuilders.prefixQuery("message", "dis")).where());
+        assertEquals("regexp_like(\"message\", '\\bd[^\\s]sk\\b', 'i')", translate(QueryBuilders.wildcardQuery("message", "d?sk")).where());
+        assertEquals("regexp_like(\"message\", '\\b(?:d.sk)\\b', 'i')", translate(QueryBuilders.regexpQuery("message", "d.sk")).where());
+        assertEquals("\"level\" LIKE 'err%'", translate(QueryBuilders.prefixQuery("level", "err")).where());
     }
 
     public void testUnknownFieldMatchesNothingAndUnknownShapeIsNull() {

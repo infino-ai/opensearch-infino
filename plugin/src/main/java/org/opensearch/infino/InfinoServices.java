@@ -7,6 +7,7 @@ package org.opensearch.infino;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.script.ScriptService;
@@ -51,6 +52,11 @@ public final class InfinoServices extends AbstractLifecycleComponent {
 
     static ThreadPool threadPool() {
         return threadPool;
+    }
+
+    /** The current request's thread context, or null before the services are injected. */
+    static ThreadContext threadContext() {
+        return threadPool == null ? null : threadPool.getThreadContext();
     }
 
     static ScriptService scriptService() {

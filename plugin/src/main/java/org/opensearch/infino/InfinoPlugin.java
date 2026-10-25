@@ -7,24 +7,18 @@ package org.opensearch.infino;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.support.ActionFilter;
-import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
-import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.common.lifecycle.LifecycleComponent;
-import org.opensearch.common.settings.ClusterSettings;
-import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.shard.IndexEventListener;
+import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchPlugin;
-import org.opensearch.rest.RestController;
-import org.opensearch.rest.RestHandler;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -32,15 +26,17 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Supplier;
 
 /**
  * Backs an index with an Infino table at the action layer: bulk, search and
- * get for an index created with {@code index.infino.enabled} are answered
- * from the table before they are routed to a shard, so no document is ever
- * written to Lucene. The index itself exists in cluster state as a name, a
- * mapping (which declares the table's columns) and its settings; its one
- * shard stays empty.
+ * get for an index with {@code index.infino.enabled} are answered from the
+ * table before they are routed to a shard, so no document is ever written
+ * to Lucene. Every index the cluster creates gets the setting unless its
+ * request or template sets it (node setting
+ * {@code infino.index.default_enabled}, on by default), so the node holds
+ * no index data of its own. The index itself exists in cluster state as a
+ * name, a mapping (which declares the table's columns) and its settings;
+ * its one shard stays empty.
  *
  * <p>The table is {@code index.infino.table} when set, else named after the
  * index and its UUID. It is dropped when the index is deleted unless it was
@@ -73,8 +69,20 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
         Setting.Property.Dynamic
     );
 
+    /**
+     * Whether every index the cluster creates is Infino-backed unless its own
+     * settings say otherwise: on by default, so the node keeps no index data
+     * of its own, the indices other plugins create for themselves included.
+     */
+    public static final Setting<Boolean> INFINO_DEFAULT_ENABLED = Setting.boolSetting("infino.index.default_enabled", true, Setting.Property.NodeScope);
+
     private static final InfinoTables TABLES = new InfinoTables();
     private final Map<ShardId, Scheduler.Cancellable> optimizers = new ConcurrentHashMap<>();
+    private final boolean defaultEnabled;
+
+    public InfinoPlugin(Settings settings) {
+        this.defaultEnabled = INFINO_DEFAULT_ENABLED.get(settings);
+    }
 
     /** The tables behind the node's Infino-backed indices. */
     static InfinoTables tables() {
@@ -92,9 +100,10 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
         // The filters are asked for before the services are injected; they read them lazily.
         return List.of(
             new InfinoBulkActionFilter(InfinoServices::clusterService, TABLES, InfinoServices::writer),
+            new InfinoUpdateActionFilter(InfinoServices::clusterService, TABLES, InfinoServices::writer),
             new InfinoSearchActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, InfinoServices::scriptService),
-            new InfinoGetActionFilter(InfinoServices::clusterService, TABLES),
-            new InfinoMultiGetActionFilter(InfinoServices::clusterService, TABLES)
+            new InfinoGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES),
+            new InfinoMultiGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES)
         );
     }
 
@@ -177,22 +186,33 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
         }
     }
 
+    /**
+     * Stamp {@code index.infino.enabled} on every index the cluster creates
+     * unless the request or a template sets it. A provider's settings sit
+     * below templates and requests, so an index created with the setting
+     * false keeps it; without the switch the node would hold the data of
+     * every index created without the setting, which is the state the
+     * plugin exists to keep off the node.
+     */
     @Override
-    public List<Setting<?>> getSettings() {
-        return List.of(INFINO_ENABLED, INFINO_TABLE, OPTIMIZE_INTERVAL);
+    public Collection<IndexSettingProvider> getAdditionalIndexSettingProviders() {
+        if (!defaultEnabled) {
+            return List.of();
+        }
+        return List.of(new IndexSettingProvider() {
+            @Override
+            public Settings getAdditionalIndexSettings(String indexName, boolean isDataStreamIndex, Settings templateAndRequestSettings) {
+                if (templateAndRequestSettings.hasValue(INFINO_ENABLED.getKey())) {
+                    return Settings.EMPTY;
+                }
+                return Settings.builder().put(INFINO_ENABLED.getKey(), true).build();
+            }
+        });
     }
 
     @Override
-    public List<RestHandler> getRestHandlers(
-        Settings settings,
-        RestController restController,
-        ClusterSettings clusterSettings,
-        IndexScopedSettings indexScopedSettings,
-        SettingsFilter settingsFilter,
-        IndexNameExpressionResolver indexNameExpressionResolver,
-        Supplier<DiscoveryNodes> nodesInCluster
-    ) {
-        return List.of(new InfinoSqlRestHandler());
+    public List<Setting<?>> getSettings() {
+        return List.of(INFINO_DEFAULT_ENABLED, INFINO_ENABLED, INFINO_TABLE, OPTIMIZE_INTERVAL);
     }
 
     @Override

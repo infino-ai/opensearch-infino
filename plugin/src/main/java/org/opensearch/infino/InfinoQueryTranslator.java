@@ -203,6 +203,11 @@ final class InfinoQueryTranslator {
             return NONE;
         }
         if (qb instanceof TermQueryBuilder t) {
+            // A term on a text column is one indexed term, as in Lucene; on an exact column the value.
+            Column c = column(t.fieldName());
+            if (c != null && c.fts()) {
+                return textClause(c.name(), String.valueOf(t.value()), "and", false);
+            }
             return equality(t.fieldName(), t.value());
         }
         if (qb instanceof TermsQueryBuilder ts) {
@@ -216,15 +221,27 @@ final class InfinoQueryTranslator {
             return c == null ? NONE : quoteIdent(c.name()) + " IS NOT NULL";
         }
         if (qb instanceof PrefixQueryBuilder p) {
+            // On a text column a prefix is a term's prefix; on an exact column the value's.
+            Column c = column(p.fieldName());
+            if (c != null && c.fts()) {
+                return termPattern(c, wildcardToRegex(p.value()), true);
+            }
             return like(p.fieldName(), escapeLike(p.value()) + "%");
         }
         if (qb instanceof WildcardQueryBuilder w) {
+            Column c = column(w.fieldName());
+            if (c != null && c.fts()) {
+                return termPattern(c, wildcardToRegex(w.value()), w.value().endsWith("*"));
+            }
             return like(w.fieldName(), wildcardToLike(w.value()));
         }
         if (qb instanceof RegexpQueryBuilder re) {
             Column c = column(re.fieldName());
             if (c == null || !c.isString()) {
                 return c == null ? NONE : null;
+            }
+            if (c.fts()) {
+                return termPattern(c, "(?:" + re.value() + ")", false);
             }
             // A Lucene regexp is anchored to the whole value.
             return "regexp_like(" + quoteIdent(c.name()) + ", " + literal("^(?:" + re.value() + ")$") + ")";
@@ -281,20 +298,14 @@ final class InfinoQueryTranslator {
         for (QueryBuilder c : b.filter()) {
             and.add(predicate(c, positive));
         }
-        for (QueryBuilder c : b.mustNot()) {
-            String p = predicate(c, false);
-            if (p == null) {
-                return null;
-            }
-            and.add("NOT (" + p + ")");
-        }
         if (and.contains(null)) {
             return null;
         }
-        // `should` filters when nothing else does, or when minimum_should_match asks
-        // for at least one; otherwise it only affects scoring and is not a filter.
-        boolean shouldRequired = !b.should().isEmpty() && (and.isEmpty() || minimumShouldMatch(b.minimumShouldMatch()) > 0);
-        if (shouldRequired) {
+        // `should` filters when no must or filter clause does, or when
+        // minimum_should_match asks for some; otherwise it only affects scoring.
+        boolean nothingRequired = b.must().isEmpty() && b.filter().isEmpty();
+        int required = minimumShouldMatch(b.minimumShouldMatch(), b.should().size(), nothingRequired);
+        if (!b.should().isEmpty() && required > 0) {
             List<String> or = new ArrayList<>();
             for (QueryBuilder c : b.should()) {
                 String p = predicate(c, false);
@@ -303,7 +314,14 @@ final class InfinoQueryTranslator {
                 }
                 or.add(p);
             }
-            and.add("(" + String.join(" OR ", or) + ")");
+            and.add(atLeast(or, required));
+        }
+        for (QueryBuilder c : b.mustNot()) {
+            String p = predicate(c, false);
+            if (p == null) {
+                return null;
+            }
+            and.add(not(p));
         }
         if (and.isEmpty()) {
             return ALL;
@@ -311,13 +329,47 @@ final class InfinoQueryTranslator {
         return "(" + String.join(" AND ", and) + ")";
     }
 
-    /** A minimum_should_match of "N", "N%" or "-N" taken as "at least one"; absent is 0. */
-    private static int minimumShouldMatch(String msm) {
-        if (msm == null || msm.isEmpty()) {
-            return 0;
+    /**
+     * The negation of a predicate as a filter: a row the predicate does not
+     * decide (a missing value, which SQL reads as NULL) is kept, as a
+     * must_not keeps the documents without the field.
+     */
+    static String not(String predicate) {
+        return "NOT COALESCE((" + predicate + "), FALSE)";
+    }
+
+    /** At least {@code required} of the predicates true: a plain OR for one, a count of the true ones past that. */
+    private static String atLeast(List<String> predicates, int required) {
+        if (required <= 1) {
+            return "(" + String.join(" OR ", predicates) + ")";
         }
+        List<String> counted = new ArrayList<>();
+        for (String p : predicates) {
+            counted.add("CASE WHEN " + p + " THEN 1 ELSE 0 END");
+        }
+        return "((" + String.join(" + ", counted) + ") >= " + Math.min(required, predicates.size()) + ")";
+    }
+
+    /**
+     * How many of {@code n} should clauses must match: the request's
+     * minimum_should_match read as OpenSearch reads it ({@code N}, {@code -N},
+     * {@code P%}, {@code -P%}; a combination such as {@code 3<90%} is taken
+     * as one), else one when nothing else filters, else none.
+     */
+    private static int minimumShouldMatch(String msm, int n, boolean nothingRequired) {
+        if (msm == null || msm.isEmpty()) {
+            return nothingRequired ? 1 : 0;
+        }
+        String s = msm.trim();
         try {
-            return Integer.parseInt(msm.replace("%", "").replace("-", "")) > 0 ? 1 : 0;
+            if (s.endsWith("%")) {
+                int percent = Integer.parseInt(s.substring(0, s.length() - 1));
+                int magnitude = percent < 0 ? -percent : percent;
+                int share = magnitude * n / 100;
+                return Math.max(0, percent < 0 ? n - share : share);
+            }
+            int count = Integer.parseInt(s);
+            return Math.max(0, count < 0 ? n + count : count);
         } catch (NumberFormatException e) {
             return 1;
         }
@@ -331,8 +383,8 @@ final class InfinoQueryTranslator {
             return NONE;
         }
         if (!c.fts()) {
-            // A match on an exact column is an equality.
-            return c.isString() ? equality(field, value) : null;
+            // A match on an exact column is an equality, whatever the column's type.
+            return equality(field, value);
         }
         return textClause(c.name(), value, op == Operator.AND ? "and" : "or", positive);
     }
@@ -340,6 +392,12 @@ final class InfinoQueryTranslator {
     private String textClause(String column, String query, String mode, boolean positive) {
         if (positive && principal == null) {
             principal = new TextClause(column, query, mode);
+            return ALL;
+        }
+        if (positive && principal != null && principal.column().equals(column) && "and".equals(mode) && "and".equals(principal.mode())) {
+            // A second required clause on the same column joins the ranked query, so
+            // the score reflects both; under all-terms mode the join reads the same.
+            principal = new TextClause(column, principal.query() + " " + query, mode);
             return ALL;
         }
         return OSID
@@ -457,7 +515,7 @@ final class InfinoQueryTranslator {
                 if (p == null) {
                     return null;
                 }
-                and.add("NOT (" + p + ")");
+                and.add(not(p));
             }
             return and.isEmpty() ? ALL : "(" + String.join(" AND ", and) + ")";
         }
