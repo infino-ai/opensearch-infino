@@ -14,9 +14,13 @@ import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.InternalOrder;
+import org.opensearch.search.aggregations.bucket.composite.InternalComposite;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
 import org.opensearch.search.aggregations.bucket.histogram.LongBounds;
+import org.opensearch.search.aggregations.bucket.missing.MissingOrder;
 import org.opensearch.search.aggregations.bucket.terms.DoubleTerms;
+import org.opensearch.search.aggregations.bucket.terms.SignificantLongTerms;
+import org.opensearch.search.aggregations.bucket.terms.heuristic.SignificanceHeuristic;
 import org.opensearch.search.aggregations.metrics.AbstractHyperLogLogPlusPlus;
 import org.opensearch.search.aggregations.metrics.InternalCardinality;
 
@@ -131,6 +135,118 @@ final class InfinoAggregationWire {
             }
         } catch (IOException e) {
             throw new UncheckedIOException(e);
+        }
+    }
+
+    /** One bucket of a long-keyed significant terms aggregation, before it is written; the score is the reduction's. */
+    record SignificantLongBucket(long key, long subsetDf, long supersetDf, InternalAggregations subAggregations) {}
+
+    /**
+     * A {@code SignificantLongTerms}, as the reduce phase expects one from a
+     * shard: its bucket class is not public, so the object comes through its
+     * stream constructor.
+     */
+    static SignificantLongTerms significantLongTerms(
+        String name,
+        Map<String, Object> metadata,
+        int requiredSize,
+        long minDocCount,
+        DocValueFormat format,
+        long subsetSize,
+        long supersetSize,
+        SignificanceHeuristic heuristic,
+        List<SignificantLongBucket> buckets
+    ) {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            // InternalAggregation.writeTo
+            out.writeString(name);
+            out.writeGenericValue(metadata);
+            // InternalSignificantTerms.doWriteTo: required size, min doc count
+            out.writeVInt(requiredSize);
+            out.writeVLong(minDocCount);
+            // InternalMappedSignificantTerms.writeTermTypeInfoTo
+            out.writeNamedWriteable(format);
+            out.writeVLong(subsetSize);
+            out.writeVLong(supersetSize);
+            out.writeNamedWriteable(heuristic);
+            out.writeVInt(buckets.size());
+            for (SignificantLongBucket b : buckets) {
+                // SignificantLongTerms.Bucket.writeTo
+                out.writeVLong(b.subsetDf());
+                out.writeVLong(b.supersetDf());
+                out.writeLong(b.key());
+                out.writeDouble(0.0);
+                (b.subAggregations() == null ? InternalAggregations.EMPTY : b.subAggregations()).writeTo(out);
+            }
+            try (StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), registry())) {
+                return new SignificantLongTerms(in);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** One bucket of a composite aggregation, before it is written: its key, one value per source, as the stock object carries them. */
+    record CompositeBucket(Comparable<?>[] key, long docCount, InternalAggregations subAggregations) {}
+
+    /**
+     * An {@code InternalComposite}, as the reduce phase expects one from a
+     * shard: neither it nor its bucket or key classes have public
+     * constructors, so the object comes through its stream constructor.
+     * {@code afterKey} is the key the next page starts after (the last
+     * bucket's), null when there is none.
+     */
+    static InternalComposite composite(
+        String name,
+        Map<String, Object> metadata,
+        int size,
+        List<String> sourceNames,
+        List<DocValueFormat> formats,
+        int[] reverseMuls,
+        MissingOrder[] missingOrders,
+        List<CompositeBucket> buckets,
+        Comparable<?>[] afterKey
+    ) {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            // InternalAggregation.writeTo
+            out.writeString(name);
+            out.writeGenericValue(metadata);
+            // InternalComposite.doWriteTo
+            out.writeVInt(size);
+            out.writeStringCollection(sourceNames);
+            for (DocValueFormat format : formats) {
+                out.writeNamedWriteable(format);
+            }
+            out.writeIntArray(reverseMuls);
+            out.writeVInt(missingOrders.length);
+            for (MissingOrder order : missingOrders) {
+                order.writeTo(out);
+            }
+            out.writeVInt(buckets.size());
+            for (CompositeBucket b : buckets) {
+                // InternalBucket.writeTo: the key (CompositeKey.writeTo), the count, the sub-aggregations
+                writeCompositeKey(out, b.key());
+                out.writeVLong(b.docCount());
+                (b.subAggregations() == null ? InternalAggregations.EMPTY : b.subAggregations()).writeTo(out);
+            }
+            out.writeBoolean(afterKey != null);
+            if (afterKey != null) {
+                writeCompositeKey(out, afterKey);
+            }
+            out.writeBoolean(false); // not terminated early
+            try (StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), registry())) {
+                return new InternalComposite(in);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** CompositeKey.writeTo: the values as generic values. */
+    private static void writeCompositeKey(BytesStreamOutput out, Comparable<?>[] key) throws IOException {
+        out.writeVInt(key.length);
+        for (Comparable<?> value : key) {
+            out.writeGenericValue(value);
         }
     }
 

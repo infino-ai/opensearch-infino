@@ -154,12 +154,4 @@
       search:
         index: events
         body:
-          size: 0
-          aggs:
-            sig: { significant_terms: { field: level } }
-  - do:
-      catch: bad_request
-      search:
-        index: events
-        body:
           query: { fuzzy: { host: n0 } }

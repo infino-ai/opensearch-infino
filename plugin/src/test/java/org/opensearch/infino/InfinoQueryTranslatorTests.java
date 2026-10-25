@@ -67,8 +67,9 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             .filter(QueryBuilders.termQuery("level", "error"));
         t = translate(b);
         assertEquals("token_match('os_logs_0', 'message', 'disk', 'or')", t.from());
+        // A phrase goes to the engine quoted: adjacent terms in order, through its positions.
         assertEquals(
-            "(1=1 AND osid IN (SELECT osid FROM token_match('os_logs_0', 'message', 'node 3', 'and')) AND \"level\" = 'error')",
+            "(1=1 AND osid IN (SELECT osid FROM token_match('os_logs_0', 'message', '\"node 3\"', 'and')) AND \"level\" = 'error')",
             t.where()
         );
     }

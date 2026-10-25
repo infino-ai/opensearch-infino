@@ -47,7 +47,11 @@ import java.util.Map;
  * engine's own token index: the first such clause in a required position
  * becomes the {@code FROM} source (the {@code token_match} table function,
  * or {@code bm25_search} when hits are ranked by it), every other one is
- * an {@code osid IN (SELECT ...)} subquery over the same function. Nothing
+ * an {@code osid IN (SELECT ...)} subquery over the same function. A phrase
+ * goes to the engine quoted, which it matches as adjacent terms in order; a
+ * query string's {@code +}, {@code -}, quotes and {@code AND} / {@code OR}
+ * / {@code NOT} go through as the engine's own syntax, and its
+ * {@code field:term} clauses become predicates on those columns. Nothing
  * materializes a match set in Java.
  *
  * <p>A query the table cannot answer translates to {@code null}; the
@@ -226,11 +230,15 @@ final class InfinoQueryTranslator {
             return text(m.fieldName(), String.valueOf(m.value()), m.operator(), positive);
         }
         if (qb instanceof MatchPhraseQueryBuilder mp) {
-            // The index has no phrase mode; every term must be present.
-            return text(mp.fieldName(), String.valueOf(mp.value()), Operator.AND, positive);
+            // A quoted query is a phrase to the engine: the terms adjacent, in order.
+            return text(mp.fieldName(), phrase(String.valueOf(mp.value())), Operator.AND, positive);
         }
         if (qb instanceof MultiMatchQueryBuilder mm) {
-            return textOnFields(new ArrayList<>(mm.fields().keySet()), String.valueOf(mm.value()), mm.operator(), positive);
+            String value = String.valueOf(mm.value());
+            if (mm.type() == MultiMatchQueryBuilder.Type.PHRASE) {
+                value = phrase(value);
+            }
+            return textOnFields(new ArrayList<>(mm.fields().keySet()), value, mm.operator(), positive);
         }
         if (qb instanceof QueryStringQueryBuilder qs) {
             return queryString(qs.queryString(), qs.defaultField(), new ArrayList<>(qs.fields().keySet()), qs.defaultOperator(), positive);
@@ -349,16 +357,33 @@ final class InfinoQueryTranslator {
         return "(" + String.join(" OR ", or) + ")";
     }
 
+    /** The query that matches {@code value} as a phrase: the engine reads a quoted run as adjacent terms in order. */
+    static String phrase(String value) {
+        return "\"" + value.replace("\"", " ") + "\"";
+    }
+
+    /** One atom of a query string: its polarity, the field it names (null for the default fields) and its text. */
+    private record Atom(char sigil, String field, String text, boolean quoted) {}
+
     /**
-     * A query string is taken as the terms it holds, over the named field, the
-     * default field, or every indexed text column. {@code *} alone matches
-     * everything. Lucene syntax inside the string (field:value, AND / OR, quotes)
-     * is not interpreted.
+     * A query string, read for the syntax the engine shares with Lucene and
+     * the part the plugin resolves itself. {@code +term}, {@code -term} and
+     * {@code "a phrase"} go to the engine as written; {@code AND}, {@code OR}
+     * and {@code NOT} become that polarity and mode; {@code field:term} and
+     * {@code field:"a phrase"} are clauses on that column, a text column's
+     * through its token index, an exact column's as an equality (with
+     * {@code *} and {@code ?} as a pattern); {@code _exists_:field} is a null
+     * check. {@code *} alone matches everything. Grouping with parentheses,
+     * ranges, fuzziness and boosts are not read; such a string is not served.
      */
     private String queryString(String query, String defaultField, List<String> fields, Operator op, boolean positive) {
         String q = query == null ? "" : query.trim();
         if (q.isEmpty() || "*".equals(q) || "*:*".equals(q)) {
             return ALL;
+        }
+        List<Atom> atoms = readAtoms(q, op);
+        if (atoms == null) {
+            return null;
         }
         List<String> targets = new ArrayList<>(fields);
         if (targets.isEmpty() && defaultField != null && !"*".equals(defaultField)) {
@@ -372,7 +397,164 @@ final class InfinoQueryTranslator {
                 }
             }
         }
-        return textOnFields(targets, q, op, positive);
+        boolean anyOr = atoms.stream().anyMatch(a -> a.sigil() == '|');
+        Operator mode = anyOr ? Operator.OR : op;
+        // The atoms on the default fields go to the engine as one query in its own syntax.
+        StringBuilder text = new StringBuilder();
+        List<String> musts = new ArrayList<>();
+        List<String> shoulds = new ArrayList<>();
+        List<String> nots = new ArrayList<>();
+        for (Atom a : atoms) {
+            if (a.field() == null) {
+                if (text.length() > 0) {
+                    text.append(' ');
+                }
+                if (a.sigil() == '+' || a.sigil() == '-') {
+                    text.append(a.sigil());
+                }
+                text.append(a.quoted() ? phrase(a.text()) : a.text());
+                continue;
+            }
+            String p = fieldAtom(a);
+            if (p == null) {
+                return null;
+            }
+            switch (a.sigil()) {
+                case '-' -> nots.add(p);
+                case '+' -> musts.add(p);
+                default -> (mode == Operator.AND ? musts : shoulds).add(p);
+            }
+        }
+        List<String> and = new ArrayList<>();
+        if (text.length() > 0) {
+            String t = textOnFields(targets, text.toString(), mode, positive && musts.isEmpty() && shoulds.isEmpty());
+            if (t == null) {
+                return null;
+            }
+            if (mode == Operator.AND || shoulds.isEmpty()) {
+                and.add(t);
+            } else {
+                shoulds.add(t);
+            }
+        }
+        and.addAll(musts);
+        if (!shoulds.isEmpty()) {
+            and.add("(" + String.join(" OR ", shoulds) + ")");
+        }
+        for (String n : nots) {
+            and.add("NOT (" + n + ")");
+        }
+        if (and.isEmpty()) {
+            return ALL;
+        }
+        return "(" + String.join(" AND ", and) + ")";
+    }
+
+    /**
+     * The atoms of a query string in order, or null when it uses syntax that
+     * is not read. {@code AND} marks its neighbours required, {@code OR} marks
+     * them optional (sigil {@code |}), {@code NOT} negates the next atom.
+     */
+    private static List<Atom> readAtoms(String q, Operator op) {
+        List<String> tokens = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        boolean inQuote = false;
+        for (int i = 0; i < q.length(); i++) {
+            char ch = q.charAt(i);
+            if (ch == '"') {
+                inQuote = !inQuote;
+                cur.append(ch);
+            } else if (Character.isWhitespace(ch) && !inQuote) {
+                if (cur.length() > 0) {
+                    tokens.add(cur.toString());
+                    cur.setLength(0);
+                }
+            } else {
+                cur.append(ch);
+            }
+        }
+        if (inQuote) {
+            return null;
+        }
+        if (cur.length() > 0) {
+            tokens.add(cur.toString());
+        }
+        List<Atom> atoms = new ArrayList<>();
+        char pending = 0;
+        for (String token : tokens) {
+            if (token.indexOf('(') >= 0 || token.indexOf(')') >= 0 || token.indexOf('[') >= 0 || token.indexOf('{') >= 0
+                || token.indexOf('~') >= 0 || token.indexOf('^') >= 0) {
+                return null;
+            }
+            switch (token) {
+                case "AND", "&&" -> {
+                    if (!atoms.isEmpty() && atoms.get(atoms.size() - 1).sigil() == 0) {
+                        Atom last = atoms.remove(atoms.size() - 1);
+                        atoms.add(new Atom('+', last.field(), last.text(), last.quoted()));
+                    }
+                    pending = '+';
+                    continue;
+                }
+                case "OR", "||" -> {
+                    if (!atoms.isEmpty() && atoms.get(atoms.size() - 1).sigil() == 0) {
+                        Atom last = atoms.remove(atoms.size() - 1);
+                        atoms.add(new Atom('|', last.field(), last.text(), last.quoted()));
+                    }
+                    pending = '|';
+                    continue;
+                }
+                case "NOT", "!" -> {
+                    pending = '-';
+                    continue;
+                }
+                default -> {
+                }
+            }
+            char sigil = pending;
+            pending = 0;
+            String rest = token;
+            if (rest.startsWith("+") || rest.startsWith("-")) {
+                sigil = rest.charAt(0);
+                rest = rest.substring(1);
+            }
+            String field = null;
+            int colon = rest.indexOf(':');
+            if (colon > 0 && !rest.startsWith("\"")) {
+                field = rest.substring(0, colon);
+                rest = rest.substring(colon + 1);
+            }
+            boolean quoted = rest.length() >= 2 && rest.startsWith("\"") && rest.endsWith("\"");
+            if (quoted) {
+                rest = rest.substring(1, rest.length() - 1);
+            }
+            if (rest.isEmpty()) {
+                return null;
+            }
+            atoms.add(new Atom(sigil, field, rest, quoted));
+        }
+        return atoms;
+    }
+
+    /** The predicate of a field-scoped atom, or null when the column cannot take it. */
+    private String fieldAtom(Atom a) {
+        if ("_exists_".equals(a.field())) {
+            Column c = column(a.text());
+            return c == null ? NONE : quoteIdent(c.name()) + " IS NOT NULL";
+        }
+        if ("_id".equals(a.field())) {
+            return OSID + " = " + literal(a.text());
+        }
+        Column c = column(a.field());
+        if (c == null) {
+            return NONE;
+        }
+        if (c.fts()) {
+            return textClause(c.name(), a.quoted() ? phrase(a.text()) : a.text(), "and", false);
+        }
+        if (!a.quoted() && (a.text().indexOf('*') >= 0 || a.text().indexOf('?') >= 0)) {
+            return c.isString() ? quoteIdent(c.name()) + " LIKE " + literal(wildcardToLike(a.text())) : null;
+        }
+        return equality(a.field(), a.text());
     }
 
     // ---- scalars ----
@@ -463,6 +645,11 @@ final class InfinoQueryTranslator {
             }
         }
         return out.toString();
+    }
+
+    /** A literal of {@code value} for the column's type, or null when it cannot be one: for a value a client hands back. */
+    static String literalFor(Column c, Object value, long nowMillis) {
+        return new InfinoQueryTranslator(Map.of(), "", nowMillis).scalar(c, value, false);
     }
 
     /** A literal for the column's type, or null when the value cannot be one. */

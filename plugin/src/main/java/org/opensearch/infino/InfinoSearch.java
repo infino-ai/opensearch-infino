@@ -6,11 +6,15 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.action.OriginalIndices;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchResponseSections;
 import org.opensearch.action.search.ShardSearchFailure;
+import org.opensearch.common.document.DocumentField;
+import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
@@ -32,7 +36,10 @@ import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.aggregations.metrics.InternalTopHits;
+import org.opensearch.search.aggregations.metrics.TopHitsAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.collapse.CollapseBuilder;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.FieldSortBuilder;
@@ -84,14 +91,30 @@ public final class InfinoSearch {
 
     private InfinoSearch() {}
 
-    /** What one request translates to, shared by the hit and aggregation paths. */
-    record Plan(String table, Map<String, Column> cols, Translation query, List<SortSpec> sorts, VectorRequest vector) {
+    /**
+     * What one request translates to, shared by the hit and aggregation paths.
+     * {@code postWhere} is the post_filter's predicate (null when none): it
+     * narrows the hits and their total, never the aggregations. {@code collapse}
+     * is the column hits are collapsed on (null when none), {@code searchAfter}
+     * the sort values the page starts after (null when none).
+     */
+    record Plan(
+        String table,
+        Map<String, Column> cols,
+        Translation query,
+        List<SortSpec> sorts,
+        VectorRequest vector,
+        String postWhere,
+        Column collapse,
+        Object[] searchAfter
+    ) {
         List<String> orderBy() {
-            List<String> out = new ArrayList<>(sorts.size());
-            for (SortSpec s : sorts) {
-                out.add(InfinoQueryTranslator.quoteIdent(s.column().name()) + (s.desc() ? " DESC" : " ASC") + " NULLS LAST");
-            }
-            return out;
+            return InfinoSearch.orderBy(sorts);
+        }
+
+        /** The predicate the hits satisfy: the query's and the post_filter's. */
+        String hitWhere() {
+            return postWhere == null ? query.where() : "(" + query.where() + ") AND (" + postWhere + ")";
         }
     }
 
@@ -110,15 +133,6 @@ public final class InfinoSearch {
     static Plan plan(String table, SearchSourceBuilder source, long nowMillis) {
         if (source.suggest() != null) {
             throw new IllegalArgumentException("[infino] suggest is not served by the table");
-        }
-        if (source.collapse() != null) {
-            throw new IllegalArgumentException("[infino] collapse is not served by the table");
-        }
-        if (source.postFilter() != null) {
-            throw new IllegalArgumentException("[infino] post_filter is not served by the table");
-        }
-        if (source.searchAfter() != null) {
-            throw new IllegalArgumentException("[infino] search_after is not served by the table");
         }
         Map<String, Column> cols = InfinoNative.columns(table);
         if (cols.isEmpty()) {
@@ -140,23 +154,67 @@ public final class InfinoSearch {
             }
         }
         log.debug("[infino] query {} -> FROM {} WHERE {}", qb, query.from(), query.where());
-        List<SortSpec> sorts = sorts(source, cols);
-        Plan plan = new Plan(table, cols, query, sorts, vector);
+        List<SortSpec> sorts = sorts(source.sorts(), cols);
+        String postWhere = null;
+        if (source.postFilter() != null) {
+            if (vector != null) {
+                throw new IllegalArgumentException("[infino] post_filter is not served with a vector query");
+            }
+            postWhere = InfinoQueryTranslator.predicate(source.postFilter(), cols, table, nowMillis);
+            if (postWhere == null) {
+                throw new IllegalArgumentException("[infino] post_filter not served by the table: " + source.postFilter());
+            }
+        }
+        Column collapse = null;
+        if (source.collapse() != null) {
+            CollapseBuilder cb = source.collapse();
+            if (cb.getInnerHits() != null && !cb.getInnerHits().isEmpty()) {
+                throw new IllegalArgumentException("[infino] collapse with inner_hits is not served by the table");
+            }
+            if (vector != null) {
+                throw new IllegalArgumentException("[infino] collapse is not served with a vector query");
+            }
+            collapse = columnFor(cols, cb.getField());
+            if (collapse == null) {
+                throw new IllegalArgumentException("[infino] collapse names field [" + cb.getField() + "], which the table has no column for");
+            }
+        }
+        Object[] searchAfter = source.searchAfter();
+        if (searchAfter != null) {
+            if (sorts.isEmpty()) {
+                throw new IllegalArgumentException("[infino] search_after needs a sort on fields");
+            }
+            if (searchAfter.length != sorts.size()) {
+                throw new IllegalArgumentException("[infino] search_after has " + searchAfter.length + " values for " + sorts.size() + " sort fields");
+            }
+            if (source.from() > 0) {
+                throw new IllegalArgumentException("[infino] search_after cannot be combined with from");
+            }
+            if (vector != null) {
+                throw new IllegalArgumentException("[infino] search_after is not served with a vector query");
+            }
+            for (Object v : searchAfter) {
+                if (v == null) {
+                    throw new IllegalArgumentException("[infino] search_after with a null sort value is not served; sort with a tiebreaker such as _id");
+                }
+            }
+        }
+        Plan plan = new Plan(table, cols, query, sorts, vector, postWhere, collapse, searchAfter);
         InfinoAggregationProcessor.check(builders(source), plan);
         return plan;
     }
 
     /**
-     * The request's field sorts over columns, in request order; {@code _score}
-     * and {@code _doc} add nothing. Throws when a sort names something the
-     * table has no column for.
+     * The field sorts over columns, in request order; {@code _score} and
+     * {@code _doc} add nothing. Throws when a sort names something the table
+     * has no column for.
      */
-    private static List<SortSpec> sorts(SearchSourceBuilder source, Map<String, Column> cols) {
+    static List<SortSpec> sorts(List<SortBuilder<?>> sorts, Map<String, Column> cols) {
         List<SortSpec> out = new ArrayList<>();
-        if (source.sorts() == null) {
+        if (sorts == null) {
             return out;
         }
-        for (SortBuilder<?> sort : source.sorts()) {
+        for (SortBuilder<?> sort : sorts) {
             if (sort instanceof ScoreSortBuilder) {
                 continue;
             }
@@ -175,7 +233,20 @@ public final class InfinoSearch {
         return out;
     }
 
+    /** ORDER BY terms for field sorts: each column in its direction, missing values last. */
+    static List<String> orderBy(List<SortSpec> sorts) {
+        List<String> out = new ArrayList<>(sorts.size());
+        for (SortSpec s : sorts) {
+            out.add(InfinoQueryTranslator.quoteIdent(s.column().name()) + (s.desc() ? " DESC" : " ASC") + " NULLS LAST");
+        }
+        return out;
+    }
+
     static Column columnFor(Map<String, Column> cols, String field) {
+        if ("_id".equals(field)) {
+            // The document id is the id column: a sort or collapse on it is served there.
+            return cols.get(InfinoQueryTranslator.OSID);
+        }
         Column c = cols.get(field);
         if (c == null && field.endsWith(".keyword")) {
             Column base = cols.get(field.substring(0, field.length() - ".keyword".length()));
@@ -220,23 +291,7 @@ public final class InfinoSearch {
             }
             InfinoNative.prefetchSources(plan.table(), ids);
         } else {
-            // The hit statement carries each hit's source and sort values.
-            StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE);
-            for (SortSpec s : plan.sorts()) {
-                hit.append(", ").append(InfinoQueryTranslator.quoteIdent(s.column().name()));
-            }
-            String sql;
-            if (!plan.sorts().isEmpty()) {
-                sql = "SELECT " + hit + " FROM " + q.from() + " WHERE " + q.where() + " ORDER BY "
-                    + String.join(", ", plan.orderBy()) + " LIMIT " + fetch;
-            } else if (q.principal() != null) {
-                boolean filtered = !InfinoQueryTranslator.ALL.equals(q.where());
-                sql = "SELECT " + hit + ", score FROM " + q.rankedFrom(filtered ? RANK_WINDOW : fetch)
-                    + " WHERE " + q.where() + " ORDER BY score DESC LIMIT " + fetch;
-            } else {
-                sql = "SELECT " + hit + " FROM " + q.from() + " WHERE " + q.where() + " LIMIT " + fetch;
-            }
-            rows = InfinoNative.sqlRows(sql);
+            rows = InfinoNative.sqlRows(hitStatement(plan, fetch));
         }
 
         boolean exact = trackTotal(source);
@@ -244,15 +299,16 @@ public final class InfinoSearch {
         if (plan.vector() != null) {
             total = rows.size(); // kNN is inherently top-k
         } else if (exact) {
-            total = count(plan.table(), q);
+            // The total counts what the query and post_filter keep, before
+            // any collapse and regardless of where the page starts.
+            total = plan.postWhere() == null ? count(plan.table(), q) : count(plan.table(), new Translation(q.table(), plan.hitWhere(), q.principal()));
         } else {
             total = rows.size();
         }
 
-        FetchSourceContext sourceFilter = sourceFilter(source);
+        FetchSourceContext sourceFilter = sourceFilter(source.fetchSource());
         boolean withSource = source.fetchSource() == null || source.fetchSource().fetchSource();
-        ShardId shardId = new ShardId(index, 0);
-        SearchShardTarget target = new SearchShardTarget(NODE, shardId, null, OriginalIndices.NONE);
+        SearchShardTarget target = target(index);
         List<SearchHit> hits = new ArrayList<>();
         float maxScore = Float.NaN;
         int end = Math.min(rows.size(), fetch);
@@ -295,9 +351,89 @@ public final class InfinoSearch {
                 }
                 h.sortValues(values, formats);
             }
+            if (plan.collapse() != null) {
+                // A collapsed hit carries its collapse value, as stock does.
+                String field = plan.collapse().name();
+                Object value = row.get(field);
+                h.setDocumentField(field, new DocumentField(field, value == null ? List.of() : List.of(value)));
+            }
             hits.add(h);
         }
         return new Page(hits, total, exact || plan.vector() != null, maxScore);
+    }
+
+    /**
+     * The statement that fetches the page's hits: each hit's id, source,
+     * sort values and, under a collapse, its collapse value. A sorted request
+     * orders the filtered relation; a text-ranked one orders the engine's
+     * ranked candidates by score; anything else is a filtered scan. A
+     * search_after narrows the relation to the rows past the given sort values
+     * (a keyset, so no earlier page is scanned), and a collapse keeps the first
+     * row of each collapse value in the request's order, through a window.
+     */
+    static String hitStatement(Plan plan, int fetch) {
+        Translation q = plan.query();
+        StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE);
+        for (SortSpec s : plan.sorts()) {
+            hit.append(", ").append(InfinoQueryTranslator.quoteIdent(s.column().name()));
+        }
+        if (plan.collapse() != null && plan.sorts().stream().noneMatch(s -> s.column().name().equals(plan.collapse().name()))) {
+            hit.append(", ").append(InfinoQueryTranslator.quoteIdent(plan.collapse().name()));
+        }
+        String where = plan.hitWhere();
+        if (plan.searchAfter() != null) {
+            where = "(" + where + ") AND " + keysetPredicate(plan);
+        }
+        boolean sorted = !plan.sorts().isEmpty();
+        boolean ranked = !sorted && q.principal() != null;
+        String from;
+        String order;
+        if (sorted) {
+            from = q.from();
+            order = String.join(", ", plan.orderBy());
+        } else if (ranked) {
+            boolean filtered = !InfinoQueryTranslator.ALL.equals(where);
+            from = q.rankedFrom(filtered ? RANK_WINDOW : fetch);
+            hit.append(", score");
+            order = "score DESC";
+        } else {
+            from = q.from();
+            order = null;
+        }
+        if (plan.collapse() == null) {
+            return "SELECT " + hit + " FROM " + from + " WHERE " + where + (order == null ? "" : " ORDER BY " + order) + " LIMIT " + fetch;
+        }
+        // One row per collapse value: the first in the request's order (the
+        // id's order when the request names none, so the page is stable).
+        String within = order == null ? InfinoQueryTranslator.OSID + " ASC" : order;
+        String partition = InfinoQueryTranslator.quoteIdent(plan.collapse().name());
+        return "SELECT " + hit + " FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY " + within
+            + ") AS collapse_rank FROM " + from + " t WHERE " + where + ") WHERE collapse_rank = 1"
+            + (order == null ? "" : " ORDER BY " + order) + " LIMIT " + fetch;
+    }
+
+    /**
+     * The rows after the search_after values in the request's sort order:
+     * {@code (s1 > v1) OR (s1 = v1 AND s2 > v2) OR ...}, each comparison
+     * turned for a descending sort.
+     */
+    private static String keysetPredicate(Plan plan) {
+        List<String> alternatives = new ArrayList<>();
+        List<String> equal = new ArrayList<>();
+        long now = System.currentTimeMillis();
+        for (int i = 0; i < plan.sorts().size(); i++) {
+            SortSpec s = plan.sorts().get(i);
+            String col = InfinoQueryTranslator.quoteIdent(s.column().name());
+            String lit = InfinoQueryTranslator.literalFor(s.column(), plan.searchAfter()[i], now);
+            if (lit == null) {
+                throw new IllegalArgumentException("[infino] search_after value [" + plan.searchAfter()[i] + "] is not a " + s.column().type());
+            }
+            List<String> conj = new ArrayList<>(equal);
+            conj.add(col + (s.desc() ? " < " : " > ") + lit);
+            alternatives.add("(" + String.join(" AND ", conj) + ")");
+            equal.add(col + " = " + lit);
+        }
+        return "(" + String.join(" OR ", alternatives) + ")";
     }
 
     /** Whether the request asks for the exact total (the default, and what dashboards send). */
@@ -306,15 +442,79 @@ public final class InfinoSearch {
         return upTo == null || upTo != SearchContext.TRACK_TOTAL_HITS_DISABLED;
     }
 
-    /** The request's source includes/excludes, or null when the source is returned whole. */
-    private static FetchSourceContext sourceFilter(SearchSourceBuilder source) {
-        FetchSourceContext ctx = source.fetchSource();
+    /** The source includes/excludes of {@code ctx}, or null when the source is returned whole (or not at all). */
+    private static FetchSourceContext sourceFilter(FetchSourceContext ctx) {
         if (ctx == null || !ctx.fetchSource()) {
             return null;
         }
         boolean includes = ctx.includes() != null && ctx.includes().length > 0;
         boolean excludes = ctx.excludes() != null && ctx.excludes().length > 0;
         return includes || excludes ? ctx : null;
+    }
+
+    /** The shard target a hit of {@code index} carries; it names the index in the response. */
+    private static SearchShardTarget target(Index index) {
+        return new SearchShardTarget(NODE, new ShardId(index, 0), null, OriginalIndices.NONE);
+    }
+
+    /**
+     * A {@code top_hits} result from a bucket's first rows (in order, at most
+     * {@code from + size} of them, each with its id, source and sort values)
+     * and the bucket's row count. The final reduction pages the rows past
+     * {@code from} itself, so all of them are handed over, in order: the
+     * reduction merges by score then position, and every hit scores alike.
+     */
+    static InternalAggregation topHits(
+        TopHitsAggregationBuilder b,
+        int from,
+        int size,
+        List<SortSpec> sorts,
+        FetchSourceContext fetchSource,
+        List<Map<String, Object>> rows,
+        long bucketCount,
+        Index index
+    ) {
+        FetchSourceContext sourceFilter = sourceFilter(fetchSource);
+        boolean withSource = fetchSource == null || fetchSource.fetchSource();
+        float score = sorts.isEmpty() ? 1.0f : Float.NaN;
+        SearchShardTarget target = index == null ? null : target(index);
+        List<SearchHit> hits = new ArrayList<>();
+        for (Map<String, Object> row : rows) {
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            if (id == null) {
+                continue;
+            }
+            SearchHit h = new SearchHit(hits.size(), id.toString(), Map.of(), Map.of());
+            if (target != null) {
+                h.shard(target);
+            }
+            h.score(score);
+            if (withSource) {
+                String src = String.valueOf(row.get(InfinoQueryTranslator.SOURCE));
+                if (!src.isEmpty()) {
+                    h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
+                }
+            }
+            if (!sorts.isEmpty()) {
+                Object[] values = new Object[sorts.size()];
+                DocValueFormat[] formats = new DocValueFormat[values.length];
+                for (int k = 0; k < values.length; k++) {
+                    values[k] = row.get(sorts.get(k).column().name());
+                    formats[k] = DocValueFormat.RAW;
+                }
+                h.sortValues(values, formats);
+            }
+            hits.add(h);
+        }
+        ScoreDoc[] docs = new ScoreDoc[hits.size()];
+        for (int i = 0; i < docs.length; i++) {
+            docs[i] = new ScoreDoc(i, 1.0f);
+        }
+        float maxScore = hits.isEmpty() || !sorts.isEmpty() ? Float.NaN : 1.0f;
+        TotalHits total = new TotalHits(bucketCount, TotalHits.Relation.EQUAL_TO);
+        TopDocsAndMaxScore topDocs = new TopDocsAndMaxScore(new TopDocs(total, docs), maxScore);
+        SearchHits searchHits = new SearchHits(hits.toArray(new SearchHit[0]), total, maxScore);
+        return new InternalTopHits(b.getName(), from, size, topDocs, searchHits, b.getMetadata());
     }
 
     private static BytesReference filtered(String src, FetchSourceContext filter) {
@@ -370,8 +570,10 @@ public final class InfinoSearch {
             Page page = page(index, plan, source);
             pages.add(page);
             if (!builders.isEmpty()) {
-                Long total = page.exact() && plan.vector() == null ? page.total() : null;
-                aggs.add(new InfinoAggregationProcessor().evaluate(builders, plan, total));
+                // Aggregations see the query, not the post_filter, so a post-filtered
+                // page's total is not theirs.
+                Long total = page.exact() && plan.vector() == null && plan.postWhere() == null ? page.total() : null;
+                aggs.add(new InfinoAggregationProcessor(index).evaluate(builders, plan, total));
             }
         }
         SearchHits hits = merge(pages, source);

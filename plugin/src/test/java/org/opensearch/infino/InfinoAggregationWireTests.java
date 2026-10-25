@@ -4,13 +4,21 @@
 
 package org.opensearch.infino;
 
+import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
+import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchModule;
 import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.aggregations.bucket.composite.CompositeAggregation;
+import org.opensearch.search.aggregations.bucket.composite.InternalComposite;
+import org.opensearch.search.aggregations.bucket.missing.MissingOrder;
 import org.opensearch.search.aggregations.bucket.terms.DoubleTerms;
+import org.opensearch.search.aggregations.bucket.terms.SignificantLongTerms;
+import org.opensearch.search.aggregations.bucket.terms.SignificantTerms;
 import org.opensearch.search.aggregations.bucket.terms.Terms;
+import org.opensearch.search.aggregations.bucket.terms.heuristic.JLHScore;
 import org.opensearch.search.aggregations.metrics.InternalCardinality;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -54,6 +62,57 @@ public class InfinoAggregationWireTests extends OpenSearchTestCase {
         assertEquals(4, buckets.get(0).getDocCount());
         assertEquals(2.25, buckets.get(1).getKeyAsNumber().doubleValue(), 0.0);
         assertEquals(7, terms.getSumOfOtherDocCounts());
+    }
+
+    public void testSignificantLongTermsReadsBackItsBuckets() {
+        SignificantLongTerms terms = InfinoAggregationWire.significantLongTerms(
+            "s",
+            Map.of(),
+            10,
+            1,
+            DocValueFormat.RAW,
+            30,
+            100,
+            new JLHScore(),
+            List.of(new InfinoAggregationWire.SignificantLongBucket(404L, 12, 15, InternalAggregations.EMPTY), new InfinoAggregationWire.SignificantLongBucket(200L, 3, 60, null))
+        );
+        assertEquals("s", terms.getName());
+        List<? extends SignificantTerms.Bucket> buckets = ((SignificantTerms) terms).getBuckets();
+        assertEquals(2, buckets.size());
+        assertEquals(404L, buckets.get(0).getKeyAsNumber().longValue());
+        assertEquals(12, buckets.get(0).getSubsetDf());
+        assertEquals(15, buckets.get(0).getSupersetDf());
+        assertEquals(30, buckets.get(0).getSubsetSize());
+        assertEquals(100, buckets.get(0).getSupersetSize());
+        assertEquals(200L, buckets.get(1).getKeyAsNumber().longValue());
+        assertEquals(3, buckets.get(1).getDocCount());
+    }
+
+    public void testCompositeReadsBackItsBucketsAndAfterKey() {
+        InternalComposite composite = InfinoAggregationWire.composite(
+            "c",
+            Map.of(),
+            2,
+            List.of("cat", "n"),
+            List.of(DocValueFormat.RAW, DocValueFormat.RAW),
+            new int[] { 1, -1 },
+            new MissingOrder[] { MissingOrder.DEFAULT, MissingOrder.FIRST },
+            List.of(
+                new InfinoAggregationWire.CompositeBucket(new Comparable<?>[] { new BytesRef("coats"), 7L }, 4, InternalAggregations.EMPTY),
+                new InfinoAggregationWire.CompositeBucket(new Comparable<?>[] { new BytesRef("hats"), null }, 1, null)
+            ),
+            new Comparable<?>[] { new BytesRef("hats"), null }
+        );
+        assertEquals("c", composite.getName());
+        assertEquals(2, composite.getSize());
+        List<? extends CompositeAggregation.Bucket> buckets = composite.getBuckets();
+        assertEquals(2, buckets.size());
+        assertEquals(Map.of("cat", "coats", "n", 7L), buckets.get(0).getKey());
+        assertEquals(4, buckets.get(0).getDocCount());
+        assertEquals("hats", buckets.get(1).getKey().get("cat"));
+        assertNull(buckets.get(1).getKey().get("n"));
+        assertEquals("hats", composite.afterKey().get("cat"));
+        assertNull(composite.afterKey().get("n"));
     }
 
     public void testCardinalityTracksTheCountPastIt() {

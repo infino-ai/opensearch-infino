@@ -1,0 +1,268 @@
+---
+"Phrases, query strings, mget, paging, post_filter, collapse and the remaining aggregations":
+  - do:
+      indices.create:
+        index: shop
+        body:
+          settings:
+            index.infino.enabled: true
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              category: { type: keyword }
+              brand: { type: keyword }
+              title: { type: text }
+              price: { type: float }
+              qty: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: shop, _id: "1" }
+          - { "@timestamp": "2026-10-24T10:00:00Z", category: coats, brand: acme, title: "red wool coat", price: 120, qty: 2 }
+          - index: { _index: shop, _id: "2" }
+          - { "@timestamp": "2026-10-24T11:00:00Z", category: coats, brand: acme, title: "coat of red wool", price: 80, qty: 1 }
+          - index: { _index: shop, _id: "3" }
+          - { "@timestamp": "2026-10-24T12:00:00Z", category: scarves, brand: acme, title: "wool scarf", price: 20, qty: 5 }
+          - index: { _index: shop, _id: "4" }
+          - { "@timestamp": "2026-10-25T10:00:00Z", category: shoes, brand: zed, title: "leather boots", price: 150, qty: 1 }
+          - index: { _index: shop, _id: "5" }
+          - { "@timestamp": "2026-10-25T11:00:00Z", category: shoes, brand: zed, title: "canvas sneakers", price: 50, qty: 3 }
+          - index: { _index: shop, _id: "6" }
+          - { "@timestamp": "2026-10-25T12:00:00Z", category: hats, brand: zed, title: "cotton cap", price: 15, qty: 10 }
+          - index: { _index: shop, _id: "7" }
+          - { "@timestamp": "2026-10-26T10:00:00Z", category: hats, brand: acme, title: "felt hat", price: 35, qty: 4 }
+          - index: { _index: shop, _id: "8" }
+          - { "@timestamp": "2026-10-26T11:00:00Z", category: scarves, brand: zed, title: "silk scarf", price: 60, qty: 2 }
+  - match: { errors: false }
+
+  # A phrase is adjacent terms in order: "coat of red wool" has every term but not the phrase.
+  - do:
+      search:
+        index: shop
+        body:
+          query: { match: { title: "red wool coat" } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: shop
+        body:
+          query: { match_phrase: { title: "red wool coat" } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+  # query_string: AND, a quoted phrase, a negated term and a field clause.
+  - do:
+      search:
+        index: shop
+        body:
+          query: { query_string: { query: "wool AND coat", default_field: title } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: shop
+        body:
+          query: { query_string: { query: "\"red wool\"", default_field: title } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: shop
+        body:
+          query: { query_string: { query: "wool -coat", default_field: title } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - do:
+      search:
+        index: shop
+        body:
+          query: { query_string: { query: "category:shoes OR category:hats", default_field: title } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search:
+        index: shop
+        body:
+          query: { query_string: { query: "brand:acme AND wool", default_field: title } }
+  - match: { hits.total.value: 3 }
+
+  # mget: each id answered from the table, a missing one reported as not found.
+  - do:
+      mget:
+        body:
+          docs:
+            - { _index: shop, _id: "1" }
+            - { _index: shop, _id: "99" }
+            - { _index: shop, _id: "4" }
+  - match: { docs.0.found: true }
+  - match: { docs.0._source.title: "red wool coat" }
+  - match: { docs.1.found: false }
+  - match: { docs.2.found: true }
+  - match: { docs.2._id: "4" }
+
+  # search_after: the page after the given sort values, a keyset over the sort.
+  - do:
+      search:
+        index: shop
+        body:
+          size: 3
+          sort: [ { price: asc } ]
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.2._id: "7" }
+  - length: { hits.hits.2.sort: 1 }
+  - do:
+      search:
+        index: shop
+        body:
+          size: 3
+          sort: [ { price: asc } ]
+          search_after: [35.0]
+  - match: { hits.total.value: 8 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "8" }
+  - match: { hits.hits.2._id: "2" }
+
+  # post_filter narrows the hits and their total, not the aggregations.
+  - do:
+      search:
+        index: shop
+        body:
+          post_filter: { term: { category: shoes } }
+          aggs:
+            cats: { terms: { field: category } }
+  - match: { hits.total.value: 2 }
+  - length: { aggregations.cats.buckets: 4 }
+
+  # collapse: one hit per category, the first in the request's order, carrying its collapse value.
+  - do:
+      search:
+        index: shop
+        body:
+          collapse: { field: category }
+          sort: [ { price: asc } ]
+  - match: { hits.total.value: 8 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.0.fields.category: [hats] }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "2" }
+
+  # percentile_ranks: one row below 20 and seven below 150. The digest reads the
+  # value's own row as half (18.75 and 93.75 on 3.x); the older digest in 2.x
+  # interpolates the ranks lower, so the check is a range.
+  - do:
+      search:
+        index: shop
+        body:
+          size: 0
+          aggs:
+            ranks: { percentile_ranks: { field: price, values: [20, 150] } }
+  - gte: { aggregations.ranks.values.20\.0: 10.0 }
+  - lte: { aggregations.ranks.values.20\.0: 25.0 }
+  - gte: { aggregations.ranks.values.150\.0: 85.0 }
+  - lte: { aggregations.ranks.values.150\.0: 100.0 }
+
+  # top_hits at the root and under a terms level, with a source filter.
+  - do:
+      search:
+        index: shop
+        body:
+          size: 0
+          aggs:
+            priciest:
+              top_hits: { size: 2, sort: [ { price: desc } ] }
+            by_cat:
+              terms: { field: category, order: { _key: asc } }
+              aggs:
+                cheapest:
+                  top_hits: { size: 1, sort: [ { price: asc } ], _source: { includes: [title] } }
+  - match: { aggregations.priciest.hits.total.value: 8 }
+  - length: { aggregations.priciest.hits.hits: 2 }
+  - match: { aggregations.priciest.hits.hits.0._id: "4" }
+  - match: { aggregations.priciest.hits.hits.0._index: shop }
+  - length: { aggregations.priciest.hits.hits.0.sort: 1 }
+  - match: { aggregations.priciest.hits.hits.1._id: "1" }
+  - match: { aggregations.by_cat.buckets.0.key: coats }
+  - match: { aggregations.by_cat.buckets.0.cheapest.hits.total.value: 2 }
+  - match: { aggregations.by_cat.buckets.0.cheapest.hits.hits.0._id: "2" }
+  - match: { aggregations.by_cat.buckets.0.cheapest.hits.hits.0._source: { title: "coat of red wool" } }
+  - match: { aggregations.by_cat.buckets.1.key: hats }
+  - match: { aggregations.by_cat.buckets.1.cheapest.hits.hits.0._id: "6" }
+  - match: { aggregations.by_cat.buckets.3.key: shoes }
+  - match: { aggregations.by_cat.buckets.3.cheapest.hits.hits.0._id: "5" }
+
+  # significant_terms: the brand every wool item has, against its share of the whole shop.
+  - do:
+      search:
+        index: shop
+        body:
+          size: 0
+          query: { match: { title: wool } }
+          aggs:
+            brands: { significant_terms: { field: brand, min_doc_count: 1 } }
+  - match: { aggregations.brands.doc_count: 3 }
+  - match: { aggregations.brands.bg_count: 8 }
+  - length: { aggregations.brands.buckets: 1 }
+  - match: { aggregations.brands.buckets.0.key: acme }
+  - match: { aggregations.brands.buckets.0.doc_count: 3 }
+  - match: { aggregations.brands.buckets.0.bg_count: 4 }
+  - gt: { aggregations.brands.buckets.0.score: 0.0 }
+
+  # composite: buckets in key order, paged by the after key.
+  - do:
+      search:
+        index: shop
+        body:
+          size: 0
+          aggs:
+            pairs:
+              composite:
+                size: 3
+                sources:
+                  - cat: { terms: { field: category } }
+                  - brand: { terms: { field: brand } }
+              aggs:
+                units: { sum: { field: qty } }
+  - length: { aggregations.pairs.buckets: 3 }
+  - match: { aggregations.pairs.buckets.0.key: { cat: coats, brand: acme } }
+  - match: { aggregations.pairs.buckets.0.doc_count: 2 }
+  - match: { aggregations.pairs.buckets.0.units.value: 3.0 }
+  - match: { aggregations.pairs.buckets.1.key: { cat: hats, brand: acme } }
+  - match: { aggregations.pairs.buckets.2.key: { cat: hats, brand: zed } }
+  - match: { aggregations.pairs.after_key: { cat: hats, brand: zed } }
+  - do:
+      search:
+        index: shop
+        body:
+          size: 0
+          aggs:
+            pairs:
+              composite:
+                size: 3
+                after: { cat: hats, brand: zed }
+                sources:
+                  - cat: { terms: { field: category } }
+                  - brand: { terms: { field: brand } }
+  - length: { aggregations.pairs.buckets: 3 }
+  - match: { aggregations.pairs.buckets.0.key: { cat: scarves, brand: acme } }
+  - match: { aggregations.pairs.buckets.1.key: { cat: scarves, brand: zed } }
+  - match: { aggregations.pairs.buckets.2.key: { cat: shoes, brand: zed } }
+  - match: { aggregations.pairs.buckets.2.doc_count: 2 }
+
+  # composite over a day histogram, descending.
+  - do:
+      search:
+        index: shop
+        body:
+          size: 0
+          aggs:
+            days:
+              composite:
+                sources:
+                  - day: { date_histogram: { field: "@timestamp", calendar_interval: 1d, order: desc } }
+  - length: { aggregations.days.buckets: 3 }
+  - match: { aggregations.days.buckets.0.doc_count: 2 }
+  - match: { aggregations.days.buckets.1.doc_count: 3 }
+  - match: { aggregations.days.buckets.2.doc_count: 3 }

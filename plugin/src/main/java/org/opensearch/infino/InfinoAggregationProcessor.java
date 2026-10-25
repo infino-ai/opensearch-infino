@@ -6,20 +6,42 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.Rounding;
+import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.common.time.DateFormatter;
+import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.index.Index;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.core.xcontent.ToXContent;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.mapper.DateFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
 import org.opensearch.infino.InfinoSearch.Plan;
+import org.opensearch.infino.InfinoSearch.SortSpec;
 import org.opensearch.search.DocValueFormat;
+import org.opensearch.search.SearchHit;
+import org.opensearch.search.SearchHits;
+import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.InternalOrder;
+import org.opensearch.search.aggregations.bucket.BucketUtils;
+import org.opensearch.search.aggregations.bucket.composite.CompositeAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.composite.CompositeValuesSourceBuilder;
+import org.opensearch.search.aggregations.bucket.composite.DateHistogramValuesSourceBuilder;
+import org.opensearch.search.aggregations.bucket.composite.HistogramValuesSourceBuilder;
+import org.opensearch.search.aggregations.bucket.composite.TermsValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator;
 import org.opensearch.search.aggregations.bucket.filter.InternalFilters;
@@ -30,32 +52,45 @@ import org.opensearch.search.aggregations.bucket.histogram.HistogramAggregationB
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
 import org.opensearch.search.aggregations.bucket.histogram.InternalHistogram;
 import org.opensearch.search.aggregations.bucket.histogram.LongBounds;
+import org.opensearch.search.aggregations.bucket.missing.MissingOrder;
 import org.opensearch.search.aggregations.bucket.range.DateRangeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.range.InternalDateRange;
 import org.opensearch.search.aggregations.bucket.range.InternalRange;
 import org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.range.RangeAggregator;
 import org.opensearch.search.aggregations.bucket.terms.LongTerms;
+import org.opensearch.search.aggregations.bucket.terms.SignificantStringTerms;
+import org.opensearch.search.aggregations.bucket.terms.SignificantTermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.StringTerms;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregator;
+import org.opensearch.search.aggregations.bucket.terms.heuristic.JLHScore;
+import org.opensearch.search.aggregations.bucket.terms.heuristic.SignificanceHeuristic;
 import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.CardinalityAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.InternalAvg;
 import org.opensearch.search.aggregations.metrics.InternalMax;
 import org.opensearch.search.aggregations.metrics.InternalMin;
 import org.opensearch.search.aggregations.metrics.InternalSum;
+import org.opensearch.search.aggregations.metrics.InternalTDigestPercentileRanks;
 import org.opensearch.search.aggregations.metrics.InternalTDigestPercentiles;
+import org.opensearch.search.aggregations.metrics.InternalTopHits;
 import org.opensearch.search.aggregations.metrics.InternalValueCount;
 import org.opensearch.search.aggregations.metrics.MaxAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.MinAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.PercentileRanksAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.PercentilesAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.PercentilesConfig;
 import org.opensearch.search.aggregations.metrics.SumAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.TDigestState;
+import org.opensearch.search.aggregations.metrics.TopHitsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder;
 import org.opensearch.search.aggregations.support.ValuesSourceAggregationBuilder;
+import org.opensearch.search.fetch.subphase.FetchSourceContext;
+import org.opensearch.search.sort.SortOrder;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
@@ -77,19 +112,27 @@ import static org.opensearch.infino.InfinoQueryTranslator.quoteIdent;
  * use (so a full-text query scopes its aggregations through the engine's
  * token index, never through a materialized id list).
  *
- * <p>Three kinds of aggregation are planned:
+ * <p>Four kinds of aggregation are planned:
  * <ul>
  *   <li><b>metrics</b> ({@code value_count}, {@code sum}, {@code avg},
- *       {@code min}, {@code max}, {@code cardinality}, {@code percentiles}):
- *       aggregate columns of the query at their level;</li>
+ *       {@code min}, {@code max}, {@code cardinality}, {@code percentiles},
+ *       {@code percentile_ranks}): aggregate columns of the query at their
+ *       level;</li>
  *   <li><b>grouped buckets</b> ({@code terms}, {@code date_histogram},
  *       {@code histogram}): a chain of consecutive grouped levels is answered
  *       with one {@code GROUP BY} per depth, each level grouping by every key
  *       above it, with the per-parent size of a terms level applied by a
- *       window function, and the rows folded into nested buckets;</li>
+ *       window function, and the rows folded into nested buckets;
+ *       {@code composite} is one such level over several keys, paged by a
+ *       keyset predicate, and {@code significant_terms} one whose buckets
+ *       carry a second, background count over the whole table;</li>
  *   <li><b>explicit buckets</b> ({@code filters}, {@code range},
  *       {@code date_range}): one query per bucket, the bucket's predicate
- *       added to the request's, since buckets may overlap.</li>
+ *       added to the request's, since buckets may overlap;</li>
+ *   <li><b>top hits</b> ({@code top_hits}): the first rows of a bucket in
+ *       the requested order, one window statement per grouped level (the
+ *       window partitioned by the level's keys) and one statement per
+ *       explicit bucket.</li>
  * </ul>
  * Pipeline aggregations need nothing here: the final reduction computes them
  * from the buckets returned. A request with an aggregation outside this
@@ -106,6 +149,21 @@ public class InfinoAggregationProcessor {
     private static final String DEFAULT_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
     /** The t-digest compression OpenSearch uses when the request names none. */
     private static final double DEFAULT_TDIGEST_COMPRESSION = 100.0;
+    /** OpenSearch's page size for top hits when the request names none. */
+    private static final int DEFAULT_TOP_HITS_SIZE = 3;
+    /** Hits one top_hits may ask for per bucket; past this the rows belong in a search. */
+    private static final int MAX_TOP_HITS = 100;
+    /** Separator of a key tuple's string form, chosen so no key contains it. */
+    private static final char KEY_SEPARATOR = '\u0001';
+    /** Stand-in for a missing key in a tuple's string form. */
+    private static final String NULL_KEY = "\u0000";
+
+    private final Index index;
+
+    /** A processor whose top hits name {@code index}; null for planning only. */
+    InfinoAggregationProcessor(Index index) {
+        this.index = index;
+    }
 
     /** An aggregation the table cannot serve; the request fails with this reason. */
     static final class Unsupported extends IllegalArgumentException {
@@ -135,6 +193,10 @@ public class InfinoAggregationProcessor {
             }
             if (total == null) {
                 total = InfinoSearch.count(plan.table(), q);
+            }
+            if (spec instanceof TopHits th) {
+                byName.put(spec.name(), th.build(topHitRows(th, q.from(), q.where()), total, index));
+                continue;
             }
             byName.put(spec.name(), evalBucket((BucketSpec) spec, q.from(), q.where(), total));
         }
@@ -185,36 +247,49 @@ public class InfinoAggregationProcessor {
                 }
                 return Metric.of(b, cols, index);
             }
+            if (b instanceof TopHitsAggregationBuilder th) {
+                return TopHits.of(th, cols);
+            }
             List<Metric> metrics = new ArrayList<>();
+            List<TopHits> hits = new ArrayList<>();
             BucketSpec child = null;
             int i = 0;
             for (AggregationBuilder sub : b.getSubAggregations()) {
                 Spec s = of(sub, cols, table, i++);
                 if (s instanceof Metric m) {
                     metrics.add(m);
+                } else if (s instanceof TopHits t) {
+                    hits.add(t);
                 } else if (child == null) {
                     child = (BucketSpec) s;
                 } else {
                     throw new Unsupported("aggregation [" + b.getName() + "] has more than one nested bucket aggregation");
                 }
             }
+            Leaves leaves = new Leaves(metrics, hits);
             if (b instanceof TermsAggregationBuilder t) {
-                return Grouped.terms(t, cols, metrics, child);
+                return Grouped.terms(t, cols, leaves, child);
             }
             if (b instanceof DateHistogramAggregationBuilder dh) {
-                return Grouped.dateHistogram(dh, cols, metrics, child);
+                return Grouped.dateHistogram(dh, cols, leaves, child);
             }
             if (b instanceof HistogramAggregationBuilder h) {
-                return Grouped.histogram(h, cols, metrics, child);
+                return Grouped.histogram(h, cols, leaves, child);
             }
             if (b instanceof FiltersAggregationBuilder f) {
-                return Explicit.filters(f, cols, table, metrics, child);
+                return Explicit.filters(f, cols, table, leaves, child);
             }
             if (b instanceof RangeAggregationBuilder r) {
-                return Explicit.range(r, cols, metrics, child);
+                return Explicit.range(r, cols, leaves, child);
             }
             if (b instanceof DateRangeAggregationBuilder dr) {
-                return Explicit.dateRange(dr, cols, metrics, child);
+                return Explicit.dateRange(dr, cols, leaves, child);
+            }
+            if (b instanceof SignificantTermsAggregationBuilder st) {
+                return Significant.of(st, cols, table, leaves, child);
+            }
+            if (b instanceof CompositeAggregationBuilder c) {
+                return Composite.of(c, cols, leaves, child);
             }
             throw new Unsupported("aggregation [" + b.getName() + "] of type [" + b.getType() + "] is not served");
         }
@@ -239,7 +314,8 @@ public class InfinoAggregationProcessor {
         MIN,
         MAX,
         CARDINALITY,
-        PERCENTILES
+        PERCENTILES,
+        PERCENTILE_RANKS
     }
 
     /** A metric over one column: the SQL aggregate columns it needs and the result it builds. */
@@ -268,7 +344,8 @@ public class InfinoAggregationProcessor {
                 || b instanceof MinAggregationBuilder
                 || b instanceof MaxAggregationBuilder
                 || b instanceof CardinalityAggregationBuilder
-                || b instanceof PercentilesAggregationBuilder;
+                || b instanceof PercentilesAggregationBuilder
+                || b instanceof PercentileRanksAggregationBuilder;
         }
 
         static Metric of(AggregationBuilder b, Map<String, Column> cols, int index) {
@@ -295,6 +372,18 @@ public class InfinoAggregationProcessor {
             }
             if (b instanceof MaxAggregationBuilder) {
                 return new Metric(b, c, alias, MetricKind.MAX, null, false, 0);
+            }
+            if (b instanceof PercentileRanksAggregationBuilder pr) {
+                PercentilesConfig config = pr.percentilesConfig();
+                if (config != null && !(config instanceof PercentilesConfig.TDigest)) {
+                    throw new Unsupported("aggregation [" + b.getName() + "] uses the HDR method; only t-digest is served");
+                }
+                double compression = config instanceof PercentilesConfig.TDigest td ? td.getCompression() : DEFAULT_TDIGEST_COMPRESSION;
+                double[] values = pr.values();
+                if (values == null || values.length == 0) {
+                    throw new Unsupported("aggregation [" + b.getName() + "] names no values");
+                }
+                return new Metric(b, c, alias, MetricKind.PERCENTILE_RANKS, values, pr.keyed(), compression);
             }
             PercentilesAggregationBuilder p = (PercentilesAggregationBuilder) b;
             PercentilesConfig config = p.percentilesConfig();
@@ -329,6 +418,20 @@ public class InfinoAggregationProcessor {
                     cols.add("COUNT(" + f + ") AS " + alias + "_c");
                     yield String.join(", ", cols);
                 }
+                case PERCENTILE_RANKS -> {
+                    // One exact count of the rows below each value, beside the
+                    // row count and bounds. The digest the value goes into reads
+                    // its rank as that count plus half the value's own row, which
+                    // is how stock's digest over the rows themselves reads it.
+                    List<String> cols = new ArrayList<>();
+                    for (int i = 0; i < percents.length; i++) {
+                        cols.add("SUM(CASE WHEN " + f + " < " + percents[i] + " THEN 1 ELSE 0 END) AS " + alias + "_r" + i);
+                    }
+                    cols.add("MIN(" + f + ") AS " + alias + "_mn");
+                    cols.add("MAX(" + f + ") AS " + alias + "_mx");
+                    cols.add("COUNT(" + f + ") AS " + alias + "_c");
+                    yield String.join(", ", cols);
+                }
             };
         }
 
@@ -339,7 +442,7 @@ public class InfinoAggregationProcessor {
                 case SUM -> alias + "_s";
                 case MIN, MAX -> alias + "_v";
                 case CARDINALITY -> alias + "_d";
-                case AVG, PERCENTILES -> null;
+                case AVG, PERCENTILES, PERCENTILE_RANKS -> null;
             };
         }
 
@@ -354,6 +457,7 @@ public class InfinoAggregationProcessor {
                 case MAX -> new InternalMax(name, asDouble(row.get(alias + "_v"), Double.NEGATIVE_INFINITY), DocValueFormat.RAW, meta);
                 case CARDINALITY -> InfinoAggregationWire.cardinality(name, meta, asLong(row.get(alias + "_d")));
                 case PERCENTILES -> percentiles(row);
+                case PERCENTILE_RANKS -> percentileRanks(row);
             };
         }
 
@@ -367,6 +471,38 @@ public class InfinoAggregationProcessor {
          * centroids the digest requires; everything else stays strictly inside.
          */
         private InternalAggregation percentiles(Map<String, Object> row) {
+            double[] values = new double[percents.length];
+            for (int i = 0; i < percents.length; i++) {
+                values[i] = asDouble(row.get(alias + "_p" + i), Double.NaN);
+            }
+            TDigestState state = digest(row, percents, values);
+            return new InternalTDigestPercentiles(builder.getName(), percents, state, keyed, DocValueFormat.RAW, builder.getMetadata());
+        }
+
+        /**
+         * The inverse: each requested value goes in as a single-row centroid
+         * past the rows the engine counted below it, so the digest's
+         * cumulative distribution reads the value's rank as those rows plus
+         * half its own, which is what stock's digest over the rows reads.
+         */
+        private InternalAggregation percentileRanks(Map<String, Object> row) {
+            double[] values = percents;
+            long count = asLong(row.get(alias + "_c"));
+            double[] ranks = new double[values.length];
+            for (int i = 0; i < values.length; i++) {
+                ranks[i] = count == 0 ? 0.0 : 100.0 * asLong(row.get(alias + "_r" + i)) / count;
+            }
+            TDigestState state = digest(row, ranks, values);
+            return new InternalTDigestPercentileRanks(builder.getName(), values, state, keyed, DocValueFormat.RAW, builder.getMetadata());
+        }
+
+        /**
+         * The digest over {@code count} rows whose quantile at each of
+         * {@code percents} is the matching entry of {@code values}, built
+         * from the row's count and bounds. A value outside the bounds is
+         * clamped to them: the digest's ends are the minimum and maximum.
+         */
+        private TDigestState digest(Map<String, Object> row, double[] percents, double[] values) {
             TDigestState state = new TDigestState(compression);
             long count = asLong(row.get(alias + "_c"));
             if (count > 0) {
@@ -380,14 +516,14 @@ public class InfinoAggregationProcessor {
                 double innerMax = Math.nextDown(max);
                 long interior = count - 2;
                 if (interior > 0 && innerMin <= innerMax) {
-                    placeInterior(state, row, count, innerMin, innerMax);
+                    placeInterior(state, percents, values, count, innerMin, innerMax);
                 }
             }
-            return new InternalTDigestPercentiles(builder.getName(), percents, state, keyed, DocValueFormat.RAW, builder.getMetadata());
+            return state;
         }
 
         /** The percent centroids in percent order, each at its position, fillers between; the end rows stay with the caller. */
-        private void placeInterior(TDigestState state, Map<String, Object> row, long count, double innerMin, double innerMax) {
+        private static void placeInterior(TDigestState state, double[] percents, double[] values, long count, double innerMin, double innerMax) {
             int n = percents.length;
             Integer[] order = new Integer[n];
             for (int i = 0; i < n; i++) {
@@ -396,7 +532,8 @@ public class InfinoAggregationProcessor {
             Arrays.sort(order, Comparator.comparingDouble(i -> percents[i]));
             double[] value = new double[n];
             for (int i = 0; i < n; i++) {
-                value[i] = Math.min(innerMax, Math.max(innerMin, asDouble(row.get(alias + "_p" + i), innerMin)));
+                double v = Double.isNaN(values[i]) ? innerMin : values[i];
+                value[i] = Math.min(innerMax, Math.max(innerMin, v));
             }
             // Rows placed so far: the minimum is row 0, so the interior starts at 1
             // and must end before the maximum at count - 1.
@@ -422,23 +559,106 @@ public class InfinoAggregationProcessor {
         }
     }
 
-    /** A bucket aggregation: the metrics under it and at most one nested bucket aggregation. */
+    /**
+     * The first rows of a bucket: {@code top_hits}. Ordered by the request's
+     * field sorts when it has any, else by id so the page is stable; a
+     * text-ranked order is not served here (the aggregation relation is the
+     * match set, which carries no score), so hits score alike, as filtered
+     * hits do.
+     */
+    static final class TopHits extends Spec {
+        final int from;
+        final int size;
+        final List<SortSpec> sorts;
+        final FetchSourceContext source;
+
+        private TopHits(TopHitsAggregationBuilder b, List<SortSpec> sorts, FetchSourceContext source) {
+            super(b);
+            this.from = Math.max(0, b.from());
+            this.size = b.size() < 0 ? DEFAULT_TOP_HITS_SIZE : b.size();
+            this.sorts = sorts;
+            this.source = source;
+        }
+
+        static TopHits of(TopHitsAggregationBuilder b, Map<String, Column> cols) {
+            if (b.size() > MAX_TOP_HITS) {
+                throw new Unsupported("aggregation [" + b.getName() + "] asks for " + b.size() + " hits per bucket; at most " + MAX_TOP_HITS + " are served");
+            }
+            // The builder's collections are null until the request names them.
+            boolean scripts = b.scriptFields() != null && !b.scriptFields().isEmpty();
+            if (b.highlighter() != null || b.explain() || b.version() || scripts || b.storedFields() != null) {
+                throw new Unsupported("aggregation [" + b.getName() + "] asks for highlight, explain, version, script or stored fields, which the table does not serve");
+            }
+            boolean docValues = b.docValueFields() != null && !b.docValueFields().isEmpty();
+            boolean fetchFields = b.fetchFields() != null && !b.fetchFields().isEmpty();
+            if (docValues || fetchFields) {
+                throw new Unsupported("aggregation [" + b.getName() + "] asks for docvalue or fetch fields; the source carries the row");
+            }
+            List<SortSpec> sorts;
+            try {
+                sorts = InfinoSearch.sorts(b.sorts(), cols);
+            } catch (IllegalArgumentException e) {
+                throw new Unsupported("aggregation [" + b.getName() + "] " + e.getMessage());
+            }
+            return new TopHits(b, sorts, b.fetchSource());
+        }
+
+        /** The columns a hit row carries beyond the id and the source. */
+        List<String> rowColumns() {
+            List<String> out = new ArrayList<>();
+            for (SortSpec s : sorts) {
+                out.add(quoteIdent(s.column().name()));
+            }
+            return out;
+        }
+
+        /** ORDER BY within a bucket. */
+        String order() {
+            return sorts.isEmpty() ? InfinoQueryTranslator.OSID + " ASC" : String.join(", ", InfinoSearch.orderBy(sorts));
+        }
+
+        int fetch() {
+            return from + size;
+        }
+
+        /** This aggregation over the bucket's rows (in order, at most {@link #fetch()} of them) and its row count; the hits name {@code index}. */
+        InternalAggregation build(List<Map<String, Object>> rows, long bucketCount, Index index) {
+            return InfinoSearch.topHits((TopHitsAggregationBuilder) builder, from, size, sorts, source, rows, bucketCount, index);
+        }
+
+        InternalAggregation empty() {
+            return build(List.of(), 0, null);
+        }
+    }
+
+    /** What sits under a bucket besides a nested bucket aggregation: its metrics and its top hits. */
+    record Leaves(List<Metric> metrics, List<TopHits> hits) {
+        static final Leaves NONE = new Leaves(List.of(), List.of());
+    }
+
+    /** A bucket aggregation: the metrics and top hits under it and at most one nested bucket aggregation. */
     abstract static class BucketSpec extends Spec {
         final List<Metric> metrics;
+        final List<TopHits> hits;
         final BucketSpec child;
 
-        BucketSpec(AggregationBuilder b, List<Metric> metrics, BucketSpec child) {
+        BucketSpec(AggregationBuilder b, Leaves leaves, BucketSpec child) {
             super(b);
-            this.metrics = metrics;
+            this.metrics = leaves.metrics();
+            this.hits = leaves.hits();
             this.child = child;
         }
 
-        /** The sub-aggregations of a bucket: its metrics from the row, and the nested aggregation given. */
-        InternalAggregations subs(Map<String, Object> row, InternalAggregation nested) {
+        /**
+         * The sub-aggregations of a bucket: its metrics from the row, its top
+         * hits (one per top_hits spec, in order) and the nested aggregation given.
+         */
+        InternalAggregations subs(Map<String, Object> row, List<InternalAggregation> topHits, InternalAggregation nested) {
             List<InternalAggregation> out = new ArrayList<>();
             for (Metric m : metrics) {
                 out.add(m.build(row));
             }
+            out.addAll(topHits);
             if (nested != null) {
                 out.add(nested);
             }
@@ -447,7 +667,16 @@ public class InfinoAggregationProcessor {
 
         /** The sub-aggregations of an empty bucket. */
         InternalAggregations emptySubs() {
-            return subs(Map.of(), child == null ? null : child.empty());
+            return subs(Map.of(), emptyHits(), child == null ? null : child.empty());
+        }
+
+        /** One empty top_hits per spec. */
+        List<InternalAggregation> emptyHits() {
+            List<InternalAggregation> out = new ArrayList<>();
+            for (TopHits th : hits) {
+                out.add(th.empty());
+            }
+            return out;
         }
 
         /** This aggregation with no buckets. */
@@ -483,7 +712,7 @@ public class InfinoAggregationProcessor {
 
         private Grouped(
             AggregationBuilder b,
-            List<Metric> metrics,
+            Leaves leaves,
             BucketSpec child,
             Column column,
             String keyExpr,
@@ -495,7 +724,7 @@ public class InfinoAggregationProcessor {
             DateKey date,
             HistKey hist
         ) {
-            super(b, metrics, child);
+            super(b, leaves, child);
             this.column = column;
             this.keyExpr = keyExpr;
             this.keyKind = keyKind;
@@ -507,57 +736,24 @@ public class InfinoAggregationProcessor {
             this.hist = hist;
         }
 
-        static Grouped terms(TermsAggregationBuilder t, Map<String, Column> cols, List<Metric> metrics, BucketSpec child) {
+        static Grouped terms(TermsAggregationBuilder t, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
             Column c = columnOf(t, cols);
             if (t.size() > MAX_TERMS_SIZE) {
                 throw new Unsupported("aggregation [" + t.getName() + "] asks for " + t.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
             }
             KeyKind kind = kindOf(c);
-            String order = orderClause(t.order(), metrics);
+            String order = orderClause(t.order(), leaves.metrics());
             if (order == null) {
                 throw new Unsupported("aggregation [" + t.getName() + "] has an order the table cannot sort by: " + t.order());
             }
-            return new Grouped(t, metrics, child, c, quoteIdent(c.name()), kind, true, t.size(), t.minDocCount(), order, null, null);
+            return new Grouped(t, leaves, child, c, quoteIdent(c.name()), kind, true, t.size(), t.minDocCount(), order, null, null);
         }
 
-        static Grouped dateHistogram(DateHistogramAggregationBuilder dh, Map<String, Column> cols, List<Metric> metrics, BucketSpec child) {
+        static Grouped dateHistogram(DateHistogramAggregationBuilder dh, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
             Column c = columnOf(dh, cols);
-            if (!c.isTimestamp()) {
-                throw new Unsupported("aggregation [" + dh.getName() + "] needs a date field, [" + c.name() + "] is " + c.type());
-            }
             ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
-            String source = quoteIdent(c.name());
-            if (!ZoneOffset.UTC.equals(tz) && !"UTC".equals(tz.getId())) {
-                // Bucket boundaries fall on local time in the request's zone; the
-                // epoch value of each boundary is unchanged.
-                source = "arrow_cast(" + source + ", 'Timestamp(Millisecond, Some(\"" + tz.getId() + "\"))')";
-            }
-            String keyExpr;
-            DateIntervalWrapper wrapper = new DateIntervalWrapper();
-            if (dh.getFixedInterval() != null) {
-                long ms = dh.getFixedInterval().estimateMillis();
-                if (ms <= 0) {
-                    throw new Unsupported("aggregation [" + dh.getName() + "] has an interval of no length");
-                }
-                String origin = dh.offset() == 0 ? "" : ", TIMESTAMP '1970-01-01T00:00:00Z' + INTERVAL '" + dh.offset() + " milliseconds'";
-                keyExpr = "date_bin(INTERVAL '" + ms + " milliseconds', " + source + origin + ")";
-                wrapper.fixedInterval(dh.getFixedInterval());
-            } else if (dh.getCalendarInterval() != null) {
-                if (dh.offset() != 0) {
-                    throw new Unsupported("aggregation [" + dh.getName() + "] combines a calendar interval with an offset");
-                }
-                String unit = calendarUnit(dh.getCalendarInterval());
-                if (unit == null) {
-                    throw new Unsupported("aggregation [" + dh.getName() + "] has calendar interval [" + dh.getCalendarInterval() + "]; one unit at a time is served");
-                }
-                keyExpr = "date_trunc('" + unit + "', " + source + ")";
-                wrapper.calendarInterval(dh.getCalendarInterval());
-            } else {
-                throw new Unsupported("aggregation [" + dh.getName() + "] names no interval");
-            }
-            Rounding rounding = wrapper.createRounding(tz, dh.offset());
-            String fmt = dh.format() == null ? DEFAULT_DATE_FORMAT : dh.format();
-            DocValueFormat format = new DocValueFormat.DateTime(DateFormatter.forPattern(fmt), tz, DateFieldMapper.Resolution.MILLISECONDS);
+            DateExpr expr = dateExpr(dh.getName(), c, tz, dh.getFixedInterval(), dh.getCalendarInterval(), dh.offset());
+            DocValueFormat format = dateFormat(dh.format(), tz);
             LongBounds bounds = null;
             if (dh.extendedBounds() != null) {
                 // Bounds given as epoch milliseconds (what dashboards send) are rounded to the
@@ -567,32 +763,83 @@ public class InfinoAggregationProcessor {
                 if (min == null && max == null) {
                     throw new Unsupported("aggregation [" + dh.getName() + "] gives extended_bounds as dates; epoch milliseconds are served");
                 }
-                Rounding.Prepared prepared = rounding.prepareForUnknown();
+                Rounding.Prepared prepared = expr.rounding().prepareForUnknown();
                 bounds = new LongBounds(min == null ? null : prepared.round(min), max == null ? null : prepared.round(max));
             }
-            DateKey date = new DateKey(format, rounding, bounds, dh.keyed(), dh.offset());
-            return new Grouped(dh, metrics, child, c, keyExpr, KeyKind.DATE, false, Integer.MAX_VALUE, dh.minDocCount(), "{key} ASC", date, null);
+            DateKey date = new DateKey(format, expr.rounding(), bounds, dh.keyed(), dh.offset());
+            return new Grouped(dh, leaves, child, c, expr.keyExpr(), KeyKind.DATE, false, Integer.MAX_VALUE, dh.minDocCount(), "{key} ASC", date, null);
         }
 
-        static Grouped histogram(HistogramAggregationBuilder h, Map<String, Column> cols, List<Metric> metrics, BucketSpec child) {
+        static Grouped histogram(HistogramAggregationBuilder h, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
             Column c = columnOf(h, cols);
-            if (!c.isNumeric()) {
-                throw new Unsupported("aggregation [" + h.getName() + "] needs a numeric field, [" + c.name() + "] is " + c.type());
-            }
-            if (h.interval() <= 0) {
-                throw new Unsupported("aggregation [" + h.getName() + "] has an interval of no length");
-            }
-            String f = quoteIdent(c.name());
-            String keyExpr = "floor((" + f + " - " + h.offset() + ") / " + h.interval() + ") * " + h.interval() + " + " + h.offset();
+            String keyExpr = histExpr(h.getName(), c, h.interval(), h.offset());
             if (h.order() != null && !InternalOrder.isKeyOrder(h.order())) {
                 throw new Unsupported("aggregation [" + h.getName() + "] has an order other than by key");
             }
             String order = h.order() != null && InternalOrder.isKeyDesc(h.order()) ? "{key} DESC" : "{key} ASC";
             HistKey hist = new HistKey(h.interval(), h.offset(), h.keyed());
-            return new Grouped(h, metrics, child, c, keyExpr, KeyKind.DOUBLE, false, Integer.MAX_VALUE, h.minDocCount(), order, null, hist);
+            return new Grouped(h, leaves, child, c, keyExpr, KeyKind.DOUBLE, false, Integer.MAX_VALUE, h.minDocCount(), order, null, hist);
         }
 
-        private static KeyKind kindOf(Column c) {
+        /** The SQL expression of a date bucket's key and the rounding it stands for. */
+        record DateExpr(String keyExpr, Rounding rounding) {}
+
+        /** The date bucket of {@code c} at the interval given, in the request's zone; the aggregation's name is for the refusal. */
+        static DateExpr dateExpr(String agg, Column c, ZoneId tz, DateHistogramInterval fixed, DateHistogramInterval calendar, long offset) {
+            if (!c.isTimestamp()) {
+                throw new Unsupported("aggregation [" + agg + "] needs a date field, [" + c.name() + "] is " + c.type());
+            }
+            String source = quoteIdent(c.name());
+            if (!ZoneOffset.UTC.equals(tz) && !"UTC".equals(tz.getId())) {
+                // Bucket boundaries fall on local time in the request's zone; the
+                // epoch value of each boundary is unchanged.
+                source = "arrow_cast(" + source + ", 'Timestamp(Millisecond, Some(\"" + tz.getId() + "\"))')";
+            }
+            String keyExpr;
+            DateIntervalWrapper wrapper = new DateIntervalWrapper();
+            if (fixed != null) {
+                long ms = fixed.estimateMillis();
+                if (ms <= 0) {
+                    throw new Unsupported("aggregation [" + agg + "] has an interval of no length");
+                }
+                String origin = offset == 0 ? "" : ", TIMESTAMP '1970-01-01T00:00:00Z' + INTERVAL '" + offset + " milliseconds'";
+                keyExpr = "date_bin(INTERVAL '" + ms + " milliseconds', " + source + origin + ")";
+                wrapper.fixedInterval(fixed);
+            } else if (calendar != null) {
+                if (offset != 0) {
+                    throw new Unsupported("aggregation [" + agg + "] combines a calendar interval with an offset");
+                }
+                String unit = calendarUnit(calendar);
+                if (unit == null) {
+                    throw new Unsupported("aggregation [" + agg + "] has calendar interval [" + calendar + "]; one unit at a time is served");
+                }
+                keyExpr = "date_trunc('" + unit + "', " + source + ")";
+                wrapper.calendarInterval(calendar);
+            } else {
+                throw new Unsupported("aggregation [" + agg + "] names no interval");
+            }
+            return new DateExpr(keyExpr, wrapper.createRounding(tz, offset));
+        }
+
+        /** How a date key prints: the request's format, else the default. */
+        static DocValueFormat dateFormat(String format, ZoneId tz) {
+            String fmt = format == null ? DEFAULT_DATE_FORMAT : format;
+            return new DocValueFormat.DateTime(DateFormatter.forPattern(fmt), tz, DateFieldMapper.Resolution.MILLISECONDS);
+        }
+
+        /** The numeric bucket of {@code c} at the interval and offset given. */
+        static String histExpr(String agg, Column c, double interval, double offset) {
+            if (!c.isNumeric()) {
+                throw new Unsupported("aggregation [" + agg + "] needs a numeric field, [" + c.name() + "] is " + c.type());
+            }
+            if (interval <= 0) {
+                throw new Unsupported("aggregation [" + agg + "] has an interval of no length");
+            }
+            String f = quoteIdent(c.name());
+            return "floor((" + f + " - " + offset + ") / " + interval + ") * " + interval + " + " + offset;
+        }
+
+        static KeyKind kindOf(Column c) {
             if (c.isString()) {
                 return KeyKind.STR;
             }
@@ -632,7 +879,12 @@ public class InfinoAggregationProcessor {
 
         /** The key as an SQL literal, for restricting a nested level to a parent's bucket. */
         String keyLiteral(Object key) {
-            return switch (keyKind) {
+            return keyLiteral(keyKind, key);
+        }
+
+        /** A key of {@code kind}, as a row returned it, as an SQL literal. */
+        static String keyLiteral(KeyKind kind, Object key) {
+            return switch (kind) {
                 case STR -> literal(key.toString());
                 case BOOL -> String.valueOf(Boolean.parseBoolean(key.toString()));
                 case LONG -> Long.toString(asLong(key));
@@ -745,15 +997,15 @@ public class InfinoAggregationProcessor {
         final boolean keyed;
         final DocValueFormat format;
 
-        private Explicit(AggregationBuilder b, List<Metric> metrics, BucketSpec child, ExplicitKind kind, List<ExplicitBucket> buckets, boolean keyed, DocValueFormat format) {
-            super(b, metrics, child);
+        private Explicit(AggregationBuilder b, Leaves leaves, BucketSpec child, ExplicitKind kind, List<ExplicitBucket> buckets, boolean keyed, DocValueFormat format) {
+            super(b, leaves, child);
             this.kind = kind;
             this.buckets = buckets;
             this.keyed = keyed;
             this.format = format;
         }
 
-        static Explicit filters(FiltersAggregationBuilder f, Map<String, Column> cols, String table, List<Metric> metrics, BucketSpec child) {
+        static Explicit filters(FiltersAggregationBuilder f, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
             List<ExplicitBucket> buckets = new ArrayList<>();
             List<String> all = new ArrayList<>();
             for (FiltersAggregator.KeyedFilter kf : f.filters()) {
@@ -768,10 +1020,10 @@ public class InfinoAggregationProcessor {
                 String other = all.isEmpty() ? InfinoQueryTranslator.ALL : "NOT (" + String.join(" OR ", all) + ")";
                 buckets.add(new ExplicitBucket(f.otherBucketKey(), other, Double.NaN, Double.NaN));
             }
-            return new Explicit(f, metrics, child, ExplicitKind.FILTERS, buckets, f.isKeyed(), DocValueFormat.RAW);
+            return new Explicit(f, leaves, child, ExplicitKind.FILTERS, buckets, f.isKeyed(), DocValueFormat.RAW);
         }
 
-        static Explicit range(RangeAggregationBuilder r, Map<String, Column> cols, List<Metric> metrics, BucketSpec child) {
+        static Explicit range(RangeAggregationBuilder r, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
             Column c = columnOf(r, cols);
             if (!c.isNumeric()) {
                 throw new Unsupported("aggregation [" + r.getName() + "] needs a numeric field, [" + c.name() + "] is " + c.type());
@@ -782,10 +1034,10 @@ public class InfinoAggregationProcessor {
                 double to = range.getTo();
                 buckets.add(new ExplicitBucket(range.getKey(), between(c, from, to), from, to));
             }
-            return new Explicit(r, metrics, child, ExplicitKind.RANGE, buckets, r.keyed(), DocValueFormat.RAW);
+            return new Explicit(r, leaves, child, ExplicitKind.RANGE, buckets, r.keyed(), DocValueFormat.RAW);
         }
 
-        static Explicit dateRange(DateRangeAggregationBuilder r, Map<String, Column> cols, List<Metric> metrics, BucketSpec child) {
+        static Explicit dateRange(DateRangeAggregationBuilder r, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
             Column c = columnOf(r, cols);
             if (!c.isTimestamp()) {
                 throw new Unsupported("aggregation [" + r.getName() + "] needs a date field, [" + c.name() + "] is " + c.type());
@@ -801,7 +1053,7 @@ public class InfinoAggregationProcessor {
                 double to = bound(range.getToAsString(), range.getTo(), fmt, false, tz, now, r.getName());
                 buckets.add(new ExplicitBucket(range.getKey(), between(c, from, to), from, to));
             }
-            return new Explicit(r, metrics, child, ExplicitKind.DATE_RANGE, buckets, r.keyed(), format);
+            return new Explicit(r, leaves, child, ExplicitKind.DATE_RANGE, buckets, r.keyed(), format);
         }
 
         /** A date-range bound as epoch milliseconds: the string with date math when given, else the number, else open. */
@@ -836,15 +1088,15 @@ public class InfinoAggregationProcessor {
             return v == Math.rint(v) && Math.abs(v) < 9.0e15 ? Long.toString((long) v) : Double.toString(v);
         }
 
-        /** Build from one row per bucket (doc_count and metrics) and each bucket's nested aggregation. */
-        InternalAggregation build(List<Map<String, Object>> rows, List<InternalAggregation> nested) {
+        /** Build from one row per bucket (doc_count and metrics), each bucket's top hits and its nested aggregation. */
+        InternalAggregation build(List<Map<String, Object>> rows, List<List<InternalAggregation>> topHits, List<InternalAggregation> nested) {
             String name = builder.getName();
             Map<String, Object> meta = builder.getMetadata();
             switch (kind) {
                 case FILTERS -> {
                     List<InternalFilters.InternalBucket> out = new ArrayList<>();
                     for (int i = 0; i < buckets.size(); i++) {
-                        out.add(new InternalFilters.InternalBucket(buckets.get(i).key(), asLong(rows.get(i).get("doc_count")), subs(rows.get(i), nested.get(i)), keyed));
+                        out.add(new InternalFilters.InternalBucket(buckets.get(i).key(), asLong(rows.get(i).get("doc_count")), subs(rows.get(i), topHits.get(i), nested.get(i)), keyed));
                     }
                     return new InternalFilters(name, out, keyed, meta);
                 }
@@ -853,7 +1105,7 @@ public class InfinoAggregationProcessor {
                     List<InternalRange.Bucket> out = new ArrayList<>();
                     for (int i = 0; i < buckets.size(); i++) {
                         ExplicitBucket b = buckets.get(i);
-                        out.add(factory.createBucket(b.key(), b.from(), b.to(), asLong(rows.get(i).get("doc_count")), subs(rows.get(i), nested.get(i)), keyed, format));
+                        out.add(factory.createBucket(b.key(), b.from(), b.to(), asLong(rows.get(i).get("doc_count")), subs(rows.get(i), topHits.get(i), nested.get(i)), keyed, format));
                     }
                     return factory.create(name, out, format, keyed, meta);
                 }
@@ -861,7 +1113,7 @@ public class InfinoAggregationProcessor {
                     List<InternalDateRange.Bucket> out = new ArrayList<>();
                     for (int i = 0; i < buckets.size(); i++) {
                         ExplicitBucket b = buckets.get(i);
-                        out.add(InternalDateRange.FACTORY.createBucket(b.key(), b.from(), b.to(), asLong(rows.get(i).get("doc_count")), subs(rows.get(i), nested.get(i)), keyed, format));
+                        out.add(InternalDateRange.FACTORY.createBucket(b.key(), b.from(), b.to(), asLong(rows.get(i).get("doc_count")), subs(rows.get(i), topHits.get(i), nested.get(i)), keyed, format));
                     }
                     return InternalDateRange.FACTORY.create(name, out, format, keyed, meta);
                 }
@@ -871,12 +1123,329 @@ public class InfinoAggregationProcessor {
         @Override
         InternalAggregation empty() {
             List<Map<String, Object>> rows = new ArrayList<>();
+            List<List<InternalAggregation>> topHits = new ArrayList<>();
             List<InternalAggregation> nested = new ArrayList<>();
             for (int i = 0; i < buckets.size(); i++) {
                 rows.add(Map.of());
+                topHits.add(emptyHits());
                 nested.add(child == null ? null : child.empty());
             }
-            return build(rows, nested);
+            return build(rows, topHits, nested);
+        }
+    }
+
+    /**
+     * {@code significant_terms}: the terms of the query's rows whose share
+     * there stands out against their share of the whole table (or of the
+     * background filter's rows). The level is a terms GROUP BY over the query
+     * relation for the foreground counts, and a second over the table for the
+     * background counts of the same terms; the scoring and the cut to size
+     * are the stock reduction's, from those four counts.
+     */
+    static final class Significant extends BucketSpec {
+        final String table;
+        final Column column;
+        final KeyKind keyKind;
+        final String backgroundWhere;
+        final int candidates;
+        final long minDocCount;
+        final SignificanceHeuristic heuristic;
+        final TermsAggregator.BucketCountThresholds thresholds;
+
+        private Significant(
+            SignificantTermsAggregationBuilder b,
+            Leaves leaves,
+            BucketSpec child,
+            String table,
+            Column column,
+            KeyKind keyKind,
+            String backgroundWhere,
+            int candidates,
+            long minDocCount,
+            SignificanceHeuristic heuristic,
+            TermsAggregator.BucketCountThresholds thresholds
+        ) {
+            super(b, leaves, child);
+            this.table = table;
+            this.column = column;
+            this.keyKind = keyKind;
+            this.backgroundWhere = backgroundWhere;
+            this.candidates = candidates;
+            this.minDocCount = minDocCount;
+            this.heuristic = heuristic;
+            this.thresholds = thresholds;
+        }
+
+        static Significant of(SignificantTermsAggregationBuilder st, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
+            Column c = columnOf(st, cols);
+            KeyKind kind = Grouped.kindOf(c);
+            if (kind == KeyKind.DOUBLE) {
+                throw new Unsupported("aggregation [" + st.getName() + "] needs a keyword, boolean, integer or date field, [" + c.name() + "] is " + c.type());
+            }
+            if (st.includeExclude() != null) {
+                throw new Unsupported("aggregation [" + st.getName() + "] has include/exclude, which is not served");
+            }
+            TermsAggregator.BucketCountThresholds thresholds = new TermsAggregator.BucketCountThresholds(st.bucketCountThresholds());
+            if (thresholds.getRequiredSize() > MAX_TERMS_SIZE) {
+                throw new Unsupported("aggregation [" + st.getName() + "] asks for " + thresholds.getRequiredSize() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
+            }
+            if (thresholds.getShardSize() < 0) {
+                // As stock: a shard looks past the requested size, since the score reorders.
+                thresholds.setShardSize(BucketUtils.suggestShardSideQueueSize(thresholds.getRequiredSize()));
+            }
+            int candidates = Math.min(MAX_TERMS_SIZE, Math.max(thresholds.getShardSize(), thresholds.getRequiredSize()));
+            String background = InfinoQueryTranslator.ALL;
+            if (st.backgroundFilter() != null) {
+                background = InfinoQueryTranslator.predicate(st.backgroundFilter(), cols, table, System.currentTimeMillis());
+                if (background == null) {
+                    throw new Unsupported("aggregation [" + st.getName() + "] has a background filter the table cannot answer: " + st.backgroundFilter());
+                }
+            }
+            SignificanceHeuristic heuristic = st.significanceHeuristic() == null ? new JLHScore() : st.significanceHeuristic();
+            return new Significant(st, leaves, child, table, c, kind, background, candidates, thresholds.getMinDocCount(), heuristic, thresholds);
+        }
+
+        String keyExpr() {
+            return quoteIdent(column.name());
+        }
+
+        /** One candidate term with both of its counts. */
+        record Candidate(Object key, long subsetDf, long supersetDf, Map<String, Object> row) {}
+
+        /** Build from the candidates, each with its top hits and nested aggregation, and the two population sizes. */
+        InternalAggregation build(List<Candidate> candidates, List<List<InternalAggregation>> topHits, List<InternalAggregation> nested, long subsetSize, long supersetSize) {
+            String name = builder.getName();
+            Map<String, Object> meta = builder.getMetadata();
+            // The score is left for the reduction, which computes it from the four counts.
+            if (keyKind == KeyKind.STR || keyKind == KeyKind.BOOL) {
+                List<SignificantStringTerms.Bucket> out = new ArrayList<>();
+                for (int i = 0; i < candidates.size(); i++) {
+                    Candidate c = candidates.get(i);
+                    InternalAggregations subs = subs(c.row(), topHits.get(i), nested.get(i));
+                    out.add(new SignificantStringTerms.Bucket(new BytesRef(c.key().toString()), c.subsetDf(), subsetSize, c.supersetDf(), supersetSize, subs, DocValueFormat.RAW, 0.0));
+                }
+                return new SignificantStringTerms(name, meta, DocValueFormat.RAW, subsetSize, supersetSize, heuristic, out, thresholds);
+            }
+            List<InfinoAggregationWire.SignificantLongBucket> out = new ArrayList<>();
+            for (int i = 0; i < candidates.size(); i++) {
+                Candidate c = candidates.get(i);
+                InternalAggregations subs = subs(c.row(), topHits.get(i), nested.get(i));
+                out.add(new InfinoAggregationWire.SignificantLongBucket(asLong(c.key()), c.subsetDf(), c.supersetDf(), subs));
+            }
+            return InfinoAggregationWire.significantLongTerms(name, meta, thresholds.getRequiredSize(), minDocCount, DocValueFormat.RAW, subsetSize, supersetSize, heuristic, out);
+        }
+
+        @Override
+        InternalAggregation empty() {
+            return build(List.of(), List.of(), List.of(), 0, 0);
+        }
+    }
+
+    /** One source of a composite aggregation: a key expression and how its values order and print. */
+    record CompositeSource(String name, Column column, String keyExpr, KeyKind keyKind, DocValueFormat format, boolean desc, boolean missingBucket, MissingOrder missingOrder) {
+        /** Whether a missing key sorts before the present ones. */
+        boolean nullsFirst() {
+            return missingOrder == MissingOrder.FIRST || (missingOrder == MissingOrder.DEFAULT && !desc);
+        }
+    }
+
+    /**
+     * {@code composite}: one GROUP BY over every source's key, the buckets in
+     * key order, the page after the request's {@code after} key by a keyset
+     * predicate over the grouped keys (so no earlier page is scanned), cut
+     * to {@code size}.
+     */
+    static final class Composite extends BucketSpec {
+        final List<CompositeSource> sources;
+        final int size;
+        final Object[] after;
+
+        private Composite(CompositeAggregationBuilder b, Leaves leaves, BucketSpec child, List<CompositeSource> sources, int size, Object[] after) {
+            super(b, leaves, child);
+            this.sources = sources;
+            this.size = size;
+            this.after = after;
+        }
+
+        static Composite of(CompositeAggregationBuilder c, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
+            if (c.size() > MAX_TERMS_SIZE) {
+                throw new Unsupported("aggregation [" + c.getName() + "] asks for " + c.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
+            }
+            List<CompositeSource> sources = new ArrayList<>();
+            for (CompositeValuesSourceBuilder<?> s : c.sources()) {
+                sources.add(source(c.getName(), s, cols));
+            }
+            Object[] after = null;
+            Map<String, Object> afterKey = afterOf(c);
+            if (afterKey != null) {
+                after = new Object[sources.size()];
+                for (int i = 0; i < sources.size(); i++) {
+                    CompositeSource s = sources.get(i);
+                    if (!afterKey.containsKey(s.name())) {
+                        throw new Unsupported("aggregation [" + c.getName() + "] has an after key without [" + s.name() + "]");
+                    }
+                    Object v = afterKey.get(s.name());
+                    if (v == null && !s.missingBucket()) {
+                        throw new Unsupported("aggregation [" + c.getName() + "] has a null after key for [" + s.name() + "], which has no missing bucket");
+                    }
+                    after[i] = v == null ? null : afterLiteral(c.getName(), s, v);
+                }
+            }
+            return new Composite(c, leaves, child, sources, c.size(), after);
+        }
+
+        /**
+         * The request's {@code after} key, or null. The builder keeps it
+         * without a getter, so it is read back from the builder's own JSON
+         * form: {@code {name: {composite: {..., after: {...}}}}}.
+         */
+        @SuppressWarnings("unchecked")
+        private static Map<String, Object> afterOf(CompositeAggregationBuilder c) {
+            try (XContentBuilder xb = XContentFactory.jsonBuilder()) {
+                xb.startObject();
+                c.toXContent(xb, ToXContent.EMPTY_PARAMS);
+                xb.endObject();
+                Map<String, Object> map = XContentHelper.convertToMap(BytesReference.bytes(xb), false, MediaTypeRegistry.JSON).v2();
+                Map<String, Object> agg = (Map<String, Object>) map.get(c.getName());
+                Map<String, Object> body = agg == null ? null : (Map<String, Object>) agg.get(CompositeAggregationBuilder.NAME);
+                return body == null ? null : (Map<String, Object>) body.get(CompositeAggregationBuilder.AFTER_FIELD_NAME.getPreferredName());
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+
+        private static CompositeSource source(String agg, CompositeValuesSourceBuilder<?> s, Map<String, Column> cols) {
+            if (s.script() != null) {
+                throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] is a script, which is not served");
+            }
+            if (s.field() == null) {
+                throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] names no field");
+            }
+            Column c = InfinoSearch.columnFor(cols, s.field());
+            if (c == null) {
+                throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] names field [" + s.field() + "], which the table has no column for");
+            }
+            boolean desc = s.order() == SortOrder.DESC;
+            MissingOrder missing = s.missingOrder() == null ? MissingOrder.DEFAULT : s.missingOrder();
+            if (s instanceof TermsValuesSourceBuilder) {
+                KeyKind kind = Grouped.kindOf(c);
+                DocValueFormat format = kind == KeyKind.DATE
+                    ? Grouped.dateFormat(s.format(), ZoneOffset.UTC)
+                    : kind == KeyKind.BOOL ? DocValueFormat.BOOLEAN : DocValueFormat.RAW;
+                return new CompositeSource(s.name(), c, quoteIdent(c.name()), kind, format, desc, s.missingBucket(), missing);
+            }
+            if (s instanceof DateHistogramValuesSourceBuilder dh) {
+                ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
+                Grouped.DateExpr expr = Grouped.dateExpr(agg, c, tz, dh.getIntervalAsFixed(), dh.getIntervalAsCalendar(), dh.offset());
+                // As stock: the key is epoch milliseconds unless the source names a format.
+                DocValueFormat format = s.format() == null ? DocValueFormat.RAW : Grouped.dateFormat(s.format(), tz);
+                return new CompositeSource(s.name(), c, expr.keyExpr(), KeyKind.DATE, format, desc, s.missingBucket(), missing);
+            }
+            if (s instanceof HistogramValuesSourceBuilder h) {
+                String keyExpr = Grouped.histExpr(agg, c, h.interval(), 0);
+                return new CompositeSource(s.name(), c, keyExpr, KeyKind.DOUBLE, DocValueFormat.RAW, desc, s.missingBucket(), missing);
+            }
+            throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] of type [" + s.getClass().getSimpleName() + "] is not served");
+        }
+
+        /** The after value of a source as an SQL literal, read as the source's key kind. */
+        private static String afterLiteral(String agg, CompositeSource s, Object v) {
+            if (s.keyKind() == KeyKind.DATE && v instanceof String text) {
+                Long ms = InfinoQueryTranslator.dateMathMillis(text, null, false, ZoneOffset.UTC, System.currentTimeMillis());
+                if (ms == null) {
+                    throw new Unsupported("aggregation [" + agg + "] has an after key [" + text + "] for [" + s.name() + "] that is not a date");
+                }
+                return Grouped.keyLiteral(KeyKind.DATE, ms);
+            }
+            if ((s.keyKind() == KeyKind.LONG || s.keyKind() == KeyKind.DOUBLE || s.keyKind() == KeyKind.DATE) && !(v instanceof Number)) {
+                throw new Unsupported("aggregation [" + agg + "] has an after key [" + v + "] for [" + s.name() + "] that is not a number");
+            }
+            return Grouped.keyLiteral(s.keyKind(), v);
+        }
+
+        /** ORDER BY over the key aliases: each source's direction, missing keys where the source puts them. */
+        String order() {
+            List<String> parts = new ArrayList<>();
+            for (int i = 0; i < sources.size(); i++) {
+                CompositeSource s = sources.get(i);
+                parts.add("k" + i + (s.desc() ? " DESC" : " ASC") + (s.nullsFirst() ? " NULLS FIRST" : " NULLS LAST"));
+            }
+            return String.join(", ", parts);
+        }
+
+        /**
+         * The buckets past the after key, in this order: {@code (k0 > a0) OR
+         * (k0 = a0 AND k1 > a1) ...}, each comparison turned for a descending
+         * source and a missing key placed where its source orders it.
+         */
+        String keysetPredicate() {
+            List<String> alternatives = new ArrayList<>();
+            List<String> equal = new ArrayList<>();
+            for (int i = 0; i < sources.size(); i++) {
+                CompositeSource s = sources.get(i);
+                String k = "k" + i;
+                String lit = (String) after[i];
+                String strict;
+                if (lit == null) {
+                    // After the missing bucket: everything present when missing sorts first, nothing otherwise.
+                    strict = s.nullsFirst() ? k + " IS NOT NULL" : InfinoQueryTranslator.NONE;
+                } else {
+                    strict = k + (s.desc() ? " < " : " > ") + lit;
+                    if (!s.nullsFirst()) {
+                        strict = "(" + strict + " OR " + k + " IS NULL)";
+                    }
+                }
+                List<String> conj = new ArrayList<>(equal);
+                conj.add(strict);
+                alternatives.add("(" + String.join(" AND ", conj) + ")");
+                equal.add(lit == null ? k + " IS NULL" : k + " = " + lit);
+            }
+            return "(" + String.join(" OR ", alternatives) + ")";
+        }
+
+        /** The key values of a row, typed as the stock object carries them. */
+        Comparable<?>[] keyOf(Map<String, Object> row) {
+            Comparable<?>[] key = new Comparable<?>[sources.size()];
+            for (int i = 0; i < sources.size(); i++) {
+                Object v = row.get("k" + i);
+                if (v == null) {
+                    continue;
+                }
+                key[i] = switch (sources.get(i).keyKind()) {
+                    case STR -> new BytesRef(v.toString());
+                    case BOOL -> Boolean.parseBoolean(v.toString()) ? 1L : 0L;
+                    case LONG, DATE -> asLong(v);
+                    case DOUBLE -> asDouble(v, 0.0);
+                };
+            }
+            return key;
+        }
+
+        /** Build from the page's rows in order, each with its top hits and nested aggregation. */
+        InternalAggregation build(List<Map<String, Object>> rows, List<List<InternalAggregation>> topHits, List<InternalAggregation> nested) {
+            List<String> names = new ArrayList<>();
+            List<DocValueFormat> formats = new ArrayList<>();
+            int[] reverseMuls = new int[sources.size()];
+            MissingOrder[] missingOrders = new MissingOrder[sources.size()];
+            for (int i = 0; i < sources.size(); i++) {
+                CompositeSource s = sources.get(i);
+                names.add(s.name());
+                formats.add(s.format());
+                reverseMuls[i] = s.desc() ? -1 : 1;
+                missingOrders[i] = s.missingOrder();
+            }
+            List<InfinoAggregationWire.CompositeBucket> buckets = new ArrayList<>();
+            for (int i = 0; i < rows.size(); i++) {
+                Map<String, Object> row = rows.get(i);
+                buckets.add(new InfinoAggregationWire.CompositeBucket(keyOf(row), asLong(row.get("doc_count")), subs(row, topHits.get(i), nested.get(i))));
+            }
+            Comparable<?>[] afterKey = rows.isEmpty() ? null : keyOf(rows.get(rows.size() - 1));
+            return InfinoAggregationWire.composite(builder.getName(), builder.getMetadata(), size, names, formats, reverseMuls, missingOrders, buckets, afterKey);
+        }
+
+        @Override
+        InternalAggregation empty() {
+            return build(List.of(), List.of(), List.of());
         }
     }
 
@@ -956,27 +1525,138 @@ public class InfinoAggregationProcessor {
         if (spec instanceof Explicit e) {
             return evalExplicit(e, from, where);
         }
+        if (spec instanceof Significant s) {
+            return evalSignificant(s, from, where, total);
+        }
+        if (spec instanceof Composite c) {
+            return evalComposite(c, from, where);
+        }
         return evalChain((Grouped) spec, from, where, total);
     }
 
     private InternalAggregation evalExplicit(Explicit e, String from, String where) {
         List<Map<String, Object>> rows = new ArrayList<>();
+        List<List<InternalAggregation>> topHits = new ArrayList<>();
         List<InternalAggregation> nested = new ArrayList<>();
         for (ExplicitBucket b : e.buckets) {
             String w = "(" + where + ") AND (" + b.predicate() + ")";
             String select = "COUNT(*) AS doc_count" + (e.metrics.isEmpty() ? "" : ", " + metricColumns(e.metrics));
             Map<String, Object> row = oneRow("SELECT " + select + " FROM " + from + " WHERE " + w);
+            long docCount = asLong(row.get("doc_count"));
             rows.add(row);
-            nested.add(e.child == null ? null : evalBucket(e.child, from, w, asLong(row.get("doc_count"))));
+            topHits.add(bucketHits(e, from, w, docCount));
+            nested.add(e.child == null ? null : evalBucket(e.child, from, w, docCount));
         }
-        return e.build(rows, nested);
+        return e.build(rows, topHits, nested);
+    }
+
+    /** The top hits of one bucket of {@code spec}, one statement per top_hits over {@code from WHERE where}. */
+    private List<InternalAggregation> bucketHits(BucketSpec spec, String from, String where, long docCount) {
+        List<InternalAggregation> out = new ArrayList<>();
+        for (TopHits th : spec.hits) {
+            out.add(th.build(topHitRows(th, from, where), docCount, index));
+        }
+        return out;
+    }
+
+    /** The first rows of {@code from WHERE where} in the top_hits' order, each with its id, source and sort values. */
+    private static List<Map<String, Object>> topHitRows(TopHits th, String from, String where) {
+        List<String> cols = new ArrayList<>(List.of(InfinoQueryTranslator.OSID, InfinoQueryTranslator.SOURCE));
+        cols.addAll(th.rowColumns());
+        return InfinoNative.sqlRows("SELECT " + String.join(", ", cols) + " FROM " + from + " WHERE " + where + " ORDER BY " + th.order() + " LIMIT " + th.fetch());
+    }
+
+    /**
+     * {@code significant_terms}: the foreground counts are a terms GROUP BY
+     * over the query relation, the most frequent terms first; the background
+     * counts of those terms are a second GROUP BY over the table, and the
+     * table's size (under the background filter) is the superset size.
+     */
+    private InternalAggregation evalSignificant(Significant s, String from, String where, long subsetSize) {
+        String key = s.keyExpr();
+        String select = key + " AS k0, COUNT(*) AS doc_count" + (s.metrics.isEmpty() ? "" : ", " + metricColumns(s.metrics));
+        String having = s.minDocCount > 1 ? " HAVING COUNT(*) >= " + s.minDocCount : "";
+        List<Map<String, Object>> foreground = InfinoNative.sqlRows(
+            "SELECT * FROM (SELECT " + select + " FROM " + from + " WHERE (" + where + ") AND " + key + " IS NOT NULL GROUP BY 1" + having
+                + ") t ORDER BY doc_count DESC, k0 ASC LIMIT " + s.candidates
+        );
+        String table = quoteIdent(s.table);
+        Map<String, Object> size = oneRow("SELECT COUNT(*) AS c FROM " + table + " WHERE " + s.backgroundWhere);
+        long supersetSize = asLong(size.get("c"));
+        Map<String, Long> background = new HashMap<>();
+        if (!foreground.isEmpty()) {
+            List<String> literals = new ArrayList<>();
+            for (Map<String, Object> row : foreground) {
+                literals.add(Grouped.keyLiteral(s.keyKind, row.get("k0")));
+            }
+            for (Map<String, Object> row : InfinoNative.sqlRows(
+                "SELECT " + key + " AS k0, COUNT(*) AS bg FROM " + table + " WHERE (" + s.backgroundWhere + ") AND " + key + " IN (" + String.join(", ", literals) + ") GROUP BY 1"
+            )) {
+                background.put(keyString(row.get("k0")), asLong(row.get("bg")));
+            }
+        }
+        List<Significant.Candidate> candidates = new ArrayList<>();
+        List<List<InternalAggregation>> topHits = new ArrayList<>();
+        List<InternalAggregation> nested = new ArrayList<>();
+        for (Map<String, Object> row : foreground) {
+            Object k = row.get("k0");
+            long subsetDf = asLong(row.get("doc_count"));
+            long supersetDf = background.getOrDefault(keyString(k), 0L);
+            candidates.add(new Significant.Candidate(k, subsetDf, Math.max(subsetDf, supersetDf), row));
+            String w = "(" + where + ") AND " + key + " = " + Grouped.keyLiteral(s.keyKind, k);
+            topHits.add(bucketHits(s, from, w, subsetDf));
+            nested.add(s.child == null ? null : evalBucket(s.child, from, w, subsetDf));
+        }
+        return s.build(candidates, topHits, nested, subsetSize, supersetSize);
+    }
+
+    /** The composite page: the GROUP BY over every key, past the after key, in key order, cut to size. */
+    private InternalAggregation evalComposite(Composite c, String from, String where) {
+        List<String> keyCols = new ArrayList<>();
+        List<String> present = new ArrayList<>();
+        StringBuilder positions = new StringBuilder();
+        for (int i = 0; i < c.sources.size(); i++) {
+            CompositeSource s = c.sources.get(i);
+            keyCols.add(s.keyExpr() + " AS k" + i);
+            if (!s.missingBucket()) {
+                present.add(s.keyExpr() + " IS NOT NULL");
+            }
+            positions.append(i == 0 ? "" : ", ").append(i + 1);
+        }
+        String select = String.join(", ", keyCols) + ", COUNT(*) AS doc_count" + (c.metrics.isEmpty() ? "" : ", " + metricColumns(c.metrics));
+        String w = present.isEmpty() ? where : "(" + where + ") AND " + String.join(" AND ", present);
+        String inner = "SELECT " + select + " FROM " + from + " WHERE " + w + " GROUP BY " + positions;
+        String page = c.after == null ? "" : " WHERE " + c.keysetPredicate();
+        List<Map<String, Object>> rows = InfinoNative.sqlRows("SELECT * FROM (" + inner + ") t" + page + " ORDER BY " + c.order() + " LIMIT " + c.size);
+        List<List<InternalAggregation>> topHits = new ArrayList<>();
+        List<InternalAggregation> nested = new ArrayList<>();
+        for (Map<String, Object> row : rows) {
+            long docCount = asLong(row.get("doc_count"));
+            String bucket = "(" + where + ") AND " + bucketRestriction(c, row);
+            topHits.add(bucketHits(c, from, bucket, docCount));
+            nested.add(c.child == null ? null : evalBucket(c.child, from, bucket, docCount));
+        }
+        return c.build(rows, topHits, nested);
+    }
+
+    /** {@code (k0 = a AND k1 = b ...)} over a composite's key expressions, for one of its buckets. */
+    private static String bucketRestriction(Composite c, Map<String, Object> row) {
+        List<String> ands = new ArrayList<>();
+        for (int i = 0; i < c.sources.size(); i++) {
+            CompositeSource s = c.sources.get(i);
+            Object key = row.get("k" + i);
+            ands.add(key == null ? s.keyExpr() + " IS NULL" : s.keyExpr() + " = " + Grouped.keyLiteral(s.keyKind(), key));
+        }
+        return "(" + String.join(" AND ", ands) + ")";
     }
 
     /**
      * Evaluate a chain of grouped levels: one GROUP BY per depth over all keys
      * above it, each level restricted to the buckets its parent kept, then
-     * fold the rows into nested buckets. An explicit level under the chain's
-     * leaf is evaluated per leaf bucket.
+     * fold the rows into nested buckets. A level's top hits are one window
+     * statement per top_hits, partitioned by the level's keys. An explicit,
+     * significant or composite level under the chain's leaf is evaluated per
+     * leaf bucket.
      */
     private InternalAggregation evalChain(Grouped root, String from, String where, long total) {
         List<Grouped> chain = new ArrayList<>();
@@ -985,9 +1665,10 @@ public class InfinoAggregationProcessor {
             chain.add(g);
             cursor = g.child;
         }
-        Explicit leafChild = (Explicit) cursor;
+        BucketSpec leafChild = cursor;
 
         List<List<Map<String, Object>>> rowsByLevel = new ArrayList<>();
+        List<Map<String, List<List<Map<String, Object>>>>> hitsByLevel = new ArrayList<>();
         List<List<Object>> kept = null;
         for (int i = 0; i < chain.size(); i++) {
             Grouped level = chain.get(i);
@@ -1026,6 +1707,7 @@ public class InfinoAggregationProcessor {
                 }
                 kept.add(tuple);
             }
+            hitsByLevel.add(levelHits(chain, i, kept, from, where));
             if (rows.isEmpty()) {
                 break;
             }
@@ -1035,8 +1717,58 @@ public class InfinoAggregationProcessor {
         }
         while (rowsByLevel.size() < chain.size()) {
             rowsByLevel.add(List.of());
+            hitsByLevel.add(Map.of());
         }
-        return fold(chain, 0, List.of(), rowsByLevel, total, leafChild, from, where);
+        return fold(chain, 0, List.of(), rowsByLevel, hitsByLevel, total, leafChild, from, where);
+    }
+
+    /**
+     * The top hits of every bucket level {@code i} kept: one window statement
+     * per top_hits, the window partitioned by the level's keys over the rows
+     * of the kept buckets, the first {@code from + size} of each bucket in the
+     * request's order. Keyed by the bucket's key tuple, one row list per
+     * top_hits in spec order.
+     */
+    private static Map<String, List<List<Map<String, Object>>>> levelHits(List<Grouped> chain, int i, List<List<Object>> kept, String from, String where) {
+        Grouped level = chain.get(i);
+        Map<String, List<List<Map<String, Object>>>> out = new HashMap<>();
+        if (level.hits.isEmpty() || kept.isEmpty()) {
+            return out;
+        }
+        if (kept.size() > MAX_PARENT_TUPLES) {
+            throw new Unsupported("aggregation [" + level.hits.get(0).name() + "] would run under " + kept.size() + " buckets; at most " + MAX_PARENT_TUPLES + " are served");
+        }
+        List<String> keyExprs = new ArrayList<>();
+        List<String> keyCols = new ArrayList<>();
+        List<String> aliases = new ArrayList<>();
+        for (int j = 0; j <= i; j++) {
+            keyExprs.add(chain.get(j).keyExpr);
+            keyCols.add(chain.get(j).keyExpr + " AS k" + j);
+            aliases.add("k" + j);
+        }
+        String restriction = tupleRestriction(chain, kept, i + 1);
+        for (int h = 0; h < level.hits.size(); h++) {
+            TopHits th = level.hits.get(h);
+            List<String> cols = new ArrayList<>(aliases);
+            cols.add(InfinoQueryTranslator.OSID);
+            cols.add(InfinoQueryTranslator.SOURCE);
+            cols.addAll(th.rowColumns());
+            String sql = "SELECT " + String.join(", ", cols) + " FROM (SELECT t.*, " + String.join(", ", keyCols) + ", ROW_NUMBER() OVER (PARTITION BY "
+                + String.join(", ", keyExprs) + " ORDER BY " + th.order() + ") AS hit_rank FROM " + from + " t WHERE (" + where + ") AND " + restriction
+                + ") WHERE hit_rank <= " + th.fetch() + " ORDER BY " + String.join(", ", aliases) + ", hit_rank";
+            for (Map<String, Object> row : InfinoNative.sqlRows(sql)) {
+                List<Object> tuple = new ArrayList<>();
+                for (int j = 0; j <= i; j++) {
+                    tuple.add(row.get("k" + j));
+                }
+                List<List<Map<String, Object>>> perSpec = out.computeIfAbsent(keyString(tuple), k -> new ArrayList<>());
+                while (perSpec.size() < level.hits.size()) {
+                    perSpec.add(new ArrayList<>());
+                }
+                perSpec.get(h).add(row);
+            }
+        }
+        return out;
     }
 
     /** {@code ((k0 = a AND k1 = b) OR ...)} over the key expressions, for the tuples the parent levels kept. */
@@ -1059,8 +1791,9 @@ public class InfinoAggregationProcessor {
         int depth,
         List<Object> prefix,
         List<List<Map<String, Object>>> rowsByLevel,
+        List<Map<String, List<List<Map<String, Object>>>>> hitsByLevel,
         long parentTotal,
-        Explicit leafChild,
+        BucketSpec leafChild,
         String from,
         String where
     ) {
@@ -1076,14 +1809,43 @@ public class InfinoAggregationProcessor {
             List<Object> keys = new ArrayList<>(prefix);
             keys.add(row.get(keyAlias));
             long docCount = asLong(row.get("doc_count"));
+            List<InternalAggregation> topHits = new ArrayList<>();
+            List<List<Map<String, Object>>> hitRows = hitsByLevel.get(depth).get(keyString(keys));
+            for (int h = 0; h < level.hits.size(); h++) {
+                List<Map<String, Object>> hits = hitRows == null || h >= hitRows.size() ? List.of() : hitRows.get(h);
+                topHits.add(level.hits.get(h).build(hits, docCount, index));
+            }
             InternalAggregation nested = null;
             if (depth + 1 < chain.size()) {
-                nested = fold(chain, depth + 1, keys, rowsByLevel, docCount, leafChild, from, where);
+                nested = fold(chain, depth + 1, keys, rowsByLevel, hitsByLevel, docCount, leafChild, from, where);
             } else if (leafChild != null) {
-                nested = evalExplicit(leafChild, from, "(" + where + ") AND " + tupleRestriction(chain, List.of(keys), keys.size()));
+                nested = evalBucket(leafChild, from, "(" + where + ") AND " + tupleRestriction(chain, List.of(keys), keys.size()), docCount);
             }
-            return level.subs(row, nested);
+            return level.subs(row, topHits, nested);
         }, parentTotal);
+    }
+
+    /** A key tuple as one string, so tuples from two statements over the same expressions meet. */
+    private static String keyString(List<Object> tuple) {
+        StringBuilder sb = new StringBuilder();
+        for (Object key : tuple) {
+            if (sb.length() > 0) {
+                sb.append(KEY_SEPARATOR);
+            }
+            sb.append(keyString(key));
+        }
+        return sb.toString();
+    }
+
+    private static String keyString(Object key) {
+        if (key == null) {
+            return NULL_KEY;
+        }
+        if (key instanceof Number n) {
+            double d = n.doubleValue();
+            return d == Math.rint(d) && Math.abs(d) < 9.0e15 ? Long.toString((long) d) : Double.toString(d);
+        }
+        return key.toString();
     }
 
     private static boolean hasPrefix(Map<String, Object> row, List<Object> prefix) {

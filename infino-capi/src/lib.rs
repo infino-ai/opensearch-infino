@@ -322,7 +322,9 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                 }
                 fields.push(Field::new(&f.path, f.data_type.clone(), true));
                 if f.fts {
-                    spec = spec.fts(FtsField::new(f.path.clone()));
+                    // Positions let a quoted phrase match adjacent terms in
+                    // order (match_phrase, quoted atoms of a query_string).
+                    spec = spec.fts(FtsField::new(f.path.clone()).positions(true));
                 }
                 if let Some((dim, metric)) = f.vector {
                     spec = spec.vector(f.path.clone(), dim, metric);
@@ -765,10 +767,11 @@ pub unsafe extern "C" fn infino_index_batch_buf(
         if buf.is_null() || id_ends.is_null() || src_ends.is_null() || count <= 0 {
             return err_json("empty batch");
         }
-        let prepared = match unsafe { prepare(conn, name, buf, buf_len, id_ends, src_ends, count as usize) } {
-            Ok(p) => p,
-            Err(why) => return err_json(&why),
-        };
+        let prepared =
+            match unsafe { prepare(conn, name, buf, buf_len, id_ends, src_ends, count as usize) } {
+                Ok(p) => p,
+                Err(why) => return err_json(&why),
+            };
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
@@ -1499,7 +1502,15 @@ mod tests {
     }
 
     fn count(h: *mut Bridge, column: &str, query: &str) -> String {
-        take(unsafe { infino_count(h, c("logs").as_ptr(), c(column).as_ptr(), c(query).as_ptr(), c("or").as_ptr()) })
+        take(unsafe {
+            infino_count(
+                h,
+                c("logs").as_ptr(),
+                c(column).as_ptr(),
+                c(query).as_ptr(),
+                c("or").as_ptr(),
+            )
+        })
     }
 
     fn get(h: *mut Bridge, osid: &str) -> String {
@@ -1657,6 +1668,144 @@ mod tests {
         close(h);
     }
 
+    /// Where an aggregation scoped by a text match spends its time on the
+    /// bench's document shape, through the same C-ABI entry the plugin
+    /// calls and, beside it, the engine's public API without the JSON
+    /// round trip. Not a check; run with `--release --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn where_a_scoped_aggregation_spends_its_time() {
+        use std::time::Instant;
+        const DOCS: usize = 5_000;
+        const BATCHES: usize = 200;
+        const ITERS: usize = 10;
+        let vocab = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+            "sierra", "tango",
+        ];
+        let mut seed: u64 = 42;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mapping = r#"{"properties":{"category":{"type":"keyword"},"price":{"type":"float"},"text":{"type":"text"}}}"#;
+        let h = open_logs();
+        let conn = unsafe { &*h };
+        take(unsafe { infino_ensure_table(h, c("bench").as_ptr(), c(mapping).as_ptr()) });
+        for b in 0..BATCHES {
+            let docs: Vec<(String, String)> = (0..DOCS)
+                .map(|i| {
+                    let words: Vec<&str> = (0..5).map(|_| vocab[(next() % 20) as usize]).collect();
+                    let price = (next() % 100_000) as f64 / 100.0;
+                    (
+                        (b * DOCS + i).to_string(),
+                        format!(
+                            r#"{{"text": "{}", "category": "cat{}", "price": {}}}"#,
+                            words.join(" "),
+                            next() % 8,
+                            price
+                        ),
+                    )
+                })
+                .collect();
+            let ids: Vec<CString> = docs.iter().map(|(id, _)| c(id)).collect();
+            let srcs: Vec<CString> = docs.iter().map(|(_, s)| c(s)).collect();
+            let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+            let sp: Vec<*const c_char> = srcs.iter().map(|x| x.as_ptr()).collect();
+            let out = take(unsafe {
+                infino_index_batch(
+                    h,
+                    c("bench").as_ptr(),
+                    idp.as_ptr(),
+                    sp.as_ptr(),
+                    docs.len() as c_int,
+                )
+            });
+            assert!(out.contains("\"ok\":5000"), "{out}");
+        }
+        let report = |label: &str, run: &dyn Fn() -> String| {
+            run();
+            let mut times: Vec<f64> = (0..ITERS)
+                .map(|_| {
+                    let t = Instant::now();
+                    run();
+                    t.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let sample = run();
+            eprintln!(
+                "{label:<52} median {:7.2} ms   min {:7.2} ms   -> {}",
+                times[ITERS / 2],
+                times[0],
+                &sample[..sample.len().min(48)]
+            );
+        };
+        let tm = "token_match('bench', 'text', 'alpha', 'and')";
+        for phase in ["as ingested (200 commits)", "after optimize"] {
+            if phase == "after optimize" {
+                let t = Instant::now();
+                let rc = unsafe { infino_optimize(h, c("bench").as_ptr()) };
+                eprintln!(
+                    "optimize: {:.0} ms -> rc {rc}",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            eprintln!("== {phase}");
+            for (label, sql) in [
+                ("C-ABI sql: SELECT 1", "SELECT 1 AS ok".to_string()),
+                (
+                    "C-ABI sql: count(*) FROM token_match",
+                    format!("SELECT count(*) AS n FROM {tm}"),
+                ),
+                (
+                    "C-ABI sql: sum(price) FROM token_match",
+                    format!("SELECT sum(price) AS s FROM {tm}"),
+                ),
+                (
+                    "C-ABI sql: sum(price) FROM bench",
+                    "SELECT sum(price) AS s FROM bench".to_string(),
+                ),
+            ] {
+                report(label, &|| take(unsafe { infino_sql(h, c(&sql).as_ptr()) }));
+            }
+            report("C-ABI count (token_match_count)", &|| {
+                take(unsafe {
+                    infino_count(
+                        h,
+                        c("bench").as_ptr(),
+                        c("text").as_ptr(),
+                        c("alpha").as_ptr(),
+                        c("and").as_ptr(),
+                    )
+                })
+            });
+            for (label, sql) in [
+                (
+                    "public query_sql: count(*) FROM token_match",
+                    format!("SELECT count(*) AS n FROM {tm}"),
+                ),
+                (
+                    "public query_sql: sum(price) FROM token_match",
+                    format!("SELECT sum(price) AS s FROM {tm}"),
+                ),
+            ] {
+                report(label, &|| {
+                    let b = conn.conn.query_sql(&sql).unwrap();
+                    format!(
+                        "{} batches, {} rows",
+                        b.len(),
+                        b.iter().map(|x| x.num_rows()).sum::<usize>()
+                    )
+                });
+            }
+        }
+        close(h);
+    }
+
     /// Where a batch's time goes, stage by stage, on the bench's document
     /// shape. Not a check; run with `--ignored --nocapture` and read the lines.
     #[test]
@@ -1666,8 +1815,9 @@ mod tests {
         const DOCS: usize = 5_000;
         const BATCHES: usize = 20;
         let vocab = [
-            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima",
-            "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+            "sierra", "tango",
         ];
         let mut seed: u64 = 42;
         let mut next = move || {
@@ -1711,24 +1861,36 @@ mod tests {
                     Field::new("text", DataType::LargeUtf8, true),
                 ];
                 conn.conn
-                    .create_table("bench", Arc::new(Schema::new(fields)), IndexSpec::new().fts(FtsField::new("text".to_string())))
+                    .create_table(
+                        "bench",
+                        Arc::new(Schema::new(fields)),
+                        IndexSpec::new().fts(FtsField::new("text".to_string())),
+                    )
                     .unwrap();
             }
             let table = conn.table("bench").unwrap();
             let schema = table.schema();
             let table_schema = conn.conn.schema("bench").unwrap();
-            let (mut t_conform, mut t_unify, mut t_rows_to_batch, mut t_append, mut t_capi) = (0.0, 0.0, 0.0, 0.0, 0.0);
+            let (mut t_conform, mut t_unify, mut t_rows_to_batch, mut t_append, mut t_capi) =
+                (0.0, 0.0, 0.0, 0.0, 0.0);
             for (bi, docs) in batches.iter().enumerate() {
                 // Stage timings on the even batches, the whole C-ABI call on the odd ones.
                 if bi % 2 == 1 {
-                    let refs: Vec<(&str, &str)> = docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                    let refs: Vec<(&str, &str)> =
+                        docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
                     let ids: Vec<CString> = refs.iter().map(|(id, _)| c(id)).collect();
                     let srcs: Vec<CString> = refs.iter().map(|(_, s)| c(s)).collect();
                     let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
                     let sp: Vec<*const c_char> = srcs.iter().map(|x| x.as_ptr()).collect();
                     let t = Instant::now();
                     let out = take(unsafe {
-                        infino_index_batch(h, c("bench").as_ptr(), idp.as_ptr(), sp.as_ptr(), refs.len() as c_int)
+                        infino_index_batch(
+                            h,
+                            c("bench").as_ptr(),
+                            idp.as_ptr(),
+                            sp.as_ptr(),
+                            refs.len() as c_int,
+                        )
                     });
                     t_capi += t.elapsed().as_secs_f64();
                     assert!(out.contains("\"ok\":5000"), "{out}");
