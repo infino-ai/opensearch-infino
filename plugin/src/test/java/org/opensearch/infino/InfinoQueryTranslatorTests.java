@@ -99,6 +99,41 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("token_match('os_logs_0', 'message', 'disk', 'or')", t.from());
     }
 
+    public void testQueryStringClausesReadAsLuceneReadsThem() {
+        // Terms on the default fields go to the engine as one query with Lucene's occurrences as sigils.
+        assertEquals("token_match('os_logs_0', 'message', '+disk +cache', 'or')", translate(QueryBuilders.queryStringQuery("disk AND cache")).from());
+        assertEquals("token_match('os_logs_0', 'message', 'disk cache -full', 'or')", translate(QueryBuilders.queryStringQuery("disk cache -full")).from());
+        assertEquals(
+            "token_match('os_logs_0', 'message', '+disk +cache', 'or')",
+            translate(QueryBuilders.queryStringQuery("disk cache").defaultOperator(org.opensearch.index.query.Operator.AND)).from()
+        );
+        // Field clauses are predicates; AND makes both sides required.
+        assertEquals("(\"level\" = 'error' AND \"status\" = 500)", translate(QueryBuilders.queryStringQuery("level:error AND status:500")).where());
+        // A group of terms stays one engine query; a prohibited field clause is a NOT.
+        Translation t = translate(QueryBuilders.queryStringQuery("(disk OR cache) AND NOT level:info"));
+        assertEquals("token_match('os_logs_0', 'message', 'disk cache', 'or')", t.from());
+        assertEquals("(1=1 AND NOT (\"level\" = 'info'))", t.where());
+        // Ranges and comparisons, with date math on a date column.
+        assertEquals("(\"status\" >= 200 AND \"status\" <= 299)", translate(QueryBuilders.queryStringQuery("status:[200 TO 299]")).where());
+        assertEquals("(\"status\" > 499)", translate(QueryBuilders.queryStringQuery("status:>499")).where());
+        assertEquals("(\"@timestamp\" >= '2026-10-24T00:00:00Z')", translate(QueryBuilders.queryStringQuery("@timestamp:[2026-10-24 TO *]")).where());
+        assertEquals("\"status\" IS NOT NULL", translate(QueryBuilders.queryStringQuery("status:*")).where());
+        // A field's group distributes the field; a lone prohibited clause excludes from everything.
+        assertEquals("((\"level\" = 'error' OR \"level\" = 'warn'))", translate(QueryBuilders.queryStringQuery("level:(error OR warn)")).where());
+        assertEquals("(NOT (\"level\" = 'info'))", translate(QueryBuilders.queryStringQuery("-level:info")).where());
+        // Wildcards and regular expressions: a term of a text column, the whole value of an exact one.
+        assertEquals("regexp_like(\"message\", '\\bdis[^\\s]*', 'i')", translate(QueryBuilders.queryStringQuery("message:dis*")).where());
+        assertEquals("regexp_like(\"message\", '\\bdis[^\\s]*', 'i')", translate(QueryBuilders.queryStringQuery("dis*")).where());
+        assertEquals("\"host.name\" LIKE 'n%'", translate(QueryBuilders.queryStringQuery("host.name:n*")).where());
+        assertEquals("regexp_like(\"message\", '\\b(?:d.sk)\\b', 'i')", translate(QueryBuilders.queryStringQuery("message:/d.sk/")).where());
+        assertEquals("regexp_like(\"level\", '^(?:err.*)$')", translate(QueryBuilders.queryStringQuery("level:/err.*/")).where());
+        // Boosts change nothing; fuzziness and proximity are refused with the clause named; so is a bad string.
+        assertEquals("token_match('os_logs_0', 'message', '+disk +cache', 'or')", translate(QueryBuilders.queryStringQuery("disk^2 AND cache")).from());
+        assertTrue(expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("disk~1"))).getMessage().contains("fuzziness"));
+        assertTrue(expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("\"disk full\"~2"))).getMessage().contains("proximity"));
+        assertTrue(expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("(disk"))).getMessage().contains("parenthesis"));
+    }
+
     public void testMatchOnAKeywordIsAnEquality() {
         Translation t = translate(QueryBuilders.matchQuery("level", "error"));
         assertNull(t.principal());

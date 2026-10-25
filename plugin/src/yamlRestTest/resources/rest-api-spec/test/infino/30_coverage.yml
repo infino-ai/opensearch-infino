@@ -86,6 +86,51 @@
           query: { query_string: { query: "brand:acme AND wool", default_field: title } }
   - match: { hits.total.value: 3 }
 
+  # The rest of the Lucene syntax: a field's group, ranges and comparisons, wildcards and
+  # regular expressions on a text column, a parenthesized group with a prohibited term.
+  - do:
+      search:
+        index: shop
+        body:
+          query: { query_string: { query: "category:(hats OR shoes)", default_field: title } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search:
+        index: shop
+        body:
+          query: { query_string: { query: "price:[20 TO 60]", default_field: title } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search:
+        index: shop
+        body:
+          query: { query_string: { query: "brand:acme AND price:<50", default_field: title } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: shop
+        body:
+          query: { query_string: { query: "title:wo*", default_field: title } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: shop
+        body:
+          query: { query_string: { query: "title:/sc.rf/", default_field: title } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: shop
+        body:
+          query: { query_string: { query: "(wool OR silk) AND -coat", default_field: title } }
+  - match: { hits.total.value: 2 }
+  - do:
+      catch: bad_request
+      search:
+        index: shop
+        body:
+          query: { query_string: { query: "wool~1", default_field: title } }
+
   # mget: each id answered from the table, a missing one reported as not found.
   - do:
       mget:

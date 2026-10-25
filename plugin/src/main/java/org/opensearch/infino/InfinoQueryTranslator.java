@@ -25,6 +25,13 @@ import org.opensearch.index.query.SimpleQueryStringBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.index.query.WildcardQueryBuilder;
+import org.opensearch.infino.InfinoLuceneQuery.All;
+import org.opensearch.infino.InfinoLuceneQuery.Bool;
+import org.opensearch.infino.InfinoLuceneQuery.Node;
+import org.opensearch.infino.InfinoLuceneQuery.Range;
+import org.opensearch.infino.InfinoLuceneQuery.Regex;
+import org.opensearch.infino.InfinoLuceneQuery.Term;
+import org.opensearch.infino.InfinoLuceneQuery.Wildcard;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoScriptTranslator.Sql;
 import org.opensearch.infino.InfinoScriptTranslator.SqlType;
@@ -35,6 +42,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.function.Function;
 
 /**
  * Translates an OpenSearch query-DSL builder tree into the SQL the Infino
@@ -53,10 +61,11 @@ import java.util.Map;
  * or {@code bm25_search} when hits are ranked by it), every other one is
  * an {@code osid IN (SELECT ...)} subquery over the same function. A phrase
  * goes to the engine quoted, which it matches as adjacent terms in order; a
- * query string's {@code +}, {@code -}, quotes and {@code AND} / {@code OR}
- * / {@code NOT} go through as the engine's own syntax, and its
- * {@code field:term} clauses become predicates on those columns. Nothing
- * materializes a match set in Java.
+ * query string is read as Lucene reads it ({@link InfinoLuceneQuery}): its
+ * terms and phrases on the default fields go to the engine with the
+ * clause occurrences as {@code +} / {@code -} sigils, and its field
+ * clauses, ranges, wildcards and regular expressions become predicates on
+ * those columns. Nothing materializes a match set in Java.
  *
  * <p>A query the table cannot answer translates to {@code null}; the
  * caller then falls back to the stock query phase.
@@ -378,24 +387,24 @@ final class InfinoQueryTranslator {
     private record Atom(char sigil, String field, String text, boolean quoted) {}
 
     /**
-     * A query string, read for the syntax the engine shares with Lucene and
-     * the part the plugin resolves itself. {@code +term}, {@code -term} and
-     * {@code "a phrase"} go to the engine as written; {@code AND}, {@code OR}
-     * and {@code NOT} become that polarity and mode; {@code field:term} and
-     * {@code field:"a phrase"} are clauses on that column, a text column's
-     * through its token index, an exact column's as an equality (with
-     * {@code *} and {@code ?} as a pattern); {@code _exists_:field} is a null
-     * check. {@code *} alone matches everything. Grouping with parentheses,
-     * ranges, fuzziness and boosts are not read; such a string is not served.
+     * A query string, read as Lucene reads it ({@link InfinoLuceneQuery}) and
+     * served clause by clause: a clause on the default fields goes to the
+     * engine's token index, and a group whose clauses are all plain terms or
+     * phrases on the default fields goes as one engine query with the
+     * {@code +} / {@code -} sigils Lucene's clause list maps to; a
+     * {@code field:} clause is a predicate on that column (text columns
+     * through the token index, exact columns as an equality, a pattern or a
+     * range); a wildcard or regular expression on a text column matches a
+     * term of its text; {@code _exists_:field} is a null check; a range or
+     * comparison on a date column takes date math. Boosts change nothing
+     * here and are dropped. Fuzziness and proximity have no counterpart in
+     * the token index and are refused with the clause named, as is a range
+     * without a field.
      */
     private String queryString(String query, String defaultField, List<String> fields, Operator op, boolean positive) {
         String q = query == null ? "" : query.trim();
         if (q.isEmpty() || "*".equals(q) || "*:*".equals(q)) {
             return ALL;
-        }
-        List<Atom> atoms = readAtoms(q, op);
-        if (atoms == null) {
-            return null;
         }
         List<String> targets = new ArrayList<>(fields);
         if (targets.isEmpty() && defaultField != null && !"*".equals(defaultField)) {
@@ -409,142 +418,187 @@ final class InfinoQueryTranslator {
                 }
             }
         }
-        boolean anyOr = atoms.stream().anyMatch(a -> a.sigil() == '|');
-        Operator mode = anyOr ? Operator.OR : op;
-        // The atoms on the default fields go to the engine as one query in its own syntax.
-        StringBuilder text = new StringBuilder();
-        List<String> musts = new ArrayList<>();
-        List<String> shoulds = new ArrayList<>();
-        List<String> nots = new ArrayList<>();
-        for (Atom a : atoms) {
-            if (a.field() == null) {
-                if (text.length() > 0) {
-                    text.append(' ');
-                }
-                if (a.sigil() == '+' || a.sigil() == '-') {
-                    text.append(a.sigil());
-                }
-                text.append(a.quoted() ? phrase(a.text()) : a.text());
-                continue;
-            }
-            String p = fieldAtom(a);
-            if (p == null) {
-                return null;
-            }
-            switch (a.sigil()) {
-                case '-' -> nots.add(p);
-                case '+' -> musts.add(p);
-                default -> (mode == Operator.AND ? musts : shoulds).add(p);
-            }
-        }
-        List<String> and = new ArrayList<>();
-        if (text.length() > 0) {
-            String t = textOnFields(targets, text.toString(), mode, positive && musts.isEmpty() && shoulds.isEmpty());
-            if (t == null) {
-                return null;
-            }
-            if (mode == Operator.AND || shoulds.isEmpty()) {
-                and.add(t);
-            } else {
-                shoulds.add(t);
-            }
-        }
-        and.addAll(musts);
-        if (!shoulds.isEmpty()) {
-            and.add("(" + String.join(" OR ", shoulds) + ")");
-        }
-        for (String n : nots) {
-            and.add("NOT (" + n + ")");
-        }
-        if (and.isEmpty()) {
+        return node(InfinoLuceneQuery.parse(q, op), targets, positive, q, op);
+    }
+
+    /** The predicate of one node of a query string's tree, or null when the table cannot take it; {@code op} reads a bare term's words. */
+    private String node(Node n, List<String> targets, boolean positive, String query, Operator op) {
+        if (n instanceof All) {
             return ALL;
         }
-        return "(" + String.join(" AND ", and) + ")";
+        if (n instanceof Bool b) {
+            String engine = engineQuery(b);
+            if (engine != null) {
+                return textOnFields(targets, engine, Operator.OR, positive);
+            }
+            // Lucene's clause list: the required clauses match on their own, the
+            // optional ones only when nothing is required, the prohibited never.
+            List<String> and = new ArrayList<>();
+            for (Node m : b.must()) {
+                String p = node(m, targets, positive, query, op);
+                if (p == null) {
+                    return null;
+                }
+                and.add(p);
+            }
+            if (b.must().isEmpty() && !b.should().isEmpty()) {
+                List<String> or = new ArrayList<>();
+                for (Node s : b.should()) {
+                    String p = node(s, targets, false, query, op);
+                    if (p == null) {
+                        return null;
+                    }
+                    or.add(p);
+                }
+                and.add("(" + String.join(" OR ", or) + ")");
+            }
+            for (Node x : b.mustNot()) {
+                String p = node(x, targets, false, query, op);
+                if (p == null) {
+                    return null;
+                }
+                and.add("NOT (" + p + ")");
+            }
+            return and.isEmpty() ? ALL : "(" + String.join(" AND ", and) + ")";
+        }
+        if (n instanceof Term t) {
+            if (t.fuzzy() > 0) {
+                throw new InfinoLuceneQuery.Malformed("[" + query + "] asks for fuzziness on [" + t.text() + "], which the token index does not serve");
+            }
+            if (t.quoted() && t.slop() > 0) {
+                throw new InfinoLuceneQuery.Malformed("[" + query + "] asks for proximity on [\"" + t.text() + "\"], which the token index does not serve; a phrase matches adjacent terms");
+            }
+            if (t.field() == null) {
+                return textOnFields(targets, t.quoted() ? phrase(t.text()) : t.text(), op, positive);
+            }
+            return fieldAtom(new Atom((char) 0, t.field(), t.text(), t.quoted()));
+        }
+        if (n instanceof Wildcard w) {
+            if (w.field() == null) {
+                return anyOf(targets, c -> termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*")));
+            }
+            Column c = column(w.field());
+            if (c == null) {
+                return NONE;
+            }
+            if (c.fts()) {
+                return termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*"));
+            }
+            return c.isString() ? quoteIdent(c.name()) + " LIKE " + literal(wildcardToLike(w.pattern())) : null;
+        }
+        if (n instanceof Regex r) {
+            if (r.field() == null) {
+                return anyOf(targets, c -> termPattern(c, "(?:" + r.pattern() + ")", false));
+            }
+            Column c = column(r.field());
+            if (c == null) {
+                return NONE;
+            }
+            if (c.fts()) {
+                return termPattern(c, "(?:" + r.pattern() + ")", false);
+            }
+            // A Lucene regexp is anchored to the whole value.
+            return c.isString() ? "regexp_like(" + quoteIdent(c.name()) + ", " + literal("^(?:" + r.pattern() + ")$") + ")" : null;
+        }
+        if (n instanceof Range r) {
+            if (r.field() == null) {
+                throw new InfinoLuceneQuery.Malformed("[" + query + "] has a range with no field; a range needs field:[a TO b]");
+            }
+            Column c = column(r.field());
+            if (c == null) {
+                return NONE;
+            }
+            if (r.from() == null && r.to() == null) {
+                return quoteIdent(c.name()) + " IS NOT NULL";
+            }
+            RangeQueryBuilder rb = new RangeQueryBuilder(r.field());
+            if (r.from() != null) {
+                rb.from(r.from(), r.includeFrom());
+            }
+            if (r.to() != null) {
+                rb.to(r.to(), r.includeTo());
+            }
+            return range(rb);
+        }
+        return null;
     }
 
     /**
-     * The atoms of a query string in order, or null when it uses syntax that
-     * is not read. {@code AND} marks its neighbours required, {@code OR} marks
-     * them optional (sigil {@code |}), {@code NOT} negates the next atom.
+     * A clause list whose clauses are all plain terms or phrases on the
+     * default fields, as one engine query: required clauses with {@code +},
+     * prohibited with {@code -}, optional bare, read in the engine's
+     * any-of mode so the sigils alone decide. Null when a clause needs the
+     * plugin's own translation, or when nothing is required or optional (a
+     * purely negative query excludes rows from everything, which is a
+     * predicate, not a search).
      */
-    private static List<Atom> readAtoms(String q, Operator op) {
-        List<String> tokens = new ArrayList<>();
-        StringBuilder cur = new StringBuilder();
-        boolean inQuote = false;
-        for (int i = 0; i < q.length(); i++) {
-            char ch = q.charAt(i);
-            if (ch == '"') {
-                inQuote = !inQuote;
-                cur.append(ch);
-            } else if (Character.isWhitespace(ch) && !inQuote) {
-                if (cur.length() > 0) {
-                    tokens.add(cur.toString());
-                    cur.setLength(0);
-                }
-            } else {
-                cur.append(ch);
-            }
-        }
-        if (inQuote) {
+    private static String engineQuery(Bool b) {
+        if (b.must().isEmpty() && b.should().isEmpty()) {
             return null;
         }
-        if (cur.length() > 0) {
-            tokens.add(cur.toString());
-        }
-        List<Atom> atoms = new ArrayList<>();
-        char pending = 0;
-        for (String token : tokens) {
-            if (token.indexOf('(') >= 0 || token.indexOf(')') >= 0 || token.indexOf('[') >= 0 || token.indexOf('{') >= 0
-                || token.indexOf('~') >= 0 || token.indexOf('^') >= 0) {
-                return null;
+        StringBuilder out = new StringBuilder();
+        for (List<Node> group : List.of(b.must(), b.should(), b.mustNot())) {
+            String sigil = group == b.must() ? "+" : group == b.mustNot() ? "-" : "";
+            for (Node n : group) {
+                if (!(n instanceof Term t) || t.field() != null || t.fuzzy() > 0 || t.slop() > 0 || t.text().isBlank()) {
+                    return null;
+                }
+                if (out.length() > 0) {
+                    out.append(' ');
+                }
+                out.append(sigil).append(t.quoted() ? phrase(t.text()) : t.text());
             }
-            switch (token) {
-                case "AND", "&&" -> {
-                    if (!atoms.isEmpty() && atoms.get(atoms.size() - 1).sigil() == 0) {
-                        Atom last = atoms.remove(atoms.size() - 1);
-                        atoms.add(new Atom('+', last.field(), last.text(), last.quoted()));
-                    }
-                    pending = '+';
-                    continue;
+        }
+        return out.toString();
+    }
+
+    /** The predicate over the text columns named, any of them matching; none matches nothing. */
+    private String anyOf(List<String> targets, Function<Column, String> perColumn) {
+        List<String> or = new ArrayList<>();
+        for (String f : targets) {
+            Column c = column(f);
+            if (c != null && c.fts()) {
+                String p = perColumn.apply(c);
+                if (p == null) {
+                    return null;
                 }
-                case "OR", "||" -> {
-                    if (!atoms.isEmpty() && atoms.get(atoms.size() - 1).sigil() == 0) {
-                        Atom last = atoms.remove(atoms.size() - 1);
-                        atoms.add(new Atom('|', last.field(), last.text(), last.quoted()));
-                    }
-                    pending = '|';
-                    continue;
-                }
-                case "NOT", "!" -> {
-                    pending = '-';
-                    continue;
-                }
+                or.add(p);
+            }
+        }
+        if (or.isEmpty()) {
+            return NONE;
+        }
+        return or.size() == 1 ? or.get(0) : "(" + String.join(" OR ", or) + ")";
+    }
+
+    /**
+     * A term of a text column's text matching {@code regex}: the pattern is
+     * bounded at a word boundary on the left and, unless it ends open, on the
+     * right, and read without regard to case, since the index lowercases
+     * its terms.
+     */
+    private static String termPattern(Column c, String regex, boolean openEnd) {
+        String bounded = "\\b" + regex + (openEnd ? "" : "\\b");
+        return "regexp_like(" + quoteIdent(c.name()) + ", " + literal(bounded) + ", 'i')";
+    }
+
+    /** A Lucene wildcard as a regular expression: {@code *} any run within a term, {@code ?} one character, the rest literal. */
+    private static String wildcardToRegex(String s) {
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            switch (ch) {
+                case '*' -> out.append("[^\\s]*");
+                case '?' -> out.append("[^\\s]");
                 default -> {
+                    if ("\\.[]{}()<>+-=!?^$|".indexOf(ch) >= 0) {
+                        out.append('\\');
+                    }
+                    out.append(ch);
                 }
             }
-            char sigil = pending;
-            pending = 0;
-            String rest = token;
-            if (rest.startsWith("+") || rest.startsWith("-")) {
-                sigil = rest.charAt(0);
-                rest = rest.substring(1);
-            }
-            String field = null;
-            int colon = rest.indexOf(':');
-            if (colon > 0 && !rest.startsWith("\"")) {
-                field = rest.substring(0, colon);
-                rest = rest.substring(colon + 1);
-            }
-            boolean quoted = rest.length() >= 2 && rest.startsWith("\"") && rest.endsWith("\"");
-            if (quoted) {
-                rest = rest.substring(1, rest.length() - 1);
-            }
-            if (rest.isEmpty()) {
-                return null;
-            }
-            atoms.add(new Atom(sigil, field, rest, quoted));
         }
-        return atoms;
+        return out.toString();
     }
 
     /** The predicate of a field-scoped atom, or null when the column cannot take it. */
