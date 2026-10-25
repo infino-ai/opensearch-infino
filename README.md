@@ -70,12 +70,18 @@ bin/opensearch-plugin install -b file:///path/infino-engine-3.9.0.zip
 -Dinfino.lib=/path/libinfino_capi.so
 ```
 
-**3. Choose where the tables live**, one of the two:
+**3. Choose where the tables live.** Four choices; the same OpenSearch
+APIs on top of each, and nothing in Lucene with any of them:
 
-- *Your own storage*: add `-Dinfino.uri=s3://bucket/prefix` beside it
-  (`file:///abs/path` for a single node). The node needs credentials for
-  the bucket the way any client does.
-- *The hosted service*: in `config/opensearch.yml`
+- *In memory*: the default when nothing is set. Fast and gone on restart;
+  for trying things out.
+- *On disk*: `-Dinfino.uri=file:///abs/path` beside the bridge option. One
+  node's own disk; the node that owns the path serves the tables.
+- *In a bucket*: `-Dinfino.uri=s3://bucket/prefix` (`gs://`, `az://` too).
+  Your storage, your credentials, the way any client reaches the bucket;
+  any node pointed at it serves the same tables.
+- *On an Infino account*: the hosted service runs the engine; in
+  `config/opensearch.yml`
 
   ```yaml
   infino.platform.url: https://host
@@ -87,7 +93,8 @@ bin/opensearch-plugin install -b file:///path/infino-engine-3.9.0.zip
   `POST /_plugins/_infino/account/trial {"accept": true}` answers with the
   key, exactly once, and these lines; the node uses the account from then
   on, and the lines make it the node's own after a restart. See "Hosted
-  account, and stateless nodes" below.
+  account, and stateless nodes" below. When both a URI and an account are
+  set, the account wins.
 
 **4. Start the node and use OpenSearch as usual.** Every index the cluster
 creates is Infino-backed (`index.infino.enabled: false` on an index keeps
