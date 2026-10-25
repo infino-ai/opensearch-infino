@@ -3,16 +3,17 @@
 Back **OpenSearch** with the **Infino** engine for storage, full-text (BM25),
 vector (kNN / hybrid) and analytics (SQL aggregations), delivered as an
 **OpenSearch plugin**, not a fork. The OpenSearch REST API and cluster
-framework stay intact; an index that opts in keeps its name, mapping and
-settings in cluster state, and every document lives in an Infino table on
-local disk or object storage (`file://`, `s3://`, `gs://`, `az://`). Nothing
-is written to Lucene.
+framework stay intact; an index keeps its name, mapping and settings in
+cluster state, and every document lives in an Infino table on the hosted
+service or on storage of your own (`file://`, `s3://`, `gs://`, `az://`).
+Nothing is written to Lucene.
 
 The plugin answers at the **action layer**: bulk, search (so also `_count`
 and each request of an `_msearch`) and get for an Infino-backed index are
 served from the table before they are routed to any shard. The index's one
-shard stays empty. A node can be wiped and the index recreated with
-`index.infino.table` naming the table; the rows are where they were.
+shard stays empty. Nodes are stateless: a node with an empty data directory
+boots, reads a registry kept beside the tables and brings every index back
+with its mapping and aliases; the rows are where they were.
 
 The original spike and its findings are in [HANDOVER.md](HANDOVER.md). Since
 then the plugin has been shaped for log and event streams: the table is
@@ -48,17 +49,64 @@ One source tree builds for 2.19 through 3.9; the full check passes on
 cd plugin && gradle check               # precommit gates, unit tests, YAML REST suites on a test cluster with the bridge
 ```
 
-## Run
+## Install and use
+
+There is no published release yet, so the two artifacts come from the build
+above: the native bridge (`infino-capi/target/release/libinfino_capi.so`, or
+`.dylib` on macOS) and the plugin zip for one OpenSearch version
+(`plugin/build/distributions/infino-engine-<version>.zip`).
+
+**1. Install the plugin on every node**, into the exact OpenSearch version
+the zip was built for:
+
+```bash
+bin/opensearch-plugin install -b file:///path/infino-engine-3.9.0.zip
+```
+
+**2. Point the JVM at the bridge**, in `config/jvm.options` or
+`OPENSEARCH_JAVA_OPTS`:
+
+```
+-Dinfino.lib=/path/libinfino_capi.so
+```
+
+**3. Choose where the tables live**, one of the two:
+
+- *Your own storage*: add `-Dinfino.uri=s3://bucket/prefix` beside it
+  (`file:///abs/path` for a single node). The node needs credentials for
+  the bucket the way any client does.
+- *The hosted service*: in `config/opensearch.yml`
+
+  ```yaml
+  infino.platform.url: https://host
+  infino.platform.database: logs        # optional: the cluster's name when unset
+  ```
+  and the key in the node's keystore, `bin/opensearch-keystore add
+  infino.platform.api_key` (or `INFINO_API_KEY` in the node's environment).
+  With no account yet, start the node without these and ask for one:
+  `POST /_plugins/_infino/account/trial {"accept": true}` answers with the
+  key, exactly once, and these lines; the node uses the account from then
+  on, and the lines make it the node's own after a restart. See "Hosted
+  account, and stateless nodes" below.
+
+**4. Start the node and use OpenSearch as usual.** Every index the cluster
+creates is Infino-backed (`index.infino.enabled: false` on an index keeps
+that one off; `infino.index.default_enabled: false` on the node turns the
+default off). Index, bulk, get, search, aggregations, scroll and Dashboards
+work through the same APIs; nothing reaches Lucene. Give an index one shard
+and no replicas, since the shard holds nothing and the engine scales reads
+itself. A fresh node on the same storage brings the indices back by itself.
+
+For a development node, `scripts/run.sh` does steps 1 to 4 on a
+distribution:
 
 ```bash
 DISTRO=/path/to/opensearch-3.9.0 INFINO_URI=s3://bucket/prefix ./scripts/run.sh
 ```
 
-The bridge and the catalog are JVM system properties: `-Dinfino.lib` (path to
-the native library) and `-Dinfino.uri` (`file:///abs/path`, `s3://bucket/prefix`,
-...). An index opts in with `index.infino.enabled: true`; give it one shard
-and no replicas, since the shard holds nothing and the engine scales reads
-itself.
+Two things would make this a one-step install and are not done: a published
+zip per OpenSearch version, and the bridge inside the zip (loaded from the
+plugin's own directory, per platform) so `-Dinfino.lib` goes away.
 
 ```bash
 curl -XPUT localhost:9200/logs -H 'Content-Type: application/json' -d '{
