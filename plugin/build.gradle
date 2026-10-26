@@ -169,12 +169,21 @@ testClusters.all {
     setting 'plugins.security.allow_unsafe_democertificates', 'true'
     setting 'plugins.security.allow_default_init_securityindex', 'true'
     setting 'plugins.security.authcz.admin_dn', 'CN=kirk,OU=client,O=client,L=test,C=de'
+    // The security suite creates an API token through the security plugin's
+    // REST API, which admits a user by role.
+    setting 'plugins.security.restapi.roles_enabled', '["all_access"]'
     extraConfigFile 'esnode.pem', file("${securityResources}/certs/esnode.pem")
     extraConfigFile 'esnode-key.pem', file("${securityResources}/certs/esnode-key.pem")
     extraConfigFile 'root-ca.pem', file("${securityResources}/certs/root-ca.pem")
     fileTree("${securityResources}/opensearch-security").each { f ->
-        extraConfigFile "opensearch-security/${f.name}", f
+        if (f.name != 'config.yml') {
+            extraConfigFile "opensearch-security/${f.name}", f
+        }
     }
+    // The releases whose security plugin issues API tokens (3.9 and later, as
+    // far as the matrix knows) authenticate them too, so the suite can send one.
+    def apiTokens = versionMajor > 3 || (versionMajor == 3 && versionMinor >= 9)
+    extraConfigFile 'opensearch-security/config.yml', file(apiTokens ? "${securityResources}/config-api-tokens.yml" : "${securityResources}/opensearch-security/config.yml")
 }
 
 // A run that dies before its shards are deleted leaves their tables; each run starts clean.

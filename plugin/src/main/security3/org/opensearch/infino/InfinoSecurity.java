@@ -7,58 +7,57 @@ package org.opensearch.infino;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.OpenSearchSecurityException;
-import org.opensearch.common.inject.Binding;
-import org.opensearch.common.inject.Injector;
-import org.opensearch.common.inject.TypeLiteral;
-import org.opensearch.common.util.concurrent.ThreadContext;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.inject.Injector;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.ThreadContext;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.index.query.QueryBuilder;
 
 import java.lang.reflect.Constructor;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
+
+import static org.opensearch.infino.InfinoSecurityCalls.ADMIN_DNS;
+import static org.opensearch.infino.InfinoSecurityCalls.USER;
+import static org.opensearch.infino.InfinoSecurityCalls.call;
+import static org.opensearch.infino.InfinoSecurityCalls.component;
+import static org.opensearch.infino.InfinoSecurityCalls.has;
+import static org.opensearch.infino.InfinoSecurityCalls.reason;
+import static org.opensearch.infino.InfinoSecurityCalls.restrictedUser;
 
 /**
  * The security plugin's document-level security, field-level security and
  * field masking for a request, as the table enforces them (3.x). The
  * security plugin keeps the evaluated rules in its own objects rather than
- * the thread context, so the plugin asks those objects: the user's
+ * the thread context, so the plugin asks those objects (see
+ * {@link InfinoSecurityCalls} for how they are reached): the user's
  * evaluation context from its privileges evaluator, the rules for an index
- * from its processed roles configuration. The checks that lift the rules
- * are its own too: no user (a node-internal request), a plugin user, an
- * admin certificate, or the configuration-request header its own
- * configuration reads carry.
+ * from its processed roles configuration.
  *
- * <p>The objects are the components the security plugin registers with the
- * node's injector, found there by class name and called through reflection:
- * the plugin neither compiles against the security plugin nor extends it
- * (the 3.0 security plugin cannot be extended at all, and extending binds
- * the plugin's install to the security plugin's), so one class serves every
- * 3.x release and a node without the security plugin. The classes are
- * loaded through the security plugin's own class loader, which the first
- * request from a user hands over with its user object; until then there is
- * no user to restrict. Where the two objects live moved in 3.6: from there
- * one component, the privileges configuration, holds both; before it the
- * evaluator is a component of its own and the processed rules sit inside
- * the DLS/FLS valve, which is not one, so the plugin builds the same rules
- * from the roles configuration the security plugin's repository holds. A
- * security plugin offering neither leaves
- * nothing to evaluate with, and a request from a user is then refused
- * rather than served around rules that may apply.
+ * <p>Where the two objects live moved in 3.6: from there one component,
+ * the privileges configuration, holds both; before it the evaluator is a
+ * component of its own and the processed rules sit inside the DLS/FLS
+ * valve, which is not one, so the plugin builds the same rules from the
+ * roles configuration the security plugin's repository holds. A security
+ * plugin offering neither leaves nothing to evaluate with, and a request
+ * from a user is then refused rather than served around rules that may
+ * apply.
+ *
+ * <p>The security plugin's audit log records reads of the indices its
+ * compliance configuration watches from inside the shard, which the plugin
+ * bypasses; where the audit log is a component (3.6 and later) the plugin
+ * reports every document it hands out to it instead.
  */
 final class InfinoSecurity {
     private static final Logger log = LogManager.getLogger(InfinoSecurity.class);
-    /** The security plugin's admin certificates; bound whenever the security plugin runs. */
-    private static final String ADMIN_DNS = "org.opensearch.security.configuration.AdminDNs";
     /** The component holding the privileges evaluator and the processed DLS/FLS rules (3.6 and later). */
     private static final String PRIVILEGES_CONFIGURATION = "org.opensearch.security.privileges.PrivilegesConfiguration";
     /** The privileges evaluator, a component of its own before 3.6. */
@@ -79,16 +78,18 @@ final class InfinoSecurity {
     private static final String FIELD_MASKING_CONFIG = "org.opensearch.security.privileges.dlsfls.FieldMasking$Config";
     /** The per-request allow list of documents the security plugin's own reads may see regardless of a rule. */
     private static final String DOCUMENT_ALLOW_LIST = "org.opensearch.security.privileges.DocumentAllowList";
-    /** The thread-context transient the security plugin keeps the authenticated user under. */
-    private static final String USER = "_opendistro_security_user";
-    /** The header the security plugin's own configuration reads carry. */
-    private static final String CONF_REQUEST_HEADER = "_opendistro_security_conf_request";
+    /** The audit log as the security plugin binds it when auditing is on (a component from 3.6). */
+    private static final String AUDIT_LOG = "org.opensearch.security.auditlog.impl.AuditLogImpl";
     /** The header saying the security plugin already folded the document rule into the query (its filter-level mode). */
     private static final String FILTER_LEVEL_DLS_DONE = "_opendistro_security_filter_level_dls_done";
     /** The thread-context key the security plugin keeps a request's evaluation context under; shared so one evaluation serves both. */
     private static final String EVALUATION_CONTEXT = "tmp_dls_fls_ctx";
     /** The id the security plugin's document allow list uses for "every document of the index" (a constant of its own only from 3.9). */
     private static final String ANY_DOCUMENT = "*";
+    /** The one shard an Infino-backed index has, which a read is reported against. */
+    private static final int THE_SHARD = 0;
+    /** The user's own word on whether an API token authenticated the request (3.9 and later). */
+    private static final String API_TOKEN_REQUEST = "isApiTokenRequest";
 
     /** The security plugin's evaluator and its processed rules, wherever this release keeps them. */
     private interface Evaluation {
@@ -98,12 +99,10 @@ final class InfinoSecurity {
     }
 
     /** The security plugin's components, resolved once from the class loader its user object came with. */
-    private record Components(Object adminDns, Class<?> documentAllowList, Evaluation evaluation) {}
+    private record Components(Object adminDns, Class<?> documentAllowList, Evaluation evaluation, Object auditLog) {}
 
     private static volatile Injector injector;
     private static volatile Components components;
-    /** Public methods by class, name and arity, looked up once. */
-    private static final Map<String, Method> METHODS = new ConcurrentHashMap<>();
 
     private InfinoSecurity() {}
 
@@ -122,6 +121,8 @@ final class InfinoSecurity {
         if (injector == null) {
             return null;
         }
+        // The loader the security plugin's classes come from; no security manager
+        // guards the question on 3.x.
         ClassLoader loader = user.getClass().getClassLoader();
         Object dns = component(injector, loader, ADMIN_DNS);
         if (dns == null) {
@@ -143,7 +144,11 @@ final class InfinoSecurity {
             log.warn("[infino] this security plugin registers neither a privileges configuration nor its evaluator and configuration repository; requests from users are refused");
             return null;
         }
-        found = new Components(dns, allowList, evaluation);
+        Object auditLog = component(injector, loader, AUDIT_LOG);
+        if (auditLog == null) {
+            log.info("[infino] this security plugin registers no audit log the plugin can reach; reads of Infino-backed indices are not in its read history");
+        }
+        found = new Components(dns, allowList, evaluation, auditLog);
         components = found;
         return found;
     }
@@ -254,71 +259,29 @@ final class InfinoSecurity {
         };
     }
 
-    /** The component bound under the class of that name, or null when the class or a binding for it is absent. */
-    private static Object component(Injector injector, ClassLoader loader, String className) {
-        try {
-            Class<?> cls = Class.forName(className, false, loader);
-            List<? extends Binding<?>> bindings = injector.findBindingsByType(TypeLiteral.get(cls));
-            return bindings.isEmpty() ? null : bindings.get(0).getProvider().get();
-        } catch (ClassNotFoundException e) {
-            return null;
-        }
-    }
-
-    /**
-     * Call the public method of {@code name} on {@code target} whose
-     * parameters take {@code args} (a null argument fits any reference
-     * parameter); the method is looked up once per class, name and arity.
-     */
-    private static Object call(Object target, String name, Object... args) throws ReflectiveOperationException {
-        Class<?> cls = target.getClass();
-        String key = cls.getName() + '#' + name + '/' + args.length;
-        Method method = METHODS.get(key);
-        if (method == null) {
-            for (Method m : cls.getMethods()) {
-                if (m.getName().equals(name) && m.getParameterCount() == args.length && accepts(m, args)) {
-                    method = m;
-                    break;
-                }
-            }
-            if (method == null) {
-                throw new NoSuchMethodException(cls.getName() + "." + name + " taking " + args.length + " arguments");
-            }
-            METHODS.put(key, method);
-        }
-        return method.invoke(target, args);
-    }
-
-    private static boolean accepts(Method m, Object[] args) {
-        Class<?>[] params = m.getParameterTypes();
-        for (int i = 0; i < args.length; i++) {
-            if (args[i] == null ? params[i].isPrimitive() : !params[i].isInstance(args[i])) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     /** What the request may see of {@code index}; {@code what} names the request in a refusal. */
     static InfinoAccess access(String index, String what) {
         ThreadContext context = InfinoServices.threadContext();
         if (context == null) {
             return InfinoAccess.NONE;
         }
-        Object user = context.getTransient(USER);
-        if (user == null) {
+        Object anyUser = context.getTransient(USER);
+        if (anyUser == null) {
             return InfinoAccess.NONE;
         }
-        if ("true".equals(context.getHeader(CONF_REQUEST_HEADER))) {
-            return InfinoAccess.NONE;
-        }
-        Components security = components(user);
+        Components security = components(anyUser);
         if (security == null) {
             throw refused(what, index, "this security plugin keeps no evaluation the plugin can read, so its document- and field-level rules cannot be applied");
         }
+        BiConsumer<String, String> onRead = readAudit(security.auditLog(), index);
         try {
-            if ((Boolean) call(user, "isPluginUser") || (Boolean) call(security.adminDns(), "isAdmin", user)) {
-                return InfinoAccess.NONE;
+            Object user = restrictedUser(context, security.adminDns());
+            // A user authenticated by one of the security plugin's API tokens
+            // (3.9 and later) is governed by the token's own permissions; the
+            // security plugin evaluates no document, field or masking rule for
+            // such a request, and neither does the plugin.
+            if (user == null || (has(user, API_TOKEN_REQUEST) && (Boolean) call(user, API_TOKEN_REQUEST))) {
+                return onRead == null ? InfinoAccess.NONE : new InfinoAccess(null, null, null, onRead);
             }
             Object ctx = context.getTransient(EVALUATION_CONTEXT);
             if (ctx == null) {
@@ -372,16 +335,42 @@ final class InfinoSecurity {
                     throw refused(what, index, "its masking rule could not be evaluated: " + reason(e));
                 }
             };
-            return new InfinoAccess(documents, visible, maskOf);
+            return new InfinoAccess(documents, visible, maskOf, onRead);
         } catch (ReflectiveOperationException e) {
             throw refused(what, index, "its document- and field-level rules could not be evaluated: " + reason(e));
         }
     }
 
-    /** The security plugin's own message when a call threw inside it, the reflective failure otherwise. */
-    private static String reason(Exception e) {
-        Throwable cause = e instanceof InvocationTargetException ite && ite.getCause() != null ? ite.getCause() : e;
-        return cause.getMessage() == null ? cause.toString() : cause.getMessage();
+    /**
+     * What tells the audit log of each document a request is handed, when
+     * its compliance configuration watches {@code index} for reads; null
+     * when it does not, or the audit log is out of reach on this release.
+     */
+    private static BiConsumer<String, String> readAudit(Object auditLog, String index) {
+        if (auditLog == null) {
+            return null;
+        }
+        try {
+            Object compliance = call(auditLog, "getComplianceConfig");
+            if (compliance == null || !(Boolean) call(compliance, "isEnabled") || !(Boolean) call(compliance, "readHistoryEnabledForIndex", index)) {
+                return null;
+            }
+        } catch (ReflectiveOperationException e) {
+            log.debug("[infino] the audit log's compliance configuration could not be read: {}", reason(e));
+            return null;
+        }
+        IndexMetadata md = InfinoServices.clusterService().state().metadata().index(index);
+        if (md == null) {
+            return null;
+        }
+        ShardId shard = new ShardId(md.getIndex(), THE_SHARD);
+        return (id, shown) -> {
+            try {
+                call(auditLog, "logDocumentRead", index, id, shard, InfinoAccess.fields(shown));
+            } catch (ReflectiveOperationException e) {
+                log.warn("[infino] a read of {} from {} could not be reported to the audit log: {}", id, index, reason(e));
+            }
+        };
     }
 
     private static OpenSearchSecurityException refused(String what, String index, String why) {

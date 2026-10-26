@@ -22,6 +22,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
@@ -37,11 +38,23 @@ import java.util.function.UnaryOperator;
  * evaluation of the user's roles, so the semantics are its: a hidden field
  * is as if unmapped, a masked field is read and aggregated by its hash, and
  * the document rule narrows hits, totals, aggregations and gets alike.
+ * {@code onRead} is told of every document the request is handed, by id
+ * and as shown, where the security plugin's audit log watches the index
+ * for reads (null when it does not).
  */
-record InfinoAccess(List<QueryBuilder> documents, Predicate<String> fieldVisible, Function<String, UnaryOperator<String>> maskOf) {
+record InfinoAccess(
+    List<QueryBuilder> documents,
+    Predicate<String> fieldVisible,
+    Function<String, UnaryOperator<String>> maskOf,
+    BiConsumer<String, String> onRead
+) {
 
     /** No restriction: the request sees the index whole. */
-    static final InfinoAccess NONE = new InfinoAccess(null, null, null);
+    static final InfinoAccess NONE = new InfinoAccess(null, null, null, null);
+
+    InfinoAccess(List<QueryBuilder> documents, Predicate<String> fieldVisible, Function<String, UnaryOperator<String>> maskOf) {
+        this(documents, fieldVisible, maskOf, null);
+    }
 
     boolean restrictsDocuments() {
         return documents != null;
@@ -57,6 +70,39 @@ record InfinoAccess(List<QueryBuilder> documents, Predicate<String> fieldVisible
 
     boolean unrestricted() {
         return !restrictsDocuments() && !restrictsFields() && !masks();
+    }
+
+    /**
+     * The document {@code id} as this access shows it (see {@link #source}),
+     * the read reported to the audit log when it watches the index.
+     */
+    String read(String id, String source) {
+        String shown = source(source);
+        if (onRead != null && shown != null && !shown.isEmpty()) {
+            onRead.accept(id, shown);
+        }
+        return shown;
+    }
+
+    /** A document's fields by dotted path, each value as text: what the audit log records of a read. */
+    static Map<String, String> fields(String source) {
+        Map<String, String> out = new LinkedHashMap<>();
+        Map<String, Object> map = XContentHelper.convertToMap(new BytesArray(source), true, MediaTypeRegistry.JSON).v2();
+        flatten("", map, out);
+        return out;
+    }
+
+    private static void flatten(String prefix, Map<String, Object> map, Map<String, String> out) {
+        for (Map.Entry<String, Object> e : map.entrySet()) {
+            String path = prefix.isEmpty() ? e.getKey() : prefix + "." + e.getKey();
+            if (e.getValue() instanceof Map<?, ?> nested) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> inner = (Map<String, Object>) nested;
+                flatten(path, inner, out);
+            } else {
+                out.put(path, String.valueOf(e.getValue()));
+            }
+        }
     }
 
     /** A request refused under a restriction the table cannot enforce as it stands, named. */
