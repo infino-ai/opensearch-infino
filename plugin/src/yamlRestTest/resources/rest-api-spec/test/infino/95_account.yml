@@ -49,6 +49,32 @@
       error.reason: /.*database\smust\sbe.*/
 
 ---
+"Only a caller who may manage the cluster can point the node at a service":
+  - skip:
+      version: "3.0.0 - 3.5.99"
+      reason: the test cluster runs without the security plugin on these releases, so every caller has the right
+      features: headers
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      catch: forbidden
+      infino.account_store:
+        body: { "platform": "https://nobody.invalid", "api_key": "ik_x" }
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      catch: forbidden
+      infino.account_trial:
+        body: { "accept": true, "platform": "https://nobody.invalid" }
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      catch: forbidden
+      infino.account_forget: {}
+  # Reading what is served needs no such right.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      infino.account: {}
+  - match: { configured: false }
+
+---
 "Forgetting with no account in use changes nothing":
   - do:
       infino.account_forget: {}

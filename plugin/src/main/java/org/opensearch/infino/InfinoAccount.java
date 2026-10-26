@@ -7,6 +7,7 @@ package org.opensearch.infino;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
@@ -33,8 +34,12 @@ import java.util.regex.Pattern;
  * {@link InfinoRegistry}). In the cloud: every document, the account, its
  * credit and its limits. Nothing is kept in any shard.
  *
- * <p>An account is created only when a person accepts. The acceptance is a
- * request to this route carrying {@code "accept": true}; the service answers
+ * <p>An account is created only when a person accepts, and only one the
+ * cluster lets manage it: every request here that points the node at a
+ * service, or away from one, is first authorized by the cluster as a
+ * cluster-management action under the caller's own identity, so a user
+ * without that right is refused and nothing that runs on its own can do
+ * it. The acceptance is a request carrying {@code "accept": true}; the service answers
  * with the key, exactly once, and this node uses the account from then on,
  * for its life. The response carries the key and the configuration lines
  * that make it the node's own after a restart; nothing here stores it. The
@@ -159,15 +164,36 @@ public final class InfinoAccount {
             }
             case POST -> {
                 if (trial) {
-                    trial(body, channel);
+                    Map<String, Object> accepted = body;
+                    asClusterAdmin(channel, () -> trial(accepted, channel));
                 } else {
                     notAllowed(request, channel);
                 }
             }
-            case PUT -> store(body, channel);
-            case DELETE -> forget(channel);
+            case PUT -> {
+                Map<String, Object> given = body;
+                asClusterAdmin(channel, () -> store(given, channel));
+            }
+            case DELETE -> asClusterAdmin(channel, () -> forget(channel));
             default -> notAllowed(request, channel);
         }
+    }
+
+    /**
+     * Run {@code then} only for a caller the cluster lets manage it.
+     * Pointing the node's data plane at a service is cluster management, so
+     * the same right gates it: the cluster is asked, under the caller's own
+     * identity, and a refusal (403 from the security plugin) is the answer.
+     * Without the security plugin every caller has the right.
+     */
+    private static void asClusterAdmin(RestChannel channel, Work then) {
+        InfinoClient.requireClusterManagement(ActionListener.wrap(allowed -> {
+            try {
+                then.run();
+            } catch (Exception e) {
+                fail(channel, e);
+            }
+        }, e -> fail(channel, e)));
     }
 
     private static void notAllowed(RestRequest request, RestChannel channel) {

@@ -195,7 +195,11 @@ public class InfinoBulkActionFilter implements ActionFilter {
     /**
      * The Infino-backed indices a bulk's items write to (the concrete names
      * {@link #concreteIndices} gave, one per slot), by name; empty when none
-     * is. A bulk that mixes them with other indices is refused.
+     * is. A bulk that mixes them with other indices is refused, and so is a
+     * write to an index the security plugin restricts for this user by
+     * document, field or mask: a write reads the document it replaces or
+     * merges into and puts fields the rule hides, so under a rule it is
+     * refused whole rather than served outside the rule.
      */
     static Map<String, IndexMetadata> infinoIndices(ClusterService clusters, List<String> concrete) {
         Map<String, IndexMetadata> infino = new LinkedHashMap<>();
@@ -212,6 +216,11 @@ public class InfinoBulkActionFilter implements ActionFilter {
         }
         if (infinoItems != concrete.size()) {
             throw new IllegalArgumentException("[infino] a bulk mixing Infino-backed indices with others is not served");
+        }
+        for (String name : infino.keySet()) {
+            if (!InfinoSecurity.access(name, "write").unrestricted()) {
+                throw InfinoAccess.refused("a write to " + name + " under a document, field or masking rule is not served");
+            }
         }
         return infino;
     }

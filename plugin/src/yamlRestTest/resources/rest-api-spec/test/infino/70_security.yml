@@ -164,6 +164,46 @@
   - match: { _source.secret: beta }
   - match: { _source.ip: "10.0.0.2" }
 
+  # A write under a rule is refused whole: it would read the document it
+  # replaces or merges into, and put fields the rule hides.
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      index:
+        index: sec1
+        id: s4
+        body: { tag: x, secret: delta, ip: "10.0.0.4", n: 4, title: "wool socks" }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      update:
+        index: sec1
+        id: s1
+        body: { doc: { n: 10 } }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      bulk:
+        body:
+          - index: { _index: sec1, _id: "s5" }
+          - { tag: y, secret: eps, ip: "10.0.0.5", n: 5, title: "felt hat" }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      delete:
+        index: sec1
+        id: s1
+  # Nothing of that landed: the admin still counts three.
+  - do:
+      count:
+        index: sec1
+  - match: { count: 3 }
+  - do:
+      get:
+        index: sec1
+        id: s1
+  - match: { _source.n: 1 }
+
 ---
 "Security on 2.x: a request under a document- or field-level rule is refused, one without is served":
   - skip:

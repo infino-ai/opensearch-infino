@@ -215,12 +215,11 @@ public final class InfinoWriter {
             } finally {
                 batch.lock.unlock();
             }
-            // The prepared handles are consumed by the append; on any other way out
-            // they are released here, so a failing backend leaks no native memory.
-            boolean consumed = false;
+            // The prepared handles are owned by apply(): it hands them to the
+            // engine, which releases them whatever the outcome, or releases
+            // them itself when it fails before that.
             try {
                 Applied applied = apply(table, staged);
-                consumed = true;
                 for (Staged s : staged) {
                     answer(s.waiter(), applied);
                 }
@@ -228,12 +227,6 @@ public final class InfinoWriter {
                 log.warn("[infino] append of {} bulks to {} failed", staged.size(), table, e);
                 for (Staged s : staged) {
                     s.waiter().listener().onFailure(e);
-                }
-            } finally {
-                if (!consumed) {
-                    for (Staged s : staged) {
-                        InfinoNative.freePrepared(s.prepared());
-                    }
                 }
             }
         }
@@ -243,8 +236,13 @@ public final class InfinoWriter {
      * Write the batch: the rows of ids the table already holds replace
      * those rows in the same mutation as the append (so a failed write
      * leaves the old rows), ids only deleted are tombstoned, and a create of
-     * an id that exists is a conflict, left out of the write. Consumes every
-     * prepared handle.
+     * an id that exists is a conflict, left out of the write.
+     *
+     * <p>Owns the prepared handles. The engine releases every handle it is
+     * handed, on success and on failure alike, and the folded path releases
+     * them before it prepares afresh; so a handle is released here only when
+     * this fails before either, on the lookup of the ids the table holds.
+     * Releasing one twice corrupts the native heap.
      */
     private static Applied apply(String table, List<Staged> staged) {
         Set<String> lookups = new HashSet<>();
@@ -272,7 +270,16 @@ public final class InfinoWriter {
                 }
             }
         }
-        Set<String> existed = lookups.isEmpty() ? Set.of() : InfinoNative.existingOsids(table, lookups);
+        Set<String> existed;
+        try {
+            existed = lookups.isEmpty() ? Set.of() : InfinoNative.existingOsids(table, lookups);
+        } catch (RuntimeException e) {
+            // The handles never reached the engine: released here, once.
+            for (Staged s : staged) {
+                InfinoNative.freePrepared(s.prepared());
+            }
+            throw e;
+        }
         Set<String> conflicts = new HashSet<>();
         for (String id : creates) {
             if (existed.contains(id)) {
@@ -293,6 +300,8 @@ public final class InfinoWriter {
         }
         Map<String, String> refused;
         try {
+            // Both paths release every handle: the engine does on the prepared
+            // path, the folded path up front. Nothing after this may release one.
             refused = collision || !conflicts.isEmpty() ? appendFolded(table, staged, conflicts, replaced) : appendPrepared(table, staged, replaced);
         } finally {
             // A read after the write must see the table, not a prefetched copy.

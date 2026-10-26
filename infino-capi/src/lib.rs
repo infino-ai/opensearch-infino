@@ -42,9 +42,9 @@ use std::time::Duration;
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::prelude::{col, lit};
 use infino::arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int64Array, LargeStringArray, RecordBatch,
-    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt64Array,
+    new_null_array, Array, BooleanArray, Float32Array, Float64Array, Int64Array, LargeStringArray,
+    RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
 };
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
@@ -1120,13 +1120,78 @@ fn split_by_osid(batch: &RecordBatch, ids: &[String]) -> Option<(RecordBatch, Re
     Some((replacing, fresh))
 }
 
-/// Append prepared batches as one commit when their schemas agree (a batch
-/// that added an unmapped path has its own), else one commit each; a batch
-/// the engine refuses falls back to the halving append that names each
-/// refused document. When `replaced` names ids, the rows under those ids
-/// are replaced in the same mutation as the append (the engine's update:
-/// tombstone and append in one commit), so a write that fails leaves the
-/// old rows in place. Returns every refused document as (batch index,
+/// The batches as one, over the union of their schemas: a batch that added
+/// an unmapped path has a column the others lack, and takes null there in
+/// theirs. A path typed differently by two batches cannot be joined and is
+/// the error. None when there is no batch.
+fn join_over_union(batches: &[&RecordBatch]) -> Result<Option<RecordBatch>, String> {
+    let Some(first) = batches.first() else {
+        return Ok(None);
+    };
+    if batches.len() == 1 {
+        return Ok(Some((*first).clone()));
+    }
+    let mut fields: Vec<Field> = Vec::new();
+    for batch in batches {
+        for field in batch.schema().fields() {
+            match fields.iter().find(|f| f.name() == field.name()) {
+                None => fields.push(field.as_ref().clone()),
+                Some(seen) if seen.data_type() != field.data_type() => {
+                    return Err(format!(
+                        "[{}] is typed differently across the batch ({} and {})",
+                        field.name(),
+                        seen.data_type(),
+                        field.data_type()
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let mut aligned: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let columns: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|f| match batch.column_by_name(f.name()) {
+                Some(c) => c.clone(),
+                None => new_null_array(f.data_type(), batch.num_rows()),
+            })
+            .collect();
+        aligned.push(RecordBatch::try_new(schema.clone(), columns).map_err(|e| e.to_string())?);
+    }
+    concat_batches(&schema, aligned.iter())
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// The documents of `prepared` whose id is among `replaced`, as (batch
+/// index, document index).
+fn replaced_rows(prepared: &[Prepared], replaced: &[String]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (b, p) in prepared.iter().enumerate() {
+        for (j, v) in p.values.iter().enumerate() {
+            let id = v.get(OSID).and_then(Value::as_str).unwrap_or("");
+            if replaced.iter().any(|r| r == id) {
+                out.push((b, p.index_of[j]));
+            }
+        }
+    }
+    out
+}
+
+/// Append prepared batches as one commit. When `replaced` names ids, the
+/// rows under those ids are replaced in the same mutation as their
+/// tombstones (the engine's update), whatever shape the batches take: they
+/// are joined over the union of their schemas first, so a batch that added
+/// a path does not push the write onto a path that tombstones ahead of an
+/// append. A replace that fails leaves the old rows and reports every
+/// document it carried; an append the engine refuses falls back to the
+/// halving append that names each refused document, over the documents
+/// that replace nothing. A document whose batch could not be converted and
+/// whose id is replaced is refused rather than appended beside the row it
+/// was to replace. Returns every refused document as (batch index,
 /// document index, reason).
 fn append_prepared(
     table: &Supertable,
@@ -1141,57 +1206,85 @@ fn append_prepared(
     }
     let replace_pred =
         || col(OSID).in_list(replaced.iter().map(|s| lit(s.clone())).collect(), false);
-    // The engine's update replaces the matched rows one for one with the rows
-    // given, so the batch is split: the rows under replaced ids go through the
-    // update (tombstone and new row in one commit), the rest are appended.
-    let write = |batch: &RecordBatch| -> bool {
-        if replaced.is_empty() {
-            return table.append(batch).is_ok();
-        }
-        let (replacing, fresh) = match split_by_osid(batch, replaced) {
-            Some(parts) => parts,
-            None => return false,
-        };
-        if replacing.num_rows() > 0 && table.update(replace_pred(), &replacing).is_err() {
-            return false;
-        }
-        fresh.num_rows() == 0 || table.append(&fresh).is_ok()
-    };
     let batches: Vec<&RecordBatch> = prepared.iter().filter_map(|p| p.batch.as_ref()).collect();
-    let same_schema = batches.len() == prepared.len()
-        && batches.windows(2).all(|w| w[0].schema() == w[1].schema());
-    if same_schema && !batches.is_empty() {
-        let joined = if batches.len() == 1 {
-            Ok(batches[0].clone())
-        } else {
-            concat_batches(&batches[0].schema(), batches.iter().copied())
-        };
-        if let Ok(batch) = joined {
-            if write(&batch) {
-                return failed;
-            }
-        }
-    }
-    // The replacement has to be one mutation with the rows that replace; past
-    // the joined batch the ids are tombstoned once, ahead of the per-batch path.
-    if !replaced.is_empty() {
-        if let Err(e) = table.delete(replace_pred()) {
+    let joined = match join_over_union(&batches) {
+        Ok(joined) => joined,
+        Err(why) => {
             for (b, p) in prepared.iter().enumerate() {
-                for i in &p.index_of {
-                    failed.push((b, *i, format!("replace: {e}")));
+                if p.batch.is_some() {
+                    for i in &p.index_of {
+                        failed.push((b, *i, why.clone()));
+                    }
                 }
             }
-            return failed;
+            None
         }
-    }
-    // Per batch: its Arrow form, else its rows one halving at a time.
-    for (b, p) in prepared.into_iter().enumerate() {
-        if let Some(batch) = &p.batch {
-            if table.append(batch).is_ok() {
-                continue;
+    };
+    // Whether the joined batch's rows that replace nothing landed as Arrow;
+    // the rows that replace are either in by the update or reported by it.
+    let mut fresh_landed = joined.is_none();
+    if let Some(batch) = &joined {
+        if replaced.is_empty() {
+            fresh_landed = table.append(batch).is_ok();
+        } else {
+            match split_by_osid(batch, replaced) {
+                Some((replacing, fresh)) => {
+                    if replacing.num_rows() > 0 {
+                        if let Err(e) = table.update(replace_pred(), &replacing) {
+                            let why = format!("replace: {e}");
+                            for (b, i) in replaced_rows(&prepared, replaced) {
+                                failed.push((b, i, why.clone()));
+                            }
+                        }
+                    }
+                    fresh_landed = fresh.num_rows() == 0 || table.append(&fresh).is_ok();
+                }
+                None => {
+                    let why = "the batch carries no readable id column".to_string();
+                    for (b, p) in prepared.iter().enumerate() {
+                        if p.batch.is_some() {
+                            for i in &p.index_of {
+                                failed.push((b, *i, why.clone()));
+                            }
+                        }
+                    }
+                    fresh_landed = true;
+                }
             }
         }
-        let indexed: Vec<(usize, Value)> = p.index_of.into_iter().zip(p.values).collect();
+    }
+    let joined_batches = joined.is_some();
+    // What did not land as Arrow goes a document at a time: the rows of a
+    // batch that could not be converted, and the fresh rows of the joined
+    // batch when the engine refused the append. A document that replaces a
+    // row is never appended this way: with its replace failed (reported
+    // above) or its batch unconverted, appending it would put a second row
+    // beside the one it was to replace.
+    for (b, p) in prepared.into_iter().enumerate() {
+        let converted = p.batch.is_some();
+        if converted && joined_batches && fresh_landed {
+            continue;
+        }
+        if converted && !joined_batches {
+            continue; // reported as untyped above
+        }
+        let mut indexed: Vec<(usize, Value)> = Vec::new();
+        for (j, v) in p.values.into_iter().enumerate() {
+            let id = v.get(OSID).and_then(Value::as_str).unwrap_or("");
+            let replaces = replaced.iter().any(|r| r == id);
+            if replaces {
+                if !converted {
+                    failed.push((
+                        b,
+                        p.index_of[j],
+                        "replace: the batch could not be converted".to_string(),
+                    ));
+                }
+                // converted and replacing: landed, or reported by the replace.
+                continue;
+            }
+            indexed.push((p.index_of[j], v));
+        }
         let mut refused: Vec<Value> = Vec::new();
         append_checked(table, &indexed, &mut refused);
         for r in refused {
@@ -2328,6 +2421,108 @@ mod tests {
         assert!(get(h, "a1").contains("\"status\":111"), "{}", get(h, "a1"));
         let rows = sql(h, "SELECT osid FROM logs WHERE osid = 'a1'");
         assert_eq!(rows.as_array().map(|r| r.len()), Some(1), "{rows}");
+        close(h);
+    }
+
+    fn append_replacing_many(
+        h: *mut Bridge,
+        handles: &[*mut Prepared],
+        replaced: &[&str],
+    ) -> Value {
+        let ids: Vec<CString> = replaced.iter().map(|x| c(x)).collect();
+        let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+        let out = take(unsafe {
+            infino_append_prepared(
+                h,
+                c("logs").as_ptr(),
+                handles.as_ptr(),
+                handles.len() as c_int,
+                if idp.is_empty() {
+                    ptr::null()
+                } else {
+                    idp.as_ptr()
+                },
+                idp.len() as c_int,
+            )
+        });
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
+    /// Two batches of different shape (the second adds a path the mapping
+    /// does not name) replacing an existing id go in as one mutation: the
+    /// replaced row is gone, its new row and the other batch's rows are
+    /// there, and nothing was tombstoned ahead of an append.
+    #[test]
+    fn batches_of_different_shape_replace_in_one_mutation() {
+        let h = open_logs();
+        let out = index(
+            h,
+            &[
+                ("b1", r#"{"level":"info","status":1}"#),
+                ("b2", r#"{"level":"info","status":2}"#),
+            ],
+        );
+        assert_eq!(out["ok"], 2, "{out}");
+        let first = prepared(h, &[("b1", r#"{"level":"warn","status":11}"#)]);
+        let second = prepared(
+            h,
+            &[
+                ("b2", r#"{"level":"warn","status":22,"extra":"yes"}"#),
+                ("b3", r#"{"level":"info","status":3,"extra":"new"}"#),
+            ],
+        );
+        let out = append_replacing_many(h, &[first, second], &["b1", "b2"]);
+        assert_eq!(out["ok"], 3, "{out}");
+        for id in ["b1", "b2"] {
+            let rows = sql(h, &format!("SELECT osid FROM logs WHERE osid = '{id}'"));
+            assert_eq!(rows.as_array().map(|r| r.len()), Some(1), "{id}: {rows}");
+        }
+        assert!(get(h, "b1").contains("\"status\":11"), "{}", get(h, "b1"));
+        assert!(
+            get(h, "b2").contains("\"extra\":\"yes\""),
+            "{}",
+            get(h, "b2")
+        );
+        assert!(
+            get(h, "b3").contains("\"extra\":\"new\""),
+            "{}",
+            get(h, "b3")
+        );
+        let rows = sql(h, "SELECT COUNT(*) AS c FROM logs");
+        assert_eq!(rows[0]["c"], 3, "{rows}");
+        // The added path is a column now, null for the batch that lacked it.
+        let rows = sql(h, "SELECT osid FROM logs WHERE extra IS NULL ORDER BY osid");
+        assert_eq!(rows.as_array().map(|r| r.len()), Some(1), "{rows}");
+        assert_eq!(rows[0]["osid"], "b1", "{rows}");
+        close(h);
+    }
+
+    /// A path typed one way by one batch and another way by the next cannot
+    /// be joined; every document of those batches is refused with the
+    /// reason, and the rows they were to replace stay as they were.
+    #[test]
+    fn batches_that_type_a_path_differently_are_refused_whole() {
+        let h = open_logs();
+        let out = index(h, &[("c1", r#"{"level":"info","status":1}"#)]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let first = prepared(h, &[("c1", r#"{"level":"warn","status":11,"extra":1}"#)]);
+        let second = prepared(
+            h,
+            &[("c2", r#"{"level":"info","status":2,"extra":"text"}"#)],
+        );
+        let out = append_replacing_many(h, &[first, second], &["c1"]);
+        assert_eq!(out["ok"], 0, "{out}");
+        let failed = out["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 2, "{out}");
+        assert!(
+            failed[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("typed differently"),
+            "{out}"
+        );
+        assert!(get(h, "c1").contains("\"status\":1"), "{}", get(h, "c1"));
+        assert!(get(h, "c2").is_empty(), "{}", get(h, "c2"));
         close(h);
     }
 

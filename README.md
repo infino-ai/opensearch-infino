@@ -166,7 +166,17 @@ index it names; the tables are named by the index, so the rows are there
 before the first request. Cluster state is a cache of this, rebuilt at boot,
 never the source. The security plugin's configuration index and Dashboards'
 saved objects come back the same way. The same holds for a `file://` or
-`s3://` catalog of the node's own. In the cloud: every document, the account,
+`s3://` catalog of the node's own.
+
+The security plugin's index is Infino-backed like every other, so roles,
+users and password hashes live in a table under the same credentials as the
+data (the account's key, or the bucket's), and a fresh node reads them from
+there rather than from a `securityadmin` run. The table is the only copy,
+written on every change, so it cannot be staler than the cluster was. An
+operator who wants that index in Lucene instead puts an index template on
+`.opendistro_security` with `index.infino.enabled: false`; templates sit
+above the plugin's default, and such a node then needs `securityadmin` (or
+the demo initialization) after a restart with an empty data directory. In the cloud: every document, the account,
 its credit and its limits. Nothing is kept in any shard either way.
 
 ```bash

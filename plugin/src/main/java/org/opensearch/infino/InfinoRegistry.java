@@ -71,6 +71,8 @@ final class InfinoRegistry {
 
     /** The metadata version of each index as last recorded, so a state that moved nothing writes nothing. */
     private static final Map<String, Long> recorded = new ConcurrentHashMap<>();
+    /** Indices whose metadata moved and are not yet recorded, by name; the latest metadata wins. */
+    private static final Map<String, IndexMetadata> pending = new ConcurrentHashMap<>();
     /** Whether the registry table has been declared on the connection. */
     private static final AtomicBoolean declared = new AtomicBoolean();
     /** Whether this node has rebuilt the indices from the registry since it started. */
@@ -99,22 +101,33 @@ final class InfinoRegistry {
         } else if (!event.metadataChanged()) {
             return;
         }
-        List<IndexMetadata> moved = new ArrayList<>();
+        boolean any = false;
         for (IndexMetadata md : state.metadata().indices().values()) {
             if (!md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
                 continue;
             }
             Long last = recorded.get(md.getIndex().getName());
             if (last == null || last != md.getVersion()) {
-                moved.add(md);
+                pending.put(md.getIndex().getName(), md);
+                any = true;
             }
         }
-        if (!moved.isEmpty()) {
-            threadPool.generic().execute(() -> {
-                for (IndexMetadata md : moved) {
-                    record(md);
-                }
-            });
+        if (any) {
+            threadPool.generic().execute(InfinoRegistry::drain);
+        }
+    }
+
+    /**
+     * Write every index whose metadata moved since it was last recorded.
+     * Called from the generic pool after a state applies, and by every read
+     * of the registry first, so a read sees the state the manager has seen.
+     */
+    private static synchronized void drain() {
+        for (String name : new ArrayList<>(pending.keySet())) {
+            IndexMetadata md = pending.remove(name);
+            if (md != null) {
+                record(md);
+            }
         }
     }
 
@@ -123,12 +136,19 @@ final class InfinoRegistry {
         String name = md.getIndex().getName();
         try {
             declare();
+            // A row the registry holds under this name is replaced in the same
+            // mutation as the append; a first row is appended. The engine's
+            // update replaces only what it matches, so the row is looked up
+            // first, as the writer looks ids up.
+            List<String> replaced = InfinoNative.existingOsids(TABLE, List.of(name)).isEmpty() ? List.of() : List.of(name);
             Pointer prepared = InfinoNative.prepare(TABLE, List.of(name), List.of(rowOf(md)));
             if (prepared == null) {
                 throw new IllegalStateException("the registry row could not be prepared");
             }
-            // The row under this name is replaced in the same mutation as the append.
-            InfinoNative.appendPrepared(TABLE, List.of(prepared), List.of(name));
+            InfinoNative.PreparedResult result = InfinoNative.appendPrepared(TABLE, List.of(prepared), replaced);
+            if (!result.failed().isEmpty()) {
+                throw new IllegalStateException(result.failed().get(0).reason());
+            }
             recorded.put(name, md.getVersion());
         } catch (Exception e) {
             log.warn("[infino] index {} could not be recorded in the registry", name, e);
@@ -137,6 +157,7 @@ final class InfinoRegistry {
 
     /** The index is gone: so is its row. */
     static void forget(String name) {
+        pending.remove(name);
         recorded.remove(name);
         try {
             declare();
@@ -146,8 +167,9 @@ final class InfinoRegistry {
         }
     }
 
-    /** The registry's rows: one object per recorded index, by name. */
+    /** The registry's rows: one object per recorded index, by name, after what moved is written. */
     static List<Map<String, Object>> rows() {
+        drain();
         declare();
         Map<String, Map<String, Object>> byName = new LinkedHashMap<>();
         for (Map<String, Object> row : InfinoNative.sqlRows(
