@@ -1,0 +1,182 @@
+---
+"The requests OpenSearch Dashboards sends: Discover, a visualization, a filters panel, a top hit metric":
+  - skip:
+      features: allowed_warnings
+  - do:
+      indices.create:
+        index: web
+        body:
+          settings:
+            index.infino.enabled: true
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              host: { type: keyword }
+              message: { type: text }
+              bytes: { type: long }
+              geo:
+                properties:
+                  country: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: web, _id: "1" }
+          - { "@timestamp": "2026-10-24T10:00:00Z", host: n1, message: "GET /index.html 200", bytes: 512, geo: { country: US } }
+          - index: { _index: web, _id: "2" }
+          - { "@timestamp": "2026-10-24T10:05:00Z", host: n2, message: "GET /app.js 200", bytes: 2048, geo: { country: DE } }
+          - index: { _index: web, _id: "3" }
+          - { "@timestamp": "2026-10-24T10:10:00Z", host: n1, message: "POST /login 500", bytes: 128, geo: { country: US } }
+          - index: { _index: web, _id: "4" }
+          - { "@timestamp": "2026-10-24T11:00:00Z", host: n3, message: "GET /index.html 304", bytes: 0, geo: { country: FR } }
+  - match: { errors: false }
+
+  # Discover: the document list with its histogram, as the page sends it (version, stored_fields,
+  # script_fields, docvalue_fields with a format, highlight, a bool of filters with a date range).
+  # The empty `_source.excludes` draws a deprecation warning from the request parser on 3.x.
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: web
+        body:
+          version: true
+          size: 500
+          sort: [ { "@timestamp": { order: desc, unmapped_type: boolean } } ]
+          _source: { excludes: [] }
+          aggs:
+            "2":
+              date_histogram: { field: "@timestamp", fixed_interval: 30m, time_zone: UTC, min_doc_count: 1 }
+          stored_fields: ["*"]
+          script_fields: {}
+          docvalue_fields: [ { field: "@timestamp", format: date_time } ]
+          query:
+            bool:
+              must: []
+              filter:
+                - match_all: {}
+                - range: { "@timestamp": { gte: "2026-10-24T00:00:00.000Z", lte: "2026-10-24T10:30:00.000Z", format: strict_date_optional_time } }
+              should: []
+              must_not: []
+          highlight:
+            pre_tags: ["@opensearch-dashboards-highlighted-field@"]
+            post_tags: ["@/opensearch-dashboards-highlighted-field@"]
+            fields: { "*": {} }
+            fragment_size: 2147483647
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.0._version: 1 }
+  - match: { hits.hits.0._source.host: n1 }
+  - match: { hits.hits.0.fields.@timestamp: ["2026-10-24T10:10:00.000Z"] }
+  - match: { hits.hits.2._id: "1" }
+  - length: { aggregations.2.buckets: 1 }
+  - match: { aggregations.2.buckets.0.doc_count: 3 }
+
+  # A query typed into the search bar, with the fields API as newer pages send it.
+  - do:
+      search:
+        index: web
+        body:
+          size: 10
+          fields: [ "*", { field: "@timestamp", format: epoch_millis } ]
+          _source: false
+          query:
+            bool:
+              filter:
+                - query_string: { query: "message:GET AND host:n1", analyze_wildcard: true, time_zone: UTC }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.fields.host: [n1] }
+  - match: { hits.hits.0.fields.geo\.country: [US] }
+  - match: { hits.hits.0.fields.bytes: [512] }
+  - match: { hits.hits.0.fields.@timestamp: ["1792836000000"] }
+
+  # A visualization: a terms split with a metric under it, ordered by the metric, over the time filter.
+  - do:
+      search:
+        index: web
+        body:
+          size: 0
+          aggs:
+            "2":
+              terms: { field: host, order: { "1": desc }, size: 5 }
+              aggs:
+                "1": { sum: { field: bytes } }
+          query:
+            bool:
+              filter:
+                - match_all: {}
+                - range: { "@timestamp": { gte: "2026-10-24T00:00:00.000Z", lte: "2026-10-25T00:00:00.000Z", format: strict_date_optional_time } }
+  - match: { aggregations.2.buckets.0.key: n2 }
+  - match: { aggregations.2.buckets.0.1.value: 2048.0 }
+  - match: { aggregations.2.buckets.1.key: n1 }
+  - match: { aggregations.2.buckets.1.1.value: 640.0 }
+
+  # A filters panel: each filter a query_string, as the editor sends it.
+  - do:
+      search:
+        index: web
+        body:
+          size: 0
+          aggs:
+            "3":
+              filters:
+                filters:
+                  errors: { query_string: { query: "message:500", analyze_wildcard: true } }
+                  us: { query_string: { query: "geo.country:US", analyze_wildcard: true } }
+  - match: { aggregations.3.buckets.errors.doc_count: 1 }
+  - match: { aggregations.3.buckets.us.doc_count: 2 }
+
+  # The Top Hit metric: docvalue_fields with the field's own format, the newest document per bucket.
+  - do:
+      search:
+        index: web
+        body:
+          size: 0
+          aggs:
+            "2":
+              terms: { field: geo.country, order: { _key: asc } }
+              aggs:
+                "1":
+                  top_hits:
+                    docvalue_fields: [ { field: bytes, format: use_field_mapping } ]
+                    _source: bytes
+                    size: 1
+                    sort: [ { "@timestamp": { order: desc } } ]
+  - match: { aggregations.2.buckets.0.key: DE }
+  - match: { aggregations.2.buckets.0.1.hits.hits.0.fields.bytes: [2048] }
+  - match: { aggregations.2.buckets.0.1.hits.hits.0._source: { bytes: 2048 } }
+  - match: { aggregations.2.buckets.2.key: US }
+  - match: { aggregations.2.buckets.2.1.hits.hits.0._id: "3" }
+  - match: { aggregations.2.buckets.2.1.hits.hits.0.fields.bytes: [128] }
+
+  # A filter pill on a keyword field is a match_phrase, beside the search bar's query_string.
+  - do:
+      search:
+        index: web
+        body:
+          size: 0
+          query:
+            bool:
+              must: [ { query_string: { query: "index.html", analyze_wildcard: true, time_zone: "America/New_York" } } ]
+              filter: [ { match_phrase: { host: n1 } } ]
+              should: []
+              must_not: []
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: web
+        body:
+          size: 0
+          query: { bool: { filter: [ { match_phrase: { host: n1 } } ] } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: web
+        body:
+          size: 0
+          query: { multi_match: { query: "n2", fields: [ "host", "message" ], type: phrase } }
+  - match: { hits.total.value: 1 }

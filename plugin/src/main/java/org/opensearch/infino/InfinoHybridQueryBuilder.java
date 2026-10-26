@@ -1,3 +1,7 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 package org.opensearch.infino;
 
 import java.io.IOException;
@@ -6,6 +10,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 
+import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
 
 import org.opensearch.core.ParseField;
@@ -19,8 +24,10 @@ import org.opensearch.index.query.QueryShardContext;
 /**
  * {@code infino_hybrid} query: native hybrid (BM25 + vector) search routed to
  * Infino's {@code hybrid_search}.
- * <pre>{"query":{"infino_hybrid":{"text_column":"text","query":"fox",
- *   "vector_column":"emb","vector":[...],"k":10}}}</pre>
+ * <pre>{"query":{"infino_hybrid":{"text_column":"title","query":"fox",
+ *   "vector_column":"embedding","vector":[...],"k":10}}}</pre>
+ * Both columns are named by the request: the text column must carry a text
+ * index and the vector column must be a mapped {@code knn_vector}.
  */
 public class InfinoHybridQueryBuilder extends AbstractQueryBuilder<InfinoHybridQueryBuilder> {
     public static final String NAME = "infino_hybrid";
@@ -37,9 +44,9 @@ public class InfinoHybridQueryBuilder extends AbstractQueryBuilder<InfinoHybridQ
     private final int k;
 
     public InfinoHybridQueryBuilder(String textColumn, String textQuery, String vectorColumn, float[] vector, int k) {
-        this.textColumn = textColumn == null ? "text" : textColumn;
+        this.textColumn = textColumn;
         this.textQuery = textQuery;
-        this.vectorColumn = vectorColumn == null ? "emb" : vectorColumn;
+        this.vectorColumn = vectorColumn;
         this.vector = vector;
         this.k = k;
     }
@@ -75,9 +82,9 @@ public class InfinoHybridQueryBuilder extends AbstractQueryBuilder<InfinoHybridQ
     }
 
     public static InfinoHybridQueryBuilder fromXContent(XContentParser parser) throws IOException {
-        String textColumn = "text";
+        String textColumn = null;
         String textQuery = "";
-        String vectorColumn = "emb";
+        String vectorColumn = null;
         int k = 10;
         List<Float> vec = new ArrayList<>();
         String current = null;
@@ -103,8 +110,15 @@ public class InfinoHybridQueryBuilder extends AbstractQueryBuilder<InfinoHybridQ
 
     @Override
     protected Query doToQuery(QueryShardContext context) {
-        return new InfinoVectorQuery(true, textColumn, textQuery, vectorColumn, vector, k);
+        // Served at the action layer from the table; a shard never runs it.
+        return new MatchNoDocsQuery(NAME + " is served by the Infino table");
     }
+
+    String textColumn() { return textColumn; }
+    String textQuery() { return textQuery; }
+    String vectorColumn() { return vectorColumn; }
+    float[] vector() { return vector; }
+    int k() { return k; }
 
     @Override
     protected boolean doEquals(InfinoHybridQueryBuilder o) {

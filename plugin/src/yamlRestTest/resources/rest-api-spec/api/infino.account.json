@@ -1,0 +1,17 @@
+{
+  "infino.account": {
+    "documentation": {
+      "description": "What the cluster's tables are served from, and the notice when no hosted account is stored."
+    },
+    "stability": "experimental",
+    "url": {
+      "paths": [
+        {
+          "path": "/_plugins/_infino/account",
+          "methods": ["GET"]
+        }
+      ]
+    },
+    "params": {}
+  }
+}

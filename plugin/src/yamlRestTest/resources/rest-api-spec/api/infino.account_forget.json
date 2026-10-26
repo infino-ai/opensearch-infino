@@ -1,0 +1,17 @@
+{
+  "infino.account_forget": {
+    "documentation": {
+      "description": "Forget the stored hosted account; the tables stay on the service."
+    },
+    "stability": "experimental",
+    "url": {
+      "paths": [
+        {
+          "path": "/_plugins/_infino/account",
+          "methods": ["DELETE"]
+        }
+      ]
+    },
+    "params": {}
+  }
+}

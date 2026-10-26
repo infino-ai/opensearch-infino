@@ -1,0 +1,166 @@
+---
+"Writes: an index named before it exists is created Infino-backed, and a bulk over several indices is served per index":
+  # A bulk, an index request and an update with an upsert to indices that do not exist yet create them,
+  # and the documents land in their tables, not in a shard.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: new1, _id: "n1" }
+          - { tag: x, n: 1 }
+          - index: { _index: new2, _id: "m1" }
+          - { tag: y, n: 2 }
+          - index: { _index: new1, _id: "n2" }
+          - { tag: x, n: 3 }
+  - match: { errors: false }
+  - match: { items.0.index._index: new1 }
+  - match: { items.1.index._index: new2 }
+  - match: { items.2.index._index: new1 }
+  - match: { items.2.index._id: "n2" }
+  - do:
+      indices.get_settings:
+        index: new1
+  - match: { new1.settings.index.infino.enabled: "true" }
+  - do:
+      count:
+        index: new1
+  - match: { count: 2 }
+  - do:
+      count:
+        index: new2
+  - match: { count: 1 }
+  - do:
+      get:
+        index: new2
+        id: m1
+  - match: { _source.n: 2 }
+  - do:
+      index:
+        index: new3
+        id: p1
+        refresh: true
+        body: { tag: z }
+  - do:
+      indices.get_settings:
+        index: new3
+  - match: { new3.settings.index.infino.enabled: "true" }
+  - do:
+      get:
+        index: new3
+        id: p1
+  - match: { _source.tag: z }
+  - do:
+      update:
+        index: new4
+        id: q1
+        refresh: true
+        body: { doc: { n: 7 }, doc_as_upsert: true }
+  - do:
+      get:
+        index: new4
+        id: q1
+  - match: { _source.n: 7 }
+  - do:
+      search:
+        index: new*
+        body: { size: 0 }
+  - match: { hits.total.value: 5 }
+
+  # A bulk over two existing indices answers each item in the bulk's order, failures included.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: new2, _id: "m2" }
+          - { tag: y, n: 4 }
+          - create: { _index: new1, _id: "n1" }
+          - { tag: x, n: 9 }
+          - delete: { _index: new1, _id: "n2" }
+          - index: { _index: new2, _id: "m3" }
+          - { tag: y, n: 5 }
+  - match: { errors: true }
+  - match: { items.0.index._id: "m2" }
+  - match: { items.0.index.status: 201 }
+  - match: { items.1.create.status: 409 }
+  - match: { items.2.delete._id: "n2" }
+  - match: { items.2.delete.status: 200 }
+  - match: { items.3.index._id: "m3" }
+  - match: { items.3.index.status: 201 }
+  - do:
+      count:
+        index: new1
+  - match: { count: 1 }
+  - do:
+      count:
+        index: new2
+  - match: { count: 3 }
+
+  # A write through an alias lands in the alias's index's table, as Dashboards writes its saved objects.
+  - do:
+      indices.put_alias:
+        index: new2
+        name: new-alias
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: new-alias, _id: "m4" }
+          - { tag: y, n: 6 }
+  - match: { errors: false }
+  - match: { items.0.index._index: new2 }
+  - do:
+      index:
+        index: new-alias
+        id: m5
+        refresh: true
+        body: { tag: y, n: 7 }
+  - match: { _index: new2 }
+  - do:
+      count:
+        index: new2
+  - match: { count: 5 }
+  - do:
+      get:
+        index: new-alias
+        id: m5
+  - match: { _source.n: 7 }
+  - do:
+      indices.stats:
+        index: new2
+        metric: docs
+  - match: { indices.new2.primaries.docs.count: 0 }
+
+  # An array of objects under a nested mapping (what Dashboards' saved objects carry as references) is written whole and read back whole.
+  - do:
+      indices.create:
+        index: new5
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              title: { type: keyword }
+              references:
+                type: nested
+                properties:
+                  name: { type: keyword }
+                  type: { type: keyword }
+                  id: { type: keyword }
+  - do:
+      index:
+        index: new5
+        id: v1
+        refresh: true
+        body: { title: "levels", references: [ { name: "panel_0", type: "visualization", id: "viz-1" }, { name: "panel_1", type: "visualization", id: "viz-2" } ] }
+  - do:
+      get:
+        index: new5
+        id: v1
+  - match: { _source.title: levels }
+  - match: { _source.references.1.id: viz-2 }
+  - length: { _source.references: 2 }
+  - do:
+      search:
+        index: new5
+        body: { query: { term: { title: levels } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._source.references.0.name: panel_0 }

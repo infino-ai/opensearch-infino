@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
-# Install the plugin into a built OpenSearch distribution and (re)start the node.
+# Install the plugin into an OpenSearch distribution and (re)start the node.
 #
 # Env you may override:
-#   DISTRO      path to a built OpenSearch install (bin/opensearch inside)
-#   INFINO_LIB  path to libinfino_capi.dylib  (-Dinfino.lib)
-#   INFINO_URI  Infino catalog URI            (-Dinfino.uri, e.g. file:///abs/path)
+#   DISTRO              path to an OpenSearch install of the version the zip was built for
+#   OPENSEARCH_VERSION  the version the zip was built for (default 3.9.0)
+#   INFINO_LIB          path to the native bridge         (-Dinfino.lib)
+#   INFINO_URI          Infino catalog URI                (-Dinfino.uri: file:///abs/path, s3://bucket/prefix, ...)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-WS="$(cd "$HERE/.." && pwd)"
-DISTRO="${DISTRO:-$WS/OpenSearch/distribution/archives/darwin-arm64-tar/build/install/opensearch-3.10.0-SNAPSHOT}"
-INFINO_LIB="${INFINO_LIB:-$HERE/infino-capi/target/release/libinfino_capi.dylib}"
+OPENSEARCH_VERSION="${OPENSEARCH_VERSION:-3.9.0}"
+DISTRO="${DISTRO:?set DISTRO to an OpenSearch $OPENSEARCH_VERSION install}"
+case "$(uname -s)" in
+  Darwin) DEFAULT_LIB="$HERE/infino-capi/target/release/libinfino_capi.dylib" ;;
+  *)      DEFAULT_LIB="$HERE/infino-capi/target/release/libinfino_capi.so" ;;
+esac
+INFINO_LIB="${INFINO_LIB:-$DEFAULT_LIB}"
 INFINO_URI="${INFINO_URI:-file://$HERE/data}"
-export JAVA_HOME="${JAVA21_HOME:-/opt/homebrew/opt/openjdk@21}"
-export OPENSEARCH_JAVA_HOME="$JAVA_HOME"; export PATH="$JAVA_HOME/bin:$PATH"
 
-ZIP=$(ls "$WS"/OpenSearch/plugins/examples/infino-engine/build/distributions/infino-engine-*.zip | head -1)
+ZIP="$HERE/plugin/build/distributions/infino-engine-$OPENSEARCH_VERSION.zip"
 echo "==> (re)installing plugin: $ZIP"
 "$DISTRO/bin/opensearch-plugin" remove infino-engine 2>/dev/null || true
 "$DISTRO/bin/opensearch-plugin" install -b "file://$ZIP"
 
-# Pass the dylib + catalog location as JVM system properties.
-export OPENSEARCH_JAVA_OPTS="-Dinfino.lib=$INFINO_LIB -Dinfino.uri=$INFINO_URI"
+# The bridge and the catalog location are JVM system properties.
+export OPENSEARCH_JAVA_OPTS="${OPENSEARCH_JAVA_OPTS:-} -Dinfino.lib=$INFINO_LIB -Dinfino.uri=$INFINO_URI"
 echo "==> starting node  (infino.lib=$INFINO_LIB  infino.uri=$INFINO_URI)"
 mkdir -p "$HERE/data"
 exec "$DISTRO/bin/opensearch"

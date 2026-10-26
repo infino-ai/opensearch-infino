@@ -1,23 +1,168 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+// Standalone build against a released OpenSearch: no source checkout needed.
+// Pick the target with -Dopensearch.version=<release>; the plugin zip only
+// installs into that exact version.
+buildscript {
+    ext {
+        opensearch_version = System.getProperty("opensearch.version", "3.9.0")
+    }
+    repositories {
+        mavenLocal()
+        maven { url = "https://ci.opensearch.org/maven2/" }
+        maven { url = "https://ci.opensearch.org/m2/" }
+        mavenCentral()
+        maven { url = "https://plugins.gradle.org/m2/" }
+    }
+    dependencies {
+        classpath "org.opensearch.gradle:build-tools:${opensearch_version}"
+    }
+}
+
+apply plugin: 'java'
 apply plugin: 'opensearch.opensearchplugin'
+apply plugin: 'opensearch.yaml-rest-test'
+// The Java agent replaced the security manager in 3.x; 2.x build tools have no such
+// plugin, and every later major is taken to have it.
+if (!opensearch_version.startsWith('2.')) {
+    apply plugin: 'opensearch.java-agent'
+}
+
+java {
+    targetCompatibility = JavaVersion.VERSION_21
+    sourceCompatibility = JavaVersion.VERSION_21
+}
+
+// The security plugin's document- and field-level rules are enforced from
+// its own evaluation, which the plugin reaches by extending it: from 3.6 the
+// security plugin is extensible and registers the component holding that
+// evaluation, so it becomes a dependency and its classes load for ours. On
+// 2.x the rules arrive as thread-context headers and a restricted request is
+// refused; on 3.0 to 3.5 the security plugin cannot be extended (3.0) or
+// keeps the evaluation where nothing can read it, so any user's request is
+// refused, the suites' admin included, so the test cluster runs the security
+// plugin only where requests from users are served.
+def securityVersion = "${opensearch_version}.0"
+def (versionMajor, versionMinor) = opensearch_version.tokenize('.')[0..1].collect { it as int }
+def extendsSecurity = versionMajor > 3 || (versionMajor == 3 && versionMinor >= 6)
+def securityOnTestCluster = extendsSecurity || versionMajor == 2
 
 opensearchplugin {
-  name = 'infino-engine'
-  description = 'Spike: back OpenSearch shards with the Infino engine (JNA bridge)'
-  classname = 'org.opensearch.infino.InfinoPlugin'
-  licenseFile = rootProject.file('licenses/APACHE-LICENSE-2.0.txt')
-  noticeFile = rootProject.file('NOTICE.txt')
+    name = 'infino-engine'
+    description = 'Back OpenSearch shards with the Infino engine (JNA bridge)'
+    classname = 'org.opensearch.infino.InfinoPlugin'
+    licenseFile = rootProject.file('LICENSE.txt')
+    noticeFile = rootProject.file('NOTICE.txt')
+    if (extendsSecurity) {
+        extendedPlugins = ['opensearch-security']
+    }
+}
+
+// Two classes exist per release line: the one reading the security plugin's
+// rules (its own evaluation from 3.6, the thread context before) and the
+// one holding the node client (whose package moved in 3.0). The tree for
+// the target release joins the build.
+sourceSets.main.java.srcDirs += extendsSecurity ? 'src/main/security3' : 'src/main/security2'
+sourceSets.main.java.srcDirs += versionMajor >= 3 ? 'src/main/client3' : 'src/main/client2'
+
+configurations {
+    securityPlugin
+}
+
+repositories {
+    mavenLocal()
+    maven { url = "https://ci.opensearch.org/maven2/" }
+    maven { url = "https://ci.opensearch.org/m2/" }
+    mavenCentral()
+    maven { url = "https://plugins.gradle.org/m2/" }
 }
 
 dependencies {
-  compileOnly 'net.java.dev.jna:jna:5.16.0'
+    // OpenSearch ships JNA itself; compiling against it (not bundling) avoids jar hell.
+    compileOnly "net.java.dev.jna:jna:${versions.jna}"
+    // The security plugin of the target release: installed on the test cluster
+    // for every major, and on 3.x also compiled against (its jars, read out of
+    // the zip; at runtime they come from the plugin itself, extended).
+    securityPlugin "org.opensearch.plugin:opensearch-security:${securityVersion}@zip"
+    if (extendsSecurity) {
+        // The security plugin's own jar, and guava, whose immutable collections
+        // its rule objects hand back; the rest of its zip is not needed to compile.
+        compileOnly files({
+            zipTree(configurations.securityPlugin.singleFile).matching {
+                include 'opensearch-security-*.jar'
+                include 'guava-*.jar'
+            }
+        })
+    }
 }
 
-// --- spike: relax the strict plugin-dev gates so we can iterate fast ---
-test.enabled = false
-tasks.configureEach { t ->
-  if (t.name in ['dependencyLicenses', 'thirdPartyAudit', 'forbiddenApisMain',
-                 'forbiddenApisTest', 'loggerUsageCheck', 'validateNebulaPom',
-                 'namingConventionsMain', 'licenseHeaders']) {
-    t.enabled = false
-  }
+configurations.all {
+    resolutionStrategy {
+        // The test framework and the server disagree on these annotation-only jars.
+        force "com.google.errorprone:error_prone_annotations:${versions.error_prone_annotations}"
+        force "org.jspecify:jspecify:1.0.1"
+    }
+}
+
+// Needs a jar that build-tools does not publish.
+loggerUsageCheck.enabled = false
+// No Maven publication of this plugin.
+validateNebulaPom.enabled = false
+
+test {
+    include '**/*Tests.class'
+}
+
+// Where the sibling Rust build leaves the native bridge, and a catalog on local
+// disk for the test cluster (memory:// tables cannot take deletes). Both can be
+// pointed elsewhere with -Dinfino.lib / -Dinfino.uri.
+def defaultLib = file("${projectDir}/../infino-capi/target/release/libinfino_capi.so").absolutePath
+def defaultData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog"
+def defaultUri = "file://${defaultData}"
+
+// The test cluster runs the security plugin, enabled, with the demo node
+// certificates on the transport layer and plain HTTP with basic
+// authentication: the suites run as admin, and the security suite sends
+// its requests as restricted users. The security plugin's own index is
+// Infino-backed like every other, which is part of what the suites verify.
+def securityResources = file("${projectDir}/src/yamlRestTest/resources/security")
+
+testClusters.all {
+    systemProperty 'infino.lib', System.getProperty('infino.lib', defaultLib)
+    systemProperty 'infino.uri', System.getProperty('infino.uri', defaultUri)
+    // The security policy grants the file catalog's directory by this property.
+    systemProperty 'infino.data', System.getProperty('infino.data', defaultData)
+    // The SQL each request runs, in the node log, so a wrong answer can be read back.
+    setting 'logger.org.opensearch.infino', 'DEBUG'
+
+    if (securityOnTestCluster) {
+        plugin(layout.file(provider { configurations.securityPlugin.singleFile }))
+        // Plain HTTP with basic authentication; the build's own wait for cluster
+        // health sends no credentials, so the anonymous user may read it (see the
+        // cluster_health role in the security configuration).
+        setting 'plugins.security.disabled', 'false'
+        setting 'plugins.security.ssl.http.enabled', 'false'
+        setting 'plugins.security.ssl.transport.pemcert_filepath', 'esnode.pem'
+        setting 'plugins.security.ssl.transport.pemkey_filepath', 'esnode-key.pem'
+        setting 'plugins.security.ssl.transport.pemtrustedcas_filepath', 'root-ca.pem'
+        setting 'plugins.security.ssl.transport.enforce_hostname_verification', 'false'
+        setting 'plugins.security.allow_unsafe_democertificates', 'true'
+        setting 'plugins.security.allow_default_init_securityindex', 'true'
+        setting 'plugins.security.authcz.admin_dn', 'CN=kirk,OU=client,O=client,L=test,C=de'
+        extraConfigFile 'esnode.pem', file("${securityResources}/certs/esnode.pem")
+        extraConfigFile 'esnode-key.pem', file("${securityResources}/certs/esnode-key.pem")
+        extraConfigFile 'root-ca.pem', file("${securityResources}/certs/root-ca.pem")
+        fileTree("${securityResources}/opensearch-security").each { f ->
+            extraConfigFile "opensearch-security/${f.name}", f
+        }
+    }
+}
+
+// A run that dies before its shards are deleted leaves their tables; each run starts clean.
+tasks.named('yamlRestTest').configure {
+    doFirst {
+        delete layout.buildDirectory.dir('infino-catalog')
+    }
 }

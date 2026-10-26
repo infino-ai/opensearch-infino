@@ -1,0 +1,157 @@
+---
+"Dashboard aggregations on an Infino index":
+  - do:
+      indices.create:
+        index: events
+        body:
+          settings:
+            index.infino.enabled: true
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              host: { type: keyword }
+              level: { type: keyword }
+              region: { type: keyword }
+              status: { type: long }
+              took: { type: float }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: events, _id: "1" }
+          - { "@timestamp": "2026-10-24T10:00:00Z", host: n1, level: error, region: eu, status: 500, took: 1 }
+          - index: { _index: events, _id: "2" }
+          - { "@timestamp": "2026-10-24T10:01:00Z", host: n1, level: info, region: eu, status: 200, took: 2 }
+          - index: { _index: events, _id: "3" }
+          - { "@timestamp": "2026-10-24T10:02:00Z", host: n2, level: info, region: eu, status: 200, took: 3 }
+          - index: { _index: events, _id: "4" }
+          - { "@timestamp": "2026-10-24T10:03:00Z", host: n2, level: warn, region: us, status: 404, took: 4 }
+          - index: { _index: events, _id: "5" }
+          - { "@timestamp": "2026-10-24T10:04:00Z", host: n3, level: error, region: us, status: 503, took: 5 }
+          - index: { _index: events, _id: "6" }
+          - { "@timestamp": "2026-10-24T10:05:00Z", host: n3, level: info, region: us, status: 200, took: 6 }
+          - index: { _index: events, _id: "7" }
+          - { "@timestamp": "2026-10-24T11:00:00Z", host: n1, level: info, region: eu, status: 201, took: 7 }
+          - index: { _index: events, _id: "8" }
+          - { "@timestamp": "2026-10-24T11:30:00Z", host: n2, level: error, region: us, status: 500, took: 8 }
+  - match: { errors: false }
+
+  # Unique count, percentiles, filters, ranges and a numeric histogram: the panels beyond count/sum.
+  - do:
+      search:
+        index: events
+        body:
+          size: 0
+          aggs:
+            hosts: { cardinality: { field: host } }
+            pct: { percentiles: { field: took, percents: [50, 95] } }
+            by_level:
+              filters:
+                filters:
+                  errors: { term: { level: error } }
+                  infos: { term: { level: info } }
+            by_status:
+              range:
+                field: status
+                ranges: [ { to: 300 }, { from: 300, to: 500 }, { from: 500 } ]
+            by_time:
+              date_range:
+                field: "@timestamp"
+                ranges: [ { to: "2026-10-24T10:04:00Z" }, { from: "2026-10-24T10:04:00Z" } ]
+            status_hist: { histogram: { field: status, interval: 100 } }
+  - match: { hits.total.value: 8 }
+  - match: { aggregations.hosts.value: 3 }
+  - gte: { aggregations.pct.values.50\.0: 3.5 }
+  - lte: { aggregations.pct.values.50\.0: 5.5 }
+  - gte: { aggregations.pct.values.95\.0: 7.0 }
+  - lte: { aggregations.pct.values.95\.0: 8.0 }
+  - match: { aggregations.by_level.buckets.errors.doc_count: 3 }
+  - match: { aggregations.by_level.buckets.infos.doc_count: 4 }
+  - match: { aggregations.by_status.buckets.0.doc_count: 4 }
+  - match: { aggregations.by_status.buckets.1.doc_count: 1 }
+  - match: { aggregations.by_status.buckets.2.doc_count: 3 }
+  - match: { aggregations.by_time.buckets.0.doc_count: 4 }
+  - match: { aggregations.by_time.buckets.1.doc_count: 4 }
+  # min_doc_count defaults to 0, so the empty 300 bucket is filled in, as stock does.
+  - length: { aggregations.status_hist.buckets: 4 }
+  - match: { aggregations.status_hist.buckets.0.key: 200.0 }
+  - match: { aggregations.status_hist.buckets.0.doc_count: 4 }
+  - match: { aggregations.status_hist.buckets.1.key: 300.0 }
+  - match: { aggregations.status_hist.buckets.1.doc_count: 0 }
+  - match: { aggregations.status_hist.buckets.3.key: 500.0 }
+  - match: { aggregations.status_hist.buckets.3.doc_count: 3 }
+
+  # Split chart by region, split series by host, a time axis under both, a metric at the leaf.
+  - do:
+      search:
+        index: events
+        body:
+          size: 0
+          aggs:
+            regions:
+              terms: { field: region }
+              aggs:
+                hosts:
+                  terms: { field: host }
+                  aggs:
+                    over_time:
+                      date_histogram: { field: "@timestamp", calendar_interval: 1h }
+                      aggs:
+                        avg_took: { avg: { field: took } }
+  - match: { aggregations.regions.buckets.0.key: eu }
+  - match: { aggregations.regions.buckets.0.doc_count: 4 }
+  - match: { aggregations.regions.buckets.0.hosts.buckets.0.key: n1 }
+  - match: { aggregations.regions.buckets.0.hosts.buckets.0.doc_count: 3 }
+  - length: { aggregations.regions.buckets.0.hosts.buckets.0.over_time.buckets: 2 }
+  - match: { aggregations.regions.buckets.0.hosts.buckets.0.over_time.buckets.0.doc_count: 2 }
+  - match: { aggregations.regions.buckets.0.hosts.buckets.0.over_time.buckets.0.avg_took.value: 1.5 }
+  - match: { aggregations.regions.buckets.0.hosts.buckets.0.over_time.buckets.1.avg_took.value: 7.0 }
+  - match: { aggregations.regions.buckets.0.hosts.buckets.1.key: n2 }
+  - match: { aggregations.regions.buckets.1.key: us }
+  - match: { aggregations.regions.buckets.1.hosts.buckets.0.doc_count: 2 }
+
+  # A filter bucket under a time axis, and a metric order on terms.
+  - do:
+      search:
+        index: events
+        body:
+          size: 0
+          aggs:
+            over_time:
+              date_histogram: { field: "@timestamp", calendar_interval: 1h }
+              aggs:
+                errors:
+                  filters:
+                    filters:
+                      e: { term: { level: error } }
+            slow_hosts:
+              terms: { field: host, order: { max_took: desc } }
+              aggs:
+                max_took: { max: { field: took } }
+  - match: { aggregations.over_time.buckets.0.errors.buckets.e.doc_count: 2 }
+  - match: { aggregations.over_time.buckets.1.errors.buckets.e.doc_count: 1 }
+  - match: { aggregations.slow_hosts.buckets.0.key: n2 }
+  - match: { aggregations.slow_hosts.buckets.0.max_took.value: 8.0 }
+
+  # Terms over a float column: double keys, every value its own bucket.
+  - do:
+      search:
+        index: events
+        body:
+          size: 0
+          aggs:
+            by_took: { terms: { field: took, size: 3 } }
+  - length: { aggregations.by_took.buckets: 3 }
+  - match: { aggregations.by_took.buckets.0.key: 1.0 }
+  - match: { aggregations.by_took.buckets.0.doc_count: 1 }
+  - match: { aggregations.by_took.sum_other_doc_count: 5 }
+
+  # What the table cannot serve is refused with the reason, not answered empty.
+  - do:
+      catch: bad_request
+      search:
+        index: events
+        body:
+          query: { fuzzy: { host: n0 } }

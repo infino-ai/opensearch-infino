@@ -1,0 +1,27 @@
+---
+# The test cluster's authentication: HTTP basic against the internal user
+# database, nothing else.
+_meta:
+  type: "config"
+  config_version: 2
+
+config:
+  dynamic:
+    http:
+      # The build's own wait for cluster health sends no credentials; the
+      # anonymous user may read cluster health (the cluster_health role).
+      anonymous_auth_enabled: true
+      xff:
+        enabled: false
+    authc:
+      basic_internal_auth_domain:
+        description: "HTTP basic against the internal users"
+        http_enabled: true
+        transport_enabled: true
+        order: 0
+        http_authenticator:
+          type: basic
+          challenge: true
+        authentication_backend:
+          type: intern
+    authz: {}

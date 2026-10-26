@@ -1,0 +1,22 @@
+{
+  "infino.account_indices": {
+    "documentation": {
+      "description": "The indices the registry beside the tables would bring back on a fresh cluster; with name, whether that one is registered."
+    },
+    "stability": "experimental",
+    "url": {
+      "paths": [
+        {
+          "path": "/_plugins/_infino/account/indices",
+          "methods": ["GET"]
+        }
+      ]
+    },
+    "params": {
+      "name": {
+        "type": "string",
+        "description": "One index to look up"
+      }
+    }
+  }
+}

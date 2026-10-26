@@ -1,0 +1,9 @@
+---
+# Read by the 2.x security plugin only; 3.x has no such configuration type.
+_meta:
+  type: "whitelist"
+  config_version: 2
+
+config:
+  enabled: false
+  requests: {}

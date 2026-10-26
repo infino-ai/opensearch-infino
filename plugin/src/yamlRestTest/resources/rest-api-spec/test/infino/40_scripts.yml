@@ -1,0 +1,151 @@
+---
+"Scripts run as column expressions: scripted fields, script queries, scripted aggregations and sorts":
+  - do:
+      indices.create:
+        index: inv
+        body:
+          settings:
+            index.infino.enabled: true
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              category: { type: keyword }
+              brand: { type: keyword }
+              price: { type: float }
+              qty: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: inv, _id: "1" }
+          - { "@timestamp": "2026-10-24T10:00:00Z", category: coats, brand: acme, price: 120, qty: 2 }
+          - index: { _index: inv, _id: "2" }
+          - { "@timestamp": "2026-10-24T11:00:00Z", category: coats, brand: acme, price: 80, qty: 1 }
+          - index: { _index: inv, _id: "3" }
+          - { "@timestamp": "2026-10-24T12:00:00Z", category: scarves, brand: acme, price: 20, qty: 5 }
+          - index: { _index: inv, _id: "4" }
+          - { "@timestamp": "2026-10-25T10:00:00Z", category: shoes, brand: zed, price: 150, qty: 1 }
+          - index: { _index: inv, _id: "5" }
+          - { "@timestamp": "2026-10-25T11:00:00Z", category: shoes, brand: zed, price: 50, qty: 3 }
+          - index: { _index: inv, _id: "6" }
+          - { "@timestamp": "2026-10-25T12:00:00Z", category: hats, brand: zed, price: 15, qty: 10 }
+          - index: { _index: inv, _id: "7" }
+          - { "@timestamp": "2026-10-26T10:00:00Z", category: hats, brand: acme, price: 35, qty: 4 }
+          - index: { _index: inv, _id: "8" }
+          - { "@timestamp": "2026-10-26T11:00:00Z", category: scarves, brand: zed, price: 60, qty: 2 }
+  - match: { errors: false }
+
+  # Scripted fields: arithmetic, a date method, a string built from two columns, an if/else chain.
+  - do:
+      search:
+        index: inv
+        body:
+          query: { ids: { values: ["1"] } }
+          script_fields:
+            total: { script: { source: "doc['price'].value * doc['qty'].value" } }
+            hour: { script: { source: "doc['@timestamp'].value.getHour()" } }
+            label: { script: { source: "doc['category'].value + '/' + doc['brand'].value" } }
+            tier: { script: { source: "if (doc['price'].value >= 100) { return 'high'; } else if (doc['price'].value >= 50) { return 'mid'; } return 'low';" } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0.fields.total: [240] }
+  - match: { hits.hits.0.fields.hour: [10] }
+  - match: { hits.hits.0.fields.label: ["coats/acme"] }
+  - match: { hits.hits.0.fields.tier: ["high"] }
+  - match: { hits.hits.0._source.price: 120 }
+
+  # A script query is a predicate; params are literals; def and return are read.
+  - do:
+      search:
+        index: inv
+        body:
+          size: 0
+          query: { script: { script: { source: "doc['price'].value * doc['qty'].value > 200", lang: painless } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: inv
+        body:
+          size: 0
+          query: { script: { script: { source: "def t = doc['price'].value * params.rate; return t > params.min;", params: { rate: 2, min: 200 } } } }
+  - match: { hits.total.value: 2 }
+
+  # The helper-function form Dashboards emits for a filter on a scripted field, for equality and for a range.
+  - do:
+      search:
+        index: inv
+        body:
+          size: 0
+          query:
+            script:
+              script:
+                source: "boolean compare(Supplier s, def v) {return s.get() == v;}compare(() -> { return doc['category'].value }, params.value);"
+                params: { value: hats }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: inv
+        body:
+          size: 0
+          query:
+            script:
+              script:
+                source: "boolean gte(Supplier s, def v) {return s.get() >= v;}boolean lte(Supplier s, def v) {return s.get() <= v;}gte(() -> { doc['price'].value * doc['qty'].value }, params.gte) && lte(() -> { doc['price'].value * doc['qty'].value }, params.lte)"
+                params: { gte: 100, lte: 150 }
+  - match: { hits.total.value: 6 }
+
+  # Scripted aggregation sources: terms over a built string, a histogram over a value script, a scripted sum, a composite source.
+  - do:
+      search:
+        index: inv
+        body:
+          size: 0
+          aggs:
+            pairs:
+              terms: { script: { source: "doc['category'].value + '-' + doc['brand'].value" }, order: { _key: asc } }
+            tens:
+              histogram: { field: price, script: { source: "_value / 10" }, interval: 5 }
+            revenue:
+              sum: { script: { source: "doc['price'].value * doc['qty'].value" } }
+            cheap:
+              range:
+                script: { source: "doc['price'].value * doc['qty'].value" }
+                ranges: [ { to: 100 }, { from: 100 } ]
+            paged:
+              composite:
+                size: 2
+                sources:
+                  - cb: { terms: { script: { source: "doc['category'].value + '/' + doc['brand'].value" } } }
+  - match: { aggregations.pairs.buckets.0.key: coats-acme }
+  - match: { aggregations.pairs.buckets.0.doc_count: 2 }
+  - length: { aggregations.pairs.buckets: 6 }
+  - length: { aggregations.tens.buckets: 4 }
+  - match: { aggregations.tens.buckets.0.key: 0.0 }
+  - match: { aggregations.tens.buckets.0.doc_count: 3 }
+  - match: { aggregations.tens.buckets.3.key: 15.0 }
+  - match: { aggregations.revenue.value: 1130.0 }
+  - match: { aggregations.cheap.buckets.0.doc_count: 1 }
+  - match: { aggregations.cheap.buckets.1.doc_count: 7 }
+  - length: { aggregations.paged.buckets: 2 }
+  - match: { aggregations.paged.buckets.0.key: { cb: "coats/acme" } }
+  - match: { aggregations.paged.after_key: { cb: "hats/acme" } }
+
+  # A script sort orders by the expression.
+  - do:
+      search:
+        index: inv
+        body:
+          sort: [ { _script: { type: number, script: { source: "doc['price'].value * doc['qty'].value" }, order: desc } } ]
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.7._id: "2" }
+
+  # What the reader does not know is refused with the script named, not run elsewhere.
+  - do:
+      catch: bad_request
+      search:
+        index: inv
+        body:
+          size: 0
+          query: { script: { script: { source: "for (int i = 0; i < 3; i++) { } return true;" } } }
+  - match: { error.reason: "/.*script.*for.*/" }

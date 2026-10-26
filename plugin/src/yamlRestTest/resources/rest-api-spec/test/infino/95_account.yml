@@ -1,0 +1,125 @@
+---
+"Without an account the route says what is served and what accepting means":
+  - do:
+      infino.account: {}
+  - match: { configured: false }
+  - match:
+      serving: /^file:.*/
+  - match: { notice.0: "The hosted service holds every document of this cluster." }
+  - is_false: platform
+  - is_false: api_key
+
+---
+"A trial is not asked for without an acceptance":
+  - do:
+      catch: bad_request
+      infino.account_trial:
+        body: { "platform": "https://nobody.invalid" }
+  - match: { created: false }
+  - match:
+      notice.1: /.*nobody\.invalid.*documents\sthemselves.*/
+
+  - do:
+      catch: bad_request
+      infino.account_trial:
+        body: { "accept": false }
+  - match: { created: false }
+
+---
+"Using an account needs its key and a service URL":
+  - do:
+      catch: bad_request
+      infino.account_store:
+        body: { "platform": "https://nobody.invalid" }
+  - match:
+      error.reason: /.*api_key\sis\srequired.*/
+
+  - do:
+      catch: bad_request
+      infino.account_store:
+        body: { "platform": "ftp://nobody.invalid", "api_key": "ik_x" }
+  - match:
+      error.reason: /.*must\sbe\san\shttp.*URL.*/
+
+  - do:
+      catch: bad_request
+      infino.account_store:
+        body: { "platform": "https://nobody.invalid", "api_key": "ik_x", "database": "_bad name" }
+  - match:
+      error.reason: /.*database\smust\sbe.*/
+
+---
+"Only a caller who may manage the cluster can point the node at a service":
+  - skip:
+      version: "3.0.0 - 3.5.99"
+      reason: the test cluster runs without the security plugin on these releases, so every caller has the right
+      features: headers
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      catch: forbidden
+      infino.account_store:
+        body: { "platform": "https://nobody.invalid", "api_key": "ik_x" }
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      catch: forbidden
+      infino.account_trial:
+        body: { "accept": true, "platform": "https://nobody.invalid" }
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      catch: forbidden
+      infino.account_forget: {}
+  # Reading what is served needs no such right.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      infino.account: {}
+  - match: { configured: false }
+
+---
+"Forgetting with no account in use changes nothing":
+  - do:
+      infino.account_forget: {}
+  - match: { forgotten: false }
+  - do:
+      infino.account: {}
+  - match: { configured: false }
+
+---
+"The registry beside the tables names every index with its aliases, and forgets a deleted one":
+  - do:
+      indices.create:
+        index: reg1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              message: { type: text }
+          aliases:
+            reg-read: {}
+            reg-write: { is_write_index: true }
+  - do:
+      cluster.health:
+        index: reg1
+        wait_for_status: green
+  - do:
+      index:
+        index: reg1
+        id: "1"
+        body: { "@timestamp": "2026-10-25T10:00:00Z", "message": "registered" }
+
+  - do:
+      infino.account_indices:
+        name: reg1
+  - match:
+      serving: /^file:.*/
+  - match: { registered: true }
+  - match: { table: os_reg1 }
+  - match: { aliases: ["reg-read", "reg-write"] }
+
+  - do:
+      indices.delete:
+        index: reg1
+  - do:
+      infino.account_indices:
+        name: reg1
+  - match: { registered: false }

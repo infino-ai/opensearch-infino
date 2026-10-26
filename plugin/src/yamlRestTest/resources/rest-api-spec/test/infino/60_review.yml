@@ -1,0 +1,332 @@
+---
+"Review fixes: paging across indices, search_after ties, bool seams, missing values, time zones, writes":
+  - do:
+      indices.create:
+        index: rev1
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              tag: { type: keyword }
+              title: { type: text }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: rev2
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              tag: { type: keyword }
+              title: { type: text }
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: rev1, _id: "a1" }
+          - { "@timestamp": "2026-10-24T10:00:00Z", tag: x, title: "wool coat", n: 1 }
+          - index: { _index: rev1, _id: "a2" }
+          - { "@timestamp": "2026-10-24T10:00:00Z", tag: x, title: "coat of wool", n: 3 }
+          - index: { _index: rev1, _id: "a3" }
+          - { "@timestamp": "2026-10-24T10:00:00Z", tag: y, title: "silk scarf", n: 5 }
+          - index: { _index: rev1, _id: "a4" }
+          - { "@timestamp": "2026-10-24T10:00:00Z", title: "no tag here", n: 7 }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: rev2, _id: "b1" }
+          - { "@timestamp": "2026-10-24T10:00:00Z", tag: x, title: "wool hat", n: 2 }
+          - index: { _index: rev2, _id: "b2" }
+          - { "@timestamp": "2026-10-25T03:30:00Z", tag: z, title: "felt hat", n: 4 }
+          - index: { _index: rev2, _id: "b3" }
+          - { "@timestamp": "2026-10-25T05:30:00Z", tag: z, n: 6 }
+  - match: { errors: false }
+
+  # The window is applied once over the merged pages: from 2, size 3 over seven rows by n.
+  - do:
+      search:
+        index: rev*
+        body:
+          from: 2
+          size: 3
+          sort: [ { n: asc } ]
+  - match: { hits.total.value: 7 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "a2" }
+  - match: { hits.hits.1._id: "b2" }
+  - match: { hits.hits.2._id: "a3" }
+
+  # search_after through rows sharing the sort value: the id breaks the tie and comes back in the sort values.
+  - do:
+      search:
+        index: rev1
+        body:
+          size: 2
+          sort: [ { "@timestamp": asc } ]
+  - length: { hits.hits: 2 }
+  - length: { hits.hits.1.sort: 2 }
+  - match: { hits.hits.0._id: "a1" }
+  - match: { hits.hits.1._id: "a2" }
+  - set: { hits.hits.1.sort: after }
+  - do:
+      search:
+        index: rev1
+        body:
+          size: 2
+          sort: [ { "@timestamp": asc } ]
+          search_after: $after
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "a3" }
+  - match: { hits.hits.1._id: "a4" }
+
+  # Rows missing the sort value come last and are reached by paging, not lost.
+  - do:
+      search:
+        index: rev2
+        body:
+          size: 2
+          sort: [ { tag: asc } ]
+  - match: { hits.hits.0._id: "b1" }
+  - match: { hits.hits.1._id: "b2" }
+  - set: { hits.hits.1.sort: after2 }
+  - do:
+      search:
+        index: rev2
+        body:
+          size: 2
+          sort: [ { tag: asc } ]
+          search_after: $after2
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "b3" }
+
+  # should beside must_not with no must still filters; must_not keeps the rows without the field.
+  - do:
+      search:
+        index: rev1
+        body:
+          size: 0
+          query:
+            bool:
+              should: [ { term: { tag: x } }, { term: { tag: y } } ]
+              must_not: [ { term: { n: 1 } } ]
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: rev1
+        body:
+          size: 0
+          query: { bool: { must_not: [ { term: { tag: x } } ] } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: rev1
+        body:
+          size: 0
+          query:
+            bool:
+              should: [ { term: { tag: x } }, { term: { n: 5 } }, { term: { title: wool } } ]
+              minimum_should_match: 2
+  - match: { hits.total.value: 2 }
+
+  # A match on a number is an equality; a prefix on a text column is a term's prefix.
+  - do:
+      search:
+        index: rev1
+        body:
+          size: 0
+          query: { match: { n: 5 } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: rev1
+        body:
+          size: 0
+          query: { prefix: { title: wo } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: rev1
+        body:
+          size: 0
+          query: { query_string: { query: "n:[-10 TO 3]" } }
+  - match: { hits.total.value: 2 }
+
+  # terms: the missing value takes no slot and is no one's other count.
+  - do:
+      search:
+        index: rev1
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, size: 1 } }
+  - length: { aggregations.tags.buckets: 1 }
+  - match: { aggregations.tags.buckets.0.key: x }
+  - match: { aggregations.tags.buckets.0.doc_count: 2 }
+  - match: { aggregations.tags.sum_other_doc_count: 1 }
+
+  # A fixed interval bins on the request's zone: midnight in New York is 04:00Z, so the
+  # 25th's 03:30Z row is still the 24th there and the 05:30Z row opens the 25th.
+  - do:
+      search:
+        index: rev2
+        body:
+          size: 0
+          aggs:
+            days: { date_histogram: { field: "@timestamp", fixed_interval: 1d, time_zone: America/New_York } }
+  - length: { aggregations.days.buckets: 2 }
+  - match: { aggregations.days.buckets.0.key_as_string: "2026-10-24T00:00:00.000-04:00" }
+  - match: { aggregations.days.buckets.0.doc_count: 2 }
+  - match: { aggregations.days.buckets.1.doc_count: 1 }
+
+  # A read after an acknowledged write sees the write, and an update merges into the table's row, not a prefetched one.
+  - do:
+      mget:
+        body: { docs: [ { _index: rev1, _id: "a1" }, { _index: rev1, _id: "a2" } ] }
+  - match: { docs.0._source.n: 1 }
+  - do:
+      update:
+        index: rev1
+        id: a1
+        refresh: true
+        body: { doc: { n: 11 } }
+  - do:
+      get:
+        index: rev1
+        id: a1
+  - match: { _source.n: 11 }
+  - do:
+      update:
+        index: rev1
+        id: a1
+        refresh: true
+        body: { doc: { extra: "later" } }
+  - do:
+      get:
+        index: rev1
+        id: a1
+  - match: { _source.n: 11 }
+  - match: { _source.extra: "later" }
+
+  # op_type create over an existing id conflicts and writes nothing. Every document reports
+  # version 1 at sequence number 0, primary term 1; a write conditioned on those values is
+  # served as unconditioned, one on any other value is refused.
+  - do:
+      catch: conflict
+      create:
+        index: rev1
+        id: a1
+        body: { n: 99 }
+  - do:
+      get:
+        index: rev1
+        id: a1
+  - match: { _source.n: 11 }
+  - match: { _version: 1 }
+  - match: { _seq_no: 0 }
+  - match: { _primary_term: 1 }
+  - do:
+      catch: bad_request
+      index:
+        index: rev1
+        id: a1
+        version: 5
+        version_type: external
+        body: { n: 99 }
+  - do:
+      catch: bad_request
+      index:
+        index: rev1
+        id: a1
+        if_seq_no: 1
+        if_primary_term: 1
+        body: { n: 99 }
+  - do:
+      index:
+        index: rev1
+        id: a1
+        if_seq_no: 0
+        if_primary_term: 1
+        refresh: true
+        body: { n: 12, extra: "later" }
+  - match: { _seq_no: 0 }
+  - match: { _primary_term: 1 }
+  - do:
+      get:
+        index: rev1
+        id: a1
+  - match: { _source.n: 12 }
+  - do:
+      search:
+        index: rev1
+        body: { size: 1, seq_no_primary_term: true, query: { term: { n: 12 } } }
+  - match: { hits.hits.0._seq_no: 0 }
+  - match: { hits.hits.0._primary_term: 1 }
+
+  # get and mget through an alias, and get with a source filter.
+  - do:
+      indices.put_alias:
+        index: rev1
+        name: rev-alias
+  - do:
+      get:
+        index: rev-alias
+        id: a3
+        _source_includes: tag
+  - match: { _source: { tag: y } }
+  - do:
+      mget:
+        body: { docs: [ { _index: rev-alias, _id: "a3" } ] }
+  - match: { docs.0.found: true }
+  - match: { docs.0._index: rev1 }
+
+  # An index created without the setting is Infino-backed: the cluster stamps it, and a
+  # document written to it is read back from the table. Setting it false in the request wins.
+  - do:
+      indices.create:
+        index: rev3
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+  - do:
+      indices.get_settings:
+        index: rev3
+  - match: { rev3.settings.index.infino.enabled: "true" }
+  - do:
+      index:
+        index: rev3
+        id: c1
+        refresh: true
+        body: { tag: stamped }
+  - do:
+      search:
+        index: rev3
+        body: { query: { term: { tag: stamped } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "c1" }
+  - do:
+      indices.create:
+        index: rev4
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      indices.get_settings:
+        index: rev4
+  - match: { rev4.settings.index.infino.enabled: "false" }
+
+  # A text field mapped after creation cannot have a text index; the index says so instead of serving it as exact.
+  - do:
+      indices.put_mapping:
+        index: rev2
+        body: { properties: { note: { type: text } } }
+  - do:
+      catch: /cannot be applied to its table/
+      search:
+        index: rev2
+        body: { size: 0 }

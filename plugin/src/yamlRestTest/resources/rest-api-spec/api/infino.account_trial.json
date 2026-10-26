@@ -1,0 +1,21 @@
+{
+  "infino.account_trial": {
+    "documentation": {
+      "description": "Create a free hosted account for the cluster and store it; the body must carry the acceptance."
+    },
+    "stability": "experimental",
+    "url": {
+      "paths": [
+        {
+          "path": "/_plugins/_infino/account/trial",
+          "methods": ["POST"]
+        }
+      ]
+    },
+    "params": {},
+    "body": {
+      "description": "accept (true), platform, database",
+      "required": false
+    }
+  }
+}
