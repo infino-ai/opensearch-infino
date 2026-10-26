@@ -1,8 +1,8 @@
 ---
 "Security: the security plugin's document, field and masking rules are enforced from the table":
   - skip:
-      version: " - 3.5.99"
-      reason: the rules are read through the security plugin's privileges configuration, which exists from 3.6
+      version: " - 2.99.99"
+      reason: on 2.x the rules cannot be read, and a request under one is refused (the next test)
       features: headers
   - do:
       indices.create:
