@@ -18,8 +18,12 @@ import org.opensearch.index.query.QueryBuilder;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -29,6 +33,7 @@ import static org.opensearch.infino.InfinoSecurityCalls.ADMIN_DNS;
 import static org.opensearch.infino.InfinoSecurityCalls.USER;
 import static org.opensearch.infino.InfinoSecurityCalls.call;
 import static org.opensearch.infino.InfinoSecurityCalls.component;
+import static org.opensearch.infino.InfinoSecurityCalls.documentRuleFolded;
 import static org.opensearch.infino.InfinoSecurityCalls.has;
 import static org.opensearch.infino.InfinoSecurityCalls.reason;
 import static org.opensearch.infino.InfinoSecurityCalls.restrictedUser;
@@ -67,21 +72,34 @@ final class InfinoSecurity {
     /** The configuration types, whose {@code ROLES} names the roles configuration. */
     private static final String CONFIG_TYPE = "org.opensearch.security.securityconf.impl.CType";
     private static final String ROLES_TYPE = "ROLES";
+    /** A configuration as the repository hands it out; the roles configuration is one. */
+    private static final String DYNAMIC_CONFIGURATION = "org.opensearch.security.securityconf.impl.SecurityDynamicConfiguration";
+    /** What the repository tells of every configuration change; the security plugin rebuilds its valve's rules from it. */
+    private static final String CONFIGURATION_CHANGE_LISTENER = "org.opensearch.security.configuration.ConfigurationChangeListener";
     /** The factory that merges the built-in static roles into a roles configuration, as it does for the valve. */
     private static final String DYNAMIC_CONFIG_FACTORY = "org.opensearch.security.securityconf.DynamicConfigFactory";
     private static final String ADD_STATICS = "addStatics";
     /** The processed rules, built from a roles configuration; the valve keeps one, and before 3.6 the plugin builds its own. */
     private static final String PROCESSED_CONFIG = "org.opensearch.security.privileges.dlsfls.DlsFlsProcessedConfig";
-    /** Its constructor's arguments: the roles, the indices lookup, the content registry, the node settings, the masking configuration. */
-    private static final int PROCESSED_CONFIG_ARGUMENTS = 5;
     /** The field-masking configuration (hash algorithm, salt), read from the node settings as the valve reads it. */
     private static final String FIELD_MASKING_CONFIG = "org.opensearch.security.privileges.dlsfls.FieldMasking$Config";
+    /**
+     * The processed rules' constructor, by its parameter types in order: the
+     * roles, the indices lookup, the content registry, the node settings,
+     * the masking configuration. The one public constructor on every release
+     * from 3.0 to 3.5; one of any other shape is not called.
+     */
+    private static final List<String> PROCESSED_CONFIG_PARAMETERS = List.of(
+        DYNAMIC_CONFIGURATION,
+        Map.class.getName(),
+        NamedXContentRegistry.class.getName(),
+        Settings.class.getName(),
+        FIELD_MASKING_CONFIG
+    );
     /** The per-request allow list of documents the security plugin's own reads may see regardless of a rule. */
     private static final String DOCUMENT_ALLOW_LIST = "org.opensearch.security.privileges.DocumentAllowList";
     /** The audit log as the security plugin binds it when auditing is on (a component from 3.6). */
     private static final String AUDIT_LOG = "org.opensearch.security.auditlog.impl.AuditLogImpl";
-    /** The header saying the security plugin already folded the document rule into the query (its filter-level mode). */
-    private static final String FILTER_LEVEL_DLS_DONE = "_opendistro_security_filter_level_dls_done";
     /** The thread-context key the security plugin keeps a request's evaluation context under; shared so one evaluation serves both. */
     private static final String EVALUATION_CONTEXT = "tmp_dls_fls_ctx";
     /** The id the security plugin's document allow list uses for "every document of the index" (a constant of its own only from 3.9). */
@@ -121,8 +139,10 @@ final class InfinoSecurity {
         if (injector == null) {
             return null;
         }
-        // The loader the security plugin's classes come from; no security manager
-        // guards the question on 3.x.
+        // The loader the security plugin's classes come from. No security manager
+        // guards the question on 3.x, which removed it (and whose forbidden-API
+        // signatures ban AccessController, so 2.x's privileged block has no
+        // place here).
         ClassLoader loader = user.getClass().getClassLoader();
         Object dns = component(injector, loader, ADMIN_DNS);
         if (dns == null) {
@@ -136,6 +156,10 @@ final class InfinoSecurity {
             log.warn("[infino] this security plugin has no document allow list the plugin can read; requests from users are refused");
             return null;
         }
+        Object auditLog = component(injector, loader, AUDIT_LOG);
+        // The evaluation comes last: before 3.6 it subscribes to the security
+        // plugin's configuration changes, which must happen once, for the
+        // components that are then kept.
         Evaluation evaluation = fromPrivilegesConfiguration(injector, loader);
         if (evaluation == null) {
             evaluation = fromRolesConfiguration(injector, loader);
@@ -144,7 +168,6 @@ final class InfinoSecurity {
             log.warn("[infino] this security plugin registers neither a privileges configuration nor its evaluator and configuration repository; requests from users are refused");
             return null;
         }
-        Object auditLog = component(injector, loader, AUDIT_LOG);
         if (auditLog == null) {
             log.info("[infino] this security plugin registers no audit log the plugin can reach; reads of Infino-backed indices are not in its read history");
         }
@@ -179,9 +202,11 @@ final class InfinoSecurity {
      * processed rules the valve builds, from the roles configuration the
      * repository holds, with the valve's own ingredients (the indices
      * lookup, the content registry, the node settings and the masking
-     * configuration), keeps them following cluster state as the valve
-     * does, and rebuilds them when the repository hands out a new roles
-     * configuration.
+     * configuration), and keeps them current the way the security plugin
+     * keeps the valve's: rebuilt when the repository reports a
+     * configuration change (it hands out a fresh copy of the roles on every
+     * read, so the copy itself says nothing about a change), and told of
+     * every cluster-state change so their indices lookup follows it.
      */
     private static Evaluation fromRolesConfiguration(Injector injector, ClassLoader loader) {
         Object evaluator = component(injector, loader, PRIVILEGES_EVALUATOR);
@@ -189,74 +214,137 @@ final class InfinoSecurity {
         if (evaluator == null || repository == null) {
             return null;
         }
-        Object rolesType;
-        Object maskingConfig;
-        Constructor<?> processed;
-        Method addStatics;
-        Settings settings;
-        NamedXContentRegistry registry;
+        RolesEvaluation evaluation;
         try {
-            rolesType = Class.forName(CONFIG_TYPE, false, loader).getField(ROLES_TYPE).get(null);
-            addStatics = null;
-            for (Method m : Class.forName(DYNAMIC_CONFIG_FACTORY, false, loader).getMethods()) {
-                if (m.getName().equals(ADD_STATICS) && m.getParameterCount() == 1) {
-                    addStatics = m;
-                }
-            }
-            if (addStatics == null) {
-                return null;
-            }
-            settings = injector.getInstance(Settings.class);
-            registry = injector.getInstance(NamedXContentRegistry.class);
-            maskingConfig = Class.forName(FIELD_MASKING_CONFIG, false, loader).getMethod("fromSettings", Settings.class).invoke(null, settings);
-            processed = null;
+            Object rolesType = Class.forName(CONFIG_TYPE, false, loader).getField(ROLES_TYPE).get(null);
+            Class<?> configurationType = Class.forName(DYNAMIC_CONFIGURATION, false, loader);
+            Method addStatics = Class.forName(DYNAMIC_CONFIG_FACTORY, false, loader).getMethod(ADD_STATICS, configurationType);
+            Settings settings = injector.getInstance(Settings.class);
+            NamedXContentRegistry registry = injector.getInstance(NamedXContentRegistry.class);
+            Object maskingConfig = Class.forName(FIELD_MASKING_CONFIG, false, loader).getMethod("fromSettings", Settings.class).invoke(null, settings);
+            Constructor<?> processed = null;
             for (Constructor<?> c : Class.forName(PROCESSED_CONFIG, false, loader).getConstructors()) {
-                if (c.getParameterCount() == PROCESSED_CONFIG_ARGUMENTS) {
+                if (Arrays.stream(c.getParameterTypes()).map(Class::getName).toList().equals(PROCESSED_CONFIG_PARAMETERS)) {
                     processed = c;
                 }
             }
             if (processed == null) {
+                log.warn("[infino] this security plugin's processed rules have no constructor taking {}; requests from users are refused", PROCESSED_CONFIG_PARAMETERS);
                 return null;
             }
+            evaluation = new RolesEvaluation(evaluator, repository, rolesType, addStatics, processed, registry, settings, maskingConfig);
+            // Subscribed last, once everything it needs was found: the
+            // components holding this evaluation are kept, so this happens once.
+            Class<?> listenerType = Class.forName(CONFIGURATION_CHANGE_LISTENER, false, loader);
+            call(repository, "subscribeOnChange", Proxy.newProxyInstance(loader, new Class<?>[] { listenerType }, evaluation::onConfigurationEvent));
+            InfinoServices.clusterService().addListener(event -> evaluation.followClusterState());
         } catch (ReflectiveOperationException | RuntimeException e) {
             log.warn("[infino] the security plugin's processed rules cannot be built here: {}", reason(e));
             return null;
         }
-        Constructor<?> constructor = processed;
-        Method withStatics = addStatics;
-        return new Evaluation() {
-            /** The roles configuration the current rules were built from, and those rules. */
-            private Object builtFrom;
-            private Object built;
+        return evaluation;
+    }
 
-            @Override
-            public Object evaluator() {
-                return evaluator;
+    /** The processed rules before 3.6, built by the plugin and kept current as the security plugin keeps its valve's. */
+    private static final class RolesEvaluation implements Evaluation {
+        private final Object evaluator;
+        private final Object repository;
+        private final Object rolesType;
+        private final Method addStatics;
+        private final Constructor<?> constructor;
+        private final NamedXContentRegistry registry;
+        private final Settings settings;
+        private final Object maskingConfig;
+        /** Whether the security plugin's configuration changed since the rules were built. */
+        private final AtomicBoolean stale = new AtomicBoolean(true);
+        private volatile Object built;
+
+        RolesEvaluation(
+            Object evaluator,
+            Object repository,
+            Object rolesType,
+            Method addStatics,
+            Constructor<?> constructor,
+            NamedXContentRegistry registry,
+            Settings settings,
+            Object maskingConfig
+        ) {
+            this.evaluator = evaluator;
+            this.repository = repository;
+            this.rolesType = rolesType;
+            this.addStatics = addStatics;
+            this.constructor = constructor;
+            this.registry = registry;
+            this.settings = settings;
+            this.maskingConfig = maskingConfig;
+        }
+
+        @Override
+        public Object evaluator() {
+            return evaluator;
+        }
+
+        @Override
+        public synchronized Object rules() throws ReflectiveOperationException {
+            // Cleared before the roles are read, so a change reported while
+            // they are being built marks the new rules stale in turn.
+            if (!stale.getAndSet(false) && built != null) {
+                return built;
             }
-
-            @Override
-            public synchronized Object rules() throws ReflectiveOperationException {
+            try {
                 Object roles = call(repository, "getConfiguration", rolesType);
                 if (roles == null) {
                     throw new IllegalStateException("the security plugin has not loaded its roles yet");
                 }
-                if (roles != builtFrom) {
-                    // The repository holds the configured roles alone; the built-in
-                    // static ones (all_access among them) are merged in by the
-                    // security plugin before its valve sees them, on a copy here too.
-                    Object merged = withStatics.invoke(null, call(roles, "deepClone"));
-                    ClusterService clusters = InfinoServices.clusterService();
-                    Object rules = constructor.newInstance(merged, clusters.state().metadata().getIndicesLookup(), registry, settings, maskingConfig);
-                    call(rules, "updateClusterStateMetadataAsync", clusters, InfinoServices.threadPool());
-                    if (built != null) {
-                        call(built, "shutdown");
-                    }
-                    built = rules;
-                    builtFrom = roles;
+                // The repository holds the configured roles alone; the built-in
+                // static ones (all_access among them) are merged in by the
+                // security plugin before its valve sees them, on a copy here too.
+                Object merged = addStatics.invoke(null, call(roles, "deepClone"));
+                ClusterService clusters = InfinoServices.clusterService();
+                Object rules = constructor.newInstance(merged, clusters.state().metadata().getIndicesLookup(), registry, settings, maskingConfig);
+                call(rules, "updateClusterStateMetadataAsync", clusters, InfinoServices.threadPool());
+                log.debug("[infino] processed rules built from the security plugin's roles");
+                Object previous = built;
+                built = rules;
+                if (previous != null) {
+                    call(previous, "shutdown");
                 }
-                return built;
+                return rules;
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                stale.set(true);
+                throw e;
             }
-        };
+        }
+
+        /** The repository's change notice (the only method of its listener); anything else asked of the proxy is the object's own. */
+        Object onConfigurationEvent(Object proxy, Method method, Object[] args) {
+            if (method.getDeclaringClass() == Object.class) {
+                return switch (method.getName()) {
+                    case "equals" -> proxy == args[0];
+                    case "hashCode" -> System.identityHashCode(proxy);
+                    default -> "infino processed-rules listener";
+                };
+            }
+            stale.set(true);
+            return null;
+        }
+
+        /**
+         * A cluster-state change: the rules update their indices lookup to it
+         * in the background, as the valve's rules do on every change (a no-op
+         * when the metadata version has not moved).
+         */
+        void followClusterState() {
+            Object rules = built;
+            if (rules == null) {
+                return;
+            }
+            try {
+                call(rules, "updateClusterStateMetadataAsync", InfinoServices.clusterService(), InfinoServices.threadPool());
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                log.warn("[infino] the processed rules could not follow the cluster state: {}", reason(e));
+            }
+        }
     }
 
     /** What the request may see of {@code index}; {@code what} names the request in a refusal. */
@@ -269,7 +357,15 @@ final class InfinoSecurity {
         if (anyUser == null) {
             return InfinoAccess.NONE;
         }
-        Components security = components(anyUser);
+        Components security;
+        try {
+            security = components(anyUser);
+        } catch (RuntimeException e) {
+            // A failure while asking the node for the security plugin's
+            // components refuses this request; nothing is kept from it, so the
+            // next request asks again.
+            throw refused(what, index, "the security plugin's components could not be read: " + reason(e));
+        }
         if (security == null) {
             throw refused(what, index, "this security plugin keeps no evaluation the plugin can read, so its document- and field-level rules cannot be applied");
         }
@@ -290,7 +386,7 @@ final class InfinoSecurity {
             }
             Object rules = security.evaluation().rules();
             List<QueryBuilder> documents = null;
-            if (context.getHeader(FILTER_LEVEL_DLS_DONE) == null) {
+            if (!documentRuleFolded(context, what)) {
                 Object dls = call(call(rules, "getDocumentPrivileges"), "getRestriction", ctx, index);
                 Object allowList = security.documentAllowList().getMethod("get", ThreadContext.class).invoke(null, context);
                 boolean lifted = (Boolean) call(allowList, "isAllowed", index, ANY_DOCUMENT);
@@ -355,8 +451,8 @@ final class InfinoSecurity {
             if (compliance == null || !(Boolean) call(compliance, "isEnabled") || !(Boolean) call(compliance, "readHistoryEnabledForIndex", index)) {
                 return null;
             }
-        } catch (ReflectiveOperationException e) {
-            log.debug("[infino] the audit log's compliance configuration could not be read: {}", reason(e));
+        } catch (Exception e) {
+            log.warn("[infino] the audit log's compliance configuration could not be read; reads of [{}] are not reported: {}", index, reason(e));
             return null;
         }
         IndexMetadata md = InfinoServices.clusterService().state().metadata().index(index);
@@ -364,10 +460,11 @@ final class InfinoSecurity {
             return null;
         }
         ShardId shard = new ShardId(md.getIndex(), THE_SHARD);
+        // A report that fails, for any reason, is logged; it never fails the read.
         return (id, shown) -> {
             try {
                 call(auditLog, "logDocumentRead", index, id, shard, InfinoAccess.fields(shown));
-            } catch (ReflectiveOperationException e) {
+            } catch (Exception e) {
                 log.warn("[infino] a read of {} from {} could not be reported to the audit log: {}", id, index, reason(e));
             }
         };

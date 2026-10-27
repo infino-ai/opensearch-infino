@@ -36,6 +36,7 @@ import static org.opensearch.infino.InfinoSecurityCalls.ADMIN_DNS;
 import static org.opensearch.infino.InfinoSecurityCalls.USER;
 import static org.opensearch.infino.InfinoSecurityCalls.call;
 import static org.opensearch.infino.InfinoSecurityCalls.component;
+import static org.opensearch.infino.InfinoSecurityCalls.documentRuleFolded;
 import static org.opensearch.infino.InfinoSecurityCalls.reason;
 import static org.opensearch.infino.InfinoSecurityCalls.restrictedUser;
 
@@ -59,8 +60,6 @@ final class InfinoSecurity {
     private static final String DLS_HEADER = "_opendistro_security_dls_query";
     private static final String FLS_HEADER = "_opendistro_security_fls_fields";
     private static final String MASKED_HEADER = "_opendistro_security_masked_fields";
-    /** The header saying the security plugin already folded the document rule into the query (its filter-level mode). */
-    private static final String FILTER_LEVEL_DLS_DONE = "_opendistro_security_filter_level_dls_done";
     /** The security plugin's serializer for those headers. */
     private static final String BASE64_HELPER = "org.opensearch.security.support.Base64Helper";
     /** The security plugin's pattern matcher: wildcards, and regular expressions between slashes. */
@@ -105,10 +104,21 @@ final class InfinoSecurity {
             Object dns = component(injector, loader, ADMIN_DNS);
             Method deserialize = Class.forName(BASE64_HELPER, false, loader).getMethod("deserializeObject", String.class);
             Method matcherFrom = Class.forName(WILDCARD_MATCHER, false, loader).getMethod("from", String.class);
-            Class<?> saltClass = Class.forName(SALT, false, loader);
             Settings settings = injector.getInstance(Settings.class);
-            Object salt = saltClass.getMethod("from", Settings.class).invoke(null, settings);
-            Constructor<?> maskedField = Class.forName(MASKED_FIELD, false, loader).getConstructor(String.class, saltClass, String.class);
+            // The masking helpers are resolved on their own: without them only
+            // a request under a masking rule is refused, not every request
+            // under a rule. An unset default algorithm is passed as null, which
+            // the masked field reads as its built-in hash, as the security
+            // plugin's own reader does.
+            Constructor<?> maskedField = null;
+            Object salt = null;
+            try {
+                Class<?> saltClass = Class.forName(SALT, false, loader);
+                salt = saltClass.getMethod("from", Settings.class).invoke(null, settings);
+                maskedField = Class.forName(MASKED_FIELD, false, loader).getConstructor(String.class, saltClass, String.class);
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                log.warn("[infino] this security plugin lacks the masked-field helper the plugin hashes with ({}); requests under a masking rule are refused", reason(e));
+            }
             found = new Helpers(dns, deserialize, matcherFrom, maskedField, salt, settings.get(MASKING_ALGORITHM_SETTING));
         } catch (ReflectiveOperationException | RuntimeException e) {
             log.warn("[infino] this security plugin lacks a helper the plugin reads its rules with ({}); requests under a rule are refused", reason(e));
@@ -145,7 +155,7 @@ final class InfinoSecurity {
             if (restrictedUser(context, security == null ? null : security.adminDns()) == null) {
                 return InfinoAccess.NONE;
             }
-            Set<String> queries = context.getHeader(FILTER_LEVEL_DLS_DONE) == null ? rulesFor(security, context, DLS_HEADER, index, what) : Set.of();
+            Set<String> queries = documentRuleFolded(context, what) ? Set.of() : rulesFor(security, context, DLS_HEADER, index, what);
             Set<String> fields = rulesFor(security, context, FLS_HEADER, index, what);
             Set<String> masked = rulesFor(security, context, MASKED_HEADER, index, what);
             if (log.isDebugEnabled()) {
@@ -184,10 +194,15 @@ final class InfinoSecurity {
         }
         Set<String> out = new LinkedHashSet<>();
         for (Map.Entry<?, ?> e : byPattern.entrySet()) {
-            if (matches(security, String.valueOf(e.getKey()), index) && e.getValue() instanceof Iterable<?> rules) {
-                for (Object rule : rules) {
-                    out.add(String.valueOf(rule));
-                }
+            if (!matches(security, String.valueOf(e.getKey()), index)) {
+                continue;
+            }
+            // A rule that applies and cannot be read refuses, as an unreadable header does.
+            if (!(e.getValue() instanceof Iterable<?> rules)) {
+                throw refused(what, index, "the security plugin's rules for [" + e.getKey() + "] arrived in a shape the plugin does not read");
+            }
+            for (Object rule : rules) {
+                out.add(String.valueOf(rule));
             }
         }
         return out;
@@ -249,6 +264,9 @@ final class InfinoSecurity {
 
     /** The masks as the security plugin's masked fields apply them: a field takes the first specification whose name pattern matches it. */
     private static Function<String, UnaryOperator<String>> maskedBy(Helpers security, Set<String> specifications) throws ReflectiveOperationException {
+        if (security.maskedField() == null) {
+            throw InfinoAccess.refused("a masking rule applies, and this security plugin has no masked-field helper the plugin can hash with");
+        }
         List<Object> masks = new ArrayList<>();
         for (String spec : specifications) {
             Object mask = MASKED.get(spec);

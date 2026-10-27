@@ -4,6 +4,8 @@
 
 package org.opensearch.infino;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
@@ -49,6 +51,8 @@ record InfinoAccess(
     BiConsumer<String, String> onRead
 ) {
 
+    private static final Logger log = LogManager.getLogger(InfinoAccess.class);
+
     /** No restriction: the request sees the index whole. */
     static final InfinoAccess NONE = new InfinoAccess(null, null, null, null);
 
@@ -79,7 +83,12 @@ record InfinoAccess(
     String read(String id, String source) {
         String shown = source(source);
         if (onRead != null && shown != null && !shown.isEmpty()) {
-            onRead.accept(id, shown);
+            // Reporting a read never fails it.
+            try {
+                onRead.accept(id, shown);
+            } catch (RuntimeException e) {
+                log.warn("[infino] the read of {} could not be reported: {}", id, e.toString());
+            }
         }
         return shown;
     }

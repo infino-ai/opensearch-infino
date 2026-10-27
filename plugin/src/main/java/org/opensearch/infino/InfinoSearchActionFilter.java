@@ -108,7 +108,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
             // Each index is read under what the security plugin lets this user see of it.
             Map<Index, InfinoAccess> access = new HashMap<>();
             for (Index index : infino) {
-                access.put(index, InfinoSecurity.access(index.getName(), "search"));
+                access.put(index, InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH));
             }
             SearchResponse response = search.scroll() == null
                 ? InfinoSearch.search(infino, tableOf, access::get, source, scripts.get(), start)
