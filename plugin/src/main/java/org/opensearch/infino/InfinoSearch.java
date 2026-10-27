@@ -13,6 +13,9 @@ import org.opensearch.action.OriginalIndices;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchResponseSections;
 import org.opensearch.action.search.ShardSearchFailure;
+import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.document.DocumentField;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.common.regex.Regex;
@@ -74,7 +77,8 @@ import java.util.function.Function;
  * at the action layer: no shard, no Lucene, no fetch phase.
  *
  * <p>Hits come one of three ways: an {@code infino_knn} / {@code infino_hybrid}
- * query runs the engine's vector search; a request sorted by a field runs an
+ * query, or the k-NN plugin's own {@code knn} query (see {@link InfinoStockKnn}),
+ * runs the engine's vector search; a request sorted by a field runs an
  * ordered SQL scan over the translated filter; a request ranked by a
  * full-text clause runs the engine's BM25 table function with the filter
  * applied to the ranked candidates; anything else is a filtered scan. The hit
@@ -156,8 +160,19 @@ public final class InfinoSearch {
     /** One scripted field of the request: its name and its expression, selected under {@code alias}. */
     record ScriptedField(String name, String expr, String alias) {}
 
-    /** A kNN or hybrid request, served by the engine's vector search instead of SQL. */
-    record VectorRequest(boolean hybrid, String textColumn, String textQuery, String vectorColumn, float[] vector, int k) {}
+    /**
+     * A kNN or hybrid request, served by the engine's vector search instead of
+     * SQL. {@code stock} marks the k-NN plugin's own {@code knn} query, which
+     * keeps that query's meaning: the engine returns its k nearest and the
+     * page is a window over them, so the total is how many came back.
+     * {@code filter} is that query's filter as a predicate the engine narrows
+     * the search with (null when it has none).
+     */
+    record VectorRequest(boolean hybrid, String textColumn, String textQuery, String vectorColumn, float[] vector, int k, boolean stock, String filter) {
+        static VectorRequest of(boolean hybrid, String textColumn, String textQuery, String vectorColumn, float[] vector, int k) {
+            return new VectorRequest(hybrid, textColumn, textQuery, vectorColumn, vector, k, false, null);
+        }
+    }
 
     /** The hits and total of one index, before the response is assembled. */
     record Page(List<SearchHit> hits, long total, boolean exact, float maxScore) {}
@@ -185,11 +200,22 @@ public final class InfinoSearch {
         VectorRequest vector = null;
         Translation query;
         if (qb instanceof InfinoKnnQueryBuilder knn) {
-            vector = new VectorRequest(false, null, null, knn.field(), knn.vector(), knn.k());
+            vector = VectorRequest.of(false, null, null, knn.field(), knn.vector(), knn.k());
             query = new Translation(table, InfinoQueryTranslator.ALL, null);
         } else if (qb instanceof InfinoHybridQueryBuilder hybrid) {
-            vector = new VectorRequest(true, hybrid.textColumn(), hybrid.textQuery(), hybrid.vectorColumn(), hybrid.vector(), hybrid.k());
+            vector = VectorRequest.of(true, hybrid.textColumn(), hybrid.textQuery(), hybrid.vectorColumn(), hybrid.vector(), hybrid.k());
             query = new Translation(table, InfinoQueryTranslator.ALL, null);
+        } else if (InfinoStockKnn.is(qb)) {
+            vector = stockKnn(InfinoStockKnn.read(qb), cols, table, nowMillis);
+            query = new Translation(table, InfinoQueryTranslator.ALL, null);
+            if (!builders(source).isEmpty()) {
+                // Stock aggregates over the k nearest; the table would aggregate over every row.
+                throw new IllegalArgumentException("[infino] aggregations are not served with a knn query");
+            }
+            if (source.sorts() != null && source.sorts().stream().anyMatch(s -> !(s instanceof ScoreSortBuilder))) {
+                // Stock orders the k nearest by the sort; the engine hands them back by distance only.
+                throw new IllegalArgumentException("[infino] a sort other than _score is not served with a knn query");
+            }
         } else {
             query = InfinoQueryTranslator.translate(qb, cols, table, nowMillis);
             if (query == null) {
@@ -279,6 +305,55 @@ public final class InfinoSearch {
     }
 
     /**
+     * The vector request of the k-NN plugin's {@code knn} query. Its filter
+     * becomes the predicate the engine narrows the search with, so the k
+     * nearest come from the rows the filter keeps, as the k-NN plugin's
+     * filtered search returns them; a filter that cannot be such a predicate
+     * is refused with the clause named.
+     */
+    private static VectorRequest stockKnn(InfinoStockKnn.Query knn, Map<String, Column> cols, String table, long nowMillis) {
+        Column c = cols.get(knn.field());
+        if (c == null || !c.vector()) {
+            throw new IllegalArgumentException("[infino] knn names field [" + knn.field() + "], which the table has no vector column for");
+        }
+        String filter = null;
+        if (knn.filter() != null) {
+            filter = InfinoQueryTranslator.vectorFilter(knn.filter(), cols, table, nowMillis);
+            if (filter == null) {
+                throw new IllegalArgumentException("[infino] knn filter not served by the table: " + knn.filter());
+            }
+            if (InfinoQueryTranslator.ALL.equals(filter)) {
+                filter = null; // a filter that keeps every row narrows nothing
+            }
+        }
+        return new VectorRequest(false, null, null, c.name(), knn.vector(), knn.k(), true, filter);
+    }
+
+    /**
+     * The statement a filtered {@code knn} query runs: the engine's
+     * {@code vector_search} table function with the filter as its
+     * {@code WHERE}, which the engine pushes into the search, so the k
+     * nearest are ranked among the rows the filter keeps rather than cut
+     * from an unfiltered top k.
+     */
+    static String filteredKnnStatement(String table, VectorRequest v) {
+        String csv = floatsToJson(v.vector());
+        csv = csv.substring(1, csv.length() - 1);
+        return "SELECT " + InfinoQueryTranslator.OSID + ", score FROM vector_search("
+            + InfinoQueryTranslator.literal(table)
+            + ", "
+            + InfinoQueryTranslator.literal(v.vectorColumn())
+            + ", "
+            + InfinoQueryTranslator.literal(csv)
+            + ", "
+            + v.k()
+            + ") WHERE "
+            + v.filter()
+            + " ORDER BY score ASC LIMIT "
+            + v.k();
+    }
+
+    /**
      * The field sorts over columns, in request order; {@code _score} and
      * {@code _doc} add nothing. Throws when a sort names something the table
      * has no column for.
@@ -355,15 +430,24 @@ public final class InfinoSearch {
         final Translation q = plan.query();
         List<Map<String, Object>> rows;
         boolean knnDistance = false;
-        if (size == 0) {
+        // A knn query's total is how many of its k came back, so it runs even for an empty page.
+        boolean stockKnn = plan.vector() != null && plan.vector().stock();
+        if (size == 0 && !stockKnn) {
             rows = List.of();
         } else if (plan.vector() != null) {
             VectorRequest v = plan.vector();
             String emb = floatsToJson(v.vector());
-            String json = v.hybrid()
-                ? InfinoNative.hybrid(plan.table(), v.textColumn(), v.textQuery(), v.vectorColumn(), emb, Math.max(fetch, 1))
-                : InfinoNative.knn(plan.table(), v.vectorColumn(), emb, Math.max(fetch, 1));
-            rows = InfinoNative.rows(json);
+            // The engine's top k for a knn query (the page is a window over them),
+            // otherwise as many as the page reaches.
+            int want = stockKnn ? v.k() : Math.max(fetch, 1);
+            if (v.filter() != null) {
+                rows = InfinoNative.sqlRows(filteredKnnStatement(plan.table(), v));
+            } else {
+                String json = v.hybrid()
+                    ? InfinoNative.hybrid(plan.table(), v.textColumn(), v.textQuery(), v.vectorColumn(), emb, want)
+                    : InfinoNative.knn(plan.table(), v.vectorColumn(), emb, want);
+                rows = InfinoNative.rows(json);
+            }
             knnDistance = !v.hybrid();
             // The vector entry points return ids and scores; the page's sources come in one statement.
             List<String> ids = new ArrayList<>();
@@ -396,6 +480,8 @@ public final class InfinoSearch {
         boolean version = Boolean.TRUE.equals(source.version());
         boolean seqNoAndPrimaryTerm = Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
         SearchShardTarget target = target(index);
+        // A knn query's hits score as the k-NN plugin scores them, under the field's space type.
+        String space = stockKnn ? InfinoStockKnn.spaceType(mapping(index), plan.vector().vectorColumn()) : null;
         List<SearchHit> hits = new ArrayList<>();
         float maxScore = Float.NaN;
         // Every row up to the window's end: the window itself is applied once,
@@ -413,7 +499,9 @@ public final class InfinoSearch {
             Object s = row.get("score");
             if (s instanceof Number n) {
                 score = n.floatValue();
-                if (knnDistance) {
+                if (stockKnn) {
+                    score = InfinoStockKnn.score(space, score);
+                } else if (knnDistance) {
                     score = 1.0f / (1.0f + score);
                 }
             } else if (plan.sorts().isEmpty()) {
@@ -576,6 +664,13 @@ public final class InfinoSearch {
         boolean includes = ctx.includes() != null && ctx.includes().length > 0;
         boolean excludes = ctx.excludes() != null && ctx.excludes().length > 0;
         return includes || excludes ? ctx : null;
+    }
+
+    /** The index's mapping from the cluster state, or null when it cannot be read there. */
+    private static MappingMetadata mapping(Index index) {
+        ClusterService clusters = InfinoServices.clusterService();
+        IndexMetadata md = clusters == null ? null : clusters.state().metadata().index(index);
+        return md == null ? null : md.mapping();
     }
 
     /** The shard target a hit of {@code index} carries; it names the index in the response. */

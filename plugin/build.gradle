@@ -69,6 +69,7 @@ sourceSets.main.java.srcDirs += versionMajor >= 3 ? 'src/main/client3' : 'src/ma
 
 configurations {
     securityPlugin
+    knnPlugin
 }
 
 repositories {
@@ -86,6 +87,10 @@ dependencies {
     // for every major, and on 3.x also compiled against (its jars, read out of
     // the zip; at runtime they come from the plugin itself, extended).
     securityPlugin "org.opensearch.plugin:opensearch-security:${securityVersion}@zip"
+    // The k-NN plugin of the target release, installed on the test cluster
+    // only: it owns the knn_vector mapping and the stock knn query, which the
+    // suites send to an Infino-backed index and to a Lucene twin alike.
+    knnPlugin "org.opensearch.plugin:opensearch-knn:${opensearch_version}.0@zip"
     if (extendsSecurity) {
         // The security plugin's own jar, and guava, whose immutable collections
         // its rule objects hand back; the rest of its zip is not needed to compile.
@@ -136,6 +141,12 @@ testClusters.all {
     systemProperty 'infino.data', System.getProperty('infino.data', defaultData)
     // The SQL each request runs, in the node log, so a wrong answer can be read back.
     setting 'logger.org.opensearch.infino', 'DEBUG'
+
+    // The k-NN plugin extends lang-painless (and transport-grpc on 3.x),
+    // which only the full archive carries as modules; the integration-test
+    // distribution has the transport alone.
+    testDistribution = 'ARCHIVE'
+    plugin(layout.file(provider { configurations.knnPlugin.singleFile }))
 
     if (securityOnTestCluster) {
         plugin(layout.file(provider { configurations.securityPlugin.singleFile }))
