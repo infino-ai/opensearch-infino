@@ -349,6 +349,15 @@ public final class InfinoSearch {
 
     /** The hits of one index for the request's window, each carrying its source, with the total. */
     static Page page(Index index, Plan plan, SearchSourceBuilder source) {
+        return page(index, plan, source, true);
+    }
+
+    /**
+     * As {@link #page(Index, Plan, SearchSourceBuilder)}; with {@code count}
+     * false an exact total is left for the caller, which reads it beside the
+     * aggregations (the page's total is then 0 until replaced).
+     */
+    static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count) {
         final int from = Math.max(0, source.from());
         final int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
         final int fetch = from + size;
@@ -382,6 +391,8 @@ public final class InfinoSearch {
         long total;
         if (plan.vector() != null) {
             total = rows.size(); // kNN is inherently top-k
+        } else if (exact && !count) {
+            total = 0;
         } else if (exact) {
             // The total counts what the query and post_filter keep, before
             // any collapse and regardless of where the page starts.
@@ -815,14 +826,24 @@ public final class InfinoSearch {
             SearchSourceBuilder perIndex = after == null || after.get(index) == null ? source : withSearchAfter(source, after.get(index));
             Plan plan = plan(tableOf.apply(index), perIndex, now, accessOf.apply(index));
             sorts = plan.sorts();
-            Page page = page(index, plan, perIndex);
-            pages.add(page);
+            // Aggregations see the query, not the post_filter, so they share the
+            // total only when there is none. A request with no hits to fetch then
+            // reads its total beside the aggregations rather than in a count of its own.
+            boolean sharedTotal = !builders.isEmpty() && plan.vector() == null && plan.postWhere() == null && trackTotal(perIndex);
+            boolean countWithAggs = sharedTotal && perIndex.size() == 0;
+            Page page = page(index, plan, perIndex, !countWithAggs);
             if (!builders.isEmpty()) {
-                // Aggregations see the query, not the post_filter, so a post-filtered
-                // page's total is not theirs.
-                Long pageTotal = page.exact() && plan.vector() == null && plan.postWhere() == null ? page.total() : null;
-                aggs.add(new InfinoAggregationProcessor(index).evaluate(builders, plan, pageTotal));
+                InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(index).evaluate(
+                    builders,
+                    plan,
+                    sharedTotal && !countWithAggs ? page.total() : null
+                );
+                aggs.add(counted.aggregations());
+                if (countWithAggs) {
+                    page = new Page(page.hits(), counted.total(), page.exact(), page.maxScore());
+                }
             }
+            pages.add(page);
         }
         SearchHits hits = merge(pages, source, sorts, total);
         Map<Index, Object[]> cursor = null;

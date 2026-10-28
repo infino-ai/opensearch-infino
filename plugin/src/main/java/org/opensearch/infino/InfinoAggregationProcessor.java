@@ -149,6 +149,14 @@ public class InfinoAggregationProcessor {
     private static final Logger log = LogManager.getLogger(InfinoAggregationProcessor.class);
     /** Buckets a terms level may return; past this the window is not worth a GROUP BY. */
     private static final int MAX_TERMS_SIZE = 10_000;
+    /**
+     * Groups a top terms level may have for its buckets to be picked here
+     * rather than by a window statement: the bare GROUP BY is answered from
+     * the table's statistics, the window over it is not.
+     */
+    private static final int MAX_GROUPS_PICKED_HERE = 10_000;
+    /** The alias the request's total takes when it is read beside the root metrics. */
+    private static final String TOTAL_ALIAS = "request_total";
     /** Parent buckets a nested grouped level is restricted to; past this the key list is not worth a predicate. */
     private static final int MAX_PARENT_TUPLES = 1_000;
     /** How bucket keys are printed when the request names no format. */
@@ -178,12 +186,17 @@ public class InfinoAggregationProcessor {
         }
     }
 
+    /** The aggregations of a request and its exact match count. */
+    record Counted(InternalAggregations aggregations, long total) {}
+
     /**
      * The requested aggregations over the plan's relation, in request order,
-     * as the stock response objects. {@code total} is the request's exact
-     * match count when the hit path already has it, else null.
+     * as the stock response objects, with the request's exact match count.
+     * {@code total} is that count when the hit path already has it; when
+     * null it is counted here, beside the root metrics when there are any,
+     * so it costs no statement of its own.
      */
-    public InternalAggregations evaluate(Collection<AggregationBuilder> builders, Plan plan, Long total) {
+    Counted evaluate(Collection<AggregationBuilder> builders, Plan plan, Long total) {
         Translation q = plan.query();
         List<Spec> specs = new ArrayList<>();
         int position = 0;
@@ -207,10 +220,18 @@ public class InfinoAggregationProcessor {
             byName.put(spec.name(), evalBucket((BucketSpec) spec, q.from(), q.where(), total));
         }
         if (!rootMetrics.isEmpty()) {
-            Map<String, Object> row = oneRow("SELECT " + metricColumns(rootMetrics) + " FROM " + q.from() + " WHERE " + q.where());
+            boolean counting = total == null;
+            String select = (counting ? "COUNT(*) AS " + TOTAL_ALIAS + ", " : "") + metricColumns(rootMetrics);
+            Map<String, Object> row = oneRow("SELECT " + select + " FROM " + q.from() + " WHERE " + q.where());
+            if (counting) {
+                total = asLong(row.get(TOTAL_ALIAS));
+            }
             for (Metric m : rootMetrics) {
                 byName.put(m.name(), m.build(row));
             }
+        }
+        if (total == null) {
+            total = InfinoSearch.count(plan.table(), q);
         }
         // Keep the request's order of aggregations.
         List<InternalAggregation> ordered = new ArrayList<>();
@@ -218,7 +239,7 @@ public class InfinoAggregationProcessor {
             ordered.add(byName.get(b.getName()));
         }
         log.debug("[infino] served {} aggregation(s) from {}", ordered.size(), plan.table());
-        return InternalAggregations.from(ordered);
+        return new Counted(InternalAggregations.from(ordered), total);
     }
 
     // ---- servability (shared with the hit path's plan) ----
@@ -1805,17 +1826,20 @@ public class InfinoAggregationProcessor {
                 inner += " HAVING COUNT(*) >= " + level.minDocCount;
             }
             String parents = String.join(", ", aliases.subList(0, i));
-            String sql;
-            if (level.terms) {
-                String partition = i == 0 ? "" : "PARTITION BY " + parents + " ";
-                // keyed_total: the rows with a value under this parent, so what the
-                // window drops is counted exactly, without the field-less rows.
-                sql = "SELECT * FROM (SELECT t.*, ROW_NUMBER() OVER (" + partition + "ORDER BY " + level.order("k" + i) + ") AS rn, SUM(doc_count) OVER ("
-                    + partition.trim() + ") AS keyed_total FROM (" + inner + ") t) WHERE rn <= " + level.size + " ORDER BY " + (i == 0 ? "rn" : parents + ", rn");
-            } else {
-                sql = "SELECT * FROM (" + inner + ") t ORDER BY " + String.join(", ", aliases);
+            List<Map<String, Object>> rows = i == 0 && level.terms ? pickTopTerms(level, inner) : null;
+            if (rows == null) {
+                String sql;
+                if (level.terms) {
+                    String partition = i == 0 ? "" : "PARTITION BY " + parents + " ";
+                    // keyed_total: the rows with a value under this parent, so what the
+                    // window drops is counted exactly, without the field-less rows.
+                    sql = "SELECT * FROM (SELECT t.*, ROW_NUMBER() OVER (" + partition + "ORDER BY " + level.order("k" + i) + ") AS rn, SUM(doc_count) OVER ("
+                        + partition.trim() + ") AS keyed_total FROM (" + inner + ") t) WHERE rn <= " + level.size + " ORDER BY " + (i == 0 ? "rn" : parents + ", rn");
+                } else {
+                    sql = "SELECT * FROM (" + inner + ") t ORDER BY " + String.join(", ", aliases);
+                }
+                rows = InfinoNative.sqlRows(sql);
             }
-            List<Map<String, Object>> rows = InfinoNative.sqlRows(sql);
             rowsByLevel.add(rows);
             kept = new ArrayList<>();
             for (Map<String, Object> row : rows) {
@@ -1838,6 +1862,75 @@ public class InfinoAggregationProcessor {
             hitsByLevel.add(Map.of());
         }
         return fold(chain, 0, List.of(), rowsByLevel, hitsByLevel, total, leafChild, from, where);
+    }
+
+    /**
+     * The buckets of a top terms level picked from its bare GROUP BY
+     * ({@code inner}), which the engine answers from the table's statistics,
+     * instead of through the window statement, which it does not: the groups
+     * in the level's order, the first {@code size} kept, each carrying
+     * keyed_total, the rows of every group, as the window statement's rows
+     * do. Null, for the window statement to answer, when the order reads a
+     * metric (a missing metric value sorts where the engine puts it) or the
+     * level has more groups than are worth picking here.
+     */
+    private static List<Map<String, Object>> pickTopTerms(Grouped level, String inner) {
+        Comparator<Map<String, Object>> order = termsOrder(level);
+        if (order == null) {
+            return null;
+        }
+        List<Map<String, Object>> groups = new ArrayList<>(InfinoNative.sqlRows(inner + " LIMIT " + (MAX_GROUPS_PICKED_HERE + 1)));
+        if (groups.size() > MAX_GROUPS_PICKED_HERE) {
+            return null;
+        }
+        long keyedTotal = 0;
+        for (Map<String, Object> group : groups) {
+            keyedTotal += asLong(group.get("doc_count"));
+        }
+        groups.sort(order);
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Map<String, Object> group : groups.subList(0, Math.min(level.size, groups.size()))) {
+            Map<String, Object> row = new HashMap<>(group);
+            row.put("keyed_total", keyedTotal);
+            out.add(row);
+        }
+        return out;
+    }
+
+    /**
+     * A top terms level's order over its group rows, as the engine's ORDER BY
+     * reads it: by count, and by key in the key's own order (a string by its
+     * UTF-8 bytes, false before true, numbers by value). Null when the order
+     * reads anything else.
+     */
+    private static Comparator<Map<String, Object>> termsOrder(Grouped level) {
+        Comparator<Map<String, Object>> out = null;
+        for (String term : level.orderTemplate.split(", ")) {
+            String[] parts = term.split(" ");
+            Comparator<Map<String, Object>> c;
+            if (parts[0].equals("doc_count")) {
+                c = Comparator.comparingLong(row -> asLong(row.get("doc_count")));
+            } else if (parts[0].equals("{key}")) {
+                c = (a, b) -> compareKeys(level.keyKind, a.get("k0"), b.get("k0"));
+            } else {
+                return null;
+            }
+            if (parts[1].equals("DESC")) {
+                c = c.reversed();
+            }
+            out = out == null ? c : out.thenComparing(c);
+        }
+        return out;
+    }
+
+    /** Two present keys of {@code kind} in the engine's order. */
+    private static int compareKeys(KeyKind kind, Object a, Object b) {
+        return switch (kind) {
+            case STR -> new BytesRef(a.toString()).compareTo(new BytesRef(b.toString()));
+            case BOOL -> Boolean.compare(Boolean.parseBoolean(a.toString()), Boolean.parseBoolean(b.toString()));
+            case LONG, DATE -> Long.compare(asLong(a), asLong(b));
+            case DOUBLE -> Double.compare(asDouble(a, 0.0), asDouble(b, 0.0));
+        };
     }
 
     /**
