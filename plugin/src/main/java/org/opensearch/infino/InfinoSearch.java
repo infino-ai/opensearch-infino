@@ -347,15 +347,11 @@ public final class InfinoSearch {
 
     // ---- one index ----
 
-    /** The hits of one index for the request's window, each carrying its source, with the total. */
-    static Page page(Index index, Plan plan, SearchSourceBuilder source) {
-        return page(index, plan, source, true);
-    }
-
     /**
-     * As {@link #page(Index, Plan, SearchSourceBuilder)}; with {@code count}
-     * false an exact total is left for the caller, which reads it beside the
-     * aggregations (the page's total is then 0 until replaced).
+     * The hits of one index for the request's window, each carrying its
+     * source, with the total. With {@code count} false an exact total is left
+     * for the caller, which reads it beside the aggregations (the page's total
+     * is then 0 until replaced).
      */
     static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count) {
         final int from = Math.max(0, source.from());

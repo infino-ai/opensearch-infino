@@ -88,7 +88,8 @@
   - match: { aggregations.ns.buckets.0.key: 5 }
   - match: { aggregations.ns.buckets.3.key: 1 }
 
-  # min_doc_count keeps the groups with at least that many rows.
+  # min_doc_count keeps the groups with at least that many rows; the groups it
+  # drops are not the other count (the next test has a stock index agree).
   - do:
       search:
         index: tt
@@ -99,6 +100,7 @@
   - length: { aggregations.tags.buckets: 2 }
   - match: { aggregations.tags.buckets.0.key: a }
   - match: { aggregations.tags.buckets.1.key: b }
+  - match: { aggregations.tags.sum_other_doc_count: 0 }
 
   # An order by a metric: a and z both sum to 7.0 and tie by key; b is last.
   - do:
@@ -167,3 +169,153 @@
           aggs:
             tags: { terms: { field: tag } }
   - match: { hits.total.value: 8 }
+
+---
+"Other counts under min_doc_count and boolean keys, as a stock index answers them":
+  # The same documents in a table and in a stock (Lucene) index; each request
+  # runs on both and the answers are asserted alike.
+  - do:
+      indices.create:
+        index: mdc
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              flag: { type: boolean }
+  - do:
+      indices.create:
+        index: mdc_stock
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              flag: { type: boolean }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: mdc, _id: "d1" }
+          - { tag: b, flag: true }
+          - index: { _index: mdc, _id: "d2" }
+          - { tag: b, flag: true }
+          - index: { _index: mdc, _id: "d3" }
+          - { tag: a, flag: false }
+          - index: { _index: mdc, _id: "d4" }
+          - { tag: a, flag: true }
+          - index: { _index: mdc, _id: "d5" }
+          - { tag: Z, flag: false }
+          - index: { _index: mdc, _id: "d6" }
+          - { tag: "é", flag: true }
+          - index: { _index: mdc, _id: "d7" }
+          - { tag: z, flag: true }
+          - index: { _index: mdc, _id: "d8" }
+          - { flag: false }
+  - match: { errors: false }
+  # A bulk is served by the table or by Lucene, never both: one per index.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: mdc_stock, _id: "d1" }
+          - { tag: b, flag: true }
+          - index: { _index: mdc_stock, _id: "d2" }
+          - { tag: b, flag: true }
+          - index: { _index: mdc_stock, _id: "d3" }
+          - { tag: a, flag: false }
+          - index: { _index: mdc_stock, _id: "d4" }
+          - { tag: a, flag: true }
+          - index: { _index: mdc_stock, _id: "d5" }
+          - { tag: Z, flag: false }
+          - index: { _index: mdc_stock, _id: "d6" }
+          - { tag: "é", flag: true }
+          - index: { _index: mdc_stock, _id: "d7" }
+          - { tag: z, flag: true }
+          - index: { _index: mdc_stock, _id: "d8" }
+          - { flag: false }
+  - match: { errors: false }
+
+  # The three single-row terms min_doc_count drops are in no bucket and not the
+  # other count: a shard keeps every term in its queue, and the reduce drops the
+  # ones under min_doc_count without adding them to the other count.
+  - do:
+      search:
+        index: mdc_stock
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, min_doc_count: 2 } }
+  - length: { aggregations.tags.buckets: 2 }
+  - match: { aggregations.tags.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: mdc
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, min_doc_count: 2 } }
+  - length: { aggregations.tags.buckets: 2 }
+  - match: { aggregations.tags.sum_other_doc_count: 0 }
+
+  # A term that passes min_doc_count but falls past the size is the other count.
+  - do:
+      search:
+        index: mdc_stock
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, size: 1, min_doc_count: 2 } }
+  - match: { aggregations.tags.buckets.0.key: a }
+  - match: { aggregations.tags.sum_other_doc_count: 2 }
+  - do:
+      search:
+        index: mdc
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, size: 1, min_doc_count: 2 } }
+  - match: { aggregations.tags.buckets.0.key: a }
+  - match: { aggregations.tags.sum_other_doc_count: 2 }
+
+  # Boolean keys by key: false before true, and the reverse.
+  - do:
+      search:
+        index: mdc_stock
+        body:
+          size: 0
+          aggs:
+            flags: { terms: { field: flag, order: { _key: asc } } }
+  - match: { aggregations.flags.buckets.0.key_as_string: "false" }
+  - match: { aggregations.flags.buckets.0.doc_count: 3 }
+  - match: { aggregations.flags.buckets.1.key_as_string: "true" }
+  - match: { aggregations.flags.buckets.1.doc_count: 5 }
+  - do:
+      search:
+        index: mdc
+        body:
+          size: 0
+          aggs:
+            flags: { terms: { field: flag, order: { _key: asc } } }
+  - match: { aggregations.flags.buckets.0.key: "false" }
+  - match: { aggregations.flags.buckets.0.doc_count: 3 }
+  - match: { aggregations.flags.buckets.1.key: "true" }
+  - match: { aggregations.flags.buckets.1.doc_count: 5 }
+  - do:
+      search:
+        index: mdc_stock
+        body:
+          size: 0
+          aggs:
+            flags: { terms: { field: flag, order: { _key: desc } } }
+  - match: { aggregations.flags.buckets.0.key_as_string: "true" }
+  - match: { aggregations.flags.buckets.1.key_as_string: "false" }
+  - do:
+      search:
+        index: mdc
+        body:
+          size: 0
+          aggs:
+            flags: { terms: { field: flag, order: { _key: desc } } }
+  - match: { aggregations.flags.buckets.0.key: "true" }
+  - match: { aggregations.flags.buckets.1.key: "false" }

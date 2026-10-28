@@ -152,9 +152,12 @@ public class InfinoAggregationProcessor {
     /**
      * Groups a top terms level may have for its buckets to be picked here
      * rather than by a window statement: the bare GROUP BY is answered from
-     * the table's statistics, the window over it is not.
+     * the table's statistics, the window over it is not, but every group
+     * crosses the bridge to be picked here. Measured on a size 10 level, the
+     * picking is ahead up to about a thousand groups and the window from
+     * about fifteen hundred.
      */
-    private static final int MAX_GROUPS_PICKED_HERE = 10_000;
+    private static final int MAX_GROUPS_PICKED_HERE = 1_000;
     /** The alias the request's total takes when it is read beside the root metrics. */
     private static final String TOTAL_ALIAS = "request_total";
     /** Parent buckets a nested grouped level is restricted to; past this the key list is not worth a predicate. */
@@ -1001,7 +1004,7 @@ public class InfinoAggregationProcessor {
         static String keyLiteral(KeyKind kind, Object key) {
             return switch (kind) {
                 case STR -> literal(key.toString());
-                case BOOL -> String.valueOf(Boolean.parseBoolean(key.toString()));
+                case BOOL -> String.valueOf(asBoolean(key));
                 case LONG -> Long.toString(asLong(key));
                 case DOUBLE -> Double.toString(asDouble(key, 0.0));
                 case DATE -> literal(Instant.ofEpochMilli(asLong(key)).toString());
@@ -1494,6 +1497,9 @@ public class InfinoAggregationProcessor {
             if ((s.keyKind() == KeyKind.LONG || s.keyKind() == KeyKind.DOUBLE || s.keyKind() == KeyKind.DATE) && !(v instanceof Number)) {
                 throw new Unsupported("aggregation [" + agg + "] has an after key [" + v + "] for [" + s.name() + "] that is not a number");
             }
+            if (s.keyKind() == KeyKind.BOOL && !(v instanceof Boolean || "true".equals(v) || "false".equals(v))) {
+                throw new Unsupported("aggregation [" + agg + "] has an after key [" + v + "] for [" + s.name() + "] that is not a boolean");
+            }
             return Grouped.keyLiteral(s.keyKind(), v);
         }
 
@@ -1547,7 +1553,7 @@ public class InfinoAggregationProcessor {
                 }
                 key[i] = switch (sources.get(i).keyKind()) {
                     case STR -> new BytesRef(v.toString());
-                    case BOOL -> Boolean.parseBoolean(v.toString()) ? 1L : 0L;
+                    case BOOL -> asBoolean(v) ? 1L : 0L;
                     case LONG, DATE -> asLong(v);
                     case DOUBLE -> asDouble(v, 0.0);
                 };
@@ -1927,7 +1933,7 @@ public class InfinoAggregationProcessor {
     private static int compareKeys(KeyKind kind, Object a, Object b) {
         return switch (kind) {
             case STR -> new BytesRef(a.toString()).compareTo(new BytesRef(b.toString()));
-            case BOOL -> Boolean.compare(Boolean.parseBoolean(a.toString()), Boolean.parseBoolean(b.toString()));
+            case BOOL -> Boolean.compare(asBoolean(a), asBoolean(b));
             case LONG, DATE -> Long.compare(asLong(a), asLong(b));
             case DOUBLE -> Double.compare(asDouble(a, 0.0), asDouble(b, 0.0));
         };
@@ -2106,5 +2112,21 @@ public class InfinoAggregationProcessor {
             }
         }
         return dflt;
+    }
+
+    /**
+     * A boolean key as the bridge returns it: a JSON {@code true} or
+     * {@code false}, which the row parser reads as a Boolean. Anything else is
+     * refused rather than read as false, which would put every key in one
+     * place in a key order.
+     */
+    static boolean asBoolean(Object v) {
+        if (v instanceof Boolean b) {
+            return b;
+        }
+        if ("true".equals(v) || "false".equals(v)) {
+            return "true".equals(v);
+        }
+        throw new IllegalStateException("a boolean key arrived as " + v);
     }
 }
