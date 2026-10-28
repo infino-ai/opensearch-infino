@@ -1,0 +1,71 @@
+---
+"Terms total: documents missing the key count in the total, not in a bucket":
+  # A top terms aggregation reads the request's total from its own groups;
+  # rows without the key are one more group, counted in the total and in no
+  # bucket, with and without a filter.
+  - do:
+      indices.create:
+        index: tm
+        body:
+          mappings:
+            properties:
+              tag: { type: keyword }
+              n: { type: long }
+  - do:
+      bulk:
+        index: tm
+        refresh: true
+        body:
+          - index: { _id: "1" }
+          - { tag: a, n: 1 }
+          - index: { _id: "2" }
+          - { tag: a, n: 2 }
+          - index: { _id: "3" }
+          - { tag: b, n: 3 }
+          - index: { _id: "4" }
+          - { tag: c, n: 4 }
+          - index: { _id: "5" }
+          - { n: 5 }
+          - index: { _id: "6" }
+          - { n: 6 }
+  - do:
+      search:
+        index: tm
+        body:
+          size: 0
+          track_total_hits: true
+          aggs:
+            t: { terms: { field: tag, size: 2 } }
+  - match: { hits.total.value: 6 }
+  - length: { aggregations.t.buckets: 2 }
+  - match: { aggregations.t.buckets.0.key: a }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.1.key: b }
+  - match: { aggregations.t.buckets.1.doc_count: 1 }
+  - match: { aggregations.t.sum_other_doc_count: 1 }
+
+  - do:
+      search:
+        index: tm
+        body:
+          size: 0
+          track_total_hits: true
+          query: { range: { n: { gte: 2 } } }
+          aggs:
+            t: { terms: { field: tag } }
+  - match: { hits.total.value: 5 }
+  - length: { aggregations.t.buckets: 3 }
+  - match: { aggregations.t.sum_other_doc_count: 0 }
+
+  # min_doc_count leaves groups out of the sum, so the total is counted on its own.
+  - do:
+      search:
+        index: tm
+        body:
+          size: 0
+          track_total_hits: true
+          aggs:
+            t: { terms: { field: tag, min_doc_count: 2 } }
+  - match: { hits.total.value: 6 }
+  - length: { aggregations.t.buckets: 1 }
+  - match: { aggregations.t.buckets.0.key: a }
