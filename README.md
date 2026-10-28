@@ -226,11 +226,38 @@ math and time zones), `exists`, `prefix`, `wildcard`, `regexp`, `ids`, `match`,
 `match_phrase` (as all-terms), `multi_match`, `query_string` /
 `simple_query_string` (as the terms they hold; Lucene syntax inside the string
 is not interpreted), `bool` (must / filter / must_not / should with
-minimum_should_match as "at least one"), `infino_knn`, `infino_hybrid`. A field
+minimum_should_match as "at least one"), `infino_knn`, `infino_hybrid`, and
+the k-NN plugin's own `knn` query. A field
 named `x.keyword` resolves to the string column `x`. Sorting by fields;
 `from` / `size` paging; `_source` includes and excludes; exact `hits.total`.
 A search over several Infino-backed indices merges their pages by sort values
 or score and reduces their aggregations once.
+
+Vector search: `knn_vector` is the k-NN plugin's mapping type, so an index
+with vectors runs beside the k-NN plugin, and its stock query is served from
+the table as it is sent to a Lucene index:
+`{"query": {"knn": {"<field>": {"vector": [...], "k": 10, "filter": {...}}}}}`.
+The engine returns the k nearest and the page is a window over them, so the
+total is how many came back. A `filter` goes to the engine's `vector_search`
+as a predicate, and the k nearest come from the documents it keeps, as the
+k-NN plugin's filtered search returns them, however many nearer documents
+the filter rejects: when the engine's nearest hits leave fewer than k that
+match, it evaluates the predicate over the table's rows and searches within
+exactly the rows it keeps.
+The filter takes the term-level clauses above (term, terms, range, exists,
+prefix, wildcard, regexp, ids, bool); a full-text clause inside it is refused,
+since a text match is a search of its own rather than a predicate the vector
+search takes. `knn` is served as the whole query, like `infino_knn`, not as a
+clause inside `bool`. Refused with the parameter named: radial search
+(`max_distance`, `min_score`), `method_parameters`, `rescore`,
+`expand_nested_docs`, `ignore_unmapped`, a boost or query name, and
+aggregations, a field sort, `post_filter`, `collapse`, `search_after` or a
+scroll with a `knn` query. Hits score as the k-NN plugin scores them under
+the field's `space_type` (`l2`, `innerproduct`, `cosinesimil`); a `knn` on
+a field mapped with any other space type (`l1`, `linf`, `hamming`) is
+refused, since the engine computes none of those distances. Name the
+`space_type` in the mapping: the bridge declares a vector field mapped
+without one as cosine.
 
 Aggregations: `value_count`, `sum`, `avg`, `min`, `max`, `cardinality`
 (exact, `COUNT(DISTINCT)`), `percentiles` (t-digest, from the engine's

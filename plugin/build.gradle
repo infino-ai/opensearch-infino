@@ -2,6 +2,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import org.opensearch.gradle.test.RestIntegTestTask
+
 // Standalone build against a released OpenSearch: no source checkout needed.
 // Pick the target with -Dopensearch.version=<release>; the plugin zip only
 // installs into that exact version.
@@ -69,6 +71,7 @@ sourceSets.main.java.srcDirs += versionMajor >= 3 ? 'src/main/client3' : 'src/ma
 
 configurations {
     securityPlugin
+    knnPlugin
 }
 
 repositories {
@@ -86,6 +89,10 @@ dependencies {
     // for every major, and on 3.x also compiled against (its jars, read out of
     // the zip; at runtime they come from the plugin itself, extended).
     securityPlugin "org.opensearch.plugin:opensearch-security:${securityVersion}@zip"
+    // The k-NN plugin of the target release, installed on the knn suites' test
+    // cluster only: it owns the knn_vector mapping and the stock knn query,
+    // which those suites send to an Infino-backed index and to a Lucene twin alike.
+    knnPlugin "org.opensearch.plugin:opensearch-knn:${opensearch_version}.0@zip"
     if (extendsSecurity) {
         // The security plugin's own jar, and guava, whose immutable collections
         // its rule objects hand back; the rest of its zip is not needed to compile.
@@ -121,6 +128,17 @@ test {
 def defaultLib = file("${projectDir}/../infino-capi/target/release/libinfino_capi.so").absolutePath
 def defaultData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog"
 def defaultUri = "file://${defaultData}"
+
+// The stock knn suites need the k-NN plugin, which owns the knn_vector mapping
+// and the knn query and extends lang-painless (and transport-grpc on 3.x):
+// modules only the full archive distribution carries. So those suites run in
+// a task of their own, on a cluster of the archive with the k-NN plugin, and
+// every other suite keeps the integration-test distribution without it. The
+// knn cluster keeps its own catalog, so neither cluster sees the other's tables.
+def knnTask = 'knnYamlRestTest'
+def knnSuite = 'infino/100_knn'
+def knnTests = 'org.opensearch.infino.InfinoStockKnnIT'
+def knnData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-knn"
 
 // The test cluster runs the security plugin, enabled, with the demo node
 // certificates on the transport layer and plain HTTP with basic
@@ -160,9 +178,40 @@ testClusters.all {
     }
 }
 
+// The cluster is made while the build is evaluated, as the YAML suites' own is:
+// one made later, when the task is first configured, misses its distribution.
+testClusters.maybeCreate(knnTask)
+testClusters.matching { it.name == knnTask }.all {
+    testDistribution = 'ARCHIVE'
+    plugin(layout.file(provider { configurations.knnPlugin.singleFile }))
+    // Build-tools installs this plugin on the YAML suites' cluster only; this
+    // one takes it after the plugins it may extend.
+    plugin(tasks.named('bundlePlugin').flatMap { it.archiveFile })
+    systemProperty 'infino.uri', System.getProperty('infino.uri', "file://${knnData}")
+    systemProperty 'infino.data', System.getProperty('infino.data', knnData)
+}
+
 // A run that dies before its shards are deleted leaves their tables; each run starts clean.
 tasks.named('yamlRestTest').configure {
+    systemProperty 'tests.rest.denylist', "${knnSuite}/*"
+    filter {
+        excludeTestsMatching knnTests
+    }
     doFirst {
         delete layout.buildDirectory.dir('infino-catalog')
     }
+}
+
+def knnYamlRestTest = tasks.register(knnTask, RestIntegTestTask) {
+    description = 'Runs the stock knn suites on a cluster with the k-NN plugin.'
+    group = 'verification'
+    testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
+    classpath = sourceSets.yamlRestTest.runtimeClasspath
+    systemProperty 'tests.rest.suite', knnSuite
+    doFirst {
+        delete knnData
+    }
+}
+tasks.named('check').configure {
+    dependsOn knnYamlRestTest
 }
