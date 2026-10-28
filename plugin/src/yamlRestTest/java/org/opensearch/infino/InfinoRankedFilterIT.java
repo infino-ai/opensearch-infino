@@ -46,6 +46,8 @@ public class InfinoRankedFilterIT extends OpenSearchRestTestCase {
     private static final int WIDE_PAGE = 20;
     /** Where a later page starts. */
     private static final int LATER_FROM = 5;
+    /** The strong documents' date, long before any "now" a date-math filter reads. */
+    private static final String STRONG_DATE = "2020-01-01T00:00:00Z";
 
     @Override
     protected Settings restClientSettings() {
@@ -64,21 +66,25 @@ public class InfinoRankedFilterIT extends OpenSearchRestTestCase {
         create.setJsonEntity(
             "{\"settings\":{\"index.infino.enabled\":true,\"number_of_shards\":1,\"number_of_replicas\":0},"
                 + "\"mappings\":{\"properties\":{\"message\":{\"type\":\"text\"},\"level\":{\"type\":\"keyword\"},"
-                + "\"status\":{\"type\":\"long\"}}}}"
+                + "\"status\":{\"type\":\"long\"},\"host\":{\"type\":\"keyword\"},\"at\":{\"type\":\"date\"}}}}"
         );
         client().performRequest(create);
 
         // "disk disk" (the term twice in a two-word message) outranks "disk
         // failed on the node now" (once in six words) under BM25, so every
-        // matching document ranks below every strong one.
+        // matching document ranks below every strong one. Only the matching
+        // documents have a host, and only they are dated today.
+        long now = System.currentTimeMillis();
         for (int b = 0; b < BULKS; b++) {
             StringBuilder body = new StringBuilder();
             for (int i = 0; i < STRONG_PER_BULK; i++) {
                 body.append("{\"index\":{\"_index\":\"").append(INDEX).append("\",\"_id\":\"s").append(b).append('-').append(i).append("\"}}\n");
-                body.append("{\"message\":\"disk disk\",\"level\":\"info\",\"status\":200}\n");
+                body.append("{\"message\":\"disk disk\",\"level\":\"info\",\"status\":200,\"at\":\"").append(STRONG_DATE).append("\"}\n");
             }
             body.append("{\"index\":{\"_index\":\"").append(INDEX).append("\",\"_id\":\"m").append(b).append("\"}}\n");
-            body.append("{\"message\":\"disk failed on the node now\",\"level\":\"error\",\"status\":500}\n");
+            body.append("{\"message\":\"disk failed on the node now\",\"level\":\"error\",\"status\":500,\"host\":\"db-7\",\"at\":")
+                .append(now)
+                .append("}\n");
             Request bulk = new Request("POST", "/_bulk");
             if (b == BULKS - 1) {
                 bulk.addParameter("refresh", "true");
@@ -96,6 +102,33 @@ public class InfinoRankedFilterIT extends OpenSearchRestTestCase {
         // A numeric range.
         String byStatus = "{\"bool\":{\"must\":[{\"match\":{\"message\":\"disk\"}}],\"filter\":[{\"range\":{\"status\":{\"gte\":500}}}]}}";
         assertMatchingPage(byStatus, 0, PAGE, PAGE);
+
+        // Every other shape the translator writes a filter as rides with the
+        // ranked search the same way: the engine evaluates the whole WHERE
+        // over the rows it ranks within, not only a column comparison.
+        StringBuilder ids = new StringBuilder();
+        for (int b = 0; b < BULKS; b++) {
+            ids.append(b == 0 ? "" : ",").append("\"m").append(b).append('"');
+        }
+        List<String> filters = List.of(
+            "{\"terms\":{\"level\":[\"error\",\"fatal\"]}}",
+            "{\"regexp\":{\"level\":\"err.*\"}}",
+            "{\"wildcard\":{\"level\":\"e*r\"}}",
+            "{\"prefix\":{\"level\":\"err\"}}",
+            "{\"exists\":{\"field\":\"host\"}}",
+            "{\"bool\":{\"should\":[{\"term\":{\"level\":\"fatal\"}},{\"range\":{\"status\":{\"gte\":500}}}],\"minimum_should_match\":1}}",
+            "{\"bool\":{\"must_not\":[{\"term\":{\"level\":\"info\"}}]}}",
+            "{\"range\":{\"at\":{\"gte\":\"now-1d\"}}}",
+            "{\"script\":{\"script\":{\"source\":\"doc['status'].value >= 500\",\"lang\":\"painless\"}}}",
+            "{\"query_string\":{\"query\":\"level:error AND status:[500 TO *]\"}}",
+            "{\"ids\":{\"values\":[" + ids + "]}}"
+        );
+        for (String filter : filters) {
+            assertMatchingPage("{\"bool\":{\"must\":[{\"match\":{\"message\":\"disk\"}}],\"filter\":[" + filter + "]}}", 0, PAGE, PAGE);
+        }
+        // A must_not beside the ranked clause rather than inside its filter.
+        String notInfo = "{\"bool\":{\"must\":[{\"match\":{\"message\":\"disk\"}}],\"must_not\":[{\"term\":{\"level\":\"info\"}}]}}";
+        assertMatchingPage(notInfo, 0, WIDE_PAGE, MATCHING);
     }
 
     /**

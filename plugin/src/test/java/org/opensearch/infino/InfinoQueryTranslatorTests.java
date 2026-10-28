@@ -120,6 +120,25 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             "SELECT osid, source, score FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') WHERE 1=1 ORDER BY score DESC LIMIT 10",
             hits(translate(QueryBuilders.matchQuery("message", "disk")), null, 10)
         );
+        // Every filter shape the translator writes over the table's columns (a
+        // negation, a pattern, a null check, a list, a disjunction, date math,
+        // ids) is evaluated by the engine before it ranks, so each asks for the
+        // page; InfinoRankedFilterIT checks the engine does so.
+        java.util.List<org.opensearch.index.query.QueryBuilder> filters = java.util.List.of(
+            QueryBuilders.boolQuery().mustNot(QueryBuilders.termQuery("level", "info")),
+            QueryBuilders.regexpQuery("level", "err.*"),
+            QueryBuilders.wildcardQuery("level", "e*r"),
+            QueryBuilders.existsQuery("host.name"),
+            QueryBuilders.termsQuery("level", "error", "fatal"),
+            QueryBuilders.boolQuery().should(QueryBuilders.termQuery("level", "fatal")).should(QueryBuilders.rangeQuery("status").gte(500)).minimumShouldMatch(1),
+            QueryBuilders.rangeQuery("@timestamp").gte("now-1d"),
+            QueryBuilders.idsQuery().addIds("a", "b")
+        );
+        for (org.opensearch.index.query.QueryBuilder filter : filters) {
+            Translation t = translate(QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).filter(filter));
+            assertFalse(filter.toString(), InfinoQueryTranslator.joinsAfterRanking(t.where()));
+            assertTrue(filter.toString(), hits(t, null, 10).contains("bm25_search('os_logs_0', 'message', 'disk', 10, 'or')"));
+        }
     }
 
     public void testRankedSearchKeepsTheWindowWhereRowsGoAfterTheRanking() {
