@@ -113,22 +113,20 @@ public class InfinoStockKnnIT extends OpenSearchRestTestCase {
 
     /**
      * A filtered knn whose matching documents all sit farther from the query
-     * than every other document, measured on both sides of the engine's limit.
+     * than every other document: the k nearest the filter keeps, as the k-NN
+     * plugin returns them, however many nearer documents it rejects.
      *
      * <p>The engine's {@code vector_search} takes the filter as a predicate
-     * on a column with no index, so it searches unfiltered, checks the
-     * predicate on the hits, and widens until k survive, up to a ceiling
-     * (10,000 hits for any k below 157). With fewer nearer documents than
-     * that, the answer is exact: the k nearest the filter keeps, as the k-NN
-     * plugin returns them. Past it the matching documents are never reached
-     * and the page comes back empty, where the k-NN plugin would return them.
-     * That gap is the engine's to close (rank within exactly the rows the
-     * predicate keeps, as its BM25 search does); this pins both sides, so a
-     * change on either one shows here.
+     * on a column with no index. It checks the predicate on its k nearest
+     * and, when fewer than k survive, evaluates it over the table's rows and
+     * searches within exactly the rows it keeps. Before that, it widened the
+     * search until k survived, up to a ceiling (10,000 hits for any k below
+     * 157), and the matching documents past it were never reached: the cases
+     * past 10,000 nearer documents came back empty.
      */
-    public void testAFilteredKnnIsExactUpToTheEnginesWidening() throws IOException {
+    public void testAFilteredKnnIsExactHoweverManyNearerDocumentsItRejects() throws IOException {
         List<String> measured = new ArrayList<>();
-        // Below the engine's widening: 5,000 nearer documents, 11 matching.
+        // Below the engine's old widening ceiling: 5,000 nearer documents, 11 matching.
         String small = "knn_scale_small";
         createIndex(small, true, "l2");
         StringBuilder smallBody = new StringBuilder();
@@ -157,13 +155,12 @@ public class InfinoStockKnnIT extends OpenSearchRestTestCase {
         assertEquals(
             report,
             List.of(
-                // Exact: fewer nearer documents than the engine widens to.
                 "5k nearer k=10: 10 of 10",
                 "5k nearer k=20: 11 of 11",
-                // Short: the matching documents rank past the ceiling.
-                "10k nearer k=10: 0 of 1",
-                "110k nearer k=10: 0 of 10",
-                "110k nearer k=20: 0 of 11"
+                // Past the old ceiling: these came back empty.
+                "10k nearer k=10: 1 of 1",
+                "110k nearer k=10: 10 of 10",
+                "110k nearer k=20: 11 of 11"
             ),
             measured
         );

@@ -240,11 +240,10 @@ the table as it is sent to a Lucene index:
 The engine returns the k nearest and the page is a window over them, so the
 total is how many came back. A `filter` goes to the engine's `vector_search`
 as a predicate, and the k nearest come from the documents it keeps, as the
-k-NN plugin's filtered search returns them, up to a limit: the engine checks
-the predicate on its nearest hits and widens the search until k survive, up
-to 10,000 hits for any k below 157. When more documents than that sit nearer
-the query than the filter's matches, the matches are not reached and the
-page comes back short or empty, where the k-NN plugin would return them.
+k-NN plugin's filtered search returns them, however many nearer documents
+the filter rejects: when the engine's nearest hits leave fewer than k that
+match, it evaluates the predicate over the table's rows and searches within
+exactly the rows it keeps.
 The filter takes the term-level clauses above (term, terms, range, exists,
 prefix, wildcard, regexp, ids, bool); a full-text clause inside it is refused,
 since a text match is a search of its own rather than a predicate the vector
