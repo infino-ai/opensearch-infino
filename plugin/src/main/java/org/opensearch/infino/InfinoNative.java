@@ -214,6 +214,7 @@ public final class InfinoNative {
             }
             COLUMNS.clear();
             SOURCES.invalidateAll();
+            InfinoRequestCache.changedAll();
             conn = p;
             opened = target;
         }
@@ -398,7 +399,12 @@ public final class InfinoNative {
     public static void ensureTable(String name, String mappingJson) {
         init();
         COLUMNS.remove(name);
-        takeOrThrow(lib.infino_ensure_table(conn, name, mappingJson));
+        InfinoRequestCache.changed(name);
+        try {
+            takeOrThrow(lib.infino_ensure_table(conn, name, mappingJson));
+        } finally {
+            InfinoRequestCache.changed(name);
+        }
     }
 
     /** Column name → description; empty if the table does not exist yet. */
@@ -432,12 +438,22 @@ public final class InfinoNative {
     public static int dropTable(String name) {
         init();
         COLUMNS.remove(name);
-        return lib.infino_drop(conn, name);
+        InfinoRequestCache.changed(name);
+        try {
+            return lib.infino_drop(conn, name);
+        } finally {
+            InfinoRequestCache.changed(name);
+        }
     }
 
     public static int optimize(String name) {
         init();
-        return lib.infino_optimize(conn, name);
+        InfinoRequestCache.changed(name);
+        try {
+            return lib.infino_optimize(conn, name);
+        } finally {
+            InfinoRequestCache.changed(name);
+        }
     }
 
     // ---- documents ----
@@ -505,7 +521,13 @@ public final class InfinoNative {
         init();
         COLUMNS.remove(name); // the batch may have added paths to the schema
         String[] ids = replaced.toArray(new String[0]);
-        Map<String, Object> out = object(takeOrThrow(lib.infino_append_prepared(conn, name, prepared.toArray(new Pointer[0]), prepared.size(), ids, ids.length)));
+        InfinoRequestCache.changed(name);
+        Map<String, Object> out;
+        try {
+            out = object(takeOrThrow(lib.infino_append_prepared(conn, name, prepared.toArray(new Pointer[0]), prepared.size(), ids, ids.length)));
+        } finally {
+            InfinoRequestCache.changed(name);
+        }
         List<PreparedFailure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
             failed.add(new PreparedFailure(((Number) f.get("b")).intValue(), ((Number) f.get("i")).intValue(), (String) f.get("reason")));
@@ -530,7 +552,13 @@ public final class InfinoNative {
         init();
         COLUMNS.remove(name); // the batch may have added paths to the schema
         Packed p = Packed.of(List.of(osids).subList(0, n), List.of(sources).subList(0, n));
-        Map<String, Object> out = object(takeOrThrow(lib.infino_index_batch_buf(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), n)));
+        InfinoRequestCache.changed(name);
+        Map<String, Object> out;
+        try {
+            out = object(takeOrThrow(lib.infino_index_batch_buf(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), n)));
+        } finally {
+            InfinoRequestCache.changed(name);
+        }
         List<Failure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
             failed.add(new Failure(((Number) f.get("i")).intValue(), (String) f.get("reason")));
@@ -541,7 +569,12 @@ public final class InfinoNative {
     /** Tombstone every row with one of these ids, in one mutation. */
     public static int deleteOsids(String name, String[] osids, int n) {
         init();
-        return lib.infino_delete_osids(conn, name, osids, n);
+        InfinoRequestCache.changed(name);
+        try {
+            return lib.infino_delete_osids(conn, name, osids, n);
+        } finally {
+            InfinoRequestCache.changed(name);
+        }
     }
 
     /** The source of one id: the page prefetch when the query phase ran one, else a lookup. */
