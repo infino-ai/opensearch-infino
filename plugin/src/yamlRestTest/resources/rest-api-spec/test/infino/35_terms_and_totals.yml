@@ -1,0 +1,321 @@
+---
+"Top terms picked from the grouped counts, and totals read beside the aggregations":
+  - do:
+      indices.create:
+        index: tt
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              n: { type: long }
+              price: { type: double }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: tt, _id: "d1" }
+          - { tag: b, n: 1, price: 1.5 }
+          - index: { _index: tt, _id: "d2" }
+          - { tag: b, n: 1, price: 2.5 }
+          - index: { _index: tt, _id: "d3" }
+          - { tag: a, n: 2, price: 3.0 }
+          - index: { _index: tt, _id: "d4" }
+          - { tag: a, n: 2, price: 4.0 }
+          - index: { _index: tt, _id: "d5" }
+          - { tag: Z, n: 3, price: 5.0 }
+          - index: { _index: tt, _id: "d6" }
+          - { tag: "é", n: 3, price: 6.0 }
+          - index: { _index: tt, _id: "d7" }
+          - { tag: z, n: 5, price: 7.0 }
+          - index: { _index: tt, _id: "d8" }
+          - { n: 5, price: 8.0 }
+  - match: { errors: false }
+
+  # Count first, ties by key in byte order (Z before z before é); the row without a tag
+  # takes no slot, and the two buckets past the size are the other count.
+  - do:
+      search:
+        index: tt
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, size: 3 } }
+  - length: { aggregations.tags.buckets: 3 }
+  - match: { aggregations.tags.buckets.0.key: a }
+  - match: { aggregations.tags.buckets.1.key: b }
+  - match: { aggregations.tags.buckets.2.key: Z }
+  - match: { aggregations.tags.buckets.2.doc_count: 1 }
+  - match: { aggregations.tags.sum_other_doc_count: 2 }
+
+  # By key, descending: é's first byte sorts above every ASCII letter.
+  - do:
+      search:
+        index: tt
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, order: { _key: desc } } }
+  - length: { aggregations.tags.buckets: 5 }
+  - match: { aggregations.tags.buckets.0.key: "é" }
+  - match: { aggregations.tags.buckets.1.key: z }
+  - match: { aggregations.tags.buckets.2.key: b }
+  - match: { aggregations.tags.buckets.3.key: a }
+  - match: { aggregations.tags.buckets.4.key: Z }
+  - match: { aggregations.tags.sum_other_doc_count: 0 }
+
+  # By count, ascending, ties by key.
+  - do:
+      search:
+        index: tt
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, size: 2, order: { _count: asc } } }
+  - match: { aggregations.tags.buckets.0.key: Z }
+  - match: { aggregations.tags.buckets.1.key: z }
+  - match: { aggregations.tags.sum_other_doc_count: 5 }
+
+  # A numeric key orders by value.
+  - do:
+      search:
+        index: tt
+        body:
+          size: 0
+          aggs:
+            ns: { terms: { field: n, order: { _key: desc } } }
+  - length: { aggregations.ns.buckets: 4 }
+  - match: { aggregations.ns.buckets.0.key: 5 }
+  - match: { aggregations.ns.buckets.3.key: 1 }
+
+  # min_doc_count keeps the groups with at least that many rows; the groups it
+  # drops are not the other count (the next test has a stock index agree).
+  - do:
+      search:
+        index: tt
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, min_doc_count: 2 } }
+  - length: { aggregations.tags.buckets: 2 }
+  - match: { aggregations.tags.buckets.0.key: a }
+  - match: { aggregations.tags.buckets.1.key: b }
+  - match: { aggregations.tags.sum_other_doc_count: 0 }
+
+  # An order by a metric: a and z both sum to 7.0 and tie by key; b is last.
+  - do:
+      search:
+        index: tt
+        body:
+          size: 0
+          aggs:
+            tags:
+              terms: { field: tag, order: { s: desc } }
+              aggs:
+                s: { sum: { field: price } }
+  - match: { aggregations.tags.buckets.0.key: a }
+  - match: { aggregations.tags.buckets.0.s.value: 7.0 }
+  - match: { aggregations.tags.buckets.1.key: z }
+  - match: { aggregations.tags.buckets.4.key: b }
+
+  # The exact total of a request with no hits to fetch comes beside the metrics.
+  - do:
+      search:
+        index: tt
+        body:
+          size: 0
+          track_total_hits: true
+          aggs:
+            s: { sum: { field: price } }
+            a: { avg: { field: price } }
+  - match: { hits.total.value: 8 }
+  - match: { hits.total.relation: eq }
+  - match: { aggregations.s.value: 37.0 }
+  - match: { aggregations.a.value: 4.625 }
+
+  # ... over the query's rows,
+  - do:
+      search:
+        index: tt
+        body:
+          size: 0
+          track_total_hits: true
+          query: { term: { tag: b } }
+          aggs:
+            s: { sum: { field: price } }
+  - match: { hits.total.value: 2 }
+  - match: { aggregations.s.value: 4.0 }
+
+  # ... and a post_filter narrows the total, not the aggregations.
+  - do:
+      search:
+        index: tt
+        body:
+          size: 0
+          track_total_hits: true
+          post_filter: { term: { tag: a } }
+          aggs:
+            s: { sum: { field: price } }
+  - match: { hits.total.value: 2 }
+  - match: { aggregations.s.value: 37.0 }
+
+  # A bucket aggregation alone still reports the total.
+  - do:
+      search:
+        index: tt
+        body:
+          size: 0
+          track_total_hits: true
+          aggs:
+            tags: { terms: { field: tag } }
+  - match: { hits.total.value: 8 }
+
+---
+"Other counts under min_doc_count and boolean keys, as a stock index answers them":
+  # The same documents in a table and in a stock (Lucene) index; each request
+  # runs on both and the answers are asserted alike.
+  - do:
+      indices.create:
+        index: mdc
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              flag: { type: boolean }
+  - do:
+      indices.create:
+        index: mdc_stock
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              flag: { type: boolean }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: mdc, _id: "d1" }
+          - { tag: b, flag: true }
+          - index: { _index: mdc, _id: "d2" }
+          - { tag: b, flag: true }
+          - index: { _index: mdc, _id: "d3" }
+          - { tag: a, flag: false }
+          - index: { _index: mdc, _id: "d4" }
+          - { tag: a, flag: true }
+          - index: { _index: mdc, _id: "d5" }
+          - { tag: Z, flag: false }
+          - index: { _index: mdc, _id: "d6" }
+          - { tag: "é", flag: true }
+          - index: { _index: mdc, _id: "d7" }
+          - { tag: z, flag: true }
+          - index: { _index: mdc, _id: "d8" }
+          - { flag: false }
+  - match: { errors: false }
+  # A bulk is served by the table or by Lucene, never both: one per index.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: mdc_stock, _id: "d1" }
+          - { tag: b, flag: true }
+          - index: { _index: mdc_stock, _id: "d2" }
+          - { tag: b, flag: true }
+          - index: { _index: mdc_stock, _id: "d3" }
+          - { tag: a, flag: false }
+          - index: { _index: mdc_stock, _id: "d4" }
+          - { tag: a, flag: true }
+          - index: { _index: mdc_stock, _id: "d5" }
+          - { tag: Z, flag: false }
+          - index: { _index: mdc_stock, _id: "d6" }
+          - { tag: "é", flag: true }
+          - index: { _index: mdc_stock, _id: "d7" }
+          - { tag: z, flag: true }
+          - index: { _index: mdc_stock, _id: "d8" }
+          - { flag: false }
+  - match: { errors: false }
+
+  # The three single-row terms min_doc_count drops are in no bucket and not the
+  # other count: a shard keeps every term in its queue, and the reduce drops the
+  # ones under min_doc_count without adding them to the other count.
+  - do:
+      search:
+        index: mdc_stock
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, min_doc_count: 2 } }
+  - length: { aggregations.tags.buckets: 2 }
+  - match: { aggregations.tags.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: mdc
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, min_doc_count: 2 } }
+  - length: { aggregations.tags.buckets: 2 }
+  - match: { aggregations.tags.sum_other_doc_count: 0 }
+
+  # A term that passes min_doc_count but falls past the size is the other count.
+  - do:
+      search:
+        index: mdc_stock
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, size: 1, min_doc_count: 2 } }
+  - match: { aggregations.tags.buckets.0.key: a }
+  - match: { aggregations.tags.sum_other_doc_count: 2 }
+  - do:
+      search:
+        index: mdc
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, size: 1, min_doc_count: 2 } }
+  - match: { aggregations.tags.buckets.0.key: a }
+  - match: { aggregations.tags.sum_other_doc_count: 2 }
+
+  # Boolean keys by key: false before true, and the reverse.
+  - do:
+      search:
+        index: mdc_stock
+        body:
+          size: 0
+          aggs:
+            flags: { terms: { field: flag, order: { _key: asc } } }
+  - match: { aggregations.flags.buckets.0.key_as_string: "false" }
+  - match: { aggregations.flags.buckets.0.doc_count: 3 }
+  - match: { aggregations.flags.buckets.1.key_as_string: "true" }
+  - match: { aggregations.flags.buckets.1.doc_count: 5 }
+  - do:
+      search:
+        index: mdc
+        body:
+          size: 0
+          aggs:
+            flags: { terms: { field: flag, order: { _key: asc } } }
+  - match: { aggregations.flags.buckets.0.key: "false" }
+  - match: { aggregations.flags.buckets.0.doc_count: 3 }
+  - match: { aggregations.flags.buckets.1.key: "true" }
+  - match: { aggregations.flags.buckets.1.doc_count: 5 }
+  - do:
+      search:
+        index: mdc_stock
+        body:
+          size: 0
+          aggs:
+            flags: { terms: { field: flag, order: { _key: desc } } }
+  - match: { aggregations.flags.buckets.0.key_as_string: "true" }
+  - match: { aggregations.flags.buckets.1.key_as_string: "false" }
+  - do:
+      search:
+        index: mdc
+        body:
+          size: 0
+          aggs:
+            flags: { terms: { field: flag, order: { _key: desc } } }
+  - match: { aggregations.flags.buckets.0.key: "true" }
+  - match: { aggregations.flags.buckets.1.key: "false" }
