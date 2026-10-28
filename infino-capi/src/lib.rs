@@ -1537,13 +1537,17 @@ pub unsafe extern "C" fn infino_sql(h: *mut Bridge, sql: *const c_char) -> *mut 
     .unwrap_or(ptr::null_mut())
 }
 
-/// Ranked BM25 over one text column; rows carry `osid` and `score`.
+/// Ranked BM25 over one text column (`mode` is `"and"` or `"or"`), the top
+/// `k` rows best first, each carrying `osid`, `source` and `score`: a page
+/// of hits in one call, where the same page through `bm25_search` in SQL
+/// would plan a statement first.
 #[no_mangle]
 pub unsafe extern "C" fn infino_bm25(
     h: *mut Bridge,
     name: *const c_char,
     column: *const c_char,
     query: *const c_char,
+    mode: *const c_char,
     k: c_int,
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
@@ -1555,6 +1559,10 @@ pub unsafe extern "C" fn infino_bm25(
         ) else {
             return ptr::null_mut();
         };
+        let mode = match unsafe { cstr(mode) } {
+            Some("and") => BoolMode::And,
+            _ => BoolMode::Or,
+        };
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
@@ -1563,8 +1571,8 @@ pub unsafe extern "C" fn infino_bm25(
             column,
             query,
             k.max(0) as usize,
-            Bm25SearchOptions::default(),
-            Some(&[OSID, "score"]),
+            Bm25SearchOptions::new().with_mode(mode),
+            Some(&[OSID, SOURCE, "score"]),
         ) {
             Ok(b) => out_string(batches_to_json(&b)),
             Err(e) => err_json(&e.to_string()),
@@ -1669,7 +1677,7 @@ pub unsafe extern "C" fn infino_knn(
             &emb,
             k.max(0) as usize,
             None,
-            Some(&[OSID, "score"]),
+            Some(&[OSID, SOURCE, "score"]),
         ) {
             Ok(b) => out_string(batches_to_json(&b)),
             Err(e) => err_json(&e.to_string()),
@@ -1714,7 +1722,7 @@ pub unsafe extern "C" fn infino_hybrid(
             vcol,
             &emb,
             k.max(0) as usize,
-            Some(&[OSID, "score"]),
+            Some(&[OSID, SOURCE, "score"]),
         ) {
             Ok(b) => out_string(batches_to_json(&b)),
             Err(e) => err_json(&e.to_string()),
