@@ -19,6 +19,7 @@ import org.opensearch.threadpool.ThreadPool;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
 
@@ -54,6 +55,7 @@ import java.util.regex.Pattern;
  * <pre>
  * GET    /_plugins/_infino/account          what the tables are served from; the notice when no account is set
  * GET    /_plugins/_infino/account/indices  the indices the registry would bring back on a fresh cluster
+ * POST   /_plugins/_infino/account/indices  bring them back now: create every one the cluster lacks (with ?name=, that one)
  * POST   /_plugins/_infino/account/trial    {"accept": true, "platform"?, "database"?}: create a free account and use it
  * PUT    /_plugins/_infino/account          {"platform", "api_key", "database"?}: use an account you have
  * DELETE /_plugins/_infino/account          stop using the account on this node; the tables stay on the service
@@ -166,6 +168,9 @@ public final class InfinoAccount {
                 if (trial) {
                     Map<String, Object> accepted = body;
                     asClusterAdmin(channel, () -> trial(accepted, channel));
+                } else if (indices) {
+                    String name = request.param("name");
+                    asClusterAdmin(channel, () -> restore(name, channel));
                 } else {
                     notAllowed(request, channel);
                 }
@@ -253,6 +258,42 @@ public final class InfinoAccount {
             }
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, b.endObject()));
         });
+    }
+
+    /**
+     * POST indices: create every index the registry names that the cluster
+     * lacks, now, as a fresh cluster does at boot; with {@code name}, that
+     * one. What serves an index whose table and registry row a loader wrote
+     * while the cluster runs (a snapshot load into the plugin's table),
+     * with no restart. Creating indices is cluster management, so the
+     * caller needs that right. Answers with each registered index and what
+     * became of it: created, present, or failed with the reason.
+     */
+    private void restore(String name, RestChannel channel) {
+        ClusterService clusters = InfinoServices.clusterService();
+        if (clusters == null) {
+            throw new IllegalStateException("[infino] the node is not ready");
+        }
+        onGeneric(channel, () -> InfinoRegistry.restore(clusters.state(), name, ActionListener.wrap(restored -> {
+            XContentBuilder b = channel.newBuilder().startObject();
+            b.field("serving", InfinoNative.serving());
+            if (name != null) {
+                b.field("name", name);
+                b.field("registered", !restored.isEmpty());
+            }
+            b.startArray("indices");
+            for (InfinoRegistry.Restored r : restored) {
+                b.startObject();
+                b.field("name", r.name());
+                b.field("result", r.outcome().name().toLowerCase(Locale.ROOT));
+                if (r.reason() != null) {
+                    b.field("reason", r.reason());
+                }
+                b.endObject();
+            }
+            b.endArray();
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, b.endObject()));
+        }, e -> fail(channel, e))));
     }
 
     private static void index(XContentBuilder b, Map<String, Object> row) throws IOException {

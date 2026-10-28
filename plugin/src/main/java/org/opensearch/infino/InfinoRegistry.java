@@ -27,6 +27,7 @@ import org.opensearch.threadpool.ThreadPool;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -51,6 +52,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * row. The security plugin's configuration index and Dashboards' saved
  * objects come back the same way, so a fresh node needs neither
  * {@code securityadmin} nor a saved-objects migration.
+ *
+ * <p>A row can also come from outside the cluster: a loader that writes a
+ * table in this shape writes its index's row beside it (a load of a Lucene
+ * index's snapshot into such a table does), and
+ * {@code POST /_plugins/_infino/account/indices} creates it on a running
+ * cluster, as a fresh one would at boot ({@link #restore}).
  */
 final class InfinoRegistry {
 
@@ -184,43 +191,82 @@ final class InfinoRegistry {
         return new ArrayList<>(byName.values());
     }
 
-    /** Create every index the registry names that the cluster lacks, one after another. */
+    /** What became of a registered index when the registry was restored. */
+    enum Outcome {
+        /** The cluster lacked it, and it was created from its row. */
+        CREATED,
+        /** The cluster already has an index or an alias of that name. */
+        PRESENT,
+        /** Its row could not be read as a create request, or the create failed. */
+        FAILED
+    }
+
+    /** One registered index, what became of it, and why when it failed. */
+    record Restored(String name, Outcome outcome, String reason) {}
+
+    /** Create every index the registry names that the cluster lacks, one after another: once per node life, at boot. */
     static void rebuild(ClusterState state) {
+        restore(state, null, ActionListener.wrap(restored -> {
+            long created = restored.stream().filter(r -> r.outcome() == Outcome.CREATED).count();
+            if (created == 0 && restored.stream().noneMatch(r -> r.outcome() == Outcome.FAILED)) {
+                log.info("[infino] the registry names {} indices, all present", restored.size());
+            } else {
+                log.info("[infino] rebuilt {} of the {} indices the registry names", created, restored.size());
+            }
+        }, e -> log.warn("[infino] the registry could not be read; the indices are not rebuilt", e)));
+    }
+
+    /**
+     * Create every index the registry names that {@code state} lacks, now,
+     * as {@link #rebuild} does at boot; with {@code only}, that one index
+     * alone. What brings up an index whose table and row a loader wrote
+     * beside the others while the cluster runs (a snapshot load into the
+     * plugin's table), with no restart. The listener gets every registered
+     * index considered, with what became of it; a row that fails is
+     * reported and the rest still created. Reads the engine: never call it
+     * on a transport or applier thread.
+     */
+    static void restore(ClusterState state, String only, ActionListener<List<Restored>> listener) {
         List<Map<String, Object>> rows;
         try {
             rows = rows();
         } catch (Exception e) {
-            log.warn("[infino] the registry could not be read; the indices are not rebuilt", e);
+            listener.onFailure(e);
             return;
         }
+        List<Restored> restored = Collections.synchronizedList(new ArrayList<>());
         List<CreateIndexRequest> missing = new ArrayList<>();
         for (Map<String, Object> row : rows) {
-            Object name = row.get("name");
-            if (name instanceof String n && !state.metadata().hasIndex(n) && !state.metadata().hasAlias(n)) {
-                try {
-                    missing.add(requestOf(n, row));
-                } catch (Exception e) {
-                    log.warn("[infino] index {} could not be rebuilt from its registry row", n, e);
-                }
+            if (!(row.get("name") instanceof String name) || (only != null && !only.equals(name))) {
+                continue;
+            }
+            if (state.metadata().hasIndex(name) || state.metadata().hasAlias(name)) {
+                restored.add(new Restored(name, Outcome.PRESENT, null));
+                continue;
+            }
+            try {
+                missing.add(requestOf(name, row));
+            } catch (Exception e) {
+                log.warn("[infino] index {} could not be rebuilt from its registry row", name, e);
+                restored.add(new Restored(name, Outcome.FAILED, "its registry row is not a create request: " + e.getMessage()));
             }
         }
-        if (missing.isEmpty()) {
-            log.info("[infino] the registry names {} indices, all present", rows.size());
-            return;
-        }
-        log.info("[infino] rebuilding {} of the {} indices the registry names", missing.size(), rows.size());
-        createNext(missing, 0);
+        createNext(missing, 0, restored, () -> listener.onResponse(List.copyOf(restored)));
     }
 
-    private static void createNext(List<CreateIndexRequest> requests, int at) {
+    private static void createNext(List<CreateIndexRequest> requests, int at, List<Restored> restored, Runnable done) {
         if (at == requests.size()) {
-            log.info("[infino] rebuilt {} indices from the registry", requests.size());
+            done.run();
             return;
         }
         CreateIndexRequest request = requests.get(at);
-        InfinoClient.createIndex(request, ActionListener.wrap(created -> createNext(requests, at + 1), e -> {
+        InfinoClient.createIndex(request, ActionListener.wrap(created -> {
+            restored.add(new Restored(request.index(), Outcome.CREATED, null));
+            createNext(requests, at + 1, restored, done);
+        }, e -> {
             log.warn("[infino] index {} could not be rebuilt", request.index(), e);
-            createNext(requests, at + 1);
+            restored.add(new Restored(request.index(), Outcome.FAILED, e.getMessage()));
+            createNext(requests, at + 1, restored, done);
         }));
     }
 

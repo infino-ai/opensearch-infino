@@ -34,6 +34,7 @@ public final class InfinoAccountRestHandler extends BaseRestHandler {
         return List.of(
             new Route(RestRequest.Method.GET, InfinoAccount.ROUTE),
             new Route(RestRequest.Method.GET, InfinoAccount.INDICES_ROUTE),
+            new Route(RestRequest.Method.POST, InfinoAccount.INDICES_ROUTE),
             new Route(RestRequest.Method.POST, InfinoAccount.TRIAL_ROUTE),
             new Route(RestRequest.Method.PUT, InfinoAccount.ROUTE),
             new Route(RestRequest.Method.DELETE, InfinoAccount.ROUTE)
