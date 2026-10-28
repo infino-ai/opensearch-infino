@@ -86,6 +86,8 @@ public final class InfinoNative {
     /** The target the node is configured for: its own URI until the settings or the account route say otherwise. */
     private static volatile Target wanted = Target.node();
     private static final Map<String, Map<String, Column>> COLUMNS = new ConcurrentHashMap<>();
+    /** The count's key in {@link #valueCounts}'s rows, as the engine names it. */
+    static final String VALUE_COUNT = "count";
     /** How long a prefetched source waits for its fetch phase. */
     private static final TimeValue SOURCE_PREFETCH_TTL = TimeValue.timeValueSeconds(30);
     /** Bytes of prefetched sources held at once across requests. */
@@ -589,6 +591,18 @@ public final class InfinoNative {
     public static long count(String n, String c, String q, String mode) {
         init();
         return Long.parseLong(takeOrThrow(lib.infino_count(conn, n, c, q, mode)).trim());
+    }
+
+    /**
+     * A column's rows counted per value, read from the table's statistics
+     * without a statement: one row per value (under the column's name, null
+     * for the rows without one) with its count under {@link #VALUE_COUNT}.
+     * Null when the statistics can't answer exactly; a GROUP BY answers then.
+     */
+    public static List<Map<String, Object>> valueCounts(String n, String column) {
+        init();
+        String out = takeOrThrow(lib.infino_value_counts(conn, n, column)).trim();
+        return out.equals("null") ? null : rows(out);
     }
 
     /**

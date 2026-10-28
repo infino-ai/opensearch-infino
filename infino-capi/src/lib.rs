@@ -1609,6 +1609,35 @@ pub unsafe extern "C" fn infino_count(
     .unwrap_or(ptr::null_mut())
 }
 
+/// A column's rows counted per value, read from the table's statistics
+/// without a statement: rows of the value (under the column's name, null for
+/// the rows without one) and `count`. `null` when the statistics can't answer
+/// exactly; a `GROUP BY` answers then.
+#[no_mangle]
+pub unsafe extern "C" fn infino_value_counts(
+    h: *mut Bridge,
+    name: *const c_char,
+    column: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(column)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(column) })
+        else {
+            return ptr::null_mut();
+        };
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        match table.value_counts(column) {
+            Ok(Some(b)) => out_string(batches_to_json(&[b])),
+            Ok(None) => out_string("null".to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// Unranked full-text match set: the osids of every row matching `query` on
 /// `column`. Backs query-scoped aggregations over a text query.
 #[no_mangle]
@@ -1919,6 +1948,46 @@ mod tests {
 
     fn optimize(h: *mut Bridge) -> c_int {
         unsafe { infino_optimize(h, c("logs").as_ptr()) }
+    }
+
+    fn value_counts(h: *mut Bridge, column: &str) -> Value {
+        let out = take(unsafe { infino_value_counts(h, c("logs").as_ptr(), c(column).as_ptr()) });
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
+    /// `(value, count)` pairs of `rows`, the value under `key` and the count under `count`, sorted.
+    fn counted(rows: &Value, key: &str, count: &str) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r[key].to_string(), r[count].as_u64().unwrap()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn value_counts_are_the_grouped_count_until_a_delete() {
+        let h = open_logs();
+        index(
+            h,
+            &[
+                ("a", r#"{"level":"error"}"#),
+                ("b", r#"{"level":"info"}"#),
+                ("c", r#"{"level":"info"}"#),
+                ("d", r#"{"message":"no level"}"#),
+            ],
+        );
+        let grouped = sql(h, "SELECT level, COUNT(*) AS n FROM logs GROUP BY level");
+        assert_eq!(
+            counted(&value_counts(h, "level"), "level", "count"),
+            counted(&grouped, "level", "n")
+        );
+        // The deleted row is still in the table's statistics, so they don't answer.
+        assert_eq!(delete(h, &["a"]), 0);
+        assert_eq!(value_counts(h, "level"), Value::Null);
+        close(h);
     }
 
     #[test]

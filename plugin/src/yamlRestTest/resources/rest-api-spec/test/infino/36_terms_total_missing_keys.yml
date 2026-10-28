@@ -57,6 +57,29 @@
   - length: { aggregations.t.buckets: 3 }
   - match: { aggregations.t.sum_other_doc_count: 0 }
 
+  # After a delete the table's per-value statistics still hold the deleted
+  # row, so the groups come from a statement instead, with the same answer.
+  - do:
+      delete:
+        index: tm
+        id: "3"
+        refresh: true
+  - do:
+      search:
+        index: tm
+        body:
+          size: 0
+          track_total_hits: true
+          aggs:
+            t: { terms: { field: tag, size: 2 } }
+  - match: { hits.total.value: 5 }
+  - length: { aggregations.t.buckets: 2 }
+  - match: { aggregations.t.buckets.0.key: a }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.1.key: c }
+  - match: { aggregations.t.buckets.1.doc_count: 1 }
+  - match: { aggregations.t.sum_other_doc_count: 0 }
+
   # min_doc_count leaves groups out of the sum, so the total is counted on its own.
   - do:
       search:
@@ -66,6 +89,6 @@
           track_total_hits: true
           aggs:
             t: { terms: { field: tag, min_doc_count: 2 } }
-  - match: { hits.total.value: 6 }
+  - match: { hits.total.value: 5 }
   - length: { aggregations.t.buckets: 1 }
   - match: { aggregations.t.buckets.0.key: a }

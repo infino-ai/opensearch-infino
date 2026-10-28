@@ -357,7 +357,7 @@ public class InfinoAggregationProcessor {
                 // A script reads values themselves, so it sees no masked column, the value script's included.
                 Column valueColumn = c != null && c.masked() ? null : c;
                 Sql sql = InfinoScriptTranslator.translate(b.script(), InfinoAccess.scriptColumns(cols), valueColumn, System.currentTimeMillis());
-                return new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]", null);
+                return new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]", null, null);
             }
             if (c == null) {
                 throw new Unsupported("aggregation [" + b.getName() + "] needs a field or a script");
@@ -369,11 +369,12 @@ public class InfinoAggregationProcessor {
     /**
      * What an aggregation reads, as a column expression with its type;
      * {@code label} names it in a refusal, {@code mask} is how a key of it
-     * leaves the node when the field is masked for the user (null when not).
+     * leaves the node when the field is masked for the user (null when not),
+     * {@code column} the column it reads as is (null for a script).
      */
-    record Source(String expr, SqlType type, String label, UnaryOperator<String> mask) {
+    record Source(String expr, SqlType type, String label, UnaryOperator<String> mask, String column) {
         static Source of(Column c) {
-            return new Source(quoteIdent(c.name()), InfinoScriptTranslator.typeOf(c), "[" + c.name() + "]", c.mask());
+            return new Source(quoteIdent(c.name()), InfinoScriptTranslator.typeOf(c), "[" + c.name() + "]", c.mask(), c.name());
         }
 
         boolean masked() {
@@ -1461,7 +1462,7 @@ public class InfinoAggregationProcessor {
                 // A script reads values themselves, so it sees no masked column, the value script's included.
                 Column valueColumn = column != null && column.masked() ? null : column;
                 Sql sql = InfinoScriptTranslator.translate(s.script(), InfinoAccess.scriptColumns(cols), valueColumn, System.currentTimeMillis());
-                c = new Source(sql.expr(), sql.type(), "script [" + s.script().getIdOrCode() + "]", null);
+                c = new Source(sql.expr(), sql.type(), "script [" + s.script().getIdOrCode() + "]", null, null);
             } else if (column != null) {
                 c = Source.of(column);
             } else {
@@ -1913,7 +1914,10 @@ public class InfinoAggregationProcessor {
         }
         List<Grouped> chain = List.of(level);
         String picked = levelInner(chain, 0, q.from(), q.where(), "", true);
-        List<Map<String, Object>> groups = InfinoNative.sqlRows(levelInner(chain, 0, q.from(), q.where(), "", false) + " LIMIT " + (MAX_GROUPS_PICKED_HERE + 2));
+        List<Map<String, Object>> groups = valueCounts(level, q);
+        if (groups == null) {
+            groups = InfinoNative.sqlRows(levelInner(chain, 0, q.from(), q.where(), "", false) + " LIMIT " + (MAX_GROUPS_PICKED_HERE + 2));
+        }
         // One group more than are picked here may be the missing key's.
         if (groups.size() > MAX_GROUPS_PICKED_HERE + 1) {
             readAhead.put(picked, null);
@@ -1933,6 +1937,32 @@ public class InfinoAggregationProcessor {
         }
         readAhead.put(picked, keyed);
         return total;
+    }
+
+    /**
+     * A top terms level's groups over the whole table, the rows missing its
+     * key among them, as its GROUP BY would return them, read from the
+     * table's statistics by a direct call instead of a statement. Null, for
+     * the statement to answer, when the request filters the table, the level
+     * reads a script or carries metrics, or the statistics can't answer
+     * exactly (a table with deletes, a column whose values were not counted).
+     */
+    private static List<Map<String, Object>> valueCounts(Grouped level, Translation q) {
+        if (q.principal() != null || !InfinoQueryTranslator.ALL.equals(q.where()) || level.source.column() == null || !level.metrics.isEmpty()) {
+            return null;
+        }
+        List<Map<String, Object>> counts = InfinoNative.valueCounts(q.table(), level.source.column());
+        if (counts == null) {
+            return null;
+        }
+        List<Map<String, Object>> groups = new ArrayList<>(counts.size());
+        for (Map<String, Object> row : counts) {
+            Map<String, Object> group = new HashMap<>();
+            group.put("k0", row.get(level.source.column()));
+            group.put("doc_count", row.get(InfinoNative.VALUE_COUNT));
+            groups.add(group);
+        }
+        return groups;
     }
 
     /**
