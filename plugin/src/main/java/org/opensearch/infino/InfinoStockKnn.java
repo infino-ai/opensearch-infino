@@ -114,10 +114,16 @@ final class InfinoStockKnn {
      * as the bridge reads it when it declares the column's metric: the
      * method's {@code space_type}, else the field's own, else the bridge's
      * default. The engine's distances are under that metric.
+     *
+     * <p>Throws rather than guess where the scores would come out wrong: a
+     * mapping that cannot be read or does not hold the field, and a space type
+     * whose distance the engine does not compute ({@code l1}, {@code linf},
+     * {@code hamming}, which the bridge declares as cosine), so the engine
+     * ranks under another metric than the k-NN plugin would.
      */
     static String spaceType(MappingMetadata mapping, String field) {
         if (mapping == null) {
-            return BRIDGE_DEFAULT_SPACE;
+            throw new IllegalStateException("[infino] knn on [" + field + "]: the index mapping could not be read, so its space type is unknown");
         }
         Object node = mapping.sourceAsMap();
         for (String part : field.split("\\.")) {
@@ -125,13 +131,19 @@ final class InfinoStockKnn {
             node = props instanceof Map<?, ?> p ? p.get(part) : null;
         }
         if (!(node instanceof Map<?, ?> def)) {
-            return BRIDGE_DEFAULT_SPACE;
+            throw new IllegalArgumentException("[infino] knn on [" + field + "]: the field is not in the index mapping");
         }
         Object space = def.get("method") instanceof Map<?, ?> method ? method.get("space_type") : null;
         if (space == null) {
             space = def.get("space_type");
         }
-        return space == null ? BRIDGE_DEFAULT_SPACE : space.toString();
+        String named = space == null ? BRIDGE_DEFAULT_SPACE : space.toString();
+        if (!served(named)) {
+            throw new IllegalArgumentException(
+                "[infino] knn on [" + field + "] with space_type [" + named + "] is not served by the table; it serves l2, innerproduct and cosinesimil"
+            );
+        }
+        return named;
     }
 
     /**
@@ -141,14 +153,20 @@ final class InfinoStockKnn {
      * distance is the negated product and the score is the product plus one
      * when it is not negative, else {@code 1 / (1 - product)}; for cosine
      * the distance is one minus the similarity and the score
-     * {@code (1 + similarity) / 2}.
+     * {@code (1 + similarity) / 2}. Any other space type throws.
      */
     static float score(String spaceType, float distance) {
         return switch (spaceType) {
             case L2 -> 1.0f / (1.0f + distance);
             case INNER_PRODUCT -> distance <= 0 ? 1.0f - distance : 1.0f / (1.0f + distance);
-            default -> 1.0f - distance / 2.0f;
+            case COSINE -> 1.0f - distance / 2.0f;
+            default -> throw new IllegalArgumentException("[infino] knn space_type [" + spaceType + "] is not served by the table");
         };
+    }
+
+    /** Whether the engine computes {@code spaceType}'s distance, so its hits score as the k-NN plugin's. */
+    private static boolean served(String spaceType) {
+        return L2.equals(spaceType) || INNER_PRODUCT.equals(spaceType) || COSINE.equals(spaceType);
     }
 
     /** The builder as the query DSL it renders to: {@code {"knn": {field: {...}}}}. */

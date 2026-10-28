@@ -432,6 +432,9 @@ public final class InfinoSearch {
         boolean knnDistance = false;
         // A knn query's total is how many of its k came back, so it runs even for an empty page.
         boolean stockKnn = plan.vector() != null && plan.vector().stock();
+        // A knn query's hits score as the k-NN plugin scores them, under the
+        // field's space type; one the table cannot score is refused before the search.
+        String space = stockKnn ? InfinoStockKnn.spaceType(mapping(index), plan.vector().vectorColumn()) : null;
         if (size == 0 && !stockKnn) {
             rows = List.of();
         } else if (plan.vector() != null) {
@@ -480,8 +483,6 @@ public final class InfinoSearch {
         boolean version = Boolean.TRUE.equals(source.version());
         boolean seqNoAndPrimaryTerm = Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
         SearchShardTarget target = target(index);
-        // A knn query's hits score as the k-NN plugin scores them, under the field's space type.
-        String space = stockKnn ? InfinoStockKnn.spaceType(mapping(index), plan.vector().vectorColumn()) : null;
         List<SearchHit> hits = new ArrayList<>();
         float maxScore = Float.NaN;
         // Every row up to the window's end: the window itself is applied once,

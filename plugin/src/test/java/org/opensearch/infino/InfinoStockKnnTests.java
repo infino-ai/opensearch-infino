@@ -166,6 +166,11 @@ public class InfinoStockKnnTests extends OpenSearchTestCase {
         // cosine: the engine's 1 - similarity, (1 + similarity) / 2.
         assertEquals(1.0f, InfinoStockKnn.score(InfinoStockKnn.COSINE, 0f), 0f);
         assertEquals(0.0f, InfinoStockKnn.score(InfinoStockKnn.COSINE, 2f), 0f);
+        // Any other space type has no score here, rather than a cosine one.
+        for (String other : new String[] { "l1", "linf", "hamming" }) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> InfinoStockKnn.score(other, 0.5f));
+            assertTrue(e.getMessage(), e.getMessage().contains("[" + other + "]"));
+        }
     }
 
     public void testSpaceTypeIsReadAsTheBridgeReadsIt() {
@@ -180,7 +185,26 @@ public class InfinoStockKnnTests extends OpenSearchTestCase {
         assertEquals("l2", InfinoStockKnn.spaceType(mapping, "doc.emb"));
         assertEquals("innerproduct", InfinoStockKnn.spaceType(mapping, "top"));
         assertEquals(InfinoStockKnn.COSINE, InfinoStockKnn.spaceType(mapping, "bare"));
-        assertEquals(InfinoStockKnn.COSINE, InfinoStockKnn.spaceType(null, "emb"));
+    }
+
+    public void testASpaceTypeTheTableCannotScoreIsRefused() {
+        // A mapping that cannot be read, or that does not hold the field: no space type to score under.
+        IllegalStateException unread = expectThrows(IllegalStateException.class, () -> InfinoStockKnn.spaceType(null, "emb"));
+        assertTrue(unread.getMessage(), unread.getMessage().contains("[emb]"));
+        Map<String, Object> l2 = Map.of("type", "knn_vector", "dimension", 4, "space_type", "l2");
+        MappingMetadata mapping = new MappingMetadata("_doc", Map.of("properties", Map.of("emb", l2)));
+        IllegalArgumentException missing = expectThrows(IllegalArgumentException.class, () -> InfinoStockKnn.spaceType(mapping, "other"));
+        assertTrue(missing.getMessage(), missing.getMessage().contains("[other]"));
+        // A space type the engine does not compute, wherever the mapping names it.
+        for (String other : new String[] { "l1", "linf", "hamming" }) {
+            Map<String, Object> onMethod = Map.of("type", "knn_vector", "dimension", 4, "method", Map.of("space_type", other));
+            Map<String, Object> onField = Map.of("type", "knn_vector", "dimension", 4, "space_type", other);
+            MappingMetadata m = new MappingMetadata("_doc", Map.of("properties", Map.of("a", onMethod, "b", onField)));
+            for (String field : new String[] { "a", "b" }) {
+                IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> InfinoStockKnn.spaceType(m, field));
+                assertTrue(e.getMessage(), e.getMessage().contains("space_type [" + other + "]"));
+            }
+        }
     }
 
     public void testFilteredStatementRanksAmongTheKeptRows() {
