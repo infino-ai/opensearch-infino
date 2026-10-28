@@ -85,6 +85,66 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
     }
 
+    /** The hit statement for a translated query, with no sort, collapse, post_filter or search_after. */
+    private static String hits(Translation t, Column collapse, int fetch) {
+        InfinoSearch.Plan plan = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            t,
+            java.util.List.of(),
+            null,
+            null,
+            collapse,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE
+        );
+        return InfinoSearch.hitStatement(plan, fetch);
+    }
+
+    public void testRankedSearchUnderAFilterAsksForThePage() {
+        // The engine ranks within the rows the filter keeps, as Lucene filters
+        // while it collects: the filter rides with the ranked search, which is
+        // asked for the page alone.
+        BoolQueryBuilder b = QueryBuilders.boolQuery()
+            .must(QueryBuilders.matchQuery("message", "disk"))
+            .filter(QueryBuilders.termQuery("level", "error"))
+            .filter(QueryBuilders.rangeQuery("status").gte(500));
+        assertEquals(
+            "SELECT osid, source, score FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') "
+                + "WHERE (1=1 AND \"level\" = 'error' AND (\"status\" >= 500)) ORDER BY score DESC LIMIT 10",
+            hits(translate(b), null, 10)
+        );
+        // No filter: the page, as before.
+        assertEquals(
+            "SELECT osid, source, score FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') WHERE 1=1 ORDER BY score DESC LIMIT 10",
+            hits(translate(QueryBuilders.matchQuery("message", "disk")), null, 10)
+        );
+    }
+
+    public void testRankedSearchKeepsTheWindowWhereRowsGoAfterTheRanking() {
+        // A text clause on another column is a subquery joined above the
+        // ranked search, so the search ranks more candidates than the page.
+        Map<String, Column> cols = columns();
+        cols.put("title", new Column("title", "str", true, false));
+        BoolQueryBuilder b = QueryBuilders.boolQuery()
+            .must(QueryBuilders.matchQuery("message", "disk"))
+            .filter(QueryBuilders.matchQuery("title", "outage"));
+        Translation t = InfinoQueryTranslator.translate(b, cols, TABLE, NOW);
+        assertTrue(InfinoQueryTranslator.joinsAfterRanking(t.where()));
+        assertTrue(hits(t, null, 10).contains("bm25_search('os_logs_0', 'message', 'disk', 10000, 'or')"));
+        // A collapse keeps one row per value after the ranking: a filtered one
+        // keeps the window, an unfiltered one the page, as before.
+        Column level = columns().get("level");
+        BoolQueryBuilder filtered = QueryBuilders.boolQuery()
+            .must(QueryBuilders.matchQuery("message", "disk"))
+            .filter(QueryBuilders.rangeQuery("status").gte(500));
+        assertTrue(hits(translate(filtered), level, 10).contains("bm25_search('os_logs_0', 'message', 'disk', 10000, 'or')"));
+        assertTrue(hits(translate(QueryBuilders.matchQuery("message", "disk")), level, 10).contains(", 10, 'or')"));
+        // A plain filter has no subquery.
+        assertFalse(InfinoQueryTranslator.joinsAfterRanking("\"level\" = 'error'"));
+    }
+
     public void testTextUnderShouldIsASubquery() {
         BoolQueryBuilder b = QueryBuilders.boolQuery()
             .should(QueryBuilders.matchQuery("message", "disk"))

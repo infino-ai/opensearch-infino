@@ -91,10 +91,12 @@ public final class InfinoSearch {
 
     private static final Logger log = LogManager.getLogger(InfinoSearch.class);
     /**
-     * Candidates BM25 ranks before a filter narrows them, when a request has
-     * both: OpenSearch's own index.max_result_window. A filter that keeps few
-     * of the top-scored rows gives fewer hits than the total, as Lucene's
-     * windowed collection would.
+     * Candidates BM25 ranks for a page whose statement removes rows after the
+     * ranking: a collapse keeps one row per value, and a text clause on
+     * another column is a subquery the engine joins above the ranked search.
+     * Every other filter goes to the engine with the ranked search, which
+     * ranks within exactly the rows the filter keeps (as Lucene applies a
+     * filter while it collects), so such a page asks for the page alone.
      */
     private static final int RANK_WINDOW = 10_000;
     /** OpenSearch's page size when the request names none. */
@@ -505,8 +507,12 @@ public final class InfinoSearch {
             from = q.from();
             order = String.join(", ", plan.orderBy());
         } else if (ranked) {
+            // The engine ranks within the rows the predicate keeps, so the page
+            // is all it needs to rank; only a step that removes rows after the
+            // ranking needs more candidates to choose from.
             boolean filtered = !InfinoQueryTranslator.ALL.equals(where);
-            from = q.rankedFrom(filtered ? RANK_WINDOW : fetch);
+            boolean narrowedAfterRanking = InfinoQueryTranslator.joinsAfterRanking(where) || (filtered && plan.collapse() != null);
+            from = q.rankedFrom(narrowedAfterRanking ? RANK_WINDOW : fetch);
             hit.append(", score");
             order = "score DESC";
         } else {

@@ -2088,8 +2088,8 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.11.12"
-source = "git+https://github.com/infino-ai/infino.git?branch=remote%2Fschema-document#9f8032b4b7622797e21e99a751fe10ef1d7e30f7"
+version = "0.11.13"
+source = "git+https://github.com/infino-ai/infino.git?branch=fts%2Fbm25-where-exact-rows#485e63adb7e2d861391e0982ae55091b31e940a8"
 dependencies = [
  "apache-avro",
  "arc-swap",
@@ -2132,6 +2132,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tracing",
  "unicode-properties",
  "unicode-segmentation",
