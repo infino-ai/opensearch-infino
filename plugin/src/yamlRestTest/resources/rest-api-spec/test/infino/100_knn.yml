@@ -1,0 +1,268 @@
+---
+"The stock knn query: the same answers from an Infino-backed index and its Lucene twin":
+  # The same mapping and documents twice: an Infino-backed index and a Lucene
+  # twin whose k-NN plugin answers the knn query itself. Each answer of the
+  # twin is stashed and the Infino-backed index must give the same one. The
+  # vectors have 16 components (the engine's smallest vector), all but the
+  # first four zero. Every vector sits at its own squared l2 distance from
+  # the query [1, 0, 0, ...], so the nearest order has no ties: v1 0,
+  # v2 0.02, v3 0.13, v4 0.5, v5 2, v6 2.44, v7 4, v8 5.
+  - do:
+      indices.create:
+        index: knn_inf
+        body:
+          settings: { index.infino.enabled: true, index.knn: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              emb: { type: knn_vector, dimension: 16, method: { name: hnsw, engine: lucene, space_type: l2 } }
+              tag: { type: keyword }
+              title: { type: text }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: knn_luc
+        body:
+          settings: { index.infino.enabled: false, index.knn: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              emb: { type: knn_vector, dimension: 16, method: { name: hnsw, engine: lucene, space_type: l2 } }
+              tag: { type: keyword }
+              title: { type: text }
+              n: { type: long }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: knn_inf
+        body:
+          - index: { _id: "v1" }
+          - { emb: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: x, title: "wool coat", n: 1 }
+          - index: { _id: "v2" }
+          - { emb: [ 0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: y, title: "wool hat", n: 2 }
+          - index: { _id: "v3" }
+          - { emb: [ 0.8, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: x, title: "silk scarf", n: 3 }
+          - index: { _id: "v4" }
+          - { emb: [ 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: y, title: "felt hat", n: 4 }
+          - index: { _id: "v5" }
+          - { emb: [ 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: x, title: "linen shirt", n: 5 }
+          - index: { _id: "v6" }
+          - { emb: [ 0.0, 0.0, 1.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: y, title: "wool scarf", n: 6 }
+          - index: { _id: "v7" }
+          - { emb: [ -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: z, title: "cotton coat", n: 7 }
+          - index: { _id: "v8" }
+          - { emb: [ 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: z, title: "rain coat", n: 8 }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: knn_luc
+        body:
+          - index: { _id: "v1" }
+          - { emb: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: x, title: "wool coat", n: 1 }
+          - index: { _id: "v2" }
+          - { emb: [ 0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: y, title: "wool hat", n: 2 }
+          - index: { _id: "v3" }
+          - { emb: [ 0.8, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: x, title: "silk scarf", n: 3 }
+          - index: { _id: "v4" }
+          - { emb: [ 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: y, title: "felt hat", n: 4 }
+          - index: { _id: "v5" }
+          - { emb: [ 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: x, title: "linen shirt", n: 5 }
+          - index: { _id: "v6" }
+          - { emb: [ 0.0, 0.0, 1.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: y, title: "wool scarf", n: 6 }
+          - index: { _id: "v7" }
+          - { emb: [ -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: z, title: "cotton coat", n: 7 }
+          - index: { _id: "v8" }
+          - { emb: [ 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: z, title: "rain coat", n: 8 }
+  - match: { errors: false }
+
+  # The k nearest.
+  - do:
+      search:
+        index: knn_luc
+        body: { query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 3 } } } }
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - set: { hits.hits.0._id: l0 }
+  - set: { hits.hits.1._id: l1 }
+  - set: { hits.hits.2._id: l2 }
+  - do:
+      search:
+        index: knn_inf
+        body: { query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 3 } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.total.relation: eq }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: $l0 }
+  - match: { hits.hits.1._id: $l1 }
+  - match: { hits.hits.2._id: $l2 }
+  - match: { hits.hits.0._id: "v1" }
+  - match: { hits.hits.1._id: "v2" }
+  - match: { hits.hits.2._id: "v3" }
+  - match: { hits.hits.0._source.tag: x }
+  # l2 scores as the k-NN plugin gives them, 1 / (1 + squared distance): 1, 0.98, 0.885.
+  - gt: { hits.hits.0._score: 0.99 }
+  - gt: { hits.hits.2._score: 0.87 }
+  - lt: { hits.hits.2._score: 0.9 }
+
+  # The page is a window over the k, and the total is k.
+  - do:
+      search:
+        index: knn_luc
+        body: { from: 1, size: 2, query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 5 } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - set: { hits.hits.0._id: l0 }
+  - set: { hits.hits.1._id: l1 }
+  - do:
+      search:
+        index: knn_inf
+        body: { from: 1, size: 2, query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 5 } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: $l0 }
+  - match: { hits.hits.1._id: $l1 }
+  - match: { hits.hits.0._id: "v2" }
+
+  # A page reaching past k stops at k.
+  - do:
+      search:
+        index: knn_luc
+        body: { size: 10, query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2 } } } }
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - do:
+      search:
+        index: knn_inf
+        body: { size: 10, query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2 } } } }
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+
+  # No page at all still counts the k.
+  - do:
+      count:
+        index: knn_luc
+        body: { query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 4 } } } }
+  - match: { count: 4 }
+  - do:
+      count:
+        index: knn_inf
+        body: { query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 4 } } } }
+  - match: { count: 4 }
+
+  # A filter: the k nearest among the documents it keeps. The unfiltered top
+  # two hold no tag z, so a filter applied after the search would leave nothing.
+  - do:
+      search:
+        index: knn_luc
+        body: { query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2, filter: { term: { tag: z } } } } } }
+  - match: { hits.total.value: 2 }
+  - set: { hits.hits.0._id: l0 }
+  - set: { hits.hits.1._id: l1 }
+  - do:
+      search:
+        index: knn_inf
+        body: { query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2, filter: { term: { tag: z } } } } } }
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: $l0 }
+  - match: { hits.hits.1._id: $l1 }
+  - match: { hits.hits.0._id: "v7" }
+  - match: { hits.hits.1._id: "v8" }
+
+  # A bool filter: a range and a must_not.
+  - do:
+      search:
+        index: knn_luc
+        body:
+          query:
+            knn:
+              emb:
+                vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ]
+                k: 3
+                filter: { bool: { filter: [ { range: { n: { gte: 3 } } } ], must_not: [ { term: { tag: x } } ] } }
+  - match: { hits.total.value: 3 }
+  - set: { hits.hits.0._id: l0 }
+  - set: { hits.hits.1._id: l1 }
+  - set: { hits.hits.2._id: l2 }
+  - do:
+      search:
+        index: knn_inf
+        body:
+          query:
+            knn:
+              emb:
+                vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ]
+                k: 3
+                filter: { bool: { filter: [ { range: { n: { gte: 3 } } } ], must_not: [ { term: { tag: x } } ] } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: $l0 }
+  - match: { hits.hits.1._id: $l1 }
+  - match: { hits.hits.2._id: $l2 }
+  - match: { hits.hits.0._id: "v4" }
+  - match: { hits.hits.1._id: "v6" }
+  - match: { hits.hits.2._id: "v7" }
+
+  # Fewer matching documents than k: all of them.
+  - do:
+      search:
+        index: knn_luc
+        body: { query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 5, filter: { ids: { values: [ "v5", "v8" ] } } } } } }
+  - match: { hits.total.value: 2 }
+  - set: { hits.hits.0._id: l0 }
+  - set: { hits.hits.1._id: l1 }
+  - do:
+      search:
+        index: knn_inf
+        body: { query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 5, filter: { ids: { values: [ "v5", "v8" ] } } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: $l0 }
+  - match: { hits.hits.1._id: $l1 }
+  - match: { hits.hits.0._id: "v5" }
+
+  # What the table does not serve is refused with the clause named. A text
+  # match inside the filter is a search of its own, not a predicate the
+  # vector search takes.
+  - do:
+      catch: /knn filter matching text on \[title\]/
+      search:
+        index: knn_inf
+        body: { query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2, filter: { match: { title: wool } } } } } }
+  # A radial search.
+  - do:
+      catch: /knn on \[emb\] with \[max_distance\] is not served/
+      search:
+        index: knn_inf
+        body: { query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], max_distance: 1.0 } } } }
+  # knn as one clause of a bool, where infino_knn is not served either.
+  - do:
+      catch: /\[knn\] is served as the whole query only/
+      search:
+        index: knn_inf
+        body: { query: { bool: { must: [ { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2 } } } ], filter: [ { term: { tag: x } } ] } } }
+  - do:
+      catch: /\[infino_knn\] is served as the whole query only/
+      search:
+        index: knn_inf
+        body: { query: { bool: { must: [ { infino_knn: { field: emb, vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2 } } ] } } }
+  # Aggregations over the k nearest.
+  - do:
+      catch: /aggregations are not served with a knn query/
+      search:
+        index: knn_inf
+        body: { size: 0, query: { knn: { emb: { vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2 } } }, aggs: { tags: { terms: { field: tag } } } }
+
+  # infino_knn and infino_hybrid keep working beside knn.
+  - do:
+      search:
+        index: knn_inf
+        body: { size: 3, query: { infino_knn: { field: emb, vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 3 } } }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "v1" }
+  - match: { hits.hits.1._id: "v2" }
+  - match: { hits.hits.2._id: "v3" }
+  - do:
+      search:
+        index: knn_inf
+        body: { size: 3, query: { infino_hybrid: { text_column: title, query: wool, vector_column: emb, vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 3 } } }
+  - gte: { hits.total.value: 1 }
+  - match: { hits.hits.0._index: knn_inf }
