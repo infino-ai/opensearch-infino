@@ -54,8 +54,8 @@ import java.util.regex.Pattern;
  *
  * <pre>
  * GET    /_plugins/_infino/account          what the tables are served from; the notice when no account is set
- * GET    /_plugins/_infino/account/indices  the indices the registry would bring back on a fresh cluster
- * POST   /_plugins/_infino/account/indices  bring them back now: create every one the cluster lacks (with ?name=, that one)
+ * GET    /_plugins/_infino/account/indices  the indices the registry would bring back on a fresh cluster, and the cluster state registered with them
+ * POST   /_plugins/_infino/account/indices  bring them back now: apply the registered cluster state, then create every index the cluster lacks (with ?name=, that one)
  * POST   /_plugins/_infino/account/trial    {"accept": true, "platform"?, "database"?}: create a free account and use it
  * PUT    /_plugins/_infino/account          {"platform", "api_key", "database"?}: use an account you have
  * DELETE /_plugins/_infino/account          stop using the account on this node; the tables stay on the service
@@ -170,7 +170,7 @@ public final class InfinoAccount {
                     asClusterAdmin(channel, () -> trial(accepted, channel));
                 } else if (indices) {
                     String name = request.param("name");
-                    asClusterAdmin(channel, () -> restore(name, channel));
+                    asClusterAdmin(channel, () -> restore(name, request, channel));
                 } else {
                     notAllowed(request, channel);
                 }
@@ -255,6 +255,15 @@ public final class InfinoAccount {
                     b.endObject();
                 }
                 b.endArray();
+                // The cluster state the next POST applies before the indices.
+                b.startArray("state");
+                for (InfinoClusterState.Item item : InfinoClusterState.registered()) {
+                    b.startObject();
+                    b.field("kind", item.kindKey());
+                    b.field("name", item.name());
+                    b.endObject();
+                }
+                b.endArray();
             }
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, b.endObject()));
         });
@@ -266,17 +275,27 @@ public final class InfinoAccount {
      * one. What serves an index whose table and registry row a loader wrote
      * while the cluster runs (a snapshot load into the plugin's table),
      * with no restart. Creating indices is cluster management, so the
-     * caller needs that right. Answers with each registered index and what
-     * became of it: created, present, or failed with the reason.
+     * caller needs that right. The cluster state a loader registered with
+     * them (templates, pipelines, scripts, settings, the security plugin's
+     * users and roles) is applied first, as the caller, so each index comes
+     * up with its templates and pipelines in place ({@link InfinoClusterState}).
+     * Answers with each registered item and index and what became of it:
+     * applied, created, present, or failed with the reason.
      */
-    private void restore(String name, RestChannel channel) {
+    private void restore(String name, RestRequest request, RestChannel channel) {
         ClusterService clusters = InfinoServices.clusterService();
         if (clusters == null) {
             throw new IllegalStateException("[infino] the node is not ready");
         }
-        onGeneric(channel, () -> InfinoRegistry.restore(clusters.state(), name, ActionListener.wrap(restored -> {
+        onGeneric(channel, () -> InfinoClusterState.apply(request, ActionListener.wrap(applied -> restore(name, applied, clusters, channel), e -> fail(channel, e))));
+    }
+
+    /** Create the registered indices once {@code applied} is the cluster state applied before them. */
+    private void restore(String name, List<InfinoClusterState.Applied> applied, ClusterService clusters, RestChannel channel) {
+        InfinoRegistry.restore(clusters.state(), name, ActionListener.wrap(restored -> {
             XContentBuilder b = channel.newBuilder().startObject();
             b.field("serving", InfinoNative.serving());
+            InfinoClusterState.write(b, applied);
             if (name != null) {
                 b.field("name", name);
                 b.field("registered", !restored.isEmpty());
@@ -293,7 +312,7 @@ public final class InfinoAccount {
             }
             b.endArray();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, b.endObject()));
-        }, e -> fail(channel, e))));
+        }, e -> fail(channel, e)));
     }
 
     private static void index(XContentBuilder b, Map<String, Object> row) throws IOException {

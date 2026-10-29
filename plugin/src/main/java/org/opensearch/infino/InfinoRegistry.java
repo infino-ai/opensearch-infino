@@ -57,7 +57,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * table in this shape writes its index's row beside it (a load of a Lucene
  * index's snapshot into such a table does), and
  * {@code POST /_plugins/_infino/account/indices} creates it on a running
- * cluster, as a fresh one would at boot ({@link #restore}).
+ * cluster, as a fresh one would at boot ({@link #restore}). Such a loader
+ * may register the cluster state its source held besides the indices too,
+ * one row per item, which that call applies first ({@link InfinoClusterState}).
  */
 final class InfinoRegistry {
 
@@ -176,19 +178,25 @@ final class InfinoRegistry {
 
     /** The registry's rows: one object per recorded index, by name, after what moved is written. */
     static List<Map<String, Object>> rows() {
-        drain();
-        declare();
         Map<String, Map<String, Object>> byName = new LinkedHashMap<>();
-        for (Map<String, Object> row : InfinoNative.sqlRows(
-            "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM " + InfinoQueryTranslator.quoteIdent(TABLE)
-        )) {
+        for (Map<String, Object> row : rawRows()) {
             Object source = row.get(InfinoQueryTranslator.SOURCE);
             Object name = row.get(InfinoQueryTranslator.OSID);
-            if (source != null && name != null) {
+            // The cluster state a loader registered beside the indices is no index.
+            if (source != null && name != null && !InfinoClusterState.isClusterRow(name.toString())) {
                 byName.put(name.toString(), InfinoNative.object(source.toString()));
             }
         }
         return new ArrayList<>(byName.values());
+    }
+
+    /** Every row of the registry table, each its id and source, after what moved is written. */
+    static List<Map<String, Object>> rawRows() {
+        drain();
+        declare();
+        return InfinoNative.sqlRows(
+            "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM " + InfinoQueryTranslator.quoteIdent(TABLE)
+        );
     }
 
     /** What became of a registered index when the registry was restored. */

@@ -12,6 +12,7 @@ import org.opensearch.common.inject.Injector;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -53,6 +54,8 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoClient.bind(injector);
         // The security plugin's components, when it runs, come from the same injector.
         InfinoSecurity.bind(injector);
+        // Registered cluster state is sent as REST requests, whose bodies the node parses with this.
+        InfinoClusterState.bind(injector.getInstance(NamedXContentRegistry.class));
         // The indices come back from the tables on a fresh cluster, and every
         // index's shape is recorded as it moves (see InfinoRegistry).
         clusterService.addListener(InfinoRegistry::onClusterChanged);

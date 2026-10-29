@@ -290,6 +290,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
+        // Registered cluster state is applied through the node's own REST API.
+        InfinoClusterState.bind(restController);
         return List.of(new InfinoAccountRestHandler(account));
     }
 

@@ -182,7 +182,7 @@ its credit and its limits. Nothing is kept in any shard either way.
 ```bash
 curl localhost:9200/_plugins/_infino/account           # what the tables are served from; the notice when no account is in use
 curl localhost:9200/_plugins/_infino/account/indices   # what the registry would bring back on a fresh cluster (?name=<index> for one)
-curl -XPOST localhost:9200/_plugins/_infino/account/indices  # bring them back now: create every one the cluster lacks (?name=<index> for one)
+curl -XPOST localhost:9200/_plugins/_infino/account/indices  # bring them back now: apply the cluster state a loader registered (templates, pipelines, scripts, settings, users and roles), then create every index the cluster lacks (?name=<index> for one)
 curl -XPOST localhost:9200/_plugins/_infino/account/trial -H 'Content-Type: application/json' -d '{"accept": true}'
 curl -XPUT  localhost:9200/_plugins/_infino/account -H 'Content-Type: application/json' -d '{"platform": "https://host", "api_key": "..."}'
 curl -XDELETE localhost:9200/_plugins/_infino/account  # stop using the account on this node; the tables stay on the service

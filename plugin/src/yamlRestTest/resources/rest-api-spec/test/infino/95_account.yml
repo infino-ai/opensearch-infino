@@ -151,6 +151,8 @@
   - match: { registered: true }
   - match: { indices.0.name: reg2 }
   - match: { indices.0.result: present }
+  # No loader registered any cluster state, so none was applied first.
+  - length: { state: 0 }
   - do:
       count:
         index: reg2
