@@ -7,12 +7,15 @@ package org.opensearch.infino;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.support.ContextPreservingActionListener;
+import org.opensearch.common.settings.IndexScopedSettings;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.http.HttpChannel;
 import org.opensearch.http.HttpRequest;
@@ -31,6 +34,7 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -70,6 +74,11 @@ final class InfinoClusterState {
     private static final String KIND = "kind";
     private static final String NAME = "name";
     private static final String BODY = "body";
+    /** Where an index or component template keeps its settings, and the settings' own key. */
+    private static final String TEMPLATE_BODY = "template";
+    private static final String SETTINGS = "settings";
+    /** Settings written by their dotted names, as a template's body takes them. */
+    private static final ToXContent.Params FLAT_SETTINGS = new ToXContent.MapParams(Map.of("flat_settings", "true"));
 
     /** The security plugin's REST API, which each of its kinds is created through. */
     private static final String SECURITY_API = "/_plugins/_security/api/";
@@ -126,7 +135,7 @@ final class InfinoClusterState {
     record Item(String osid, String kindKey, Kind kind, String name, Map<String, Object> body) {}
 
     /** What became of an item: applied, or failed with the cluster's status and answer. */
-    record Applied(String kind, String name, boolean applied, int status, String reason) {}
+    record Applied(String kind, String name, boolean applied, int status, String reason, List<String> leftOut) {}
 
     private static volatile RestController controller;
     private static volatile NamedXContentRegistry xContentRegistry;
@@ -249,28 +258,29 @@ final class InfinoClusterState {
                 }
                 Item item = items.get(at);
                 if (item.kind() == null) {
-                    note(item, RestStatus.BAD_REQUEST.getStatus(), "no kind [" + item.kindKey() + "] is known to this node");
+                    note(item, RestStatus.BAD_REQUEST.getStatus(), "no kind [" + item.kindKey() + "] is known to this node", List.of());
                     next(at + 1);
                     return;
                 }
                 try {
                     send(item, at);
                 } catch (Exception e) {
-                    note(item, RestStatus.INTERNAL_SERVER_ERROR.getStatus(), e.toString());
+                    note(item, RestStatus.INTERNAL_SERVER_ERROR.getStatus(), e.toString(), List.of());
                     next(at + 1);
                 }
             });
         }
 
         private void send(Item item, int at) throws IOException {
+            List<String> leftOut = new ArrayList<>();
             BytesReference body;
             try (XContentBuilder b = XContentFactory.jsonBuilder()) {
-                body = BytesReference.bytes(b.map(item.body()));
+                body = BytesReference.bytes(b.map(heldToKnownSettings(item, InfinoServices.indexScopedSettings(), leftOut)));
             }
             HttpRequest http = new Sent(RestRequest.Method.PUT, item.kind().uri(item.name()), body, headers);
             RestRequest request = RestRequest.request(xContentRegistry, http, channel);
             Answer answer = new Answer(request, response -> {
-                note(item, response.status().getStatus(), response.content() == null ? "" : response.content().utf8ToString());
+                note(item, response.status().getStatus(), response.content() == null ? "" : response.content().utf8ToString(), leftOut);
                 next(at + 1);
             });
             ThreadContext context = threadPool.getThreadContext();
@@ -283,12 +293,15 @@ final class InfinoClusterState {
             }
         }
 
-        private synchronized void note(Item item, int status, String answer) {
+        private synchronized void note(Item item, int status, String answer, List<String> leftOut) {
             boolean ok = status < RestStatus.MULTIPLE_CHOICES.getStatus();
             String reason = ok ? null : answer.length() > MAX_REASON_CHARS ? answer.substring(0, MAX_REASON_CHARS) : answer;
-            applied.add(new Applied(item.kindKey(), item.name(), ok, status, reason));
+            applied.add(new Applied(item.kindKey(), item.name(), ok, status, reason, List.copyOf(leftOut)));
             if (ok) {
                 appliedRows.add(item.osid());
+                if (!leftOut.isEmpty()) {
+                    log.warn("[infino] the registered {} [{}] was applied without the settings this cluster does not know: {}", item.kindKey(), item.name(), leftOut);
+                }
             } else {
                 log.warn("[infino] the registered {} [{}] was not applied: {} {}", item.kindKey(), item.name(), status, reason);
             }
@@ -448,11 +461,49 @@ final class InfinoClusterState {
                     b.field("status", a.status());
                     b.field("reason", a.reason());
                 }
+                if (!a.leftOut().isEmpty()) {
+                    b.field("left_out", a.leftOut());
+                }
                 b.endObject();
             }
             b.endArray();
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    /**
+     * {@code item}'s body with a template's settings held to {@code known},
+     * the index settings this node knows, each one it does not (another
+     * engine's, a plugin's this cluster does not run) named onto
+     * {@code leftOut}: the cluster refuses a template carrying one, as it
+     * refuses such an index. Every other kind's body as it is.
+     */
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> heldToKnownSettings(Item item, IndexScopedSettings known, List<String> leftOut) {
+        Map<String, Object> body = new LinkedHashMap<>(item.body());
+        Map<String, Object> holder = body;
+        if (item.kind() == Kind.INDEX_TEMPLATE || item.kind() == Kind.COMPONENT_TEMPLATE) {
+            if (!(body.get(TEMPLATE_BODY) instanceof Map<?, ?> inner)) {
+                return body;
+            }
+            holder = new LinkedHashMap<>((Map<String, Object>) inner);
+            body.put(TEMPLATE_BODY, holder);
+        } else if (item.kind() != Kind.TEMPLATE) {
+            return body;
+        }
+        if (!(holder.get(SETTINGS) instanceof Map<?, ?> settings)) {
+            return body;
+        }
+        Settings kept = InfinoRegistry.knownSettings(Settings.builder().loadFromMap((Map<String, ?>) settings).build(), known, leftOut);
+        try (XContentBuilder b = XContentFactory.jsonBuilder()) {
+            b.startObject();
+            kept.toXContent(b, FLAT_SETTINGS);
+            b.endObject();
+            holder.put(SETTINGS, InfinoNative.object(BytesReference.bytes(b).utf8ToString()));
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return body;
     }
 }

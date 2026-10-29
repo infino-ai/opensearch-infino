@@ -4,10 +4,14 @@
 
 package org.opensearch.infino;
 
+import org.opensearch.common.settings.IndexScopedSettings;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 public class InfinoClusterStateTests extends OpenSearchTestCase {
 
@@ -48,6 +52,55 @@ public class InfinoClusterStateTests extends OpenSearchTestCase {
             assertSame(kind, InfinoClusterState.Kind.of(kind.key));
         }
         assertNull(InfinoClusterState.Kind.of("data_stream"));
+    }
+
+    /** The index settings a node with no plugin knows. */
+    private static final IndexScopedSettings KNOWN = new IndexScopedSettings(Settings.EMPTY, IndexScopedSettings.BUILT_IN_INDEX_SETTINGS);
+
+    @SuppressWarnings("unchecked")
+    public void testATemplatesSettingsTheClusterDoesNotKnowAreLeftOutAndNamed() {
+        Map<String, Object> composable = Map.of(
+            "index_patterns",
+            List.of("logs-*"),
+            "template",
+            Map.of("settings", Map.of("index.lifecycle.name", "logs", "index.default_pipeline", "tag"), "mappings", Map.of())
+        );
+        InfinoClusterState.Item item = new InfinoClusterState.Item(
+            "_cluster/index_template/logs",
+            "index_template",
+            InfinoClusterState.Kind.INDEX_TEMPLATE,
+            "logs",
+            composable
+        );
+        List<String> leftOut = new ArrayList<>();
+        Map<String, Object> held = InfinoClusterState.heldToKnownSettings(item, KNOWN, leftOut);
+        Map<String, Object> settings = (Map<String, Object>) ((Map<String, Object>) held.get("template")).get("settings");
+        assertEquals(Map.of("index.default_pipeline", "tag"), settings);
+        assertEquals(List.of("index.lifecycle.name"), leftOut);
+        assertEquals(List.of("logs-*"), held.get("index_patterns"));
+
+        Map<String, Object> legacy = Map.of("index_patterns", List.of("old-*"), "settings", Map.of("index.lifecycle.name", "logs"));
+        List<String> legacyLeftOut = new ArrayList<>();
+        Map<String, Object> heldLegacy = InfinoClusterState.heldToKnownSettings(
+            new InfinoClusterState.Item("_cluster/template/old", "template", InfinoClusterState.Kind.TEMPLATE, "old", legacy),
+            KNOWN,
+            legacyLeftOut
+        );
+        assertEquals(Map.of(), heldLegacy.get("settings"));
+        assertEquals(List.of("index.lifecycle.name"), legacyLeftOut);
+
+        // A pipeline's body is not a template's: it is sent as it is.
+        Map<String, Object> pipeline = Map.of("processors", List.of());
+        List<String> none = new ArrayList<>();
+        assertEquals(
+            pipeline,
+            InfinoClusterState.heldToKnownSettings(
+                new InfinoClusterState.Item("_cluster/ingest_pipeline/p", "ingest_pipeline", InfinoClusterState.Kind.INGEST_PIPELINE, "p", pipeline),
+                KNOWN,
+                none
+            )
+        );
+        assertTrue(none.isEmpty());
     }
 
     public void testOnlyAClusterStateRowIsTakenForOne() {
