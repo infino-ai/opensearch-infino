@@ -130,6 +130,15 @@ final class InfinoClusterState {
 
     private static volatile RestController controller;
     private static volatile NamedXContentRegistry xContentRegistry;
+    /**
+     * A thread context holding nothing, taken as the node starts: what a
+     * request arriving on the node's network threads begins with. An item
+     * is sent in it, never in a context stashed from the caller's request,
+     * since a stash keeps the security plugin's record of the caller
+     * (a persistent header), which a request authenticating afresh refuses
+     * to find already set.
+     */
+    private static volatile ThreadContext.StoredContext emptyContext;
 
     private InfinoClusterState() {}
 
@@ -138,9 +147,10 @@ final class InfinoClusterState {
         controller = restController;
     }
 
-    /** The registry the node parses request bodies with. */
-    static void bind(NamedXContentRegistry registry) {
+    /** The registry the node parses request bodies with, and the empty context items are sent in. */
+    static void bind(NamedXContentRegistry registry, ThreadContext.StoredContext empty) {
         xContentRegistry = registry;
+        emptyContext = empty;
     }
 
     /** The registered items, in the order they are applied. Reads the engine: never on a transport or applier thread. */
@@ -179,7 +189,7 @@ final class InfinoClusterState {
     static void apply(RestRequest caller, ActionListener<List<Applied>> listener) {
         ThreadPool threadPool = InfinoServices.threadPool();
         RestController rest = controller;
-        if (threadPool == null || rest == null || xContentRegistry == null) {
+        if (threadPool == null || rest == null || xContentRegistry == null || emptyContext == null) {
             listener.onFailure(new IllegalStateException("[infino] the node is not ready"));
             return;
         }
@@ -264,9 +274,11 @@ final class InfinoClusterState {
                 next(at + 1);
             });
             ThreadContext context = threadPool.getThreadContext();
-            // A clean context, so the node authenticates the item from the
-            // caller's headers as it would the caller's own request.
-            try (ThreadContext.StoredContext ignored = context.stashContext()) {
+            // An empty context, so the node authenticates the item from the
+            // caller's headers alone, as it would the caller's own request;
+            // the context this thread had comes back once it is sent.
+            try (ThreadContext.StoredContext ignored = context.newStoredContext(false)) {
+                emptyContext.restore();
                 rest.dispatchRequest(request, answer, context);
             }
         }

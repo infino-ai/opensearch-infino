@@ -54,8 +54,10 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoClient.bind(injector);
         // The security plugin's components, when it runs, come from the same injector.
         InfinoSecurity.bind(injector);
-        // Registered cluster state is sent as REST requests, whose bodies the node parses with this.
-        InfinoClusterState.bind(injector.getInstance(NamedXContentRegistry.class));
+        // Registered cluster state is sent as REST requests, whose bodies the
+        // node parses with this, each in the empty context the node starts
+        // with (no request has run on this thread yet).
+        InfinoClusterState.bind(injector.getInstance(NamedXContentRegistry.class), threadPool.getThreadContext().newStoredContext(false));
         // The indices come back from the tables on a fresh cluster, and every
         // index's shape is recorded as it moves (see InfinoRegistry).
         clusterService.addListener(InfinoRegistry::onClusterChanged);
