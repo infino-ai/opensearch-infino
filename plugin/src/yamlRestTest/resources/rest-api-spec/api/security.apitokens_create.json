@@ -1,0 +1,21 @@
+{
+  "security.apitokens_create": {
+    "documentation": {
+      "description": "Create an API token through the security plugin's API (3.9 and later)."
+    },
+    "stability": "experimental",
+    "url": {
+      "paths": [
+        {
+          "path": "/_plugins/_security/api/apitokens",
+          "methods": ["POST"]
+        }
+      ]
+    },
+    "params": {},
+    "body": {
+      "description": "name, cluster_permissions, index_permissions, duration_seconds",
+      "required": true
+    }
+  }
+}
