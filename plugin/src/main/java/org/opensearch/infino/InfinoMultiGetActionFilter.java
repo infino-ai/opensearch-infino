@@ -33,8 +33,8 @@ import java.util.function.Supplier;
  * each index are looked up through the id column's term index in one
  * statement, and each item comes back as a get response. An index may be
  * named through an alias. A request that also names an index the plugin
- * does not back goes on to the shards as it is. Version and sequence number
- * are not carried, as for a single get.
+ * does not back goes on to the shards as it is. Each document carries the
+ * sequence number it was written under, as for a single get.
  */
 public class InfinoMultiGetActionFilter implements ActionFilter {
 
@@ -85,34 +85,30 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             }
         }
         try {
-            // One source fetch per index, over all of its ids: through the
-            // document rule when the security plugin has one for this user.
+            // One fetch per index, over all of its ids: through the document
+            // rule when the security plugin has one for this user.
             Map<String, List<String>> idsByIndex = new HashMap<>();
             for (MultiGetRequest.Item item : mget.getItems()) {
                 idsByIndex.computeIfAbsent(item.index(), k -> new ArrayList<>()).add(item.id());
             }
-            Map<String, String> tableOf = new HashMap<>();
             Map<String, InfinoAccess> accessOf = new HashMap<>();
-            Map<String, Map<String, String>> restricted = new HashMap<>();
+            Map<String, Map<String, InfinoNative.Doc>> docsOf = new HashMap<>();
             for (Map.Entry<String, List<String>> e : idsByIndex.entrySet()) {
                 IndexMetadata md = indices.get(e.getKey());
                 InfinoAccess access = InfinoSecurity.access(md.getIndex().getName(), "mget");
                 accessOf.put(e.getKey(), access);
                 String table = tables.ensure(md);
-                tableOf.put(e.getKey(), table);
-                if (access.restrictsDocuments()) {
-                    restricted.put(e.getKey(), InfinoGetActionFilter.restrictedSources(table, e.getValue(), access));
-                } else {
-                    InfinoNative.prefetchSources(table, e.getValue());
-                }
+                docsOf.put(
+                    e.getKey(),
+                    access.restrictsDocuments() ? InfinoGetActionFilter.restrictedDocs(table, e.getValue(), access) : InfinoNative.docs(table, e.getValue(), null)
+                );
             }
             MultiGetItemResponse[] responses = new MultiGetItemResponse[mget.getItems().size()];
             for (int i = 0; i < responses.length; i++) {
                 MultiGetRequest.Item item = mget.getItems().get(i);
-                Map<String, String> byId = restricted.get(item.index());
-                String source = byId != null ? byId.get(item.id()) : InfinoNative.getSource(tableOf.get(item.index()), item.id());
-                String shown = accessOf.get(item.index()).source(source);
-                GetResponse get = new GetResponse(InfinoGetActionFilter.result(indices.get(item.index()).getIndex().getName(), item.id(), shown, item.fetchSourceContext()));
+                InfinoNative.Doc doc = docsOf.get(item.index()).get(item.id());
+                String index = indices.get(item.index()).getIndex().getName();
+                GetResponse get = new GetResponse(InfinoGetActionFilter.result(index, item.id(), doc, accessOf.get(item.index()), item.fetchSourceContext()));
                 responses[i] = new MultiGetItemResponse(get, null);
             }
             @SuppressWarnings("unchecked")

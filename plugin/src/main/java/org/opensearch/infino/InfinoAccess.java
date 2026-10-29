@@ -68,20 +68,25 @@ record InfinoAccess(List<QueryBuilder> documents, Predicate<String> fieldVisible
      * The columns a plan may name: a hidden column is gone (the id and the
      * source stay, as metadata), a masked one carries its hash. A query,
      * sort, aggregation or script naming a hidden field then finds no
-     * column, as it would for an unmapped field.
+     * column, as it would for an unmapped field. A field alias goes with
+     * the field it names: hidden, masked or visible as that field is, and so
+     * does the list column holding a field's several values.
      */
     Map<String, Column> columns(Map<String, Column> cols) {
         if (!restrictsFields() && !masks()) {
             return cols;
         }
         Map<String, Column> out = new LinkedHashMap<>();
-        for (Column c : cols.values()) {
-            boolean reserved = c.name().equals(InfinoQueryTranslator.OSID) || c.name().equals(InfinoQueryTranslator.SOURCE);
-            if (!reserved && restrictsFields() && !fieldVisible.test(c.name())) {
+        for (Map.Entry<String, Column> entry : cols.entrySet()) {
+            Column c = entry.getValue();
+            String name = c.name();
+            boolean reserved = name.equals(InfinoQueryTranslator.OSID) || name.equals(InfinoQueryTranslator.SOURCE) || name.equals(InfinoQueryTranslator.SEQ);
+            String field = InfinoQueryTranslator.fieldOf(name);
+            if (!reserved && restrictsFields() && !fieldVisible.test(field)) {
                 continue;
             }
-            UnaryOperator<String> mask = reserved || !masks() ? null : maskOf.apply(c.name());
-            out.put(c.name(), mask == null ? c : c.masked(mask));
+            UnaryOperator<String> mask = reserved || !masks() ? null : maskOf.apply(field);
+            out.put(entry.getKey(), mask == null ? c : c.masked(mask));
         }
         return Collections.unmodifiableMap(out);
     }
@@ -89,9 +94,9 @@ record InfinoAccess(List<QueryBuilder> documents, Predicate<String> fieldVisible
     /** The columns a script may read: the visible ones that are not masked, since a script would read the value itself. */
     static Map<String, Column> scriptColumns(Map<String, Column> cols) {
         Map<String, Column> out = new LinkedHashMap<>();
-        for (Column c : cols.values()) {
-            if (!c.masked()) {
-                out.put(c.name(), c);
+        for (Map.Entry<String, Column> entry : cols.entrySet()) {
+            if (!entry.getValue().masked()) {
+                out.put(entry.getKey(), entry.getValue());
             }
         }
         return out.size() == cols.size() ? cols : Collections.unmodifiableMap(out);

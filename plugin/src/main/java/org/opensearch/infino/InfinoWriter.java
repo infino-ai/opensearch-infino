@@ -25,8 +25,10 @@ import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -61,6 +63,14 @@ import java.util.concurrent.locks.ReentrantLock;
  * names the ids the table already holds; those are tombstoned in one
  * mutation, so an append of new documents (the shape of a log stream) pays
  * no lookup.
+ *
+ * <p>Each write is given the next sequence number of its table when its
+ * batch is written, in the order the batch staged it, and the table stores
+ * the number beside the row. A table's flushes run one at a time on this
+ * node, so the numbers rise in the order the writes commit. A write
+ * conditioned on a sequence number is checked then, against the number the
+ * table stores for its id or the one the write before it in the batch was
+ * given (see {@link InfinoDocumentVersion}).
  */
 public final class InfinoWriter {
 
@@ -71,9 +81,10 @@ public final class InfinoWriter {
     private static final long MAX_BATCH_BYTES = Long.getLong("infino.batch.bytes", 64L << 20);
     /** Version reported for every write; the table keeps no per-document version. */
     private static final long VERSION = InfinoDocumentVersion.VERSION;
-    /** Sequence number and primary term reported for every write; the table keeps neither. */
-    private static final long SEQ_NO = InfinoDocumentVersion.SEQ_NO;
+    /** Primary term reported for every write; the table has no primary to fail over. */
     private static final long PRIMARY_TERM = InfinoDocumentVersion.PRIMARY_TERM;
+    /** A table's next sequence number before its first flush on this node has read the highest the table holds. */
+    private static final long UNREAD = -1L;
 
     /**
      * One write a bulk item asks for: the source to append (null for a
@@ -97,11 +108,19 @@ public final class InfinoWriter {
     private record Staged(Waiter waiter, Pointer prepared, List<String> preparedIds, long bytes) {}
 
     /**
-     * What a flush did: the ids the engine refused with the reason, the ids
-     * that already existed, and the creates among those (not written, answered
-     * as conflicts).
+     * What one write became when its batch was written: the sequence number
+     * it was given, whether a document stood under its id just before it, and
+     * the conflict that kept it out of the write (null when it was written).
      */
-    private record Applied(Map<String, String> refused, Set<String> existed, Set<String> conflicts) {}
+    private record Written(long seq, boolean existed, Exception conflict) {}
+
+    /** What a flush did: the ids the engine refused with the reason, and what each write became. */
+    private record Applied(Map<String, String> refused, Map<Outcome, Written> written) {}
+
+    /** Whether an outcome carries a row to append: its prepared batch holds these, in the bulk's order. */
+    private static boolean carriesRow(Outcome o) {
+        return o.write() != null && o.write().source() != null;
+    }
 
     /** The pending batch of one table, and whether an append is running for it. */
     private static final class Batch {
@@ -114,6 +133,13 @@ public final class InfinoWriter {
         int docs = 0;
         long bytes = 0;
         boolean flushing = false;
+        /**
+         * The sequence number the next write is given; {@link InfinoWriter#UNREAD}
+         * until the first flush reads the table's highest. Only the running flush
+         * touches it, and flushes take turns through {@link #flushing}, set under
+         * {@link #lock}.
+         */
+        long nextSeq = UNREAD;
     }
 
     private final ThreadPool threadPool;
@@ -148,7 +174,7 @@ public final class InfinoWriter {
         List<String> sources = new ArrayList<>();
         long bytes = 0;
         for (Outcome o : waiter.outcomes()) {
-            if (o.write() != null && o.write().source() != null) {
+            if (carriesRow(o)) {
                 ids.add(o.write().id());
                 sources.add(o.write().source());
                 bytes += o.write().source().length();
@@ -219,7 +245,7 @@ public final class InfinoWriter {
             // engine, which releases them whatever the outcome, or releases
             // them itself when it fails before that.
             try {
-                Applied applied = apply(table, staged);
+                Applied applied = apply(table, batch, staged);
                 for (Staged s : staged) {
                     answer(s.waiter(), applied);
                 }
@@ -235,44 +261,49 @@ public final class InfinoWriter {
     /**
      * Write the batch: the rows of ids the table already holds replace
      * those rows in the same mutation as the append (so a failed write
-     * leaves the old rows), ids only deleted are tombstoned, and a create of
-     * an id that exists is a conflict, left out of the write.
+     * leaves the old rows), ids whose last write is a delete are tombstoned,
+     * and a write that meets a conflict (a create over a document, or a
+     * sequence-number condition the document does not meet) is left out.
      *
      * <p>Owns the prepared handles. The engine releases every handle it is
      * handed, on success and on failure alike, and the folded path releases
      * them before it prepares afresh; so a handle is released here only when
-     * this fails before either, on the lookup of the ids the table holds.
+     * this fails before either, on the reads of the table that come first.
      * Releasing one twice corrupts the native heap.
      */
-    private static Applied apply(String table, List<Staged> staged) {
+    private static Applied apply(String table, Batch batch, List<Staged> staged) {
         Set<String> lookups = new HashSet<>();
-        Set<String> written = new HashSet<>();
-        Set<String> creates = new HashSet<>();
-        Set<String> deleted = new HashSet<>();
-        boolean collision = false;
+        boolean conditioned = false;
         for (Staged s : staged) {
             for (Outcome o : s.waiter().outcomes()) {
-                Write w = o.write();
-                if (w == null) {
+                if (o.write() == null) {
                     continue;
                 }
-                if (w.lookup()) {
-                    lookups.add(w.id());
+                if (o.write().lookup()) {
+                    lookups.add(o.write().id());
                 }
-                if (w.create()) {
-                    creates.add(w.id());
-                }
-                if (w.source() == null) {
-                    deleted.add(w.id());
-                }
-                if (!written.add(w.id())) {
-                    collision = true; // the same id twice in one batch: written twice, or written and deleted
-                }
+                conditioned |= InfinoDocumentVersion.seqConditioned(o.item());
             }
         }
         Set<String> existed;
+        Map<String, Long> stored;
         try {
-            existed = lookups.isEmpty() ? Set.of() : InfinoNative.existingOsids(table, lookups);
+            if (batch.nextSeq == UNREAD) {
+                batch.nextSeq = InfinoNative.maxSeq(table) + 1;
+            }
+            // A conditioned write is checked against the sequence numbers the table
+            // stores, read in the same probe as which ids it holds; a batch without
+            // one reads only which ids it holds.
+            if (lookups.isEmpty()) {
+                stored = Map.of();
+                existed = Set.of();
+            } else if (conditioned) {
+                stored = InfinoNative.storedSeqs(table, lookups);
+                existed = stored.keySet();
+            } else {
+                stored = Map.of();
+                existed = InfinoNative.existingOsids(table, lookups);
+            }
         } catch (RuntimeException e) {
             // The handles never reached the engine: released here, once.
             for (Staged s : staged) {
@@ -280,32 +311,62 @@ public final class InfinoWriter {
             }
             throw e;
         }
-        Set<String> conflicts = new HashSet<>();
-        for (String id : creates) {
-            if (existed.contains(id)) {
-                conflicts.add(id);
+        // Each write in the order the batch staged it, against its document as
+        // the writes before it left it: a conflict is left out of the write, and
+        // every other write is given the next sequence number.
+        Map<Outcome, Written> written = new IdentityHashMap<>();
+        // The sequence number each id's document stands at after the writes so far; null once deleted.
+        Map<String, Long> standing = new HashMap<>();
+        // The last write of each id that goes to the table.
+        Map<String, Outcome> last = new LinkedHashMap<>();
+        boolean folded = false;
+        for (Staged s : staged) {
+            ShardId shardId = s.waiter().shardId();
+            for (Outcome o : s.waiter().outcomes()) {
+                Write w = o.write();
+                if (w == null) {
+                    continue;
+                }
+                Long current = standing.containsKey(w.id())
+                    ? standing.get(w.id())
+                    : existed.contains(w.id()) ? stored.getOrDefault(w.id(), InfinoDocumentVersion.UNTRACKED_SEQ_NO) : null;
+                Exception conflict = w.create() && current != null
+                    ? new VersionConflictEngineException(shardId, w.id(), "document already exists")
+                    : InfinoDocumentVersion.conflict(shardId, o.item(), current);
+                if (conflict != null) {
+                    written.put(o, new Written(SequenceNumbers.UNASSIGNED_SEQ_NO, current != null, conflict));
+                    folded = true; // the prepared batches carry its row; only the folded path leaves it out
+                    continue;
+                }
+                long seq = batch.nextSeq++;
+                written.put(o, new Written(seq, current != null, null));
+                standing.put(w.id(), w.source() == null ? null : seq);
+                if (last.put(w.id(), o) != null) {
+                    folded = true; // the same id twice in one batch: written twice, or written and deleted
+                }
             }
         }
         List<String> replaced = new ArrayList<>();
         List<String> tombstones = new ArrayList<>();
-        for (String id : written) {
-            if (!existed.contains(id) || conflicts.contains(id)) {
-                continue;
+        for (Outcome o : last.values()) {
+            Write w = o.write();
+            if (!existed.contains(w.id())) {
+                continue; // a new id: its row is appended, and there is nothing to replace
             }
-            if (deleted.contains(id)) {
-                tombstones.add(id);
+            if (w.source() == null) {
+                tombstones.add(w.id());
             } else {
-                replaced.add(id);
+                replaced.add(w.id());
             }
         }
         Map<String, String> refused;
         try {
             // Both paths release every handle: the engine does on the prepared
             // path, the folded path up front. Nothing after this may release one.
-            refused = collision || !conflicts.isEmpty() ? appendFolded(table, staged, conflicts, replaced) : appendPrepared(table, staged, replaced);
+            refused = folded ? appendFolded(table, staged, last.values(), written, replaced) : appendPrepared(table, staged, written, replaced);
         } finally {
             // A read after the write must see the table, not a prefetched copy.
-            InfinoNative.forgetSources(table, written);
+            InfinoNative.forgetSources(table, last.keySet());
         }
         if (!tombstones.isEmpty()) {
             int rc = InfinoNative.deleteOsids(table, tombstones.toArray(new String[0]), tombstones.size());
@@ -313,30 +374,37 @@ public final class InfinoWriter {
                 throw new IllegalStateException("[infino] delete of " + tombstones.size() + " ids from " + table + " returned " + rc);
             }
         }
-        return new Applied(refused, existed, conflicts);
+        return new Applied(refused, written);
     }
 
-    /** The prepared batches as one commit; a refused document is reported under its id. */
-    private static Map<String, String> appendPrepared(String table, List<Staged> staged, List<String> replaced) {
+    /** The prepared batches as one commit, each row under the sequence number its write was given; a refused document is reported under its id. */
+    private static Map<String, String> appendPrepared(String table, List<Staged> staged, Map<Outcome, Written> written, List<String> replaced) {
         List<Pointer> handles = new ArrayList<>();
         List<Staged> withRows = new ArrayList<>();
+        int docs = 0;
         for (Staged s : staged) {
             if (s.prepared() != null) {
                 handles.add(s.prepared());
                 withRows.add(s);
+                docs += s.preparedIds().size();
             }
         }
         Map<String, String> refused = new HashMap<>();
         if (handles.isEmpty()) {
             return refused;
         }
-        long start = System.nanoTime();
-        InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, handles, replaced);
-        long millis = (System.nanoTime() - start) / 1_000_000L;
-        int docs = 0;
+        long[] seqs = new long[docs];
+        int at = 0;
         for (Staged s : withRows) {
-            docs += s.preparedIds().size();
+            for (Outcome o : s.waiter().outcomes()) {
+                if (carriesRow(o)) {
+                    seqs[at++] = written.get(o).seq();
+                }
+            }
         }
+        long start = System.nanoTime();
+        InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, handles, replaced, seqs);
+        long millis = (System.nanoTime() - start) / 1_000_000L;
         for (InfinoNative.PreparedFailure f : result.failed()) {
             refused.put(withRows.get(f.batch()).preparedIds().get(f.index()), f.reason());
         }
@@ -345,27 +413,23 @@ public final class InfinoWriter {
     }
 
     /**
-     * The batch's writes folded by id, last write winning, a delete
-     * cancelling an earlier write and a conflicting create left out, then
-     * prepared afresh and written as one mutation: the path for a batch in
-     * which one id appears twice or a create meets an existing id.
+     * The batch's last write of each id, prepared afresh and written as one
+     * mutation under the sequence number it was given (a delete writes no
+     * row): the path for a batch in which one id appears twice, or a write
+     * meets a conflict and is left out.
      */
-    private static Map<String, String> appendFolded(String table, List<Staged> staged, Set<String> conflicts, List<String> replaced) {
-        Map<String, Write> writes = new LinkedHashMap<>();
+    private static Map<String, String> appendFolded(String table, List<Staged> staged, Collection<Outcome> last, Map<Outcome, Written> written, List<String> replaced) {
         for (Staged s : staged) {
             InfinoNative.freePrepared(s.prepared());
-            for (Outcome o : s.waiter().outcomes()) {
-                if (o.write() != null) {
-                    writes.put(o.write().id(), o.write());
-                }
-            }
         }
         List<String> ids = new ArrayList<>();
         List<String> sources = new ArrayList<>();
-        for (Write w : writes.values()) {
-            if (w.source() != null && !conflicts.contains(w.id())) {
-                ids.add(w.id());
-                sources.add(w.source());
+        List<Long> seqs = new ArrayList<>();
+        for (Outcome o : last) {
+            if (carriesRow(o)) {
+                ids.add(o.write().id());
+                sources.add(o.write().source());
+                seqs.add(written.get(o).seq());
             }
         }
         Map<String, String> refused = new HashMap<>();
@@ -376,11 +440,12 @@ public final class InfinoWriter {
         if (prepared == null) {
             throw new IllegalStateException("[infino] the bridge could not prepare the folded batch for " + table);
         }
-        InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced);
+        long[] numbers = seqs.stream().mapToLong(Long::longValue).toArray();
+        InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced, numbers);
         for (InfinoNative.PreparedFailure f : result.failed()) {
             refused.put(ids.get(f.index()), f.reason());
         }
-        log.debug("[infino] appended {} of {} documents to {} (folded: an id appeared twice in the batch, or a create met an existing id)", result.ok(), ids.size(), table);
+        log.debug("[infino] appended {} of {} documents to {} (folded: an id appeared twice in the batch, or a write met a conflict)", result.ok(), ids.size(), table);
         return refused;
     }
 
@@ -392,12 +457,13 @@ public final class InfinoWriter {
                 continue;
             }
             Write write = o.write();
-            if (write.create() && applied.conflicts().contains(write.id())) {
-                // op_type create over an id the table holds: the conflict stock reports, and no row written.
+            Written done = applied.written().get(o);
+            if (done.conflict() != null) {
+                // A create over a document, or a condition the document does not meet: the conflict stock reports, and no row written.
                 w.items()[o.slot()] = new BulkItemResponse(
                     o.slot(),
                     o.item().opType(),
-                    new BulkItemResponse.Failure(w.indexName(), write.id(), new VersionConflictEngineException(w.shardId(), write.id(), "document already exists"), RestStatus.CONFLICT)
+                    new BulkItemResponse.Failure(w.indexName(), write.id(), done.conflict(), RestStatus.CONFLICT)
                 );
                 continue;
             }
@@ -410,14 +476,20 @@ public final class InfinoWriter {
                 );
                 continue;
             }
-            boolean existed = applied.existed().contains(write.id());
             DocWriteResponse r;
             if (write.source() == null) {
-                r = new DeleteResponse(w.shardId(), write.id(), SEQ_NO, PRIMARY_TERM, VERSION, existed);
+                r = new DeleteResponse(w.shardId(), write.id(), done.seq(), PRIMARY_TERM, VERSION, done.existed());
             } else if (o.item() instanceof UpdateRequest) {
-                r = new UpdateResponse(w.shardId(), write.id(), SEQ_NO, PRIMARY_TERM, VERSION, existed ? DocWriteResponse.Result.UPDATED : DocWriteResponse.Result.CREATED);
+                r = new UpdateResponse(
+                    w.shardId(),
+                    write.id(),
+                    done.seq(),
+                    PRIMARY_TERM,
+                    VERSION,
+                    done.existed() ? DocWriteResponse.Result.UPDATED : DocWriteResponse.Result.CREATED
+                );
             } else {
-                r = new IndexResponse(w.shardId(), write.id(), SEQ_NO, PRIMARY_TERM, VERSION, !existed);
+                r = new IndexResponse(w.shardId(), write.id(), done.seq(), PRIMARY_TERM, VERSION, !done.existed());
             }
             r.setShardInfo(new ReplicationResponse.ShardInfo(1, 1));
             w.items()[o.slot()] = new BulkItemResponse(o.slot(), o.item().opType(), r);

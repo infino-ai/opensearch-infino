@@ -26,8 +26,6 @@ import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.tasks.Task;
 
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
@@ -36,7 +34,8 @@ import java.util.function.Supplier;
  * Serves {@code GET /index/_doc/id} for an Infino-backed index from the
  * table, through the id column's term index, before the request is routed to
  * the shard that holds nothing. The index may be named through an alias.
- * Version and sequence number are not carried; {@code _source} includes and
+ * The document carries the sequence number it was written under, which a
+ * conditional write on it is checked against; {@code _source} includes and
  * excludes are applied.
  */
 public class InfinoGetActionFilter implements ActionFilter {
@@ -83,13 +82,11 @@ public class InfinoGetActionFilter implements ActionFilter {
             // cut to the fields the user may read.
             InfinoAccess access = InfinoSecurity.access(index.getIndex().getName(), "get");
             String table = tables.ensure(index);
-            String source = access.restrictsDocuments()
-                ? restrictedSources(table, List.of(get.id()), access).get(get.id())
-                : InfinoNative.getSource(table, get.id());
+            InfinoNative.Doc doc = access.restrictsDocuments()
+                ? restrictedDocs(table, List.of(get.id()), access).get(get.id())
+                : InfinoNative.getDoc(table, get.id());
             @SuppressWarnings("unchecked")
-            Response response = (Response) new GetResponse(
-                result(index.getIndex().getName(), get.id(), access.source(source), get.fetchSourceContext())
-            );
+            Response response = (Response) new GetResponse(result(index.getIndex().getName(), get.id(), doc, access, get.fetchSourceContext()));
             listener.onResponse(response);
         } catch (Exception e) {
             log.warn("[infino] get of {} from {} failed", get.id(), get.index(), e);
@@ -98,27 +95,12 @@ public class InfinoGetActionFilter implements ActionFilter {
     }
 
     /**
-     * The sources of {@code ids} the document-level rule lets the user see,
-     * by id: one statement over the table with the rule as its predicate. An
-     * id the rule hides is absent, as a missing document is.
+     * The documents of {@code ids} the document-level rule lets the user
+     * see, by id: one statement over the table with the rule as its
+     * predicate. An id the rule hides is absent, as a missing document is.
      */
-    static Map<String, String> restrictedSources(String table, List<String> ids, InfinoAccess access) {
-        String rule = access.documentsWhere(InfinoNative.columns(table), table, System.currentTimeMillis());
-        List<String> literals = new ArrayList<>(ids.size());
-        for (String id : ids) {
-            literals.add(InfinoQueryTranslator.literal(id));
-        }
-        String sql = "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM " + InfinoQueryTranslator.quoteIdent(table)
-            + " WHERE " + InfinoQueryTranslator.OSID + " IN (" + String.join(", ", literals) + ") AND (" + rule + ")";
-        Map<String, String> out = new HashMap<>();
-        for (Map<String, Object> row : InfinoNative.sqlRows(sql)) {
-            Object id = row.get(InfinoQueryTranslator.OSID);
-            Object source = row.get(InfinoQueryTranslator.SOURCE);
-            if (id != null && source != null) {
-                out.put(id.toString(), source.toString());
-            }
-        }
-        return out;
+    static Map<String, InfinoNative.Doc> restrictedDocs(String table, List<String> ids, InfinoAccess access) {
+        return InfinoNative.docs(table, ids, access.documentsWhere(InfinoNative.columns(table), table, System.currentTimeMillis()));
     }
 
     /** The Infino-backed index a request names, directly or through an alias; null when it names something else. */
@@ -138,8 +120,13 @@ public class InfinoGetActionFilter implements ActionFilter {
         return md != null && md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false) ? md : null;
     }
 
-    /** A get result from a source string (null or empty when the document is missing), with the request's source filter applied. */
-    static GetResult result(String index, String id, String source, FetchSourceContext fetch) {
+    /**
+     * A get result from the table's document (null when it is missing): its
+     * source as the user may see it, with the request's source filter
+     * applied, and the sequence number it was written under.
+     */
+    static GetResult result(String index, String id, InfinoNative.Doc doc, InfinoAccess access, FetchSourceContext fetch) {
+        String source = doc == null ? null : access.source(doc.source());
         boolean exists = source != null && !source.isEmpty();
         BytesReference bytes = null;
         if (exists && (fetch == null || fetch.fetchSource())) {
@@ -147,11 +134,11 @@ public class InfinoGetActionFilter implements ActionFilter {
             boolean excludes = fetch != null && fetch.excludes() != null && fetch.excludes().length > 0;
             bytes = includes || excludes ? InfinoSearch.filtered(source, fetch) : new BytesArray(source);
         }
-        // A found document carries the constants the table reports as its version (see InfinoDocumentVersion).
+        // A found document carries its sequence number, and the version and primary term the table reports (see InfinoDocumentVersion).
         return new GetResult(
             index,
             id,
-            exists ? InfinoDocumentVersion.SEQ_NO : SequenceNumbers.UNASSIGNED_SEQ_NO,
+            exists ? doc.seq() : SequenceNumbers.UNASSIGNED_SEQ_NO,
             exists ? InfinoDocumentVersion.PRIMARY_TERM : SequenceNumbers.UNASSIGNED_PRIMARY_TERM,
             exists ? InfinoDocumentVersion.VERSION : -1L,
             exists,

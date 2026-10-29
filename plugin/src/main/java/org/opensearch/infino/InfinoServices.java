@@ -13,6 +13,7 @@ import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.ingest.IngestService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -33,6 +34,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     private static volatile IndexNameExpressionResolver indexNameExpressionResolver;
     private static volatile InfinoWriter writer;
     private static volatile AutoCreateIndex autoCreateIndex;
+    private static volatile IngestService ingestService;
 
     @Inject
     public InfinoServices(
@@ -51,6 +53,8 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoServices.writer = new InfinoWriter(threadPool);
         // The node's own rule for creating an index a write names before it exists.
         InfinoServices.autoCreateIndex = injector.getInstance(AutoCreateIndex.class);
+        // The node's ingest pipelines, which a write to the table runs as a stock bulk runs them.
+        InfinoServices.ingestService = injector.getInstance(IngestService.class);
         InfinoClient.bind(injector);
         // The security plugin's components, when it runs, come from the same injector.
         InfinoSecurity.bind(injector);
@@ -66,6 +70,11 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     /** Whether the cluster would create an index a write names before it exists, as it decides for a stock bulk. */
     static AutoCreateIndex autoCreateIndex() {
         return autoCreateIndex;
+    }
+
+    /** The node's ingest service, or null before the services are injected. */
+    static IngestService ingestService() {
+        return ingestService;
     }
 
     static ClusterService clusterService() {

@@ -50,15 +50,20 @@ public interface InfinoLib extends Library {
     /**
      * Append prepared batches in one commit and release them; the rows whose ids
      * are in {@code replaced} replace the table's rows under those ids in the
-     * same mutation (null or zero for a plain append).
+     * same mutation (null or zero for a plain append). {@code seqs} holds the
+     * sequence number of every document, batch after batch in order (null or
+     * zero for none).
      */
-    Pointer infino_append_prepared(Pointer h, String name, Pointer[] prepared, int count, String[] replaced, int replacedCount);
+    Pointer infino_append_prepared(Pointer h, String name, Pointer[] prepared, int count, String[] replaced, int replacedCount, long[] seqs, int seqsCount);
 
     void infino_free_prepared(Pointer prepared);
 
     int infino_delete_osids(Pointer h, String name, String[] osids, int count);
 
     Pointer infino_get(Pointer h, String name, String osid);
+
+    /** One id's document as {@code {"source", "seq"}}; "" when the table holds no such id. */
+    Pointer infino_get_doc(Pointer h, String name, String osid);
 
     int infino_drop(Pointer h, String name);
 

@@ -27,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -86,6 +87,18 @@ public final class InfinoNative {
     /** The target the node is configured for: its own URI until the settings or the account route say otherwise. */
     private static volatile Target wanted = Target.node();
     private static final Map<String, Map<String, Column>> COLUMNS = new ConcurrentHashMap<>();
+    /** What each table's mapping declares, from the mapping it was last declared with. */
+    private static final Map<String, Mapping> MAPPINGS = new ConcurrentHashMap<>();
+    /** A mapping's key for a field's multi-fields. */
+    private static final String MULTI_FIELDS = "fields";
+    /** A mapping's keys for its fields, a field's type, an alias's target, and a date's format. */
+    private static final String PROPERTIES = "properties";
+    private static final String TYPE = "type";
+    private static final String ALIAS_TYPE = "alias";
+    private static final String ALIAS_PATH = "path";
+    private static final String FORMAT = "format";
+    /** The mapping types whose values are dates. */
+    private static final Set<String> DATE_TYPES = Set.of("date", "date_nanos");
     /** How long a prefetched source waits for its fetch phase. */
     private static final TimeValue SOURCE_PREFETCH_TTL = TimeValue.timeValueSeconds(30);
     /** Bytes of prefetched sources held at once across requests. */
@@ -107,16 +120,37 @@ public final class InfinoNative {
      * One column of a table, as the bridge describes it. {@code mask} is the
      * security plugin's field masking for the request, when the field is
      * masked for the user: how a value of the column is hashed before it
-     * leaves the node (null when it is not).
+     * leaves the node (null when it is not). {@code dateFormat} is the format
+     * a date column's mapping declares (null for the default one). {@code elem}
+     * is a list column's element type (null for any other column).
      */
-    public record Column(String name, String type, boolean fts, boolean vector, UnaryOperator<String> mask) {
+    public record Column(String name, String type, boolean fts, boolean vector, UnaryOperator<String> mask, String dateFormat, String elem) {
         public Column(String name, String type, boolean fts, boolean vector) {
-            this(name, type, fts, vector, null);
+            this(name, type, fts, vector, null, null, null);
+        }
+
+        /** A list column of {@code elem} values. */
+        static Column list(String name, String elem) {
+            return new Column(name, "list", false, false, null, null, elem);
         }
 
         /** This column as the request sees it, its values masked by {@code mask}. */
         Column masked(UnaryOperator<String> mask) {
-            return new Column(name, type, fts, vector, mask);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem);
+        }
+
+        /** This column with the date format its mapping declares. */
+        Column dated(String dateFormat) {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem);
+        }
+
+        /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */
+        Column element() {
+            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null) : this;
+        }
+
+        public boolean isList() {
+            return "list".equals(type);
         }
 
         public boolean masked() {
@@ -399,9 +433,76 @@ public final class InfinoNative {
         init();
         COLUMNS.remove(name);
         takeOrThrow(lib.infino_ensure_table(conn, name, mappingJson));
+        MAPPINGS.put(name, Mapping.of(mappingJson));
+        // A lookup while the table was declared cached its columns without what the mapping adds.
+        COLUMNS.remove(name);
     }
 
-    /** Column name → description; empty if the table does not exist yet. */
+    /**
+     * What a mapping declares beyond the columns: every field path, of any
+     * type, a multi-field and an alias included ({@link #maps}); each field
+     * alias's dotted path to the path it points at, since an alias has no
+     * column of its own and OpenSearch reads it as the field it names; and
+     * each date field's declared format.
+     */
+    record Mapping(Set<String> paths, Map<String, String> aliases, Map<String, String> dateFormats) {
+        @SuppressWarnings("unchecked")
+        static Mapping of(String mappingJson) {
+            Mapping out = new Mapping(new HashSet<>(), new LinkedHashMap<>(), new LinkedHashMap<>());
+            Object root = object(mappingJson);
+            // The mapping as the cluster keeps it sits under its type name.
+            while (root instanceof Map<?, ?> m && !m.containsKey(PROPERTIES) && m.size() == 1) {
+                root = m.values().iterator().next();
+            }
+            if (root instanceof Map<?, ?> m && m.get(PROPERTIES) instanceof Map<?, ?> properties) {
+                out.walk((Map<String, Object>) properties, "");
+            }
+            return out;
+        }
+
+        @SuppressWarnings("unchecked")
+        private void walk(Map<String, Object> properties, String prefix) {
+            for (Map.Entry<String, Object> entry : properties.entrySet()) {
+                if (!(entry.getValue() instanceof Map<?, ?> field)) {
+                    continue;
+                }
+                String path = prefix.isEmpty() ? entry.getKey() : prefix + "." + entry.getKey();
+                paths.add(path);
+                if (ALIAS_TYPE.equals(field.get(TYPE)) && field.get(ALIAS_PATH) instanceof String target) {
+                    aliases.put(path, target);
+                }
+                // An object field has no type.
+                if (field.get(TYPE) instanceof String type && DATE_TYPES.contains(type) && field.get(FORMAT) instanceof String format) {
+                    dateFormats.put(path, format);
+                }
+                if (field.get(MULTI_FIELDS) instanceof Map<?, ?> multi) {
+                    for (Object sub : multi.keySet()) {
+                        paths.add(path + "." + sub);
+                    }
+                }
+                if (field.get(PROPERTIES) instanceof Map<?, ?> inner) {
+                    walk((Map<String, Object>) inner, path);
+                }
+            }
+        }
+    }
+
+    /**
+     * Whether {@code table}'s index maps {@code field} ({@link Mapping}). A
+     * field it does not map has no value in any of its documents, as
+     * OpenSearch reads an unmapped field. True for a table no mapping has
+     * declared yet, whose fields are unknown.
+     */
+    static boolean maps(String table, String field) {
+        Mapping mapping = MAPPINGS.get(table);
+        return mapping == null || mapping.paths().contains(field);
+    }
+
+    /**
+     * Column name → description; empty if the table does not exist yet. A
+     * field alias is a name of its target's column, and a date column
+     * carries the format its mapping declares.
+     */
     public static Map<String, Column> columns(String name) {
         init();
         Map<String, Column> cached = COLUMNS.get(name);
@@ -412,17 +513,37 @@ public final class InfinoNative {
         if (json == null || json.isEmpty()) {
             return Collections.emptyMap();
         }
+        Mapping mapping = MAPPINGS.get(name);
         Map<String, Column> out = new LinkedHashMap<>();
         for (Map<String, Object> c : rows(json)) {
             String column = (String) c.get("name");
-            out.put(
+            Column described = new Column(
                 column,
-                new Column(column, (String) c.get("type"), Boolean.TRUE.equals(c.get("fts")), Boolean.TRUE.equals(c.get("vector")))
+                (String) c.get("type"),
+                Boolean.TRUE.equals(c.get("fts")),
+                Boolean.TRUE.equals(c.get("vector")),
+                null,
+                null,
+                (String) c.get("elem")
             );
+            // A list column of a mapped field reads its dates as the field's do.
+            String format = mapping == null ? null : mapping.dateFormats().get(InfinoQueryTranslator.fieldOf(column));
+            out.put(column, format == null ? described : described.dated(format));
+        }
+        for (Map.Entry<String, String> alias : (mapping == null ? Map.<String, String>of() : mapping.aliases()).entrySet()) {
+            Column target = out.get(alias.getValue());
+            if (target != null) {
+                out.putIfAbsent(alias.getKey(), target);
+            }
         }
         Map<String, Column> view = Collections.unmodifiableMap(out);
         COLUMNS.put(name, view);
         return view;
+    }
+
+    /** Whether {@code key} names {@code column} by an alias rather than by the column's own name. */
+    static boolean isAlias(String key, Column column) {
+        return !key.equals(column.name());
     }
 
     public static void forgetColumns(String name) {
@@ -499,13 +620,18 @@ public final class InfinoNative {
      * Append prepared batches in one commit; the handles are released by the
      * call. The rows of {@code replaced} ids replace the table's rows under
      * those ids in the same mutation, so a failed write leaves the old rows.
+     * {@code seqs} (null for none) is the sequence number of every document,
+     * batch after batch in order, stored beside its row.
      */
     @SuppressWarnings("unchecked")
-    public static PreparedResult appendPrepared(String name, List<Pointer> prepared, Collection<String> replaced) {
+    public static PreparedResult appendPrepared(String name, List<Pointer> prepared, Collection<String> replaced, long[] seqs) {
         init();
         COLUMNS.remove(name); // the batch may have added paths to the schema
         String[] ids = replaced.toArray(new String[0]);
-        Map<String, Object> out = object(takeOrThrow(lib.infino_append_prepared(conn, name, prepared.toArray(new Pointer[0]), prepared.size(), ids, ids.length)));
+        int seqCount = seqs == null ? 0 : seqs.length;
+        Map<String, Object> out = object(
+            takeOrThrow(lib.infino_append_prepared(conn, name, prepared.toArray(new Pointer[0]), prepared.size(), ids, ids.length, seqs, seqCount))
+        );
         List<PreparedFailure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
             failed.add(new PreparedFailure(((Number) f.get("b")).intValue(), ((Number) f.get("i")).intValue(), (String) f.get("reason")));
@@ -560,6 +686,55 @@ public final class InfinoNative {
         return take(lib.infino_get(conn, name, osid));
     }
 
+    /** One document as the table holds it: its source and the sequence number it was written under. */
+    public record Doc(String source, long seq) {}
+
+    /** One id's document from the table, never from the prefetch; null when the table holds no such id. */
+    @SuppressWarnings("unchecked")
+    public static Doc getDoc(String name, String osid) {
+        init();
+        String out = take(lib.infino_get_doc(conn, name, osid));
+        if (out == null || out.isEmpty()) {
+            return null;
+        }
+        Map<String, Object> doc = object(out);
+        return new Doc((String) doc.get("source"), seq(doc.get("seq")));
+    }
+
+    /**
+     * The documents of these ids, by id, in one statement, narrowed by
+     * {@code where} (null for none): an id the table does not hold, or the
+     * predicate drops, is absent. The table has no index on ids, so this
+     * scans the id column, as {@link #prefetchSources} does.
+     */
+    public static Map<String, Doc> docs(String name, Collection<String> osids, String where) {
+        Map<String, Doc> out = new HashMap<>();
+        if (osids.isEmpty()) {
+            return out;
+        }
+        String columns = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + ", " + InfinoQueryTranslator.SEQ;
+        for (Map<String, Object> row : sqlRows(byIds(name, columns, osids, where))) {
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            Object source = row.get(InfinoQueryTranslator.SOURCE);
+            if (id != null && source != null) {
+                out.put(id.toString(), new Doc(source.toString(), seq(row.get(InfinoQueryTranslator.SEQ))));
+            }
+        }
+        return out;
+    }
+
+    /** A sequence number as a row holds it: a row written without one reads as {@link InfinoDocumentVersion#UNTRACKED_SEQ_NO}. */
+    static long seq(Object value) {
+        return value instanceof Number n ? n.longValue() : InfinoDocumentVersion.UNTRACKED_SEQ_NO;
+    }
+
+    /** The highest sequence number the table holds, {@link InfinoDocumentVersion#UNTRACKED_SEQ_NO} when it holds none. */
+    public static long maxSeq(String name) {
+        String sql = "SELECT MAX(" + InfinoQueryTranslator.SEQ + ") AS " + InfinoQueryTranslator.SEQ + " FROM " + InfinoQueryTranslator.quoteIdent(name);
+        List<Map<String, Object>> rows = sqlRows(sql);
+        return rows.isEmpty() ? InfinoDocumentVersion.UNTRACKED_SEQ_NO : seq(rows.get(0).get(InfinoQueryTranslator.SEQ));
+    }
+
     /** Drop the prefetched sources of ids a write just changed, so a read after the write sees the table. */
     public static void forgetSources(String name, Collection<String> osids) {
         for (String id : osids) {
@@ -602,13 +777,17 @@ public final class InfinoNative {
         if (osids.isEmpty()) {
             return;
         }
+        keepSources(name, sqlRows(byIds(name, InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE, osids, null)));
+    }
+
+    /** The statement selecting {@code columns} of the rows under these ids, narrowed by {@code where} (null for none). */
+    private static String byIds(String name, String columns, Collection<String> osids, String where) {
         List<String> lits = new ArrayList<>(osids.size());
         for (String id : osids) {
             lits.add(InfinoQueryTranslator.literal(id));
         }
-        String sql = "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM "
-            + InfinoQueryTranslator.quoteIdent(name) + " WHERE " + InfinoQueryTranslator.OSID + " IN (" + String.join(", ", lits) + ")";
-        keepSources(name, sqlRows(sql));
+        return "SELECT " + columns + " FROM " + InfinoQueryTranslator.quoteIdent(name) + " WHERE " + InfinoQueryTranslator.OSID + " IN ("
+            + String.join(", ", lits) + ")" + (where == null ? "" : " AND (" + where + ")");
     }
 
     /** Ids per statement when probing which of a batch's ids the table already holds. */
@@ -621,30 +800,44 @@ public final class InfinoNative {
      * several terms and the union may name ids that only share one.
      */
     public static Set<String> existingOsids(String name, Collection<String> osids) {
+        return probe(name, osids, false).keySet();
+    }
+
+    /**
+     * The sequence number of each of these ids the table holds, by id, the
+     * same probe as {@link #existingOsids} reading the sequence column too:
+     * an id the table does not hold is absent.
+     */
+    public static Map<String, Long> storedSeqs(String name, Collection<String> osids) {
+        return probe(name, osids, true);
+    }
+
+    private static Map<String, Long> probe(String name, Collection<String> osids, boolean withSeqs) {
         Set<String> wanted = new HashSet<>(osids);
-        Set<String> found = new HashSet<>();
+        Map<String, Long> found = new HashMap<>();
         List<String> batch = new ArrayList<>(PROBE_IDS_PER_STATEMENT);
         for (String id : wanted) {
             batch.add(id);
             if (batch.size() == PROBE_IDS_PER_STATEMENT) {
-                probe(name, batch, wanted, found);
+                probe(name, batch, withSeqs, wanted, found);
                 batch.clear();
             }
         }
         if (!batch.isEmpty()) {
-            probe(name, batch, wanted, found);
+            probe(name, batch, withSeqs, wanted, found);
         }
         return found;
     }
 
-    private static void probe(String name, List<String> ids, Set<String> wanted, Set<String> found) {
+    private static void probe(String name, List<String> ids, boolean withSeqs, Set<String> wanted, Map<String, Long> found) {
         String terms = InfinoQueryTranslator.literal(String.join(" ", ids));
-        String sql = "SELECT " + InfinoQueryTranslator.OSID + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '"
-            + InfinoQueryTranslator.OSID + "', " + terms + ", 'or')";
+        String columns = withSeqs ? InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SEQ : InfinoQueryTranslator.OSID;
+        String sql = "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', " + terms
+            + ", 'or')";
         for (Map<String, Object> row : sqlRows(sql)) {
             Object id = row.get(InfinoQueryTranslator.OSID);
             if (id != null && wanted.contains(id.toString())) {
-                found.add(id.toString());
+                found.put(id.toString(), seq(row.get(InfinoQueryTranslator.SEQ)));
             }
         }
     }

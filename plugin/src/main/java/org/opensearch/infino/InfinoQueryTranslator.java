@@ -75,10 +75,30 @@ final class InfinoQueryTranslator {
     static final String OSID = "osid";
     /** The reserved column holding each document's JSON source. */
     static final String SOURCE = "source";
+    /** The reserved column holding the sequence number each document was written under (see {@link InfinoDocumentVersion}). */
+    static final String SEQ = "osseq";
+    /**
+     * What the bridge adds to a field's column name for the list column that
+     * holds the field's values for a document that gives it several; the
+     * field's own column is then null for that document (a string field's
+     * keeps the values joined, for its text index).
+     */
+    static final String LIST_SUFFIX = "[]";
+    /**
+     * The names a list's subquery gives a document's id and each of its
+     * values, and the aliases of the table it reads and of its rows. The
+     * engine plans the subquery only with both relations aliased.
+     */
+    private static final String LIST_ID = "list_id";
+    private static final String LIST_VALUE = "list_value";
+    private static final String LIST_SOURCE = "list_source";
+    private static final String LIST_ROWS = "list_rows";
     /** Mapping suffix OpenSearch clients use for the exact form of a text field. */
     private static final String KEYWORD_SUFFIX = ".keyword";
     /** How a date range or histogram bound is read when the request names no format. */
     private static final String DEFAULT_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
+    /** How a text clause that is not the FROM source reads the token index: a subquery over its ids. */
+    private static final String TEXT_SUBQUERY = OSID + " IN (SELECT " + OSID + " FROM token_match(";
     /** Predicate that keeps every row. */
     static final String ALL = "1=1";
     /** Predicate that keeps no row. */
@@ -201,9 +221,13 @@ final class InfinoQueryTranslator {
 
     // ---- columns ----
 
-    /** The column a query names, resolving {@code name.keyword} to the string column {@code name}. */
+    /**
+     * The column a query names, resolving {@code name.keyword} to the string
+     * column {@code name}. A field's list column ({@link #LIST_SUFFIX}) is no
+     * field of its own: a query naming one names an unmapped field.
+     */
     Column column(String field) {
-        if (field == null) {
+        if (field == null || field.endsWith(LIST_SUFFIX)) {
             return null;
         }
         Column c = cols.get(field);
@@ -214,6 +238,83 @@ final class InfinoQueryTranslator {
             }
         }
         return c;
+    }
+
+    /** The field a column holds: its own name, or a list column's field ({@link #LIST_SUFFIX}). */
+    static String fieldOf(String column) {
+        return column.endsWith(LIST_SUFFIX) ? column.substring(0, column.length() - LIST_SUFFIX.length()) : column;
+    }
+
+    /** The list column holding a field's values for the documents that give it several; null when no document has. */
+    static Column listOf(Map<String, Column> cols, Column c) {
+        return c.isList() ? null : cols.get(c.name() + LIST_SUFFIX);
+    }
+
+    /**
+     * The rows where any value of a field passes {@code test}, a predicate
+     * over a column expression of the field's own type: a document's own
+     * value, or, where it gave the field several, any of the values its list
+     * column holds, through a subquery over the list's values by id. Null
+     * when {@code test} is (a value with no literal), and for a list in a
+     * vector search's filter, which compares column values only.
+     */
+    private String anyValue(Column c, Function<String, String> test) {
+        Column values = c.isList() ? c : listOf(cols, c);
+        if (values == null) {
+            return test.apply(quoteIdent(c.name()));
+        }
+        if (columnValuesOnly) {
+            return null;
+        }
+        return anyValue(table, c.isList() ? null : quoteIdent(c.name()), quoteIdent(values.name()), test);
+    }
+
+    /**
+     * {@link #anyValue(Column, Function)} over named columns: {@code own} the
+     * field's own column (null when the field is its list), {@code list} its
+     * list column, both quoted, in {@code table}. Null when {@code test} is.
+     */
+    static String anyValue(String table, String own, String list, Function<String, String> test) {
+        String mine = own == null ? null : test.apply(own);
+        String each = test.apply(LIST_ROWS + "." + LIST_VALUE);
+        if (each == null || (own != null && mine == null)) {
+            return null;
+        }
+        String read = LIST_SOURCE + "." + list;
+        String any = OSID + " IN (SELECT " + LIST_ROWS + "." + LIST_ID + " FROM (SELECT " + LIST_SOURCE + "." + OSID + " AS " + LIST_ID + ", unnest(" + read
+            + ") AS " + LIST_VALUE + " FROM " + quoteIdent(table) + " " + LIST_SOURCE + " WHERE " + read + " IS NOT NULL) " + LIST_ROWS + " WHERE " + each
+            + ")";
+        return own == null ? any : "((" + list + " IS NULL AND " + mine + ") OR " + any + ")";
+    }
+
+    /**
+     * The rows where a field has a value. A field that is an object holds
+     * its values in the columns under it, so it exists where any of them
+     * holds one, as Lucene expands {@code exists} on an object over its
+     * sub-fields; a pattern ({@code *}) names every column it matches. The
+     * reserved columns are never a document's field.
+     */
+    private String exists(String field) {
+        Column c = column(field);
+        if (c != null) {
+            Column values = listOf(cols, c);
+            String own = quoteIdent(c.name()) + " IS NOT NULL";
+            return values == null ? own : "(" + own + " OR " + quoteIdent(values.name()) + " IS NOT NULL)";
+        }
+        String under = field + ".";
+        // OpenSearch's own field-pattern matcher, named in full: this class's Regex is a query node.
+        boolean pattern = org.opensearch.common.regex.Regex.isSimpleMatchPattern(field);
+        List<String> present = new ArrayList<>();
+        for (Column sub : cols.values()) {
+            String name = sub.name();
+            if (name.equals(OSID) || name.equals(SOURCE) || name.equals(SEQ)) {
+                continue;
+            }
+            if (name.startsWith(under) || (pattern && org.opensearch.common.regex.Regex.simpleMatch(field, name))) {
+                present.add(quoteIdent(name) + " IS NOT NULL");
+            }
+        }
+        return present.isEmpty() ? NONE : "(" + String.join(" OR ", present) + ")";
     }
 
     static String quoteIdent(String name) {
@@ -260,8 +361,7 @@ final class InfinoQueryTranslator {
             return range(r);
         }
         if (qb instanceof ExistsQueryBuilder e) {
-            Column c = column(e.fieldName());
-            return c == null ? NONE : quoteIdent(c.name()) + " IS NOT NULL";
+            return exists(e.fieldName());
         }
         if (qb instanceof PrefixQueryBuilder p) {
             // On a text column a prefix is a term's prefix; on an exact column the value's.
@@ -280,14 +380,15 @@ final class InfinoQueryTranslator {
         }
         if (qb instanceof RegexpQueryBuilder re) {
             Column c = column(re.fieldName());
-            if (c == null || !c.isString()) {
+            if (c == null || !c.element().isString()) {
                 return c == null ? NONE : null;
             }
             if (c.fts()) {
                 return termPattern(c, "(?:" + re.value() + ")", false);
             }
             // A Lucene regexp is anchored to the whole value.
-            return "regexp_like(" + quoteIdent(c.name()) + ", " + literal("^(?:" + re.value() + ")$") + ")";
+            String anchored = literal("^(?:" + re.value() + ")$");
+            return anyValue(c, v -> "regexp_like(" + v + ", " + anchored + ")");
         }
         if (qb instanceof IdsQueryBuilder ids) {
             if (ids.ids().isEmpty()) {
@@ -460,18 +561,16 @@ final class InfinoQueryTranslator {
             principal = new TextClause(column, principal.query() + " " + query, mode);
             return ALL;
         }
-        return OSID
-            + " IN (SELECT "
-            + OSID
-            + " FROM token_match("
-            + literal(table)
-            + ", "
-            + literal(column)
-            + ", "
-            + literal(query)
-            + ", "
-            + literal(mode)
-            + "))";
+        return TEXT_SUBQUERY + literal(table) + ", " + literal(column) + ", " + literal(query) + ", " + literal(mode) + "))";
+    }
+
+    /**
+     * Whether {@code predicate} reads the token index through a subquery,
+     * which the engine plans in a WHERE clause but not inside an aggregate's
+     * expression.
+     */
+    static boolean readsTextIndex(String predicate) {
+        return predicate.contains(TEXT_SUBQUERY);
     }
 
     /**
@@ -545,8 +644,10 @@ final class InfinoQueryTranslator {
         }
         if (targets.isEmpty() || targets.contains("*")) {
             targets.clear();
-            for (Column c : cols.values()) {
-                if (c.fts()) {
+            // Every text column once: an alias names a column already here.
+            for (Map.Entry<String, Column> entry : cols.entrySet()) {
+                Column c = entry.getValue();
+                if (c.fts() && !InfinoNative.isAlias(entry.getKey(), c)) {
                     targets.add(c.name());
                 }
             }
@@ -737,8 +838,7 @@ final class InfinoQueryTranslator {
     /** The predicate of a field-scoped atom, or null when the column cannot take it. */
     private String fieldAtom(Atom a) {
         if ("_exists_".equals(a.field())) {
-            Column c = column(a.text());
-            return c == null ? NONE : quoteIdent(c.name()) + " IS NOT NULL";
+            return exists(a.text());
         }
         if ("_id".equals(a.field())) {
             return OSID + " = " + literal(a.text());
@@ -751,7 +851,7 @@ final class InfinoQueryTranslator {
             return textClause(c.name(), a.quoted() ? phrase(a.text()) : a.text(), "and", false);
         }
         if (!a.quoted() && (a.text().indexOf('*') >= 0 || a.text().indexOf('?') >= 0)) {
-            return c.isString() ? quoteIdent(c.name()) + " LIKE " + literal(wildcardToLike(a.text())) : null;
+            return like(c, wildcardToLike(a.text()));
         }
         return equality(a.field(), a.text());
     }
@@ -763,8 +863,8 @@ final class InfinoQueryTranslator {
         if (c == null || value == null) {
             return c == null ? NONE : null;
         }
-        String lit = scalar(c, value, false);
-        return lit == null ? null : quoteIdent(c.name()) + " = " + lit;
+        String lit = scalar(c.element(), value, false);
+        return lit == null ? null : anyValue(c, v -> v + " = " + lit);
     }
 
     private String inList(String field, List<Object> values) {
@@ -777,13 +877,14 @@ final class InfinoQueryTranslator {
         }
         List<String> lits = new ArrayList<>();
         for (Object v : values) {
-            String lit = scalar(c, v, false);
+            String lit = scalar(c.element(), v, false);
             if (lit == null) {
                 return null;
             }
             lits.add(lit);
         }
-        return quoteIdent(c.name()) + " IN (" + String.join(", ", lits) + ")";
+        String in = " IN (" + String.join(", ", lits) + ")";
+        return anyValue(c, v -> v + in);
     }
 
     private String range(RangeQueryBuilder r) {
@@ -791,30 +892,38 @@ final class InfinoQueryTranslator {
         if (c == null) {
             return NONE;
         }
-        if (!(c.isNumeric() || c.isTimestamp() || c.isString())) {
+        Column typed = c.element();
+        if (!(typed.isNumeric() || typed.isTimestamp() || typed.isString())) {
             return null;
         }
-        List<String> parts = new ArrayList<>();
+        // Each bound as a comparison and its literal, applied to whichever values the field has.
+        List<String> bounds = new ArrayList<>();
         ZoneId zone = r.timeZone() == null ? null : ZoneId.of(r.timeZone());
         if (r.from() != null) {
             // An exclusive lower date bound rounds up (gt 2026-10-24 means after that day).
-            String lit = c.isTimestamp() ? dateLiteral(r.from(), r.format(), !r.includeLower(), zone) : scalar(c, r.from(), false);
+            String lit = typed.isTimestamp() ? dateLiteral(r.from(), r.format(), !r.includeLower(), zone) : scalar(typed, r.from(), false);
             if (lit == null) {
                 return null;
             }
-            parts.add(quoteIdent(c.name()) + (r.includeLower() ? " >= " : " > ") + lit);
+            bounds.add((r.includeLower() ? " >= " : " > ") + lit);
         }
         if (r.to() != null) {
-            String lit = c.isTimestamp() ? dateLiteral(r.to(), r.format(), r.includeUpper(), zone) : scalar(c, r.to(), false);
+            String lit = typed.isTimestamp() ? dateLiteral(r.to(), r.format(), r.includeUpper(), zone) : scalar(typed, r.to(), false);
             if (lit == null) {
                 return null;
             }
-            parts.add(quoteIdent(c.name()) + (r.includeUpper() ? " <= " : " < ") + lit);
+            bounds.add((r.includeUpper() ? " <= " : " < ") + lit);
         }
-        if (parts.isEmpty()) {
+        if (bounds.isEmpty()) {
             return ALL;
         }
-        return "(" + String.join(" AND ", parts) + ")";
+        return anyValue(c, v -> {
+            List<String> parts = new ArrayList<>(bounds.size());
+            for (String bound : bounds) {
+                parts.add(v + bound);
+            }
+            return "(" + String.join(" AND ", parts) + ")";
+        });
     }
 
     private String like(String field, String pattern) {
@@ -822,10 +931,15 @@ final class InfinoQueryTranslator {
         if (c == null) {
             return NONE;
         }
-        if (!c.isString()) {
+        return like(c, pattern);
+    }
+
+    /** The rows where a value of a string field matches a LIKE pattern; null for a field of another type. */
+    private String like(Column c, String pattern) {
+        if (!c.element().isString()) {
             return null;
         }
-        return quoteIdent(c.name()) + " LIKE " + literal(pattern);
+        return anyValue(c, v -> v + " LIKE " + literal(pattern));
     }
 
     private static String escapeLike(String s) {

@@ -154,7 +154,8 @@ final class InfinoRegistry {
             if (prepared == null) {
                 throw new IllegalStateException("the registry row could not be prepared");
             }
-            InfinoNative.PreparedResult result = InfinoNative.appendPrepared(TABLE, List.of(prepared), replaced);
+            // The registry's rows are the node's own bookkeeping: no client conditions a write on them.
+            InfinoNative.PreparedResult result = InfinoNative.appendPrepared(TABLE, List.of(prepared), replaced, null);
             if (!result.failed().isEmpty()) {
                 throw new IllegalStateException(result.failed().get(0).reason());
             }

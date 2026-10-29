@@ -1,0 +1,343 @@
+---
+"What a mapping says beyond its columns: aliases, every default date form, arrays of arrays, unmapped fields":
+  - do:
+      indices.create:
+        index: semantics_web
+        body:
+          settings:
+            index.infino.enabled: true
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              timestamp: { type: date }
+              "@timestamp": { type: alias, path: timestamp }
+              host: { type: keyword }
+              message: { type: text }
+              bytes: { type: long }
+              sort: { type: keyword }
+              geo:
+                properties:
+                  src: { type: keyword }
+                  origin: { type: alias, path: geo.src }
+  - do:
+      indices.create:
+        index: semantics_other
+        body:
+          settings:
+            index.infino.enabled: true
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              timestamp: { type: date }
+              note: { type: text }
+              tag: { type: keyword }
+  # Every form of OpenSearch's default date format in one bulk (a day with an
+  # empty time, a time without seconds, a zone offset, epoch milliseconds),
+  # and a saved search's sort, an array of arrays in a keyword field.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: semantics_web, _id: "1" }
+          - { timestamp: "2026-11-23T", host: n1, message: "GET /a 200", bytes: 100, geo: { src: US } }
+          - index: { _index: semantics_web, _id: "2" }
+          - { timestamp: "2026-11-23T10:30", host: n2, message: "GET /b 200", bytes: 200, geo: { src: IN } }
+          - index: { _index: semantics_web, _id: "3" }
+          - { timestamp: "2026-11-23T10:30:15+02:00", host: n1, message: "POST /c 500", bytes: 300 }
+          - index: { _index: semantics_web, _id: "4" }
+          - { timestamp: 1795392000000, host: n3, message: "GET /d 304", bytes: 400, sort: [ [ "@timestamp", "desc" ] ] }
+          - index: { _index: semantics_web, _id: "5" }
+          - { timestamp: "2026-11-24T08:00:00.250Z", host: n2, message: "GET /e 200", bytes: 500 }
+          - index: { _index: semantics_other, _id: "o1" }
+          - { timestamp: "2026-11-23T09:00:00Z", note: "not a web log" }
+          - index: { _index: semantics_other, _id: "o2" }
+          - { timestamp: "2026-11-23", note: "another" }
+  - match: { errors: false }
+
+  # A field alias is read as the field it names: queried, bucketed, sorted, fetched.
+  - do:
+      search:
+        index: semantics_web
+        body:
+          size: 0
+          query: { range: { "@timestamp": { gte: "2026-11-23T08:00:00Z", lt: "2026-11-24T00:00:00Z" } } }
+          aggs:
+            h: { date_histogram: { field: "@timestamp", calendar_interval: 1d } }
+  - match: { hits.total.value: 2 }
+  - length: { aggregations.h.buckets: 1 }
+  - match: { aggregations.h.buckets.0.doc_count: 2 }
+
+  - do:
+      search:
+        index: semantics_web
+        body:
+          size: 2
+          _source: false
+          sort: [ { "@timestamp": asc }, { bytes: asc } ]
+          docvalue_fields: [ { field: "@timestamp", format: epoch_millis } ]
+          fields: [ "geo.*" ]
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.fields.@timestamp: [ "1795392000000" ] }
+  - match: { hits.hits.0.fields.geo\.src: [ US ] }
+  - match: { hits.hits.0.fields.geo\.origin: [ US ] }
+
+  - do:
+      search:
+        index: semantics_web
+        body:
+          size: 0
+          query: { term: { geo.origin: US } }
+          aggs:
+            t: { terms: { field: geo.origin } }
+  - match: { hits.total.value: 1 }
+  - length: { aggregations.t.buckets: 1 }
+  - match: { aggregations.t.buckets.0.key: US }
+
+  # Each default date form read as the instant OpenSearch indexes, printed in the field's format.
+  - do:
+      search:
+        index: semantics_web
+        body:
+          size: 5
+          _source: false
+          sort: [ { bytes: asc } ]
+          fields: [ timestamp, { field: "@timestamp", format: epoch_millis } ]
+  - match: { hits.hits.0.fields.timestamp: [ "2026-11-23T00:00:00.000Z" ] }
+  - match: { hits.hits.1.fields.timestamp: [ "2026-11-23T10:30:00.000Z" ] }
+  - match: { hits.hits.2.fields.timestamp: [ "2026-11-23T08:30:15.000Z" ] }
+  - match: { hits.hits.3.fields.@timestamp: [ "1795392000000" ] }
+  - match: { hits.hits.4.fields.@timestamp: [ "1795507200250" ] }
+
+  # An array of arrays in a string field is its values; the source keeps what was sent.
+  - do:
+      get:
+        index: semantics_web
+        id: "4"
+  - match: { _source.sort: [ [ "@timestamp", "desc" ] ] }
+
+  - do:
+      search:
+        index: semantics_web
+        body:
+          size: 1
+          _source: false
+          query: { ids: { values: [ "4" ] } }
+          fields: [ sort ]
+  - match: { hits.hits.0.fields.sort: [ "@timestamp", desc ] }
+
+  # The filter aggregation; meta only where the request sends it.
+  - do:
+      search:
+        index: semantics_web
+        body:
+          size: 0
+          aggs:
+            f:
+              meta: { panel: tsvb }
+              filter: { term: { host: n1 } }
+              aggs:
+                b: { sum: { field: bytes } }
+            g:
+              filter: { query_string: { query: "message:GET" } }
+  - match: { aggregations.f.meta: { panel: tsvb } }
+  - match: { aggregations.f.doc_count: 2 }
+  - match: { aggregations.f.b.value: 400.0 }
+  - is_false: aggregations.f.b.meta
+  - match: { aggregations.g.doc_count: 4 }
+  - is_false: aggregations.g.meta
+
+  # A field one of the searched indices does not map has no value there.
+  - do:
+      search:
+        index: semantics_web,semantics_other
+        body:
+          size: 0
+          aggs:
+            a: { avg: { field: bytes } }
+            t: { terms: { field: host } }
+            h: { date_histogram: { field: nowhere, calendar_interval: 1d } }
+  - match: { hits.total.value: 7 }
+  - match: { aggregations.a.value: 300.0 }
+  - length: { aggregations.t.buckets: 3 }
+  - match: { aggregations.t.sum_other_doc_count: 0 }
+  - match: { aggregations.t.doc_count_error_upper_bound: 0 }
+  - length: { aggregations.h.buckets: 0 }
+
+  # A field the index maps and no document holds: no buckets, nothing counted as other.
+  - do:
+      search:
+        index: semantics_other
+        body:
+          size: 0
+          aggs:
+            t: { terms: { field: tag } }
+  - length: { aggregations.t.buckets: 0 }
+  - match: { aggregations.t.sum_other_doc_count: 0 }
+
+---
+"A date field's own format reads its values and prints its keys":
+  - do:
+      indices.create:
+        index: semantics_custom
+        body:
+          settings:
+            index.infino.enabled: true
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              when: { type: date, format: "yyyy-MM-dd HH:mm:ss||strict_date_optional_time" }
+              n: { type: long }
+  # A form only the field's own format reads beside the default format's, in one bulk.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: semantics_custom, _id: c1 }
+          - { when: "2026-11-23 10:30:15", n: 1 }
+          - index: { _index: semantics_custom, _id: c2 }
+          - { when: "2026-11-23T", n: 2 }
+          - index: { _index: semantics_custom, _id: c3 }
+          - { when: "2026-11-23T11:00:00Z", n: 3 }
+  - match: { errors: false }
+
+  - do:
+      search:
+        index: semantics_custom
+        body:
+          size: 3
+          _source: false
+          sort: [ { n: asc } ]
+          fields: [ when ]
+          query: { range: { when: { gte: "2026-11-23T10:00:00Z" } } }
+          aggs:
+            h: { date_histogram: { field: when, fixed_interval: 1h } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0.fields.when: [ "2026-11-23 10:30:15" ] }
+  - match: { hits.hits.1.fields.when: [ "2026-11-23 11:00:00" ] }
+  - match: { aggregations.h.buckets.0.key_as_string: "2026-11-23 10:00:00" }
+  - match: { aggregations.h.buckets.1.key_as_string: "2026-11-23 11:00:00" }
+
+---
+"The shapes Dashboards sends: a zoned histogram's splits, filter ratios, sibling series, a scripted field":
+  - do:
+      indices.create:
+        index: semantics_shapes
+        body:
+          settings:
+            index.infino.enabled: true
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              ts: { type: date }
+              host: { type: keyword }
+              status: { type: long }
+              bytes: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: semantics_shapes, _id: d1 }
+          - { ts: "2026-11-20T02:00:00Z", host: a, status: 200, bytes: 100 }
+          - index: { _index: semantics_shapes, _id: d2 }
+          - { ts: "2026-11-20T04:30:00Z", host: b, status: 500, bytes: 200 }
+          - index: { _index: semantics_shapes, _id: d3 }
+          - { ts: "2026-11-20T06:00:00Z", host: a, status: 500, bytes: 300 }
+          - index: { _index: semantics_shapes, _id: d4 }
+          - { ts: "2026-11-20T13:00:00Z", host: b, status: 200, bytes: 400 }
+          - index: { _index: semantics_shapes, _id: d5 }
+          - { ts: "2026-11-20T23:00:00Z", host: a, status: 200, bytes: 500 }
+  - match: { errors: false }
+
+  # The split under a histogram in the viewer's time zone: each local day's own hosts.
+  - do:
+      search:
+        index: semantics_shapes
+        body:
+          size: 0
+          aggs:
+            days:
+              date_histogram: { field: ts, calendar_interval: 1d, time_zone: America/New_York }
+              aggs:
+                hosts: { terms: { field: host } }
+  - length: { aggregations.days.buckets: 2 }
+  - match: { aggregations.days.buckets.0.key: 1795064400000 }
+  - match: { aggregations.days.buckets.0.hosts.buckets.0: { key: a, doc_count: 1 } }
+  - match: { aggregations.days.buckets.0.hosts.buckets.1: { key: b, doc_count: 1 } }
+  - match: { aggregations.days.buckets.1.key: 1795150800000 }
+  - match: { aggregations.days.buckets.1.hosts.buckets.0: { key: a, doc_count: 2 } }
+  - match: { aggregations.days.buckets.1.hosts.buckets.1: { key: b, doc_count: 1 } }
+
+  # TSVB's filter ratio: two filters side by side under each time bucket.
+  - do:
+      search:
+        index: semantics_shapes
+        body:
+          size: 0
+          aggs:
+            half:
+              date_histogram: { field: ts, fixed_interval: 12h }
+              aggs:
+                errors:
+                  filter: { term: { status: 500 } }
+                  aggs:
+                    b: { sum: { field: bytes } }
+                all: { filter: { match_all: {} } }
+                avg_bytes: { avg: { field: bytes } }
+  - match: { aggregations.half.buckets.0.errors.doc_count: 2 }
+  - match: { aggregations.half.buckets.0.errors.b.value: 500.0 }
+  - match: { aggregations.half.buckets.0.all.doc_count: 3 }
+  - match: { aggregations.half.buckets.0.avg_bytes.value: 200.0 }
+  - match: { aggregations.half.buckets.1.errors.doc_count: 0 }
+  - match: { aggregations.half.buckets.1.errors.b.value: 0.0 }
+  - match: { aggregations.half.buckets.1.all.doc_count: 2 }
+
+  # TSVB's table: one filter per series under the pivot, each with its own histogram.
+  - do:
+      search:
+        index: semantics_shapes
+        body:
+          size: 0
+          aggs:
+            pivot:
+              terms: { field: host }
+              aggs:
+                s500:
+                  filter: { term: { status: 500 } }
+                  aggs:
+                    t: { date_histogram: { field: ts, calendar_interval: 1d } }
+                s200:
+                  filter: { term: { status: 200 } }
+                  aggs:
+                    t:
+                      date_histogram: { field: ts, calendar_interval: 1d }
+                      aggs:
+                        b: { sum: { field: bytes } }
+  - match: { aggregations.pivot.buckets.0.key: a }
+  - match: { aggregations.pivot.buckets.0.s500.doc_count: 1 }
+  - match: { aggregations.pivot.buckets.0.s500.t.buckets.0.doc_count: 1 }
+  - match: { aggregations.pivot.buckets.0.s200.doc_count: 2 }
+  - match: { aggregations.pivot.buckets.0.s200.t.buckets.0.b.value: 600.0 }
+  - match: { aggregations.pivot.buckets.1.key: b }
+  - match: { aggregations.pivot.buckets.1.s500.doc_count: 1 }
+  - match: { aggregations.pivot.buckets.1.s200.t.buckets.0.b.value: 400.0 }
+
+  # A scripted field reading a date's hour as Painless's getter shortcut, as the sample flights' does.
+  - do:
+      search:
+        index: semantics_shapes
+        body:
+          size: 1
+          sort: [ { ts: asc } ]
+          _source: false
+          script_fields:
+            hour: { script: { source: "doc['ts'].value.hour", lang: painless } }
+          aggs:
+            h: { histogram: { script: { source: "doc['ts'].value.hour", lang: painless }, interval: 12 } }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0.fields.hour: [ 2 ] }
+  - match: { aggregations.h.buckets.0: { key: 0.0, doc_count: 3 } }
+  - match: { aggregations.h.buckets.1: { key: 12.0, doc_count: 2 } }

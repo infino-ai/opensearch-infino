@@ -20,6 +20,7 @@ import org.opensearch.common.document.DocumentField;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.common.regex.Regex;
 import org.opensearch.common.time.DateFormatter;
+import org.opensearch.common.time.DateFormatters;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
@@ -30,6 +31,7 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
@@ -54,6 +56,7 @@ import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.search.sort.ScoreSortBuilder;
 import org.opensearch.search.sort.ScriptSortBuilder;
 import org.opensearch.search.sort.SortBuilder;
+import org.opensearch.search.sort.SortMode;
 import org.opensearch.search.sort.SortOrder;
 
 import java.io.IOException;
@@ -105,8 +108,12 @@ public final class InfinoSearch {
     private static final int DEFAULT_SIZE = 10;
     /** The node name a hit's shard target carries; it only names the index in the response. */
     private static final String NODE = "infino";
-    /** How a date in a hit's source is read back before it is printed in a requested format. */
-    private static final String READ_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
+    /** How a date in a hit's source is read back and printed when its mapping names no format: OpenSearch's default. */
+    private static final String DEFAULT_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
+    /** The format a request names to have a date printed as its field's mapping prints it. */
+    private static final String MAPPING_FORMAT = "use_field_mapping";
+    /** The format that prints a date as its epoch milliseconds. */
+    private static final String EPOCH_MILLIS_FORMAT = "epoch_millis";
     /** The sort a scroll without one pages by: the document id, which {@link #columnFor} resolves to the id column. */
     private static final String ID_SORT_FIELD = "_id";
 
@@ -154,6 +161,27 @@ public final class InfinoSearch {
     record SortSpec(String expr, String name, SqlType type, boolean desc) {
         static SortSpec of(Column c, boolean desc) {
             return new SortSpec(InfinoQueryTranslator.quoteIdent(c.name()), c.name(), InfinoScriptTranslator.typeOf(c), desc);
+        }
+
+        /**
+         * The sort on a field some document gives several values, whose list
+         * column is {@code values} (the field's own column when it is a list):
+         * such a document sorts by its greatest value when {@code greatest},
+         * else its least.
+         */
+        static SortSpec ofValues(Column c, Column values, boolean greatest, boolean desc) {
+            String pick = (greatest ? "array_max(" : "array_min(") + InfinoQueryTranslator.quoteIdent(values.name()) + ")";
+            String expr = c.isList()
+                ? pick
+                : "CASE WHEN " + InfinoQueryTranslator.quoteIdent(values.name()) + " IS NULL THEN " + InfinoQueryTranslator.quoteIdent(c.name())
+                    + " ELSE " + pick + " END";
+            return new SortSpec(expr, c.name(), InfinoScriptTranslator.typeOf(c.element()), desc);
+        }
+
+        /** The sort on {@code _seq_no}: the sequence column, a row written without a number at the one it reports. */
+        static SortSpec seqNo(boolean desc) {
+            String expr = "COALESCE(" + InfinoQueryTranslator.SEQ + ", " + InfinoDocumentVersion.UNTRACKED_SEQ_NO + ")";
+            return new SortSpec(expr, SeqNoFieldMapper.NAME, SqlType.INT, desc);
         }
     }
 
@@ -355,7 +383,8 @@ public final class InfinoSearch {
 
     /**
      * The field sorts over columns, in request order; {@code _score} and
-     * {@code _doc} add nothing. Throws when a sort names something the table
+     * {@code _doc} add nothing, and {@code _seq_no} orders by the sequence
+     * numbers the table keeps. Throws when a sort names something the table
      * has no column for.
      */
     static List<SortSpec> sorts(List<SortBuilder<?>> sorts, Map<String, Column> cols) {
@@ -379,6 +408,11 @@ public final class InfinoSearch {
             if (FieldSortBuilder.DOC_FIELD_NAME.equals(fs.getFieldName())) {
                 continue;
             }
+            if (SeqNoFieldMapper.NAME.equals(fs.getFieldName())) {
+                // The job sweepers of alerting and its kin page their jobs in this order.
+                out.add(SortSpec.seqNo(fs.order() == SortOrder.DESC));
+                continue;
+            }
             Column c = columnFor(cols, fs.getFieldName());
             if (c == null) {
                 throw new IllegalArgumentException("[infino] sort names field [" + fs.getFieldName() + "], which the table has no column for");
@@ -387,7 +421,20 @@ public final class InfinoSearch {
                 // The order of the values would show through the hashes.
                 throw InfinoAccess.refused("sort on [" + fs.getFieldName() + "], a field masked for this user, is not served");
             }
-            out.add(SortSpec.of(c, fs.order() == SortOrder.DESC));
+            boolean desc = fs.order() == SortOrder.DESC;
+            Column values = c.isList() ? c : InfinoQueryTranslator.listOf(cols, c);
+            if (values == null) {
+                out.add(SortSpec.of(c, desc));
+                continue;
+            }
+            SortMode mode = fs.sortMode();
+            if (mode != null && mode != SortMode.MIN && mode != SortMode.MAX) {
+                throw new IllegalArgumentException("[infino] sort mode [" + mode + "] on [" + fs.getFieldName() + "], which documents give several values, is not served");
+            }
+            // Stock's default mode is the least value ascending and the greatest
+            // descending; an explicit min or max picks that value either way.
+            boolean greatest = mode == null ? desc : mode == SortMode.MAX;
+            out.add(SortSpec.ofValues(c, values, greatest, desc));
         }
         return out;
     }
@@ -440,6 +487,10 @@ public final class InfinoSearch {
         // A knn query's hits score as the k-NN plugin scores them, under the
         // field's space type; one the table cannot score is refused before the search.
         String space = stockKnn ? InfinoStockKnn.spaceType(mapping(index), plan.vector().vectorColumn()) : null;
+        boolean seqNoAndPrimaryTerm = Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
+        // A vector hit's sequence number, by id, when the request asks for it: the
+        // vector entry points return ids and scores only.
+        Map<String, Long> vectorSeqs = Map.of();
         if (size == 0 && !stockKnn) {
             rows = List.of();
         } else if (plan.vector() != null) {
@@ -466,8 +517,11 @@ public final class InfinoSearch {
                 }
             }
             InfinoNative.prefetchSources(plan.table(), ids);
+            if (seqNoAndPrimaryTerm) {
+                vectorSeqs = InfinoNative.storedSeqs(plan.table(), ids);
+            }
         } else {
-            rows = InfinoNative.sqlRows(hitStatement(plan, fetch));
+            rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
         }
 
         boolean exact = trackTotal(source);
@@ -488,7 +542,6 @@ public final class InfinoSearch {
         boolean withSource = source.fetchSource() == null || source.fetchSource().fetchSource();
         List<FieldAndFormat> fields = requestedFields(source.docValueFields(), source.fetchFields());
         boolean version = Boolean.TRUE.equals(source.version());
-        boolean seqNoAndPrimaryTerm = Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
         SearchShardTarget target = target(index);
         List<SearchHit> hits = new ArrayList<>();
         float maxScore = Float.NaN;
@@ -519,12 +572,17 @@ public final class InfinoSearch {
             if (!Float.isNaN(score)) {
                 maxScore = Float.isNaN(maxScore) ? score : Math.max(maxScore, score);
             }
-            // The constants the table reports as a document's version (see InfinoDocumentVersion).
+            // The sequence number the document was written under, and the version
+            // and primary term the table reports (see InfinoDocumentVersion).
             if (version) {
                 h.version(InfinoDocumentVersion.VERSION);
             }
             if (seqNoAndPrimaryTerm) {
-                h.setSeqNo(InfinoDocumentVersion.SEQ_NO);
+                h.setSeqNo(
+                    plan.vector() != null
+                        ? vectorSeqs.getOrDefault(id.toString(), InfinoDocumentVersion.UNTRACKED_SEQ_NO)
+                        : InfinoNative.seq(row.get(InfinoQueryTranslator.SEQ))
+                );
                 h.setPrimaryTerm(InfinoDocumentVersion.PRIMARY_TERM);
             }
             if (withSource || !fields.isEmpty()) {
@@ -567,16 +625,21 @@ public final class InfinoSearch {
 
     /**
      * The statement that fetches the page's hits: each hit's id, source,
-     * sort values and, under a collapse, its collapse value. A sorted request
+     * sort values, its sequence number when {@code withSeq} (the request
+     * asks for {@code seq_no_primary_term}) and, under a collapse, its
+     * collapse value. A sorted request
      * orders the filtered relation; a text-ranked one orders the engine's
      * ranked candidates by score; anything else is a filtered scan. A
      * search_after narrows the relation to the rows past the given sort values
      * (a keyset, so no earlier page is scanned), and a collapse keeps the first
      * row of each collapse value in the request's order, through a window.
      */
-    static String hitStatement(Plan plan, int fetch) {
+    static String hitStatement(Plan plan, int fetch, boolean withSeq) {
         Translation q = plan.query();
         StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE);
+        if (withSeq) {
+            hit.append(", ").append(InfinoQueryTranslator.SEQ);
+        }
         for (SortSpec s : plan.sorts()) {
             if (s.name().equals(InfinoQueryTranslator.OSID)) {
                 continue; // the id is selected already
@@ -749,32 +812,33 @@ public final class InfinoSearch {
         TotalHits total = new TotalHits(bucketCount, TotalHits.Relation.EQUAL_TO);
         TopDocsAndMaxScore topDocs = new TopDocsAndMaxScore(new TopDocs(total, docs), maxScore);
         SearchHits searchHits = new SearchHits(hits.toArray(new SearchHit[0]), total, maxScore);
-        return new InternalTopHits(b.getName(), from, size, topDocs, searchHits, b.getMetadata());
+        return new InternalTopHits(b.getName(), from, size, topDocs, searchHits, InfinoAggregationProcessor.metadataOf(b));
     }
 
     /**
      * The fields a request asks for beside the source ({@code docvalue_fields}
-     * and {@code fields}), each once; a pattern such as {@code *} stays a
-     * pattern and is matched against the source's paths per hit.
+     * and {@code fields}), each once, in the format the last request for it
+     * names, as stock's later fetch overwrites the earlier; a pattern such
+     * as {@code *} stays a pattern and is matched against the source's paths
+     * per hit.
      */
     static List<FieldAndFormat> requestedFields(List<FieldAndFormat> docValues, List<FieldAndFormat> fetch) {
-        List<FieldAndFormat> out = new ArrayList<>();
-        Set<String> seen = new HashSet<>();
+        Map<String, FieldAndFormat> byField = new LinkedHashMap<>();
         for (List<FieldAndFormat> group : List.of(docValues == null ? List.<FieldAndFormat>of() : docValues, fetch == null ? List.<FieldAndFormat>of() : fetch)) {
             for (FieldAndFormat f : group) {
-                if (seen.add(f.field)) {
-                    out.add(f);
-                }
+                byField.put(f.field, f);
             }
         }
-        return out;
+        return new ArrayList<>(byField.values());
     }
 
     /**
      * Each requested field on the hit under {@code fields}, read from the
      * hit's source (the table holds what was sent, so a field's value is the
      * source's value at that path): a date column in the requested format,
-     * everything else as it is. A missing path is left out, as stock does.
+     * else its mapping's, everything else as it is. A field alias carries the
+     * values of the field it names, as stock reads it. A missing path is left
+     * out, as stock does.
      */
     static void fillFields(SearchHit h, String src, List<FieldAndFormat> fields, Map<String, Column> cols) {
         if (fields.isEmpty()) {
@@ -784,17 +848,38 @@ public final class InfinoSearch {
         flatten("", XContentHelper.convertToMap(new BytesArray(src), true, MediaTypeRegistry.JSON).v2(), flat);
         for (FieldAndFormat f : fields) {
             for (Map.Entry<String, Object> e : flat.entrySet()) {
-                if (!Regex.simpleMatch(f.field, e.getKey())) {
-                    continue;
+                if (Regex.simpleMatch(f.field, e.getKey())) {
+                    fillField(h, e.getKey(), e.getValue(), cols.get(e.getKey()), f.format);
                 }
-                List<Object> values = new ArrayList<>();
-                Column c = cols.get(e.getKey());
-                for (Object v : e.getValue() instanceof List<?> list ? list : List.of(e.getValue())) {
-                    values.add(c != null && c.isTimestamp() ? formatDate(v, f.format) : v);
+            }
+            for (Map.Entry<String, Column> e : cols.entrySet()) {
+                Column c = e.getValue();
+                if (InfinoNative.isAlias(e.getKey(), c) && Regex.simpleMatch(f.field, e.getKey()) && flat.containsKey(c.name())) {
+                    fillField(h, e.getKey(), flat.get(c.name()), c, f.format);
                 }
-                h.setDocumentField(e.getKey(), new DocumentField(e.getKey(), values));
             }
         }
+    }
+
+    /** One field on the hit under {@code name}: the source's value at its path, a date in {@code format}. */
+    private static void fillField(SearchHit h, String name, Object value, Column c, String format) {
+        List<Object> values = new ArrayList<>();
+        for (Object v : leaves(value, new ArrayList<>())) {
+            values.add(c != null && c.isTimestamp() ? formatDate(v, format, c.dateFormat()) : v);
+        }
+        h.setDocumentField(name, new DocumentField(name, values));
+    }
+
+    /** A source value's values, in order: an array inside an array is read through, as OpenSearch flattens arrays of arrays. */
+    private static List<Object> leaves(Object value, List<Object> out) {
+        if (value instanceof List<?> list) {
+            for (Object item : list) {
+                leaves(item, out);
+            }
+        } else if (value != null) {
+            out.add(value);
+        }
+        return out;
     }
 
     /** The source's leaves by dotted path; a list of scalars stays one value. */
@@ -811,24 +896,31 @@ public final class InfinoSearch {
         }
     }
 
-    /** A date value in the requested format: epoch milliseconds, or a named or patterned date format; unreadable values stay as they are. */
-    private static Object formatDate(Object v, String format) {
+    /**
+     * A date value of a field mapped with {@code mapped} (null for the
+     * default format) in the requested format: epoch milliseconds, a named or
+     * patterned date format, or the mapping's own when the request names
+     * none. The value is read as stock indexed it, with the mapping's format,
+     * the parts it leaves out (a time, a zone) at their start; an unreadable
+     * value stays as it is.
+     */
+    private static Object formatDate(Object v, String format, String mapped) {
+        DateFormatter mapping = DateFormatter.forPattern(mapped == null ? DEFAULT_DATE_FORMAT : mapped);
         Instant at;
         try {
-            at = v instanceof Number n
-                ? Instant.ofEpochMilli(n.longValue())
-                : DateFormatter.forPattern(READ_DATE_FORMAT).parse(v.toString()).query(Instant::from);
+            at = DateFormatters.from(mapping.parse(v.toString())).toInstant();
         } catch (RuntimeException e) {
-            return v;
+            if (!(v instanceof Number n)) {
+                return v;
+            }
+            at = Instant.ofEpochMilli(n.longValue());
         }
-        if (format == null || format.equals("use_field_mapping")) {
-            return v;
-        }
-        if (format.equals("epoch_millis")) {
+        if (EPOCH_MILLIS_FORMAT.equals(format)) {
             return Long.toString(at.toEpochMilli());
         }
         try {
-            return DateFormatter.forPattern(format).format(at.atZone(ZoneOffset.UTC));
+            DateFormatter printer = format == null || format.equals(MAPPING_FORMAT) ? mapping : DateFormatter.forPattern(format);
+            return printer.format(at.atZone(ZoneOffset.UTC));
         } catch (RuntimeException e) {
             return v;
         }

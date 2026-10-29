@@ -212,9 +212,10 @@
   - match: { _source.n: 11 }
   - match: { _source.extra: "later" }
 
-  # op_type create over an existing id conflicts and writes nothing. Every document reports
-  # version 1 at sequence number 0, primary term 1; a write conditioned on those values is
-  # served as unconditioned, one on any other value is refused.
+  # op_type create over an existing id conflicts and writes nothing. Each write is given the
+  # next sequence number of its table, which get, mget and search report at primary term 1;
+  # a write conditioned on a document's sequence number conflicts once another write has come
+  # between, and one conditioned on a version is refused.
   - do:
       catch: conflict
       create:
@@ -227,8 +228,8 @@
         id: a1
   - match: { _source.n: 11 }
   - match: { _version: 1 }
-  - match: { _seq_no: 0 }
   - match: { _primary_term: 1 }
+  - set: { _seq_no: read }
   - do:
       catch: bad_request
       index:
@@ -238,34 +239,123 @@
         version_type: external
         body: { n: 99 }
   - do:
-      catch: bad_request
+      catch: conflict
       index:
         index: rev1
         id: a1
-        if_seq_no: 1
-        if_primary_term: 1
+        if_seq_no: $read
+        if_primary_term: 2
         body: { n: 99 }
   - do:
       index:
         index: rev1
         id: a1
-        if_seq_no: 0
+        if_seq_no: $read
         if_primary_term: 1
         refresh: true
         body: { n: 12, extra: "later" }
-  - match: { _seq_no: 0 }
   - match: { _primary_term: 1 }
+  - gt: { _seq_no: $read }
+  - set: { _seq_no: written }
+  - do:
+      catch: conflict
+      index:
+        index: rev1
+        id: a1
+        if_seq_no: $read
+        if_primary_term: 1
+        body: { n: 99 }
   - do:
       get:
         index: rev1
         id: a1
   - match: { _source.n: 12 }
+  - match: { _seq_no: $written }
+  - do:
+      mget:
+        body: { docs: [ { _index: rev1, _id: "a1" } ] }
+  - match: { docs.0._seq_no: $written }
   - do:
       search:
         index: rev1
         body: { size: 1, seq_no_primary_term: true, query: { term: { n: 12 } } }
-  - match: { hits.hits.0._seq_no: 0 }
+  - match: { hits.hits.0._seq_no: $written }
   - match: { hits.hits.0._primary_term: 1 }
+
+  # An update conditioned on what it read is served, and the same condition a second time conflicts;
+  # a condition on a document that does not exist conflicts as well.
+  - do:
+      update:
+        index: rev1
+        id: a1
+        if_seq_no: $written
+        if_primary_term: 1
+        body: { doc: { tag: "conditioned" } }
+  - gt: { _seq_no: $written }
+  - do:
+      catch: conflict
+      update:
+        index: rev1
+        id: a1
+        if_seq_no: $written
+        if_primary_term: 1
+        body: { doc: { tag: "stale" } }
+  - do:
+      catch: conflict
+      index:
+        index: rev1
+        id: never-written
+        if_seq_no: 0
+        if_primary_term: 1
+        body: { n: 1 }
+
+  # A batch settles each id by its last write that goes through: a delete and then a
+  # re-index of the same id leave the new document, and a create that conflicts is left
+  # out without taking the other writes to its id with it.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: rev1, _id: "w1" }
+          - { n: 40 }
+          - index: { _index: rev1, _id: "w2" }
+          - { n: 50 }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - delete: { _index: rev1, _id: "w1" }
+          - index: { _index: rev1, _id: "w1" }
+          - { n: 41 }
+          - create: { _index: rev1, _id: "w2" }
+          - { n: 99 }
+          - index: { _index: rev1, _id: "w2" }
+          - { n: 51 }
+  - match: { errors: true }
+  - match: { items.0.delete.result: deleted }
+  - match: { items.1.index.result: created }
+  - match: { items.2.create.status: 409 }
+  - match: { items.3.index.result: updated }
+  - do:
+      get:
+        index: rev1
+        id: w1
+  - match: { _source.n: 41 }
+  - do:
+      get:
+        index: rev1
+        id: w2
+  - match: { _source.n: 51 }
+
+  # A sort on _seq_no orders by the sequence numbers the writes were given: w2 was written last.
+  - do:
+      search:
+        index: rev1
+        body: { size: 2, seq_no_primary_term: true, sort: [ { _seq_no: desc } ] }
+  - match: { hits.hits.0._id: "w2" }
+  - match: { hits.hits.1._id: "w1" }
+  - set: { hits.hits.0._seq_no: last }
+  - match: { hits.hits.0.sort.0: $last }
 
   # get and mget through an alias, and get with a source filter.
   - do:
