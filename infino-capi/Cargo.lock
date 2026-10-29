@@ -2089,7 +2089,7 @@ dependencies = [
 [[package]]
 name = "infino"
 version = "0.11.13"
-source = "git+https://github.com/infino-ai/infino.git?branch=fts%2Fbm25-where-exact-rows#485e63adb7e2d861391e0982ae55091b31e940a8"
+source = "git+https://github.com/infino-ai/infino.git?branch=vector%2Fwhere-exact-rows#11b2e3358fa746852d6bb17d4965d29996302497"
 dependencies = [
  "apache-avro",
  "arc-swap",

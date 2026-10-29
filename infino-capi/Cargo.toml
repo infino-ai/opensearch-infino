@@ -24,8 +24,8 @@ rayon = "1"
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 
 [patch.crates-io]
-# Until the engine release that ranks a filtered BM25 search within exactly
-# the rows the filter keeps (infino-ai/infino#1102; it also carries the
-# schema document and schema patches over the hosted transport); the pin
-# above then moves to that version and this block goes.
-infino = { git = "https://github.com/infino-ai/infino.git", branch = "fts/bm25-where-exact-rows" }
+# Until the engine release that ranks a filtered vector search within exactly
+# the rows the filter keeps (infino-ai/infino#1117, stacked on #1102; it also
+# carries the schema document and schema patches over the hosted transport);
+# the pin above then moves to that version and this block goes.
+infino = { git = "https://github.com/infino-ai/infino.git", branch = "vector/where-exact-rows" }
