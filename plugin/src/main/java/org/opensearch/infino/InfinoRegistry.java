@@ -15,6 +15,8 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.common.settings.AbstractScopedSettings;
+import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.action.ActionListener;
@@ -263,7 +265,7 @@ final class InfinoRegistry {
             return;
         }
         List<Restored> restored = Collections.synchronizedList(new ArrayList<>());
-        List<CreateIndexRequest> missing = new ArrayList<>();
+        List<Pending> missing = new ArrayList<>();
         for (Map<String, Object> row : rows) {
             if (!(row.get("name") instanceof String name) || (only != null && !only.equals(name))) {
                 continue;
@@ -273,7 +275,8 @@ final class InfinoRegistry {
                 continue;
             }
             try {
-                missing.add(requestOf(name, row));
+                List<String> leftOut = new ArrayList<>();
+                missing.add(new Pending(requestOf(name, row, InfinoServices.indexScopedSettings(), leftOut), leftOut));
             } catch (Exception e) {
                 log.warn("[infino] index {} could not be rebuilt from its registry row", name, e);
                 restored.add(new Restored(name, Outcome.FAILED, "its registry row is not a create request: " + e.getMessage()));
@@ -282,19 +285,45 @@ final class InfinoRegistry {
         createNext(missing, 0, restored, () -> listener.onResponse(List.copyOf(restored)));
     }
 
-    private static void createNext(List<CreateIndexRequest> requests, int at, List<Restored> restored, Runnable done) {
-        if (at == requests.size()) {
+    /** An index to create, and the settings of its row the cluster does not know, left out of its request. */
+    private record Pending(CreateIndexRequest request, List<String> leftOut) {}
+
+    /**
+     * {@code given} without the settings {@code known} does not know or
+     * finds invalid, each named onto {@code leftOut}, as the cluster sets
+     * them aside when it restores an index; {@code given} as it is with no
+     * {@code known} to hold it to.
+     */
+    static Settings knownSettings(Settings given, IndexScopedSettings known, List<String> leftOut) {
+        if (known == null) {
+            return given;
+        }
+        Settings archived = known.archiveUnknownOrInvalidSettings(
+            given,
+            unknown -> leftOut.add(unknown.getKey()),
+            (invalid, why) -> leftOut.add(invalid.getKey())
+        );
+        return archived.filter(key -> !key.startsWith(AbstractScopedSettings.ARCHIVED_SETTINGS_PREFIX));
+    }
+
+    private static void createNext(List<Pending> pending, int at, List<Restored> restored, Runnable done) {
+        if (at == pending.size()) {
             done.run();
             return;
         }
-        CreateIndexRequest request = requests.get(at);
+        CreateIndexRequest request = pending.get(at).request();
+        List<String> leftOut = pending.get(at).leftOut();
         InfinoClient.createIndex(request, ActionListener.wrap(created -> {
-            restored.add(new Restored(request.index(), Outcome.CREATED, null));
-            createNext(requests, at + 1, restored, done);
+            String note = leftOut.isEmpty() ? null : "created without the settings this cluster does not know: " + String.join(", ", leftOut);
+            if (note != null) {
+                log.warn("[infino] index {} was {}", request.index(), note);
+            }
+            restored.add(new Restored(request.index(), Outcome.CREATED, note));
+            createNext(pending, at + 1, restored, done);
         }, e -> {
             log.warn("[infino] index {} could not be rebuilt", request.index(), e);
             restored.add(new Restored(request.index(), Outcome.FAILED, e.getMessage()));
-            createNext(requests, at + 1, restored, done);
+            createNext(pending, at + 1, restored, done);
         }));
     }
 
@@ -348,13 +377,21 @@ final class InfinoRegistry {
         }
     }
 
-    /** The create request a row describes. */
+    /**
+     * The create request a row describes, without the settings
+     * {@code known} (the cluster's index settings; null for none to hold
+     * them to) does not know or cannot take as given, each named onto
+     * {@code leftOut}: the cluster refuses a create request carrying such a
+     * setting, where a restore sets it aside. A row a loader wrote from
+     * another cluster's snapshot can carry one, from a plugin this cluster
+     * does not run or from another engine altogether.
+     */
     @SuppressWarnings("unchecked")
-    static CreateIndexRequest requestOf(String name, Map<String, Object> row) {
+    static CreateIndexRequest requestOf(String name, Map<String, Object> row, IndexScopedSettings known, List<String> leftOut) {
         CreateIndexRequest request = new CreateIndexRequest(name);
         Object settings = row.get("settings");
         if (settings instanceof Map<?, ?> s) {
-            request.settings((Map<String, ?>) s);
+            request.settings(knownSettings(Settings.builder().loadFromMap((Map<String, ?>) s).build(), known, leftOut));
         }
         Object mappings = row.get("mappings");
         if (mappings instanceof String m && !m.isEmpty() && !"{}".equals(m)) {

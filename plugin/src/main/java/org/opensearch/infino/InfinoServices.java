@@ -9,6 +9,7 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.inject.Injector;
+import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
@@ -35,6 +36,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     private static volatile InfinoWriter writer;
     private static volatile AutoCreateIndex autoCreateIndex;
     private static volatile IngestService ingestService;
+    private static volatile IndexScopedSettings indexScopedSettings;
 
     @Inject
     public InfinoServices(
@@ -55,6 +57,8 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoServices.autoCreateIndex = injector.getInstance(AutoCreateIndex.class);
         // The node's ingest pipelines, which a write to the table runs as a stock bulk runs them.
         InfinoServices.ingestService = injector.getInstance(IngestService.class);
+        // The index settings this node knows, which a registered index is created with.
+        InfinoServices.indexScopedSettings = injector.getInstance(IndexScopedSettings.class);
         InfinoClient.bind(injector);
         // The security plugin's components, when it runs, come from the same injector.
         InfinoSecurity.bind(injector);
@@ -75,6 +79,11 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     /** The node's ingest service, or null before the services are injected. */
     static IngestService ingestService() {
         return ingestService;
+    }
+
+    /** The index settings this node knows, or null before the services are injected. */
+    static IndexScopedSettings indexScopedSettings() {
+        return indexScopedSettings;
     }
 
     static ClusterService clusterService() {
