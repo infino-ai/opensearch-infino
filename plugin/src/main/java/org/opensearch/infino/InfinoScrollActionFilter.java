@@ -137,7 +137,9 @@ public class InfinoScrollActionFilter implements ActionFilter {
         if (source.searchAfter() != null) {
             throw new IllegalArgumentException("[infino] search_after is not served with a scroll; a scroll keeps its own place");
         }
-        if (source.query() instanceof InfinoKnnQueryBuilder || source.query() instanceof InfinoHybridQueryBuilder) {
+        if (source.query() instanceof InfinoKnnQueryBuilder
+            || source.query() instanceof InfinoHybridQueryBuilder
+            || InfinoStockKnn.is(source.query())) {
             throw new IllegalArgumentException("[infino] a vector query is not served with a scroll");
         }
         SearchSourceBuilder pages = InfinoSearch.scrollSource(source);

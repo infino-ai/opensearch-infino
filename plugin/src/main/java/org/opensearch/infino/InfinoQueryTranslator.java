@@ -130,13 +130,24 @@ final class InfinoQueryTranslator {
      * for a user's query, whose lookup would pass no authorization here.
      */
     private final boolean trusted;
+    /**
+     * Whether the predicate may compare column values only: true for a knn
+     * query's filter, which the engine pushes into its vector search, where
+     * a text clause's subquery over the token index cannot go.
+     */
+    private final boolean columnValuesOnly;
     private TextClause principal;
 
     private InfinoQueryTranslator(Map<String, Column> cols, String table, long nowMillis, boolean trusted) {
+        this(cols, table, nowMillis, trusted, false);
+    }
+
+    private InfinoQueryTranslator(Map<String, Column> cols, String table, long nowMillis, boolean trusted, boolean columnValuesOnly) {
         this.cols = cols;
         this.table = table;
         this.nowMillis = nowMillis;
         this.trusted = trusted;
+        this.columnValuesOnly = columnValuesOnly;
     }
 
     /** Translate, or {@code null} when the query is not answerable over the table's columns. */
@@ -156,6 +167,19 @@ final class InfinoQueryTranslator {
      */
     static String predicate(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis) {
         InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, false);
+        return t.predicate(qb, false);
+    }
+
+    /**
+     * A knn query's filter as the predicate the engine narrows its vector
+     * search with (the k nearest among the rows it keeps): as
+     * {@link #predicate}, over column values only. A full-text clause would
+     * be a subquery over the token index, which the engine does not push
+     * into the vector search, so one is refused with the clause named.
+     * Null when not answerable.
+     */
+    static String vectorFilter(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis) {
+        InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, false, true);
         return t.predicate(qb, false);
     }
 
@@ -303,6 +327,11 @@ final class InfinoQueryTranslator {
             }
             return "(" + s.expr() + ")";
         }
+        if (qb instanceof InfinoKnnQueryBuilder || qb instanceof InfinoHybridQueryBuilder || InfinoStockKnn.is(qb)) {
+            // The engine's vector search answers a whole request; as one clause
+            // among others it would have to be a predicate, which it is not.
+            throw new IllegalArgumentException("[infino] [" + qb.getWriteableName() + "] is served as the whole query only, not as a clause inside another");
+        }
         return null;
     }
 
@@ -416,6 +445,11 @@ final class InfinoQueryTranslator {
     }
 
     private String textClause(String column, String query, String mode, boolean positive) {
+        if (columnValuesOnly) {
+            throw new IllegalArgumentException(
+                "[infino] a knn filter matching text on [" + column + "] (" + query + ") is not served: the engine narrows its vector search by column values, and a text match is a search of its own"
+            );
+        }
         if (positive && principal == null) {
             principal = new TextClause(column, query, mode);
             return ALL;
