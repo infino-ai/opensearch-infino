@@ -76,6 +76,9 @@ const MULTI_VALUE_SEPARATOR: &str = " ";
 const LIST_SUFFIX: &str = "[]";
 /// The name Arrow gives a list column's element.
 const LIST_ITEM: &str = "item";
+/// A float of this magnitude or more is past the whole numbers a float holds
+/// exactly (under 2^53), so an integer column does not take it as one.
+const WHOLE_FLOAT_LIMIT: f64 = 9.0e15;
 /// The hosted service's trial route: the one call made without a key, since
 /// it is the call that asks for one.
 const TRIAL_PATH: &str = "/v1/trial";
@@ -1062,10 +1065,19 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
     }
     match dt {
         DataType::Int64 => match &value {
-            Value::Number(n) if n.is_i64() || n.is_u64() => Ok(value),
+            Value::Number(n) if n.is_i64() => Ok(value),
+            // An `unsigned_long` past the largest signed 64-bit integer.
+            Value::Number(n) if n.is_u64() => Err(format!(
+                "{n} is past the largest value an integer column holds"
+            )),
             Value::Number(n) => match n.as_f64() {
-                Some(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => Ok(json!(f as i64)),
-                _ => Err("a fractional number for an integer field".into()),
+                Some(f) if f.fract() != 0.0 => {
+                    Err("a fractional number for an integer field".into())
+                }
+                Some(f) if f.abs() < WHOLE_FLOAT_LIMIT => Ok(json!(f as i64)),
+                _ => Err(format!(
+                    "{n} is past the whole numbers a float holds exactly, so it is no integer"
+                )),
             },
             Value::String(s) => s
                 .trim()
@@ -3181,6 +3193,26 @@ mod tests {
         let hits = sql(h, r#"SELECT osid FROM logs WHERE array_has("n[]", 2)"#);
         assert_eq!(hits, json!([{ "osid": "m1" }]), "{hits}");
         close(h);
+    }
+
+    /// An `unsigned_long` past the largest signed 64-bit integer, and a
+    /// whole float past those a float holds exactly, are refused by what
+    /// they are rather than taken for fractions.
+    #[test]
+    fn an_integer_past_the_column_s_range_is_refused_by_what_it_is() {
+        let past = conform(json!(u64::MAX), &DataType::Int64).expect_err("refused");
+        assert!(past.contains("past the largest value"), "{past}");
+        let whole = conform(json!(1.0e16), &DataType::Int64).expect_err("refused");
+        assert!(
+            whole.contains("whole numbers a float holds exactly"),
+            "{whole}"
+        );
+        let fraction = conform(json!(1.5), &DataType::Int64).expect_err("refused");
+        assert!(fraction.contains("fractional"), "{fraction}");
+        assert_eq!(
+            conform(json!(i64::MAX), &DataType::Int64).expect("held"),
+            json!(i64::MAX)
+        );
     }
 
     /// A `float`, `half_float` or `scaled_float` field holds each value as
