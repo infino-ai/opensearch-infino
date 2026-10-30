@@ -50,6 +50,7 @@ public class InfinoAggregationWireTests extends OpenSearchTestCase {
             Map.of(),
             BucketOrder.count(false),
             10,
+            25,
             1,
             7,
             List.of(new InfinoAggregationWire.DoubleBucket(1.5, 4, InternalAggregations.EMPTY), new InfinoAggregationWire.DoubleBucket(2.25, 2, null))

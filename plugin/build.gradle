@@ -134,6 +134,16 @@ def knnSuite = 'infino/100_knn'
 def knnTests = 'org.opensearch.infino.InfinoStockKnnIT'
 def knnData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-knn"
 
+// Engine mode with a replica needs a second node: a copy recovers from the
+// primary's history, and a replica takes over as primary. That test runs in
+// a task of its own, on a two-node cluster over one catalog both nodes
+// share, as the hosted service's tables are shared by every node.
+def replicaTask = 'engineReplicaTest'
+def replicaTests = 'org.opensearch.infino.InfinoEngineReplicaIT'
+def replicaData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-replica"
+// The YAML suites' runner, which the knn task runs over its own suite.
+def yamlSuiteRunner = 'org.opensearch.infino.InfinoClientYamlTestSuiteIT'
+
 // The test cluster runs the security plugin, enabled, with the demo node
 // certificates on the transport layer and plain HTTP with basic
 // authentication: the suites run as admin, and the security suite sends
@@ -220,11 +230,20 @@ testClusters.matching { it.name == knnTask }.all {
     systemProperty 'infino.data', System.getProperty('infino.data', knnData)
 }
 
+testClusters.maybeCreate(replicaTask)
+testClusters.matching { it.name == replicaTask }.all {
+    numberOfNodes = 2
+    plugin(tasks.named('bundlePlugin').flatMap { it.archiveFile })
+    systemProperty 'infino.uri', System.getProperty('infino.uri', "file://${replicaData}")
+    systemProperty 'infino.data', System.getProperty('infino.data', replicaData)
+}
+
 // A run that dies before its shards are deleted leaves their tables; each run starts clean.
 tasks.named('yamlRestTest').configure {
     systemProperty 'tests.rest.denylist', "${knnSuite}/*"
     filter {
         excludeTestsMatching knnTests
+        excludeTestsMatching replicaTests
     }
     doFirst {
         delete layout.buildDirectory.dir('infino-catalog')
@@ -237,10 +256,28 @@ def knnYamlRestTest = tasks.register(knnTask, RestIntegTestTask) {
     testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
     classpath = sourceSets.yamlRestTest.runtimeClasspath
     systemProperty 'tests.rest.suite', knnSuite
+    filter {
+        includeTestsMatching yamlSuiteRunner
+        includeTestsMatching knnTests
+    }
     doFirst {
         delete knnData
     }
 }
+
+def engineReplicaTest = tasks.register(replicaTask, RestIntegTestTask) {
+    description = 'Runs the engine-mode replica tests on a two-node cluster.'
+    group = 'verification'
+    testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
+    classpath = sourceSets.yamlRestTest.runtimeClasspath
+    filter {
+        includeTestsMatching replicaTests
+    }
+    doFirst {
+        delete replicaData
+    }
+}
 tasks.named('check').configure {
     dependsOn knnYamlRestTest
+    dependsOn engineReplicaTest
 }

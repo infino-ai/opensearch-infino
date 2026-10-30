@@ -176,10 +176,22 @@ public class InfinoAggregationProcessor {
     private static final String NULL_KEY = "\u0000";
 
     private final Index index;
+    /**
+     * Whether these aggregations are one shard's of a search over several,
+     * which the coordinating node reduces: a terms level then returns its
+     * shard size of groups, as a stock shard does, not its final size.
+     */
+    private final boolean shardOfMany;
 
     /** A processor whose top hits name {@code index}; null for planning only. */
     InfinoAggregationProcessor(Index index) {
+        this(index, false);
+    }
+
+    /** A processor for one shard of a search over {@code shardOfMany} several shards, or over the whole index. */
+    InfinoAggregationProcessor(Index index, boolean shardOfMany) {
         this.index = index;
+        this.shardOfMany = shardOfMany;
     }
 
     /** An aggregation the table cannot serve; the request fails with this reason. */
@@ -204,7 +216,7 @@ public class InfinoAggregationProcessor {
         List<Spec> specs = new ArrayList<>();
         int position = 0;
         for (AggregationBuilder b : builders) {
-            specs.add(Spec.of(b, plan.cols(), plan.table(), plan.access(), position++));
+            specs.add(Spec.of(b, plan.cols(), plan.table(), plan.access(), position++, shardOfMany));
         }
         Map<String, InternalAggregation> byName = new HashMap<>();
         List<Metric> rootMetrics = new ArrayList<>();
@@ -251,7 +263,7 @@ public class InfinoAggregationProcessor {
     static void check(Collection<AggregationBuilder> builders, Plan plan) {
         int position = 0;
         for (AggregationBuilder b : builders) {
-            Spec.of(b, plan.cols(), plan.table(), plan.access(), position++);
+            Spec.of(b, plan.cols(), plan.table(), plan.access(), position++, false);
         }
     }
 
@@ -276,8 +288,11 @@ public class InfinoAggregationProcessor {
             return builder.getName();
         }
 
-        /** The spec for a builder at {@code index} among its siblings, or an {@link Unsupported} reason. */
-        static Spec of(AggregationBuilder b, Map<String, Column> cols, String table, InfinoAccess access, int index) {
+        /**
+         * The spec for a builder at {@code index} among its siblings, or an
+         * {@link Unsupported} reason; {@code shardOfMany} as the processor's.
+         */
+        static Spec of(AggregationBuilder b, Map<String, Column> cols, String table, InfinoAccess access, int index, boolean shardOfMany) {
             if (Metric.handles(b)) {
                 if (!b.getSubAggregations().isEmpty()) {
                     throw new Unsupported("metric aggregation [" + b.getName() + "] cannot have sub-aggregations");
@@ -292,7 +307,7 @@ public class InfinoAggregationProcessor {
             BucketSpec child = null;
             int i = 0;
             for (AggregationBuilder sub : b.getSubAggregations()) {
-                Spec s = of(sub, cols, table, access, i++);
+                Spec s = of(sub, cols, table, access, i++, shardOfMany);
                 if (s instanceof Metric m) {
                     metrics.add(m);
                 } else if (s instanceof TopHits t) {
@@ -305,7 +320,7 @@ public class InfinoAggregationProcessor {
             }
             Leaves leaves = new Leaves(metrics, hits);
             if (b instanceof TermsAggregationBuilder t) {
-                return Grouped.terms(t, cols, leaves, child);
+                return Grouped.terms(t, cols, leaves, child, shardOfMany);
             }
             if (b instanceof DateHistogramAggregationBuilder dh) {
                 return Grouped.dateHistogram(dh, cols, leaves, child);
@@ -843,7 +858,12 @@ public class InfinoAggregationProcessor {
             this.hist = hist;
         }
 
-        static Grouped terms(TermsAggregationBuilder t, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
+        /**
+         * A terms level. On one shard of several it keeps its shard size of
+         * groups at its shard minimum count, as a stock shard does, so the
+         * coordinating node ranks from more than each shard's final top.
+         */
+        static Grouped terms(TermsAggregationBuilder t, Map<String, Column> cols, Leaves leaves, BucketSpec child, boolean shardOfMany) {
             Source c = sourceOf(t, cols);
             if (t.size() > MAX_TERMS_SIZE) {
                 throw new Unsupported("aggregation [" + t.getName() + "] asks for " + t.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
@@ -856,7 +876,23 @@ public class InfinoAggregationProcessor {
             if (order == null) {
                 throw new Unsupported("aggregation [" + t.getName() + "] has an order the table cannot sort by: " + t.order());
             }
-            return new Grouped(t, leaves, child, c, c.expr(), kind, true, t.size(), t.minDocCount(), order, null, null);
+            int size = shardOfMany ? shardSize(t) : t.size();
+            long minDocCount = shardOfMany ? Math.min(t.shardMinDocCount(), t.minDocCount()) : t.minDocCount();
+            return new Grouped(t, leaves, child, c, c.expr(), kind, true, size, minDocCount, order, null, null);
+        }
+
+        /**
+         * The groups one shard of a search returns for a terms level, as
+         * stock sizes them: the shard size the request names, else past the
+         * requested size unless the order is by key (a key order merges
+         * exactly), never under the requested size nor over what is served.
+         */
+        static int shardSize(TermsAggregationBuilder t) {
+            int shard = t.shardSize();
+            if (shard < 0 && !InternalOrder.isKeyOrder(t.order())) {
+                shard = BucketUtils.suggestShardSideQueueSize(t.size());
+            }
+            return Math.min(MAX_TERMS_SIZE, Math.max(shard, t.size()));
         }
 
         static Grouped dateHistogram(DateHistogramAggregationBuilder dh, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
@@ -1052,12 +1088,16 @@ public class InfinoAggregationProcessor {
             // without the field are in no bucket, as stock counts it.
             long keyed = rows.isEmpty() || rows.get(0).get("keyed_total") == null ? parentTotal : asLong(rows.get(0).get("keyed_total"));
             long otherDocCount = Math.max(0, keyed - sumTop);
-            TermsAggregator.BucketCountThresholds thresholds = new TermsAggregator.BucketCountThresholds(t.minDocCount(), t.shardMinDocCount(), t.size(), t.shardSize());
+            // The shard size as stock resolves it: the reduce reads a result
+            // with fewer buckets than this as holding every group, so with no
+            // error in its counts.
+            int shardSize = Grouped.shardSize(t);
+            TermsAggregator.BucketCountThresholds thresholds = new TermsAggregator.BucketCountThresholds(t.minDocCount(), t.shardMinDocCount(), t.size(), shardSize);
             return switch (keyKind) {
-                case STR, BOOL -> new StringTerms(t.getName(), t.order(), t.order(), t.getMetadata(), DocValueFormat.RAW, t.shardSize(), false, otherDocCount, sBuckets, 0L, thresholds);
-                case LONG, DATE -> new LongTerms(t.getName(), t.order(), t.order(), t.getMetadata(), DocValueFormat.RAW, t.shardSize(), false, otherDocCount, lBuckets, 0L, thresholds);
+                case STR, BOOL -> new StringTerms(t.getName(), t.order(), t.order(), t.getMetadata(), DocValueFormat.RAW, shardSize, false, otherDocCount, sBuckets, 0L, thresholds);
+                case LONG, DATE -> new LongTerms(t.getName(), t.order(), t.order(), t.getMetadata(), DocValueFormat.RAW, shardSize, false, otherDocCount, lBuckets, 0L, thresholds);
                 // The double bucket class is not public in every release built against; the object comes through its stream form.
-                case DOUBLE -> InfinoAggregationWire.doubleTerms(t.getName(), t.getMetadata(), t.order(), t.size(), t.minDocCount(), otherDocCount, dBuckets);
+                case DOUBLE -> InfinoAggregationWire.doubleTerms(t.getName(), t.getMetadata(), t.order(), t.size(), shardSize, t.minDocCount(), otherDocCount, dBuckets);
             };
         }
 

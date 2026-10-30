@@ -165,7 +165,10 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         InfinoSearch.Page page = InfinoSearch.page(index, plan, source, !countWithAggs);
         long total = page.total();
         if (!builders.isEmpty()) {
-            InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(index).evaluate(
+            // A search over several shards (this index's, or other indices')
+            // is reduced on the coordinating node from each shard's groups.
+            boolean shardOfMany = context.request().numberOfShards() > 1;
+            InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(index, shardOfMany).evaluate(
                 builders,
                 plan,
                 sharedTotal && !countWithAggs ? page.total() : null

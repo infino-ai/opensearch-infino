@@ -104,6 +104,7 @@ final class InfinoAggregationWire {
         Map<String, Object> metadata,
         BucketOrder order,
         int requiredSize,
+        int shardSize,
         long minDocCount,
         long otherDocCount,
         List<DoubleBucket> buckets
@@ -120,7 +121,7 @@ final class InfinoAggregationWire {
             // InternalMappedTerms.writeTermTypeInfoTo
             out.writeZLong(0L); // doc count error
             out.writeNamedWriteable(DocValueFormat.RAW);
-            out.writeVInt(requiredSize); // shard size
+            out.writeVInt(shardSize);
             out.writeBoolean(false); // show term doc count error
             out.writeVLong(otherDocCount);
             out.writeVInt(buckets.size());

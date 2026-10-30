@@ -8,12 +8,17 @@ import com.sun.jna.Pointer;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.document.NumericDocValuesField;
+import org.apache.lucene.document.StoredField;
+import org.apache.lucene.util.BytesRef;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineCreationFailureException;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.mapper.ParseContext.Document;
 import org.opensearch.index.mapper.SourceFieldMapper;
+import org.opensearch.index.translog.Translog;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -24,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 /**
  * The engine of an index in engine mode ({@code index.infino.mode: engine}):
@@ -37,17 +43,36 @@ import java.util.concurrent.ConcurrentHashMap;
  * Lucene document, which keeps {@code _id}, the sequence number and the
  * version, what the engine contract and the fetch phase need.
  *
- * <p>Writes reach the table in batches. A batch commits on refresh, so a
- * document becomes visible in the table when Lucene's skeleton does, and on
- * flush, before the translog that holds it is trimmed; a batch past its
- * document or byte bound commits on its own. The engine knows which writes
- * replace an existing document (the version map says so), so those rows
- * replace their old ones in the same commit without a lookup; a write
- * replayed from the translog, which may or may not have reached the table
- * before a restart, is looked up. Only a primary writes the table: one
- * table has one writer, and a replica's documents are the primary's. Each
- * shard has its own table (see {@link InfinoTables}), so an index of
- * several shards has one writer per table too.
+ * <p>Writes reach the table in batches. A batch commits when the shard syncs
+ * its translog for a write, before the write is acknowledged, so an
+ * acknowledged write is in the table on every copy's behalf; on refresh, so
+ * a document becomes visible in the table when Lucene's skeleton does; and
+ * on flush, before the translog that holds it is trimmed. A batch past its
+ * document or byte bound commits on its own, and one whose commit fails is
+ * kept for the next. The engine knows which writes replace an existing
+ * document (the version map says so), so those rows replace their old ones
+ * in the same commit without a lookup; a write replayed from the translog,
+ * which may or may not have reached the table before a restart, is looked
+ * up.
+ *
+ * <p>Only the primary writes the table: one table has one writer. A
+ * replica's documents, the operations a recovering copy receives, and a
+ * replica's own translog replay were all written by the primary that took
+ * them, so on a replica the skeleton alone is written. Every copy keeps each
+ * write's source as the recovery source, as stock does for a filtered
+ * source, so a copy can recover from another's history; Lucene drops it
+ * from merged segments once no copy can need it. A replica promoted to
+ * primary finds every acknowledged write already in the table. Each shard
+ * has its own table (see {@link InfinoTables}), so an index of several
+ * shards has one writer per table too.
+ *
+ * <p>An index the registry recreated on a fresh cluster ({@link
+ * InfinoPlugin#INFINO_REBUILT}) starts with an empty skeleton over a table
+ * that holds rows; {@link InfinoSkeletonAdopter} creates a document for each
+ * row, through the write path, with writes that leave the table alone. Until
+ * it is done the skeleton cannot say which ids exist: a write the skeleton
+ * takes as new is looked up in the table, and a delete the skeleton does
+ * not find deletes the table's row and reports it found.
  *
  * <p>A table refusal after Lucene has acknowledged a write leaves that
  * document out of the table; it is logged. The mapper refuses what the
@@ -81,6 +106,9 @@ public class InfinoEngine extends InternalEngine {
     }
 
     private final String table;
+    private final ShardId shardId;
+    /** Whether the skeleton started empty over a table holding rows (see the class comment). */
+    private final boolean rebuilt;
     private final Object batchLock = new Object();
     /** Serializes commits, so one batch reaches the table before the next. */
     private final Object commitLock = new Object();
@@ -97,8 +125,46 @@ public class InfinoEngine extends InternalEngine {
     /** The live engines by table, so a read sees what a shard has acknowledged and not yet committed. */
     private static final Map<String, InfinoEngine> BY_TABLE = new ConcurrentHashMap<>();
 
+    /**
+     * Whether this node's copy of each shard is its primary, as its routing
+     * said when it began recovering and as it changes since (a promotion):
+     * a copy replaying its own translog writes the table only as primary.
+     */
+    private static final Map<ShardId, Boolean> PRIMARY_COPY = new ConcurrentHashMap<>();
+
+    /** The shards of rebuilt indices whose skeleton holds every row of the table again (see {@link InfinoSkeletonAdopter}). */
+    private static final Set<ShardId> SKELETON_COMPLETE = ConcurrentHashMap.newKeySet();
+
+    /** Record whether this node's copy of {@code shard} is its primary. */
+    static void primaryCopy(ShardId shard, boolean primary) {
+        PRIMARY_COPY.put(shard, primary);
+    }
+
+    /** {@code shard}'s skeleton holds a document for every row of its table: ids need no lookup. */
+    static void skeletonComplete(ShardId shard) {
+        SKELETON_COMPLETE.add(shard);
+    }
+
+    /** This node no longer holds a copy of {@code shard}. */
+    static void forgetCopy(ShardId shard) {
+        PRIMARY_COPY.remove(shard);
+        SKELETON_COMPLETE.remove(shard);
+    }
+
+    /** Whether the skeleton can say which ids the table holds: not while a rebuilt index's skeleton is rebuilt. */
+    private boolean skeletonKnowsIds() {
+        return !rebuilt || SKELETON_COMPLETE.contains(shardId);
+    }
+
+    /** Whether the write being applied is a skeleton-only one, whose row the table holds already. */
+    private boolean skeletonOnly() {
+        return config().getThreadPool().getThreadContext().getHeader(InfinoSkeletonAdopter.SKELETON_ONLY) != null;
+    }
+
     public InfinoEngine(EngineConfig config) {
         super(config);
+        this.shardId = config.getShardId();
+        this.rebuilt = InfinoPlugin.INFINO_REBUILT.get(config.getIndexSettings().getSettings());
         try {
             this.table = InfinoPlugin.tables().ensure(config.getIndexSettings().getIndexMetadata(), config.getShardId().id());
         } catch (Throwable t) {
@@ -155,6 +221,21 @@ public class InfinoEngine extends InternalEngine {
         super.close();
     }
 
+    /**
+     * Whether an operation of this origin is this copy's to write to the
+     * table: the primary's own writes, and its replay of its own translog
+     * after a restart. A replica's operations, a recovering copy's, and a
+     * replica's replay or reset all carry writes the primary that took them
+     * has written.
+     */
+    private boolean writesTable(Operation.Origin origin) {
+        return switch (origin) {
+            case PRIMARY -> true;
+            case LOCAL_TRANSLOG_RECOVERY -> PRIMARY_COPY.getOrDefault(shardId, false);
+            default -> false;
+        };
+    }
+
     @Override
     public IndexResult index(Index index) throws IOException {
         String source = index.source() == null
@@ -165,8 +246,9 @@ public class InfinoEngine extends InternalEngine {
         for (Document d : index.docs()) {
             d.getFields().removeIf(f -> !f.name().startsWith("_") || SourceFieldMapper.NAME.equals(f.name()));
         }
+        keepRecoverySource(index);
         IndexResult result = super.index(index);
-        if (result.getResultType() != Result.Type.SUCCESS || index.origin() == Operation.Origin.REPLICA || source == null) {
+        if (result.getResultType() != Result.Type.SUCCESS || !writesTable(index.origin()) || source == null || skeletonOnly()) {
             return result;
         }
         boolean full;
@@ -176,7 +258,8 @@ public class InfinoEngine extends InternalEngine {
             boolean pendingCreate = b.created.contains(id);
             b.writes.put(id, source);
             b.deleted.remove(id);
-            if (index.origin().isRecovery()) {
+            if (index.origin().isRecovery() || (!skeletonKnowsIds() && result.isCreated() && !pendingCreate)) {
+                // The table may hold a row the skeleton does not know of.
                 b.replayed.add(id);
             } else if (result.isCreated()) {
                 b.created.add(id);
@@ -193,15 +276,36 @@ public class InfinoEngine extends InternalEngine {
         return result;
     }
 
+    /**
+     * Keep the write's source in the skeleton as its recovery source, as the
+     * mapper does when an index filters its stored source: what a copy
+     * recovering from this one replays its operations from.
+     */
+    private static void keepRecoverySource(Index index) {
+        if (index.source() == null || index.parsedDoc() == null) {
+            return;
+        }
+        Document root = index.parsedDoc().rootDoc();
+        if (root.getField(SourceFieldMapper.RECOVERY_SOURCE_NAME) != null) {
+            return; // the mapper kept it already
+        }
+        BytesRef ref = index.source().toBytesRef();
+        root.add(new StoredField(SourceFieldMapper.RECOVERY_SOURCE_NAME, ref.bytes, ref.offset, ref.length));
+        root.add(new NumericDocValuesField(SourceFieldMapper.RECOVERY_SOURCE_NAME, 1));
+    }
+
     @Override
     public DeleteResult delete(Delete delete) throws IOException {
         DeleteResult result = super.delete(delete);
-        if (result.getResultType() != Result.Type.SUCCESS || delete.origin() == Operation.Origin.REPLICA || !result.isFound()) {
+        if (result.getResultType() != Result.Type.SUCCESS || !writesTable(delete.origin())) {
             return result;
+        }
+        String id = delete.id();
+        if (!result.isFound()) {
+            return skeletonKnowsIds() ? result : deleteTableOnly(id, result);
         }
         synchronized (batchLock) {
             Batch b = batch;
-            String id = delete.id();
             b.writes.remove(id);
             b.replaced.remove(id);
             b.replayed.remove(id);
@@ -210,6 +314,39 @@ public class InfinoEngine extends InternalEngine {
             }
         }
         return result;
+    }
+
+    /**
+     * A delete the skeleton of a rebuilt index did not find: the table may
+     * hold the row from before the rebuild. When it does, the row is deleted
+     * and the delete reports it found, as it would have before the rebuild;
+     * the found result carries no translog location, so the delete's is
+     * synced here when the index syncs for each request.
+     */
+    private DeleteResult deleteTableOnly(String id, DeleteResult notFound) throws IOException {
+        if (InfinoNative.existingOsids(table, List.of(id)).isEmpty()) {
+            return notFound;
+        }
+        synchronized (batchLock) {
+            batch.deleted.add(id);
+        }
+        Translog.Location location = notFound.getTranslogLocation();
+        if (location != null && config().getIndexSettings().getTranslogDurability() == Translog.Durability.REQUEST) {
+            translogManager().ensureTranslogSynced(Stream.of(location));
+        }
+        return new DeleteResult(notFound.getVersion(), notFound.getTerm(), notFound.getSeqNo(), true);
+    }
+
+    /**
+     * Commit what is pending before the shard syncs its translog for a write,
+     * so a write is in the table before it is acknowledged (see the class
+     * comment). A failure fails the sync, and so the write.
+     */
+    protected void commitBeforeSync() {
+        if (commitLock == null) {
+            return; // a sync from within the base engine's constructor: nothing is pending yet
+        }
+        commitBatch();
     }
 
     /** Commit what is pending to the table; batches reach it in the order they were taken. */
@@ -224,12 +361,40 @@ public class InfinoEngine extends InternalEngine {
                 batch = new Batch();
                 committing = b;
             }
+            boolean committed = false;
             try {
                 commit(b);
+                committed = true;
             } finally {
                 synchronized (batchLock) {
                     committing = null;
+                    if (!committed) {
+                        keepForNextCommit(b);
+                    }
                 }
+            }
+        }
+    }
+
+    /**
+     * Fold a batch whose commit failed back under the open one, so its
+     * writes go with the next commit: a write the open batch holds for the
+     * same id is newer and wins. Its rows are looked up then, since a
+     * failed commit may have reached the table in part.
+     */
+    private void keepForNextCommit(Batch failed) {
+        Batch next = batch;
+        for (Map.Entry<String, String> w : failed.writes.entrySet()) {
+            String id = w.getKey();
+            if (!next.writes.containsKey(id) && !next.deleted.contains(id)) {
+                next.writes.put(id, w.getValue());
+                next.replayed.add(id);
+                next.bytes += w.getValue().length();
+            }
+        }
+        for (String id : failed.deleted) {
+            if (!next.writes.containsKey(id)) {
+                next.deleted.add(id);
             }
         }
     }

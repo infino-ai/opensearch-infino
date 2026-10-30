@@ -251,6 +251,106 @@
         scroll_id: $scroll
 
 ---
+"Engine mode: terms over two shards ranks from more than each shard's top":
+  # Routed so the overall top term is neither shard's top: shard 0 holds
+  # a x3 and b x2, shard 1 holds c x3 and b x2, so b leads with 4. A shard
+  # that returned only its own top for size 1 would leave b out.
+  - do:
+      indices.create:
+        index: emt
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: engine
+            number_of_shards: 2
+            number_of_replicas: 0
+          mappings:
+            properties:
+              kind: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emt, _id: "1", routing: r0 }
+          - { kind: a }
+          - index: { _index: emt, _id: "2", routing: r0 }
+          - { kind: a }
+          - index: { _index: emt, _id: "3", routing: r0 }
+          - { kind: a }
+          - index: { _index: emt, _id: "4", routing: r0 }
+          - { kind: b }
+          - index: { _index: emt, _id: "5", routing: r0 }
+          - { kind: b }
+          - index: { _index: emt, _id: "6", routing: r1 }
+          - { kind: c }
+          - index: { _index: emt, _id: "7", routing: r1 }
+          - { kind: c }
+          - index: { _index: emt, _id: "8", routing: r1 }
+          - { kind: c }
+          - index: { _index: emt, _id: "9", routing: r1 }
+          - { kind: b }
+          - index: { _index: emt, _id: "10", routing: r1 }
+          - { kind: b }
+  - match: { errors: false }
+  # r0 routes to shard 0, r1 to shard 1; searched alone, shard 0's top is a.
+  - do:
+      search:
+        index: emt
+        preference: _shards:0
+        body: { size: 0, aggs: { kinds: { terms: { field: kind, size: 1 } } } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.kinds.buckets.0.key: a }
+  - do:
+      search:
+        index: emt
+        body: { size: 0, aggs: { kinds: { terms: { field: kind, size: 1 } } } }
+  - match: { hits.total.value: 10 }
+  - length: { aggregations.kinds.buckets: 1 }
+  - match: { aggregations.kinds.buckets.0.key: b }
+  - match: { aggregations.kinds.buckets.0.doc_count: 4 }
+  # Each shard returned every group it has, so the count is exact.
+  - match: { aggregations.kinds.doc_count_error_upper_bound: 0 }
+  - match: { aggregations.kinds.sum_other_doc_count: 6 }
+
+---
+"Engine mode: an acknowledged write is in the table before any refresh":
+  # With refresh off, nothing commits a batch but the write's own
+  # translog sync, so the table counts the documents as soon as each
+  # write is acknowledged.
+  - do:
+      indices.create:
+        index: emw
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: engine
+            index.refresh_interval: -1
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      index:
+        index: emw
+        id: "1"
+        body: { n: 1 }
+  - do:
+      index:
+        index: emw
+        id: "2"
+        body: { n: 2 }
+  - do:
+      count:
+        index: emw
+  - match: { count: 2 }
+  - do:
+      search:
+        index: emw
+        body: { size: 0, aggs: { total: { sum: { field: n } } } }
+  - match: { aggregations.total.value: 3.0 }
+
+---
 "Engine mode: delete by query scrolls the tables and deletes through the shards":
   # The reindex module is in the test distributions from 3.6.
   - skip:

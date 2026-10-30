@@ -10,6 +10,7 @@ import org.opensearch.action.support.ActionFilter;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.lifecycle.LifecycleComponent;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.IndexScopedSettings;
@@ -100,6 +101,19 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      * plugin (neural search's hybrid query, for one) may need instead.
      */
     public static final Setting<Boolean> ENGINE_ENABLED = Setting.boolSetting("infino.engine.enabled", false, Setting.Property.NodeScope);
+
+    /**
+     * Set by the registry on an index it recreates on a fresh cluster (see
+     * {@link InfinoRegistry}): the index's table already holds rows, which
+     * an engine-mode index's new Lucene skeleton knows nothing of, so its
+     * engine looks ids up in the table (see {@link InfinoEngine}).
+     */
+    public static final Setting<Boolean> INFINO_REBUILT = Setting.boolSetting(
+        "index.infino.rebuilt",
+        false,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
 
     /** The table behind the index, when it is to be named explicitly (to reattach an index to its rows). */
     public static final Setting<String> INFINO_TABLE = Setting.simpleString(
@@ -202,7 +216,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
                 "[infino] index " + indexSettings.getIndex().getName() + " is in engine mode, which needs [" + ENGINE_ENABLED.getKey() + ": true] on the node"
             );
         }
-        return Optional.of(InfinoEngine::new);
+        // The release's own subclass hooks the translog sync (see InfinoEngine#commitBeforeSync).
+        return Optional.of(InfinoSyncedEngine::new);
     }
 
     @Override
@@ -252,6 +267,28 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             return;
         }
         indexModule.addIndexEventListener(new IndexEventListener() {
+            // Which copy of a shard this node holds, for the engine (see InfinoEngine#writesTable).
+            @Override
+            public void beforeIndexShardRecovery(IndexShard indexShard, IndexSettings indexSettings) {
+                if (indexShard.routingEntry() != null) {
+                    InfinoEngine.primaryCopy(indexShard.shardId(), indexShard.routingEntry().primary());
+                }
+            }
+
+            @Override
+            public void shardRoutingChanged(IndexShard indexShard, ShardRouting oldRouting, ShardRouting newRouting) {
+                InfinoEngine.primaryCopy(indexShard.shardId(), newRouting.primary());
+                if (oldRouting != null && !oldRouting.primary() && newRouting.primary() && newRouting.started()) {
+                    // A replica took over: it finishes a skeleton rebuild the old primary may have left.
+                    adoptIfRebuilt(indexShard);
+                }
+            }
+
+            @Override
+            public void afterIndexShardClosed(ShardId shardId, IndexShard indexShard, Settings indexSettings) {
+                InfinoEngine.forgetCopy(shardId);
+            }
+
             @Override
             public void afterIndexShardStarted(IndexShard indexShard) {
                 if (indexShard.routingEntry() == null || !indexShard.routingEntry().primary()) {
@@ -263,6 +300,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
                 } catch (Exception e) {
                     log.warn("[infino] table for {} could not be declared", indexShard.shardId().getIndexName(), e);
                 }
+                adoptIfRebuilt(indexShard);
             }
 
             @Override
@@ -290,6 +328,19 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
                 }
             }
         });
+    }
+
+    /** Rebuild the skeleton of a primary of an engine-mode index the registry recreated (see {@link InfinoSkeletonAdopter}). */
+    private static void adoptIfRebuilt(IndexShard shard) {
+        Settings settings = shard.indexSettings().getSettings();
+        if (!atEngine(settings) || !INFINO_REBUILT.get(settings)) {
+            return;
+        }
+        try {
+            InfinoSkeletonAdopter.start(shard, TABLES.ensure(shard.indexSettings().getIndexMetadata(), shard.shardId().id()));
+        } catch (Exception e) {
+            log.warn("[infino] the skeleton of {} could not be rebuilt", shard.shardId(), e);
+        }
     }
 
     private void scheduleOptimize(IndexShard shard, String table) {
@@ -354,6 +405,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             INFINO_ENABLED,
             INFINO_MODE,
             ENGINE_ENABLED,
+            INFINO_REBUILT,
             INFINO_TABLE,
             OPTIMIZE_INTERVAL,
             PLATFORM_URL,
