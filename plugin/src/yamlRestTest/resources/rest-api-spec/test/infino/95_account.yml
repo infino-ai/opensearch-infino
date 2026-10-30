@@ -51,8 +51,6 @@
 ---
 "Only a caller who may manage the cluster can point the node at a service":
   - skip:
-      version: "3.0.0 - 3.5.99"
-      reason: the test cluster runs without the security plugin on these releases, so every caller has the right
       features: headers
   - do:
       headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }

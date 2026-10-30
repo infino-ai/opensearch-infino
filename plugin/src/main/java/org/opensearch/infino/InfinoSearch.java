@@ -590,7 +590,7 @@ public final class InfinoSearch {
                     ? InfinoNative.getSource(plan.table(), id.toString())
                     : String.valueOf(row.get(InfinoQueryTranslator.SOURCE));
                 // The source as the user may see it: hidden fields gone, masked values hashed.
-                src = plan.access().source(src);
+                src = plan.access().read(id.toString(), src);
                 if (src != null && !src.isEmpty()) {
                     if (withSource) {
                         h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
@@ -785,7 +785,7 @@ public final class InfinoSearch {
             }
             h.score(score);
             if (withSource || !fields.isEmpty()) {
-                String src = access.source(String.valueOf(row.get(InfinoQueryTranslator.SOURCE)));
+                String src = access.read(id.toString(), String.valueOf(row.get(InfinoQueryTranslator.SOURCE)));
                 if (!src.isEmpty()) {
                     if (withSource) {
                         h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));

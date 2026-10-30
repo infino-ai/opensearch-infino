@@ -38,18 +38,17 @@ java {
 }
 
 // The security plugin's document- and field-level rules are enforced from
-// its own evaluation, which the plugin reaches by extending it: from 3.6 the
-// security plugin is extensible and registers the component holding that
-// evaluation, so it becomes a dependency and its classes load for ours. On
-// 2.x the rules arrive as thread-context headers and a restricted request is
-// refused; on 3.0 to 3.5 the security plugin cannot be extended (3.0) or
-// keeps the evaluation where nothing can read it, so any user's request is
-// refused, the suites' admin included, so the test cluster runs the security
-// plugin only where requests from users are served.
+// its own evaluation. On 3.x the plugin reads that evaluation off the
+// components the security plugin registers with the node (found by class
+// name, called by reflection), so it neither compiles against the security
+// plugin nor extends it: the 3.0 one cannot be extended at all. On 2.x the
+// rules arrive as thread-context headers and a request under one is refused.
 def securityVersion = "${opensearch_version}.0"
 def (versionMajor, versionMinor) = opensearch_version.tokenize('.')[0..1].collect { it as int }
-def extendsSecurity = versionMajor > 3 || (versionMajor == 3 && versionMinor >= 6)
-def securityOnTestCluster = extendsSecurity || versionMajor == 2
+// The security plugin extends the rule-framework module from 3.3, which the
+// distributions ship but the test distributions only from 3.6; before that
+// the test cluster gets it as a module built from the published jars.
+def needsRuleFrameworkModule = versionMajor == 3 && versionMinor >= 3 && versionMinor < 6
 
 opensearchplugin {
     name = 'infino-engine'
@@ -57,20 +56,18 @@ opensearchplugin {
     classname = 'org.opensearch.infino.InfinoPlugin'
     licenseFile = rootProject.file('LICENSE.txt')
     noticeFile = rootProject.file('NOTICE.txt')
-    if (extendsSecurity) {
-        extendedPlugins = ['opensearch-security']
-    }
 }
 
 // Two classes exist per release line: the one reading the security plugin's
-// rules (its own evaluation from 3.6, the thread context before) and the
-// one holding the node client (whose package moved in 3.0). The tree for
-// the target release joins the build.
-sourceSets.main.java.srcDirs += extendsSecurity ? 'src/main/security3' : 'src/main/security2'
+// rules (its own evaluation on 3.x, the thread context on 2.x) and the one
+// holding the node client (whose package moved in 3.0). The tree for the
+// target release joins the build.
+sourceSets.main.java.srcDirs += versionMajor >= 3 ? 'src/main/security3' : 'src/main/security2'
 sourceSets.main.java.srcDirs += versionMajor >= 3 ? 'src/main/client3' : 'src/main/client2'
 
 configurations {
     securityPlugin
+    ruleFramework
     knnPlugin
 }
 
@@ -85,23 +82,20 @@ repositories {
 dependencies {
     // OpenSearch ships JNA itself; compiling against it (not bundling) avoids jar hell.
     compileOnly "net.java.dev.jna:jna:${versions.jna}"
-    // The security plugin of the target release: installed on the test cluster
-    // for every major, and on 3.x also compiled against (its jars, read out of
-    // the zip; at runtime they come from the plugin itself, extended).
+    // The security plugin of the target release, installed on every test cluster.
     securityPlugin "org.opensearch.plugin:opensearch-security:${securityVersion}@zip"
     // The k-NN plugin of the target release, installed on the knn suites' test
     // cluster only: it owns the knn_vector mapping and the stock knn query,
     // which those suites send to an Infino-backed index and to a Lucene twin alike.
     knnPlugin "org.opensearch.plugin:opensearch-knn:${opensearch_version}.0@zip"
-    if (extendsSecurity) {
-        // The security plugin's own jar, and guava, whose immutable collections
-        // its rule objects hand back; the rest of its zip is not needed to compile.
-        compileOnly files({
-            zipTree(configurations.securityPlugin.singleFile).matching {
-                include 'opensearch-security-*.jar'
-                include 'guava-*.jar'
-            }
-        })
+    // The rule-framework module the security plugin depends on from 3.3; the
+    // test distributions before 3.6 ship without it, so it is built into a
+    // module from its published jars (see ruleFrameworkModule).
+    if (needsRuleFrameworkModule) {
+        ruleFramework("org.opensearch.plugin:rule-framework:${opensearch_version}") {
+            // The server's own library; a second copy in the module is jar hell.
+            exclude group: 'org.opensearch', module: 'opensearch-common'
+        }
     }
 }
 
@@ -147,7 +141,32 @@ def knnData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog
 // Infino-backed like every other, which is part of what the suites verify.
 def securityResources = file("${projectDir}/src/yamlRestTest/resources/security")
 
+// The rule-framework module as the distribution lays it out: its jars and a
+// descriptor, zipped the way the test cluster installs a module.
+def ruleFrameworkDescriptor = tasks.register('ruleFrameworkDescriptor', WriteProperties) {
+    destinationFile = layout.buildDirectory.file('rule-framework/plugin-descriptor.properties')
+    property 'name', 'rule-framework'
+    property 'description', 'OpenSearch Rule Framework plugin'
+    property 'version', opensearch_version
+    property 'opensearch.version', opensearch_version
+    property 'java.version', '21'
+    property 'classname', 'org.opensearch.rule.RuleFrameworkPlugin'
+}
+def ruleFrameworkModule = tasks.register('ruleFrameworkModule', Zip) {
+    archiveFileName = "rule-framework-${opensearch_version}.zip"
+    destinationDirectory = layout.buildDirectory.dir('rule-framework')
+    from(configurations.ruleFramework)
+    from(ruleFrameworkDescriptor)
+}
+
 testClusters.all {
+    // Installed as a plugin, ahead of the security plugin: the test cluster
+    // lays its modules down only after the plugin installer has run, and the
+    // installer checks the security plugin's dependencies against what is
+    // installed by then.
+    if (needsRuleFrameworkModule) {
+        plugin(ruleFrameworkModule.flatMap { it.archiveFile })
+    }
     systemProperty 'infino.lib', System.getProperty('infino.lib', defaultLib)
     systemProperty 'infino.uri', System.getProperty('infino.uri', defaultUri)
     // The security policy grants the file catalog's directory by this property.
@@ -155,27 +174,34 @@ testClusters.all {
     // The SQL each request runs, in the node log, so a wrong answer can be read back.
     setting 'logger.org.opensearch.infino', 'DEBUG'
 
-    if (securityOnTestCluster) {
-        plugin(layout.file(provider { configurations.securityPlugin.singleFile }))
-        // Plain HTTP with basic authentication; the build's own wait for cluster
-        // health sends no credentials, so the anonymous user may read it (see the
-        // cluster_health role in the security configuration).
-        setting 'plugins.security.disabled', 'false'
-        setting 'plugins.security.ssl.http.enabled', 'false'
-        setting 'plugins.security.ssl.transport.pemcert_filepath', 'esnode.pem'
-        setting 'plugins.security.ssl.transport.pemkey_filepath', 'esnode-key.pem'
-        setting 'plugins.security.ssl.transport.pemtrustedcas_filepath', 'root-ca.pem'
-        setting 'plugins.security.ssl.transport.enforce_hostname_verification', 'false'
-        setting 'plugins.security.allow_unsafe_democertificates', 'true'
-        setting 'plugins.security.allow_default_init_securityindex', 'true'
-        setting 'plugins.security.authcz.admin_dn', 'CN=kirk,OU=client,O=client,L=test,C=de'
-        extraConfigFile 'esnode.pem', file("${securityResources}/certs/esnode.pem")
-        extraConfigFile 'esnode-key.pem', file("${securityResources}/certs/esnode-key.pem")
-        extraConfigFile 'root-ca.pem', file("${securityResources}/certs/root-ca.pem")
-        fileTree("${securityResources}/opensearch-security").each { f ->
+    plugin(layout.file(provider { configurations.securityPlugin.singleFile }))
+    // Plain HTTP with basic authentication; the build's own wait for cluster
+    // health sends no credentials, so the anonymous user may read it (see the
+    // cluster_health role in the security configuration).
+    setting 'plugins.security.disabled', 'false'
+    setting 'plugins.security.ssl.http.enabled', 'false'
+    setting 'plugins.security.ssl.transport.pemcert_filepath', 'esnode.pem'
+    setting 'plugins.security.ssl.transport.pemkey_filepath', 'esnode-key.pem'
+    setting 'plugins.security.ssl.transport.pemtrustedcas_filepath', 'root-ca.pem'
+    setting 'plugins.security.ssl.transport.enforce_hostname_verification', 'false'
+    setting 'plugins.security.allow_unsafe_democertificates', 'true'
+    setting 'plugins.security.allow_default_init_securityindex', 'true'
+    setting 'plugins.security.authcz.admin_dn', 'CN=kirk,OU=client,O=client,L=test,C=de'
+    // The security suite creates an API token through the security plugin's
+    // REST API, which admits a user by role.
+    setting 'plugins.security.restapi.roles_enabled', '["all_access"]'
+    extraConfigFile 'esnode.pem', file("${securityResources}/certs/esnode.pem")
+    extraConfigFile 'esnode-key.pem', file("${securityResources}/certs/esnode-key.pem")
+    extraConfigFile 'root-ca.pem', file("${securityResources}/certs/root-ca.pem")
+    fileTree("${securityResources}/opensearch-security").each { f ->
+        if (f.name != 'config.yml') {
             extraConfigFile "opensearch-security/${f.name}", f
         }
     }
+    // The releases whose security plugin issues API tokens (3.9 and later, as
+    // far as the matrix knows) authenticate them too, so the suite can send one.
+    def apiTokens = versionMajor > 3 || (versionMajor == 3 && versionMinor >= 9)
+    extraConfigFile 'opensearch-security/config.yml', file(apiTokens ? "${securityResources}/config-api-tokens.yml" : "${securityResources}/opensearch-security/config.yml")
 }
 
 // The cluster is made while the build is evaluated, as the YAML suites' own is:

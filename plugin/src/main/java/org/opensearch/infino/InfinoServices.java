@@ -32,6 +32,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     private static volatile ThreadPool threadPool;
     private static volatile ScriptService scriptService;
     private static volatile NamedWriteableRegistry namedWriteableRegistry;
+    private static volatile NamedXContentRegistry namedXContentRegistry;
     private static volatile IndexNameExpressionResolver indexNameExpressionResolver;
     private static volatile InfinoWriter writer;
     private static volatile AutoCreateIndex autoCreateIndex;
@@ -44,6 +45,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         ThreadPool threadPool,
         ScriptService scriptService,
         NamedWriteableRegistry namedWriteableRegistry,
+        NamedXContentRegistry namedXContentRegistry,
         IndexNameExpressionResolver indexNameExpressionResolver,
         Injector injector
     ) {
@@ -51,6 +53,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoServices.threadPool = threadPool;
         InfinoServices.scriptService = scriptService;
         InfinoServices.namedWriteableRegistry = namedWriteableRegistry;
+        InfinoServices.namedXContentRegistry = namedXContentRegistry;
         InfinoServices.indexNameExpressionResolver = indexNameExpressionResolver;
         InfinoServices.writer = new InfinoWriter(threadPool);
         // The node's own rule for creating an index a write names before it exists.
@@ -65,7 +68,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         // Registered cluster state is sent as REST requests, whose bodies the
         // node parses with this, each in the empty context the node starts
         // with (no request has run on this thread yet).
-        InfinoClusterState.bind(injector.getInstance(NamedXContentRegistry.class), threadPool.getThreadContext().newStoredContext(false));
+        InfinoClusterState.bind(namedXContentRegistry, threadPool.getThreadContext().newStoredContext(false));
         // The indices come back from the tables on a fresh cluster, and every
         // index's shape is recorded as it moves (see InfinoRegistry).
         clusterService.addListener(InfinoRegistry::onClusterChanged);
@@ -110,6 +113,11 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     /** For tests that build aggregation objects without a node. */
     static void namedWriteableRegistry(NamedWriteableRegistry registry) {
         namedWriteableRegistry = registry;
+    }
+
+    /** The node's content registry: what a query written as JSON is parsed with. */
+    static NamedXContentRegistry namedXContentRegistry() {
+        return namedXContentRegistry;
     }
 
     static IndexNameExpressionResolver indexNameExpressionResolver() {

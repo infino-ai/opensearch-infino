@@ -122,11 +122,12 @@ public class InfinoGetActionFilter implements ActionFilter {
 
     /**
      * A get result from the table's document (null when it is missing): its
-     * source as the user may see it, with the request's source filter
-     * applied, and the sequence number it was written under.
+     * source as the user may see it (the read reported to the audit log when
+     * it watches the index), with the request's source filter applied, and
+     * the sequence number it was written under.
      */
     static GetResult result(String index, String id, InfinoNative.Doc doc, InfinoAccess access, FetchSourceContext fetch) {
-        String source = doc == null ? null : access.source(doc.source());
+        String source = doc == null ? null : access.read(id, doc.source());
         boolean exists = source != null && !source.isEmpty();
         BytesReference bytes = null;
         if (exists && (fetch == null || fetch.fetchSource())) {
