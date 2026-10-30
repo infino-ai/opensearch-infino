@@ -111,7 +111,7 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                 MultiGetRequest.Item item = mget.getItems().get(i);
                 Map<String, String> byId = restricted.get(item.index());
                 String source = byId != null ? byId.get(item.id()) : InfinoNative.getSource(tableOf.get(item.index()), item.id());
-                String shown = accessOf.get(item.index()).source(source);
+                String shown = accessOf.get(item.index()).read(item.id(), source);
                 GetResponse get = new GetResponse(InfinoGetActionFilter.result(indices.get(item.index()).getIndex().getName(), item.id(), shown, item.fetchSourceContext()));
                 responses[i] = new MultiGetItemResponse(get, null);
             }
