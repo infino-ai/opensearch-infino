@@ -10,7 +10,13 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.cluster.routing.OperationRouting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.xcontent.XContentBuilder;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -31,6 +37,11 @@ public final class InfinoTables {
     private static final Logger log = LogManager.getLogger(InfinoTables.class);
     /** What a shard's table adds to the index's table name, before the shard's number. */
     private static final String SHARD_SUFFIX = "_shard";
+    /** Mapping keys and field types the engine-mode columns are declared with. */
+    private static final String PROPERTIES = "properties";
+    private static final String TYPE = "type";
+    private static final String KEYWORD = "keyword";
+    private static final String LONG = "long";
 
     /** The mapping version each table was last declared from, by table. */
     private final Map<String, Long> declared = new ConcurrentHashMap<>();
@@ -70,13 +81,40 @@ public final class InfinoTables {
             if (last != null && last == version) {
                 return table;
             }
-            MappingMetadata mapping = md.mapping();
-            String json = mapping == null ? "{}" : mapping.source().string();
-            InfinoNative.ensureTable(table, json);
+            InfinoNative.ensureTable(table, tableMapping(md));
             declared.put(table, version);
             log.info("[infino] table {} declared from mapping version {} of {}", table, version, md.getIndex().getName());
         }
         return table;
+    }
+
+    /**
+     * The mapping a table is declared from: the index's, and for an index in
+     * engine mode the columns its engine writes beside the documents' fields
+     * (a row's routing value, and the sequence number and generation it is
+     * stamped with), declared so that every batch is converted against
+     * declared columns rather than typed from its documents.
+     */
+    @SuppressWarnings("unchecked")
+    private static String tableMapping(IndexMetadata md) {
+        MappingMetadata mapping = md.mapping();
+        if (!InfinoPlugin.atEngine(md.getSettings())) {
+            return mapping == null ? "{}" : mapping.source().string();
+        }
+        Map<String, Object> properties = new LinkedHashMap<>();
+        Object declared = mapping == null ? null : mapping.sourceAsMap().get(PROPERTIES);
+        if (declared instanceof Map<?, ?> m) {
+            properties.putAll((Map<String, Object>) m);
+        }
+        properties.put(InfinoQueryTranslator.ROUTING, Map.of(TYPE, KEYWORD));
+        properties.put(InfinoQueryTranslator.SEQ, Map.of(TYPE, LONG));
+        properties.put(InfinoQueryTranslator.GEN, Map.of(TYPE, LONG));
+        try (XContentBuilder b = XContentFactory.jsonBuilder()) {
+            b.map(Map.of(PROPERTIES, properties));
+            return BytesReference.bytes(b).utf8ToString();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /** The table is gone; a later index under the same name declares afresh. */
