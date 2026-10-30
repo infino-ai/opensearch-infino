@@ -34,6 +34,10 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     private static final int REWRITTEN_VALUE = 1_000;
     /** The id deleted. */
     private static final String DELETED = "r1";
+    /** The table of the routed test's indices, its rows and its shards. */
+    private static final String ROUTED_TABLE = "emr2_rows";
+    private static final int ROUTED_ROWS = 40;
+    private static final int ROUTED_SHARDS = 2;
 
     @SuppressWarnings("unchecked")
     public void testARebuiltIndexGetsItsRowsBackAndKeepsThemOnce() throws Exception {
@@ -77,15 +81,56 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         call("DELETE", "/emr", null);
     }
 
+    /**
+     * Documents written with routing values live in the table of the shard
+     * their routing picks, whatever shard their id alone would pick; a
+     * rebuild routes each back by the value it was written with, so every
+     * one is a hit again and a get with its routing finds it.
+     */
+    @SuppressWarnings("unchecked")
+    public void testARebuiltIndexRoutesRowsAsTheyWereWritten() throws Exception {
+        createIndex("emr2_old", false, ROUTED_TABLE, ROUTED_SHARDS);
+        StringBuilder bulk = new StringBuilder();
+        for (int i = 0; i < ROUTED_ROWS; i++) {
+            bulk.append("{\"index\":{\"_index\":\"emr2_old\",\"_id\":\"d").append(i).append("\",\"routing\":\"").append(routing(i)).append("\"}}\n");
+            bulk.append("{\"n\":").append(i).append("}\n");
+        }
+        Map<String, Object> written = call("POST", "/_bulk?refresh=true", bulk.toString());
+        assertEquals(false, written.get("errors"));
+        call("DELETE", "/emr2_old", null);
+
+        createIndex("emr2", true, ROUTED_TABLE, ROUTED_SHARDS);
+        assertBusy(() -> {
+            Map<String, Object> hits = (Map<String, Object>) call("POST", "/emr2/_search", "{\"size\":" + (ROUTED_ROWS + 1) + "}").get("hits");
+            assertEquals(ROUTED_ROWS, ((List<?>) hits.get("hits")).size());
+        }, REBUILD_SECONDS, TimeUnit.SECONDS);
+        for (int i = 0; i < ROUTED_ROWS; i++) {
+            Map<String, Object> doc = call("GET", "/emr2/_doc/d" + i + "?routing=" + routing(i), null);
+            assertEquals("d" + i + " is found by its routing", true, doc.get("found"));
+        }
+        call("DELETE", "/emr2", null);
+    }
+
+    /** The routing value document {@code i} of the routed test is written with. */
+    private static String routing(int i) {
+        return i % 2 == 0 ? "even" : "odd";
+    }
+
     private void createIndex(String index, boolean rebuilt) throws IOException {
+        createIndex(index, rebuilt, TABLE, 1);
+    }
+
+    private void createIndex(String index, boolean rebuilt, String table, int shards) throws IOException {
         call(
             "PUT",
             "/" + index,
             "{\"settings\":{\"index.infino.enabled\":true,\"index.infino.mode\":\"engine\",\"index.infino.table\":\""
-                + TABLE
+                + table
                 + "\",\"index.infino.rebuilt\":"
                 + rebuilt
-                + ",\"number_of_shards\":1,\"number_of_replicas\":0},"
+                + ",\"number_of_shards\":"
+                + shards
+                + ",\"number_of_replicas\":0},"
                 + "\"mappings\":{\"properties\":{\"n\":{\"type\":\"long\"}}}}"
         );
     }

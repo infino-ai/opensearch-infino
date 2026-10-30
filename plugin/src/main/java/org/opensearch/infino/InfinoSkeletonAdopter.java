@@ -44,8 +44,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * the shard's table is read a page at a time in id order, and every row the
  * skeleton lacks is created through the cluster's own write path, from the
  * row's own source, so each of the shard's copies gets it as it gets any
- * write. The table already holds these rows, so the primary's engine leaves
- * the table alone for them (the request carries {@link #SKELETON_ONLY}).
+ * write, routed by the routing value the row was written with when it was
+ * written with one. The table already holds these rows, so the primary's
+ * engine leaves the table alone for them (the request carries
+ * {@link #SKELETON_ONLY}).
  * Each is a create, so a client's write of the same id wins; a row a client
  * deleted while its create was in flight is deleted again through the
  * shard, so the skeleton and the translog end where the table is. Until a
@@ -99,12 +101,15 @@ final class InfinoSkeletonAdopter {
             return;
         }
         log.info("[infino] rebuilding the skeleton of {}: {} documents for {} rows of table {}", shardId, docs, rows, table);
+        // A row written with a routing value keeps it; a table that never
+        // had one has no column for it.
+        boolean routed = InfinoNative.columns(table).containsKey(InfinoQueryTranslator.ROUTING);
         long created = 0;
-        long otherShards = 0;
+        long unroutable = 0;
         String after = null;
         while (true) {
-            List<Map<String, Object>> page = InfinoNative.sqlRows(pageSql(table, after));
-            Map<String, String> missing = new LinkedHashMap<>();
+            List<Map<String, Object>> page = InfinoNative.sqlRows(pageSql(table, after, routed));
+            Map<String, Row> missing = new LinkedHashMap<>();
             try (Engine.Searcher searcher = shard.acquireSearcher("infino_skeleton")) {
                 for (Map<String, Object> row : page) {
                     Object id = row.get(InfinoQueryTranslator.OSID);
@@ -113,13 +118,16 @@ final class InfinoSkeletonAdopter {
                         continue;
                     }
                     after = id.toString();
-                    if (OperationRouting.generateShardId(md, after, null) != shardId.id()) {
-                        // Written with a routing value, which the table does not keep.
-                        otherShards++;
+                    Object r = routed ? row.get(InfinoQueryTranslator.ROUTING) : null;
+                    String routing = r == null ? null : r.toString();
+                    if (OperationRouting.generateShardId(md, after, routing) != shardId.id()) {
+                        // Written with a routing value before the table kept them: there
+                        // is no routing that brings it back to this shard.
+                        unroutable++;
                         continue;
                     }
                     if (source != null && searcher.count(new TermQuery(new Term(IdFieldMapper.NAME, Uid.encodeId(after)))) == 0) {
-                        missing.put(after, source.toString());
+                        missing.put(after, new Row(source.toString(), routing));
                     }
                 }
             }
@@ -131,11 +139,14 @@ final class InfinoSkeletonAdopter {
             }
         }
         InfinoEngine.skeletonComplete(shardId);
-        if (otherShards > 0) {
-            log.warn("[infino] {} rows of table {} route to another shard of {} by their id; they were written with a routing value and are left out of its skeleton", otherShards, table, shardId);
+        if (unroutable > 0) {
+            log.warn("[infino] {} rows of table {} route to another shard of {} by their id and keep no routing value; they are left out of its skeleton", unroutable, table, shardId);
         }
         log.info("[infino] rebuilt the skeleton of {}: created {} documents from table {}", shardId, created, table);
     }
+
+    /** A row the skeleton lacks: its source, and the routing value it was written with (null for none). */
+    private record Row(String source, String routing) {}
 
     /** The table's rows. */
     private static long tableRows(String table) {
@@ -143,13 +154,14 @@ final class InfinoSkeletonAdopter {
         return out.isEmpty() ? 0 : InfinoAggregationProcessor.asLong(out.get(0).get(COUNT_ALIAS));
     }
 
-    /** One page of the table's ids and sources in id order, after {@code after} (null for the first). */
-    private static String pageSql(String table, String after) {
+    /** One page of the table's ids, sources and (when {@code routed}) routing values in id order, after {@code after} (null for the first). */
+    private static String pageSql(String table, String after, boolean routed) {
         String osid = InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.OSID);
         return "SELECT "
             + osid
             + ", "
             + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.SOURCE)
+            + (routed ? ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING) : "")
             + " FROM "
             + InfinoQueryTranslator.quoteIdent(table)
             + (after == null ? "" : " WHERE " + osid + " > " + InfinoQueryTranslator.literal(after))
@@ -164,10 +176,15 @@ final class InfinoSkeletonAdopter {
      * delete through the shard any whose row the table lost meanwhile.
      * Returns the documents created.
      */
-    private static long createMissing(String index, String table, Map<String, String> missing) {
+    private static long createMissing(String index, String table, Map<String, Row> missing) {
         BulkRequest creates = new BulkRequest();
-        for (Map.Entry<String, String> row : missing.entrySet()) {
-            creates.add(new IndexRequest(index).id(row.getKey()).source(row.getValue(), XContentType.JSON).opType(DocWriteRequest.OpType.CREATE));
+        for (Map.Entry<String, Row> row : missing.entrySet()) {
+            creates.add(
+                new IndexRequest(index).id(row.getKey())
+                    .routing(row.getValue().routing())
+                    .source(row.getValue().source(), XContentType.JSON)
+                    .opType(DocWriteRequest.OpType.CREATE)
+            );
         }
         List<String> created = new ArrayList<>();
         for (BulkItemResponse item : run(creates, true).getItems()) {
@@ -182,7 +199,7 @@ final class InfinoSkeletonAdopter {
         BulkRequest deletes = new BulkRequest();
         for (String id : created) {
             if (!kept.contains(id)) {
-                deletes.add(new DeleteRequest(index, id));
+                deletes.add(new DeleteRequest(index, id).routing(missing.get(id).routing()));
             }
         }
         if (deletes.numberOfActions() > 0) {

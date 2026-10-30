@@ -59,6 +59,10 @@ use rayon::prelude::*;
 const OSID: &str = "osid";
 /// The raw `_source` JSON of a row, served back by the fetch phase.
 const SOURCE: &str = "source";
+/// The routing value a row was written with, when it was written with one:
+/// what rebuilding a shard's documents from its table routes them by. The
+/// column appears with the first routed write.
+const ROUTING: &str = "osrouting";
 /// Separator used when a multi-valued string field lands in a scalar string
 /// column: the values are joined so a text index sees every token. The
 /// original array is still in `source`.
@@ -1000,11 +1004,21 @@ pub unsafe extern "C" fn infino_index_batch_buf(
         if buf.is_null() || id_ends.is_null() || src_ends.is_null() || count <= 0 {
             return err_json("empty batch");
         }
-        let prepared =
-            match unsafe { prepare(conn, name, buf, buf_len, id_ends, src_ends, count as usize) } {
-                Ok(p) => p,
-                Err(why) => return err_json(&why),
-            };
+        let prepared = match unsafe {
+            prepare(
+                conn,
+                name,
+                buf,
+                buf_len,
+                id_ends,
+                src_ends,
+                None,
+                count as usize,
+            )
+        } {
+            Ok(p) => p,
+            Err(why) => return err_json(&why),
+        };
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
@@ -1033,7 +1047,10 @@ pub struct Prepared {
     failed: Vec<(usize, String)>,
 }
 
-/// Parse the buffer's documents in parallel and convert them to one Arrow batch.
+/// Parse the buffer's documents in parallel and convert them to one Arrow
+/// batch. With `rt_ends`, each row's source is followed in the buffer by its
+/// routing value, ending at `rt_ends[i]`; an empty one is no routing value.
+#[allow(clippy::too_many_arguments)]
 unsafe fn prepare(
     conn: &Bridge,
     name: &str,
@@ -1041,35 +1058,42 @@ unsafe fn prepare(
     buf_len: usize,
     id_ends: *const u32,
     src_ends: *const u32,
+    rt_ends: Option<*const u32>,
     n: usize,
 ) -> Result<Prepared, String> {
     let bytes = unsafe { std::slice::from_raw_parts(buf, buf_len) };
     let id_ends = unsafe { std::slice::from_raw_parts(id_ends, n) };
     let src_ends = unsafe { std::slice::from_raw_parts(src_ends, n) };
+    let rt_ends = rt_ends.map(|p| unsafe { std::slice::from_raw_parts(p, n) });
     let table = conn.table(name).map_err(|e| e.to_string())?;
     let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
     let schema = table.schema();
 
-    // Each row's id and source as borrowed slices of the buffer.
-    let mut rows_in: Vec<(&str, &str)> = Vec::with_capacity(n);
+    // Each row's id, source and routing value as borrowed slices of the buffer.
+    let mut rows_in: Vec<(&str, &str, &str)> = Vec::with_capacity(n);
     let mut start = 0usize;
     for i in 0..n {
         let (id_end, src_end) = (id_ends[i] as usize, src_ends[i] as usize);
-        if id_end < start || src_end < id_end || src_end > buf_len {
+        let rt_end = rt_ends.map_or(src_end, |ends| ends[i] as usize);
+        if id_end < start || src_end < id_end || rt_end < src_end || rt_end > buf_len {
             return Err("offsets out of range".into());
         }
         let id = std::str::from_utf8(&bytes[start..id_end]).unwrap_or("");
         let src = std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}");
-        rows_in.push((id, src));
-        start = src_end;
+        let routing = std::str::from_utf8(&bytes[src_end..rt_end]).unwrap_or("");
+        rows_in.push((id, src, routing));
+        start = rt_end;
     }
 
     let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
         .par_iter()
-        .map(|(id, src)| {
+        .map(|(id, src, routing)| {
             conform_doc(src, &schema).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 flat.insert(SOURCE.into(), Value::String((*src).to_string()));
+                if !routing.is_empty() {
+                    flat.insert(ROUTING.into(), Value::String((*routing).to_string()));
+                }
                 flat
             })
         })
@@ -1317,7 +1341,68 @@ pub unsafe extern "C" fn infino_prepare_batch(
         if buf.is_null() || id_ends.is_null() || src_ends.is_null() || count <= 0 {
             return ptr::null_mut();
         }
-        match unsafe { prepare(conn, name, buf, buf_len, id_ends, src_ends, count as usize) } {
+        match unsafe {
+            prepare(
+                conn,
+                name,
+                buf,
+                buf_len,
+                id_ends,
+                src_ends,
+                None,
+                count as usize,
+            )
+        } {
+            Ok(p) => Box::into_raw(Box::new(p)),
+            Err(why) => {
+                eprintln!("[capi] prepare: {why}");
+                ptr::null_mut()
+            }
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// [`infino_prepare_batch`] for documents written with routing values: the
+/// buffer holds `id0 source0 routing0 id1 ...`, and `rt_ends[i]` is where
+/// row i's routing value ends (an empty one is none). A row written with one
+/// keeps it in the `osrouting` column.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn infino_prepare_batch_routed(
+    h: *mut Bridge,
+    name: *const c_char,
+    buf: *const u8,
+    buf_len: usize,
+    id_ends: *const u32,
+    src_ends: *const u32,
+    rt_ends: *const u32,
+    count: c_int,
+) -> *mut Prepared {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
+            return ptr::null_mut();
+        };
+        if buf.is_null()
+            || id_ends.is_null()
+            || src_ends.is_null()
+            || rt_ends.is_null()
+            || count <= 0
+        {
+            return ptr::null_mut();
+        }
+        match unsafe {
+            prepare(
+                conn,
+                name,
+                buf,
+                buf_len,
+                id_ends,
+                src_ends,
+                Some(rt_ends),
+                count as usize,
+            )
+        } {
             Ok(p) => Box::into_raw(Box::new(p)),
             Err(why) => {
                 eprintln!("[capi] prepare: {why}");

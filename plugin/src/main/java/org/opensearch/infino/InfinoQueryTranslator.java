@@ -75,6 +75,8 @@ final class InfinoQueryTranslator {
     static final String OSID = "osid";
     /** The reserved column holding each document's JSON source. */
     static final String SOURCE = "source";
+    /** The reserved column holding the routing value an engine-mode document was written with, when it was. */
+    static final String ROUTING = "osrouting";
     /** Mapping suffix OpenSearch clients use for the exact form of a text field. */
     private static final String KEYWORD_SUFFIX = ".keyword";
     /** How a date range or histogram bound is read when the request names no format. */

@@ -11,17 +11,21 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.util.BytesRef;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineCreationFailureException;
 import org.opensearch.index.engine.EngineException;
+import org.opensearch.index.engine.FlushFailedEngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.mapper.ParseContext.Document;
 import org.opensearch.index.mapper.SourceFieldMapper;
 import org.opensearch.index.translog.Translog;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -43,17 +47,27 @@ import java.util.stream.Stream;
  * Lucene document, which keeps {@code _id}, the sequence number and the
  * version, what the engine contract and the fetch phase need.
  *
- * <p>Writes reach the table in batches. A batch commits when the shard syncs
- * its translog for a write, before the write is acknowledged, so an
- * acknowledged write is in the table on every copy's behalf; on refresh, so
- * a document becomes visible in the table when Lucene's skeleton does; and
- * on flush, before the translog that holds it is trimmed. A batch past its
- * document or byte bound commits on its own, and one whose commit fails is
- * kept for the next. The engine knows which writes replace an existing
- * document (the version map says so), so those rows replace their old ones
- * in the same commit without a lookup; a write replayed from the translog,
- * which may or may not have reached the table before a restart, is looked
- * up.
+ * <p>Writes reach the table in batches, a group commit: every write waiting
+ * goes in the next commit, and a write's acknowledgement waits for the
+ * commit that carries it. A batch commits when the shard syncs its translog
+ * for a write, so an acknowledged write is in the table on every copy's
+ * behalf; on refresh; on flush, before the translog that holds it is
+ * trimmed; and past its document or byte bound. Each commit first syncs the
+ * translog and refreshes the skeleton's reader, so the table never holds a
+ * write the translog could lose or a document a search's reader cannot
+ * fetch: a crash between the two leaves writes the translog's replay looks
+ * up in the table, and every search reader opened since knows each id the
+ * table answers with. A commit that fails keeps its batch for the next one
+ * and fails what asked for it: the write's sync, or the flush, so the
+ * translog keeps the writes the table lacks. Writes wait rather than pile up
+ * past a bound while commits fail.
+ *
+ * <p>The engine knows which writes replace an existing document (the version
+ * map says so), so those rows replace their old ones in the same commit
+ * without a lookup; a write replayed from the translog, which may or may not
+ * have reached the table before a restart, is looked up. A write's record in
+ * the batch is made under the same per-id lock as its skeleton write, so the
+ * batch holds each id's writes in the order the shard applied them.
  *
  * <p>Only the primary writes the table: one table has one writer. A
  * replica's documents, the operations a recovering copy receives, and a
@@ -72,7 +86,8 @@ import java.util.stream.Stream;
  * row, through the write path, with writes that leave the table alone. Until
  * it is done the skeleton cannot say which ids exist: a write the skeleton
  * takes as new is looked up in the table, and a delete the skeleton does
- * not find deletes the table's row and reports it found.
+ * not find deletes the table's row and reports it found. A row written with
+ * a routing value keeps it, so the rebuilt document is routed as it was.
  *
  * <p>A table refusal after Lucene has acknowledged a write leaves that
  * document out of the table; it is logged. The mapper refuses what the
@@ -85,11 +100,23 @@ public class InfinoEngine extends InternalEngine {
     private static final int MAX_BATCH_DOCS = Integer.getInteger("infino.engine.batch.docs", 50_000);
     /** Source bytes a batch holds before it commits on its own, between refreshes. */
     private static final long MAX_BATCH_BYTES = Long.getLong("infino.engine.batch.bytes", 64L << 20);
+    /**
+     * Batches' worth of writes that may wait for a commit before a write is
+     * refused: past this the commits are failing, and a write waits for the
+     * table rather than piling up in memory.
+     */
+    private static final int MAX_PENDING_BATCHES = 4;
+    /** Locks over ids that order each id's skeleton write with its record in the batch. */
+    private static final int ID_LOCK_STRIPES = 1024;
+    /** The refresh source of the skeleton refresh each commit runs first. */
+    private static final String COMMIT_REFRESH = "infino_commit";
 
     /** The writes waiting for the next commit, folded by id. */
     private static final class Batch {
         /** The latest source for each id written, in arrival order. */
         final Map<String, String> writes = new LinkedHashMap<>();
+        /** The routing value each id was written with, for the ids written with one. */
+        final Map<String, String> routings = new HashMap<>();
         /** Ids whose row the table holds and a write replaces. */
         final Set<String> replaced = new HashSet<>();
         /** Ids replayed from the translog: whether the table holds them is looked up at commit. */
@@ -103,6 +130,22 @@ public class InfinoEngine extends InternalEngine {
         boolean isEmpty() {
             return writes.isEmpty() && deleted.isEmpty();
         }
+
+        int size() {
+            return writes.size() + deleted.size();
+        }
+
+        /** Record a write of {@code id}, routed by {@code routing} when not null. */
+        void write(String id, String source, String routing) {
+            writes.put(id, source);
+            deleted.remove(id);
+            if (routing == null) {
+                routings.remove(id);
+            } else {
+                routings.put(id, routing);
+            }
+            bytes += source.length();
+        }
     }
 
     private final String table;
@@ -112,6 +155,7 @@ public class InfinoEngine extends InternalEngine {
     private final Object batchLock = new Object();
     /** Serializes commits, so one batch reaches the table before the next. */
     private final Object commitLock = new Object();
+    private final Object[] idLocks = new Object[ID_LOCK_STRIPES];
     private Batch batch = new Batch();
     /** The batch being committed, until the table has it; a read still sees its writes meanwhile. */
     private Batch committing = null;
@@ -165,6 +209,9 @@ public class InfinoEngine extends InternalEngine {
         super(config);
         this.shardId = config.getShardId();
         this.rebuilt = InfinoPlugin.INFINO_REBUILT.get(config.getIndexSettings().getSettings());
+        for (int i = 0; i < idLocks.length; i++) {
+            idLocks[i] = new Object();
+        }
         try {
             this.table = InfinoPlugin.tables().ensure(config.getIndexSettings().getIndexMetadata(), config.getShardId().id());
         } catch (Throwable t) {
@@ -236,8 +283,40 @@ public class InfinoEngine extends InternalEngine {
         };
     }
 
+    /** The lock that orders the writes of {@code id}. */
+    private Object idLock(String id) {
+        return idLocks[Math.floorMod(id.hashCode(), ID_LOCK_STRIPES)];
+    }
+
+    /**
+     * Refuse a new write while more than {@link #MAX_PENDING_BATCHES}
+     * batches' worth wait for a commit: the commits are failing, and the
+     * writes would otherwise pile up in memory. A replay is not refused; it
+     * restores writes the shard acknowledged.
+     */
+    private void refuseWhileBacklogged(Operation.Origin origin) {
+        if (origin.isRecovery()) {
+            return;
+        }
+        int waiting;
+        long bytes;
+        synchronized (batchLock) {
+            waiting = batch.size() + (committing == null ? 0 : committing.size());
+            bytes = batch.bytes + (committing == null ? 0 : committing.bytes);
+        }
+        if (waiting >= (long) MAX_PENDING_BATCHES * MAX_BATCH_DOCS || bytes >= MAX_PENDING_BATCHES * MAX_BATCH_BYTES) {
+            throw new OpenSearchRejectedExecutionException(
+                "[infino] " + waiting + " writes to table " + table + " are waiting for a commit; the write is refused until the table takes them"
+            );
+        }
+    }
+
     @Override
     public IndexResult index(Index index) throws IOException {
+        boolean toTable = writesTable(index.origin()) && !skeletonOnly();
+        if (toTable) {
+            refuseWhileBacklogged(index.origin());
+        }
         String source = index.source() == null
             ? null
             : InfinoBulkActionFilter.sourceAsJson(index.source(), index.parsedDoc() == null ? null : index.parsedDoc().getMediaType());
@@ -247,28 +326,29 @@ public class InfinoEngine extends InternalEngine {
             d.getFields().removeIf(f -> !f.name().startsWith("_") || SourceFieldMapper.NAME.equals(f.name()));
         }
         keepRecoverySource(index);
-        IndexResult result = super.index(index);
-        if (result.getResultType() != Result.Type.SUCCESS || !writesTable(index.origin()) || source == null || skeletonOnly()) {
-            return result;
-        }
-        boolean full;
-        synchronized (batchLock) {
-            Batch b = batch;
-            String id = index.id();
-            boolean pendingCreate = b.created.contains(id);
-            b.writes.put(id, source);
-            b.deleted.remove(id);
-            if (index.origin().isRecovery() || (!skeletonKnowsIds() && result.isCreated() && !pendingCreate)) {
-                // The table may hold a row the skeleton does not know of.
-                b.replayed.add(id);
-            } else if (result.isCreated()) {
-                b.created.add(id);
-                b.replaced.remove(id);
-            } else if (!pendingCreate) {
-                b.replaced.add(id);
+        String id = index.id();
+        IndexResult result;
+        boolean full = false;
+        synchronized (idLock(id)) {
+            result = super.index(index);
+            if (result.getResultType() != Result.Type.SUCCESS || !toTable || source == null) {
+                return result;
             }
-            b.bytes += source.length();
-            full = b.writes.size() >= MAX_BATCH_DOCS || b.bytes >= MAX_BATCH_BYTES;
+            synchronized (batchLock) {
+                Batch b = batch;
+                boolean pendingCreate = b.created.contains(id);
+                b.write(id, source, index.routing());
+                if (index.origin().isRecovery() || (!skeletonKnowsIds() && result.isCreated() && !pendingCreate)) {
+                    // The table may hold a row the skeleton does not know of.
+                    b.replayed.add(id);
+                } else if (result.isCreated()) {
+                    b.created.add(id);
+                    b.replaced.remove(id);
+                } else if (!pendingCreate) {
+                    b.replaced.add(id);
+                }
+                full = b.writes.size() >= MAX_BATCH_DOCS || b.bytes >= MAX_BATCH_BYTES;
+            }
         }
         if (full) {
             commitBatch();
@@ -296,45 +376,56 @@ public class InfinoEngine extends InternalEngine {
 
     @Override
     public DeleteResult delete(Delete delete) throws IOException {
-        DeleteResult result = super.delete(delete);
-        if (result.getResultType() != Result.Type.SUCCESS || !writesTable(delete.origin())) {
-            return result;
+        boolean toTable = writesTable(delete.origin());
+        if (toTable) {
+            refuseWhileBacklogged(delete.origin());
         }
         String id = delete.id();
-        if (!result.isFound()) {
-            return skeletonKnowsIds() ? result : deleteTableOnly(id, result);
-        }
-        synchronized (batchLock) {
-            Batch b = batch;
-            b.writes.remove(id);
-            b.replaced.remove(id);
-            b.replayed.remove(id);
-            if (!b.created.remove(id)) {
-                b.deleted.add(id); // the table holds a row for it
+        DeleteResult result;
+        synchronized (idLock(id)) {
+            result = super.delete(delete);
+            if (result.getResultType() != Result.Type.SUCCESS || !toTable) {
+                return result;
+            }
+            if (result.isFound()) {
+                synchronized (batchLock) {
+                    Batch b = batch;
+                    b.writes.remove(id);
+                    b.routings.remove(id);
+                    b.replaced.remove(id);
+                    b.replayed.remove(id);
+                    if (!b.created.remove(id)) {
+                        b.deleted.add(id); // the table holds a row for it
+                    }
+                }
+                return result;
+            }
+            if (skeletonKnowsIds() || !deleteTableOnly(id)) {
+                return result;
             }
         }
-        return result;
+        // The found result carries no translog location, so the delete's is
+        // synced here when the index syncs for each request.
+        Translog.Location location = result.getTranslogLocation();
+        if (location != null && config().getIndexSettings().getTranslogDurability() == Translog.Durability.REQUEST) {
+            translogManager().ensureTranslogSynced(Stream.of(location));
+        }
+        return new DeleteResult(result.getVersion(), result.getTerm(), result.getSeqNo(), true);
     }
 
     /**
      * A delete the skeleton of a rebuilt index did not find: the table may
      * hold the row from before the rebuild. When it does, the row is deleted
-     * and the delete reports it found, as it would have before the rebuild;
-     * the found result carries no translog location, so the delete's is
-     * synced here when the index syncs for each request.
+     * and the delete reports it found, as it would have before the rebuild.
      */
-    private DeleteResult deleteTableOnly(String id, DeleteResult notFound) throws IOException {
+    private boolean deleteTableOnly(String id) {
         if (InfinoNative.existingOsids(table, List.of(id)).isEmpty()) {
-            return notFound;
+            return false;
         }
         synchronized (batchLock) {
             batch.deleted.add(id);
         }
-        Translog.Location location = notFound.getTranslogLocation();
-        if (location != null && config().getIndexSettings().getTranslogDurability() == Translog.Durability.REQUEST) {
-            translogManager().ensureTranslogSynced(Stream.of(location));
-        }
-        return new DeleteResult(notFound.getVersion(), notFound.getTerm(), notFound.getSeqNo(), true);
+        return true;
     }
 
     /**
@@ -349,7 +440,12 @@ public class InfinoEngine extends InternalEngine {
         commitBatch();
     }
 
-    /** Commit what is pending to the table; batches reach it in the order they were taken. */
+    /**
+     * Commit what is pending to the table; batches reach it in the order they
+     * were taken. The translog is synced and the skeleton's reader refreshed
+     * first (see the class comment). A failure keeps the batch for the next
+     * commit and is thrown.
+     */
     private void commitBatch() {
         synchronized (commitLock) {
             Batch b;
@@ -363,8 +459,16 @@ public class InfinoEngine extends InternalEngine {
             }
             boolean committed = false;
             try {
+                translogManager().syncTranslog();
+                if (!b.created.isEmpty() || !b.replayed.isEmpty()) {
+                    // Each of these ids was written to the skeleton before it
+                    // entered the batch, so the refreshed reader has them all.
+                    super.refresh(COMMIT_REFRESH);
+                }
                 commit(b);
                 committed = true;
+            } catch (IOException e) {
+                throw new UncheckedIOException("[infino] syncing the translog of " + shardId + " before a commit to " + table + " failed", e);
             } finally {
                 synchronized (batchLock) {
                     committing = null;
@@ -387,9 +491,8 @@ public class InfinoEngine extends InternalEngine {
         for (Map.Entry<String, String> w : failed.writes.entrySet()) {
             String id = w.getKey();
             if (!next.writes.containsKey(id) && !next.deleted.contains(id)) {
-                next.writes.put(id, w.getValue());
+                next.write(id, w.getValue(), failed.routings.get(id));
                 next.replayed.add(id);
-                next.bytes += w.getValue().length();
             }
         }
         for (String id : failed.deleted) {
@@ -409,7 +512,16 @@ public class InfinoEngine extends InternalEngine {
         if (!b.writes.isEmpty()) {
             List<String> ids = new ArrayList<>(b.writes.keySet());
             List<String> sources = new ArrayList<>(b.writes.values());
-            Pointer prepared = InfinoNative.prepare(table, ids, sources);
+            Pointer prepared;
+            if (b.routings.isEmpty()) {
+                prepared = InfinoNative.prepare(table, ids, sources);
+            } else {
+                List<String> routings = new ArrayList<>(ids.size());
+                for (String id : ids) {
+                    routings.add(b.routings.get(id));
+                }
+                prepared = InfinoNative.prepare(table, ids, sources, routings);
+            }
             if (prepared == null) {
                 throw new IllegalStateException("[infino] the bridge could not prepare a batch for " + table);
             }
@@ -430,13 +542,15 @@ public class InfinoEngine extends InternalEngine {
         log.debug("[infino] engine committed {} writes and {} deletes to {} in {} ms", b.writes.size(), deleted.size(), table, (System.nanoTime() - start) / 1_000_000L);
     }
 
-    /** Commit pending writes before Lucene makes its skeleton visible or durable. */
+    /**
+     * Commit pending writes before Lucene's refresh or force merge. A failure
+     * is logged and Lucene's step still runs: failing it would fail the shard
+     * for writes the translog holds and a later commit takes.
+     */
     private void commitBeforeLucene(String why) {
         try {
             commitBatch();
         } catch (RuntimeException e) {
-            // Lucene's own step still runs: failing it would fail the shard
-            // for a write the translog holds and a later commit replays.
             log.warn("[infino] committing to {} on {} failed", table, why, e);
         }
     }
@@ -453,9 +567,18 @@ public class InfinoEngine extends InternalEngine {
         return super.maybeRefresh(source);
     }
 
+    /**
+     * A flush trims the translog, so the writes it holds must be in the table
+     * first: a commit that fails fails the flush, and the translog keeps
+     * them for the next.
+     */
     @Override
     public void flush(boolean force, boolean waitIfOngoing) throws EngineException {
-        commitBeforeLucene("flush");
+        try {
+            commitBatch();
+        } catch (RuntimeException e) {
+            throw new FlushFailedEngineException(shardId, e);
+        }
         super.flush(force, waitIfOngoing);
     }
 
@@ -477,9 +600,20 @@ public class InfinoEngine extends InternalEngine {
         super.forceMerge(flush, maxNumSegments, onlyExpungeDeletes, upgrade, upgradeOnlyAncientSegments, forceMergeUUID);
     }
 
+    /**
+     * The final flush trims the translog too: when the final commit fails,
+     * the shard closes without it, so its translog keeps the writes the
+     * table lacks and the next start replays them into the table.
+     */
     @Override
     public void flushAndClose() throws IOException {
-        commitBeforeLucene("close");
+        try {
+            commitBatch();
+        } catch (RuntimeException e) {
+            log.warn("[infino] committing to {} on close failed; closing without the final flush, so the translog keeps the writes", table, e);
+            close();
+            return;
+        }
         super.flushAndClose();
     }
 }

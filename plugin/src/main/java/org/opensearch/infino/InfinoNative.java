@@ -449,22 +449,38 @@ public final class InfinoNative {
         return why == null || why.isEmpty() ? null : why;
     }
 
-    /** The ids and sources of a batch as one UTF-8 buffer with the end offset of each id and each source. */
-    private record Packed(byte[] buf, int[] idEnds, int[] srcEnds) {
+    /**
+     * The ids and sources of a batch as one UTF-8 buffer with the end offset
+     * of each id and each source; with routing values, each row's follows its
+     * source (empty for none) and {@code rtEnds} holds where it ends.
+     */
+    private record Packed(byte[] buf, int[] idEnds, int[] srcEnds, int[] rtEnds) {
         static Packed of(List<String> osids, List<String> sources) {
+            return of(osids, sources, null);
+        }
+
+        static Packed of(List<String> osids, List<String> sources, List<String> routings) {
             int n = osids.size();
             int[] idEnds = new int[n];
             int[] srcEnds = new int[n];
+            int[] rtEnds = routings == null ? null : new int[n];
             byte[][] idBytes = new byte[n][];
             byte[][] srcBytes = new byte[n][];
+            byte[][] rtBytes = new byte[n][];
             int total = 0;
             for (int i = 0; i < n; i++) {
                 idBytes[i] = osids.get(i).getBytes(StandardCharsets.UTF_8);
                 srcBytes[i] = sources.get(i).getBytes(StandardCharsets.UTF_8);
+                String routing = routings == null ? null : routings.get(i);
+                rtBytes[i] = routing == null ? new byte[0] : routing.getBytes(StandardCharsets.UTF_8);
                 total += idBytes[i].length;
                 idEnds[i] = total;
                 total += srcBytes[i].length;
                 srcEnds[i] = total;
+                if (rtEnds != null) {
+                    total += rtBytes[i].length;
+                    rtEnds[i] = total;
+                }
             }
             byte[] buf = new byte[total];
             int at = 0;
@@ -473,8 +489,12 @@ public final class InfinoNative {
                 at += idBytes[i].length;
                 System.arraycopy(srcBytes[i], 0, buf, at, srcBytes[i].length);
                 at += srcBytes[i].length;
+                if (rtEnds != null) {
+                    System.arraycopy(rtBytes[i], 0, buf, at, rtBytes[i].length);
+                    at += rtBytes[i].length;
+                }
             }
-            return new Packed(buf, idEnds, srcEnds);
+            return new Packed(buf, idEnds, srcEnds, rtEnds);
         }
     }
 
@@ -493,6 +513,17 @@ public final class InfinoNative {
         init();
         Packed p = Packed.of(osids, sources);
         return lib.infino_prepare_batch(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), osids.size());
+    }
+
+    /**
+     * {@link #prepare} for documents written with routing values: each row
+     * keeps its routing value (null for none) in the
+     * {@link InfinoQueryTranslator#ROUTING} column.
+     */
+    public static Pointer prepare(String name, List<String> osids, List<String> sources, List<String> routings) {
+        init();
+        Packed p = Packed.of(osids, sources, routings);
+        return lib.infino_prepare_batch_routed(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), p.rtEnds(), osids.size());
     }
 
     /**
