@@ -87,7 +87,7 @@ public final class InfinoNative {
     private static volatile Target wanted = Target.node();
     private static final Map<String, Map<String, Column>> COLUMNS = new ConcurrentHashMap<>();
     /** The count's key in {@link #valueCounts}'s rows, as the engine names it. */
-    static final String VALUE_COUNT = "count";
+    static final String VALUE_COUNT = "count(*)";
     /** How long a prefetched source waits for its fetch phase. */
     private static final TimeValue SOURCE_PREFETCH_TTL = TimeValue.timeValueSeconds(30);
     /** Bytes of prefetched sources held at once across requests. */
@@ -594,14 +594,15 @@ public final class InfinoNative {
     }
 
     /**
-     * A column's rows counted per value, read from the table's statistics
-     * without a statement: one row per value (under the column's name, null
-     * for the rows without one) with its count under {@link #VALUE_COUNT}.
-     * Null when the statistics can't answer exactly; a GROUP BY answers then.
+     * A column's rows counted per value, without a statement: one row per
+     * value (under the column's name, null for the rows without one) with its
+     * count under {@link #VALUE_COUNT}. The engine reads them from the table's
+     * statistics when those count every row exactly, and runs the grouped
+     * count otherwise. Null when there are more than {@code maxRows}.
      */
-    public static List<Map<String, Object>> valueCounts(String n, String column) {
+    public static List<Map<String, Object>> valueCounts(String n, String column, int maxRows) {
         init();
-        String out = takeOrThrow(lib.infino_value_counts(conn, n, column)).trim();
+        String out = takeOrThrow(lib.infino_value_counts(conn, n, column, maxRows)).trim();
         return out.equals("null") ? null : rows(out);
     }
 

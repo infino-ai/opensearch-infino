@@ -1914,12 +1914,14 @@ public class InfinoAggregationProcessor {
         }
         List<Grouped> chain = List.of(level);
         String picked = levelInner(chain, 0, q.from(), q.where(), "", true);
-        List<Map<String, Object>> groups = valueCounts(level, q);
-        if (groups == null) {
+        List<Map<String, Object>> groups;
+        if (readsValueCounts(level, q)) {
+            groups = valueCounts(level, q);
+        } else {
             groups = InfinoNative.sqlRows(levelInner(chain, 0, q.from(), q.where(), "", false) + " LIMIT " + (MAX_GROUPS_PICKED_HERE + 2));
         }
         // One group more than are picked here may be the missing key's.
-        if (groups.size() > MAX_GROUPS_PICKED_HERE + 1) {
+        if (groups == null || groups.size() > MAX_GROUPS_PICKED_HERE + 1) {
             readAhead.put(picked, null);
             return null;
         }
@@ -1940,18 +1942,23 @@ public class InfinoAggregationProcessor {
     }
 
     /**
+     * Whether a top terms level's groups are the table's value counts: a
+     * request that does not filter the table, over a column, with no metrics.
+     */
+    private static boolean readsValueCounts(Grouped level, Translation q) {
+        return q.principal() == null && InfinoQueryTranslator.ALL.equals(q.where()) && level.source.column() != null && level.metrics.isEmpty();
+    }
+
+    /**
      * A top terms level's groups over the whole table, the rows missing its
-     * key among them, as its GROUP BY would return them, read from the
-     * table's statistics by a direct call instead of a statement. Null, for
-     * the statement to answer, when the request filters the table, the level
-     * reads a script or carries metrics, or the statistics can't answer
-     * exactly (a table with deletes, a column whose values were not counted).
+     * key among them, as its GROUP BY would return them, by a direct call
+     * instead of a statement (see {@link #readsValueCounts}): the engine reads
+     * them from the table's statistics when those count every row exactly,
+     * and runs the grouped count otherwise. Null when there are more than are
+     * picked here, the missing key's group aside.
      */
     private static List<Map<String, Object>> valueCounts(Grouped level, Translation q) {
-        if (q.principal() != null || !InfinoQueryTranslator.ALL.equals(q.where()) || level.source.column() == null || !level.metrics.isEmpty()) {
-            return null;
-        }
-        List<Map<String, Object>> counts = InfinoNative.valueCounts(q.table(), level.source.column());
+        List<Map<String, Object>> counts = InfinoNative.valueCounts(q.table(), level.source.column(), MAX_GROUPS_PICKED_HERE + 1);
         if (counts == null) {
             return null;
         }
