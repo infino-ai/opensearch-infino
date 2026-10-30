@@ -32,7 +32,9 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -44,7 +46,10 @@ import java.util.TreeMap;
  * what a snapshot of another cluster held besides its indices - its
  * persistent settings, index and component templates, ingest and search
  * pipelines and stored scripts - and the security plugin's action groups,
- * tenants, roles, users and role mappings. One row of the indices' registry
+ * tenants, roles, users and role mappings. A user comes without its password
+ * hash, which stays on the cluster it came from: it is created with a
+ * password no one is told, and signs in once an administrator sets one
+ * ({@link #sentBody}). One row of the indices' registry
  * ({@link InfinoRegistry#TABLE}) holds all of it ({@link #STATE_ROW}, an id
  * beginning with {@link #ROW_PREFIX}, which no index name can): each item's
  * kind, its name, and the body the cluster's own REST API takes to create
@@ -87,6 +92,18 @@ final class InfinoClusterState {
 
     /** The security plugin's REST API, which each of its kinds is created through. */
     private static final String SECURITY_API = "/_plugins/_security/api/";
+    /** The keys a user's body gives its credential by, one of which the security plugin creates a user with. */
+    private static final String USER_HASH = "hash";
+    private static final String USER_PASSWORD = "password";
+    /** The character classes, each drawn from at least once, and the length of a password no one is told. */
+    private static final List<String> PASSWORD_CLASSES = List.of(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "abcdefghijklmnopqrstuvwxyz",
+        "0123456789",
+        "!#%*+-=?@^_~"
+    );
+    private static final int PASSWORD_LENGTH = 32;
+    private static final SecureRandom RANDOM = new SecureRandom();
     /** The longest part of the cluster's answer a failed item reports. */
     private static final int MAX_REASON_CHARS = 2_000;
     /** The address a request is said to come from when the caller's channel names none. */
@@ -307,7 +324,7 @@ final class InfinoClusterState {
             List<String> leftOut = new ArrayList<>();
             BytesReference body;
             try (XContentBuilder b = XContentFactory.jsonBuilder()) {
-                body = BytesReference.bytes(b.map(heldToKnownSettings(item, InfinoServices.indexScopedSettings(), leftOut)));
+                body = BytesReference.bytes(b.map(sentBody(item, InfinoServices.indexScopedSettings(), leftOut)));
             }
             HttpRequest http = new Sent(RestRequest.Method.PUT, item.kind().uri(item.name()), body, headers);
             RestRequest request = RestRequest.request(xContentRegistry, http, channel);
@@ -505,6 +522,42 @@ final class InfinoClusterState {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    /**
+     * {@code item}'s body as it is sent: a template's settings held to the
+     * ones this node knows ({@link #heldToKnownSettings}), and a user that
+     * arrives with no credential - a loader leaves every user's password
+     * hash on the cluster it came from - given a random password no one is
+     * told, since the security plugin creates a user only with one. The user
+     * signs in once an administrator sets its password.
+     */
+    static Map<String, Object> sentBody(Item item, IndexScopedSettings known, List<String> leftOut) {
+        Map<String, Object> body = heldToKnownSettings(item, known, leftOut);
+        if (item.kind() == Kind.USER && !body.containsKey(USER_HASH) && !body.containsKey(USER_PASSWORD)) {
+            body.put(USER_PASSWORD, unknowablePassword());
+        }
+        return body;
+    }
+
+    /**
+     * A password drawn at random, of every character class a password rule
+     * may ask for, never stored or shown: what a user without one is created
+     * with.
+     */
+    static String unknowablePassword() {
+        List<Character> chars = new ArrayList<>();
+        for (String required : PASSWORD_CLASSES) {
+            chars.add(required.charAt(RANDOM.nextInt(required.length())));
+        }
+        String any = String.join("", PASSWORD_CLASSES);
+        while (chars.size() < PASSWORD_LENGTH) {
+            chars.add(any.charAt(RANDOM.nextInt(any.length())));
+        }
+        Collections.shuffle(chars, RANDOM);
+        StringBuilder password = new StringBuilder(PASSWORD_LENGTH);
+        chars.forEach(password::append);
+        return password.toString();
     }
 
     /**

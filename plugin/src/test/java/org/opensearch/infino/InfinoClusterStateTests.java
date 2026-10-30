@@ -97,6 +97,35 @@ public class InfinoClusterStateTests extends OpenSearchTestCase {
         assertTrue(none.isEmpty());
     }
 
+    public void testAUserWithNoCredentialIsCreatedWithAPasswordNoOneIsTold() {
+        InfinoClusterState.Item user = new InfinoClusterState.Item(
+            "user",
+            InfinoClusterState.Kind.USER,
+            "ana",
+            Map.of("backend_roles", List.of("reader"))
+        );
+        Map<String, Object> sent = InfinoClusterState.sentBody(user, KNOWN, new ArrayList<>());
+        assertEquals(List.of("reader"), sent.get("backend_roles"));
+        String password = (String) sent.get("password");
+        assertEquals(32, password.length());
+        assertTrue(password.chars().anyMatch(Character::isUpperCase));
+        assertTrue(password.chars().anyMatch(Character::isLowerCase));
+        assertTrue(password.chars().anyMatch(Character::isDigit));
+        assertTrue(password.chars().anyMatch(c -> !Character.isLetterOrDigit(c)));
+        assertNotEquals(password, InfinoClusterState.sentBody(user, KNOWN, new ArrayList<>()).get("password"));
+        // A user that comes with its hash is sent as it is, and no other kind is given a password.
+        Map<String, Object> hashed = Map.of("hash", "$2y$12$x");
+        assertEquals(
+            hashed,
+            InfinoClusterState.sentBody(new InfinoClusterState.Item("user", InfinoClusterState.Kind.USER, "bo", hashed), KNOWN, new ArrayList<>())
+        );
+        Map<String, Object> role = Map.of("cluster_permissions", List.of("cluster_monitor"));
+        assertEquals(
+            role,
+            InfinoClusterState.sentBody(new InfinoClusterState.Item("role", InfinoClusterState.Kind.ROLE, "reader", role), KNOWN, new ArrayList<>())
+        );
+    }
+
     public void testAStateRowListsItsItemsInTheOrderTheyAreApplied() {
         String row = "{\"items\": ["
             + "{\"kind\": \"user\", \"name\": \"ana\", \"body\": {\"hash\": \"$2y$12$x\", \"backend_roles\": [\"reader\"]}},"
