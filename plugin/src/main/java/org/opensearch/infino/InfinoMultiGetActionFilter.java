@@ -85,32 +85,42 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             }
         }
         try {
-            // One source fetch per index, over all of its ids: through the
-            // document rule when the security plugin has one for this user.
-            Map<String, List<String>> idsByIndex = new HashMap<>();
-            for (MultiGetRequest.Item item : mget.getItems()) {
-                idsByIndex.computeIfAbsent(item.index(), k -> new ArrayList<>()).add(item.id());
-            }
-            Map<String, String> tableOf = new HashMap<>();
+            // One source fetch per table, over all of its ids: through the
+            // document rule when the security plugin has one for this user. An
+            // index in engine mode with several shards has a table per shard,
+            // so each id goes to its shard's.
             Map<String, InfinoAccess> accessOf = new HashMap<>();
+            for (Map.Entry<String, IndexMetadata> e : indices.entrySet()) {
+                accessOf.put(e.getKey(), InfinoSecurity.access(e.getValue().getIndex().getName(), "mget"));
+            }
+            String[] tableOfItem = new String[mget.getItems().size()];
+            Map<String, List<String>> idsByTable = new HashMap<>();
+            Map<String, String> indexOfTable = new HashMap<>();
+            for (int i = 0; i < tableOfItem.length; i++) {
+                MultiGetRequest.Item item = mget.getItems().get(i);
+                String table = tables.ensureForDocument(indices.get(item.index()), item.id(), item.routing());
+                tableOfItem[i] = table;
+                idsByTable.computeIfAbsent(table, k -> new ArrayList<>()).add(item.id());
+                indexOfTable.put(table, item.index());
+            }
             Map<String, Map<String, String>> restricted = new HashMap<>();
-            for (Map.Entry<String, List<String>> e : idsByIndex.entrySet()) {
-                IndexMetadata md = indices.get(e.getKey());
-                InfinoAccess access = InfinoSecurity.access(md.getIndex().getName(), "mget");
-                accessOf.put(e.getKey(), access);
-                String table = tables.ensure(md);
-                tableOf.put(e.getKey(), table);
+            for (Map.Entry<String, List<String>> e : idsByTable.entrySet()) {
+                String index = indexOfTable.get(e.getKey());
+                IndexMetadata md = indices.get(index);
+                InfinoAccess access = accessOf.get(index);
                 if (access.restrictsDocuments()) {
-                    restricted.put(e.getKey(), InfinoGetActionFilter.restrictedSources(table, e.getValue(), access));
-                } else {
-                    InfinoNative.prefetchSources(table, e.getValue());
+                    restricted.put(e.getKey(), InfinoGetActionFilter.restrictedSources(e.getKey(), e.getValue(), access));
+                } else if (!InfinoPlugin.atEngine(md.getSettings())) {
+                    InfinoNative.prefetchSources(e.getKey(), e.getValue());
                 }
             }
             MultiGetItemResponse[] responses = new MultiGetItemResponse[mget.getItems().size()];
             for (int i = 0; i < responses.length; i++) {
                 MultiGetRequest.Item item = mget.getItems().get(i);
-                Map<String, String> byId = restricted.get(item.index());
-                String source = byId != null ? byId.get(item.id()) : InfinoNative.getSource(tableOf.get(item.index()), item.id());
+                Map<String, String> byId = restricted.get(tableOfItem[i]);
+                String source = byId != null
+                    ? byId.get(item.id())
+                    : InfinoGetActionFilter.sourceOf(indices.get(item.index()), tableOfItem[i], item.id());
                 String shown = accessOf.get(item.index()).read(item.id(), source);
                 GetResponse get = new GetResponse(InfinoGetActionFilter.result(indices.get(item.index()).getIndex().getName(), item.id(), shown, item.fetchSourceContext()));
                 responses[i] = new MultiGetItemResponse(get, null);

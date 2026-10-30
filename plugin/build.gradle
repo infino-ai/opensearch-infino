@@ -173,6 +173,9 @@ testClusters.all {
     systemProperty 'infino.data', System.getProperty('infino.data', defaultData)
     // The SQL each request runs, in the node log, so a wrong answer can be read back.
     setting 'logger.org.opensearch.infino', 'DEBUG'
+    // Engine mode on, so its suite runs and every other suite's indices take
+    // the stock path past the engine-mode query phase.
+    setting 'infino.engine.enabled', 'true'
 
     plugin(layout.file(provider { configurations.securityPlugin.singleFile }))
     // Plain HTTP with basic authentication; the build's own wait for cluster

@@ -1,0 +1,341 @@
+---
+"Engine mode: writes through the shard's engine, reads from the table":
+  - do:
+      indices.create:
+        index: em
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: engine
+            number_of_shards: 1
+            number_of_replicas: 0
+            refresh_interval: -1
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              level: { type: keyword }
+              message: { type: text }
+              status: { type: long }
+              took: { type: float }
+
+  # The mapper refuses what the mapping cannot hold, as on any index.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: em, _id: a }
+          - { "@timestamp": "2026-10-24T10:00:00Z", level: error, message: "disk full on node-3", status: 500, took: 1.5 }
+          - index: { _index: em, _id: b }
+          - { "@timestamp": "2026-10-24T10:01:00Z", level: info, message: "request served", status: 200, took: 3 }
+          - index: { _index: em, _id: c }
+          - { "@timestamp": "2026-10-24T10:02:00Z", level: warn, message: "slow disk", status: "not-a-number" }
+          - index: { _index: em, _id: d }
+          - { "@timestamp": "2026-10-24T10:03:00Z", level: info, message: "cache warm", status: 204, took: 0.5 }
+  - match: { errors: true }
+  - match: { items.0.index.status: 201 }
+  - match: { items.2.index.status: 400 }
+  - match: { items.3.index.status: 201 }
+
+  # A range the shard's own rewrite would turn to match_none over the empty
+  # Lucene skeleton, newest first, with the exact total.
+  - do:
+      search:
+        index: em
+        body:
+          track_total_hits: true
+          query:
+            range: { "@timestamp": { gte: "2026-10-24T10:00:30Z" } }
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d }
+  - match: { hits.hits.0._source.message: "cache warm" }
+  - match: { hits.hits.1._id: b }
+
+  # Text, a source filter, requested fields, a script field and aggregations over the same relation.
+  - do:
+      search:
+        index: em
+        body:
+          query:
+            match: { message: disk }
+          _source: [ level ]
+          docvalue_fields: [ status ]
+          script_fields:
+            doubled: { script: { source: "doc['status'].value * 2" } }
+          aggs:
+            levels: { terms: { field: level } }
+            took: { sum: { field: took } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: a }
+  - match: { hits.hits.0._source: { level: error } }
+  - match: { hits.hits.0.fields.status: [ 500 ] }
+  - match: { hits.hits.0.fields.doubled: [ 1000 ] }
+  - match: { aggregations.levels.buckets.0.key: error }
+  - match: { aggregations.took.value: 1.5 }
+
+  - do:
+      search:
+        index: em
+        body:
+          size: 0
+          aggs:
+            levels: { terms: { field: level } }
+            took: { avg: { field: took } }
+  - match: { hits.total.value: 3 }
+  - match: { aggregations.levels.buckets.0.key: info }
+  - match: { aggregations.levels.buckets.0.doc_count: 2 }
+  - match: { aggregations.took.value: 1.6666666666666667 }
+
+  # One hit per level, the newest of each.
+  - do:
+      search:
+        index: em
+        body:
+          collapse: { field: level }
+          sort: [ { "@timestamp": desc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: d }
+  - match: { hits.hits.0.fields.level: [ info ] }
+  - match: { hits.hits.1._id: a }
+
+  - do:
+      get:
+        index: em
+        id: b
+  - match: { _source.message: "request served" }
+
+  # A partial update merges into the document, a scripted one is refused as at
+  # the action layer, and a write that replaces a document replaces its row.
+  - do:
+      update:
+        index: em
+        id: a
+        body: { doc: { level: fatal } }
+  - match: { result: updated }
+  # The merged document is read back before a refresh, as a stock get reads the translog.
+  - do:
+      get:
+        index: em
+        id: a
+  - match: { _source.level: fatal }
+  - match: { _source.message: "disk full on node-3" }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - update: { _index: em, _id: b }
+          - { doc: { took: 4 } }
+          - update: { _index: em, _id: zz }
+          - { doc: { took: 1 } }
+          - update: { _index: em, _id: b }
+          - { script: { source: "ctx._source.took += 1" } }
+  - match: { items.0.update.result: updated }
+  - match: { items.1.update.status: 404 }
+  - match: { items.2.update.status: 400 }
+  - do:
+      search:
+        index: em
+        body:
+          query: { term: { level: fatal } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: a }
+  - do:
+      search:
+        index: em
+        body:
+          size: 0
+          aggs:
+            took: { sum: { field: took } }
+  # a 1.5, b now 4, d 0.5 (c was refused)
+  - match: { aggregations.took.value: 6.0 }
+
+  - do:
+      delete:
+        index: em
+        id: d
+        refresh: true
+  - do:
+      count:
+        index: em
+  - match: { count: 2 }
+
+---
+"Engine mode: a scroll, and the requests built on it":
+  - do:
+      indices.create:
+        index: ems
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: engine
+            number_of_shards: 2
+            number_of_replicas: 0
+          mappings:
+            properties:
+              n: { type: long }
+              kind: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ems, _id: "1" }
+          - { n: 1, kind: odd }
+          - index: { _index: ems, _id: "2" }
+          - { n: 2, kind: even }
+          - index: { _index: ems, _id: "3" }
+          - { n: 3, kind: odd }
+          - index: { _index: ems, _id: "4" }
+          - { n: 4, kind: even }
+          - index: { _index: ems, _id: "5" }
+          - { n: 5, kind: odd }
+  - match: { errors: false }
+
+  # Two shards, two tables: a sort, a total and aggregations merge across them.
+  - do:
+      search:
+        index: ems
+        body:
+          sort: [ { n: desc } ]
+          size: 3
+          aggs:
+            kinds: { terms: { field: kind } }
+            total: { sum: { field: n } }
+  - match: { hits.total.value: 5 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { aggregations.kinds.buckets.0.key: odd }
+  - match: { aggregations.kinds.buckets.0.doc_count: 3 }
+  - match: { aggregations.total.value: 15.0 }
+  - do:
+      get:
+        index: ems
+        id: "4"
+  - match: { _source.n: 4 }
+  - do:
+      mget:
+        body: { docs: [ { _index: ems, _id: "1" }, { _index: ems, _id: "2" } ] }
+  - match: { docs.0._source.n: 1 }
+  - match: { docs.1._source.n: 2 }
+
+  - do:
+      search:
+        index: ems
+        scroll: 1m
+        body:
+          size: 2
+          sort: [ { n: asc } ]
+  - match: { hits.total.value: 5 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - set: { _scroll_id: scroll }
+  - do:
+      scroll:
+        scroll_id: $scroll
+        scroll: 1m
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+  - do:
+      scroll:
+        scroll_id: $scroll
+        scroll: 1m
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "5" }
+  - do:
+      scroll:
+        scroll_id: $scroll
+        scroll: 1m
+  - length: { hits.hits: 0 }
+  - do:
+      clear_scroll:
+        scroll_id: $scroll
+
+---
+"Engine mode: delete by query scrolls the tables and deletes through the shards":
+  # The reindex module is in the test distributions from 3.6.
+  - skip:
+      version: " - 3.5.99"
+      reason: the test distribution has no reindex module before 3.6
+  - do:
+      indices.create:
+        index: emd
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: engine
+            number_of_shards: 2
+            number_of_replicas: 0
+          mappings:
+            properties:
+              n: { type: long }
+              kind: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emd, _id: "1" }
+          - { n: 1, kind: odd }
+          - index: { _index: emd, _id: "2" }
+          - { n: 2, kind: even }
+          - index: { _index: emd, _id: "3" }
+          - { n: 3, kind: odd }
+          - index: { _index: emd, _id: "4" }
+          - { n: 4, kind: even }
+  - do:
+      delete_by_query:
+        index: emd
+        refresh: true
+        body:
+          query: { term: { kind: even } }
+  - match: { deleted: 2 }
+  - do:
+      count:
+        index: emd
+  - match: { count: 2 }
+
+---
+"Engine mode under the security plugin's document and masking rules":
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: sec_em
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: engine
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              tag: { type: keyword }
+              ip: { type: keyword }
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec_em, _id: "e1" }
+          - { tag: x, ip: "10.0.0.1", n: 1 }
+          - index: { _index: sec_em, _id: "e2" }
+          - { tag: y, ip: "10.0.0.2", n: 2 }
+  - match: { errors: false }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec_em
+        body:
+          aggs:
+            total_n: { sum: { field: n } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "e1" }
+  - match: { aggregations.total_n.value: 1 }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      search:
+        index: sec_em
+        body:
+          sort: [ { n: asc } ]
+  - match: { hits.hits.0._source.tag: x }
+  - match:
+      hits.hits.0._source.ip: /^[0-9a-f]{64}$/

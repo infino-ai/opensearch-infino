@@ -8,6 +8,8 @@ import org.opensearch.ExceptionsHelper;
 import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.admin.cluster.reroute.ClusterRerouteRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
+import org.opensearch.action.bulk.BulkRequest;
+import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.common.inject.Injector;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.transport.client.Client;
@@ -49,6 +51,16 @@ final class InfinoClient {
             return;
         }
         c.admin().cluster().reroute(new ClusterRerouteRequest().dryRun(true), ActionListener.wrap(response -> listener.onResponse(null), listener::onFailure));
+    }
+
+    /** Run {@code request} as the caller, through the cluster's bulk action and its filters. */
+    static void bulk(BulkRequest request, ActionListener<BulkResponse> listener) {
+        Client c = client;
+        if (c == null) {
+            listener.onFailure(new IllegalStateException("[infino] the node client is not available yet"));
+            return;
+        }
+        c.bulk(request, listener);
     }
 
     /** Create the index {@code request} describes; one that appeared meanwhile counts as created. */

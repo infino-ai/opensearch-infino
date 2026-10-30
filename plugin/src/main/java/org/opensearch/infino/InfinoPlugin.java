@@ -21,20 +21,26 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexModule;
+import org.opensearch.index.IndexSettings;
+import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.plugins.ActionPlugin;
+import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchPlugin;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
+import org.opensearch.search.fetch.FetchSubPhase;
+import org.opensearch.search.query.QueryPhaseSearcher;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
@@ -53,12 +59,47 @@ import java.util.function.Supplier;
  * index and its UUID. It is dropped when the index is deleted unless it was
  * named explicitly, so an index recreated on a fresh cluster with the same
  * setting reattaches to the rows its predecessor wrote.
+ *
+ * <p>An index may instead be served through its shards
+ * ({@code index.infino.mode: engine}, on a node with
+ * {@code infino.engine.enabled}): OpenSearch's own write path through
+ * {@link InfinoEngine}, over a Lucene index holding each document's identity
+ * only, and each shard's query and fetch phases answered from its table by
+ * the same planner ({@link InfinoQueryPhaseSearcher}).
  */
-public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
+public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, EnginePlugin {
 
     private static final Logger log = LogManager.getLogger(InfinoPlugin.class);
 
     public static final Setting<Boolean> INFINO_ENABLED = Setting.boolSetting("index.infino.enabled", false, Setting.Property.IndexScope);
+
+    /** {@link #INFINO_MODE}: served before any shard, from the table; no Lucene. The default. */
+    public static final String MODE_ACTION = "action";
+    /** {@link #INFINO_MODE}: served through the shard's engine and query phase, over a Lucene skeleton. */
+    public static final String MODE_ENGINE = "engine";
+
+    /**
+     * Where an Infino-backed index is served. {@code action} (the default)
+     * answers bulk, search and get before the request reaches a shard, and
+     * nothing is written to Lucene. {@code engine} keeps OpenSearch's own
+     * write path through {@link InfinoEngine}, whose Lucene index holds each
+     * document's identity only, and answers the shard's query phase from the
+     * table ({@link InfinoQueryPhaseSearcher}), a table per shard; it needs
+     * {@link #ENGINE_ENABLED} on the node.
+     */
+    public static final Setting<String> INFINO_MODE = new Setting<>("index.infino.mode", MODE_ACTION, mode -> {
+        if (!MODE_ACTION.equals(mode) && !MODE_ENGINE.equals(mode)) {
+            throw new IllegalArgumentException("[index.infino.mode] must be [" + MODE_ACTION + "] or [" + MODE_ENGINE + "], got [" + mode + "]");
+        }
+        return mode;
+    }, Setting.Property.IndexScope, Setting.Property.Final);
+
+    /**
+     * Whether this node serves engine-mode indices. Off by default: engine
+     * mode takes the node's one query-phase searcher, which another search
+     * plugin (neural search's hybrid query, for one) may need instead.
+     */
+    public static final Setting<Boolean> ENGINE_ENABLED = Setting.boolSetting("infino.engine.enabled", false, Setting.Property.NodeScope);
 
     /** The table behind the index, when it is to be named explicitly (to reattach an index to its rows). */
     public static final Setting<String> INFINO_TABLE = Setting.simpleString(
@@ -110,10 +151,12 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
     private static final InfinoTables TABLES = new InfinoTables();
     private final Map<ShardId, Scheduler.Cancellable> optimizers = new ConcurrentHashMap<>();
     private final boolean defaultEnabled;
+    private final boolean engineEnabled;
     private final InfinoAccount account;
 
     public InfinoPlugin(Settings settings) {
         this.defaultEnabled = INFINO_DEFAULT_ENABLED.get(settings);
+        this.engineEnabled = ENGINE_ENABLED.get(settings);
         this.account = new InfinoAccount(PLATFORM_DEFAULT_URL.get(settings));
         String url = PLATFORM_URL.get(settings);
         if (url.isEmpty()) {
@@ -136,6 +179,45 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
     /** The tables behind the node's Infino-backed indices. */
     static InfinoTables tables() {
         return TABLES;
+    }
+
+    /** Whether an index with these settings is Infino-backed and served at the action layer. */
+    static boolean atActionLayer(Settings indexSettings) {
+        return indexSettings.getAsBoolean(INFINO_ENABLED.getKey(), false) && !MODE_ENGINE.equals(INFINO_MODE.get(indexSettings));
+    }
+
+    /** Whether an index with these settings is Infino-backed and served through its engine. */
+    static boolean atEngine(Settings indexSettings) {
+        return indexSettings.getAsBoolean(INFINO_ENABLED.getKey(), false) && MODE_ENGINE.equals(INFINO_MODE.get(indexSettings));
+    }
+
+    @Override
+    public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
+        if (!atEngine(indexSettings.getSettings())) {
+            return Optional.empty();
+        }
+        if (!engineEnabled) {
+            // Without the engine the index would fall to the stock one and keep its data in Lucene.
+            throw new IllegalArgumentException(
+                "[infino] index " + indexSettings.getIndex().getName() + " is in engine mode, which needs [" + ENGINE_ENABLED.getKey() + ": true] on the node"
+            );
+        }
+        return Optional.of(InfinoEngine::new);
+    }
+
+    @Override
+    public Optional<QueryPhaseSearcher> getQueryPhaseSearcher() {
+        return engineEnabled ? Optional.of(new InfinoQueryPhaseSearcher()) : Optional.empty();
+    }
+
+    @Override
+    public List<FetchSubPhase> getFetchSubPhases(FetchPhaseConstructionContext context) {
+        return engineEnabled ? List.of(new InfinoFetchSubPhase()) : List.of();
+    }
+
+    @Override
+    public List<SearchExtSpec<?>> getSearchExts() {
+        return List.of(new SearchExtSpec<>(InfinoQueryExt.NAME, InfinoQueryExt::new, InfinoQueryExt::fromXContent));
     }
 
     /** The node services arrive by injection (see {@link InfinoServices}). */
@@ -176,7 +258,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
                     return;
                 }
                 try {
-                    String table = TABLES.ensure(indexShard.indexSettings().getIndexMetadata());
+                    String table = TABLES.ensure(indexShard.indexSettings().getIndexMetadata(), indexShard.shardId().id());
                     scheduleOptimize(indexShard, table);
                 } catch (Exception e) {
                     log.warn("[infino] table for {} could not be declared", indexShard.shardId().getIndexName(), e);
@@ -193,7 +275,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
 
             @Override
             public void afterIndexShardDeleted(ShardId shardId, Settings indexSettings) {
-                String table = InfinoNative.tableFor(shardId.getIndex(), indexSettings);
+                String table = InfinoTables.shardTable(InfinoNative.tableFor(shardId.getIndex(), indexSettings), shardId.id(), indexSettings);
                 TABLES.forget(table);
                 InfinoRegistry.forget(shardId.getIndexName());
                 if (InfinoNative.tableIsExplicit(indexSettings)) {
@@ -270,6 +352,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
         return List.of(
             INFINO_DEFAULT_ENABLED,
             INFINO_ENABLED,
+            INFINO_MODE,
+            ENGINE_ENABLED,
             INFINO_TABLE,
             OPTIMIZE_INTERVAL,
             PLATFORM_URL,

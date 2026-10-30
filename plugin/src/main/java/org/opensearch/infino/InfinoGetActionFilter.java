@@ -82,10 +82,10 @@ public class InfinoGetActionFilter implements ActionFilter {
             // document rule it is looked up through the rule, and its source is
             // cut to the fields the user may read.
             InfinoAccess access = InfinoSecurity.access(index.getIndex().getName(), "get");
-            String table = tables.ensure(index);
+            String table = tables.ensureForDocument(index, get.id(), get.routing());
             String source = access.restrictsDocuments()
                 ? restrictedSources(table, List.of(get.id()), access).get(get.id())
-                : InfinoNative.getSource(table, get.id());
+                : sourceOf(index, table, get.id());
             @SuppressWarnings("unchecked")
             Response response = (Response) new GetResponse(
                 result(index.getIndex().getName(), get.id(), access.read(get.id(), source), get.fetchSourceContext())
@@ -119,6 +119,16 @@ public class InfinoGetActionFilter implements ActionFilter {
             }
         }
         return out;
+    }
+
+    /**
+     * A document's source as a read sees it now: in engine mode a write its
+     * shard has acknowledged and not yet committed counts, as a stock get
+     * reads the translog; at the action layer an acknowledged write is in
+     * the table already.
+     */
+    static String sourceOf(IndexMetadata index, String table, String id) {
+        return InfinoPlugin.atEngine(index.getSettings()) ? InfinoEngine.currentSource(table, id) : InfinoNative.getSource(table, id);
     }
 
     /** The Infino-backed index a request names, directly or through an alias; null when it names something else. */

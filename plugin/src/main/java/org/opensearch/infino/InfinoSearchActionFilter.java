@@ -85,12 +85,30 @@ public class InfinoSearchActionFilter implements ActionFilter {
         }
         List<Index> infino = new ArrayList<>();
         List<IndexMetadata> metadata = new ArrayList<>();
+        int engine = 0;
         for (String name : concrete) {
             IndexMetadata md = state.metadata().index(name);
-            if (md != null && md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
+            if (md == null) {
+                continue;
+            }
+            if (InfinoPlugin.atActionLayer(md.getSettings())) {
                 infino.add(md.getIndex());
                 metadata.add(md);
+            } else if (InfinoPlugin.atEngine(md.getSettings())) {
+                engine++;
             }
+        }
+        if (engine > 0) {
+            if (engine != concrete.length) {
+                listener.onFailure(new IllegalArgumentException("[infino] a search mixing engine-mode indices with others is not served"));
+                return;
+            }
+            // Served by the shards, which plan from the source as written (see
+            // InfinoQueryExt): the cluster routes it as it routes any search,
+            // a scroll included, and merges the shards' results.
+            search.source(InfinoQueryExt.route(search.source() == null ? new SearchSourceBuilder() : search.source()));
+            chain.proceed(task, action, request, listener);
+            return;
         }
         if (infino.isEmpty()) {
             chain.proceed(task, action, request, listener);

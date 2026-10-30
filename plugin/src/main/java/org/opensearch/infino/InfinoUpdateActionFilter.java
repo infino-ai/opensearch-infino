@@ -9,6 +9,7 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
+import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.update.UpdateAction;
@@ -30,7 +31,9 @@ import java.util.function.Supplier;
  * first; the shard holds nothing, so the update is turned into a one-item
  * bulk here and served the same way as an update inside a bulk, its item's
  * response handed back as the update's. An index the update names before
- * it exists is created first, as for a bulk.
+ * it exists is created first, as for a bulk. An update to an index in engine
+ * mode goes to the cluster as that one-item bulk, which the bulk filter
+ * merges and hands to the shard as a write of the whole document.
  */
 public class InfinoUpdateActionFilter implements ActionFilter {
 
@@ -80,11 +83,7 @@ public class InfinoUpdateActionFilter implements ActionFilter {
                 listener.onFailure(e);
                 return;
             }
-            if (infino.isEmpty()) {
-                chain.proceed(task, action, request, listener);
-                return;
-            }
-            InfinoBulkActionFilter.serve(bulk, concrete, infino, writes, tables, ActionListener.wrap(response -> {
+            ActionListener<BulkResponse> answer = ActionListener.wrap(response -> {
                 BulkItemResponse item = response.getItems()[0];
                 if (item.isFailed()) {
                     listener.onFailure(item.getFailure().getCause());
@@ -96,7 +95,20 @@ public class InfinoUpdateActionFilter implements ActionFilter {
             }, e -> {
                 log.debug("[infino] update of {} in {} failed: {}", update.id(), update.index(), e.getMessage());
                 listener.onFailure(e);
-            }));
+            });
+            if (infino.isEmpty()) {
+                IndexMetadata md = concrete.get(0) == null ? null : clusters.state().metadata().index(concrete.get(0));
+                if (md != null && InfinoPlugin.atEngine(md.getSettings())) {
+                    // The stock update reads the document's source from Lucene, which an
+                    // engine-mode index keeps no copy of: as a one-item bulk, the bulk
+                    // path merges it here and writes it whole through the shard.
+                    InfinoClient.bulk(bulk, answer);
+                    return;
+                }
+                chain.proceed(task, action, request, listener);
+                return;
+            }
+            InfinoBulkActionFilter.serve(bulk, concrete, infino, writes, tables, answer);
         }, listener::onFailure));
     }
 }

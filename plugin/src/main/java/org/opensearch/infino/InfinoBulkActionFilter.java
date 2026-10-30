@@ -8,6 +8,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.DocWriteRequest;
+import org.opensearch.action.DocWriteResponse;
 import org.opensearch.action.bulk.BulkAction;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
@@ -18,9 +19,11 @@ import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.support.AutoCreateIndex;
 import org.opensearch.action.update.UpdateRequest;
+import org.opensearch.action.update.UpdateResponse;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.routing.OperationRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.xcontent.XContentFactory;
@@ -44,6 +47,8 @@ import org.opensearch.tasks.Task;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -125,11 +130,109 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 return;
             }
             if (infino.isEmpty()) {
-                chain.proceed(task, action, request, listener);
+                EngineBulk routed = engineUpdates(clusters.state(), bulk, concrete, tables);
+                if (routed == null) {
+                    chain.proceed(task, action, request, listener);
+                    return;
+                }
+                @SuppressWarnings("unchecked")
+                Request next = (Request) routed.bulk();
+                @SuppressWarnings("unchecked")
+                ActionListener<Response> answer = (ActionListener<Response>) routed.answer(cast);
+                chain.proceed(task, action, next, answer);
                 return;
             }
             serve(bulk, concrete, infino, writes, tables, cast);
         }, listener::onFailure));
+    }
+
+    /**
+     * A bulk over engine-mode indices with its updates turned into writes of
+     * the whole document: {@code bulk} goes to the shards, and
+     * {@code answer} turns its response back into the one the client's bulk
+     * expects. {@code slots} is each item's slot in the client's bulk,
+     * {@code updates} the slots that were updates, {@code answered} the items
+     * answered before the shards (in slot order).
+     */
+    record EngineBulk(BulkRequest bulk, int[] slots, Set<Integer> updates, Map<Integer, BulkItemResponse> answered, int size) {
+        ActionListener<BulkResponse> answer(ActionListener<BulkResponse> listener) {
+            return ActionListener.wrap(response -> {
+                BulkItemResponse[] items = new BulkItemResponse[size];
+                for (Map.Entry<Integer, BulkItemResponse> e : answered.entrySet()) {
+                    items[e.getKey()] = e.getValue();
+                }
+                BulkItemResponse[] routed = response.getItems();
+                for (int i = 0; i < routed.length; i++) {
+                    int slot = slots[i];
+                    items[slot] = updates.contains(slot) ? asUpdate(routed[i], slot) : reslot(routed[i], slot);
+                }
+                listener.onResponse(new BulkResponse(items, response.getTook().millis(), response.getIngestTookInMillis()));
+            }, listener::onFailure);
+        }
+    }
+
+    /**
+     * The bulk to send to the shards of engine-mode indices when it carries
+     * updates, or null when it carries none (it goes on as it is). The stock
+     * update reads the current document from Lucene, which keeps no source
+     * in engine mode, so each update is merged here into the document as a
+     * read sees it now (the shard's write not yet committed, else the
+     * table), by the action layer's rule ({@link #merge}), and goes on as a
+     * write of the whole document, carrying any sequence-number condition
+     * for the shard to check. An update the table cannot serve (a script) or
+     * whose document is missing is answered here.
+     */
+    static EngineBulk engineUpdates(ClusterState state, BulkRequest bulk, List<String> concrete, InfinoTables tables) {
+        List<DocWriteRequest<?>> items = bulk.requests();
+        Set<Integer> updates = new HashSet<>();
+        Map<Integer, BulkItemResponse> answered = new LinkedHashMap<>();
+        Map<Integer, DocWriteRequest<?>> writes = new HashMap<>();
+        for (int slot = 0; slot < items.size(); slot++) {
+            IndexMetadata md = concrete.get(slot) == null ? null : state.metadata().index(concrete.get(slot));
+            if (!(items.get(slot) instanceof UpdateRequest update) || md == null || !InfinoPlugin.atEngine(md.getSettings())) {
+                continue;
+            }
+            updates.add(slot);
+            String index = md.getIndex().getName();
+            if (update.script() != null) {
+                answered.put(slot, failure(slot, update, index, new IllegalArgumentException("[infino] scripted updates are not served"), RestStatus.BAD_REQUEST));
+                continue;
+            }
+            String table = tables.ensureForDocument(md, update.id(), update.routing());
+            String merged = merge(InfinoEngine.currentSource(table, update.id()), update);
+            if (merged == null) {
+                ShardId shardId = new ShardId(md.getIndex(), OperationRouting.generateShardId(md, update.id(), update.routing()));
+                answered.put(slot, failure(slot, update, index, new DocumentMissingException(shardId, update.id()), RestStatus.NOT_FOUND));
+                continue;
+            }
+            IndexRequest write = new IndexRequest(index).id(update.id()).routing(update.routing()).source(merged, MediaTypeRegistry.JSON);
+            write.setIfSeqNo(update.ifSeqNo()).setIfPrimaryTerm(update.ifPrimaryTerm());
+            writes.put(slot, write);
+        }
+        if (updates.isEmpty()) {
+            return null;
+        }
+        BulkRequest routed = new BulkRequest().setRefreshPolicy(bulk.getRefreshPolicy()).timeout(bulk.timeout()).waitForActiveShards(bulk.waitForActiveShards());
+        int[] slots = new int[items.size() - answered.size()];
+        int at = 0;
+        for (int slot = 0; slot < items.size(); slot++) {
+            if (answered.containsKey(slot)) {
+                continue;
+            }
+            routed.add(writes.getOrDefault(slot, items.get(slot)));
+            slots[at++] = slot;
+        }
+        return new EngineBulk(routed, slots, updates, answered, items.size());
+    }
+
+    /** A routed write's response as the update it was in the client's bulk. */
+    private static BulkItemResponse asUpdate(BulkItemResponse r, int slot) {
+        if (r.isFailed()) {
+            return new BulkItemResponse(slot, DocWriteRequest.OpType.UPDATE, r.getFailure());
+        }
+        DocWriteResponse w = r.getResponse();
+        UpdateResponse update = new UpdateResponse(w.getShardInfo(), w.getShardId(), w.getId(), w.getSeqNo(), w.getPrimaryTerm(), w.getVersion(), w.getResult());
+        return new BulkItemResponse(slot, DocWriteRequest.OpType.UPDATE, update);
     }
 
     /**
@@ -206,7 +309,8 @@ public class InfinoBulkActionFilter implements ActionFilter {
         int infinoItems = 0;
         for (String name : concrete) {
             IndexMetadata md = name == null ? null : clusters.state().metadata().index(name);
-            if (md != null && md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
+            // An index in engine mode takes its writes through its shard's engine, as any index does.
+            if (md != null && InfinoPlugin.atActionLayer(md.getSettings())) {
                 infino.put(name, md);
                 infinoItems++;
             }
