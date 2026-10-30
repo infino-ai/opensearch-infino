@@ -292,6 +292,24 @@
           - index: { _index: emt, _id: "10", routing: r1 }
           - { kind: b }
   - match: { errors: false }
+  # A routed document reports its routing value, from a get as from a search hit.
+  - do:
+      get:
+        index: emt
+        id: "6"
+        routing: r1
+  - match: { _routing: r1 }
+  - match: { _source.kind: c }
+  - do:
+      mget:
+        body: { docs: [ { _index: emt, _id: "1", routing: r0 }, { _index: emt, _id: "9", routing: r1 } ] }
+  - match: { docs.0._routing: r0 }
+  - match: { docs.1._routing: r1 }
+  - do:
+      search:
+        index: emt
+        body: { query: { ids: { values: [ "6" ] } } }
+  - match: { hits.hits.0._routing: r1 }
   # r0 routes to shard 0, r1 to shard 1; searched alone, shard 0's top is a.
   - do:
       search:

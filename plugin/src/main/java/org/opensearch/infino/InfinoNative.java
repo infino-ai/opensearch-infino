@@ -680,6 +680,28 @@ public final class InfinoNative {
         }
     }
 
+    /**
+     * The routing value the table's row for {@code id} was written with,
+     * through the id column's term index; null when the row was written with
+     * none, when there is no row, or when the table never took a routed write.
+     */
+    public static String routingOf(String name, String id) {
+        if (!columns(name).containsKey(InfinoQueryTranslator.ROUTING)) {
+            return null;
+        }
+        String sql = "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING)
+            + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
+            + InfinoQueryTranslator.literal(id) + ", 'and')";
+        for (Map<String, Object> row : sqlRows(sql)) {
+            Object rowId = row.get(InfinoQueryTranslator.OSID);
+            Object routing = row.get(InfinoQueryTranslator.ROUTING);
+            if (rowId != null && id.equals(rowId.toString())) {
+                return routing == null ? null : routing.toString();
+            }
+        }
+        return null;
+    }
+
     /** Keep the sources of rows a hit statement returned (id and source columns), for the fetch phase. */
     public static void keepSources(String name, List<Map<String, Object>> rows) {
         for (Map<String, Object> row : rows) {

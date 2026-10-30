@@ -122,7 +122,9 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                     ? byId.get(item.id())
                     : InfinoGetActionFilter.sourceOf(indices.get(item.index()), tableOfItem[i], item.id());
                 String shown = accessOf.get(item.index()).read(item.id(), source);
-                GetResponse get = new GetResponse(InfinoGetActionFilter.result(indices.get(item.index()).getIndex().getName(), item.id(), shown, item.fetchSourceContext()));
+                IndexMetadata md = indices.get(item.index());
+                String routing = InfinoGetActionFilter.routingOf(md, tableOfItem[i], item.id(), shown);
+                GetResponse get = new GetResponse(InfinoGetActionFilter.result(md.getIndex().getName(), item.id(), shown, item.fetchSourceContext(), routing));
                 responses[i] = new MultiGetItemResponse(get, null);
             }
             @SuppressWarnings("unchecked")

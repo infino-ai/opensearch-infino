@@ -17,11 +17,13 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.document.DocumentField;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.index.get.GetResult;
+import org.opensearch.index.mapper.RoutingFieldMapper;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.tasks.Task;
@@ -86,9 +88,10 @@ public class InfinoGetActionFilter implements ActionFilter {
             String source = access.restrictsDocuments()
                 ? restrictedSources(table, List.of(get.id()), access).get(get.id())
                 : sourceOf(index, table, get.id());
+            String shown = access.read(get.id(), source);
             @SuppressWarnings("unchecked")
             Response response = (Response) new GetResponse(
-                result(index.getIndex().getName(), get.id(), access.read(get.id(), source), get.fetchSourceContext())
+                result(index.getIndex().getName(), get.id(), shown, get.fetchSourceContext(), routingOf(index, table, get.id(), shown))
             );
             listener.onResponse(response);
         } catch (Exception e) {
@@ -148,8 +151,26 @@ public class InfinoGetActionFilter implements ActionFilter {
         return md != null && md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false) ? md : null;
     }
 
+    /**
+     * The routing value a found engine-mode document was written with, which
+     * a stock get reports as {@code _routing}; null when it was written with
+     * none, when {@code source} says it was not found, or at the action layer,
+     * which routes nothing.
+     */
+    static String routingOf(IndexMetadata index, String table, String id, String source) {
+        if (source == null || source.isEmpty() || !InfinoPlugin.atEngine(index.getSettings())) {
+            return null;
+        }
+        return InfinoEngine.currentRouting(table, id);
+    }
+
     /** A get result from a source string (null or empty when the document is missing), with the request's source filter applied. */
     static GetResult result(String index, String id, String source, FetchSourceContext fetch) {
+        return result(index, id, source, fetch, null);
+    }
+
+    /** {@link #result(String, String, String, FetchSourceContext)} reporting {@code routing} (null for none) as the document's {@code _routing}. */
+    static GetResult result(String index, String id, String source, FetchSourceContext fetch, String routing) {
         boolean exists = source != null && !source.isEmpty();
         BytesReference bytes = null;
         if (exists && (fetch == null || fetch.fetchSource())) {
@@ -167,7 +188,7 @@ public class InfinoGetActionFilter implements ActionFilter {
             exists,
             bytes,
             Map.of(),
-            Map.of()
+            exists && routing != null ? Map.of(RoutingFieldMapper.NAME, new DocumentField(RoutingFieldMapper.NAME, List.of(routing))) : Map.of()
         );
     }
 }

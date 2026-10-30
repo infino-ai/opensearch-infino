@@ -262,6 +262,25 @@ public class InfinoEngine extends InternalEngine {
         return p != null ? p.source() : InfinoNative.getSourceFresh(table, id);
     }
 
+    /**
+     * The routing value {@code id} was last written with, as a read sees it
+     * now: a pending write's, else the table's; null when it was written with
+     * none.
+     */
+    static String currentRouting(String table, String id) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine != null) {
+            synchronized (engine.batchLock) {
+                for (Batch b : new Batch[] { engine.batch, engine.committing }) {
+                    if (b != null && b.writes.containsKey(id)) {
+                        return b.routings.get(id);
+                    }
+                }
+            }
+        }
+        return InfinoNative.routingOf(table, id);
+    }
+
     @Override
     public void close() throws IOException {
         BY_TABLE.remove(table, this);

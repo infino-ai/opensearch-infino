@@ -107,6 +107,7 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         for (int i = 0; i < ROUTED_ROWS; i++) {
             Map<String, Object> doc = call("GET", "/emr2/_doc/d" + i + "?routing=" + routing(i), null);
             assertEquals("d" + i + " is found by its routing", true, doc.get("found"));
+            assertEquals(routing(i), doc.get("_routing"));
         }
         call("DELETE", "/emr2", null);
     }
