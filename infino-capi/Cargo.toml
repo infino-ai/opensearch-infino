@@ -22,6 +22,12 @@ rayon = "1"
 # asks for a key, so it cannot go through a connection that needs one. The
 # same crate and features the engine's hosted client is built on.
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+# The engine's allocator is mimalloc, built here as its 2.x line. The 3.x line
+# the binding builds by default crashes (SIGSEGV in `_mi_subproc`) when a JVM
+# thread it did not create makes its first call into this library; 2.x serves
+# those threads and is as fast here. Cargo builds the binding once with the
+# union of every dependent's features, so naming it here moves the engine's too.
+libmimalloc-sys = { version = "0.1", features = ["v2"] }
 
 [patch.crates-io]
 # Until the engine release that ranks a filtered vector search within exactly
