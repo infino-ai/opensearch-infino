@@ -10,7 +10,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.StoredField;
+import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.util.BytesRef;
+import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.engine.EngineConfig;
@@ -20,7 +22,9 @@ import org.opensearch.index.engine.FlushFailedEngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.mapper.ParseContext.Document;
 import org.opensearch.index.mapper.SourceFieldMapper;
+import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.translog.Translog;
+import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -33,6 +37,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
 /**
@@ -53,14 +58,20 @@ import java.util.stream.Stream;
  * for a write, so an acknowledged write is in the table on every copy's
  * behalf; on refresh; on flush, before the translog that holds it is
  * trimmed; and past its document or byte bound. Each commit first syncs the
- * translog and refreshes the skeleton's reader, so the table never holds a
- * write the translog could lose or a document a search's reader cannot
- * fetch: a crash between the two leaves writes the translog's replay looks
- * up in the table, and every search reader opened since knows each id the
- * table answers with. A commit that fails keeps its batch for the next one
+ * translog, so the table never holds a write the translog could lose: a
+ * crash between the two leaves writes the translog's replay looks up in the
+ * table. A commit that fails keeps its batch for the next one
  * and fails what asked for it: the write's sync, or the flush, so the
  * translog keeps the writes the table lacks. Writes wait rather than pile up
  * past a bound while commits fail.
+ *
+ * <p>A search sees what the skeleton's reader sees, as on a stock index: a
+ * write is visible after the refresh that follows it. A row a write creates
+ * carries the write's sequence number, each refresh records the sequence
+ * number its reader covers, and a search over a reader that does not cover
+ * every row the table holds leaves the newer rows out (see
+ * {@link #visibleSeqNo}), so its hits, total and aggregations agree. A get
+ * sees a write as soon as it is acknowledged, as a stock get does.
  *
  * <p>The engine knows which writes replace an existing document (the version
  * map says so), so those rows replace their old ones in the same commit
@@ -108,8 +119,20 @@ public class InfinoEngine extends InternalEngine {
     private static final int MAX_PENDING_BATCHES = 4;
     /** Locks over ids that order each id's skeleton write with its record in the batch. */
     private static final int ID_LOCK_STRIPES = 1024;
-    /** The refresh source of the skeleton refresh each commit runs first. */
-    private static final String COMMIT_REFRESH = "infino_commit";
+    /** Skeleton readers whose covered sequence number is remembered; a search on an older one sees no stamped row. */
+    private static final int READERS_REMEMBERED = 1024;
+    /** The sequence number of a row that every reader may show: no stamp. */
+    private static final long UNSTAMPED = -1L;
+    /**
+     * Created ids awaiting a reader past which the engine refreshes on its
+     * own, so that with refresh off their record stays bounded.
+     */
+    private static final int MAX_UNREFRESHED = 1_000_000;
+    /** The refresh source of that refresh. */
+    private static final String UNREFRESHED_REFRESH = "infino_unrefreshed";
+    /** The seed and multiplier of the 64-bit polynomial hash an index UUID becomes a generation by. */
+    private static final long GENERATION_SEED = 1125899906842597L;
+    private static final long GENERATION_MULTIPLIER = 31L;
 
     /** The writes waiting for the next commit, folded by id. */
     private static final class Batch {
@@ -117,6 +140,8 @@ public class InfinoEngine extends InternalEngine {
         final Map<String, String> writes = new LinkedHashMap<>();
         /** The routing value each id was written with, for the ids written with one. */
         final Map<String, String> routings = new HashMap<>();
+        /** The sequence number each id's row is stamped with, for the ids whose row a reader may not show yet. */
+        final Map<String, Long> stamps = new HashMap<>();
         /** Ids whose row the table holds and a write replaces. */
         final Set<String> replaced = new HashSet<>();
         /** Ids replayed from the translog: whether the table holds them is looked up at commit. */
@@ -135,8 +160,8 @@ public class InfinoEngine extends InternalEngine {
             return writes.size() + deleted.size();
         }
 
-        /** Record a write of {@code id}, routed by {@code routing} when not null. */
-        void write(String id, String source, String routing) {
+        /** Record a write of {@code id}, routed by {@code routing} when not null, its row stamped with {@code stamp} (see {@link #UNSTAMPED}). */
+        void write(String id, String source, String routing, long stamp) {
             writes.put(id, source);
             deleted.remove(id);
             if (routing == null) {
@@ -144,12 +169,19 @@ public class InfinoEngine extends InternalEngine {
             } else {
                 routings.put(id, routing);
             }
+            if (stamp == UNSTAMPED) {
+                stamps.remove(id);
+            } else {
+                stamps.put(id, stamp);
+            }
             bytes += source.length();
         }
     }
 
     private final String table;
     private final ShardId shardId;
+    /** The index's generation, which this engine's stamped rows name (see {@link #generation}). */
+    private final long generation;
     /** Whether the skeleton started empty over a table holding rows (see the class comment). */
     private final boolean rebuilt;
     private final Object batchLock = new Object();
@@ -159,6 +191,24 @@ public class InfinoEngine extends InternalEngine {
     private Batch batch = new Batch();
     /** The batch being committed, until the table has it; a read still sees its writes meanwhile. */
     private Batch committing = null;
+    /**
+     * The ids this primary created that the latest skeleton reader may not
+     * hold yet, with their creation's sequence number: a later write of one
+     * stamps its row with it, so the row stays out of searches until a
+     * reader holds the id. Guarded by {@link #batchLock}.
+     */
+    private final Map<String, Long> unrefreshed = new HashMap<>();
+    /** The sequence number each recent skeleton reader covers, by the reader's version. */
+    private final Map<Long, Long> coveredByReader = new LinkedHashMap<>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Long, Long> eldest) {
+            return size() > READERS_REMEMBERED;
+        }
+    };
+    /** The sequence number the latest skeleton reader covers. */
+    private volatile long latestCovered = UNSTAMPED;
+    /** Whether a refresh for {@link #MAX_UNREFRESHED} is queued. */
+    private final AtomicBoolean unrefreshedRefreshQueued = new AtomicBoolean();
 
     /**
      * A write waiting for its commit, as a read sees it before the table
@@ -208,6 +258,7 @@ public class InfinoEngine extends InternalEngine {
     public InfinoEngine(EngineConfig config) {
         super(config);
         this.shardId = config.getShardId();
+        this.generation = generation(config.getIndexSettings().getUUID());
         this.rebuilt = InfinoPlugin.INFINO_REBUILT.get(config.getIndexSettings().getSettings());
         for (int i = 0; i < idLocks.length; i++) {
             idLocks[i] = new Object();
@@ -225,6 +276,83 @@ public class InfinoEngine extends InternalEngine {
         }
         BY_TABLE.put(table, this);
         log.info("[infino] engine attached to table {} for {}", table, config.getShardId());
+    }
+
+    /**
+     * The sequence number past which {@code table}'s rows are out of a search
+     * over the skeleton reader of version {@code readerVersion}, or null when
+     * the search needs no such cut: every row the table may hold was written
+     * by an operation that reader holds. A reader too old to be remembered
+     * shows no stamped row, which keeps its hits, total and aggregations in
+     * agreement at the cost of leaving rows out; so does the reader the engine
+     * opened with, which was never refreshed and holds no stamped row.
+     */
+    static Long visibleSeqNo(String table, long readerVersion) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine == null) {
+            return null;
+        }
+        Long covered;
+        synchronized (engine.coveredByReader) {
+            covered = engine.coveredByReader.get(readerVersion);
+        }
+        return engine.cutAt(covered == null ? UNSTAMPED : covered);
+    }
+
+    /**
+     * The generation of the index with UUID {@code indexUuid}: what its
+     * stamped rows name, so a table an index outlives (a rebuilt index, or a
+     * new one naming the same table) keeps the old index's rows out of the
+     * new one's cut, whose sequence numbers start again.
+     */
+    static long generation(String indexUuid) {
+        long h = GENERATION_SEED;
+        for (int i = 0; i < indexUuid.length(); i++) {
+            h = h * GENERATION_MULTIPLIER + indexUuid.charAt(i);
+        }
+        return h;
+    }
+
+    /** {@link #visibleSeqNo} for the latest skeleton reader of {@code table}'s shard on this node; null when there is none here. */
+    static Long latestVisibleSeqNo(String table) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        return engine == null ? null : engine.cutAt(engine.latestCovered);
+    }
+
+    /** The cut for a reader covering {@code covered}: none while no operation past it has been applied. */
+    private Long cutAt(long covered) {
+        long max = getSeqNoStats(SequenceNumbers.UNASSIGNED_SEQ_NO).getMaxSeqNo();
+        return max <= covered ? null : covered;
+    }
+
+    /**
+     * Record that the current external skeleton reader holds every operation
+     * up to {@code covered}, and stop stamping the ids it holds.
+     */
+    private void rememberCovered(long covered) {
+        // The reader itself, not a searcher over it: a refresh may run before the
+        // shard has warmed its searchers up.
+        long version;
+        ReferenceManager<OpenSearchDirectoryReader> readers = getReferenceManager(SearcherScope.EXTERNAL);
+        try {
+            OpenSearchDirectoryReader reader = readers.acquire();
+            try {
+                version = reader.getVersion();
+            } finally {
+                readers.release(reader);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("[infino] reading the skeleton reader of " + shardId + " failed", e);
+        }
+        synchronized (coveredByReader) {
+            coveredByReader.merge(version, covered, Math::max);
+        }
+        if (covered > latestCovered) {
+            latestCovered = covered;
+        }
+        synchronized (batchLock) {
+            unrefreshed.values().removeIf(seq -> seq <= covered);
+        }
     }
 
     /**
@@ -356,7 +484,27 @@ public class InfinoEngine extends InternalEngine {
             synchronized (batchLock) {
                 Batch b = batch;
                 boolean pendingCreate = b.created.contains(id);
-                b.write(id, source, index.routing());
+                // A row a reader may not hold the id of yet carries the sequence number that
+                // created it; a replay restores rows the readers since recovery hold.
+                long stamp = UNSTAMPED;
+                if (!index.origin().isRecovery()) {
+                    if (result.isCreated()) {
+                        stamp = result.getSeqNo();
+                        unrefreshed.put(id, stamp);
+                        if (unrefreshed.size() > MAX_UNREFRESHED && unrefreshedRefreshQueued.compareAndSet(false, true)) {
+                            config().getThreadPool().executor(ThreadPool.Names.REFRESH).execute(() -> {
+                                try {
+                                    maybeRefresh(UNREFRESHED_REFRESH);
+                                } finally {
+                                    unrefreshedRefreshQueued.set(false);
+                                }
+                            });
+                        }
+                    } else {
+                        stamp = unrefreshed.getOrDefault(id, UNSTAMPED);
+                    }
+                }
+                b.write(id, source, index.routing(), stamp);
                 if (index.origin().isRecovery() || (!skeletonKnowsIds() && result.isCreated() && !pendingCreate)) {
                     // The table may hold a row the skeleton does not know of.
                     b.replayed.add(id);
@@ -409,8 +557,10 @@ public class InfinoEngine extends InternalEngine {
             if (result.isFound()) {
                 synchronized (batchLock) {
                     Batch b = batch;
+                    unrefreshed.remove(id);
                     b.writes.remove(id);
                     b.routings.remove(id);
+                    b.stamps.remove(id);
                     b.replaced.remove(id);
                     b.replayed.remove(id);
                     if (!b.created.remove(id)) {
@@ -461,9 +611,8 @@ public class InfinoEngine extends InternalEngine {
 
     /**
      * Commit what is pending to the table; batches reach it in the order they
-     * were taken. The translog is synced and the skeleton's reader refreshed
-     * first (see the class comment). A failure keeps the batch for the next
-     * commit and is thrown.
+     * were taken. The translog is synced first (see the class comment). A
+     * failure keeps the batch for the next commit and is thrown.
      */
     private void commitBatch() {
         synchronized (commitLock) {
@@ -479,11 +628,6 @@ public class InfinoEngine extends InternalEngine {
             boolean committed = false;
             try {
                 translogManager().syncTranslog();
-                if (!b.created.isEmpty() || !b.replayed.isEmpty()) {
-                    // Each of these ids was written to the skeleton before it
-                    // entered the batch, so the refreshed reader has them all.
-                    super.refresh(COMMIT_REFRESH);
-                }
                 commit(b);
                 committed = true;
             } catch (IOException e) {
@@ -510,7 +654,7 @@ public class InfinoEngine extends InternalEngine {
         for (Map.Entry<String, String> w : failed.writes.entrySet()) {
             String id = w.getKey();
             if (!next.writes.containsKey(id) && !next.deleted.contains(id)) {
-                next.write(id, w.getValue(), failed.routings.get(id));
+                next.write(id, w.getValue(), failed.routings.get(id), failed.stamps.getOrDefault(id, UNSTAMPED));
                 next.replayed.add(id);
             }
         }
@@ -532,14 +676,16 @@ public class InfinoEngine extends InternalEngine {
             List<String> ids = new ArrayList<>(b.writes.keySet());
             List<String> sources = new ArrayList<>(b.writes.values());
             Pointer prepared;
-            if (b.routings.isEmpty()) {
+            if (b.routings.isEmpty() && b.stamps.isEmpty()) {
                 prepared = InfinoNative.prepare(table, ids, sources);
             } else {
                 List<String> routings = new ArrayList<>(ids.size());
-                for (String id : ids) {
-                    routings.add(b.routings.get(id));
+                long[] seqs = new long[ids.size()];
+                for (int i = 0; i < ids.size(); i++) {
+                    routings.add(b.routings.get(ids.get(i)));
+                    seqs[i] = b.stamps.getOrDefault(ids.get(i), UNSTAMPED);
                 }
-                prepared = InfinoNative.prepare(table, ids, sources, routings);
+                prepared = InfinoNative.prepare(table, ids, sources, routings, seqs, generation);
             }
             if (prepared == null) {
                 throw new IllegalStateException("[infino] the bridge could not prepare a batch for " + table);
@@ -574,16 +720,32 @@ public class InfinoEngine extends InternalEngine {
         }
     }
 
+    /**
+     * Commit pending writes, then refresh the skeleton's reader and record
+     * what it covers: every operation applied before the refresh began.
+     */
     @Override
     public void refresh(String source) throws EngineException {
+        if (commitLock == null) {
+            super.refresh(source); // from within the base engine's constructor: nothing is pending or recorded yet
+            return;
+        }
         commitBeforeLucene("refresh");
+        long covered = getProcessedLocalCheckpoint();
         super.refresh(source);
+        rememberCovered(covered);
     }
 
     @Override
     public boolean maybeRefresh(String source) throws EngineException {
+        if (commitLock == null) {
+            return super.maybeRefresh(source);
+        }
         commitBeforeLucene("refresh");
-        return super.maybeRefresh(source);
+        long covered = getProcessedLocalCheckpoint();
+        boolean refreshed = super.maybeRefresh(source);
+        rememberCovered(covered);
+        return refreshed;
     }
 
     /**

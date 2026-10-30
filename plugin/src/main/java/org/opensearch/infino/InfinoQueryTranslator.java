@@ -77,6 +77,10 @@ final class InfinoQueryTranslator {
     static final String SOURCE = "source";
     /** The reserved column holding the routing value an engine-mode document was written with, when it was. */
     static final String ROUTING = "osrouting";
+    /** The reserved column holding the sequence number of the write that created an engine-mode row, when it was stamped. */
+    static final String SEQ = "osseq";
+    /** The reserved column naming the index whose write stamped a row's {@link #SEQ}: sequence numbers compare within one index's history only. */
+    static final String GEN = "osgen";
     /** Mapping suffix OpenSearch clients use for the exact form of a text field. */
     private static final String KEYWORD_SUFFIX = ".keyword";
     /** How a date range or histogram bound is read when the request names no format. */

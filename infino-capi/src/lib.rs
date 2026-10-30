@@ -63,6 +63,13 @@ const SOURCE: &str = "source";
 /// what rebuilding a shard's documents from its table routes them by. The
 /// column appears with the first routed write.
 const ROUTING: &str = "osrouting";
+/// The sequence number of the write that created a row, when the writer
+/// stamps one: a search over a reader that does not hold that write yet
+/// leaves the row out. The column appears with the first stamped write.
+const SEQ: &str = "osseq";
+/// Which writer stamped a row's [`SEQ`]: sequence numbers compare only
+/// between rows of one writer's history, so a cut leaves another's alone.
+const GEN: &str = "osgen";
 /// Separator used when a multi-valued string field lands in a scalar string
 /// column: the values are joined so a text index sees every token. The
 /// original array is still in `source`.
@@ -1047,9 +1054,20 @@ pub struct Prepared {
     failed: Vec<(usize, String)>,
 }
 
+/// Each row's routing value and sequence number, beside the buffer of ids
+/// and sources: `rt_ends[i]` is where row i's routing value ends (it follows
+/// the row's source in the buffer; an empty one is none), and `seqs[i]` its
+/// sequence number (negative for none), stamped by writer `gen`.
+#[derive(Clone, Copy)]
+struct RowMeta {
+    rt_ends: *const u32,
+    seqs: *const i64,
+    gen: i64,
+}
+
 /// Parse the buffer's documents in parallel and convert them to one Arrow
-/// batch. With `rt_ends`, each row's source is followed in the buffer by its
-/// routing value, ending at `rt_ends[i]`; an empty one is no routing value.
+/// batch. With `meta`, each row also keeps its routing value in
+/// [`ROUTING`] and its sequence number in [`SEQ`] (see [`RowMeta`]).
 #[allow(clippy::too_many_arguments)]
 unsafe fn prepare(
     conn: &Bridge,
@@ -1058,19 +1076,22 @@ unsafe fn prepare(
     buf_len: usize,
     id_ends: *const u32,
     src_ends: *const u32,
-    rt_ends: Option<*const u32>,
+    meta: Option<RowMeta>,
     n: usize,
 ) -> Result<Prepared, String> {
     let bytes = unsafe { std::slice::from_raw_parts(buf, buf_len) };
     let id_ends = unsafe { std::slice::from_raw_parts(id_ends, n) };
     let src_ends = unsafe { std::slice::from_raw_parts(src_ends, n) };
-    let rt_ends = rt_ends.map(|p| unsafe { std::slice::from_raw_parts(p, n) });
+    let rt_ends = meta.map(|m| unsafe { std::slice::from_raw_parts(m.rt_ends, n) });
+    let seqs = meta.map(|m| unsafe { std::slice::from_raw_parts(m.seqs, n) });
+    let gen = meta.map_or(0, |m| m.gen);
     let table = conn.table(name).map_err(|e| e.to_string())?;
     let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
     let schema = table.schema();
 
-    // Each row's id, source and routing value as borrowed slices of the buffer.
-    let mut rows_in: Vec<(&str, &str, &str)> = Vec::with_capacity(n);
+    // Each row's id, source and routing value as borrowed slices of the
+    // buffer, with its sequence number.
+    let mut rows_in: Vec<(&str, &str, &str, i64)> = Vec::with_capacity(n);
     let mut start = 0usize;
     for i in 0..n {
         let (id_end, src_end) = (id_ends[i] as usize, src_ends[i] as usize);
@@ -1081,18 +1102,22 @@ unsafe fn prepare(
         let id = std::str::from_utf8(&bytes[start..id_end]).unwrap_or("");
         let src = std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}");
         let routing = std::str::from_utf8(&bytes[src_end..rt_end]).unwrap_or("");
-        rows_in.push((id, src, routing));
+        rows_in.push((id, src, routing, seqs.map_or(-1, |s| s[i])));
         start = rt_end;
     }
 
     let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
         .par_iter()
-        .map(|(id, src, routing)| {
+        .map(|(id, src, routing, seq)| {
             conform_doc(src, &schema).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 flat.insert(SOURCE.into(), Value::String((*src).to_string()));
                 if !routing.is_empty() {
                     flat.insert(ROUTING.into(), Value::String((*routing).to_string()));
+                }
+                if *seq >= 0 {
+                    flat.insert(SEQ.into(), json!(*seq));
+                    flat.insert(GEN.into(), json!(gen));
                 }
                 flat
             })
@@ -1363,13 +1388,15 @@ pub unsafe extern "C" fn infino_prepare_batch(
     .unwrap_or(ptr::null_mut())
 }
 
-/// [`infino_prepare_batch`] for documents written with routing values: the
-/// buffer holds `id0 source0 routing0 id1 ...`, and `rt_ends[i]` is where
-/// row i's routing value ends (an empty one is none). A row written with one
-/// keeps it in the `osrouting` column.
+/// [`infino_prepare_batch`] for documents with a routing value and a
+/// sequence number each: the buffer holds `id0 source0 routing0 id1 ...`,
+/// `rt_ends[i]` is where row i's routing value ends (an empty one is none)
+/// and `seqs[i]` is its sequence number (negative for none), stamped by
+/// writer `gen`. A row keeps them in the `osrouting`, `osseq` and `osgen`
+/// columns.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn infino_prepare_batch_routed(
+pub unsafe extern "C" fn infino_prepare_batch_meta(
     h: *mut Bridge,
     name: *const c_char,
     buf: *const u8,
@@ -1377,6 +1404,8 @@ pub unsafe extern "C" fn infino_prepare_batch_routed(
     id_ends: *const u32,
     src_ends: *const u32,
     rt_ends: *const u32,
+    seqs: *const i64,
+    gen: i64,
     count: c_int,
 ) -> *mut Prepared {
     catch_unwind(AssertUnwindSafe(|| {
@@ -1387,6 +1416,7 @@ pub unsafe extern "C" fn infino_prepare_batch_routed(
             || id_ends.is_null()
             || src_ends.is_null()
             || rt_ends.is_null()
+            || seqs.is_null()
             || count <= 0
         {
             return ptr::null_mut();
@@ -1399,7 +1429,7 @@ pub unsafe extern "C" fn infino_prepare_batch_routed(
                 buf_len,
                 id_ends,
                 src_ends,
-                Some(rt_ends),
+                Some(RowMeta { rt_ends, seqs, gen }),
                 count as usize,
             )
         } {

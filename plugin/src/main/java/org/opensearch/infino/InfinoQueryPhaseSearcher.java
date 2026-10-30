@@ -4,6 +4,7 @@
 
 package org.opensearch.infino;
 
+import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.Query;
@@ -166,7 +167,10 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         SearchSourceBuilder source = scroll == null ? carried.source() : scrollRound(carried.source(), scroll, laterRound);
         // The coordinating node's clock, so every shard reads `now` the same.
         long now = carried.nowMillis();
-        InfinoSearch.Plan plan = InfinoSearch.plan(table, source, now, access);
+        // The rows this search's skeleton reader holds, as a stock shard's search sees its reader.
+        Long cut = InfinoEngine.visibleSeqNo(table, readerVersion(searcher));
+        long generation = InfinoEngine.generation(context.indexShard().indexSettings().getUUID());
+        InfinoSearch.Plan plan = visibleTo(InfinoSearch.plan(table, source, now, access), cut, generation);
 
         Collection<AggregationBuilder> builders = InfinoSearch.builders(source);
         // A cardinality or percentiles result is built from the engine's exact
@@ -189,7 +193,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             if (!overShards) {
                 counted = processor.evaluate(builders, plan, sharedTotal && !countWithAggs ? page.total() : null);
             } else if (reached.get(0) == shardId.id()) {
-                counted = processor.evaluateOver(builders, plan, shardPlans(context, reached, source, now, access));
+                counted = processor.evaluateOver(builders, plan, shardPlans(context, reached, source, now, access, cut, generation));
             } else {
                 counted = processor.evaluateNothing(builders, plan);
             }
@@ -204,7 +208,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
 
         List<SearchHit> rows = page.hits();
         if (laterRound) {
-            rows = scrollRows(searcher, carried.source(), source, plan, index, rows);
+            rows = scrollRows(searcher, carried.source(), source, plan, index, rows, cut, generation);
         }
         boolean sorted = !plan.sorts().isEmpty();
         boolean collapsed = plan.collapse() != null;
@@ -287,14 +291,48 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         return round;
     }
 
-    /** The plan of the search over each reached shard's table, in shard order. */
-    private static List<InfinoSearch.Plan> shardPlans(SearchContext context, List<Integer> reached, SearchSourceBuilder source, long now, InfinoAccess access) {
+    /**
+     * The plan of the search over each reached shard's table, in shard order,
+     * each over the rows its shard's reader holds: this shard's by this
+     * search's reader ({@code cut}), another's on this node by its latest.
+     */
+    private static List<InfinoSearch.Plan> shardPlans(
+        SearchContext context,
+        List<Integer> reached,
+        SearchSourceBuilder source,
+        long now,
+        InfinoAccess access,
+        Long cut,
+        long generation
+    ) {
         IndexMetadata md = context.indexShard().indexSettings().getIndexMetadata();
+        int own = context.indexShard().shardId().id();
         List<InfinoSearch.Plan> out = new ArrayList<>(reached.size());
         for (int shard : reached) {
-            out.add(InfinoSearch.plan(InfinoPlugin.tables().ensure(md, shard), source, now, access));
+            String table = InfinoPlugin.tables().ensure(md, shard);
+            Long shardCut = shard == own ? cut : InfinoEngine.latestVisibleSeqNo(table);
+            out.add(visibleTo(InfinoSearch.plan(table, source, now, access), shardCut, generation));
         }
         return out;
+    }
+
+    /** The version of the skeleton reader a search holds. */
+    private static long readerVersion(ContextIndexSearcher searcher) {
+        return searcher.getIndexReader() instanceof DirectoryReader reader ? reader.getVersion() : -1L;
+    }
+
+    /**
+     * {@code plan} over the rows a skeleton reader holds: none that index
+     * generation {@code generation} created by an operation past {@code cut};
+     * the plan itself when {@code cut} is null or the table stamps no row.
+     */
+    private static InfinoSearch.Plan visibleTo(InfinoSearch.Plan plan, Long cut, long generation) {
+        if (cut == null || plan.vector() != null || !InfinoNative.columns(plan.table()).containsKey(InfinoQueryTranslator.SEQ)) {
+            return plan;
+        }
+        String seq = InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.SEQ);
+        String gen = InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.GEN);
+        return plan.requiring("(" + seq + " IS NULL OR " + gen + " <> " + generation + " OR " + seq + " <= " + cut + ")");
     }
 
     /**
@@ -312,7 +350,9 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         SearchSourceBuilder round,
         InfinoSearch.Plan plan,
         Index index,
-        List<SearchHit> first
+        List<SearchHit> first,
+        Long cut,
+        long generation
     ) throws IOException {
         int size = round.size() < 0 ? InfinoSearch.DEFAULT_SIZE : round.size();
         List<SearchHit> known = new ArrayList<>();
@@ -328,7 +368,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             }
             SearchHit last = page.get(page.size() - 1);
             SearchSourceBuilder next = InfinoSearch.scrollSource(written).searchAfter(searchAfter(sortValues(last.getSortValues(), plan.sorts())));
-            InfinoSearch.Plan nextPlan = InfinoSearch.plan(plan.table(), next, plan.nowMillis(), plan.access());
+            InfinoSearch.Plan nextPlan = visibleTo(InfinoSearch.plan(plan.table(), next, plan.nowMillis(), plan.access()), cut, generation);
             page = InfinoSearch.page(index, nextPlan, next, false).hits();
         }
     }

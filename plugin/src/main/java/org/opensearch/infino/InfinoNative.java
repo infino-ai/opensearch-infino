@@ -516,14 +516,15 @@ public final class InfinoNative {
     }
 
     /**
-     * {@link #prepare} for documents written with routing values: each row
-     * keeps its routing value (null for none) in the
-     * {@link InfinoQueryTranslator#ROUTING} column.
+     * {@link #prepare} with each row's routing value (null for none) and
+     * sequence number (negative for none) stamped by writer {@code gen}, kept
+     * in the {@link InfinoQueryTranslator#ROUTING}, {@link InfinoQueryTranslator#SEQ}
+     * and {@link InfinoQueryTranslator#GEN} columns.
      */
-    public static Pointer prepare(String name, List<String> osids, List<String> sources, List<String> routings) {
+    public static Pointer prepare(String name, List<String> osids, List<String> sources, List<String> routings, long[] seqs, long gen) {
         init();
         Packed p = Packed.of(osids, sources, routings);
-        return lib.infino_prepare_batch_routed(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), p.rtEnds(), osids.size());
+        return lib.infino_prepare_batch_meta(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), p.rtEnds(), seqs, gen, osids.size());
     }
 
     /**

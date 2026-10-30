@@ -144,6 +144,13 @@ public final class InfinoSearch {
         String hitWhere() {
             return postWhere == null ? query.where() : "(" + query.where() + ") AND (" + postWhere + ")";
         }
+
+        /** This plan with {@code predicate} required of every row, the hits', the total's and the aggregations' alike. */
+        Plan requiring(String predicate) {
+            String where = InfinoQueryTranslator.ALL.equals(query.where()) ? predicate : "(" + query.where() + ") AND " + predicate;
+            Translation narrowed = new Translation(query.table(), where, query.principal());
+            return new Plan(table, cols, narrowed, sorts, vector, postWhere, collapse, searchAfter, scriptFields, access, nowMillis);
+        }
     }
 
     /**

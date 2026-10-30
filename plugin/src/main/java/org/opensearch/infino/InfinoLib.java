@@ -47,8 +47,22 @@ public interface InfinoLib extends Library {
     /** Parse and convert a batch ahead of its append; null when the table is unknown. */
     Pointer infino_prepare_batch(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
 
-    /** {@link #infino_prepare_batch} with each row's routing value after its source (empty for none), ending at {@code rtEnds}. */
-    Pointer infino_prepare_batch_routed(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int[] rtEnds, int count);
+    /**
+     * {@link #infino_prepare_batch} with each row's routing value after its source (empty for none), ending
+     * at {@code rtEnds}, and its sequence number in {@code seqs} (negative for none), stamped by writer {@code gen}.
+     */
+    Pointer infino_prepare_batch_meta(
+        Pointer h,
+        String name,
+        byte[] buf,
+        long bufLen,
+        int[] idEnds,
+        int[] srcEnds,
+        int[] rtEnds,
+        long[] seqs,
+        long gen,
+        int count
+    );
 
     /**
      * Append prepared batches in one commit and release them; the rows whose ids
