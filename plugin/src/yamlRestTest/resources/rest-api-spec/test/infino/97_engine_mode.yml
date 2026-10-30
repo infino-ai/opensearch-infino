@@ -349,6 +349,142 @@
         index: emw
         body: { size: 0, aggs: { total: { sum: { field: n } } } }
   - match: { aggregations.total.value: 3.0 }
+  # The hits agree with the total and the aggregations: a commit refreshes
+  # the skeleton's reader first, so every row the table answers with has a
+  # document the fetch phase can read.
+  - do:
+      search:
+        index: emw
+        body: { size: 10, sort: [ { n: asc } ], aggs: { total: { sum: { field: n } } } }
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { aggregations.total.value: 3.0 }
+
+---
+"Engine mode: cardinality and percentiles over two shards are the whole index's":
+  # Each shard's table holds five users, two of them in both: the index holds
+  # eight. A shard that answered from its own table alone would report five,
+  # and the coordinating node could not merge two exact counts into eight.
+  - do:
+      indices.create:
+        index: emc
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: engine
+            number_of_shards: 2
+            number_of_replicas: 0
+          mappings:
+            properties:
+              user: { type: keyword }
+              kind: { type: keyword }
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emc, _id: "1", routing: r0 }
+          - { user: u1, kind: a, n: 1 }
+          - index: { _index: emc, _id: "2", routing: r0 }
+          - { user: u2, kind: a, n: 2 }
+          - index: { _index: emc, _id: "3", routing: r0 }
+          - { user: u3, kind: a, n: 3 }
+          - index: { _index: emc, _id: "4", routing: r0 }
+          - { user: u4, kind: a, n: 4 }
+          - index: { _index: emc, _id: "5", routing: r0 }
+          - { user: u5, kind: a, n: 5 }
+          - index: { _index: emc, _id: "6", routing: r1 }
+          - { user: u4, kind: a, n: 6 }
+          - index: { _index: emc, _id: "7", routing: r1 }
+          - { user: u5, kind: a, n: 7 }
+          - index: { _index: emc, _id: "8", routing: r1 }
+          - { user: u6, kind: a, n: 8 }
+          - index: { _index: emc, _id: "9", routing: r1 }
+          - { user: u7, kind: b, n: 9 }
+          - index: { _index: emc, _id: "10", routing: r1 }
+          - { user: u8, kind: b, n: 10 }
+  - match: { errors: false }
+  - do:
+      search:
+        index: emc
+        body:
+          size: 0
+          aggs:
+            users: { cardinality: { field: user } }
+            n_pct: { percentiles: { field: n, percents: [ 50 ] } }
+            n_rank: { percentile_ranks: { field: n, values: [ 5 ] } }
+            kinds:
+              terms: { field: kind }
+              aggs:
+                users: { cardinality: { field: user } }
+  - match: { hits.total.value: 10 }
+  - match: { aggregations.users.value: 8 }
+  - match: { aggregations.kinds.buckets.0.key: a }
+  - match: { aggregations.kinds.buckets.0.doc_count: 8 }
+  - match: { aggregations.kinds.buckets.0.users.value: 6 }
+  - match: { aggregations.kinds.buckets.1.key: b }
+  - match: { aggregations.kinds.buckets.1.doc_count: 2 }
+  - match: { aggregations.kinds.buckets.1.users.value: 2 }
+  - match: { aggregations.kinds.doc_count_error_upper_bound: 0 }
+  - set: { aggregations.n_pct.values.50\.0: median }
+  - set: { aggregations.n_rank.values.5\.0: rank }
+  # The same rows in one shard's table give the same answers.
+  - do:
+      indices.create:
+        index: emc1
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: engine
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emc1, _id: "1" }
+          - { n: 1 }
+          - index: { _index: emc1, _id: "2" }
+          - { n: 2 }
+          - index: { _index: emc1, _id: "3" }
+          - { n: 3 }
+          - index: { _index: emc1, _id: "4" }
+          - { n: 4 }
+          - index: { _index: emc1, _id: "5" }
+          - { n: 5 }
+          - index: { _index: emc1, _id: "6" }
+          - { n: 6 }
+          - index: { _index: emc1, _id: "7" }
+          - { n: 7 }
+          - index: { _index: emc1, _id: "8" }
+          - { n: 8 }
+          - index: { _index: emc1, _id: "9" }
+          - { n: 9 }
+          - index: { _index: emc1, _id: "10" }
+          - { n: 10 }
+  - do:
+      search:
+        index: emc1
+        body:
+          size: 0
+          aggs:
+            n_pct: { percentiles: { field: n, percents: [ 50 ] } }
+            n_rank: { percentile_ranks: { field: n, values: [ 5 ] } }
+  - match: { aggregations.n_pct.values.50\.0: $median }
+  - match: { aggregations.n_rank.values.5\.0: $rank }
+  # A search routed to one shard answers over that shard's table alone.
+  - do:
+      search:
+        index: emc
+        routing: r0
+        body: { size: 0, aggs: { users: { cardinality: { field: user } } } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.users.value: 5 }
 
 ---
 "Engine mode: delete by query scrolls the tables and deletes through the shards":
@@ -419,7 +555,21 @@
           - { tag: x, ip: "10.0.0.1", n: 1 }
           - index: { _index: sec_em, _id: "e2" }
           - { tag: y, ip: "10.0.0.2", n: 2 }
+          - index: { _index: sec_em, _id: "e3" }
+          - { tag: y, ip: "10.0.0.1", n: 3 }
   - match: { errors: false }
+  # The background of significant_terms is the documents the user may see:
+  # e1 alone, not the two documents the rule hides (one of them shares e1's ip).
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec_em
+        body:
+          size: 0
+          aggs:
+            ips: { significant_terms: { field: ip, min_doc_count: 1 } }
+  - match: { aggregations.ips.doc_count: 1 }
+  - match: { aggregations.ips.bg_count: 1 }
   - do:
       headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
       search:

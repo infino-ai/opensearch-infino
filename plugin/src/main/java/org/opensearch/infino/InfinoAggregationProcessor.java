@@ -103,10 +103,12 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 
 import static org.opensearch.infino.InfinoQueryTranslator.literal;
@@ -174,6 +176,12 @@ public class InfinoAggregationProcessor {
     private static final char KEY_SEPARATOR = '\u0001';
     /** Stand-in for a missing key in a tuple's string form. */
     private static final String NULL_KEY = "\u0000";
+    /** The column of {@link #unionOf} naming which shard's table a row came from. */
+    private static final String SHARD_COLUMN = "_infino_shard";
+    /** The alias of {@link #unionOf}'s relation. */
+    private static final String UNION_ALIAS = "_infino_shards";
+    /** The alias of a significant_terms level's background rows. */
+    private static final String BACKGROUND_ALIAS = "_infino_background";
 
     private final Index index;
     /**
@@ -182,6 +190,10 @@ public class InfinoAggregationProcessor {
      * shard size of groups, as a stock shard does, not its final size.
      */
     private final boolean shardOfMany;
+    /** The request being evaluated; set by {@link #evaluate}. */
+    private Plan plan;
+    /** The tables the aggregations read: the plan's, or each reached shard's (see {@link #evaluateOver}); set by {@link #evaluate}. */
+    private List<String> tables = List.of();
 
     /** A processor whose top hits name {@code index}; null for planning only. */
     InfinoAggregationProcessor(Index index) {
@@ -213,10 +225,58 @@ public class InfinoAggregationProcessor {
      */
     Counted evaluate(Collection<AggregationBuilder> builders, Plan plan, Long total) {
         Translation q = plan.query();
+        return evaluate(builders, plan, List.of(plan.table()), q.from(), q.where(), predicates(plan), () -> InfinoSearch.count(plan.table(), q), shardOfMany, total);
+    }
+
+    /**
+     * The requested aggregations over the rows each of {@code shardPlans}
+     * matches, one plan for each table of an index's reached shards, read
+     * as one relation, with the request's exact match count over all of
+     * them. A cardinality or percentiles result is built from the engine's
+     * exact values, which the coordinating node cannot merge from the
+     * shards' parts; one shard answers the whole tree this way, so the
+     * coordinating node's reduction returns it unchanged (see
+     * {@link InfinoQueryPhaseSearcher}). {@code plan} is that shard's own.
+     */
+    Counted evaluateOver(Collection<AggregationBuilder> builders, Plan plan, List<Plan> shardPlans) {
+        String from = unionOf(shardPlans);
+        List<String> shardTables = new ArrayList<>();
+        for (Plan p : shardPlans) {
+            shardTables.add(p.table());
+        }
+        Function<QueryBuilder, String> predicates = qb -> perShard(qb, shardPlans);
+        Supplier<Long> counter = () -> asLong(oneRow("SELECT COUNT(*) AS c FROM " + from).get("c"));
+        // One answer for the whole index: each terms level at its final size.
+        return evaluate(builders, plan, shardTables, from, InfinoQueryTranslator.ALL, predicates, counter, false, null);
+    }
+
+    /**
+     * The requested aggregations over no rows, as a shard reports them when
+     * another reached shard answers for all of them (see {@link #evaluateOver}):
+     * every count, size and background is zero, so the coordinating node's
+     * reduction adds nothing to that shard's answer.
+     */
+    Counted evaluateNothing(Collection<AggregationBuilder> builders, Plan plan) {
+        return evaluate(builders, plan, List.of(), InfinoQueryTranslator.quoteIdent(plan.table()), InfinoQueryTranslator.NONE, predicates(plan), () -> 0L, false, 0L);
+    }
+
+    private Counted evaluate(
+        Collection<AggregationBuilder> builders,
+        Plan plan,
+        List<String> tables,
+        String from,
+        String where,
+        Function<QueryBuilder, String> predicates,
+        Supplier<Long> counter,
+        boolean shardSized,
+        Long total
+    ) {
+        this.plan = plan;
+        this.tables = tables;
         List<Spec> specs = new ArrayList<>();
         int position = 0;
         for (AggregationBuilder b : builders) {
-            specs.add(Spec.of(b, plan.cols(), plan.table(), plan.access(), position++, shardOfMany));
+            specs.add(Spec.of(b, plan.cols(), plan.table(), predicates, plan.access(), position++, shardSized, plan.nowMillis()));
         }
         Map<String, InternalAggregation> byName = new HashMap<>();
         List<Metric> rootMetrics = new ArrayList<>();
@@ -226,18 +286,18 @@ public class InfinoAggregationProcessor {
                 continue;
             }
             if (total == null) {
-                total = InfinoSearch.count(plan.table(), q);
+                total = counter.get();
             }
             if (spec instanceof TopHits th) {
-                byName.put(spec.name(), th.build(topHitRows(th, q.from(), q.where()), total, index));
+                byName.put(spec.name(), th.build(topHitRows(th, from, where), total, index));
                 continue;
             }
-            byName.put(spec.name(), evalBucket((BucketSpec) spec, q.from(), q.where(), total));
+            byName.put(spec.name(), evalBucket((BucketSpec) spec, from, where, total));
         }
         if (!rootMetrics.isEmpty()) {
             boolean counting = total == null;
             String select = (counting ? "COUNT(*) AS " + TOTAL_ALIAS + ", " : "") + metricColumns(rootMetrics);
-            Map<String, Object> row = oneRow("SELECT " + select + " FROM " + q.from() + " WHERE " + q.where());
+            Map<String, Object> row = oneRow("SELECT " + select + " FROM " + from + " WHERE " + where);
             if (counting) {
                 total = asLong(row.get(TOTAL_ALIAS));
             }
@@ -246,15 +306,88 @@ public class InfinoAggregationProcessor {
             }
         }
         if (total == null) {
-            total = InfinoSearch.count(plan.table(), q);
+            total = counter.get();
         }
         // Keep the request's order of aggregations.
         List<InternalAggregation> ordered = new ArrayList<>();
         for (AggregationBuilder b : builders) {
             ordered.add(byName.get(b.getName()));
         }
-        log.debug("[infino] served {} aggregation(s) from {}", ordered.size(), plan.table());
+        log.debug("[infino] served {} aggregation(s) from {}", ordered.size(), tables);
         return new Counted(InternalAggregations.from(ordered), total);
+    }
+
+    /** Whether {@code builders} hold a metric whose result is built from exact values: cardinality, percentiles, percentile ranks. */
+    static boolean needsExactValues(Collection<AggregationBuilder> builders) {
+        for (AggregationBuilder b : builders) {
+            if (b instanceof CardinalityAggregationBuilder || b instanceof PercentilesAggregationBuilder || b instanceof PercentileRanksAggregationBuilder) {
+                return true;
+            }
+            if (needsExactValues(b.getSubAggregations())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** How an aggregation's own query (a filters bucket) becomes a predicate over the plan's relation. */
+    private static Function<QueryBuilder, String> predicates(Plan plan) {
+        return qb -> InfinoQueryTranslator.predicate(qb, plan.cols(), plan.table(), plan.nowMillis());
+    }
+
+    /**
+     * The rows of each plan's relation, every column any of the tables has
+     * but vectors (which no aggregation reads), as one relation: a column a
+     * table lacks is null in its rows, and {@link #SHARD_COLUMN} says which
+     * plan a row came from.
+     */
+    static String unionOf(List<Plan> plans) {
+        Map<String, Column> all = new LinkedHashMap<>();
+        List<Map<String, Column>> each = new ArrayList<>();
+        for (Plan p : plans) {
+            Map<String, Column> cols = InfinoNative.columns(p.table());
+            each.add(cols);
+            for (Column c : cols.values()) {
+                if (!c.vector()) {
+                    all.putIfAbsent(c.name(), c);
+                }
+            }
+        }
+        List<String> branches = new ArrayList<>();
+        for (int i = 0; i < plans.size(); i++) {
+            List<String> select = new ArrayList<>();
+            select.add(i + " AS " + quoteIdent(SHARD_COLUMN));
+            for (String name : all.keySet()) {
+                select.add(each.get(i).containsKey(name) ? quoteIdent(name) : "NULL AS " + quoteIdent(name));
+            }
+            Translation q = plans.get(i).query();
+            branches.add("SELECT " + String.join(", ", select) + " FROM " + q.from() + " WHERE " + q.where());
+        }
+        return "(" + String.join(" UNION ALL ", branches) + ") AS " + quoteIdent(UNION_ALIAS);
+    }
+
+    /**
+     * {@code qb} as a predicate over {@link #unionOf} the plans: one
+     * predicate when it reads the same over every table, else each row
+     * tested by its own table's (a full-text clause names its table).
+     */
+    private static String perShard(QueryBuilder qb, List<Plan> plans) {
+        List<String> each = new ArrayList<>();
+        for (Plan p : plans) {
+            String predicate = InfinoQueryTranslator.predicate(qb, p.cols(), p.table(), p.nowMillis());
+            if (predicate == null) {
+                return null;
+            }
+            each.add(predicate);
+        }
+        if (each.stream().distinct().count() == 1) {
+            return each.get(0);
+        }
+        StringBuilder out = new StringBuilder("(CASE ").append(quoteIdent(SHARD_COLUMN));
+        for (int i = 0; i < each.size(); i++) {
+            out.append(" WHEN ").append(i).append(" THEN (").append(each.get(i)).append(")");
+        }
+        return out.append(" END)").toString();
     }
 
     // ---- servability (shared with the hit path's plan) ----
@@ -263,7 +396,7 @@ public class InfinoAggregationProcessor {
     static void check(Collection<AggregationBuilder> builders, Plan plan) {
         int position = 0;
         for (AggregationBuilder b : builders) {
-            Spec.of(b, plan.cols(), plan.table(), plan.access(), position++, false);
+            Spec.of(b, plan.cols(), plan.table(), predicates(plan), plan.access(), position++, false, plan.nowMillis());
         }
     }
 
@@ -290,24 +423,36 @@ public class InfinoAggregationProcessor {
 
         /**
          * The spec for a builder at {@code index} among its siblings, or an
-         * {@link Unsupported} reason; {@code shardOfMany} as the processor's.
+         * {@link Unsupported} reason; {@code shardOfMany} as the processor's,
+         * {@code now} the time {@code now} means in the request;
+         * {@code predicates} turns an aggregation's own query into a
+         * predicate over the relation the aggregations read.
          */
-        static Spec of(AggregationBuilder b, Map<String, Column> cols, String table, InfinoAccess access, int index, boolean shardOfMany) {
+        static Spec of(
+            AggregationBuilder b,
+            Map<String, Column> cols,
+            String table,
+            Function<QueryBuilder, String> predicates,
+            InfinoAccess access,
+            int index,
+            boolean shardOfMany,
+            long now
+        ) {
             if (Metric.handles(b)) {
                 if (!b.getSubAggregations().isEmpty()) {
                     throw new Unsupported("metric aggregation [" + b.getName() + "] cannot have sub-aggregations");
                 }
-                return Metric.of(b, cols, index);
+                return Metric.of(b, cols, index, now);
             }
             if (b instanceof TopHitsAggregationBuilder th) {
-                return TopHits.of(th, cols, access);
+                return TopHits.of(th, cols, access, now);
             }
             List<Metric> metrics = new ArrayList<>();
             List<TopHits> hits = new ArrayList<>();
             BucketSpec child = null;
             int i = 0;
             for (AggregationBuilder sub : b.getSubAggregations()) {
-                Spec s = of(sub, cols, table, access, i++, shardOfMany);
+                Spec s = of(sub, cols, table, predicates, access, i++, shardOfMany, now);
                 if (s instanceof Metric m) {
                     metrics.add(m);
                 } else if (s instanceof TopHits t) {
@@ -320,28 +465,28 @@ public class InfinoAggregationProcessor {
             }
             Leaves leaves = new Leaves(metrics, hits);
             if (b instanceof TermsAggregationBuilder t) {
-                return Grouped.terms(t, cols, leaves, child, shardOfMany);
+                return Grouped.terms(t, cols, leaves, child, shardOfMany, now);
             }
             if (b instanceof DateHistogramAggregationBuilder dh) {
-                return Grouped.dateHistogram(dh, cols, leaves, child);
+                return Grouped.dateHistogram(dh, cols, leaves, child, now);
             }
             if (b instanceof HistogramAggregationBuilder h) {
-                return Grouped.histogram(h, cols, leaves, child);
+                return Grouped.histogram(h, cols, leaves, child, now);
             }
             if (b instanceof FiltersAggregationBuilder f) {
-                return Explicit.filters(f, cols, table, leaves, child);
+                return Explicit.filters(f, predicates, leaves, child);
             }
             if (b instanceof RangeAggregationBuilder r) {
-                return Explicit.range(r, cols, leaves, child);
+                return Explicit.range(r, cols, leaves, child, now);
             }
             if (b instanceof DateRangeAggregationBuilder dr) {
-                return Explicit.dateRange(dr, cols, leaves, child);
+                return Explicit.dateRange(dr, cols, leaves, child, now);
             }
             if (b instanceof SignificantTermsAggregationBuilder st) {
-                return Significant.of(st, cols, table, leaves, child);
+                return Significant.of(st, cols, table, leaves, child, now);
             }
             if (b instanceof CompositeAggregationBuilder c) {
-                return Composite.of(c, cols, leaves, child);
+                return Composite.of(c, cols, leaves, child, now);
             }
             throw new Unsupported("aggregation [" + b.getName() + "] of type [" + b.getType() + "] is not served");
         }
@@ -349,9 +494,9 @@ public class InfinoAggregationProcessor {
         /**
          * What the aggregation reads: its field's column, or its script as a
          * column expression (a value script, one given beside a field, reads
-         * that field as {@code _value}).
+         * that field as {@code _value}); a script's clock reads {@code now}.
          */
-        static Source sourceOf(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols) {
+        static Source sourceOf(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols, long now) {
             Column c = null;
             if (b.field() != null) {
                 c = InfinoSearch.columnFor(cols, b.field());
@@ -362,7 +507,7 @@ public class InfinoAggregationProcessor {
             if (b.script() != null) {
                 // A script reads values themselves, so it sees no masked column, the value script's included.
                 Column valueColumn = c != null && c.masked() ? null : c;
-                Sql sql = InfinoScriptTranslator.translate(b.script(), InfinoAccess.scriptColumns(cols), valueColumn, System.currentTimeMillis());
+                Sql sql = InfinoScriptTranslator.translate(b.script(), InfinoAccess.scriptColumns(cols), valueColumn, now);
                 return new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]", null);
             }
             if (c == null) {
@@ -455,8 +600,8 @@ public class InfinoAggregationProcessor {
                 || b instanceof PercentileRanksAggregationBuilder;
         }
 
-        static Metric of(AggregationBuilder b, Map<String, Column> cols, int index) {
-            Source c = sourceOf((ValuesSourceAggregationBuilder<?>) b, cols);
+        static Metric of(AggregationBuilder b, Map<String, Column> cols, int index, long now) {
+            Source c = sourceOf((ValuesSourceAggregationBuilder<?>) b, cols, now);
             if (c.masked()) {
                 throw masked(b, c); // a count, sum or bound would read the values themselves
             }
@@ -703,7 +848,7 @@ public class InfinoAggregationProcessor {
             this.access = access;
         }
 
-        static TopHits of(TopHitsAggregationBuilder b, Map<String, Column> cols, InfinoAccess access) {
+        static TopHits of(TopHitsAggregationBuilder b, Map<String, Column> cols, InfinoAccess access, long now) {
             if (b.size() > MAX_TOP_HITS) {
                 throw new Unsupported("aggregation [" + b.getName() + "] asks for " + b.size() + " hits per bucket; at most " + MAX_TOP_HITS + " are served");
             }
@@ -714,7 +859,7 @@ public class InfinoAggregationProcessor {
             }
             List<SortSpec> sorts;
             try {
-                sorts = InfinoSearch.sorts(b.sorts(), cols);
+                sorts = InfinoSearch.sorts(b.sorts(), cols, now);
             } catch (IllegalArgumentException e) {
                 throw new Unsupported("aggregation [" + b.getName() + "] " + e.getMessage());
             }
@@ -863,8 +1008,8 @@ public class InfinoAggregationProcessor {
          * groups at its shard minimum count, as a stock shard does, so the
          * coordinating node ranks from more than each shard's final top.
          */
-        static Grouped terms(TermsAggregationBuilder t, Map<String, Column> cols, Leaves leaves, BucketSpec child, boolean shardOfMany) {
-            Source c = sourceOf(t, cols);
+        static Grouped terms(TermsAggregationBuilder t, Map<String, Column> cols, Leaves leaves, BucketSpec child, boolean shardOfMany, long now) {
+            Source c = sourceOf(t, cols, now);
             if (t.size() > MAX_TERMS_SIZE) {
                 throw new Unsupported("aggregation [" + t.getName() + "] asks for " + t.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
             }
@@ -895,8 +1040,8 @@ public class InfinoAggregationProcessor {
             return Math.min(MAX_TERMS_SIZE, Math.max(shard, t.size()));
         }
 
-        static Grouped dateHistogram(DateHistogramAggregationBuilder dh, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Source c = sourceOf(dh, cols);
+        static Grouped dateHistogram(DateHistogramAggregationBuilder dh, Map<String, Column> cols, Leaves leaves, BucketSpec child, long now) {
+            Source c = sourceOf(dh, cols, now);
             if (c.masked()) {
                 throw masked(dh, c);
             }
@@ -919,8 +1064,8 @@ public class InfinoAggregationProcessor {
             return new Grouped(dh, leaves, child, c, expr.keyExpr(), KeyKind.DATE, false, Integer.MAX_VALUE, dh.minDocCount(), "{key} ASC", date, null);
         }
 
-        static Grouped histogram(HistogramAggregationBuilder h, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Source c = sourceOf(h, cols);
+        static Grouped histogram(HistogramAggregationBuilder h, Map<String, Column> cols, Leaves leaves, BucketSpec child, long now) {
+            Source c = sourceOf(h, cols, now);
             if (c.masked()) {
                 throw masked(h, c);
             }
@@ -1167,11 +1312,11 @@ public class InfinoAggregationProcessor {
             this.format = format;
         }
 
-        static Explicit filters(FiltersAggregationBuilder f, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
+        static Explicit filters(FiltersAggregationBuilder f, Function<QueryBuilder, String> predicates, Leaves leaves, BucketSpec child) {
             List<ExplicitBucket> buckets = new ArrayList<>();
             List<String> all = new ArrayList<>();
             for (FiltersAggregator.KeyedFilter kf : f.filters()) {
-                String p = InfinoQueryTranslator.predicate(kf.filter(), cols, table, System.currentTimeMillis());
+                String p = predicates.apply(kf.filter());
                 if (p == null) {
                     throw new Unsupported("aggregation [" + f.getName() + "] has a filter the table cannot answer: " + kf.filter());
                 }
@@ -1185,8 +1330,8 @@ public class InfinoAggregationProcessor {
             return new Explicit(f, leaves, child, ExplicitKind.FILTERS, buckets, f.isKeyed(), DocValueFormat.RAW);
         }
 
-        static Explicit range(RangeAggregationBuilder r, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Source c = sourceOf(r, cols);
+        static Explicit range(RangeAggregationBuilder r, Map<String, Column> cols, Leaves leaves, BucketSpec child, long now) {
+            Source c = sourceOf(r, cols, now);
             if (!c.isNumeric()) {
                 throw new Unsupported("aggregation [" + r.getName() + "] needs a numeric value, " + c.label() + " is " + c.typeName());
             }
@@ -1199,15 +1344,14 @@ public class InfinoAggregationProcessor {
             return new Explicit(r, leaves, child, ExplicitKind.RANGE, buckets, r.keyed(), DocValueFormat.RAW);
         }
 
-        static Explicit dateRange(DateRangeAggregationBuilder r, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Source c = sourceOf(r, cols);
+        static Explicit dateRange(DateRangeAggregationBuilder r, Map<String, Column> cols, Leaves leaves, BucketSpec child, long now) {
+            Source c = sourceOf(r, cols, now);
             if (!c.isTimestamp()) {
                 throw new Unsupported("aggregation [" + r.getName() + "] needs a date value, " + c.label() + " is " + c.typeName());
             }
             ZoneId tz = r.timeZone() == null ? ZoneOffset.UTC : r.timeZone();
             String fmt = r.format() == null ? DEFAULT_DATE_FORMAT : r.format();
             DocValueFormat format = new DocValueFormat.DateTime(DateFormatter.forPattern(fmt), tz, DateFieldMapper.Resolution.MILLISECONDS);
-            long now = System.currentTimeMillis();
             List<ExplicitBucket> buckets = new ArrayList<>();
             for (RangeAggregator.Range range : r.ranges()) {
                 // Range bounds are read as given: `to` is exclusive, so it is not rounded up.
@@ -1338,8 +1482,8 @@ public class InfinoAggregationProcessor {
             this.thresholds = thresholds;
         }
 
-        static Significant of(SignificantTermsAggregationBuilder st, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
-            Source c = sourceOf(st, cols);
+        static Significant of(SignificantTermsAggregationBuilder st, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child, long now) {
+            Source c = sourceOf(st, cols, now);
             KeyKind kind = Grouped.kindOf(c);
             if (kind == KeyKind.DOUBLE) {
                 throw new Unsupported("aggregation [" + st.getName() + "] needs a keyword, boolean, integer or date value, " + c.label() + " is " + c.typeName());
@@ -1359,15 +1503,21 @@ public class InfinoAggregationProcessor {
                 thresholds.setShardSize(BucketUtils.suggestShardSideQueueSize(thresholds.getRequiredSize()));
             }
             int candidates = Math.min(MAX_TERMS_SIZE, Math.max(thresholds.getShardSize(), thresholds.getRequiredSize()));
-            String background = InfinoQueryTranslator.ALL;
-            if (st.backgroundFilter() != null) {
-                background = InfinoQueryTranslator.predicate(st.backgroundFilter(), cols, table, System.currentTimeMillis());
-                if (background == null) {
-                    throw new Unsupported("aggregation [" + st.getName() + "] has a background filter the table cannot answer: " + st.backgroundFilter());
-                }
-            }
+            String background = backgroundWhere(st, cols, table, now);
             SignificanceHeuristic heuristic = st.significanceHeuristic() == null ? new JLHScore() : st.significanceHeuristic();
             return new Significant(st, leaves, child, table, c, kind, background, candidates, thresholds.getMinDocCount(), heuristic, thresholds);
+        }
+
+        /** The background filter of {@code st} over {@code table} as a predicate; every row when it names none. */
+        static String backgroundWhere(SignificantTermsAggregationBuilder st, Map<String, Column> cols, String table, long now) {
+            if (st.backgroundFilter() == null) {
+                return InfinoQueryTranslator.ALL;
+            }
+            String background = InfinoQueryTranslator.predicate(st.backgroundFilter(), cols, table, now);
+            if (background == null) {
+                throw new Unsupported("aggregation [" + st.getName() + "] has a background filter the table cannot answer: " + st.backgroundFilter());
+            }
+            return background;
         }
 
         String keyExpr() {
@@ -1432,13 +1582,13 @@ public class InfinoAggregationProcessor {
             this.after = after;
         }
 
-        static Composite of(CompositeAggregationBuilder c, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
+        static Composite of(CompositeAggregationBuilder c, Map<String, Column> cols, Leaves leaves, BucketSpec child, long now) {
             if (c.size() > MAX_TERMS_SIZE) {
                 throw new Unsupported("aggregation [" + c.getName() + "] asks for " + c.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
             }
             List<CompositeSource> sources = new ArrayList<>();
             for (CompositeValuesSourceBuilder<?> s : c.sources()) {
-                sources.add(source(c.getName(), s, cols));
+                sources.add(source(c.getName(), s, cols, now));
             }
             Object[] after = null;
             Map<String, Object> afterKey = afterOf(c);
@@ -1453,7 +1603,7 @@ public class InfinoAggregationProcessor {
                     if (v == null && !s.missingBucket()) {
                         throw new Unsupported("aggregation [" + c.getName() + "] has a null after key for [" + s.name() + "], which has no missing bucket");
                     }
-                    after[i] = v == null ? null : afterLiteral(c.getName(), s, v);
+                    after[i] = v == null ? null : afterLiteral(c.getName(), s, v, now);
                 }
             }
             return new Composite(c, leaves, child, sources, c.size(), after);
@@ -1479,7 +1629,7 @@ public class InfinoAggregationProcessor {
             }
         }
 
-        private static CompositeSource source(String agg, CompositeValuesSourceBuilder<?> s, Map<String, Column> cols) {
+        private static CompositeSource source(String agg, CompositeValuesSourceBuilder<?> s, Map<String, Column> cols, long now) {
             Column column = null;
             if (s.field() != null) {
                 column = InfinoSearch.columnFor(cols, s.field());
@@ -1491,7 +1641,7 @@ public class InfinoAggregationProcessor {
             if (s.script() != null) {
                 // A script reads values themselves, so it sees no masked column, the value script's included.
                 Column valueColumn = column != null && column.masked() ? null : column;
-                Sql sql = InfinoScriptTranslator.translate(s.script(), InfinoAccess.scriptColumns(cols), valueColumn, System.currentTimeMillis());
+                Sql sql = InfinoScriptTranslator.translate(s.script(), InfinoAccess.scriptColumns(cols), valueColumn, now);
                 c = new Source(sql.expr(), sql.type(), "script [" + s.script().getIdOrCode() + "]", null);
             } else if (column != null) {
                 c = Source.of(column);
@@ -1526,9 +1676,9 @@ public class InfinoAggregationProcessor {
         }
 
         /** The after value of a source as an SQL literal, read as the source's key kind. */
-        private static String afterLiteral(String agg, CompositeSource s, Object v) {
+        private static String afterLiteral(String agg, CompositeSource s, Object v, long now) {
             if (s.keyKind() == KeyKind.DATE && v instanceof String text) {
-                Long ms = InfinoQueryTranslator.dateMathMillis(text, null, false, ZoneOffset.UTC, System.currentTimeMillis());
+                Long ms = InfinoQueryTranslator.dateMathMillis(text, null, false, ZoneOffset.UTC, now);
                 if (ms == null) {
                     throw new Unsupported("aggregation [" + agg + "] has an after key [" + text + "] for [" + s.name() + "] that is not a date");
                 }
@@ -1749,8 +1899,8 @@ public class InfinoAggregationProcessor {
     /**
      * {@code significant_terms}: the foreground counts are a terms GROUP BY
      * over the query relation, the most frequent terms first; the background
-     * counts of those terms are a second GROUP BY over the table, and the
-     * table's size (under the background filter) is the superset size.
+     * counts of those terms are a second GROUP BY over the background rows
+     * (see {@link #backgroundRows}), and their number is the superset size.
      */
     private InternalAggregation evalSignificant(Significant s, String from, String where, long subsetSize) {
         String key = s.keyExpr();
@@ -1760,17 +1910,17 @@ public class InfinoAggregationProcessor {
             "SELECT * FROM (SELECT " + select + " FROM " + from + " WHERE (" + where + ") AND " + key + " IS NOT NULL GROUP BY 1" + having
                 + ") t ORDER BY doc_count DESC, k0 ASC LIMIT " + s.candidates
         );
-        String table = quoteIdent(s.table);
-        Map<String, Object> size = oneRow("SELECT COUNT(*) AS c FROM " + table + " WHERE " + s.backgroundWhere);
-        long supersetSize = asLong(size.get("c"));
+        // No tables: this shard answers over no rows (see evaluateNothing), its background included.
+        String backgroundRows = tables.isEmpty() ? null : backgroundRows(s);
+        long supersetSize = backgroundRows == null ? 0 : asLong(oneRow("SELECT COUNT(*) AS c FROM " + backgroundRows).get("c"));
         Map<String, Long> background = new HashMap<>();
-        if (!foreground.isEmpty()) {
+        if (!foreground.isEmpty() && backgroundRows != null) {
             List<String> literals = new ArrayList<>();
             for (Map<String, Object> row : foreground) {
                 literals.add(Grouped.keyLiteral(s.keyKind, row.get("k0")));
             }
             for (Map<String, Object> row : InfinoNative.sqlRows(
-                "SELECT " + key + " AS k0, COUNT(*) AS bg FROM " + table + " WHERE (" + s.backgroundWhere + ") AND " + key + " IN (" + String.join(", ", literals) + ") GROUP BY 1"
+                "SELECT k0, COUNT(*) AS bg FROM " + backgroundRows + " WHERE k0 IN (" + String.join(", ", literals) + ") GROUP BY 1"
             )) {
                 background.put(keyString(row.get("k0")), asLong(row.get("bg")));
             }
@@ -1788,6 +1938,29 @@ public class InfinoAggregationProcessor {
             nested.add(s.child == null ? null : evalBucket(s.child, from, w, subsetDf));
         }
         return s.build(candidates, topHits, nested, subsetSize, supersetSize);
+    }
+
+    /**
+     * The key of every row a significant_terms level's background counts
+     * run over, as a relation of one column, {@code k0}: the rows of each
+     * table the aggregations read that the background filter keeps and the
+     * user may see. The document-level rule applies to the background as to
+     * the foreground; without it the background counts would reveal how
+     * often a term occurs in documents the user may not read.
+     */
+    private String backgroundRows(Significant s) {
+        SignificantTermsAggregationBuilder st = (SignificantTermsAggregationBuilder) s.builder;
+        List<String> branches = new ArrayList<>();
+        for (String t : tables) {
+            Map<String, Column> full = InfinoNative.columns(t);
+            String where = t.equals(s.table) ? s.backgroundWhere : Significant.backgroundWhere(st, plan.access().columns(full), t, plan.nowMillis());
+            String rule = plan.access().documentsWhere(full, t, plan.nowMillis());
+            if (rule != null) {
+                where = "(" + where + ") AND " + rule;
+            }
+            branches.add("SELECT " + s.keyExpr() + " AS k0 FROM " + quoteIdent(t) + " WHERE " + where);
+        }
+        return "(" + String.join(" UNION ALL ", branches) + ") AS " + quoteIdent(BACKGROUND_ALIAS);
     }
 
     /** The composite page: the GROUP BY over every key, past the after key, in key order, cut to size. */

@@ -15,6 +15,7 @@ import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.routing.ShardIterator;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
@@ -24,9 +25,12 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -106,7 +110,8 @@ public class InfinoSearchActionFilter implements ActionFilter {
             // Served by the shards, which plan from the source as written (see
             // InfinoQueryExt): the cluster routes it as it routes any search,
             // a scroll included, and merges the shards' results.
-            search.source(InfinoQueryExt.route(search.source() == null ? new SearchSourceBuilder() : search.source()));
+            SearchSourceBuilder written = search.source() == null ? new SearchSourceBuilder() : search.source();
+            search.source(InfinoQueryExt.route(written, reachedShards(clusters, names, state, search, concrete)));
             chain.proceed(task, action, request, listener);
             return;
         }
@@ -138,5 +143,26 @@ public class InfinoSearchActionFilter implements ActionFilter {
             log.debug("[infino] search over {} failed: {}", infino, e.getMessage());
             listener.onFailure(e);
         }
+    }
+
+    /**
+     * The shard numbers of each index the search reaches, as the cluster
+     * will route it (its routing values and shard preference applied),
+     * ascending, by index name.
+     */
+    private static Map<String, List<Integer>> reachedShards(
+        ClusterService clusters,
+        IndexNameExpressionResolver names,
+        ClusterState state,
+        SearchRequest search,
+        String[] concrete
+    ) {
+        Map<String, Set<String>> routing = names.resolveSearchRouting(state, search.routing(), search.indices());
+        Map<String, List<Integer>> out = new TreeMap<>();
+        for (ShardIterator shard : clusters.operationRouting().searchShards(state, concrete, routing, search.preference())) {
+            out.computeIfAbsent(shard.shardId().getIndexName(), k -> new ArrayList<>()).add(shard.shardId().id());
+        }
+        out.values().forEach(Collections::sort);
+        return out;
     }
 }

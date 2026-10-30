@@ -15,6 +15,7 @@ import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.grouping.CollapseTopFieldDocs;
 import org.apache.lucene.util.BytesRef;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.document.DocumentField;
@@ -66,9 +67,14 @@ import java.util.List;
  * shard's: a sorted page carries each hit's sort values (with the id the
  * table breaks ties on), a collapsed one its collapse value, and the
  * aggregations are the table's, which the coordinating node reduces. A
- * scroll pages in a fixed order, the id's when the request names none:
- * each round resumes after the last hit the coordinating node handed out
- * from this shard, as the action layer's scroll resumes after its last.
+ * cardinality or percentiles result is built from the engine's exact values
+ * and cannot be merged from the shards' parts, so when one is asked for
+ * over several shards, the first reached shard answers the aggregations
+ * over every reached shard's table and the others over no rows. Every shard
+ * reads {@code now} as the coordinating node set it. A scroll pages in a
+ * fixed order, the id's when the request names none: each round resumes
+ * after the last hit the coordinating node handed out from this shard, as
+ * the action layer's scroll resumes after its last.
  */
 public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
 
@@ -78,6 +84,8 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
     private static final TimeValue KEPT_HIT_TTL = TimeValue.timeValueMinutes(5);
     /** How a date sort value read back from the table as text is parsed to the epoch millis a sort compares. */
     private static final String SORT_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
+    /** Pages one later scroll round reads at most while it looks for rows its reader knows (see scrollRows). */
+    private static final int MAX_SCROLL_PAGES = 100;
 
     /** The hits of each shard's query phase, by search, shard and id, until its fetch phase takes them. */
     private static final Cache<String, SearchHit> KEPT = CacheBuilder.<String, SearchHit>builder()
@@ -156,11 +164,19 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         ScrollContext scroll = context.scrollContext();
         boolean laterRound = scroll != null && scroll.totalHits != null;
         SearchSourceBuilder source = scroll == null ? carried.source() : scrollRound(carried.source(), scroll, laterRound);
-        InfinoSearch.Plan plan = InfinoSearch.plan(table, source, System.currentTimeMillis(), access);
+        // The coordinating node's clock, so every shard reads `now` the same.
+        long now = carried.nowMillis();
+        InfinoSearch.Plan plan = InfinoSearch.plan(table, source, now, access);
 
         Collection<AggregationBuilder> builders = InfinoSearch.builders(source);
+        // A cardinality or percentiles result is built from the engine's exact
+        // values, and the coordinating node cannot merge such results from the
+        // shards' parts: the first reached shard answers the aggregations over
+        // every reached shard's table, the others over no rows.
+        List<Integer> reached = carried.shards(index.getName());
+        boolean overShards = !builders.isEmpty() && reached != null && reached.size() > 1 && InfinoAggregationProcessor.needsExactValues(builders);
         boolean exact = trackTotal(source);
-        boolean sharedTotal = !builders.isEmpty() && plan.vector() == null && plan.postWhere() == null && exact;
+        boolean sharedTotal = !builders.isEmpty() && !overShards && plan.vector() == null && plan.postWhere() == null && exact;
         boolean countWithAggs = sharedTotal && source.size() == 0;
         InfinoSearch.Page page = InfinoSearch.page(index, plan, source, !countWithAggs);
         long total = page.total();
@@ -168,11 +184,15 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             // A search over several shards (this index's, or other indices')
             // is reduced on the coordinating node from each shard's groups.
             boolean shardOfMany = context.request().numberOfShards() > 1;
-            InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(index, shardOfMany).evaluate(
-                builders,
-                plan,
-                sharedTotal && !countWithAggs ? page.total() : null
-            );
+            InfinoAggregationProcessor processor = new InfinoAggregationProcessor(index, shardOfMany);
+            InfinoAggregationProcessor.Counted counted;
+            if (!overShards) {
+                counted = processor.evaluate(builders, plan, sharedTotal && !countWithAggs ? page.total() : null);
+            } else if (reached.get(0) == shardId.id()) {
+                counted = processor.evaluateOver(builders, plan, shardPlans(context, reached, source, now, access));
+            } else {
+                counted = processor.evaluateNothing(builders, plan);
+            }
             context.queryResult().aggregations(counted.aggregations());
             if (countWithAggs) {
                 total = counted.total();
@@ -182,15 +202,19 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             ? scroll.totalHits
             : new TotalHits(total, page.exact() ? TotalHits.Relation.EQUAL_TO : TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
 
+        List<SearchHit> rows = page.hits();
+        if (laterRound) {
+            rows = scrollRows(searcher, carried.source(), source, plan, index, rows);
+        }
         boolean sorted = !plan.sorts().isEmpty();
         boolean collapsed = plan.collapse() != null;
         SortField[] sortFields = sorted ? sortFields(plan.sorts()) : collapsed ? new SortField[] { SortField.FIELD_SCORE } : null;
-        List<ScoreDoc> docs = new ArrayList<>(page.hits().size());
+        List<ScoreDoc> docs = new ArrayList<>(rows.size());
         List<Object> collapseValues = new ArrayList<>();
-        for (SearchHit h : page.hits()) {
+        for (SearchHit h : rows) {
             int doc = docId(searcher, h.getId());
             if (doc < 0) {
-                continue; // in the table, not yet in the skeleton the fetch phase reads
+                continue; // in the table, not in the skeleton reader this search holds (see scrollRows)
             }
             KEPT.put(key(carried.request(), shardId, h.getId()), h);
             float score = Float.isNaN(h.getScore()) && !sorted ? 1.0f : h.getScore();
@@ -261,6 +285,52 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             round.searchAfter(searchAfter(last.fields));
         }
         return round;
+    }
+
+    /** The plan of the search over each reached shard's table, in shard order. */
+    private static List<InfinoSearch.Plan> shardPlans(SearchContext context, List<Integer> reached, SearchSourceBuilder source, long now, InfinoAccess access) {
+        IndexMetadata md = context.indexShard().indexSettings().getIndexMetadata();
+        List<InfinoSearch.Plan> out = new ArrayList<>(reached.size());
+        for (int shard : reached) {
+            out.add(InfinoSearch.plan(InfinoPlugin.tables().ensure(md, shard), source, now, access));
+        }
+        return out;
+    }
+
+    /**
+     * The rows of a later scroll round, read past the rows its skeleton
+     * reader does not know. The reader is the one the scroll opened with,
+     * so a row written since is in the table but has no document there; a
+     * round whose page held only such rows would come back empty and end
+     * the scroll before its last row. The round pages on, after the last row
+     * read, until it holds as many known rows as it asks for or the table
+     * runs out.
+     */
+    private static List<SearchHit> scrollRows(
+        ContextIndexSearcher searcher,
+        SearchSourceBuilder written,
+        SearchSourceBuilder round,
+        InfinoSearch.Plan plan,
+        Index index,
+        List<SearchHit> first
+    ) throws IOException {
+        int size = round.size() < 0 ? InfinoSearch.DEFAULT_SIZE : round.size();
+        List<SearchHit> known = new ArrayList<>();
+        List<SearchHit> page = first;
+        for (int pages = 1;; pages++) {
+            for (SearchHit h : page) {
+                if (known.size() < size && docId(searcher, h.getId()) >= 0) {
+                    known.add(h);
+                }
+            }
+            if (known.size() >= size || page.size() < size || pages == MAX_SCROLL_PAGES) {
+                return known;
+            }
+            SearchHit last = page.get(page.size() - 1);
+            SearchSourceBuilder next = InfinoSearch.scrollSource(written).searchAfter(searchAfter(sortValues(last.getSortValues(), plan.sorts())));
+            InfinoSearch.Plan nextPlan = InfinoSearch.plan(plan.table(), next, plan.nowMillis(), plan.access());
+            page = InfinoSearch.page(index, nextPlan, next, false).hits();
+        }
     }
 
     /** Whether the request asks for the exact total (the default). */

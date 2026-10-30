@@ -102,7 +102,7 @@ public final class InfinoSearch {
      */
     private static final int RANK_WINDOW = 10_000;
     /** OpenSearch's page size when the request names none. */
-    private static final int DEFAULT_SIZE = 10;
+    static final int DEFAULT_SIZE = 10;
     /** The node name a hit's shard target carries; it only names the index in the response. */
     private static final String NODE = "infino";
     /** How a date in a hit's source is read back before it is printed in a requested format. */
@@ -121,7 +121,7 @@ public final class InfinoSearch {
      * the aggregations. {@code collapse} is the column hits are collapsed on
      * (null when none), {@code searchAfter} the sort values the page starts
      * after (null when none), {@code access} what the request may see of
-     * each document.
+     * each document, {@code nowMillis} the time {@code now} means in it.
      */
     record Plan(
         String table,
@@ -133,7 +133,8 @@ public final class InfinoSearch {
         Column collapse,
         Object[] searchAfter,
         List<ScriptedField> scriptFields,
-        InfinoAccess access
+        InfinoAccess access,
+        long nowMillis
     ) {
         List<String> orderBy() {
             return InfinoSearch.orderBy(sorts);
@@ -235,7 +236,7 @@ public final class InfinoSearch {
             query = new Translation(query.table(), where, query.principal());
         }
         log.debug("[infino] query {} -> FROM {} WHERE {}", qb, query.from(), query.where());
-        List<SortSpec> sorts = sorts(source.sorts(), cols);
+        List<SortSpec> sorts = sorts(source.sorts(), cols, nowMillis);
         String postWhere = null;
         if (source.postFilter() != null) {
             if (vector != null) {
@@ -299,7 +300,7 @@ public final class InfinoSearch {
                 throw new IllegalArgumentException("[infino] search_after is not served with a vector query");
             }
         }
-        Plan plan = new Plan(table, cols, query, sorts, vector, postWhere, collapse, searchAfter, scriptFields, access);
+        Plan plan = new Plan(table, cols, query, sorts, vector, postWhere, collapse, searchAfter, scriptFields, access, nowMillis);
         InfinoAggregationProcessor.check(builders(source), plan);
         return plan;
     }
@@ -356,9 +357,9 @@ public final class InfinoSearch {
     /**
      * The field sorts over columns, in request order; {@code _score} and
      * {@code _doc} add nothing. Throws when a sort names something the table
-     * has no column for.
+     * has no column for. {@code nowMillis} is what a script's clock reads.
      */
-    static List<SortSpec> sorts(List<SortBuilder<?>> sorts, Map<String, Column> cols) {
+    static List<SortSpec> sorts(List<SortBuilder<?>> sorts, Map<String, Column> cols, long nowMillis) {
         List<SortSpec> out = new ArrayList<>();
         if (sorts == null) {
             return out;
@@ -369,7 +370,7 @@ public final class InfinoSearch {
             }
             if (sort instanceof ScriptSortBuilder ss) {
                 // A script sort orders by the script as a column expression; a script sees no masked column.
-                Sql sql = InfinoScriptTranslator.translate(ss.script(), InfinoAccess.scriptColumns(cols), null, System.currentTimeMillis());
+                Sql sql = InfinoScriptTranslator.translate(ss.script(), InfinoAccess.scriptColumns(cols), null, nowMillis);
                 out.add(new SortSpec(sql.expr(), "sort" + out.size(), sql.type(), ss.order() == SortOrder.DESC));
                 continue;
             }
@@ -632,7 +633,7 @@ public final class InfinoSearch {
     private static String keysetPredicate(Plan plan) {
         List<String> alternatives = new ArrayList<>();
         List<String> equal = new ArrayList<>();
-        long now = System.currentTimeMillis();
+        long now = plan.nowMillis();
         for (int i = 0; i < plan.searchAfter().length; i++) {
             SortSpec s = plan.sorts().get(i);
             String col = s.expr();
