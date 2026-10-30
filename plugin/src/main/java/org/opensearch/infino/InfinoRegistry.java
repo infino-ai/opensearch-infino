@@ -146,30 +146,36 @@ final class InfinoRegistry {
     static void record(IndexMetadata md) {
         String name = md.getIndex().getName();
         try {
-            declare();
-            // A row the registry holds under this name is replaced in the same
-            // mutation as the append; a first row is appended. The engine's
-            // update replaces only what it matches, one row for one, so the
-            // rows are counted first. Two writers registering the index at
-            // once (a loader's parts) can leave it two rows, which a
-            // replace of one refuses: those rows go, and one is appended.
-            long held = heldRows(name);
-            if (held > 1) {
-                InfinoNative.deleteOsids(TABLE, new String[] { name }, 1);
-            }
-            List<String> replaced = held == 1 ? List.of(name) : List.of();
-            Pointer prepared = InfinoNative.prepare(TABLE, List.of(name), List.of(rowOf(md)));
-            if (prepared == null) {
-                throw new IllegalStateException("the registry row could not be prepared");
-            }
-            // The registry's rows are the node's own bookkeeping: no client conditions a write on them.
-            InfinoNative.PreparedResult result = InfinoNative.appendPrepared(TABLE, List.of(prepared), replaced, null);
-            if (!result.failed().isEmpty()) {
-                throw new IllegalStateException(result.failed().get(0).reason());
-            }
+            write(name, rowOf(md));
             recorded.put(name, md.getVersion());
         } catch (Exception e) {
             log.warn("[infino] index {} could not be recorded in the registry", name, e);
+        }
+    }
+
+    /**
+     * Write the registry row {@code id} with {@code source}. A row the
+     * registry holds under the id is replaced in the same mutation as the
+     * append; a first row is appended. The engine's update replaces only what
+     * it matches, one row for one, so the rows are counted first. Two writers
+     * registering at once (a loader's parts) can leave two rows, which a
+     * replace of one refuses: those rows go, and one is appended.
+     */
+    static void write(String id, String source) {
+        declare();
+        long held = heldRows(id);
+        if (held > 1) {
+            InfinoNative.deleteOsids(TABLE, new String[] { id }, 1);
+        }
+        List<String> replaced = held == 1 ? List.of(id) : List.of();
+        Pointer prepared = InfinoNative.prepare(TABLE, List.of(id), List.of(source));
+        if (prepared == null) {
+            throw new IllegalStateException("the registry row could not be prepared");
+        }
+        // The registry's rows are the node's own bookkeeping: no client conditions a write on them.
+        InfinoNative.PreparedResult result = InfinoNative.appendPrepared(TABLE, List.of(prepared), replaced, null);
+        if (!result.failed().isEmpty()) {
+            throw new IllegalStateException(result.failed().get(0).reason());
         }
     }
 

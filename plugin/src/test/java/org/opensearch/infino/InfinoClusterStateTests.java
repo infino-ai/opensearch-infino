@@ -65,13 +65,7 @@ public class InfinoClusterStateTests extends OpenSearchTestCase {
             "template",
             Map.of("settings", Map.of("index.lifecycle.name", "logs", "index.default_pipeline", "tag"), "mappings", Map.of())
         );
-        InfinoClusterState.Item item = new InfinoClusterState.Item(
-            "_cluster/index_template/logs",
-            "index_template",
-            InfinoClusterState.Kind.INDEX_TEMPLATE,
-            "logs",
-            composable
-        );
+        InfinoClusterState.Item item = new InfinoClusterState.Item("index_template", InfinoClusterState.Kind.INDEX_TEMPLATE, "logs", composable);
         List<String> leftOut = new ArrayList<>();
         Map<String, Object> held = InfinoClusterState.heldToKnownSettings(item, KNOWN, leftOut);
         Map<String, Object> settings = (Map<String, Object>) ((Map<String, Object>) held.get("template")).get("settings");
@@ -82,7 +76,7 @@ public class InfinoClusterStateTests extends OpenSearchTestCase {
         Map<String, Object> legacy = Map.of("index_patterns", List.of("old-*"), "settings", Map.of("index.lifecycle.name", "logs"));
         List<String> legacyLeftOut = new ArrayList<>();
         Map<String, Object> heldLegacy = InfinoClusterState.heldToKnownSettings(
-            new InfinoClusterState.Item("_cluster/template/old", "template", InfinoClusterState.Kind.TEMPLATE, "old", legacy),
+            new InfinoClusterState.Item("template", InfinoClusterState.Kind.TEMPLATE, "old", legacy),
             KNOWN,
             legacyLeftOut
         );
@@ -95,7 +89,7 @@ public class InfinoClusterStateTests extends OpenSearchTestCase {
         assertEquals(
             pipeline,
             InfinoClusterState.heldToKnownSettings(
-                new InfinoClusterState.Item("_cluster/ingest_pipeline/p", "ingest_pipeline", InfinoClusterState.Kind.INGEST_PIPELINE, "p", pipeline),
+                new InfinoClusterState.Item("ingest_pipeline", InfinoClusterState.Kind.INGEST_PIPELINE, "p", pipeline),
                 KNOWN,
                 none
             )
@@ -103,7 +97,27 @@ public class InfinoClusterStateTests extends OpenSearchTestCase {
         assertTrue(none.isEmpty());
     }
 
+    public void testAStateRowListsItsItemsInTheOrderTheyAreApplied() {
+        String row = "{\"items\": ["
+            + "{\"kind\": \"user\", \"name\": \"ana\", \"body\": {\"hash\": \"$2y$12$x\", \"backend_roles\": [\"reader\"]}},"
+            + "{\"kind\": \"data_stream\", \"name\": \"logs\", \"body\": {}},"
+            + "\"not an item\","
+            + "{\"kind\": \"role\", \"name\": \"reader\", \"body\": {\"cluster_permissions\": [\"cluster_monitor\"]}},"
+            + "{\"kind\": \"component_template\", \"name\": \"base\", \"body\": {\"template\": {}}}"
+            + "]}";
+        List<InfinoClusterState.Item> items = InfinoClusterState.items(row);
+        assertEquals(List.of("base", "reader", "ana", "logs"), items.stream().map(InfinoClusterState.Item::name).toList());
+        // A kind this node does not know is kept, to be reported, and comes last.
+        assertNull(items.get(3).kind());
+        assertEquals("data_stream", items.get(3).kindKey());
+        assertEquals(Map.of("hash", "$2y$12$x", "backend_roles", List.of("reader")), items.get(2).body());
+        // What a pass writes back for the items that failed reads as those items.
+        assertEquals(items.subList(2, 4), InfinoClusterState.items(InfinoClusterState.source(items.subList(2, 4))));
+        assertEquals(List.of(), InfinoClusterState.items("{}"));
+    }
+
     public void testOnlyAClusterStateRowIsTakenForOne() {
+        assertTrue(InfinoClusterState.isClusterRow(InfinoClusterState.STATE_ROW));
         assertTrue(InfinoClusterState.isClusterRow("_cluster/user/ana"));
         // No index name begins with an underscore, so an index's row never is one.
         assertFalse(InfinoClusterState.isClusterRow("logs"));

@@ -44,10 +44,12 @@ import java.util.TreeMap;
  * what a snapshot of another cluster held besides its indices - its
  * persistent settings, index and component templates, ingest and search
  * pipelines and stored scripts - and the security plugin's action groups,
- * tenants, roles, users and role mappings. One row per item in the
- * indices' registry ({@link InfinoRegistry#TABLE}), its id beginning with
- * {@link #ROW_PREFIX}, which no index name can: its kind, its name, and the
- * body the cluster's own REST API takes to create it.
+ * tenants, roles, users and role mappings. One row of the indices' registry
+ * ({@link InfinoRegistry#TABLE}) holds all of it ({@link #STATE_ROW}, an id
+ * beginning with {@link #ROW_PREFIX}, which no index name can): each item's
+ * kind, its name, and the body the cluster's own REST API takes to create
+ * it. One row is written in one mutation, so the registry never holds part
+ * of a state, or none while a new one replaces the old.
  *
  * <p>{@code POST /_plugins/_infino/account/indices} applies every registered
  * item before it creates the indices, so an index comes up with its
@@ -69,8 +71,11 @@ final class InfinoClusterState {
      * index name never begins with an underscore, so no index's row is one.
      */
     static final String ROW_PREFIX = "_cluster/";
+    /** The id of the registry row that holds the cluster state. */
+    static final String STATE_ROW = ROW_PREFIX + "state";
 
-    /** The keys of a row's source. */
+    /** The key of the state row's source that lists its items, and the keys of an item. */
+    private static final String ITEMS = "items";
     private static final String KIND = "kind";
     private static final String NAME = "name";
     private static final String BODY = "body";
@@ -131,8 +136,8 @@ final class InfinoClusterState {
         }
     }
 
-    /** One registered item: its row's id, its kind (null for one this node does not know), its name and its body. */
-    record Item(String osid, String kindKey, Kind kind, String name, Map<String, Object> body) {}
+    /** One registered item: its kind (null for one this node does not know), its name and its body. */
+    record Item(String kindKey, Kind kind, String name, Map<String, Object> body) {}
 
     /** What became of an item: applied, or failed with the cluster's status and answer. */
     record Applied(String kind, String name, boolean applied, int status, String reason, List<String> leftOut) {}
@@ -162,27 +167,54 @@ final class InfinoClusterState {
         emptyContext = empty;
     }
 
-    /** The registered items, in the order they are applied. Reads the engine: never on a transport or applier thread. */
+    /**
+     * The registered items, in the order they are applied: those of the
+     * state row. Two loader parts registering together can leave the row
+     * twice, each the same state, so the first is read. Reads the engine:
+     * never on a transport or applier thread.
+     */
     static List<Item> registered() {
-        List<Item> items = new ArrayList<>();
         for (Map<String, Object> row : InfinoRegistry.rawRows()) {
-            Object osid = row.get(InfinoQueryTranslator.OSID);
             Object source = row.get(InfinoQueryTranslator.SOURCE);
-            if (osid == null || source == null || !isClusterRow(osid.toString())) {
+            if (STATE_ROW.equals(row.get(InfinoQueryTranslator.OSID)) && source != null) {
+                return items(source.toString());
+            }
+        }
+        return List.of();
+    }
+
+    /** The items a state row's source lists, in the order they are applied. */
+    static List<Item> items(String source) {
+        List<Item> items = new ArrayList<>();
+        Object listed = InfinoNative.object(source).get(ITEMS);
+        for (Object entry : listed instanceof List<?> list ? list : List.of()) {
+            if (!(entry instanceof Map<?, ?> item)) {
                 continue;
             }
-            Map<String, Object> item = InfinoNative.object(source.toString());
             String kindKey = String.valueOf(item.get(KIND));
             Object body = item.get(BODY);
             @SuppressWarnings("unchecked")
             Map<String, Object> fields = body instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
-            items.add(new Item(osid.toString(), kindKey, Kind.of(kindKey), String.valueOf(item.get(NAME)), fields));
+            items.add(new Item(kindKey, Kind.of(kindKey), String.valueOf(item.get(NAME)), fields));
         }
         items.sort(
             Comparator.comparingInt((Item item) -> item.kind() == null ? Kind.values().length : item.kind().ordinal())
                 .thenComparing(Item::name)
         );
         return items;
+    }
+
+    /** The source of a state row listing {@code items}, as a loader writes one. */
+    static String source(List<Item> items) {
+        try (XContentBuilder b = XContentFactory.jsonBuilder()) {
+            b.startObject().startArray(ITEMS);
+            for (Item item : items) {
+                b.startObject().field(KIND, item.kindKey()).field(NAME, item.name()).field(BODY, item.body()).endObject();
+            }
+            return b.endArray().endObject().toString();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /** Whether a registry row with id {@code osid} is an item of cluster state rather than an index. */
@@ -236,7 +268,7 @@ final class InfinoClusterState {
         Loopback channel,
         ActionListener<List<Applied>> done,
         List<Applied> applied,
-        List<String> appliedRows
+        List<Item> failed
     ) {
         Run(
             ThreadPool threadPool,
@@ -298,22 +330,25 @@ final class InfinoClusterState {
             String reason = ok ? null : answer.length() > MAX_REASON_CHARS ? answer.substring(0, MAX_REASON_CHARS) : answer;
             applied.add(new Applied(item.kindKey(), item.name(), ok, status, reason, List.copyOf(leftOut)));
             if (ok) {
-                appliedRows.add(item.osid());
                 if (!leftOut.isEmpty()) {
                     log.warn("[infino] the registered {} [{}] was applied without the settings this cluster does not know: {}", item.kindKey(), item.name(), leftOut);
                 }
             } else {
+                failed.add(item);
                 log.warn("[infino] the registered {} [{}] was not applied: {} {}", item.kindKey(), item.name(), status, reason);
             }
         }
 
+        /** The state row keeps only the items that failed, in one mutation; none left, it goes. */
         private void finish() {
-            if (!appliedRows.isEmpty()) {
-                try {
-                    InfinoNative.deleteOsids(InfinoRegistry.TABLE, appliedRows.toArray(new String[0]), appliedRows.size());
-                } catch (Exception e) {
-                    log.warn("[infino] the applied cluster state could not be removed from the registry; a later call applies it again", e);
+            try {
+                if (failed.isEmpty()) {
+                    InfinoNative.deleteOsids(InfinoRegistry.TABLE, new String[] { STATE_ROW }, 1);
+                } else if (failed.size() < items.size()) {
+                    InfinoRegistry.write(STATE_ROW, source(failed));
                 }
+            } catch (Exception e) {
+                log.warn("[infino] the applied cluster state could not be removed from the registry; a later call applies it again", e);
             }
             done.onResponse(List.copyOf(applied));
         }
