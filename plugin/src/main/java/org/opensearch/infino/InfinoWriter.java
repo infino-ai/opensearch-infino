@@ -17,6 +17,7 @@ import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.support.replication.ReplicationResponse;
 import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.action.update.UpdateResponse;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
@@ -32,6 +33,7 @@ import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.Condition;
@@ -67,7 +69,12 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>Each write is given the next sequence number of its table when its
  * batch is written, in the order the batch staged it, and the table stores
  * the number beside the row. A table's flushes run one at a time on this
- * node, so the numbers rise in the order the writes commit. A write
+ * node, so the numbers rise in the order the writes commit. One node writes
+ * a table, the one holding its index's primary shard (see
+ * {@link InfinoBulkActionFilter#dispatch}); when that copy changes (the
+ * primary moves, or another copy takes over) the next number is read from
+ * the table again, so a number given elsewhere meanwhile is never given
+ * twice. A write
  * conditioned on a sequence number is checked then, against the number the
  * table stores for its id or the one the write before it in the batch was
  * given (see {@link InfinoDocumentVersion}).
@@ -140,6 +147,8 @@ public final class InfinoWriter {
          * {@link #lock}.
          */
         long nextSeq = UNREAD;
+        /** The copy that wrote the table when {@link #nextSeq} was read; another copy since means it is read again. */
+        String seqAllocation;
     }
 
     private final ThreadPool threadPool;
@@ -288,8 +297,10 @@ public final class InfinoWriter {
         Set<String> existed;
         Map<String, Long> stored;
         try {
-            if (batch.nextSeq == UNREAD) {
+            String allocation = writerAllocation(staged);
+            if (batch.nextSeq == UNREAD || !Objects.equals(allocation, batch.seqAllocation)) {
                 batch.nextSeq = InfinoNative.maxSeq(table) + 1;
+                batch.seqAllocation = allocation;
             }
             // A conditioned write is checked against the sequence numbers the table
             // stores, read in the same probe as which ids it holds; a batch without
@@ -375,6 +386,15 @@ public final class InfinoWriter {
             }
         }
         return new Applied(refused, written);
+    }
+
+    /** The copy of the batch's index that writes its table, as this node's cluster state names it; null when unknown. */
+    private static String writerAllocation(List<Staged> staged) {
+        ClusterService clusters = InfinoServices.clusterService();
+        if (clusters == null || staged.isEmpty()) {
+            return null;
+        }
+        return InfinoBulkActionFilter.writerAllocation(clusters.state(), staged.get(0).waiter().shardId().getIndex());
     }
 
     /** The prepared batches as one commit, each row under the sequence number its write was given; a refused document is reported under its id. */

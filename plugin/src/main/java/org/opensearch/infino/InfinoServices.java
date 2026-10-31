@@ -17,6 +17,7 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.ingest.IngestService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
 
@@ -38,6 +39,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     private static volatile AutoCreateIndex autoCreateIndex;
     private static volatile IngestService ingestService;
     private static volatile IndexScopedSettings indexScopedSettings;
+    private static volatile TransportService transportService;
 
     @Inject
     public InfinoServices(
@@ -62,6 +64,8 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoServices.ingestService = injector.getInstance(IngestService.class);
         // The index settings this node knows, which a registered index is created with.
         InfinoServices.indexScopedSettings = injector.getInstance(IndexScopedSettings.class);
+        // A write to a table another node writes is sent there (see InfinoBulkActionFilter).
+        InfinoServices.transportService = injector.getInstance(TransportService.class);
         InfinoClient.bind(injector);
         // The security plugin's components, when it runs, come from the same injector.
         InfinoSecurity.bind(injector);
@@ -91,6 +95,11 @@ public final class InfinoServices extends AbstractLifecycleComponent {
 
     static ClusterService clusterService() {
         return clusterService;
+    }
+
+    /** The node's transport, or null before the services are injected. */
+    static TransportService transportService() {
+        return transportService;
     }
 
     static ThreadPool threadPool() {
