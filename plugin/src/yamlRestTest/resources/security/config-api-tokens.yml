@@ -1,0 +1,42 @@
+---
+# The test cluster's authentication on the releases whose security plugin
+# issues API tokens (3.9 and later): the token authenticator first, HTTP
+# basic against the internal user database for everything else.
+_meta:
+  type: "config"
+  config_version: 2
+
+config:
+  dynamic:
+    http:
+      # The build's own wait for cluster health sends no credentials; the
+      # anonymous user may read cluster health (the cluster_health role).
+      anonymous_auth_enabled: true
+      xff:
+        enabled: false
+    api_tokens:
+      enabled: true
+    authc:
+      api_token_auth_domain:
+        description: "API tokens the security plugin issued"
+        http_enabled: true
+        transport_enabled: false
+        order: 0
+        http_authenticator:
+          type: apitoken
+          challenge: false
+          config:
+            enabled: true
+        authentication_backend:
+          type: noop
+      basic_internal_auth_domain:
+        description: "HTTP basic against the internal users"
+        http_enabled: true
+        transport_enabled: true
+        order: 1
+        http_authenticator:
+          type: basic
+          challenge: true
+        authentication_backend:
+          type: intern
+    authz: {}
