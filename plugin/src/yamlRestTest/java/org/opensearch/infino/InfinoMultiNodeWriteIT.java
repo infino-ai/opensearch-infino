@@ -177,11 +177,12 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
 
     /**
      * A repeated count kept in each node's request cache, then a write with
-     * refresh=true through that same node: the next count includes it. One of
-     * the nodes forwards its write to the other, which writes the table. The
-     * index refreshes once a minute, which bounds a kept response's life, so
-     * before, the forwarding node answered from its cache for up to that
-     * minute: it never heard of the write.
+     * refresh=true through that same node: a count soon includes it. One of
+     * the nodes forwards its write to the other, which writes the table, and
+     * reads that node's commit a moment later; until it does, what it reads
+     * must not be kept. The index refreshes once a minute, which bounds a kept
+     * response's life, so a response kept from before the write, or read just
+     * after it and kept, is served for up to that minute.
      */
     public void testAWriteSentToAnotherNodeMovesTheCacheOfTheNodeThatTookIt() throws Exception {
         String index = "multi_cache";

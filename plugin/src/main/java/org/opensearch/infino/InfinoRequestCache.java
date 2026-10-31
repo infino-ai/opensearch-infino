@@ -74,6 +74,12 @@ final class InfinoRequestCache {
     private static final Map<String, AtomicLong> GENERATIONS = new ConcurrentHashMap<>();
     /** Moves when the connection is reopened elsewhere, which changes every table at once. */
     private static final AtomicLong CONNECTION = new AtomicLong();
+    /**
+     * For each table another node wrote on this node's behalf, until when (in
+     * {@link System#nanoTime} terms) a response read here is not kept (see
+     * {@link #writtenElsewhere}).
+     */
+    private static final Map<String, Long> UNSETTLED = new ConcurrentHashMap<>();
 
     private static volatile InfinoRequestCache node;
 
@@ -100,6 +106,32 @@ final class InfinoRequestCache {
     /** {@code table} is about to change, or has: responses read from it before now are not served again. */
     static void changed(String table) {
         GENERATIONS.computeIfAbsent(table, t -> new AtomicLong()).incrementAndGet();
+    }
+
+    /**
+     * {@code table} was just written by another node for a write this node
+     * took and sent there (see {@link InfinoBulkActionFilter#dispatch}). This
+     * node reads another node's commit a moment after it lands, so a response
+     * read here soon after could be from before the write; nothing read from
+     * the table is kept until {@code lifetime} (the index's refresh interval,
+     * the bound a kept response has anyway) has passed.
+     */
+    static void writtenElsewhere(String table, TimeValue lifetime) {
+        changed(table);
+        UNSETTLED.merge(table, System.nanoTime() + lifetime.nanos(), (a, b) -> b - a > 0 ? b : a);
+    }
+
+    /** Whether a write another node made for this node may not show here yet (see {@link #writtenElsewhere}). */
+    private static boolean unsettled(String table) {
+        Long until = UNSETTLED.get(table);
+        if (until == null) {
+            return false;
+        }
+        if (System.nanoTime() - until < 0) {
+            return true;
+        }
+        UNSETTLED.remove(table, until);
+        return false;
     }
 
     /** Every table changed at once: the connection now reads from somewhere else. */
@@ -138,6 +170,11 @@ final class InfinoRequestCache {
         }
         for (InfinoAccess a : access) {
             if (!a.unrestricted()) {
+                return null;
+            }
+        }
+        for (String table : tables) {
+            if (unsettled(table)) {
                 return null;
             }
         }

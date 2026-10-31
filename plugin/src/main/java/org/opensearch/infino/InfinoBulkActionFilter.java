@@ -331,23 +331,25 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 serve(part, partConcrete, partInfino, new BulkItemResponse[slots.size()], writes, tables, partListener);
             } else {
                 // The write lands on another node, which this node's request cache
-                // does not hear from: its responses over these tables move away here,
-                // before the write and once it is answered, as for a write of its own.
-                List<String> written = new ArrayList<>();
+                // does not hear from: its responses over these tables move away here
+                // before the write, and once it is answered nothing read from them is
+                // kept until this node's reads are sure to see it.
+                Map<String, IndexMetadata> written = new LinkedHashMap<>();
                 try {
                     for (IndexMetadata md : partInfino.values()) {
-                        written.add(tables.ensure(md));
+                        written.put(tables.ensure(md), md);
                     }
                 } catch (Exception e) {
                     partListener.onFailure(e);
                     continue;
                 }
-                written.forEach(InfinoRequestCache::changed);
+                written.keySet().forEach(InfinoRequestCache::changed);
+                Runnable settle = () -> written.forEach((t, md) -> InfinoRequestCache.writtenElsewhere(t, InfinoRequestCache.lifetime(List.of(md))));
                 forward(state.nodes().get(destination), part, ActionListener.wrap(response -> {
-                    written.forEach(InfinoRequestCache::changed);
+                    settle.run();
                     partListener.onResponse(response);
                 }, e -> {
-                    written.forEach(InfinoRequestCache::changed);
+                    settle.run();
                     partListener.onFailure(e);
                 }));
             }
