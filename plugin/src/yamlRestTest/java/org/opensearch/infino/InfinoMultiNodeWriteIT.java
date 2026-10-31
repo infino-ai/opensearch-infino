@@ -5,6 +5,7 @@
 package org.opensearch.infino;
 
 import org.junit.After;
+import org.junit.Before;
 import org.opensearch.client.Node;
 import org.opensearch.client.Request;
 import org.opensearch.client.RequestOptions;
@@ -19,9 +20,11 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -171,7 +174,6 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
     }
 
     private void createIndex(String index) throws IOException {
-        assertEquals("the client reaches every node", NODES, getClusterHosts().size());
         Request create = new Request("PUT", "/" + index);
         create.setJsonEntity("{\"settings\":{\"index.infino.enabled\":true,\"number_of_shards\":1,\"number_of_replicas\":0}}");
         client().performRequest(create);
@@ -191,17 +193,36 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
      * names the same node throughout a test.
      */
     private Response performOn(int node, Request request) throws IOException {
-        if (nodeClients.isEmpty()) {
-            List<Node> nodes = new ArrayList<>(client().getNodes());
-            nodes.sort(Comparator.comparing(n -> n.getHost().toString()));
-            for (Node n : nodes) {
-                nodeClients.add(RestClient.builder(n).build());
-            }
-        }
         RequestOptions.Builder options = request.getOptions().toBuilder();
         options.addHeader("Authorization", adminAuthorization());
         request.setOptions(options);
-        return nodeClients.get(node % nodeClients.size()).performRequest(request);
+        assertEquals("a client per node", NODES, nodeClients.size());
+        return nodeClients.get(node).performRequest(request);
+    }
+
+    /**
+     * A client per node of the cluster, ordered by port. The test client
+     * lists every address a node listens on (IPv4 and IPv6 alike); the one a
+     * node publishes picks a single address per node.
+     */
+    @SuppressWarnings("unchecked")
+    @Before
+    public void openNodeClients() throws IOException {
+        Map<String, Object> info = entityAsMap(client().performRequest(new Request("GET", "/_nodes/http")));
+        Set<Integer> published = new HashSet<>();
+        for (Object node : ((Map<String, Object>) info.get("nodes")).values()) {
+            String address = String.valueOf(((Map<String, Object>) ((Map<String, Object>) node).get("http")).get("publish_address"));
+            published.add(Integer.parseInt(address.substring(address.lastIndexOf(':') + 1)));
+        }
+        Map<Integer, Node> byPort = new TreeMap<>();
+        for (Node n : client().getNodes()) {
+            if (published.contains(n.getHost().getPort())) {
+                byPort.putIfAbsent(n.getHost().getPort(), n);
+            }
+        }
+        for (Node n : byPort.values()) {
+            nodeClients.add(RestClient.builder(n).build());
+        }
     }
 
     @After
