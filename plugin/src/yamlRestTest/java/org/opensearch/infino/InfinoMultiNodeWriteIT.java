@@ -50,6 +50,8 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
     private static final int RACED_IDS = 8;
     /** How long a read on one node may take to see another node's commit. */
     private static final long STALENESS_WAIT_SECONDS = 10;
+    /** The cache test's refresh interval: far past the wait, so only an invalidation lets the count move in time. */
+    private static final String CACHE_TEST_REFRESH = "60s";
     /** The status of a write refused for a conflict. */
     private static final int CONFLICT = 409;
 
@@ -173,9 +175,48 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
         }, STALENESS_WAIT_SECONDS, TimeUnit.SECONDS);
     }
 
+    /**
+     * A repeated count kept in each node's request cache, then a write with
+     * refresh=true through that same node: the next count includes it. One of
+     * the nodes forwards its write to the other, which writes the table. The
+     * index refreshes once a minute, which bounds a kept response's life, so
+     * before, the forwarding node answered from its cache for up to that
+     * minute: it never heard of the write.
+     */
+    public void testAWriteSentToAnotherNodeMovesTheCacheOfTheNodeThatTookIt() throws Exception {
+        String index = "multi_cache";
+        createIndex(index, ",\"refresh_interval\":\"" + CACHE_TEST_REFRESH + "\"");
+        for (int node = 0; node < NODES; node++) {
+            int n = node;
+            long before = total(n, index);
+            // The same request again: answered from the node's cache.
+            assertEquals(before, total(n, index));
+            Request put = new Request("PUT", "/" + index + "/_doc/w" + n);
+            put.addParameter("refresh", "true");
+            put.setJsonEntity("{\"n\":" + n + "}");
+            on(n, put);
+            assertBusy(() -> assertEquals("node " + n + " counts its own write", before + 1, total(n, index)), STALENESS_WAIT_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
+    /** The exact count of {@code index}'s documents, asked of node {@code node} as a request its cache keeps. */
+    @SuppressWarnings("unchecked")
+    private long total(int node, String index) throws IOException {
+        Request search = new Request("POST", "/" + index + "/_search");
+        search.addParameter("request_cache", "true");
+        search.setJsonEntity("{\"size\":0,\"track_total_hits\":true}");
+        Map<String, Object> hits = (Map<String, Object>) on(node, search).get("hits");
+        return ((Number) ((Map<String, Object>) hits.get("total")).get("value")).longValue();
+    }
+
     private void createIndex(String index) throws IOException {
+        createIndex(index, "");
+    }
+
+    /** An Infino-backed index of one shard and no replica, with {@code settings} (a JSON fragment, leading comma) added. */
+    private void createIndex(String index, String settings) throws IOException {
         Request create = new Request("PUT", "/" + index);
-        create.setJsonEntity("{\"settings\":{\"index.infino.enabled\":true,\"number_of_shards\":1,\"number_of_replicas\":0}}");
+        create.setJsonEntity("{\"settings\":{\"index.infino.enabled\":true,\"number_of_shards\":1,\"number_of_replicas\":0" + settings + "}}");
         client().performRequest(create);
         Request health = new Request("GET", "/_cluster/health/" + index);
         health.addParameter("wait_for_status", "green");
