@@ -516,15 +516,56 @@ public final class InfinoNative {
     }
 
     /**
-     * {@link #prepare} with each row's routing value (null for none) and
-     * sequence number (negative for none) stamped by writer {@code gen}, kept
-     * in the {@link InfinoQueryTranslator#ROUTING}, {@link InfinoQueryTranslator#SEQ}
-     * and {@link InfinoQueryTranslator#GEN} columns.
+     * {@link #prepare} with each row's routing value (null for none), stamp
+     * and the operation that wrote it (each negative for none), by writer
+     * {@code gen}, kept in the {@link InfinoQueryTranslator#ROUTING},
+     * {@link InfinoQueryTranslator#SEQ}, {@link InfinoQueryTranslator#OP} and
+     * {@link InfinoQueryTranslator#GEN} columns.
      */
-    public static Pointer prepare(String name, List<String> osids, List<String> sources, List<String> routings, long[] seqs, long gen) {
+    public static Pointer prepare(
+        String name,
+        List<String> osids,
+        List<String> sources,
+        List<String> routings,
+        long[] seqs,
+        long[] ops,
+        long gen
+    ) {
         init();
         Packed p = Packed.of(osids, sources, routings);
-        return lib.infino_prepare_batch_meta(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), p.rtEnds(), seqs, gen, osids.size());
+        return lib.infino_prepare_batch_meta(
+            conn,
+            name,
+            p.buf(),
+            p.buf().length,
+            p.idEnds(),
+            p.srcEnds(),
+            p.rtEnds(),
+            seqs,
+            ops,
+            gen,
+            osids.size()
+        );
+    }
+
+    /**
+     * The highest operation writer {@code gen} recorded on a row of table
+     * {@code name}, or null when no row carries one of its operations.
+     */
+    public static Long highestOp(String name, long gen) {
+        if (!columns(name).containsKey(InfinoQueryTranslator.OP)) {
+            return null;
+        }
+        String op = InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.OP);
+        String sql = "SELECT max(" + op + ") AS highest FROM " + InfinoQueryTranslator.quoteIdent(name) + " WHERE "
+            + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.GEN) + " = " + gen;
+        for (Map<String, Object> row : sqlRows(sql)) {
+            Object highest = row.get("highest");
+            if (highest instanceof Number n) {
+                return n.longValue();
+            }
+        }
+        return null;
     }
 
     /**

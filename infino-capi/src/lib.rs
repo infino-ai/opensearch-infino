@@ -67,8 +67,13 @@ const ROUTING: &str = "osrouting";
 /// stamps one: a search over a reader that does not hold that write yet
 /// leaves the row out. The column appears with the first stamped write.
 const SEQ: &str = "osseq";
-/// Which writer stamped a row's [`SEQ`]: sequence numbers compare only
-/// between rows of one writer's history, so a cut leaves another's alone.
+/// The sequence number of the operation that wrote a row, when the writer
+/// records one: the highest in a table says how far into the writer's
+/// history the table holds every write.
+const OP: &str = "osop";
+/// Which writer stamped a row's [`SEQ`] and [`OP`]: sequence numbers
+/// compare only between rows of one writer's history, so a cut leaves
+/// another's alone.
 const GEN: &str = "osgen";
 /// Separator used when a multi-valued string field lands in a scalar string
 /// column: the values are joined so a text index sees every token. The
@@ -1054,20 +1059,23 @@ pub struct Prepared {
     failed: Vec<(usize, String)>,
 }
 
-/// Each row's routing value and sequence number, beside the buffer of ids
+/// Each row's routing value and sequence numbers, beside the buffer of ids
 /// and sources: `rt_ends[i]` is where row i's routing value ends (it follows
-/// the row's source in the buffer; an empty one is none), and `seqs[i]` its
-/// sequence number (negative for none), stamped by writer `gen`.
+/// the row's source in the buffer; an empty one is none), `seqs[i]` its
+/// stamp and `ops[i]` the operation that wrote it (each negative for none),
+/// by writer `gen`.
 #[derive(Clone, Copy)]
 struct RowMeta {
     rt_ends: *const u32,
     seqs: *const i64,
+    ops: *const i64,
     gen: i64,
 }
 
 /// Parse the buffer's documents in parallel and convert them to one Arrow
 /// batch. With `meta`, each row also keeps its routing value in
-/// [`ROUTING`] and its sequence number in [`SEQ`] (see [`RowMeta`]).
+/// [`ROUTING`], its stamp in [`SEQ`] and its operation in [`OP`] (see
+/// [`RowMeta`]).
 #[allow(clippy::too_many_arguments)]
 unsafe fn prepare(
     conn: &Bridge,
@@ -1084,14 +1092,15 @@ unsafe fn prepare(
     let src_ends = unsafe { std::slice::from_raw_parts(src_ends, n) };
     let rt_ends = meta.map(|m| unsafe { std::slice::from_raw_parts(m.rt_ends, n) });
     let seqs = meta.map(|m| unsafe { std::slice::from_raw_parts(m.seqs, n) });
+    let ops = meta.map(|m| unsafe { std::slice::from_raw_parts(m.ops, n) });
     let gen = meta.map_or(0, |m| m.gen);
     let table = conn.table(name).map_err(|e| e.to_string())?;
     let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
     let schema = table.schema();
 
     // Each row's id, source and routing value as borrowed slices of the
-    // buffer, with its sequence number.
-    let mut rows_in: Vec<(&str, &str, &str, i64)> = Vec::with_capacity(n);
+    // buffer, with its stamp and operation.
+    let mut rows_in: Vec<(&str, &str, &str, i64, i64)> = Vec::with_capacity(n);
     let mut start = 0usize;
     for i in 0..n {
         let (id_end, src_end) = (id_ends[i] as usize, src_ends[i] as usize);
@@ -1102,13 +1111,19 @@ unsafe fn prepare(
         let id = std::str::from_utf8(&bytes[start..id_end]).unwrap_or("");
         let src = std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}");
         let routing = std::str::from_utf8(&bytes[src_end..rt_end]).unwrap_or("");
-        rows_in.push((id, src, routing, seqs.map_or(-1, |s| s[i])));
+        rows_in.push((
+            id,
+            src,
+            routing,
+            seqs.map_or(-1, |s| s[i]),
+            ops.map_or(-1, |o| o[i]),
+        ));
         start = rt_end;
     }
 
     let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
         .par_iter()
-        .map(|(id, src, routing, seq)| {
+        .map(|(id, src, routing, seq, op)| {
             conform_doc(src, &schema).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 flat.insert(SOURCE.into(), Value::String((*src).to_string()));
@@ -1117,6 +1132,11 @@ unsafe fn prepare(
                 }
                 if *seq >= 0 {
                     flat.insert(SEQ.into(), json!(*seq));
+                }
+                if *op >= 0 {
+                    flat.insert(OP.into(), json!(*op));
+                }
+                if *seq >= 0 || *op >= 0 {
                     flat.insert(GEN.into(), json!(gen));
                 }
                 flat
@@ -1388,12 +1408,12 @@ pub unsafe extern "C" fn infino_prepare_batch(
     .unwrap_or(ptr::null_mut())
 }
 
-/// [`infino_prepare_batch`] for documents with a routing value and a
-/// sequence number each: the buffer holds `id0 source0 routing0 id1 ...`,
-/// `rt_ends[i]` is where row i's routing value ends (an empty one is none)
-/// and `seqs[i]` is its sequence number (negative for none), stamped by
-/// writer `gen`. A row keeps them in the `osrouting`, `osseq` and `osgen`
-/// columns.
+/// [`infino_prepare_batch`] for documents with a routing value and two
+/// sequence numbers each: the buffer holds `id0 source0 routing0 id1 ...`,
+/// `rt_ends[i]` is where row i's routing value ends (an empty one is none),
+/// `seqs[i]` is its stamp and `ops[i]` the operation that wrote it (each
+/// negative for none), by writer `gen`. A row keeps them in the
+/// `osrouting`, `osseq`, `osop` and `osgen` columns.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn infino_prepare_batch_meta(
@@ -1405,6 +1425,7 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
     src_ends: *const u32,
     rt_ends: *const u32,
     seqs: *const i64,
+    ops: *const i64,
     gen: i64,
     count: c_int,
 ) -> *mut Prepared {
@@ -1417,6 +1438,7 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
             || src_ends.is_null()
             || rt_ends.is_null()
             || seqs.is_null()
+            || ops.is_null()
             || count <= 0
         {
             return ptr::null_mut();
@@ -1429,7 +1451,12 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
                 buf_len,
                 id_ends,
                 src_ends,
-                Some(RowMeta { rt_ends, seqs, gen }),
+                Some(RowMeta {
+                    rt_ends,
+                    seqs,
+                    ops,
+                    gen,
+                }),
                 count as usize,
             )
         } {

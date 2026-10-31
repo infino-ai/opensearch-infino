@@ -91,9 +91,10 @@ public final class InfinoTables {
     /**
      * The mapping a table is declared from: the index's, and for an index in
      * engine mode the columns its engine writes beside the documents' fields
-     * (a row's routing value, and the sequence number and generation it is
-     * stamped with), declared so that every batch is converted against
-     * declared columns rather than typed from its documents.
+     * (a row's routing value, the sequence numbers it is stamped and was
+     * written with, and their generation), declared so that every batch is
+     * converted against declared columns rather than typed from its
+     * documents.
      */
     @SuppressWarnings("unchecked")
     private static String tableMapping(IndexMetadata md) {
@@ -108,6 +109,7 @@ public final class InfinoTables {
         }
         properties.put(InfinoQueryTranslator.ROUTING, Map.of(TYPE, KEYWORD));
         properties.put(InfinoQueryTranslator.SEQ, Map.of(TYPE, LONG));
+        properties.put(InfinoQueryTranslator.OP, Map.of(TYPE, LONG));
         properties.put(InfinoQueryTranslator.GEN, Map.of(TYPE, LONG));
         try (XContentBuilder b = XContentFactory.jsonBuilder()) {
             b.map(Map.of(PROPERTIES, properties));

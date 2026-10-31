@@ -271,13 +271,13 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             @Override
             public void beforeIndexShardRecovery(IndexShard indexShard, IndexSettings indexSettings) {
                 if (indexShard.routingEntry() != null) {
-                    InfinoEngine.primaryCopy(indexShard.shardId(), indexShard.routingEntry().primary());
+                    InfinoEngine.copyOf(indexShard.shardId(), indexShard.routingEntry());
                 }
             }
 
             @Override
             public void shardRoutingChanged(IndexShard indexShard, ShardRouting oldRouting, ShardRouting newRouting) {
-                InfinoEngine.primaryCopy(indexShard.shardId(), newRouting.primary());
+                InfinoEngine.copyOf(indexShard.shardId(), newRouting);
                 if (oldRouting != null && !oldRouting.primary() && newRouting.primary() && newRouting.started()) {
                     // A replica took over: it finishes a skeleton rebuild the old primary may have left.
                     adoptIfRebuilt(indexShard);

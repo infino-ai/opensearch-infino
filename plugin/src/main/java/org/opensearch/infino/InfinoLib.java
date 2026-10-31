@@ -49,7 +49,8 @@ public interface InfinoLib extends Library {
 
     /**
      * {@link #infino_prepare_batch} with each row's routing value after its source (empty for none), ending
-     * at {@code rtEnds}, and its sequence number in {@code seqs} (negative for none), stamped by writer {@code gen}.
+     * at {@code rtEnds}, its stamp in {@code seqs} and the operation that wrote it in {@code ops} (each
+     * negative for none), by writer {@code gen}.
      */
     Pointer infino_prepare_batch_meta(
         Pointer h,
@@ -60,6 +61,7 @@ public interface InfinoLib extends Library {
         int[] srcEnds,
         int[] rtEnds,
         long[] seqs,
+        long[] ops,
         long gen,
         int count
     );

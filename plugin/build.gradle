@@ -236,6 +236,8 @@ testClusters.matching { it.name == replicaTask }.all {
     plugin(tasks.named('bundlePlugin').flatMap { it.archiveFile })
     systemProperty 'infino.uri', System.getProperty('infino.uri', "file://${replicaData}")
     systemProperty 'infino.data', System.getProperty('infino.data', replicaData)
+    // A refresh waits this long for copies that never hold the writes, as the test's replica does not.
+    systemProperty 'infino.engine.copies.wait.ms', '3000'
 }
 
 // A run that dies before its shards are deleted leaves their tables; each run starts clean.
