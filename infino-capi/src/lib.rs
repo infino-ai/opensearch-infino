@@ -2277,6 +2277,38 @@ pub unsafe extern "C" fn infino_count(
     .unwrap_or(ptr::null_mut())
 }
 
+/// A column's rows counted per value: rows of the value (under the column's
+/// name, null for the rows without one) and `count(*)`, with no statement.
+/// The engine reads them from the table's statistics when those count every
+/// row exactly, and runs the grouped count otherwise. `null` when there are
+/// more than `max_rows` of them, so a column of many values is not carried
+/// across whole to a caller that would not use them.
+#[no_mangle]
+pub unsafe extern "C" fn infino_value_counts(
+    h: *mut Bridge,
+    name: *const c_char,
+    column: *const c_char,
+    max_rows: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(column)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(column) })
+        else {
+            return ptr::null_mut();
+        };
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        match table.value_counts(column) {
+            Ok(b) if b.num_rows() > max_rows.max(0) as usize => out_string("null".to_string()),
+            Ok(b) => out_string(batches_to_json(&[b])),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// Unranked full-text match set: the osids of every row matching `query` on
 /// `column`. Backs query-scoped aggregations over a text query.
 #[no_mangle]
@@ -2587,6 +2619,55 @@ mod tests {
 
     fn optimize(h: *mut Bridge) -> c_int {
         unsafe { infino_optimize(h, c("logs").as_ptr()) }
+    }
+
+    fn value_counts(h: *mut Bridge, column: &str, max_rows: c_int) -> Value {
+        let out = take(unsafe {
+            infino_value_counts(h, c("logs").as_ptr(), c(column).as_ptr(), max_rows)
+        });
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
+    /// `(value, count)` pairs of `rows`, the value under `key` and the count under `count`, sorted.
+    fn counted(rows: &Value, key: &str, count: &str) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r[key].to_string(), r[count].as_u64().unwrap()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn value_counts_are_the_grouped_count_up_to_the_cap() {
+        // error, info and the rows without a level: three groups.
+        const GROUPS: c_int = 3;
+        let h = open_logs();
+        index(
+            h,
+            &[
+                ("a", r#"{"level":"error"}"#),
+                ("b", r#"{"level":"info"}"#),
+                ("c", r#"{"level":"info"}"#),
+                ("d", r#"{"message":"no level"}"#),
+            ],
+        );
+        let grouped_sql = "SELECT level, COUNT(*) AS n FROM logs GROUP BY level";
+        assert_eq!(
+            counted(&value_counts(h, "level", GROUPS), "level", "count(*)"),
+            counted(&sql(h, grouped_sql), "level", "n")
+        );
+        assert_eq!(value_counts(h, "level", GROUPS - 1), Value::Null);
+        // A delete leaves the deleted row in the table's statistics, so the
+        // engine runs the grouped count, which leaves it out.
+        assert_eq!(delete(h, &["a"]), 0);
+        assert_eq!(
+            counted(&value_counts(h, "level", GROUPS), "level", "count(*)"),
+            counted(&sql(h, grouped_sql), "level", "n")
+        );
+        close(h);
     }
 
     #[test]

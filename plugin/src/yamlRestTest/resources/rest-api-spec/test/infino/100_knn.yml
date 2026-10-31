@@ -7,6 +7,8 @@
   # first four zero. Every vector sits at its own squared l2 distance from
   # the query [1, 0, 0, ...], so the nearest order has no ties: v1 0,
   # v2 0.02, v3 0.13, v4 0.5, v5 2, v6 2.44, v7 4, v8 5.
+  - skip:
+      features: headers
   - do:
       indices.create:
         index: knn_inf
@@ -52,7 +54,13 @@
           - index: { _id: "v8" }
           - { emb: [ 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], tag: z, title: "rain coat", n: 8 }
   - match: { errors: false }
+  # Sent as JSON: the test runner may otherwise send a bulk as SMILE, and the
+  # k-NN plugin's codec on 3.3 and 3.6 parses every stored source as JSON, so
+  # it refuses a SMILE document in its own Lucene index (3.9 reads the
+  # source's own type).
   - do:
+      headers:
+        Content-Type: application/json
       bulk:
         refresh: true
         index: knn_luc
