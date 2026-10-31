@@ -615,9 +615,16 @@ public final class InfinoNative {
         return rows(sql(q));
     }
 
-    public static String bm25(String n, String c, String q, int k) {
+    /**
+     * The top {@code k} rows of a full-text query ({@code mode} "and" / "or")
+     * by BM25, best first, each with its id, source and score: a page of hits
+     * in one engine call, with no statement to plan.
+     */
+    public static List<Map<String, Object>> bm25Hits(String n, String c, String q, String mode, int k) {
         init();
-        return takeOrThrow(lib.infino_bm25(conn, n, c, q, k));
+        String out = takeOrThrow(lib.infino_bm25(conn, n, c, q, mode, k));
+        log.debug("[infino] bm25: {} {} {} k={} -> {} chars", n, c, q, k, out.length());
+        return rows(out);
     }
 
     /** Count of rows matching a full-text query ({@code mode} "and" / "or"), without materializing them. */

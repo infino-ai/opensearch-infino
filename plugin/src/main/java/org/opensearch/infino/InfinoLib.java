@@ -66,7 +66,7 @@ public interface InfinoLib extends Library {
 
     Pointer infino_sql(Pointer h, String sql);
 
-    Pointer infino_bm25(Pointer h, String name, String column, String query, int k);
+    Pointer infino_bm25(Pointer h, String name, String column, String query, String mode, int k);
 
     Pointer infino_count(Pointer h, String name, String column, String query, String mode);
 
