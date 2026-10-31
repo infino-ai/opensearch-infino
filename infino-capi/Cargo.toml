@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 # `remote` is the engine's hosted client: a `https://host/<database>` URI
 # with a key forwards every table operation to the hosted service, so a
 # node whose account is set up holds no table data of its own.
-infino = { version = "0.11.12", features = ["remote"] }
+infino = { version = "0.11.18", features = ["remote"] }
 # serde_json comes re-exported from infino, so the two never disagree.
 # Same major as infino so the delete-predicate Expr is the same type infino expects.
 datafusion = "54"
@@ -22,10 +22,3 @@ rayon = "1"
 # asks for a key, so it cannot go through a connection that needs one. The
 # same crate and features the engine's hosted client is built on.
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
-
-[patch.crates-io]
-# Until the engine release that ranks a filtered vector search within exactly
-# the rows the filter keeps (infino-ai/infino#1117, stacked on #1102; it also
-# carries the schema document and schema patches over the hosted transport);
-# the pin above then moves to that version and this block goes.
-infino = { git = "https://github.com/infino-ai/infino.git", branch = "vector/where-exact-rows" }
