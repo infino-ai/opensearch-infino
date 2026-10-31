@@ -32,6 +32,7 @@ import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
+import org.opensearch.infino.InfinoQueryTranslator.TextClause;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
 import org.opensearch.infino.InfinoScriptTranslator.Sql;
 import org.opensearch.infino.InfinoScriptTranslator.SqlType;
@@ -347,7 +348,7 @@ public final class InfinoSearch {
     static String filteredKnnStatement(String table, VectorRequest v) {
         String csv = floatsToJson(v.vector());
         csv = csv.substring(1, csv.length() - 1);
-        return "SELECT " + InfinoQueryTranslator.OSID + ", score FROM vector_search("
+        return "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + ", score FROM vector_search("
             + InfinoQueryTranslator.literal(table)
             + ", "
             + InfinoQueryTranslator.literal(v.vectorColumn())
@@ -454,7 +455,8 @@ public final class InfinoSearch {
             VectorRequest v = plan.vector();
             String emb = floatsToJson(v.vector());
             // The engine's top k for a knn query (the page is a window over them),
-            // otherwise as many as the page reaches.
+            // otherwise as many as the page reaches. Either way each hit comes
+            // back with its id, score and source.
             int want = stockKnn ? v.k() : Math.max(fetch, 1);
             if (v.filter() != null) {
                 rows = InfinoNative.sqlRows(filteredKnnStatement(plan.table(), v));
@@ -465,15 +467,11 @@ public final class InfinoSearch {
                 rows = InfinoNative.rows(json);
             }
             knnDistance = !v.hybrid();
-            // The vector entry points return ids and scores; the page's sources come in one statement.
-            List<String> ids = new ArrayList<>();
-            for (int i = from; i < Math.min(rows.size(), fetch); i++) {
-                Object id = rows.get(i).get(InfinoQueryTranslator.OSID);
-                if (id != null) {
-                    ids.add(id.toString());
-                }
-            }
-            InfinoNative.prefetchSources(plan.table(), ids);
+        } else if (bareRanked(plan)) {
+            // A text query and nothing else: the engine's BM25 call returns
+            // the page with its sources, so no statement is planned for it.
+            TextClause text = q.principal();
+            rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
         } else {
             rows = InfinoNative.sqlRows(hitStatement(plan, fetch));
         }
@@ -536,9 +534,7 @@ public final class InfinoSearch {
                 h.setPrimaryTerm(InfinoDocumentVersion.PRIMARY_TERM);
             }
             if (withSource || !fields.isEmpty()) {
-                String src = plan.vector() != null
-                    ? InfinoNative.getSource(plan.table(), id.toString())
-                    : String.valueOf(row.get(InfinoQueryTranslator.SOURCE));
+                String src = String.valueOf(row.get(InfinoQueryTranslator.SOURCE));
                 // The source as the user may see it: hidden fields gone, masked values hashed.
                 src = plan.access().read(id.toString(), src);
                 if (src != null && !src.isEmpty()) {
@@ -571,6 +567,22 @@ public final class InfinoSearch {
             hits.add(h);
         }
         return new Page(hits, total, exact || plan.vector() != null, maxScore);
+    }
+
+    /**
+     * Whether the page's hits are the BM25 ranking of the request's text
+     * clause and nothing more: no other predicate (a filter, a post_filter, a
+     * security rule), no sort, no search_after, no collapse and no scripted
+     * field. {@link #hitStatement} would then select exactly what the engine's
+     * BM25 call returns.
+     */
+    static boolean bareRanked(Plan plan) {
+        return plan.query().principal() != null
+            && InfinoQueryTranslator.ALL.equals(plan.hitWhere())
+            && plan.sorts().isEmpty()
+            && plan.searchAfter() == null
+            && plan.collapse() == null
+            && plan.scriptFields().isEmpty();
     }
 
     /**

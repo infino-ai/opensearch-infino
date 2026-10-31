@@ -12,11 +12,13 @@ public interface InfinoLib extends Library {
     Pointer infino_open(String uri);
 
     /**
-     * Open {@code uri} with the bearer key of a hosted URI (null for none). A
-     * hosted connection is used once before it is handed back, so a refused key
-     * fails here; null then, with the reason in {@link #infino_open_error()}.
+     * Open {@code uri} with the bearer key of a hosted URI (null for none) and
+     * the directory the engine caches the node's own storage in (null for
+     * none; a hosted URI takes none). A hosted connection is used once before
+     * it is handed back, so a refused key fails here; null then, with the
+     * reason in {@link #infino_open_error()}.
      */
-    Pointer infino_open_with(String uri, String apiKey);
+    Pointer infino_open_with(String uri, String apiKey, String cacheDir);
 
     /** Why the last open on this thread returned null, as {@code {"error", "status"?}}; null when it did not fail. */
     Pointer infino_open_error();
@@ -85,7 +87,7 @@ public interface InfinoLib extends Library {
 
     Pointer infino_sql(Pointer h, String sql);
 
-    Pointer infino_bm25(Pointer h, String name, String column, String query, int k);
+    Pointer infino_bm25(Pointer h, String name, String column, String query, String mode, int k);
 
     Pointer infino_count(Pointer h, String name, String column, String query, String mode);
 
