@@ -66,6 +66,24 @@ import java.util.TreeMap;
  * applies it again over a change made since; one that fails stays, reported
  * with the cluster's answer, for the next call to retry. A cluster coming up
  * on its own applies nothing: there is no caller to apply it as.
+ *
+ * <p>The caller is sent again by its headers alone, so the call applies the
+ * state for a caller a header authenticates (basic authentication, a bearer
+ * token, a proxy's headers). A caller authenticated by its TLS client
+ * certificate or by Kerberos has nothing a request can carry: each item then
+ * comes back refused (401), or runs as the anonymous user under that user's
+ * rights where the cluster allows one, and stays registered for a caller who
+ * can apply it.
+ *
+ * <p>Nothing is rolled back. Items apply one at a time and the row is
+ * rewritten once the pass ends, so a node that stops during a pass applies
+ * the items it had reached again on the next call, over any change made to
+ * them in between.
+ *
+ * <p>The items are configuration the cluster trusts, roles and users among
+ * them, and an administrator's call applies whatever the registry holds:
+ * write access to the registry table's storage is as privileged as write
+ * access to the security plugin's own configuration.
  */
 final class InfinoClusterState {
 
