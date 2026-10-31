@@ -2088,8 +2088,9 @@ dependencies = [
 
 [[package]]
 name = "infino"
-version = "0.11.13"
-source = "git+https://github.com/infino-ai/infino.git?branch=vector%2Fwhere-exact-rows#11b2e3358fa746852d6bb17d4965d29996302497"
+version = "0.11.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0db25ed5e7628340616d50d85e7a964913ce8821d29d70aa53f2fa554eb26a46"
 dependencies = [
  "apache-avro",
  "arc-swap",

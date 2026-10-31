@@ -88,7 +88,7 @@ public class InfinoGetActionFilter implements ActionFilter {
                 : InfinoNative.getSource(table, get.id());
             @SuppressWarnings("unchecked")
             Response response = (Response) new GetResponse(
-                result(index.getIndex().getName(), get.id(), access.source(source), get.fetchSourceContext())
+                result(index.getIndex().getName(), get.id(), access.read(get.id(), source), get.fetchSourceContext())
             );
             listener.onResponse(response);
         } catch (Exception e) {
