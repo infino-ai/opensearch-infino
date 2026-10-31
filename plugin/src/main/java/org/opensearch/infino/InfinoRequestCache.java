@@ -51,7 +51,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * Lucene index shows a write.
  *
  * <p>The cache's size is the shard request cache's own,
- * {@code indices.requests.cache.size}.
+ * {@code indices.requests.cache.size}, taken beside it: a search over an
+ * Infino-backed index never reaches the shard request cache, so a node
+ * serving only such indices holds that much, and one serving Lucene indices
+ * too can hold up to twice it in request caches.
  */
 final class InfinoRequestCache {
 
