@@ -12,6 +12,7 @@ import org.opensearch.common.inject.Injector;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -29,6 +30,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     private static volatile ThreadPool threadPool;
     private static volatile ScriptService scriptService;
     private static volatile NamedWriteableRegistry namedWriteableRegistry;
+    private static volatile NamedXContentRegistry namedXContentRegistry;
     private static volatile IndexNameExpressionResolver indexNameExpressionResolver;
     private static volatile InfinoWriter writer;
     private static volatile AutoCreateIndex autoCreateIndex;
@@ -39,6 +41,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         ThreadPool threadPool,
         ScriptService scriptService,
         NamedWriteableRegistry namedWriteableRegistry,
+        NamedXContentRegistry namedXContentRegistry,
         IndexNameExpressionResolver indexNameExpressionResolver,
         Injector injector
     ) {
@@ -46,6 +49,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoServices.threadPool = threadPool;
         InfinoServices.scriptService = scriptService;
         InfinoServices.namedWriteableRegistry = namedWriteableRegistry;
+        InfinoServices.namedXContentRegistry = namedXContentRegistry;
         InfinoServices.indexNameExpressionResolver = indexNameExpressionResolver;
         InfinoServices.writer = new InfinoWriter(threadPool);
         // The node's own rule for creating an index a write names before it exists.
@@ -87,6 +91,11 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     /** For tests that build aggregation objects without a node. */
     static void namedWriteableRegistry(NamedWriteableRegistry registry) {
         namedWriteableRegistry = registry;
+    }
+
+    /** The node's content registry: what a query written as JSON is parsed with. */
+    static NamedXContentRegistry namedXContentRegistry() {
+        return namedXContentRegistry;
     }
 
     static IndexNameExpressionResolver indexNameExpressionResolver() {

@@ -1,0 +1,66 @@
+---
+"Request cache: a repeated aggregation answers the same, and a write is seen by the next one":
+  - do:
+      bulk:
+        index: rc
+        refresh: true
+        body:
+          - index: { _id: "1" }
+          - { tag: x, n: 1 }
+          - index: { _id: "2" }
+          - { tag: x, n: 2 }
+  - do:
+      search:
+        index: rc
+        body: { size: 0, aggs: { s: { sum: { field: n } } } }
+  - match: { hits.total.value: 2 }
+  - match: { aggregations.s.value: 3.0 }
+
+  # The same request again, now kept: the same answer.
+  - do:
+      search:
+        index: rc
+        body: { size: 0, aggs: { s: { sum: { field: n } } } }
+  - match: { hits.total.value: 2 }
+  - match: { aggregations.s.value: 3.0 }
+
+  # A write on this node is seen by the next request at once.
+  - do:
+      index:
+        index: rc
+        id: "3"
+        refresh: true
+        body: { tag: x, n: 4 }
+  - do:
+      search:
+        index: rc
+        body: { size: 0, aggs: { s: { sum: { field: n } } } }
+  - match: { hits.total.value: 3 }
+  - match: { aggregations.s.value: 7.0 }
+
+  # A delete too.
+  - do:
+      delete:
+        index: rc
+        id: "1"
+        refresh: true
+  - do:
+      search:
+        index: rc
+        body: { size: 0, aggs: { s: { sum: { field: n } } } }
+  - match: { hits.total.value: 2 }
+  - match: { aggregations.s.value: 6.0 }
+
+  # request_cache=false, and a request with hits, answer from the table as before.
+  - do:
+      search:
+        index: rc
+        request_cache: false
+        body: { size: 0, aggs: { s: { sum: { field: n } } } }
+  - match: { aggregations.s.value: 6.0 }
+  - do:
+      search:
+        index: rc
+        body: { size: 10, sort: [ { n: asc } ] }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "2" }

@@ -72,6 +72,8 @@ public interface InfinoLib extends Library {
 
     Pointer infino_count(Pointer h, String name, String column, String query, String mode);
 
+    Pointer infino_value_counts(Pointer h, String name, String column, int maxRows);
+
     Pointer infino_token_match(Pointer h, String name, String column, String query);
 
     Pointer infino_knn(Pointer h, String name, String column, String embJson, int k);

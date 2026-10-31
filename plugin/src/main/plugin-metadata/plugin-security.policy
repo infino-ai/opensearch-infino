@@ -13,6 +13,11 @@ grant {
   permission java.util.PropertyPermission "infino.*", "read";
   permission java.util.PropertyPermission "jna.*", "read,write";
   permission java.lang.RuntimePermission "getenv.*";
+  // The security plugin's rules are read through its own classes, loaded by
+  // the class loader the request's user object comes with (see
+  // InfinoSecurityCalls); asking an object for its loader needs this on the
+  // releases that still run the security manager.
+  permission java.lang.RuntimePermission "getClassLoader";
 };
 
 // A file:// catalog lives on the node's disk under the directory -Dinfino.data
