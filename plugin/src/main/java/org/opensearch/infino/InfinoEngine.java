@@ -65,9 +65,9 @@ import java.util.function.LongSupplier;
  * waiting. A write the copies do not all hold may yet be undone, when a copy
  * that lacks it becomes primary, so it never reaches the table ahead of
  * them; a primary cut off from its copies, still taking writes it cannot
- * replicate, therefore never puts them in the table either. Every row
- * records the operation that wrote it, so the table says how far into the
- * shard's history it holds every write.
+ * replicate, therefore never puts them in the table either. Each commit's
+ * newest row records the operation that wrote it, so the table says how far
+ * into the shard's history it holds every write.
  *
  * <p>A batch commits when the shard syncs its translog for a write, on
  * refresh, on flush, and past its document or byte bound. The first three
@@ -982,12 +982,21 @@ public class InfinoEngine extends InternalEngine {
             }
         }
         if (!ids.isEmpty()) {
+            // The newest write's row alone records its operation: the commit holds every
+            // operation up to it, so the highest any row records is how far the table holds
+            // every write. A later delete of that row lowers it, which only widens what a
+            // new primary writes again.
             long[] seqs = new long[ids.size()];
             long[] opSeqs = new long[ids.size()];
+            int newest = 0;
             for (int i = 0; i < ids.size(); i++) {
                 seqs[i] = stamps.get(i);
-                opSeqs[i] = ops.get(i);
+                opSeqs[i] = UNSTAMPED;
+                if (ops.get(i) > ops.get(newest)) {
+                    newest = i;
+                }
             }
+            opSeqs[newest] = ops.get(newest);
             Pointer prepared = InfinoNative.prepare(table, ids, sources, routings, seqs, opSeqs, generation);
             if (prepared == null) {
                 throw new IllegalStateException("[infino] the bridge could not prepare a batch for " + table);

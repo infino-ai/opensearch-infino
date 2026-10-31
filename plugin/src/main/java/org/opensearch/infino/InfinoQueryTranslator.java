@@ -79,7 +79,7 @@ final class InfinoQueryTranslator {
     static final String ROUTING = "osrouting";
     /** The reserved column holding the sequence number of the write that created an engine-mode row, when it was stamped. */
     static final String SEQ = "osseq";
-    /** The reserved column holding the sequence number of the operation that wrote an engine-mode row. */
+    /** The reserved column holding the sequence number of the operation that wrote each engine-mode commit's newest row. */
     static final String OP = "osop";
     /**
      * The reserved column naming the index whose write stamped a row's {@link #SEQ} and {@link #OP}: sequence
