@@ -108,7 +108,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
             // Each index is read under what the security plugin lets this user see of it.
             Map<Index, InfinoAccess> access = new HashMap<>();
             for (Index index : infino) {
-                access.put(index, InfinoSecurity.access(index.getName(), "search"));
+                access.put(index, InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH));
             }
             // A repeated request is answered from the responses kept for it,
             // as the shard request cache answers it for a Lucene index.

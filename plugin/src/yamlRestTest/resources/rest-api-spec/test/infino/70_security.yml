@@ -1,8 +1,6 @@
 ---
 "Security: the security plugin's document, field and masking rules are enforced from the table":
   - skip:
-      version: " - 3.5.99"
-      reason: the rules are read through the security plugin's privileges configuration, which exists from 3.6
       features: headers
   - do:
       indices.create:
@@ -205,47 +203,185 @@
   - match: { _source.n: 1 }
 
 ---
-"Security on 2.x: a request under a document- or field-level rule is refused, one without is served":
+"Security parity: the table answers a restricted user as the security plugin answers over Lucene":
   - skip:
-      version: "3.0.0 - "
-      reason: on 3.x the rules are enforced
       features: headers
+  # The same documents in an Infino-backed index and in a Lucene one the
+  # security plugin's own shard-level enforcement serves.
   - do:
       indices.create:
         index: sec3
         body:
-          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
           mappings:
             properties:
               tag: { type: keyword }
               secret: { type: keyword }
               ip: { type: keyword }
+              n: { type: long }
   - do:
-      index:
-        index: sec3
-        id: t1
+      indices.create:
+        index: sec3l
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              secret: { type: keyword }
+              ip: { type: keyword }
+              n: { type: long }
+  # One bulk per index: a bulk mixing Infino-backed indices with others is refused.
+  - do:
+      bulk:
         refresh: true
-        body: { tag: x, secret: alpha, ip: "10.0.0.1" }
+        body:
+          - index: { _index: sec3, _id: "p1" }
+          - { tag: x, secret: alpha, ip: "10.0.0.1", n: 1 }
+          - index: { _index: sec3, _id: "p2" }
+          - { tag: y, secret: beta, ip: "10.0.0.2", n: 2 }
+  - match: { errors: false }
   - do:
-      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
-      search:
-        index: sec3
-        body: { size: 0 }
-  - match: { hits.total.value: 1 }
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec3l, _id: "p1" }
+          - { tag: x, secret: alpha, ip: "10.0.0.1", n: 1 }
+          - index: { _index: sec3l, _id: "p2" }
+          - { tag: y, secret: beta, ip: "10.0.0.2", n: 2 }
+  - match: { errors: false }
+  # The document rule: the same total on both.
   - do:
       headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
-      catch: forbidden
+      search:
+        index: sec3l
+        body: { size: 0 }
+  - set: { hits.total.value: lucene_total }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
       search:
         index: sec3
         body: { size: 0 }
+  - match: { hits.total.value: $lucene_total }
+  - match: { hits.total.value: 1 }
+  # The field rule: a query on the hidden field matches nothing on either, one on a visible field matches alike.
+  # (Sources are compared through queries and aggregations: the runner sends documents in a random
+  # content type, and the security plugin's own source filter reads a Lucene source as JSON only.)
   - do:
       headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
-      catch: forbidden
-      get:
+      search:
+        index: sec3l
+        body: { size: 0, query: { term: { secret: beta } } }
+  - set: { hits.total.value: lucene_hidden }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      search:
         index: sec3
-        id: t1
+        body: { size: 0, query: { term: { secret: beta } } }
+  - match: { hits.total.value: $lucene_hidden }
+  - match: { hits.total.value: 0 }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec3l
+        body: { size: 0, query: { term: { tag: y } } }
+  - set: { hits.total.value: lucene_visible }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec3
+        body: { size: 0, query: { term: { tag: y } } }
+  - match: { hits.total.value: $lucene_visible }
+  - match: { hits.total.value: 1 }
+  # The masked field: the same hash in the fields of a hit on both, since both use the security plugin's own hash and salt.
   - do:
       headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
-      catch: forbidden
-      mget:
-        body: { docs: [ { _index: sec3, _id: "t1" } ] }
+      search:
+        index: sec3l
+        body: { size: 1, _source: false, docvalue_fields: [ "ip" ], sort: [ { n: asc } ] }
+  - set: { hits.hits.0.fields.ip.0: lucene_masked }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      search:
+        index: sec3
+        body: { size: 1, _source: false, docvalue_fields: [ "ip" ], sort: [ { n: asc } ] }
+  - match: { hits.hits.0.fields.ip.0: $lucene_masked }
+  - match:
+      hits.hits.0.fields.ip.0: /^[0-9a-f]{64}$/
+
+---
+"Security: a user authenticated by an API token is answered as the security plugin answers over Lucene":
+  - skip:
+      version: " - 3.8.99"
+      reason: the security plugin issues API tokens from 3.9
+      features: headers
+  - do:
+      indices.create:
+        index: sec4
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: sec4l
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec4, _id: "k1" }
+          - { tag: x, n: 1 }
+          - index: { _index: sec4, _id: "k2" }
+          - { tag: y, n: 2 }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec4l, _id: "k1" }
+          - { tag: x, n: 1 }
+          - index: { _index: sec4l, _id: "k2" }
+          - { tag: y, n: 2 }
+  - match: { errors: false }
+  # A token with plain read access to both indices, created by the admin.
+  - do:
+      security.apitokens_create:
+        body:
+          name: "sec4reader"
+          cluster_permissions: [ "cluster_composite_ops_ro" ]
+          index_permissions:
+            - index_pattern: [ "sec4*" ]
+              allowed_actions: [ "read", "indices:admin/mappings/get" ]
+          duration_seconds: 3600
+  - set: { token: token }
+  - do:
+      headers: { Authorization: "apikey ${token}" }
+      search:
+        index: sec4l
+        body: { size: 0 }
+  - set: { hits.total.value: lucene_total }
+  - do:
+      headers: { Authorization: "apikey ${token}" }
+      search:
+        index: sec4
+        body: { size: 0 }
+  - match: { hits.total.value: $lucene_total }
+  - do:
+      headers: { Authorization: "apikey ${token}" }
+      get:
+        index: sec4l
+        id: k1
+  - set: { _source.tag: lucene_tag }
+  - do:
+      headers: { Authorization: "apikey ${token}" }
+      get:
+        index: sec4
+        id: k1
+  - match: { _source.tag: $lucene_tag }

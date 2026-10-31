@@ -33,7 +33,7 @@ document the mapping cannot hold fails as its own bulk item.
 | `infino-capi/` | Rust **C-ABI bridge** (`cdylib`) over the published `infino` crate. JSON in, JSON out; per-document checks against the declared columns. |
 | `plugin/` | The **OpenSearch Java plugin** (`org.opensearch.infino`): bulk, search and get action filters, the query translator, the aggregation processor, the batching writer, custom kNN/hybrid queries, SQL passthrough. Talks to the bridge via JNA. Builds out of tree against a released OpenSearch. |
 | `bench/` | `bench.py`: indexing + query-latency comparison vs stock Lucene. |
-| `scripts/` | `build.sh` (bridge + plugin zip), `run.sh` (install into a distribution + start a node). |
+| `scripts/` | `build.sh` (bridge + plugin zip), `run.sh` (install into a distribution + start a node), `check-all.sh` (the full check on every supported release). |
 
 ## Build
 
@@ -47,7 +47,14 @@ One source tree builds for 2.19 through 3.9; the full check passes on
 ```bash
 ./scripts/build.sh                      # infino-capi/target/release/libinfino_capi.{so,dylib} + plugin/build/distributions/infino-engine-<ver>.zip
 cd plugin && gradle check               # precommit gates, unit tests, YAML REST suites on a test cluster with the bridge
+./scripts/check-all.sh                  # the same check on every supported release
 ```
+
+`gradle check` builds against one release. The security integration takes a
+different path on 2.x, on 3.0 through 3.5 and from 3.6 on, and only a check
+built against a release exercises its path, so run `scripts/check-all.sh`
+before relying on any release but the default. It takes the Gradle launcher
+for each release's build tools from `GRADLE_8_12`, `GRADLE_8_14` and `GRADLE`.
 
 ## Install and use
 
