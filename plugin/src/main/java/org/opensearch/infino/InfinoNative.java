@@ -80,6 +80,8 @@ public final class InfinoNative {
     }
 
     private static volatile InfinoLib lib;
+    /** Where the engine caches what it reads from the node's own storage (see {@link InfinoPlugin#CACHE_DIR}); null for none. */
+    private static volatile String cacheDir;
     private static volatile Pointer conn;
     /** The target {@link #conn} was opened to. */
     private static volatile Target opened;
@@ -205,7 +207,7 @@ public final class InfinoNative {
                 return;
             }
             InfinoLib loaded = lib();
-            Pointer p = loaded.infino_open_with(target.uri(), target.apiKey());
+            Pointer p = loaded.infino_open_with(target.uri(), target.apiKey(), target.hosted() ? null : cacheDir);
             if (p == null) {
                 throw openFailure(loaded, target);
             }
@@ -249,6 +251,11 @@ public final class InfinoNative {
         }
     }
 
+    /** Take {@code dir} as the node's cache directory, at boot, before the first open; null for none. */
+    static void cacheDir(String dir) {
+        cacheDir = dir;
+    }
+
     /** The target the node is configured for. */
     static Target target() {
         return wanted;
@@ -289,7 +296,7 @@ public final class InfinoNative {
     static void probe(String baseUrl, String database, String apiKey) {
         InfinoLib loaded = lib();
         String uri = InfinoAccount.baseUrl(baseUrl) + "/" + database;
-        Pointer p = loaded.infino_open_with(uri, apiKey);
+        Pointer p = loaded.infino_open_with(uri, apiKey, null);
         if (p == null) {
             throw openFailure(loaded, new Target(uri, apiKey, true, baseUrl + " database " + database));
         }
