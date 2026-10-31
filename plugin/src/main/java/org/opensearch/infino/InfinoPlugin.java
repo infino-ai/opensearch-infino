@@ -172,6 +172,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         this.defaultEnabled = INFINO_DEFAULT_ENABLED.get(settings);
         this.engineEnabled = ENGINE_ENABLED.get(settings);
         this.account = new InfinoAccount(PLATFORM_DEFAULT_URL.get(settings));
+        InfinoRequestCache.configure(settings);
         String url = PLATFORM_URL.get(settings);
         if (url.isEmpty()) {
             return;

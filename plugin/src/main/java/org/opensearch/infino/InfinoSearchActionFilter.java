@@ -133,9 +133,30 @@ public class InfinoSearchActionFilter implements ActionFilter {
             for (Index index : infino) {
                 access.put(index, InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH));
             }
+            // A repeated request is answered from the responses kept for it,
+            // as the shard request cache answers it for a Lucene index.
+            InfinoRequestCache kept = InfinoRequestCache.node();
+            String key = null;
+            if (kept != null) {
+                List<String> tableNames = new ArrayList<>();
+                for (Index index : infino) {
+                    tableNames.add(tableOf.apply(index));
+                }
+                key = InfinoRequestCache.key(search, source, metadata, tableNames, access.values());
+                SearchResponse hit = key == null ? null : kept.get(key, start);
+                if (hit != null) {
+                    @SuppressWarnings("unchecked")
+                    Response cast = (Response) hit;
+                    listener.onResponse(cast);
+                    return;
+                }
+            }
             SearchResponse response = search.scroll() == null
                 ? InfinoSearch.search(infino, tableOf, access::get, source, scripts.get(), start)
                 : InfinoScrollActionFilter.open(search, infino, tableOf, access, source, scripts.get(), start);
+            if (key != null) {
+                kept.put(key, response, InfinoRequestCache.lifetime(metadata));
+            }
             @SuppressWarnings("unchecked")
             Response cast = (Response) response;
             listener.onResponse(cast);

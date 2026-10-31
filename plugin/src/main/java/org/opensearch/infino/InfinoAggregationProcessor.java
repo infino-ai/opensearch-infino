@@ -194,6 +194,12 @@ public class InfinoAggregationProcessor {
     private Plan plan;
     /** The tables the aggregations read: the plan's, or each reached shard's (see {@link #evaluateOver}); set by {@link #evaluate}. */
     private List<String> tables = List.of();
+    /**
+     * Groups of a top terms level read ahead to count the request, by the
+     * statement the level would run for them; a null value marks a level
+     * with more groups than are picked here (see {@link #totalFromTopTerms}).
+     */
+    private final Map<String, List<Map<String, Object>>> readAhead = new HashMap<>();
 
     /** A processor whose top hits name {@code index}; null for planning only. */
     InfinoAggregationProcessor(Index index) {
@@ -225,7 +231,7 @@ public class InfinoAggregationProcessor {
      */
     Counted evaluate(Collection<AggregationBuilder> builders, Plan plan, Long total) {
         Translation q = plan.query();
-        return evaluate(builders, plan, List.of(plan.table()), q.from(), q.where(), predicates(plan), () -> InfinoSearch.count(plan.table(), q), shardOfMany, total);
+        return evaluate(builders, plan, List.of(plan.table()), q.from(), q.where(), predicates(plan), () -> InfinoSearch.count(plan.table(), q), q, shardOfMany, total);
     }
 
     /**
@@ -247,7 +253,7 @@ public class InfinoAggregationProcessor {
         Function<QueryBuilder, String> predicates = qb -> perShard(qb, shardPlans);
         Supplier<Long> counter = () -> asLong(oneRow("SELECT COUNT(*) AS c FROM " + from).get("c"));
         // One answer for the whole index: each terms level at its final size.
-        return evaluate(builders, plan, shardTables, from, InfinoQueryTranslator.ALL, predicates, counter, false, null);
+        return evaluate(builders, plan, shardTables, from, InfinoQueryTranslator.ALL, predicates, counter, null, false, null);
     }
 
     /**
@@ -257,9 +263,15 @@ public class InfinoAggregationProcessor {
      * reduction adds nothing to that shard's answer.
      */
     Counted evaluateNothing(Collection<AggregationBuilder> builders, Plan plan) {
-        return evaluate(builders, plan, List.of(), InfinoQueryTranslator.quoteIdent(plan.table()), InfinoQueryTranslator.NONE, predicates(plan), () -> 0L, false, 0L);
+        return evaluate(builders, plan, List.of(), InfinoQueryTranslator.quoteIdent(plan.table()), InfinoQueryTranslator.NONE, predicates(plan), () -> 0L, null, false, 0L);
     }
 
+    /**
+     * The aggregations over {@code from WHERE where}. When the count is
+     * needed it comes from a top terms level's own groups if the relation is
+     * the plan's own query ({@code own}, null when it is not; see
+     * {@link #totalFromTopTerms}), else from {@code counter}.
+     */
     private Counted evaluate(
         Collection<AggregationBuilder> builders,
         Plan plan,
@@ -268,6 +280,7 @@ public class InfinoAggregationProcessor {
         String where,
         Function<QueryBuilder, String> predicates,
         Supplier<Long> counter,
+        Translation own,
         boolean shardSized,
         Long total
     ) {
@@ -284,6 +297,9 @@ public class InfinoAggregationProcessor {
             if (spec instanceof Metric m) {
                 rootMetrics.add(m);
                 continue;
+            }
+            if (total == null) {
+                total = own == null ? null : totalFromTopTerms(spec, own);
             }
             if (total == null) {
                 total = counter.get();
@@ -508,7 +524,7 @@ public class InfinoAggregationProcessor {
                 // A script reads values themselves, so it sees no masked column, the value script's included.
                 Column valueColumn = c != null && c.masked() ? null : c;
                 Sql sql = InfinoScriptTranslator.translate(b.script(), InfinoAccess.scriptColumns(cols), valueColumn, now);
-                return new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]", null);
+                return new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]", null, null);
             }
             if (c == null) {
                 throw new Unsupported("aggregation [" + b.getName() + "] needs a field or a script");
@@ -520,11 +536,12 @@ public class InfinoAggregationProcessor {
     /**
      * What an aggregation reads, as a column expression with its type;
      * {@code label} names it in a refusal, {@code mask} is how a key of it
-     * leaves the node when the field is masked for the user (null when not).
+     * leaves the node when the field is masked for the user (null when not),
+     * {@code column} the column it reads as is (null for a script).
      */
-    record Source(String expr, SqlType type, String label, UnaryOperator<String> mask) {
+    record Source(String expr, SqlType type, String label, UnaryOperator<String> mask, String column) {
         static Source of(Column c) {
-            return new Source(quoteIdent(c.name()), InfinoScriptTranslator.typeOf(c), "[" + c.name() + "]", c.mask());
+            return new Source(quoteIdent(c.name()), InfinoScriptTranslator.typeOf(c), "[" + c.name() + "]", c.mask(), c.name());
         }
 
         boolean masked() {
@@ -1642,7 +1659,7 @@ public class InfinoAggregationProcessor {
                 // A script reads values themselves, so it sees no masked column, the value script's included.
                 Column valueColumn = column != null && column.masked() ? null : column;
                 Sql sql = InfinoScriptTranslator.translate(s.script(), InfinoAccess.scriptColumns(cols), valueColumn, now);
-                c = new Source(sql.expr(), sql.type(), "script [" + s.script().getIdOrCode() + "]", null);
+                c = new Source(sql.expr(), sql.type(), "script [" + s.script().getIdOrCode() + "]", null, null);
             } else if (column != null) {
                 c = Source.of(column);
             } else {
@@ -2025,27 +2042,16 @@ public class InfinoAggregationProcessor {
         List<List<Object>> kept = null;
         for (int i = 0; i < chain.size(); i++) {
             Grouped level = chain.get(i);
-            List<String> keyCols = new ArrayList<>();
             List<String> aliases = new ArrayList<>();
             for (int j = 0; j <= i; j++) {
-                keyCols.add(chain.get(j).keyExpr + " AS k" + j);
                 aliases.add("k" + j);
             }
-            String select = String.join(", ", keyCols) + ", COUNT(*) AS doc_count" + (level.metrics.isEmpty() ? "" : ", " + metricColumns(level.metrics));
             String restriction = kept == null ? "" : " AND " + tupleRestriction(chain, kept, i);
             // A terms level has no bucket for the missing value, so rows without
             // one leave before the window: they take no slot and count as other to no one.
-            String present = level.terms ? " AND " + level.keyExpr + " IS NOT NULL" : "";
-            StringBuilder positions = new StringBuilder();
-            for (int j = 1; j <= i + 1; j++) {
-                positions.append(j == 1 ? "" : ", ").append(j);
-            }
-            String inner = "SELECT " + select + " FROM " + from + " WHERE " + where + restriction + present + " GROUP BY " + positions;
-            if (level.minDocCount > 1) {
-                inner += " HAVING COUNT(*) >= " + level.minDocCount;
-            }
+            String inner = levelInner(chain, i, from, where, restriction, level.terms);
             String parents = String.join(", ", aliases.subList(0, i));
-            List<Map<String, Object>> rows = i == 0 && level.terms ? pickTopTerms(level, inner) : null;
+            List<Map<String, Object>> rows = i == 0 && level.terms ? pickTopTerms(level, inner, readAhead) : null;
             if (rows == null) {
                 String sql;
                 if (level.terms) {
@@ -2084,6 +2090,109 @@ public class InfinoAggregationProcessor {
     }
 
     /**
+     * The bare GROUP BY of level {@code i} of {@code chain}: the level's keys
+     * and every parent's, the row count and the level's metrics, over
+     * {@code from WHERE where} narrowed by {@code restriction}, without rows
+     * missing the level's key when {@code present}, and with the level's
+     * minimum count as a HAVING.
+     */
+    private static String levelInner(List<Grouped> chain, int i, String from, String where, String restriction, boolean present) {
+        Grouped level = chain.get(i);
+        List<String> keyCols = new ArrayList<>();
+        StringBuilder positions = new StringBuilder();
+        for (int j = 0; j <= i; j++) {
+            keyCols.add(chain.get(j).keyExpr + " AS k" + j);
+            positions.append(j == 0 ? "" : ", ").append(j + 1);
+        }
+        String select = String.join(", ", keyCols) + ", COUNT(*) AS doc_count" + (level.metrics.isEmpty() ? "" : ", " + metricColumns(level.metrics));
+        String keep = present ? " AND " + level.keyExpr + " IS NOT NULL" : "";
+        String inner = "SELECT " + select + " FROM " + from + " WHERE " + where + restriction + keep + " GROUP BY " + positions;
+        if (level.minDocCount > 1) {
+            inner += " HAVING COUNT(*) >= " + level.minDocCount;
+        }
+        return inner;
+    }
+
+    /**
+     * The request's exact total read from a top terms aggregation's own
+     * groups, so it costs no statement of its own: the level's GROUP BY with
+     * the rows missing its key kept as one more group, whose counts add up to
+     * the relation's rows. The groups with a key are kept for the level to
+     * pick its buckets from (see {@link #pickTopTerms}), under the statement it
+     * would have run. Null, and the count is left to its own statement, when
+     * that count is not a statement (a bare text query's count is a direct
+     * call), when the level's buckets are not picked from its groups, when a
+     * minimum count leaves groups out of the sum, or when the level has more
+     * groups than are picked here.
+     */
+    private Long totalFromTopTerms(Spec spec, Translation q) {
+        if (q.principal() != null && InfinoQueryTranslator.ALL.equals(q.where())) {
+            return null;
+        }
+        if (!(spec instanceof Grouped level) || !level.terms || level.minDocCount > 1 || termsOrder(level) == null) {
+            return null;
+        }
+        List<Grouped> chain = List.of(level);
+        String picked = levelInner(chain, 0, q.from(), q.where(), "", true);
+        List<Map<String, Object>> groups;
+        if (readsValueCounts(level, q)) {
+            groups = valueCounts(level, q);
+        } else {
+            groups = InfinoNative.sqlRows(levelInner(chain, 0, q.from(), q.where(), "", false) + " LIMIT " + (MAX_GROUPS_PICKED_HERE + 2));
+        }
+        // One group more than are picked here may be the missing key's.
+        if (groups == null || groups.size() > MAX_GROUPS_PICKED_HERE + 1) {
+            readAhead.put(picked, null);
+            return null;
+        }
+        long total = 0;
+        List<Map<String, Object>> keyed = new ArrayList<>();
+        for (Map<String, Object> group : groups) {
+            total += asLong(group.get("doc_count"));
+            if (group.get("k0") != null) {
+                keyed.add(group);
+            }
+        }
+        if (keyed.size() > MAX_GROUPS_PICKED_HERE) {
+            readAhead.put(picked, null);
+            return total;
+        }
+        readAhead.put(picked, keyed);
+        return total;
+    }
+
+    /**
+     * Whether a top terms level's groups are the table's value counts: a
+     * request that does not filter the table, over a column, with no metrics.
+     */
+    private static boolean readsValueCounts(Grouped level, Translation q) {
+        return q.principal() == null && InfinoQueryTranslator.ALL.equals(q.where()) && level.source.column() != null && level.metrics.isEmpty();
+    }
+
+    /**
+     * A top terms level's groups over the whole table, the rows missing its
+     * key among them, as its GROUP BY would return them, by a direct call
+     * instead of a statement (see {@link #readsValueCounts}): the engine reads
+     * them from the table's statistics when those count every row exactly,
+     * and runs the grouped count otherwise. Null when there are more than are
+     * picked here, the missing key's group aside.
+     */
+    private static List<Map<String, Object>> valueCounts(Grouped level, Translation q) {
+        List<Map<String, Object>> counts = InfinoNative.valueCounts(q.table(), level.source.column(), MAX_GROUPS_PICKED_HERE + 1);
+        if (counts == null) {
+            return null;
+        }
+        List<Map<String, Object>> groups = new ArrayList<>(counts.size());
+        for (Map<String, Object> row : counts) {
+            Map<String, Object> group = new HashMap<>();
+            group.put("k0", row.get(level.source.column()));
+            group.put("doc_count", row.get(InfinoNative.VALUE_COUNT));
+            groups.add(group);
+        }
+        return groups;
+    }
+
+    /**
      * The buckets of a top terms level picked from its bare GROUP BY
      * ({@code inner}), which the engine answers from the table's statistics,
      * instead of through the window statement, which it does not: the groups
@@ -2093,12 +2202,23 @@ public class InfinoAggregationProcessor {
      * metric (a missing metric value sorts where the engine puts it) or the
      * level has more groups than are worth picking here.
      */
-    private static List<Map<String, Object>> pickTopTerms(Grouped level, String inner) {
+    private static List<Map<String, Object>> pickTopTerms(Grouped level, String inner, Map<String, List<Map<String, Object>>> readAhead) {
         Comparator<Map<String, Object>> order = termsOrder(level);
         if (order == null) {
             return null;
         }
-        List<Map<String, Object>> groups = new ArrayList<>(InfinoNative.sqlRows(inner + " LIMIT " + (MAX_GROUPS_PICKED_HERE + 1)));
+        // The groups the request total was read from, when it was read from
+        // them (see totalFromTopTerms); a null there is a level with too many.
+        List<Map<String, Object>> groups;
+        if (readAhead.containsKey(inner)) {
+            List<Map<String, Object>> read = readAhead.get(inner);
+            if (read == null) {
+                return null;
+            }
+            groups = new ArrayList<>(read);
+        } else {
+            groups = new ArrayList<>(InfinoNative.sqlRows(inner + " LIMIT " + (MAX_GROUPS_PICKED_HERE + 1)));
+        }
         if (groups.size() > MAX_GROUPS_PICKED_HERE) {
             return null;
         }
