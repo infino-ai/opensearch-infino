@@ -2084,6 +2084,7 @@ mod tests {
                 c("logs").as_ptr(),
                 c(column).as_ptr(),
                 c(query).as_ptr(),
+                c("or").as_ptr(),
                 10,
             )
         })
