@@ -2150,6 +2150,7 @@ version = "0.1.0"
 dependencies = [
  "datafusion",
  "infino",
+ "libmimalloc-sys",
  "rayon",
  "ureq",
 ]

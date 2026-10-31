@@ -381,12 +381,21 @@ fn is_hosted(uri: &str) -> bool {
 /// are listed — so a key the service refuses, or a service that cannot be
 /// reached, fails here where the caller can report it rather than on the
 /// first write; a database the account does not have yet is registered.
-fn open(uri: &str, api_key: Option<&str>) -> Result<Bridge, InfinoError> {
+///
+/// `cache_dir` is where the engine keeps a local copy of what it reads from
+/// the node's own storage. Without one, a table opened after a restart reads
+/// its whole file from storage on every query; the process that wrote it
+/// held it in memory, so the cost shows only after a restart. A hosted
+/// connection keeps nothing locally and takes none.
+fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bridge, InfinoError> {
     let mut options = ConnectOptions::new();
     if let Some(key) = api_key {
         options = options.with_api_key(key);
     }
     let hosted = is_hosted(uri);
+    if let Some(dir) = cache_dir.filter(|_| !hosted) {
+        options = options.with_cache_dir(dir);
+    }
     let conn = connect_with(uri, options)?;
     if hosted {
         match conn.list_tables() {
@@ -405,20 +414,23 @@ fn open(uri: &str, api_key: Option<&str>) -> Result<Bridge, InfinoError> {
 
 #[no_mangle]
 pub unsafe extern "C" fn infino_open(uri: *const c_char) -> *mut Bridge {
-    unsafe { infino_open_with(uri, ptr::null()) }
+    unsafe { infino_open_with(uri, ptr::null(), ptr::null()) }
 }
 
-/// Open `uri` with `api_key` (see `open`). Null when the open failed; the
-/// reason is then in `infino_open_error`.
+/// Open `uri` with `api_key` and `cache_dir`, each null or empty for none
+/// (see `open`). Null when the open failed; the reason is then in
+/// `infino_open_error`.
 #[no_mangle]
 pub unsafe extern "C" fn infino_open_with(
     uri: *const c_char,
     api_key: *const c_char,
+    cache_dir: *const c_char,
 ) -> *mut Bridge {
     catch_unwind(AssertUnwindSafe(|| {
         let uri = unsafe { cstr(uri) }.unwrap_or("memory://");
         let api_key = unsafe { cstr(api_key) }.filter(|k| !k.is_empty());
-        match open(uri, api_key) {
+        let cache_dir = unsafe { cstr(cache_dir) }.filter(|d| !d.is_empty());
+        match open(uri, api_key, cache_dir) {
             Ok(bridge) => {
                 OPEN_ERROR.with(|slot| *slot.borrow_mut() = None);
                 Box::into_raw(Box::new(bridge))
@@ -2205,13 +2217,17 @@ pub unsafe extern "C" fn infino_sql(h: *mut Bridge, sql: *const c_char) -> *mut 
     .unwrap_or(ptr::null_mut())
 }
 
-/// Ranked BM25 over one text column; rows carry `osid` and `score`.
+/// Ranked BM25 over one text column (`mode` is `"and"` or `"or"`), the top
+/// `k` rows best first, each carrying `osid`, `source` and `score`: a page
+/// of hits in one call, where the same page through `bm25_search` in SQL
+/// would plan a statement first.
 #[no_mangle]
 pub unsafe extern "C" fn infino_bm25(
     h: *mut Bridge,
     name: *const c_char,
     column: *const c_char,
     query: *const c_char,
+    mode: *const c_char,
     k: c_int,
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
@@ -2223,6 +2239,10 @@ pub unsafe extern "C" fn infino_bm25(
         ) else {
             return ptr::null_mut();
         };
+        let mode = match unsafe { cstr(mode) } {
+            Some("and") => BoolMode::And,
+            _ => BoolMode::Or,
+        };
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
@@ -2231,8 +2251,8 @@ pub unsafe extern "C" fn infino_bm25(
             column,
             query,
             k.max(0) as usize,
-            Bm25SearchOptions::default(),
-            Some(&[OSID, "score"]),
+            Bm25SearchOptions::new().with_mode(mode),
+            Some(&[OSID, SOURCE, "score"]),
         ) {
             Ok(b) => out_string(batches_to_json(&b)),
             Err(e) => err_json(&e.to_string()),
@@ -2369,7 +2389,7 @@ pub unsafe extern "C" fn infino_knn(
             &emb,
             k.max(0) as usize,
             None,
-            Some(&[OSID, "score"]),
+            Some(&[OSID, SOURCE, "score"]),
         ) {
             Ok(b) => out_string(batches_to_json(&b)),
             Err(e) => err_json(&e.to_string()),
@@ -2414,7 +2434,7 @@ pub unsafe extern "C" fn infino_hybrid(
             vcol,
             &emb,
             k.max(0) as usize,
-            Some(&[OSID, "score"]),
+            Some(&[OSID, SOURCE, "score"]),
         ) {
             Ok(b) => out_string(batches_to_json(&b)),
             Err(e) => err_json(&e.to_string()),
@@ -3590,6 +3610,68 @@ mod tests {
         assert_eq!(server_message("  plain text  "), "plain text");
     }
 
+    /// Bytes under `dir`, recursively.
+    fn bytes_under(dir: &std::path::Path) -> u64 {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| match e.metadata() {
+                        Ok(m) if m.is_dir() => bytes_under(&e.path()),
+                        Ok(m) => m.len(),
+                        Err(_) => 0,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// A catalog reopened with a cache directory, as a node is after a
+    /// restart, reads what its queries need through the cache: the bytes land
+    /// there, and the answers are the ones the writing connection gave.
+    #[test]
+    fn a_reopened_catalog_reads_through_its_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "infino-capi-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let data = root.join("data");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&data).unwrap();
+        let uri = c(&format!("file://{}", data.display()));
+        let cache_dir = c(&cache.display().to_string());
+
+        let h = unsafe { infino_open_with(uri.as_ptr(), ptr::null(), cache_dir.as_ptr()) };
+        assert!(!h.is_null());
+        assert!(ensure(h, MAPPING).contains("\"created\":true"));
+        index(
+            h,
+            &[
+                ("a", r#"{"level":"error","message":"disk full"}"#),
+                ("b", r#"{"level":"info","message":"request served"}"#),
+            ],
+        );
+        let written = sql(h, "SELECT osid FROM logs WHERE level = 'error'");
+        close(h);
+        // Whatever the writing connection kept goes, so only the reopened
+        // connection's reads can fill the cache.
+        let _ = std::fs::remove_dir_all(&cache);
+
+        let h = unsafe { infino_open_with(uri.as_ptr(), ptr::null(), cache_dir.as_ptr()) };
+        assert!(!h.is_null());
+        assert_eq!(
+            sql(h, "SELECT osid FROM logs WHERE level = 'error'"),
+            written
+        );
+        assert!(bytes_under(&cache) > 0, "the reopened read went through the cache");
+        close(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A hosted URI is one that names a service rather than storage.
     #[test]
     fn hosted_uris_are_http() {
@@ -3606,7 +3688,7 @@ mod tests {
     fn a_failed_open_reports_why_once() {
         let uri = CString::new("http://127.0.0.1:1/nobody").unwrap();
         let key = CString::new("ik_test").unwrap();
-        let h = unsafe { infino_open_with(uri.as_ptr(), key.as_ptr()) };
+        let h = unsafe { infino_open_with(uri.as_ptr(), key.as_ptr(), ptr::null()) };
         assert!(h.is_null());
         let why = unsafe { infino_open_error() };
         assert!(!why.is_null());

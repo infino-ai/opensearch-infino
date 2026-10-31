@@ -20,6 +20,7 @@ import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.env.Environment;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexSettingProvider;
@@ -107,6 +108,18 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
         Setting.Property.NodeScope
     );
 
+    /**
+     * Where the engine keeps a local copy of what it reads from the node's own
+     * storage, {@code infino-cache} under the node's first data path when
+     * unset. Without one, a table opened after a restart reads its whole file
+     * from storage on every query. Not used for a hosted account, which keeps
+     * nothing on the node.
+     */
+    public static final Setting<String> CACHE_DIR = Setting.simpleString("infino.cache.dir", Setting.Property.NodeScope);
+
+    /** The directory {@link #CACHE_DIR} names under the node's data path by default. */
+    static final String DEFAULT_CACHE_SUBDIR = "infino-cache";
+
     private static final InfinoTables TABLES = new InfinoTables();
     private final Map<ShardId, Scheduler.Cancellable> optimizers = new ConcurrentHashMap<>();
     private final boolean defaultEnabled;
@@ -115,6 +128,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
     public InfinoPlugin(Settings settings) {
         this.defaultEnabled = INFINO_DEFAULT_ENABLED.get(settings);
         this.account = new InfinoAccount(PLATFORM_DEFAULT_URL.get(settings));
+        InfinoNative.cacheDir(cacheDir(settings));
         InfinoRequestCache.configure(settings);
         String url = PLATFORM_URL.get(settings);
         if (url.isEmpty()) {
@@ -132,6 +146,23 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
         }
         account.configuredAtBoot(url, database, key != null);
         InfinoNative.configure(InfinoNative.Target.hosted(url, database, key));
+    }
+
+    /**
+     * The node's cache directory: {@link #CACHE_DIR} when set, else
+     * {@link #DEFAULT_CACHE_SUBDIR} under the node's first data path, as the
+     * node's environment resolves it (the home's {@code data} when none is
+     * set). Null without a home, as on a node built for a unit test.
+     */
+    static String cacheDir(Settings settings) {
+        String explicit = CACHE_DIR.get(settings);
+        if (!explicit.isEmpty()) {
+            return explicit;
+        }
+        if (Environment.PATH_HOME_SETTING.get(settings).isEmpty()) {
+            return null;
+        }
+        return new Environment(settings, null).dataFiles()[0].resolve(DEFAULT_CACHE_SUBDIR).toString();
     }
 
     /** The tables behind the node's Infino-backed indices. */
@@ -277,7 +308,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin {
             PLATFORM_URL,
             PLATFORM_DATABASE,
             PLATFORM_API_KEY,
-            PLATFORM_DEFAULT_URL
+            PLATFORM_DEFAULT_URL,
+            CACHE_DIR
         );
     }
 
