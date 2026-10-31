@@ -13,6 +13,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.QueryBuilders;
+import org.opensearch.index.query.functionscore.ScoreFunctionBuilders;
 import org.opensearch.indices.IndicesRequestCache;
 import org.opensearch.script.Script;
 import org.opensearch.search.aggregations.AggregationBuilders;
@@ -73,6 +74,26 @@ public class InfinoRequestCacheTests extends OpenSearchTestCase {
         assertNull(key(aggregationOnly().profile(true)));
         SearchRequest scroll = new SearchRequest().scroll(TimeValue.timeValueMinutes(1));
         assertNull(key(scroll, aggregationOnly(), Settings.EMPTY, InfinoAccess.NONE));
+        // now alone, rounded, and as the bound of a date aggregation.
+        assertNull(key(aggregationOnly().query(QueryBuilders.rangeQuery("ts").lte("now"))));
+        assertNull(key(aggregationOnly().query(QueryBuilders.rangeQuery("ts").gte("now/d"))));
+        assertNull(key(new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.dateRange("r").field("ts").addUnboundedTo("now+1h"))));
+        // A script under any of the keys that carry one, and a random score.
+        assertNull(key(aggregationOnly().scriptField("f", new Script("doc['n'].value"))));
+        assertNull(key(new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.terms("t").script(new Script("doc['n'].value")))));
+        assertNull(key(aggregationOnly().query(QueryBuilders.functionScoreQuery(ScoreFunctionBuilders.randomFunction()))));
+    }
+
+    /**
+     * A value or a field that only holds the letters of {@code now} or
+     * {@code script} changes nothing, so the request is kept: "unknown" and
+     * "snowfall" are words, not the time, and "transcript" is a field.
+     */
+    public void testAWordHoldingNowOrScriptIsKept() {
+        assertNotNull(key(aggregationOnly().query(QueryBuilders.termQuery("status", "unknown"))));
+        assertNotNull(key(aggregationOnly().query(QueryBuilders.termQuery("weather", "snowfall"))));
+        assertNotNull(key(aggregationOnly().query(QueryBuilders.matchQuery("transcript", "now playing"))));
+        assertNotNull(key(new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.terms("known").field("description_scripted"))));
     }
 
     public void testARestrictedUserIsNotKept() {

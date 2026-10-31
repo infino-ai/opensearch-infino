@@ -12,7 +12,9 @@ import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.Strings;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.indices.IndicesRequestCache;
@@ -36,8 +38,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * request asking for no hits ({@code size: 0}) on indices whose
  * {@code index.requests.cache.enable} is on. Never a scroll, a profiled
  * request, one whose answer depends on the time it runs ({@code now} in date
- * math) or on a script, or one the security plugin narrows for its user: a
- * document- or field-level rule, or a masked field.
+ * math), on a script or on a random score ({@link #changesWithoutWrites}),
+ * or one the security plugin narrows for its user: a document- or
+ * field-level rule, or a masked field.
  *
  * <p>A response is kept under its tables' write generations: every write
  * this node makes to a table moves the table's generation, before the write
@@ -54,6 +57,15 @@ final class InfinoRequestCache {
 
     /** A kept response and when it stops being served. */
     private record Entry(SearchResponse response, long expiresAtNanos) {}
+
+    /** What date math reads as the time a request runs. */
+    private static final String NOW = "now";
+    /** What may follow {@code now} in date math: an added or taken unit, or a rounding. */
+    private static final String DATE_MATH_OPERATIONS = "+-/";
+    /** The key a script is given by, alone or within a longer key. */
+    private static final String SCRIPT = "script";
+    /** A score drawn at random for each request. */
+    private static final String RANDOM_SCORE = "random_score";
 
     /** Writes this node made to each table, counted. */
     private static final Map<String, AtomicLong> GENERATIONS = new ConcurrentHashMap<>();
@@ -127,10 +139,7 @@ final class InfinoRequestCache {
             }
         }
         String body = source.toString();
-        // Conservative: "now" in any value (date math, or a word that holds it)
-        // and any script keep the request out, where the shard request cache
-        // asks the parsed query whether it is deterministic.
-        if (body.contains("now") || body.contains("script")) {
+        if (changesWithoutWrites(XContentHelper.convertToMap(new BytesArray(body), false, MediaTypeRegistry.JSON).v2())) {
             return null;
         }
         StringBuilder key = new StringBuilder().append(CONNECTION.get());
@@ -138,6 +147,51 @@ final class InfinoRequestCache {
             key.append('\u0000').append(table).append('\u0000').append(generation(table));
         }
         return key.append('\u0000').append(body).toString();
+    }
+
+    /**
+     * Whether a request (its body as parsed, {@code node} a part of it) can
+     * answer differently with nothing written in between, so it is never
+     * kept: a date that is {@code now} or counts from it, a script, or a
+     * random score. The shard request cache asks the parsed query the same
+     * thing. A word that merely holds {@code now} or {@code script} (a value
+     * like "known", a field like "transcript") changes nothing; a value that
+     * is the word {@code now} itself, which date math would read as the
+     * time, keeps the request out.
+     */
+    static boolean changesWithoutWrites(Object node) {
+        if (node instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                String name = String.valueOf(entry.getKey());
+                if (scriptKey(name) || RANDOM_SCORE.equals(name) || changesWithoutWrites(entry.getValue())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (node instanceof List<?> list) {
+            for (Object item : list) {
+                if (changesWithoutWrites(item)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return node instanceof String value && nowDateMath(value);
+    }
+
+    /**
+     * A key that holds a script: {@code script} itself, and the keys that
+     * name one ({@code script_score}, {@code script_fields}, {@code _script}
+     * in a sort, {@code init_script}, {@code bucket_script}, ...).
+     */
+    private static boolean scriptKey(String name) {
+        return name.equals(SCRIPT) || name.startsWith(SCRIPT + "_") || name.endsWith("_" + SCRIPT);
+    }
+
+    /** A date math expression that counts from the time it runs: {@code now}, alone or followed by its operations. */
+    private static boolean nowDateMath(String value) {
+        return value.startsWith(NOW) && (value.length() == NOW.length() || DATE_MATH_OPERATIONS.indexOf(value.charAt(NOW.length())) >= 0);
     }
 
     /** How long a response over {@code metadata} is served: the shortest refresh interval among the indices. */
