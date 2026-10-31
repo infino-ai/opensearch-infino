@@ -175,6 +175,12 @@ testClusters.all {
     if (needsRuleFrameworkModule) {
         plugin(ruleFrameworkModule.flatMap { it.archiveFile })
     }
+    // The integration-test distribution before 3.6 leaves out the
+    // ingest-common module, whose processors (set, drop, fail) the ingest
+    // suite's pipelines use; the archive carries every module.
+    if (versionMajor < 3 || (versionMajor == 3 && versionMinor < 6)) {
+        testDistribution = 'ARCHIVE'
+    }
     systemProperty 'infino.lib', System.getProperty('infino.lib', defaultLib)
     systemProperty 'infino.uri', System.getProperty('infino.uri', defaultUri)
     // The security policy grants the file catalog's directory by this property.
