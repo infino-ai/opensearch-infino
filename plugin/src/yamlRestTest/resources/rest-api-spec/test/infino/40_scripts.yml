@@ -6,6 +6,9 @@
         body:
           settings:
             index.infino.enabled: true
+            # Cloud mode: the test distributions of some releases ship without Painless, and in
+            # default mode a shard compiles an aggregation's script as any shard does.
+            index.infino.mode: cloud
             number_of_shards: 1
             number_of_replicas: 0
           mappings:
