@@ -83,6 +83,8 @@ final class InfinoQueryTranslator {
     static final String ALL = "1=1";
     /** Predicate that keeps no row. */
     static final String NONE = "1=0";
+    /** How a text clause other than the ranked one joins the relation: by id, through a subquery over its token index. */
+    private static final String ID_SUBQUERY = " IN (SELECT ";
 
     /** One full-text clause on a text-indexed column. */
     record TextClause(String column, String query, String mode) {}
@@ -214,6 +216,16 @@ final class InfinoQueryTranslator {
             }
         }
         return c;
+    }
+
+    /**
+     * Whether a predicate holds a text clause on a column other than the
+     * ranked one: a subquery the engine joins above a ranked search, so the
+     * rows it removes go after the ranking. A string literal that happens to
+     * hold the same text only costs that search a wider candidate window.
+     */
+    static boolean joinsAfterRanking(String predicate) {
+        return predicate.contains(ID_SUBQUERY);
     }
 
     static String quoteIdent(String name) {
@@ -461,7 +473,7 @@ final class InfinoQueryTranslator {
             return ALL;
         }
         return OSID
-            + " IN (SELECT "
+            + ID_SUBQUERY
             + OSID
             + " FROM token_match("
             + literal(table)
