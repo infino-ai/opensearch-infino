@@ -72,7 +72,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Supplier;
 
@@ -110,10 +109,18 @@ public class InfinoBulkActionFilter implements ActionFilter {
 
     private static final Logger log = LogManager.getLogger(InfinoBulkActionFilter.class);
     /**
-     * The header of a bulk sent to the node that writes its tables: that
-     * node serves it, never sending it on.
+     * The header of a bulk sent to the node that writes its tables. Only a
+     * node sets it: it is no REST header, so no client request carries it.
      */
     static final String FORWARDED = "_infino_forwarded";
+    /**
+     * The header of a forwarded bulk sent on once more, because the node it
+     * reached no longer wrote its tables by that node's newer cluster state;
+     * the node it reaches next never sends it on again (see {@link #dispatch}).
+     */
+    static final String FORWARDED_AGAIN = "_infino_forwarded_again";
+    /** How many times a bulk may be sent on to the node that writes its tables. */
+    private static final int MAX_FORWARDS = 2;
     /** The destination of the items a bulk writes to indices Infino does not back: the stock bulk on this node. */
     private static final String STOCK = "";
     /** The id stock answers a dropped document under when the request gave it none. */
@@ -170,6 +177,12 @@ public class InfinoBulkActionFilter implements ActionFilter {
      * the bulk goes on as it came.
      */
     static void route(BulkRequest bulk, ClusterService clusters, InfinoWriter writes, InfinoTables tables, ActionListener<BulkResponse> listener, Runnable stock) {
+        if (forwards() > 0) {
+            // Its pipelines ran on the node it arrived at, which marked each document
+            // resolved; they never run again here, whatever the documents carry.
+            createAndServe(bulk, clusters, new BulkItemResponse[bulk.requests().size()], writes, tables, listener, stock);
+            return;
+        }
         if (!resolvePipelines(bulk, clusters.state())) {
             createAndServe(bulk, clusters, new BulkItemResponse[bulk.requests().size()], writes, tables, listener, stock);
             return;
@@ -241,10 +254,21 @@ public class InfinoBulkActionFilter implements ActionFilter {
      * pipelines, and that node serves them without sending them on. Items
      * for an index Infino does not back (a mixed bulk, or a document a
      * pipeline sent elsewhere) go to the stock bulk on this node, past their
-     * pipelines too. A bulk forwarded here is served here whatever this node
-     * now holds, so a moving shard never sends a bulk back and forth. While
-     * an index has no active primary the bulk waits for one, up to its
-     * timeout, as the stock bulk does.
+     * pipelines too.
+     *
+     * <p>A bulk forwarded here is checked against this node's own cluster
+     * state, which may be newer than the sender's: the items of an index
+     * whose primary has moved on are sent on once more, to the node holding
+     * it now, and a bulk sent on that way that still misses the writer is
+     * answered with the primary unavailable for those items rather than
+     * written here, so a moving shard sends a bulk on at most twice and two
+     * nodes never write one table. While an index has no active primary its
+     * items wait for one, up to the bulk's timeout, as the stock bulk's do.
+     *
+     * <p>Each destination is a part of the bulk answered on its own: a part
+     * that fails, or whose index gets no primary in time, answers each of its
+     * items with the failure, as the stock bulk answers the items of a shard
+     * that failed, and the other parts keep their results.
      */
     static void dispatch(
         BulkRequest bulk,
@@ -256,24 +280,16 @@ public class InfinoBulkActionFilter implements ActionFilter {
         ClusterService clusters,
         ActionListener<BulkResponse> listener
     ) {
-        ThreadContext context = InfinoServices.threadContext();
-        boolean forwarded = context != null && context.getHeader(FORWARDED) != null;
+        int forwards = forwards();
         ClusterState state = clusters.state();
         String local = state.nodes().getLocalNodeId();
-        Map<String, String> writers = new HashMap<>();
-        for (IndexMetadata md : infino.values()) {
-            String node = forwarded ? local : writerNode(state, md.getIndex());
-            if (node == null) {
-                awaitWriter(bulk, md.getIndex(), clusters, listener, () -> dispatch(bulk, concrete, infino, answered, writes, tables, clusters, listener));
-                return;
-            }
-            writers.put(md.getIndex().getName(), node);
-        }
         long start = System.nanoTime();
         BulkItemResponse[] items = new BulkItemResponse[bulk.requests().size()];
-        // Each slot's destination: a node's id for an Infino-backed index, STOCK for any other.
-        // An item its pipeline answered keeps that answer and goes nowhere.
-        Map<String, List<Integer>> slotsByDestination = new LinkedHashMap<>();
+        // Where each index's items go, and each destination's slots. An item its
+        // pipeline answered keeps that answer and goes nowhere; so does one this node
+        // answers now because its primary moved on after the bulk was sent on twice.
+        Map<String, Destination> byIndex = new HashMap<>();
+        Map<Destination, List<Integer>> slotsByDestination = new LinkedHashMap<>();
         boolean anyAnswered = false;
         for (int slot = 0; slot < bulk.requests().size(); slot++) {
             if (answered[slot] != null) {
@@ -282,20 +298,25 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 continue;
             }
             String index = concrete.get(slot);
-            String destination = infino.containsKey(index) ? writers.get(index) : STOCK;
+            Destination destination = byIndex.computeIfAbsent(index, name -> destination(state, infino.get(name), local, forwards));
+            if (destination.moved()) {
+                items[slot] = failure(slot, bulk.requests().get(slot), index, movedOn(infino.get(index).getIndex()));
+                anyAnswered = true;
+                continue;
+            }
             slotsByDestination.computeIfAbsent(destination, k -> new ArrayList<>()).add(slot);
         }
-        if (!anyAnswered && slotsByDestination.size() == 1 && slotsByDestination.containsKey(local)) {
+        Destination here = new Destination(local, null, false);
+        if (!anyAnswered && slotsByDestination.size() == 1 && slotsByDestination.containsKey(here)) {
             serve(bulk, concrete, infino, answered, writes, tables, listener);
             return;
         }
         if (slotsByDestination.isEmpty()) {
-            finish(items, null, start, listener);
+            finish(items, start, listener);
             return;
         }
         AtomicInteger pending = new AtomicInteger(slotsByDestination.size());
-        AtomicReference<Exception> failure = new AtomicReference<>();
-        for (Map.Entry<String, List<Integer>> group : slotsByDestination.entrySet()) {
+        for (Map.Entry<Destination, List<Integer>> group : slotsByDestination.entrySet()) {
             List<Integer> slots = group.getValue();
             BulkRequest part = new BulkRequest();
             part.setRefreshPolicy(bulk.getRefreshPolicy());
@@ -311,23 +332,20 @@ public class InfinoBulkActionFilter implements ActionFilter {
                     partInfino.put(concrete.get(slot), md);
                 }
             }
-            ActionListener<BulkResponse> partListener = ActionListener.wrap(response -> {
-                for (int i = 0; i < slots.size(); i++) {
-                    items[slots.get(i)] = reslot(response.getItems()[i], slots.get(i));
-                }
-                if (pending.decrementAndGet() == 0) {
-                    finish(items, failure.get(), start, listener);
-                }
-            }, e -> {
-                failure.compareAndSet(null, e);
-                if (pending.decrementAndGet() == 0) {
-                    finish(items, failure.get(), start, listener);
-                }
-            });
-            String destination = group.getKey();
-            if (STOCK.equals(destination)) {
+            ActionListener<BulkResponse> partListener = slotted(bulk, concrete, slots, items, pending, start, listener);
+            Destination destination = group.getKey();
+            if (destination.waitingFor() != null) {
+                // Its index has no active primary: once one is, the part goes where it is.
+                awaitWriter(
+                    part,
+                    destination.waitingFor(),
+                    clusters,
+                    partListener,
+                    () -> dispatch(part, partConcrete, partInfino, new BulkItemResponse[slots.size()], writes, tables, clusters, partListener)
+                );
+            } else if (STOCK.equals(destination.node())) {
                 InfinoClient.bulk(part, partListener);
-            } else if (destination.equals(local)) {
+            } else if (destination.equals(here)) {
                 serve(part, partConcrete, partInfino, new BulkItemResponse[slots.size()], writes, tables, partListener);
             } else {
                 // The write lands on another node, which this node's request cache
@@ -345,7 +363,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 }
                 written.keySet().forEach(InfinoRequestCache::changed);
                 Runnable settle = () -> written.forEach((t, md) -> InfinoRequestCache.writtenElsewhere(t, InfinoRequestCache.lifetime(List.of(md))));
-                forward(state.nodes().get(destination), part, ActionListener.wrap(response -> {
+                forward(state.nodes().get(destination.node()), part, ActionListener.wrap(response -> {
                     settle.run();
                     partListener.onResponse(response);
                 }, e -> {
@@ -354,6 +372,75 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 }));
             }
         }
+    }
+
+    /**
+     * Where a bulk's items for one index go: {@code node}, the one that
+     * writes its table ({@link #STOCK} for an index Infino does not back);
+     * or, while it has no active primary, {@code waitingFor} it; or nowhere
+     * when it has {@code moved} on from this node after the bulk was sent on
+     * as often as it may be.
+     */
+    private record Destination(String node, Index waitingFor, boolean moved) {}
+
+    /** Where the items for {@code md} (null for an index Infino does not back) go from this node, the bulk sent on {@code forwards} times so far. */
+    private static Destination destination(ClusterState state, IndexMetadata md, String local, int forwards) {
+        if (md == null) {
+            return new Destination(STOCK, null, false);
+        }
+        String node = writerNode(state, md.getIndex());
+        if (node == null) {
+            return new Destination(null, md.getIndex(), false);
+        }
+        return new Destination(node, null, forwards == MAX_FORWARDS && !node.equals(local));
+    }
+
+    /** What an item of {@code index} is answered with when its primary moved on while the bulk was sent on to it twice: a client retries it. */
+    private static UnavailableShardsException movedOn(Index index) {
+        return new UnavailableShardsException(new ShardId(index, 0), "the primary moved to another node while the bulk was sent on to this one");
+    }
+
+    /** How many times the bulk this thread serves was sent on to the node that writes its tables: 0 when it arrived here from its client. */
+    private static int forwards() {
+        ThreadContext context = InfinoServices.threadContext();
+        if (context == null || context.getHeader(FORWARDED) == null) {
+            return 0;
+        }
+        return context.getHeader(FORWARDED_AGAIN) == null ? 1 : MAX_FORWARDS;
+    }
+
+    /**
+     * The listener of one part of a bulk, whose items sit at {@code slots}
+     * of the whole: it puts the part's answers in those slots, or when the
+     * part fails answers each of its items with the failure, as the stock
+     * bulk answers the items of a shard that failed. The bulk is answered
+     * once every part is.
+     */
+    private static ActionListener<BulkResponse> slotted(
+        BulkRequest bulk,
+        List<String> concrete,
+        List<Integer> slots,
+        BulkItemResponse[] items,
+        AtomicInteger pending,
+        long start,
+        ActionListener<BulkResponse> listener
+    ) {
+        return ActionListener.wrap(response -> {
+            for (int i = 0; i < slots.size(); i++) {
+                items[slots.get(i)] = reslot(response.getItems()[i], slots.get(i));
+            }
+            if (pending.decrementAndGet() == 0) {
+                finish(items, start, listener);
+            }
+        }, e -> {
+            log.debug("[infino] {} items of a bulk failed", slots.size(), e);
+            for (int slot : slots) {
+                items[slot] = failure(slot, bulk.requests().get(slot), concrete.get(slot), e);
+            }
+            if (pending.decrementAndGet() == 0) {
+                finish(items, start, listener);
+            }
+        });
     }
 
     /**
@@ -415,9 +502,9 @@ public class InfinoBulkActionFilter implements ActionFilter {
 
     /**
      * Send {@code part} to {@code node}, which writes its tables, as a bulk
-     * marked forwarded, so it serves it there. It goes as the caller: the
-     * node authorizes it again, and the answer comes back in the caller's
-     * context.
+     * marked forwarded (forwarded again when it arrived here forwarded), so
+     * it serves it there. It goes as the caller: the node authorizes it
+     * again, and the answer comes back in the caller's context.
      */
     private static void forward(DiscoveryNode node, BulkRequest part, ActionListener<BulkResponse> listener) {
         TransportService transport = InfinoServices.transportService();
@@ -428,7 +515,8 @@ public class InfinoBulkActionFilter implements ActionFilter {
         }
         ActionListener<BulkResponse> inCallerContext = new ContextPreservingActionListener<>(context.newRestorableContext(false), listener);
         try (ThreadContext.StoredContext ignored = context.newStoredContext(true)) {
-            context.putHeader(FORWARDED, "true");
+            // A header once set stays for the request's life: one sent on again carries a second.
+            context.putHeader(context.getHeader(FORWARDED) == null ? FORWARDED : FORWARDED_AGAIN, "true");
             transport.sendRequest(node, BulkAction.NAME, part, new ActionListenerResponseHandler<>(inCallerContext, BulkResponse::new));
         }
     }
@@ -643,9 +731,10 @@ public class InfinoBulkActionFilter implements ActionFilter {
      * Serve a bulk over Infino-backed indices: stage the items of each index
      * and hand them to its table's writer. With several indices, each index's
      * items go to their own waiter and the bulk is answered when every waiter
-     * has, each item in the bulk's own slot. An item {@code answered} holds
-     * an answer for (one its ingest pipeline failed or dropped) is given that
-     * answer and not written.
+     * has, each item in the bulk's own slot; an index whose write fails
+     * answers its own items with the failure, and the others keep their
+     * results. An item {@code answered} holds an answer for (one its ingest
+     * pipeline failed or dropped) is given that answer and not written.
      */
     static void serve(
         BulkRequest bulk,
@@ -672,7 +761,6 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 slotsByIndex.computeIfAbsent(concrete.get(slot), k -> new ArrayList<>()).add(slot);
             }
             AtomicInteger pending = new AtomicInteger(slotsByIndex.size());
-            AtomicReference<Exception> failure = new AtomicReference<>();
             for (Map.Entry<String, List<Integer>> group : slotsByIndex.entrySet()) {
                 IndexMetadata md = infino.get(group.getKey());
                 List<Integer> slots = group.getValue();
@@ -683,23 +771,16 @@ public class InfinoBulkActionFilter implements ActionFilter {
                     partAnswered[i] = answered[slots.get(i)];
                 }
                 BulkItemResponse[] part = new BulkItemResponse[slots.size()];
-                ActionListener<BulkResponse> partListener = ActionListener.wrap(response -> {
-                    for (int i = 0; i < slots.size(); i++) {
-                        items[slots.get(i)] = reslot(response.getItems()[i], slots.get(i));
-                    }
-                    if (pending.decrementAndGet() == 0) {
-                        finish(items, failure.get(), start, listener);
-                    }
-                }, e -> {
-                    failure.compareAndSet(null, e);
-                    if (pending.decrementAndGet() == 0) {
-                        finish(items, failure.get(), start, listener);
-                    }
-                });
-                String table = tables.ensure(md);
-                ShardId shardId = new ShardId(md.getIndex(), 0);
-                Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, requests, partAnswered, writes), part, start, partListener);
-                writes.submit(table, waiter);
+                ActionListener<BulkResponse> partListener = slotted(bulk, concrete, slots, items, pending, start, listener);
+                try {
+                    String table = tables.ensure(md);
+                    ShardId shardId = new ShardId(md.getIndex(), 0);
+                    Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, requests, partAnswered, writes), part, start, partListener);
+                    writes.submit(table, waiter);
+                } catch (Exception e) {
+                    log.warn("[infino] bulk items for {} failed", group.getKey(), e);
+                    partListener.onFailure(e);
+                }
             }
         } catch (Exception e) {
             log.warn("[infino] bulk failed", e);
@@ -707,11 +788,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
         }
     }
 
-    private static void finish(BulkItemResponse[] items, Exception failure, long start, ActionListener<BulkResponse> listener) {
-        if (failure != null) {
-            listener.onFailure(failure);
-            return;
-        }
+    private static void finish(BulkItemResponse[] items, long start, ActionListener<BulkResponse> listener) {
         listener.onResponse(new BulkResponse(items, (System.nanoTime() - start) / 1_000_000L));
     }
 
@@ -792,6 +869,11 @@ public class InfinoBulkActionFilter implements ActionFilter {
 
     private static BulkItemResponse failure(int slot, DocWriteRequest<?> item, String index, Exception cause, RestStatus status) {
         return new BulkItemResponse(slot, item.opType(), new BulkItemResponse.Failure(index, item.id(), cause, status));
+    }
+
+    /** An item failed by {@code cause}, under the status the cause carries. */
+    private static BulkItemResponse failure(int slot, DocWriteRequest<?> item, String index, Exception cause) {
+        return new BulkItemResponse(slot, item.opType(), new BulkItemResponse.Failure(index, item.id(), cause));
     }
 
     /** The source in whatever content type the client sent, as JSON for the bridge. */
