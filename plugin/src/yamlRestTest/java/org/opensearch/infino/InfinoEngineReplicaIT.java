@@ -15,7 +15,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 
 /**
- * An engine-mode index with a replica, on a two-node cluster over one
+ * A default-mode index with a replica, on a two-node cluster over one
  * catalog. A replica added after writes the primary has not flushed
  * recovers by replaying them from the primary's history, which needs the
  * source each copy keeps for recovery; a replica that takes over as primary
@@ -124,13 +124,13 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
         }, STALENESS_WAIT_SECONDS, TimeUnit.SECONDS);
     }
 
-    /** An engine-mode index of one shard, with {@code extra} settings after the others. */
+    /** A default-mode index of one shard, with {@code extra} settings after the others. */
     private void createIndex(String index, int replicas, String extra) throws IOException {
         // Refresh off: only a write's own translog sync commits it to the table.
         call(
             "PUT",
             "/" + index,
-            "{\"settings\":{\"index.infino.enabled\":true,\"index.infino.mode\":\"engine\",\"index.refresh_interval\":-1,"
+            "{\"settings\":{\"index.infino.enabled\":true,\"index.infino.mode\":\"default\",\"index.refresh_interval\":-1,"
                 + "\"number_of_shards\":1,\"number_of_replicas\":"
                 + replicas
                 + extra

@@ -49,12 +49,20 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 /**
- * Backs an index with an Infino table at the action layer: bulk, search and
- * get for an index with {@code index.infino.enabled} are answered from the
- * table before they are routed to a shard, so no document is ever written
- * to Lucene. Every index the cluster creates gets the setting unless its
- * request or template sets it (node setting
- * {@code infino.index.default_enabled}, on by default), so the node holds
+ * Backs an index with an Infino table. Every index the cluster creates gets
+ * {@code index.infino.enabled} unless its request or template sets it (node
+ * setting {@code infino.index.default_enabled}, on by default).
+ *
+ * <p>In default mode ({@code index.infino.mode: default}, the setting's
+ * default) an index is served through its shards: OpenSearch's own write
+ * path through {@link InfinoEngine}, over a Lucene index holding each
+ * document's identity only, and each shard's query and fetch phases
+ * answered from its table by the same planner
+ * ({@link InfinoQueryPhaseSearcher}).
+ *
+ * <p>In cloud mode ({@code index.infino.mode: cloud}) bulk, search and get
+ * are answered from the table at the action layer, before they are routed
+ * to a shard, so no document is ever written to Lucene and the node holds
  * no index data of its own. The index itself exists in cluster state as a
  * name, a mapping (which declares the table's columns) and its settings;
  * its one shard stays empty.
@@ -63,13 +71,6 @@ import java.util.function.Supplier;
  * index and its UUID. It is dropped when the index is deleted unless it was
  * named explicitly, so an index recreated on a fresh cluster with the same
  * setting reattaches to the rows its predecessor wrote.
- *
- * <p>An index may instead be served through its shards
- * ({@code index.infino.mode: engine}, on a node with
- * {@code infino.engine.enabled}): OpenSearch's own write path through
- * {@link InfinoEngine}, over a Lucene index holding each document's identity
- * only, and each shard's query and fetch phases answered from its table by
- * the same planner ({@link InfinoQueryPhaseSearcher}).
  */
 public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, EnginePlugin {
 
@@ -77,38 +78,41 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
 
     public static final Setting<Boolean> INFINO_ENABLED = Setting.boolSetting("index.infino.enabled", false, Setting.Property.IndexScope);
 
-    /** {@link #INFINO_MODE}: served before any shard, from the table; no Lucene. The default. */
-    public static final String MODE_ACTION = "action";
-    /** {@link #INFINO_MODE}: served through the shard's engine and query phase, over a Lucene skeleton. */
-    public static final String MODE_ENGINE = "engine";
+    /** {@link #INFINO_MODE}: served before any shard, from the table; no Lucene. */
+    public static final String MODE_CLOUD = "cloud";
+    /** {@link #INFINO_MODE}: served through the shard's engine and query phase, over a Lucene skeleton. The setting's default. */
+    public static final String MODE_DEFAULT = "default";
 
     /**
-     * Where an Infino-backed index is served. {@code action} (the default)
-     * answers bulk, search and get before the request reaches a shard, and
-     * nothing is written to Lucene. {@code engine} keeps OpenSearch's own
-     * write path through {@link InfinoEngine}, whose Lucene index holds each
-     * document's identity only, and answers the shard's query phase from the
-     * table ({@link InfinoQueryPhaseSearcher}), a table per shard; it needs
-     * {@link #ENGINE_ENABLED} on the node.
+     * Where an Infino-backed index is served. {@code default} (the setting's
+     * default) keeps OpenSearch's own write path through
+     * {@link InfinoEngine}, whose Lucene index holds each document's identity
+     * only, and answers the shard's query phase from the table
+     * ({@link InfinoQueryPhaseSearcher}), a table per shard; it needs
+     * {@link #DEFAULT_MODE_ENABLED} on the node. {@code cloud} answers bulk,
+     * search and get before the request reaches a shard, and nothing is
+     * written to Lucene.
      */
-    public static final Setting<String> INFINO_MODE = new Setting<>("index.infino.mode", MODE_ACTION, mode -> {
-        if (!MODE_ACTION.equals(mode) && !MODE_ENGINE.equals(mode)) {
-            throw new IllegalArgumentException("[index.infino.mode] must be [" + MODE_ACTION + "] or [" + MODE_ENGINE + "], got [" + mode + "]");
+    public static final Setting<String> INFINO_MODE = new Setting<>("index.infino.mode", MODE_DEFAULT, mode -> {
+        if (!MODE_CLOUD.equals(mode) && !MODE_DEFAULT.equals(mode)) {
+            throw new IllegalArgumentException("[index.infino.mode] must be [" + MODE_CLOUD + "] or [" + MODE_DEFAULT + "], got [" + mode + "]");
         }
         return mode;
     }, Setting.Property.IndexScope, Setting.Property.Final);
 
     /**
-     * Whether this node serves engine-mode indices. Off by default: engine
-     * mode takes the node's one query-phase searcher, which another search
-     * plugin (neural search's hybrid query, for one) may need instead.
+     * Whether this node serves default-mode indices. On by default, as
+     * default mode is every index's default. A node turns it off where
+     * another search plugin needs the node's one query-phase searcher
+     * (neural search's hybrid query, for one); its indices are then created
+     * in cloud mode.
      */
-    public static final Setting<Boolean> ENGINE_ENABLED = Setting.boolSetting("infino.engine.enabled", false, Setting.Property.NodeScope);
+    public static final Setting<Boolean> DEFAULT_MODE_ENABLED = Setting.boolSetting("infino.default_mode.enabled", true, Setting.Property.NodeScope);
 
     /**
      * Set by the registry on an index it recreates on a fresh cluster (see
      * {@link InfinoRegistry}): the index's table already holds rows, which
-     * an engine-mode index's new Lucene skeleton knows nothing of, so its
+     * a default-mode index's new Lucene skeleton knows nothing of, so its
      * engine looks ids up in the table (see {@link InfinoEngine}).
      */
     public static final Setting<Boolean> INFINO_REBUILT = Setting.boolSetting(
@@ -180,12 +184,12 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     private static final InfinoTables TABLES = new InfinoTables();
     private final Map<ShardId, Scheduler.Cancellable> optimizers = new ConcurrentHashMap<>();
     private final boolean defaultEnabled;
-    private final boolean engineEnabled;
+    private final boolean defaultModeEnabled;
     private final InfinoAccount account;
 
     public InfinoPlugin(Settings settings) {
         this.defaultEnabled = INFINO_DEFAULT_ENABLED.get(settings);
-        this.engineEnabled = ENGINE_ENABLED.get(settings);
+        this.defaultModeEnabled = DEFAULT_MODE_ENABLED.get(settings);
         this.account = new InfinoAccount(PLATFORM_DEFAULT_URL.get(settings));
         InfinoNative.cacheDir(cacheDir(settings));
         InfinoRequestCache.configure(settings);
@@ -229,25 +233,25 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         return TABLES;
     }
 
-    /** Whether an index with these settings is Infino-backed and served at the action layer. */
-    static boolean atActionLayer(Settings indexSettings) {
-        return indexSettings.getAsBoolean(INFINO_ENABLED.getKey(), false) && !MODE_ENGINE.equals(INFINO_MODE.get(indexSettings));
+    /** Whether an index with these settings is Infino-backed and in cloud mode, served at the action layer. */
+    static boolean inCloudMode(Settings indexSettings) {
+        return indexSettings.getAsBoolean(INFINO_ENABLED.getKey(), false) && !MODE_DEFAULT.equals(INFINO_MODE.get(indexSettings));
     }
 
-    /** Whether an index with these settings is Infino-backed and served through its engine. */
-    static boolean atEngine(Settings indexSettings) {
-        return indexSettings.getAsBoolean(INFINO_ENABLED.getKey(), false) && MODE_ENGINE.equals(INFINO_MODE.get(indexSettings));
+    /** Whether an index with these settings is Infino-backed and in default mode, served through its engine. */
+    static boolean inDefaultMode(Settings indexSettings) {
+        return indexSettings.getAsBoolean(INFINO_ENABLED.getKey(), false) && MODE_DEFAULT.equals(INFINO_MODE.get(indexSettings));
     }
 
     @Override
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
-        if (!atEngine(indexSettings.getSettings())) {
+        if (!inDefaultMode(indexSettings.getSettings())) {
             return Optional.empty();
         }
-        if (!engineEnabled) {
+        if (!defaultModeEnabled) {
             // Without the engine the index would fall to the stock one and keep its data in Lucene.
             throw new IllegalArgumentException(
-                "[infino] index " + indexSettings.getIndex().getName() + " is in engine mode, which needs [" + ENGINE_ENABLED.getKey() + ": true] on the node"
+                "[infino] index " + indexSettings.getIndex().getName() + " is in default mode, which needs [" + DEFAULT_MODE_ENABLED.getKey() + ": true] on the node"
             );
         }
         // The release's own subclass hooks the translog sync (see InfinoEngine#commitBeforeSync).
@@ -256,12 +260,12 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
 
     @Override
     public Optional<QueryPhaseSearcher> getQueryPhaseSearcher() {
-        return engineEnabled ? Optional.of(new InfinoQueryPhaseSearcher()) : Optional.empty();
+        return defaultModeEnabled ? Optional.of(new InfinoQueryPhaseSearcher()) : Optional.empty();
     }
 
     @Override
     public List<FetchSubPhase> getFetchSubPhases(FetchPhaseConstructionContext context) {
-        return engineEnabled ? List.of(new InfinoFetchSubPhase()) : List.of();
+        return defaultModeEnabled ? List.of(new InfinoFetchSubPhase()) : List.of();
     }
 
     @Override
@@ -364,10 +368,10 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         });
     }
 
-    /** Rebuild the skeleton of a primary of an engine-mode index the registry recreated (see {@link InfinoSkeletonAdopter}). */
+    /** Rebuild the skeleton of a primary of a default-mode index the registry recreated (see {@link InfinoSkeletonAdopter}). */
     private static void adoptIfRebuilt(IndexShard shard) {
         Settings settings = shard.indexSettings().getSettings();
-        if (!atEngine(settings) || !INFINO_REBUILT.get(settings)) {
+        if (!inDefaultMode(settings) || !INFINO_REBUILT.get(settings)) {
             return;
         }
         try {
@@ -410,24 +414,36 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
 
     /**
      * Stamp {@code index.infino.enabled} on every index the cluster creates
-     * unless the request or a template sets it. A provider's settings sit
-     * below templates and requests, so an index created with the setting
-     * false keeps it; without the switch the node would hold the data of
-     * every index created without the setting, which is the state the
-     * plugin exists to keep off the node.
+     * unless the request or a template sets it (and {@link #INFINO_DEFAULT_ENABLED}
+     * is on). A provider's settings sit below templates and requests, so an
+     * index created with the setting false keeps it; without the switch the
+     * node would hold the data of every index created without the setting,
+     * which is the state the plugin exists to keep off the node.
+     *
+     * <p>An Infino-backed index created without a mode is stamped with the
+     * one the creating node serves: default mode, or cloud mode where
+     * {@link #DEFAULT_MODE_ENABLED} is off. The mode is final, so the index
+     * keeps it on every node.
      */
     @Override
     public Collection<IndexSettingProvider> getAdditionalIndexSettingProviders() {
-        if (!defaultEnabled) {
-            return List.of();
-        }
         return List.of(new IndexSettingProvider() {
             @Override
             public Settings getAdditionalIndexSettings(String indexName, boolean isDataStreamIndex, Settings templateAndRequestSettings) {
+                Settings.Builder out = Settings.builder();
+                boolean enabled;
                 if (templateAndRequestSettings.hasValue(INFINO_ENABLED.getKey())) {
-                    return Settings.EMPTY;
+                    enabled = templateAndRequestSettings.getAsBoolean(INFINO_ENABLED.getKey(), false);
+                } else {
+                    enabled = defaultEnabled;
+                    if (enabled) {
+                        out.put(INFINO_ENABLED.getKey(), true);
+                    }
                 }
-                return Settings.builder().put(INFINO_ENABLED.getKey(), true).build();
+                if (enabled && !templateAndRequestSettings.hasValue(INFINO_MODE.getKey())) {
+                    out.put(INFINO_MODE.getKey(), defaultModeEnabled ? MODE_DEFAULT : MODE_CLOUD);
+                }
+                return out.build();
             }
         });
     }
@@ -438,7 +454,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             INFINO_DEFAULT_ENABLED,
             INFINO_ENABLED,
             INFINO_MODE,
-            ENGINE_ENABLED,
+            DEFAULT_MODE_ENABLED,
             INFINO_REBUILT,
             INFINO_TABLE,
             OPTIMIZE_INTERVAL,

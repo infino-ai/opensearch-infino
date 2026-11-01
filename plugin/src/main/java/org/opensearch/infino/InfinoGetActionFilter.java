@@ -125,13 +125,13 @@ public class InfinoGetActionFilter implements ActionFilter {
     }
 
     /**
-     * A document's source as a read sees it now: in engine mode a write its
+     * A document's source as a read sees it now: in default mode a write its
      * shard has acknowledged and not yet committed counts, as a stock get
-     * reads the translog; at the action layer an acknowledged write is in
-     * the table already.
+     * reads the translog; in cloud mode an acknowledged write is in the
+     * table already.
      */
     static String sourceOf(IndexMetadata index, String table, String id) {
-        return InfinoPlugin.atEngine(index.getSettings()) ? InfinoEngine.currentSource(table, id) : InfinoNative.getSource(table, id);
+        return InfinoPlugin.inDefaultMode(index.getSettings()) ? InfinoEngine.currentSource(table, id) : InfinoNative.getSource(table, id);
     }
 
     /** The Infino-backed index a request names, directly or through an alias; null when it names something else. */
@@ -152,13 +152,13 @@ public class InfinoGetActionFilter implements ActionFilter {
     }
 
     /**
-     * The routing value a found engine-mode document was written with, which
+     * The routing value a found default-mode document was written with, which
      * a stock get reports as {@code _routing}; null when it was written with
-     * none, when {@code source} says it was not found, or at the action layer,
+     * none, when {@code source} says it was not found, or in cloud mode,
      * which routes nothing.
      */
     static String routingOf(IndexMetadata index, String table, String id, String source) {
-        if (source == null || source.isEmpty() || !InfinoPlugin.atEngine(index.getSettings())) {
+        if (source == null || source.isEmpty() || !InfinoPlugin.inDefaultMode(index.getSettings())) {
             return null;
         }
         return InfinoEngine.currentRouting(table, id);

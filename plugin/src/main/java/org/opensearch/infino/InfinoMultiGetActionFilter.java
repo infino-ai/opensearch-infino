@@ -87,7 +87,7 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
         try {
             // One source fetch per table, over all of its ids: through the
             // document rule when the security plugin has one for this user. An
-            // index in engine mode with several shards has a table per shard,
+            // index in default mode with several shards has a table per shard,
             // so each id goes to its shard's.
             Map<String, InfinoAccess> accessOf = new HashMap<>();
             for (Map.Entry<String, IndexMetadata> e : indices.entrySet()) {
@@ -110,7 +110,7 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                 InfinoAccess access = accessOf.get(index);
                 if (access.restrictsDocuments()) {
                     restricted.put(e.getKey(), InfinoGetActionFilter.restrictedSources(e.getKey(), e.getValue(), access));
-                } else if (!InfinoPlugin.atEngine(md.getSettings())) {
+                } else if (!InfinoPlugin.inDefaultMode(md.getSettings())) {
                     InfinoNative.prefetchSources(e.getKey(), e.getValue());
                 }
             }

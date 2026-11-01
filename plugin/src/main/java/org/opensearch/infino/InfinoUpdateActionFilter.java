@@ -12,6 +12,7 @@ import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
+import org.opensearch.action.support.WriteRequest;
 import org.opensearch.action.update.UpdateAction;
 import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -98,10 +99,12 @@ public class InfinoUpdateActionFilter implements ActionFilter {
             });
             if (infino.isEmpty()) {
                 IndexMetadata md = concrete.get(0) == null ? null : clusters.state().metadata().index(concrete.get(0));
-                if (md != null && InfinoPlugin.atEngine(md.getSettings())) {
-                    // The stock update reads the document's source from Lucene, which an
-                    // engine-mode index keeps no copy of: as a one-item bulk, the bulk
-                    // path merges it here and writes it whole through the shard.
+                if (md != null && InfinoPlugin.inDefaultMode(md.getSettings())) {
+                    // The stock update reads the document's source from Lucene, which a
+                    // default-mode index keeps no copy of: as a one-item bulk, the bulk
+                    // path merges it here and writes it whole through the shard. The
+                    // bulk carries the refresh policy, which a bulk's item may not.
+                    update.setRefreshPolicy(WriteRequest.RefreshPolicy.NONE);
                     InfinoClient.bulk(bulk, answer);
                     return;
                 }

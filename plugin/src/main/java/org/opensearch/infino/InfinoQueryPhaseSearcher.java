@@ -26,6 +26,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.mapper.IdFieldMapper;
+import org.opensearch.index.fieldvisitor.FieldsVisitor;
 import org.opensearch.index.mapper.Uid;
 import org.opensearch.infino.InfinoScriptTranslator.SqlType;
 import org.opensearch.infino.InfinoSearch.SortSpec;
@@ -51,14 +52,14 @@ import java.util.LinkedList;
 import java.util.List;
 
 /**
- * The query phase of an engine-mode shard ({@code index.infino.mode: engine}),
+ * The query phase of a default-mode shard ({@code index.infino.mode: default}),
  * answered from the shard's table; every other shard gets the stock phase.
  *
  * <p>The shard plans from the search as the client wrote it (see
- * {@link InfinoQueryExt}) with the action layer's planner and hit statement
+ * {@link InfinoQueryExt}) with cloud mode's planner and hit statement
  * ({@link InfinoSearch#plan}, {@link InfinoSearch#page}), under what the
  * security plugin lets the user see, so both modes serve the same requests
- * the same way. Each hit is kept whole, as the action layer builds it
+ * the same way. Each hit is kept whole, as cloud mode builds it
  * (source filtered and masked, requested fields, script fields, collapse
  * value), for the shard's fetch phase to hand out ({@link InfinoFetchSubPhase});
  * the shard result names each hit by its document in the shard's Lucene
@@ -75,7 +76,7 @@ import java.util.List;
  * reads {@code now} as the coordinating node set it. A scroll pages in a
  * fixed order, the id's when the request names none: each round resumes
  * after the last hit the coordinating node handed out from this shard, as
- * the action layer's scroll resumes after its last.
+ * cloud mode's scroll resumes after its last.
  */
 public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
 
@@ -96,10 +97,10 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
 
     private final QueryPhaseSearcher fallback = new QueryPhaseSearcherWrapper();
 
-    /** Whether a shard's index is served by its table in engine mode. */
+    /** Whether a shard's index is served by its table in default mode. */
     static boolean isEngineShard(SearchContext context) {
         try {
-            return InfinoPlugin.atEngine(context.indexShard().indexSettings().getSettings());
+            return InfinoPlugin.inDefaultMode(context.indexShard().indexSettings().getSettings());
         } catch (RuntimeException e) {
             return false;
         }
@@ -155,7 +156,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
     private static void serve(SearchContext context, ContextIndexSearcher searcher) throws IOException {
         InfinoQueryExt carried = InfinoQueryExt.carried(context.request().source());
         if (carried == null) {
-            throw new IllegalStateException("[infino] a search of an engine-mode index reached its shard without the search as written");
+            throw new IllegalStateException("[infino] a search of a default-mode index reached its shard without the search as written");
         }
         ShardId shardId = context.indexShard().shardId();
         Index index = shardId.getIndex();
@@ -164,7 +165,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
 
         ScrollContext scroll = context.scrollContext();
         boolean laterRound = scroll != null && scroll.totalHits != null;
-        SearchSourceBuilder source = scroll == null ? carried.source() : scrollRound(carried.source(), scroll, laterRound);
+        SearchSourceBuilder source = scroll == null ? carried.source() : scrollRound(carried.source(), scroll, laterRound, searcher);
         // The coordinating node's clock, so every shard reads `now` the same.
         long now = carried.nowMillis();
         // The rows this search's skeleton reader holds, as a stock shard's search sees its reader.
@@ -258,16 +259,32 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             scroll.totalHits = totalHits;
             scroll.maxScore = page.maxScore();
         }
+        // A scroll of one shard fetches on the shard, so nothing else records the
+        // last document it handed out: the next round resumes after this page's
+        // last, as the stock scroll's collector records it. Over several shards
+        // the coordinating node records the last it handed out from each.
+        if (scroll != null && !docs.isEmpty() && context.request().numberOfShards() == 1) {
+            scroll.lastEmittedDoc = docs.get(docs.size() - 1);
+        }
     }
 
     /**
-     * The search one round of a scroll runs: the action layer's scroll
+     * The search one round of a scroll runs: cloud mode's scroll
      * source ({@link InfinoSearch#scrollSource}), which pages in a fixed
      * order; the first round also keeps the request's total and
      * aggregations, and every later one resumes after the last hit the
-     * coordinating node handed out from this shard.
+     * coordinating node handed out from this shard. A scroll that pages by
+     * the id (its request names no sort, or {@code _doc}) resumes from that
+     * hit's id in this shard's reader: the coordinating node names the hit
+     * by its document there, and by sort values only of its own sort, which
+     * is not the id.
      */
-    private static SearchSourceBuilder scrollRound(SearchSourceBuilder written, ScrollContext scroll, boolean laterRound) {
+    private static SearchSourceBuilder scrollRound(
+        SearchSourceBuilder written,
+        ScrollContext scroll,
+        boolean laterRound,
+        ContextIndexSearcher searcher
+    ) throws IOException {
         SearchSourceBuilder round = InfinoSearch.scrollSource(written);
         if (!laterRound) {
             if (written.trackTotalHitsUpTo() != null) {
@@ -285,7 +302,12 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             }
             return round;
         }
-        if (scroll.lastEmittedDoc instanceof FieldDoc last) {
+        if (InfinoSearch.scrollsById(written)) {
+            String id = scroll.lastEmittedDoc == null ? null : idOf(searcher, scroll.lastEmittedDoc.doc);
+            if (id != null) {
+                round.searchAfter(new Object[] { id });
+            }
+        } else if (scroll.lastEmittedDoc instanceof FieldDoc last) {
             round.searchAfter(searchAfter(last.fields));
         }
         return round;
@@ -377,6 +399,13 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
     private static boolean trackTotal(SearchSourceBuilder source) {
         Integer upTo = source.trackTotalHitsUpTo();
         return upTo == null || upTo != SearchContext.TRACK_TOTAL_HITS_DISABLED;
+    }
+
+    /** The id of the Lucene document {@code doc} of the shard's skeleton, or null when it stores none. */
+    private static String idOf(ContextIndexSearcher searcher, int doc) throws IOException {
+        FieldsVisitor visitor = new FieldsVisitor(false);
+        searcher.storedFields().document(doc, visitor);
+        return visitor.id();
     }
 
     /** The Lucene document of an id in the shard's skeleton, or -1 when it has none. */

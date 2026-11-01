@@ -14,7 +14,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
- * An engine-mode index as the registry recreates it on a fresh cluster:
+ * A default-mode index as the registry recreates it on a fresh cluster:
  * created over a table that already holds rows, and marked rebuilt. Its
  * new Lucene skeleton gets a document for each row, so its searches find
  * the rows written before; a rewrite of an existing id replaces its row, and
@@ -125,7 +125,7 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         call(
             "PUT",
             "/" + index,
-            "{\"settings\":{\"index.infino.enabled\":true,\"index.infino.mode\":\"engine\",\"index.infino.table\":\""
+            "{\"settings\":{\"index.infino.enabled\":true,\"index.infino.mode\":\"default\",\"index.infino.table\":\""
                 + table
                 + "\",\"index.infino.rebuilt\":"
                 + rebuilt

@@ -478,13 +478,15 @@ fn mapped_fields(mapping: &Value) -> Vec<MappedField> {
 }
 
 /// Create the table from the mapping, or bring an existing table's schema up
-/// to it: a mapped field the table lacks is added with its mapped type. A
-/// mapped field whose type disagrees with the column it already has, or a
-/// `text` field mapped after creation (a text index can only be declared
-/// at creation; the engine's index description is not constructible from
-/// outside the crate), is a conflict the mapping cannot express over this
-/// table: the call fails naming it, so the index answers with the reason
-/// instead of serving the column as something it is not.
+/// to it: a mapped field the table lacks is added with its mapped type, a
+/// `text` one with the text index it would have had at creation (the
+/// mapping grows as documents arrive, a dynamic field included). A mapped
+/// field whose type disagrees with the column it already has, or a `text`
+/// field the table already holds without a text index (an index is part of
+/// a column's definition, fixed when the column is added), is a conflict the
+/// mapping cannot express over this table: the call fails naming it, so the
+/// index answers with the reason instead of serving the column as something
+/// it is not.
 fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, String> {
     let mapped = mapped_fields(mapping);
     let conn = &bridge.conn;
@@ -494,17 +496,47 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
         Ok(table) => {
             let schema = table.schema();
             let table_schema = conn.schema(name).map_err(|e| e.to_string())?;
+            // The text index a field added now gets: the one creation gives a
+            // text field, the engine's defaults (as the id column's index
+            // carries them) with positions.
+            let text_index = table_schema
+                .fields()
+                .iter()
+                .find(|c| c.name == OSID)
+                .and_then(|c| match &c.index {
+                    Some(ColumnIndex::Fts {
+                        stopwords,
+                        stemmer,
+                        stored,
+                        bm25,
+                        ..
+                    }) => Some(ColumnIndex::Fts {
+                        stopwords: *stopwords,
+                        stemmer: *stemmer,
+                        positions: true,
+                        stored: *stored,
+                        bm25: *bm25,
+                    }),
+                    _ => None,
+                });
             let mut conflicts: Vec<String> = Vec::new();
             for f in &mapped {
+                let present = schema.field_with_name(&f.path).is_ok();
                 let indexed = table_schema
                     .fields()
                     .iter()
                     .any(|c| c.name == f.path && matches!(c.index, Some(ColumnIndex::Fts { .. })));
-                // A text index can only be declared at creation, so a text field the
-                // table lacks, or holds without one, cannot be served as text.
-                if f.fts && !indexed {
+                // A column's index is fixed when the column is added, so a text field
+                // the table holds without one cannot be served as text.
+                if f.fts && present && !indexed {
                     conflicts.push(format!(
-                        "[{}] is mapped as text but the table has no text index on it; a text index can only be declared when the index is created",
+                        "[{}] is mapped as text but the table holds it without a text index",
+                        f.path
+                    ));
+                }
+                if f.fts && !present && text_index.is_none() {
+                    conflicts.push(format!(
+                        "[{}] is mapped as text but the table has no text index to model one on",
                         f.path
                     ));
                 }
@@ -530,9 +562,13 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                 .iter()
                 .filter(|f| schema.field_with_name(&f.path).is_err())
                 .map(|f| {
-                    FieldPatch::named(f.path.clone())
+                    let patch = FieldPatch::named(f.path.clone())
                         .with_type(f.data_type.clone())
-                        .with_nullable(true)
+                        .with_nullable(true);
+                    match (&text_index, f.fts) {
+                        (Some(index), true) => patch.with_index(index.clone()),
+                        _ => patch,
+                    }
                 })
                 .collect();
             let added = patches.len();
@@ -2597,6 +2633,23 @@ mod tests {
         // Fetch returns the document as sent.
         let src = get(h, "a");
         assert!(src.contains("\"tags\":[\"x\",\"y\"]"), "{src}");
+        close(h);
+    }
+
+    /// A text field the mapping adds after the table exists, as a dynamic
+    /// field is, gets the text index creation would have given it; a text
+    /// field the table already holds without one is still refused.
+    #[test]
+    fn a_text_field_mapped_late_gets_its_text_index() {
+        let h = open_logs();
+        let out = ensure(h, r#"{"properties":{"note":{"type":"text"}}}"#);
+        assert!(out.contains("\"added\":1"), "{out}");
+        index(h, &[("n1", r#"{"note":"a field mapped late"}"#)]);
+        let hits = bm25(h, "note", "late");
+        assert!(hits.contains("\"n1\""), "{hits}");
+        // `level` is a keyword column: mapping it as text cannot add the index.
+        let out = ensure(h, r#"{"properties":{"level":{"type":"text"}}}"#);
+        assert!(out.contains("without a text index"), "{out}");
         close(h);
     }
 

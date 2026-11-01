@@ -91,7 +91,8 @@ public class InfinoKnnQueryBuilder extends AbstractQueryBuilder<InfinoKnnQueryBu
 
     @Override
     protected Query doToQuery(QueryShardContext context) {
-        // Served at the action layer from the table; a shard never runs it.
+        // Served from the table (at the action layer in cloud mode, by the
+        // shard's query phase in default mode); Lucene never runs it.
         return new MatchNoDocsQuery(NAME + " is served by the Infino table");
     }
 

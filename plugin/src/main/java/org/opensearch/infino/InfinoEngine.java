@@ -48,7 +48,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.LongSupplier;
 
 /**
- * The engine of an index in engine mode ({@code index.infino.mode: engine}):
+ * The engine of an index in default mode ({@code index.infino.mode: default}):
  * OpenSearch's own write path (sequence numbers, translog, acknowledgement,
  * the refresh and flush cycle) over a Lucene index that holds only each
  * document's identity, with every document's content in the index's table.
@@ -997,6 +997,10 @@ public class InfinoEngine extends InternalEngine {
                 }
             }
             opSeqs[newest] = ops.get(newest);
+            // The mapping may have grown since the table was declared (a dynamic field
+            // is mapped before its document is applied): declared first, a new text
+            // field gets its text index, where the append would add a plain column.
+            InfinoPlugin.tables().ensure(config().getIndexSettings().getIndexMetadata(), config().getShardId().id());
             Pointer prepared = InfinoNative.prepare(table, ids, sources, routings, seqs, opSeqs, generation);
             if (prepared == null) {
                 throw new IllegalStateException("[infino] the bridge could not prepare a batch for " + table);

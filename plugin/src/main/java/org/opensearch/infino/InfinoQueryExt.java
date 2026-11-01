@@ -23,11 +23,11 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * A search of engine-mode indices as the client wrote it, carried to their
+ * A search of default-mode indices as the client wrote it, carried to their
  * shards in the {@code ext} section of the source, with an id of its own and
  * the shards of each index the search reaches.
  *
- * <p>The shards plan from this copy with the action layer's planner: the
+ * <p>The shards plan from this copy with cloud mode's planner: the
  * shard's own copy of the source is rewritten against its Lucene skeleton,
  * which holds no values (a range over a field it has no points for becomes
  * {@code match_none}), and the stock query and fetch phases would act on

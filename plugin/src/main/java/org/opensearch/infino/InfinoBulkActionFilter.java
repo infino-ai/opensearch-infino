@@ -147,7 +147,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
     }
 
     /**
-     * A bulk over engine-mode indices with its updates turned into writes of
+     * A bulk over default-mode indices with its updates turned into writes of
      * the whole document: {@code bulk} goes to the shards, and
      * {@code answer} turns its response back into the one the client's bulk
      * expects. {@code slots} is each item's slot in the client's bulk,
@@ -172,12 +172,12 @@ public class InfinoBulkActionFilter implements ActionFilter {
     }
 
     /**
-     * The bulk to send to the shards of engine-mode indices when it carries
+     * The bulk to send to the shards of default-mode indices when it carries
      * updates, or null when it carries none (it goes on as it is). The stock
      * update reads the current document from Lucene, which keeps no source
-     * in engine mode, so each update is merged here into the document as a
+     * in default mode, so each update is merged here into the document as a
      * read sees it now (the shard's write not yet committed, else the
-     * table), by the action layer's rule ({@link #merge}), and goes on as a
+     * table), by cloud mode's rule ({@link #merge}), and goes on as a
      * write of the whole document, carrying any sequence-number condition
      * for the shard to check. An update the table cannot serve (a script) or
      * whose document is missing is answered here.
@@ -189,7 +189,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
         Map<Integer, DocWriteRequest<?>> writes = new HashMap<>();
         for (int slot = 0; slot < items.size(); slot++) {
             IndexMetadata md = concrete.get(slot) == null ? null : state.metadata().index(concrete.get(slot));
-            if (!(items.get(slot) instanceof UpdateRequest update) || md == null || !InfinoPlugin.atEngine(md.getSettings())) {
+            if (!(items.get(slot) instanceof UpdateRequest update) || md == null || !InfinoPlugin.inDefaultMode(md.getSettings())) {
                 continue;
             }
             updates.add(slot);
@@ -309,8 +309,8 @@ public class InfinoBulkActionFilter implements ActionFilter {
         int infinoItems = 0;
         for (String name : concrete) {
             IndexMetadata md = name == null ? null : clusters.state().metadata().index(name);
-            // An index in engine mode takes its writes through its shard's engine, as any index does.
-            if (md != null && InfinoPlugin.atActionLayer(md.getSettings())) {
+            // An index in default mode takes its writes through its shard's engine, as any index does.
+            if (md != null && InfinoPlugin.inCloudMode(md.getSettings())) {
                 infino.put(name, md);
                 infinoItems++;
             }

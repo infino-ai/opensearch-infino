@@ -95,16 +95,16 @@ public class InfinoSearchActionFilter implements ActionFilter {
             if (md == null) {
                 continue;
             }
-            if (InfinoPlugin.atActionLayer(md.getSettings())) {
+            if (InfinoPlugin.inCloudMode(md.getSettings())) {
                 infino.add(md.getIndex());
                 metadata.add(md);
-            } else if (InfinoPlugin.atEngine(md.getSettings())) {
+            } else if (InfinoPlugin.inDefaultMode(md.getSettings())) {
                 engine++;
             }
         }
         if (engine > 0) {
             if (engine != concrete.length) {
-                listener.onFailure(new IllegalArgumentException("[infino] a search mixing engine-mode indices with others is not served"));
+                listener.onFailure(new IllegalArgumentException("[infino] a search mixing default-mode indices with others is not served"));
                 return;
             }
             // Served by the shards, which plan from the source as written (see
