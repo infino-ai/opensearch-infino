@@ -2273,6 +2273,39 @@ mod tests {
         out
     }
 
+    /// The rows of several tables read as one row set, as the plugin's SQL
+    /// route reads an index pattern: each column through `coalesce(.., NULL)`,
+    /// a column a table lacks as null. A column read as stored carries its
+    /// table's Parquet field id, and the engine refuses a union whose inputs'
+    /// ids differ, as two tables' do.
+    #[test]
+    fn several_tables_read_as_one_row_set() {
+        let h = open_logs();
+        let w1 = r#"{"properties":{"n":{"type":"long"},"tag":{"type":"keyword"}}}"#;
+        let w2 = r#"{"properties":{"n":{"type":"long"},"tag":{"type":"keyword"},"extra":{"type":"keyword"}}}"#;
+        take(unsafe { infino_ensure_table(h, c("w1").as_ptr(), c(w1).as_ptr()) });
+        take(unsafe { infino_ensure_table(h, c("w2").as_ptr(), c(w2).as_ptr()) });
+        for (table, id, src) in [
+            ("w1", "a", r#"{"n":1,"tag":"a"}"#),
+            ("w1", "b", r#"{"n":2,"tag":"b"}"#),
+            ("w2", "c", r#"{"n":3,"tag":"a","extra":"x"}"#),
+        ] {
+            let ids = [c(id)];
+            let srcs = [c(src)];
+            let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+            let sp: Vec<*const c_char> = srcs.iter().map(|x| x.as_ptr()).collect();
+            take(unsafe { infino_index_batch(h, c(table).as_ptr(), idp.as_ptr(), sp.as_ptr(), 1) });
+        }
+        let rows = sql(
+            h,
+            "SELECT count(*) AS c, sum(n) AS s, count(extra) AS e FROM (\
+             SELECT coalesce(n, NULL) AS n, coalesce(tag, NULL) AS tag, NULL AS extra FROM w1 UNION ALL \
+             SELECT coalesce(n, NULL) AS n, coalesce(tag, NULL) AS tag, coalesce(extra, NULL) AS extra FROM w2) t",
+        );
+        assert_eq!(rows, json!([{ "c": 3, "s": 6, "e": 1 }]));
+        close(h);
+    }
+
     #[test]
     fn value_counts_are_the_grouped_count_up_to_the_cap() {
         // error, info and the rows without a level: three groups.

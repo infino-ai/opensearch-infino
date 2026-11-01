@@ -42,13 +42,20 @@ import java.util.function.UnaryOperator;
  * the document rule narrows hits, totals, aggregations and gets alike.
  * {@code onRead} is told of every document the request is handed, by id
  * and as shown, where the security plugin's audit log watches the index
- * for reads (null when it does not).
+ * for reads (null when it does not). {@code maskRuleOf} gives the masked-field
+ * expression a masked field is masked by, as the role writes it
+ * ({@code ip}, {@code ip::SHA-256}, {@code ip::/regex/::replacement}), and
+ * {@code maskAlgorithm} the node's default hash algorithm for one that names
+ * none (null when unset): what SQL needs to mask a value as {@code maskOf}
+ * does (see {@link InfinoSql}); both null when nothing is masked.
  */
 record InfinoAccess(
     List<QueryBuilder> documents,
     Predicate<String> fieldVisible,
     Function<String, UnaryOperator<String>> maskOf,
-    BiConsumer<String, String> onRead
+    BiConsumer<String, String> onRead,
+    Function<String, String> maskRuleOf,
+    String maskAlgorithm
 ) {
 
     private static final Logger log = LogManager.getLogger(InfinoAccess.class);
@@ -58,6 +65,15 @@ record InfinoAccess(
 
     InfinoAccess(List<QueryBuilder> documents, Predicate<String> fieldVisible, Function<String, UnaryOperator<String>> maskOf) {
         this(documents, fieldVisible, maskOf, null);
+    }
+
+    InfinoAccess(
+        List<QueryBuilder> documents,
+        Predicate<String> fieldVisible,
+        Function<String, UnaryOperator<String>> maskOf,
+        BiConsumer<String, String> onRead
+    ) {
+        this(documents, fieldVisible, maskOf, onRead, null, null);
     }
 
     boolean restrictsDocuments() {

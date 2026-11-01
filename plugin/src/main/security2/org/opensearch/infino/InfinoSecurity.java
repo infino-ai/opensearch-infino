@@ -168,7 +168,17 @@ final class InfinoSecurity {
                     documents.add(parse(json));
                 }
             }
-            return new InfinoAccess(documents, fields.isEmpty() ? null : visibleBy(security, fields), masked.isEmpty() ? null : maskedBy(security, masked));
+            if (masked.isEmpty()) {
+                return new InfinoAccess(documents, fields.isEmpty() ? null : visibleBy(security, fields), null);
+            }
+            return new InfinoAccess(
+                documents,
+                fields.isEmpty() ? null : visibleBy(security, fields),
+                maskedBy(security, masked),
+                null,
+                maskRulesBy(security, masked),
+                security.algorithm()
+            );
         } catch (ReflectiveOperationException | IOException e) {
             throw refused(what, index, "its document- and field-level rules could not be evaluated: " + reason(e));
         }
@@ -264,36 +274,58 @@ final class InfinoSecurity {
 
     /** The masks as the security plugin's masked fields apply them: a field takes the first specification whose name pattern matches it. */
     private static Function<String, UnaryOperator<String>> maskedBy(Helpers security, Set<String> specifications) throws ReflectiveOperationException {
+        Map<String, Object> masks = masks(security, specifications);
+        return field -> {
+            String spec = maskingSpecification(security, masks, field);
+            if (spec == null) {
+                return null;
+            }
+            Object mask = masks.get(spec);
+            return value -> {
+                try {
+                    return (String) call(mask, "mask", value);
+                } catch (ReflectiveOperationException e) {
+                    throw InfinoAccess.refused("the masking rule could not be applied: " + reason(e));
+                }
+            };
+        };
+    }
+
+    /** The specification each field is masked by, as the role writes it: the one {@link #maskedBy} masks it with. */
+    private static Function<String, String> maskRulesBy(Helpers security, Set<String> specifications) throws ReflectiveOperationException {
+        Map<String, Object> masks = masks(security, specifications);
+        return field -> maskingSpecification(security, masks, field);
+    }
+
+    /** The security plugin's masked field for each specification, in the specifications' order. */
+    private static Map<String, Object> masks(Helpers security, Set<String> specifications) throws ReflectiveOperationException {
         if (security.maskedField() == null) {
             throw InfinoAccess.refused("a masking rule applies, and this security plugin has no masked-field helper the plugin can hash with");
         }
-        List<Object> masks = new ArrayList<>();
+        Map<String, Object> masks = new LinkedHashMap<>();
         for (String spec : specifications) {
             Object mask = MASKED.get(spec);
             if (mask == null) {
                 mask = security.maskedField().newInstance(spec, security.salt(), security.algorithm());
                 MASKED.put(spec, mask);
             }
-            masks.add(mask);
+            masks.put(spec, mask);
         }
-        return field -> {
-            try {
-                for (Object mask : masks) {
-                    if (matches(security, (String) call(mask, "getName"), field)) {
-                        return value -> {
-                            try {
-                                return (String) call(mask, "mask", value);
-                            } catch (ReflectiveOperationException e) {
-                                throw InfinoAccess.refused("the masking rule could not be applied: " + reason(e));
-                            }
-                        };
-                    }
+        return masks;
+    }
+
+    /** The first specification whose name pattern matches {@code field}; null when none does. */
+    private static String maskingSpecification(Helpers security, Map<String, Object> masks, String field) {
+        try {
+            for (Map.Entry<String, Object> mask : masks.entrySet()) {
+                if (matches(security, (String) call(mask.getValue(), "getName"), field)) {
+                    return mask.getKey();
                 }
-                return null;
-            } catch (ReflectiveOperationException e) {
-                throw InfinoAccess.refused("the masking rule could not be evaluated: " + reason(e));
             }
-        };
+            return null;
+        } catch (ReflectiveOperationException e) {
+            throw InfinoAccess.refused("the masking rule could not be evaluated: " + reason(e));
+        }
     }
 
     /** A document rule's query, written as JSON by the security plugin, as the shard would read it. */

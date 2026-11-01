@@ -73,8 +73,8 @@ pub(crate) fn indices(sql: &str) -> Result<Vec<String>, Box<Refusal>> {
 /// gives none where a rule applies, since a search reads the table whole),
 /// is refused. A `WITH` name that is one of `tables` is refused too: where
 /// that name is out of the `WITH`'s scope it would read the table itself.
-/// A statement without a `LIMIT` is given `max_rows + 1`, so the caller can
-/// tell a result that was cut.
+/// The statement is held to `max_rows + 1` rows ([`limit_rows`]), so the
+/// caller can tell a result that was cut.
 pub(crate) fn rewrite(
     sql: &str,
     views: &HashMap<String, String>,
@@ -315,8 +315,8 @@ impl<'a> Walk<'a> {
                 None => {
                     return ControlFlow::Break(refuse(
                         format!(
-                            "{function} over [{index}] is not served under a document, field or masking rule: \
-                             it searches the whole table; read the index by name instead"
+                            "{function} over [{index}] is not served: it searches one table whole, so it reads \
+                             only an index that is one table and under no rule for you; read [{index}] by name instead"
                         ),
                         FORBIDDEN,
                     ))
@@ -374,18 +374,28 @@ fn check_body(body: &SetExpr) -> ControlFlow<Box<Refusal>> {
     }
 }
 
-/// Give a query that names no row count `max_rows + 1`, so a result that
-/// would be cut shows it by its one row too many.
+/// Hold the query to `max_rows + 1` rows: a query that names no row count,
+/// or a larger one, is given that, so the engine stops there and a result
+/// that would be cut shows it by its one row too many. A count that is not
+/// a number as written stays, and the result is held to the cap after.
 fn limit_rows(query: &mut Query, max_rows: usize) -> Result<(), Box<Refusal>> {
-    let missing = match &query.limit_clause {
-        None => true,
-        Some(LimitClause::LimitOffset { limit, .. }) => limit.is_none(),
-        Some(LimitClause::OffsetCommaLimit { .. }) => false,
+    let cap = max_rows + 1;
+    let within = |limit: &Expr| match limit {
+        Expr::Value(v) => v
+            .to_string()
+            .parse::<u128>()
+            .map_or(true, |n| n <= cap as u128),
+        _ => true,
     };
-    if !missing {
+    let keep = match &query.limit_clause {
+        None => false,
+        Some(LimitClause::LimitOffset { limit, .. }) => limit.as_ref().is_some_and(within),
+        Some(LimitClause::OffsetCommaLimit { limit, .. }) => within(limit),
+    };
+    if keep {
         return Ok(());
     }
-    let template = parse_query(&format!("SELECT 1 LIMIT {}", max_rows + 1))?;
+    let template = parse_query(&format!("SELECT 1 LIMIT {cap}"))?;
     let Some(LimitClause::LimitOffset {
         limit: Some(count), ..
     }) = template.limit_clause
@@ -394,6 +404,7 @@ fn limit_rows(query: &mut Query, max_rows: usize) -> Result<(), Box<Refusal>> {
     };
     match &mut query.limit_clause {
         Some(LimitClause::LimitOffset { limit, .. }) => *limit = Some(count),
+        Some(LimitClause::OffsetCommaLimit { limit, .. }) => *limit = count,
         clause => {
             *clause = Some(LimitClause::LimitOffset {
                 limit: Some(count),
@@ -567,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn a_limit_the_statement_names_stands() {
+    fn a_limit_within_the_cap_stands_and_a_larger_one_is_held_to_it() {
         let logs = views(&[("logs", "SELECT * FROM \"os_logs\"")]);
         let out = rewrite(
             "SELECT * FROM logs LIMIT 3",
@@ -587,5 +598,15 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("LIMIT 11"), "{out}");
+        // The engine stops at the cap rather than building a larger result first.
+        let out = rewrite(
+            "SELECT * FROM logs LIMIT 1000000",
+            &logs,
+            &HashMap::new(),
+            &[],
+            MAX_ROWS,
+        )
+        .unwrap();
+        assert!(out.ends_with("LIMIT 11"), "{out}");
     }
 }

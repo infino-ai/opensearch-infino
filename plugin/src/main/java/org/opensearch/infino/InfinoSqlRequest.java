@@ -23,12 +23,8 @@ import static org.opensearch.action.ValidateActions.addValidationError;
  */
 public final class InfinoSqlRequest extends ActionRequest implements IndicesRequest.Replaceable {
 
-    /**
-     * How the named indices resolve: each name one index, or an alias to one
-     * index, never a pattern. A statement names what it reads exactly, so
-     * the indices authorized are the ones read.
-     */
-    private static final IndicesOptions OPTIONS = IndicesOptions.strictSingleIndexNoExpandForbidClosed();
+    /** How the named indices resolve: as the statement reads them (see {@link InfinoSql#OPTIONS}). */
+    private static final IndicesOptions OPTIONS = InfinoSql.OPTIONS;
 
     private final String query;
     private String[] indices;
