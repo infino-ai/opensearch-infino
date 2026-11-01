@@ -362,6 +362,79 @@
   - match: { rows.3.tag: x }
 
 ---
+"A graph walks an edge index that names its rows as the engine does":
+  - do:
+      indices.create:
+        index: sql_people
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { name: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sql_people, _id: "p1" }
+          - { name: ann }
+          - index: { _index: sql_people, _id: "p2" }
+          - { name: bob }
+          - index: { _index: sql_people, _id: "p3" }
+          - { name: cid }
+          - index: { _index: sql_people, _id: "p4" }
+          - { name: dee }
+  - match: { errors: false }
+
+  # Every row's name in the engine: its table, and its _id as digits.
+  - do:
+      infino.sql:
+        body: { query: "SELECT _table, _id FROM sql_people ORDER BY osid" }
+  - length: { rows: 4 }
+  - match: { rows.0._table: os_sql_people }
+  - set: { rows.0._table: people }
+  - set: { rows.0._id: ann }
+  - set: { rows.1._id: bob }
+  - set: { rows.2._id: cid }
+
+  # An edge index: each document an edge between two rows, named by table and _id.
+  - do:
+      indices.create:
+        index: sql_knows
+        body:
+          settings: { index.infino.edges: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              src_table: { type: keyword }
+              src_id: { type: keyword }
+              dst_table: { type: keyword }
+              dst_id: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sql_knows, _id: "e1" }
+          - { src_table: $people, src_id: $ann, dst_table: $people, dst_id: $bob }
+          - index: { _index: sql_knows, _id: "e2" }
+          - { src_table: $people, src_id: $bob, dst_table: $people, dst_id: $cid }
+  - match: { errors: false }
+  # An end that is no row id is refused, with the reason.
+  - do:
+      catch: bad_request
+      index:
+        index: sql_knows
+        id: "e3"
+        body: { src_table: $people, src_id: "ann", dst_table: $people, dst_id: $cid }
+
+  # Compacting the edge index builds the adjacency index a walk reads.
+  - do:
+      indices.forcemerge:
+        index: sql_knows
+  - do:
+      infino.sql:
+        body: { query: "SELECT name, score FROM graph_walk('sql_knows', 'sql_people', 'sql_people', ${ann}, 2, 10) WHERE name <> 'ann' ORDER BY score, name" }
+  - length: { rows: 2 }
+  - match: { rows.0.name: bob }
+  - match: { rows.1.name: cid }
+
+---
 "SQL reaches only indices the caller may read, and only reads them":
   - skip:
       features: headers

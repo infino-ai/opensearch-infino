@@ -99,6 +99,20 @@ const STATUS_BAD_REQUEST: u16 = 400;
 const STATUS_NOT_FOUND: u16 = 404;
 /// HTTP status of a caller's statement past the connection's memory budget.
 const STATUS_TOO_MANY_REQUESTS: u16 = 429;
+/// The mapping type a column of the engine's row ids is declared with: no
+/// OpenSearch field type is the engine's `_id` type, so the plugin names it
+/// so for the id columns of an edge index.
+const ENGINE_ID_TYPE: &str = "infino_engine_id";
+/// The engine's id type, which every `_id` column has, and so an edge
+/// table's id columns.
+const ID_PRECISION: u8 = 38;
+const ID_SCALE: i8 = 0;
+/// The columns of an edge table, as the engine's adjacency index reads them:
+/// each end of an edge as the table its row is in and the row's `_id`.
+const SRC_TABLE: &str = "src_table";
+const SRC_ID: &str = "src_id";
+const DST_TABLE: &str = "dst_table";
+const DST_ID: &str = "dst_id";
 
 thread_local! {
     /// Why the last `infino_open_with` on this thread returned null, as the
@@ -440,6 +454,7 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
                 (DataType::Float64, false, None)
             }
             Some("boolean") => (DataType::Boolean, false, None),
+            Some(ENGINE_ID_TYPE) => (DataType::Decimal128(ID_PRECISION, ID_SCALE), false, None),
             Some("knn_vector") => {
                 let dim = def.get("dimension").and_then(|d| d.as_u64()).unwrap_or(0) as usize;
                 if dim == 0 {
@@ -812,6 +827,17 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
             }
             Value::Object(_) => Err("an object for a string field".into()),
             Value::Null => Ok(value),
+        },
+        // A row id: a whole number, as digits in a string where it is past
+        // what a JSON number holds exactly (as a SQL read gives an `_id`).
+        DataType::Decimal128(ID_PRECISION, ID_SCALE) => match &value {
+            Value::Number(n) if n.is_u64() => Ok(value),
+            Value::String(s)
+                if !s.trim().is_empty() && s.trim().bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                Ok(Value::String(s.trim().to_string()))
+            }
+            _ => Err("not a row id: a row's `_id` is a whole number, its digits".into()),
         },
         DataType::FixedSizeList(_, dim) => match &value {
             Value::Array(items)
@@ -1699,6 +1725,22 @@ pub unsafe extern "C" fn infino_drop(h: *mut Bridge, name: *const c_char) -> c_i
 /// what the merge superseded. Returns 0, or -2 with the reason on stderr.
 #[no_mangle]
 pub unsafe extern "C" fn infino_optimize(h: *mut Bridge, name: *const c_char) -> c_int {
+    unsafe { optimize_with(h, name, &OptimizeOptions::default()) }
+}
+
+/// Compact an edge table as [`infino_optimize`] does, and build the
+/// adjacency index the engine's graph walks read over its rows: each row an
+/// edge from the row [`SRC_ID`] of the table [`SRC_TABLE`] to the row
+/// [`DST_ID`] of the table [`DST_TABLE`]. The engine builds it again only
+/// when the rows changed since it last did. Returns what
+/// [`infino_optimize`] returns.
+#[no_mangle]
+pub unsafe extern "C" fn infino_optimize_edges(h: *mut Bridge, name: *const c_char) -> c_int {
+    let options = OptimizeOptions::default().with_adjacency(SRC_TABLE, SRC_ID, DST_TABLE, DST_ID);
+    unsafe { optimize_with(h, name, &options) }
+}
+
+unsafe fn optimize_with(h: *mut Bridge, name: *const c_char, options: &OptimizeOptions) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return -1;
@@ -1707,7 +1749,7 @@ pub unsafe extern "C" fn infino_optimize(h: *mut Bridge, name: *const c_char) ->
             Ok(t) => t,
             Err(_) => return 0,
         };
-        match table.optimize(&OptimizeOptions::default()) {
+        match table.optimize(options) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("[capi] optimize {name}: {e}");
@@ -2210,11 +2252,6 @@ mod tests {
         "geo":{"type":"geo_point"}
     }}"#;
 
-    /// The engine's id type, which every `_id` column has, and so an edge
-    /// table's id columns.
-    const ID_PRECISION: u8 = 38;
-    const ID_SCALE: i8 = 0;
-
     fn c(s: &str) -> CString {
         CString::new(s).unwrap()
     }
@@ -2376,9 +2413,11 @@ mod tests {
     }
 
     /// A graph walk as the SQL route runs it: rows of an index within some
-    /// hops of a seed row, over an edge table read whole, returned through
-    /// the index's search view; the `_id`s a caller writes edges and seeds
-    /// with read back as their digits.
+    /// hops of a seed row, over an edge index read whole, returned through
+    /// the index's search view. The edges are documents naming each end as
+    /// its table and the `_id` a SQL read gives, as digits; the edge table
+    /// is declared as the plugin declares an edge index's, and its adjacency
+    /// index is built when it is compacted.
     #[test]
     fn a_walk_runs_through_the_routes_views() {
         let h = open_logs();
@@ -2392,54 +2431,56 @@ mod tests {
             ],
         );
         let rows = sql(h, "SELECT osid, _id FROM logs ORDER BY osid");
-        let id = |osid: &str| -> i128 {
+        let id = |osid: &str| -> String {
             let row = rows
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|r| r["osid"] == osid)
                 .unwrap();
-            row["_id"].as_str().unwrap().parse().unwrap()
+            row["_id"].as_str().unwrap().to_string()
         };
+        let edge_mapping = json!({"properties": {
+            SRC_TABLE: {"type": "keyword"},
+            SRC_ID: {"type": ENGINE_ID_TYPE},
+            DST_TABLE: {"type": "keyword"},
+            DST_ID: {"type": ENGINE_ID_TYPE},
+        }})
+        .to_string();
+        let declared =
+            take(unsafe { infino_ensure_table(h, c("edges").as_ptr(), c(&edge_mapping).as_ptr()) });
+        assert!(declared.contains("\"created\":true"), "{declared}");
         // a -> b -> c; d is no row's neighbour.
-        let precision_scale = |values: Vec<i128>| {
-            Arc::new(
-                Decimal128Array::from(values)
-                    .with_precision_and_scale(ID_PRECISION, ID_SCALE)
-                    .unwrap(),
-            )
+        let edge = |from: &str, to: &str| {
+            json!({SRC_TABLE: "logs", SRC_ID: id(from), DST_TABLE: "logs", DST_ID: id(to)})
+                .to_string()
         };
-        let id_type = DataType::Decimal128(ID_PRECISION, ID_SCALE);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("src_table", DataType::Utf8, false),
-            Field::new("src_id", id_type.clone(), false),
-            Field::new("dst_table", DataType::Utf8, false),
-            Field::new("dst_id", id_type, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["logs", "logs"])),
-                precision_scale(vec![id("a"), id("b")]),
-                Arc::new(StringArray::from(vec!["logs", "logs"])),
-                precision_scale(vec![id("b"), id("c")]),
-            ],
-        )
+        let ids = [c("ab"), c("bc"), c("bad")];
+        let docs = [
+            c(&edge("a", "b")),
+            c(&edge("b", "c")),
+            c(
+                &json!({SRC_TABLE: "logs", SRC_ID: "a", DST_TABLE: "logs", DST_ID: id("d")})
+                    .to_string(),
+            ),
+        ];
+        let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+        let dp: Vec<*const c_char> = docs.iter().map(|x| x.as_ptr()).collect();
+        let written: Value = serde_json::from_str(&take(unsafe {
+            infino_index_batch(h, c("edges").as_ptr(), idp.as_ptr(), dp.as_ptr(), 3)
+        }))
         .unwrap();
+        // An edge whose end is no row id is refused, with why.
+        assert_eq!(written["ok"], 2, "{written}");
+        assert!(
+            written["failed"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("not a row id"),
+            "{written}"
+        );
+        assert_eq!(unsafe { infino_optimize_edges(h, c("edges").as_ptr()) }, 0);
         let bridge = unsafe { &*h };
-        let edges = bridge
-            .conn
-            .create_table("edges", schema, IndexSpec::new())
-            .unwrap();
-        edges.append(&batch).unwrap();
-        edges
-            .optimize(&OptimizeOptions::default().with_adjacency(
-                "src_table",
-                "src_id",
-                "dst_table",
-                "dst_id",
-            ))
-            .unwrap();
 
         let reads = read_sql::Reads {
             searches: HashMap::from([(

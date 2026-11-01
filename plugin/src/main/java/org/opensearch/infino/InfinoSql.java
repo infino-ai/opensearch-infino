@@ -112,6 +112,13 @@ final class InfinoSql {
     /** The column an engine search ranks its rows by, beside the table's own. */
     private static final String SCORE = "score";
     /**
+     * A row's name in the engine, which a graph's edges name it by (see
+     * {@link InfinoPlugin#INFINO_EDGES}): the engine's id of the row, and the
+     * table it is in. Neither is a field of a document.
+     */
+    static final String ROW_ID = "_id";
+    static final String ROW_TABLE = "_table";
+    /**
      * The keys of the bridge's answer: its columns (each a name and an Arrow
      * type), its rows, and the result columns it names to mask.
      */
@@ -419,32 +426,48 @@ final class InfinoSql {
      * indices: each part reads {@link #SEARCH_PLACEHOLDER} over its table in
      * place of the table, which the bridge makes the statement's own search,
      * and gives the search's score beside its columns.
+     *
+     * <p>Every view also gives each row's name as the engine names it, which
+     * is what a graph's edges name a row by: {@link #ROW_TABLE}, its table,
+     * and {@link #ROW_ID}, its {@code _id} (which a table read whole gives
+     * among its columns).
      */
     static String view(List<Part> parts, boolean search) {
         String score = InfinoQueryTranslator.quoteIdent(SCORE);
         if (parts.size() == 1) {
             Part p = parts.get(0);
-            String list = p.whole() ? "*" : String.join(", ", aliased(p.columns()).values()) + (search ? ", " + score : "");
+            String list = p.whole()
+                ? "*, " + aliased(named(p)).get(ROW_TABLE)
+                : String.join(", ", aliased(named(p)).values()) + (search ? ", " + score : "");
             return select(p, list, search);
         }
         Set<String> names = new LinkedHashSet<>();
         for (Part p : parts) {
-            names.addAll(p.columns().keySet());
+            names.addAll(named(p).keySet());
         }
         if (search) {
             names.add(SCORE);
         }
         List<String> selects = new ArrayList<>();
         for (Part p : parts) {
+            Map<String, String> columns = named(p);
             List<String> list = new ArrayList<>(names.size());
             for (String name : names) {
-                String expr = search && name.equals(SCORE) ? score : p.columns().get(name);
+                String expr = search && name.equals(SCORE) ? score : columns.get(name);
                 String quoted = InfinoQueryTranslator.quoteIdent(name);
                 list.add((expr == null ? "NULL" : "coalesce(" + expr + ", NULL)") + " AS " + quoted);
             }
             selects.add(select(p, String.join(", ", list), search));
         }
         return String.join(UNION, selects);
+    }
+
+    /** A part's columns, with its rows' engine names: {@link #ROW_ID} as stored, {@link #ROW_TABLE} as the part's table. */
+    private static Map<String, String> named(Part p) {
+        Map<String, String> out = new LinkedHashMap<>(p.columns());
+        out.putIfAbsent(ROW_ID, InfinoQueryTranslator.quoteIdent(ROW_ID));
+        out.put(ROW_TABLE, InfinoQueryTranslator.literal(p.table()));
+        return out;
     }
 
     /** Each column's expression under the column's own name. */

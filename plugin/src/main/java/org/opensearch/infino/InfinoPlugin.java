@@ -122,6 +122,24 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         Setting.Property.Final
     );
 
+    /**
+     * Whether the index holds a graph's edges, for the engine's graph walks
+     * over the SQL route ({@code graph_walk}, {@code graph_rank}): each
+     * document is one edge, from the row {@code src_id} of the table
+     * {@code src_table} to the row {@code dst_id} of the table
+     * {@code dst_table}, each row named as the engine names it, by its table
+     * and its {@code _id} (as a SQL read gives them). The index's table
+     * declares those columns with the engine's types, and builds the
+     * adjacency index the walks read each time it is compacted, so an edge
+     * is walked from the compaction after its write.
+     */
+    public static final Setting<Boolean> INFINO_EDGES = Setting.boolSetting(
+        "index.infino.edges",
+        false,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
     /** The table behind the index, when it is to be named explicitly (to reattach an index to its rows). */
     public static final Setting<String> INFINO_TABLE = Setting.simpleString(
         "index.infino.table",
@@ -391,11 +409,12 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             return;
         }
         TimeValue interval = shard.indexSettings().getValue(OPTIMIZE_INTERVAL);
+        Settings indexSettings = shard.indexSettings().getSettings();
         ShardId shardId = shard.shardId();
         Scheduler.Cancellable task = threadPool.scheduleWithFixedDelay(() -> {
             try {
                 long start = System.nanoTime();
-                int rc = InfinoNative.optimize(table);
+                int rc = InfinoNative.optimize(table, indexSettings);
                 long millis = (System.nanoTime() - start) / 1_000_000L;
                 if (rc != 0) {
                     log.warn("[infino] optimize of {} returned {} after {} ms", table, rc, millis);
@@ -456,6 +475,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             INFINO_MODE,
             DEFAULT_MODE_ENABLED,
             INFINO_REBUILT,
+            INFINO_EDGES,
             INFINO_TABLE,
             OPTIMIZE_INTERVAL,
             PLATFORM_URL,

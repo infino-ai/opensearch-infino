@@ -41,24 +41,32 @@ public class InfinoSqlTests extends OpenSearchTestCase {
         bColumns.put("n", "\"n\"");
         bColumns.put("ip", InfinoSql.masked(IP, "ip::SHA-256", null));
         InfinoSql.Part b = new InfinoSql.Part("os_b", bColumns, false, "\"tag\" = 'x'");
+        // Each row also gives its name in the engine: its _id and its table.
         assertEquals(
-            "SELECT coalesce(\"n\", NULL) AS \"n\", NULL AS \"ip\" FROM \"os_a\" UNION ALL "
-                + "SELECT coalesce(\"n\", NULL) AS \"n\", coalesce(encode(digest(CAST(\"ip\" AS VARCHAR), 'sha256'), 'hex'), NULL) AS \"ip\" "
+            "SELECT coalesce(\"n\", NULL) AS \"n\", coalesce(\"_id\", NULL) AS \"_id\", coalesce('os_a', NULL) AS \"_table\", NULL AS \"ip\" "
+                + "FROM \"os_a\" UNION ALL "
+                + "SELECT coalesce(\"n\", NULL) AS \"n\", coalesce(\"_id\", NULL) AS \"_id\", coalesce('os_b', NULL) AS \"_table\", "
+                + "coalesce(encode(digest(CAST(\"ip\" AS VARCHAR), 'sha256'), 'hex'), NULL) AS \"ip\" "
                 + "FROM \"os_b\" WHERE \"tag\" = 'x'",
             InfinoSql.view(List.of(a, b), false)
         );
-        // One index read whole is its table as stored.
-        assertEquals("SELECT * FROM \"os_a\"", InfinoSql.view(List.of(a), false));
+        // One index read whole is its table as stored, _id among its columns, with the table's name.
+        assertEquals("SELECT *, 'os_a' AS \"_table\" FROM \"os_a\"", InfinoSql.view(List.of(a), false));
     }
 
     public void testASearchReadsTheSearchOverEachTableWithItsScore() {
         InfinoSql.Part a = new InfinoSql.Part("os_a", new LinkedHashMap<>(Map.of("n", "\"n\"")), true, null);
         InfinoSql.Part b = new InfinoSql.Part("os_b", new LinkedHashMap<>(Map.of("n", "\"n\"")), false, "\"tag\" = 'x'");
-        assertEquals("SELECT * FROM infino_search('os_a')", InfinoSql.view(List.of(a), true));
-        assertEquals("SELECT \"n\", \"score\" FROM infino_search('os_b') WHERE \"tag\" = 'x'", InfinoSql.view(List.of(b), true));
+        assertEquals("SELECT *, 'os_a' AS \"_table\" FROM infino_search('os_a')", InfinoSql.view(List.of(a), true));
         assertEquals(
-            "SELECT coalesce(\"n\", NULL) AS \"n\", coalesce(\"score\", NULL) AS \"score\" FROM infino_search('os_a') UNION ALL "
-                + "SELECT coalesce(\"n\", NULL) AS \"n\", coalesce(\"score\", NULL) AS \"score\" FROM infino_search('os_b') WHERE \"tag\" = 'x'",
+            "SELECT \"n\", \"_id\", 'os_b' AS \"_table\", \"score\" FROM infino_search('os_b') WHERE \"tag\" = 'x'",
+            InfinoSql.view(List.of(b), true)
+        );
+        assertEquals(
+            "SELECT coalesce(\"n\", NULL) AS \"n\", coalesce(\"_id\", NULL) AS \"_id\", coalesce('os_a', NULL) AS \"_table\", "
+                + "coalesce(\"score\", NULL) AS \"score\" FROM infino_search('os_a') UNION ALL "
+                + "SELECT coalesce(\"n\", NULL) AS \"n\", coalesce(\"_id\", NULL) AS \"_id\", coalesce('os_b', NULL) AS \"_table\", "
+                + "coalesce(\"score\", NULL) AS \"score\" FROM infino_search('os_b') WHERE \"tag\" = 'x'",
             InfinoSql.view(List.of(a, b), true)
         );
     }

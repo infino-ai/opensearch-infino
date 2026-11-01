@@ -455,11 +455,16 @@ public final class InfinoNative {
         }
     }
 
-    public static int optimize(String name) {
+    /**
+     * Compact the table; for an edge index's ({@link InfinoPlugin#INFINO_EDGES}),
+     * also build the adjacency index the engine's graph walks read over its rows.
+     */
+    public static int optimize(String name, Settings indexSettings) {
         init();
+        boolean edges = InfinoPlugin.INFINO_EDGES.get(indexSettings);
         InfinoRequestCache.changed(name);
         try {
-            return lib.infino_optimize(conn, name);
+            return edges ? lib.infino_optimize_edges(conn, name) : lib.infino_optimize(conn, name);
         } finally {
             InfinoRequestCache.changed(name);
         }

@@ -85,6 +85,8 @@ public interface InfinoLib extends Library {
 
     int infino_optimize(Pointer h, String name);
 
+    int infino_optimize_edges(Pointer h, String name);
+
     Pointer infino_sql(Pointer h, String sql);
 
     /** The indices a caller's read-only statement reads, as {@code {"indices": [..]}}, or an error with its status. */
