@@ -33,7 +33,7 @@
 mod read_sql;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -1719,13 +1719,14 @@ pub unsafe extern "C" fn infino_sql_indices(sql: *const c_char) -> *mut c_char {
 }
 
 /// Run a caller's read-only statement with each index it names read
-/// through the view `views` gives for it, as
-/// `{"relations": {index: query}, "functions": {index: table}}`: the query
-/// over the index's table the caller may read, and the table an engine
-/// search over the index may read (only where no rule applies). Answers
-/// `{"schema": [{"name", "type"}], "rows": [..]}`, or an error with its
-/// status: a statement the route does not serve (400), an index without a
-/// view (403), more than `max_rows` rows (400).
+/// through the view `views` gives for it, as `{"relations": {index: query},
+/// "searches": {index: query}, "unsearchable": {index: [column]},
+/// "output_only": [column]}` (see [`read_sql::Reads`]). Answers
+/// `{"schema": [{"name", "type"}], "rows": [..], "masked": {column: field}}`
+/// (`masked`, left out when empty: the result's columns that give a field
+/// read only as output, for the plugin to mask), or an error with its status: a statement the
+/// route does not serve (400), an index without a view or a use of a field
+/// the caller may not make (403), more than `max_rows` rows (400).
 #[no_mangle]
 pub unsafe extern "C" fn infino_sql_read(
     h: *mut Bridge,
@@ -1748,17 +1749,29 @@ pub unsafe extern "C" fn infino_sql_read(
             Ok(tables) => tables,
             Err(e) => return err_json(&e.to_string()),
         };
-        let statement = match read_sql::rewrite(
-            sql,
-            &string_map(&views["relations"]),
-            &string_map(&views["functions"]),
-            &tables,
-            max_rows,
-        ) {
+        let reads = read_sql::Reads {
+            views: string_map(&views["relations"]),
+            searches: string_map(&views["searches"]),
+            unsearchable: views["unsearchable"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .map(|(index, columns)| (index.clone(), string_set(columns)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            output_only: string_set(&views["output_only"]),
+        };
+        let statement = match read_sql::rewrite(sql, &reads, &tables, max_rows) {
             Ok(statement) => statement,
             Err(refusal) => return refused_json(&refusal),
         };
-        match conn.conn.query_sql(&statement) {
+        let masked: Map<String, Value> = statement
+            .masked
+            .iter()
+            .map(|(column, field)| (column.clone(), json!(field)))
+            .collect();
+        match conn.conn.query_sql(&statement.sql) {
             Ok(batches) => {
                 let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
                 if rows > max_rows {
@@ -1769,16 +1782,32 @@ pub unsafe extern "C" fn infino_sql_read(
                         status: read_sql::BAD_REQUEST,
                     });
                 }
+                let masked = if masked.is_empty() {
+                    String::new()
+                } else {
+                    format!(",\"masked\":{}", Value::Object(masked))
+                };
                 out_string(format!(
-                    "{{\"schema\":{},\"rows\":{}}}",
+                    "{{\"schema\":{},\"rows\":{}{masked}}}",
                     schema_json(&batches),
-                    batches_to_json(&batches)
+                    batches_to_json(&batches),
                 ))
             }
             Err(e) => out_json(sql_error_value(&e)),
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// A JSON array of strings as a set; anything else is empty.
+fn string_set(v: &Value) -> HashSet<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A JSON object of strings as a map; anything else is empty.
@@ -1924,7 +1953,9 @@ pub unsafe extern "C" fn infino_value_counts(
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name), Some(column)) =
-            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(column) })
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(column)
+            })
         else {
             return ptr::null_mut();
         };
@@ -3126,7 +3157,10 @@ mod tests {
             sql(h, "SELECT osid FROM logs WHERE level = 'error'"),
             written
         );
-        assert!(bytes_under(&cache) > 0, "the reopened read went through the cache");
+        assert!(
+            bytes_under(&cache) > 0,
+            "the reopened read went through the cache"
+        );
         close(h);
         let _ = std::fs::remove_dir_all(&root);
     }

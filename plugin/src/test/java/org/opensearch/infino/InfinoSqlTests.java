@@ -10,6 +10,7 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.UnaryOperator;
 
 public class InfinoSqlTests extends OpenSearchTestCase {
 
@@ -44,17 +45,43 @@ public class InfinoSqlTests extends OpenSearchTestCase {
             "SELECT coalesce(\"n\", NULL) AS \"n\", NULL AS \"ip\" FROM \"os_a\" UNION ALL "
                 + "SELECT coalesce(\"n\", NULL) AS \"n\", coalesce(encode(digest(CAST(\"ip\" AS VARCHAR), 'sha256'), 'hex'), NULL) AS \"ip\" "
                 + "FROM \"os_b\" WHERE \"tag\" = 'x'",
-            InfinoSql.view(List.of(a, b))
+            InfinoSql.view(List.of(a, b), false)
         );
         // One index read whole is its table as stored.
-        assertEquals("SELECT * FROM \"os_a\"", InfinoSql.view(List.of(a)));
+        assertEquals("SELECT * FROM \"os_a\"", InfinoSql.view(List.of(a), false));
     }
 
-    public void testAHashSqlCannotGiveIsRefusedRatherThanServedUnmasked() {
+    public void testASearchReadsTheSearchOverEachTableWithItsScore() {
+        InfinoSql.Part a = new InfinoSql.Part("os_a", new LinkedHashMap<>(Map.of("n", "\"n\"")), true, null);
+        InfinoSql.Part b = new InfinoSql.Part("os_b", new LinkedHashMap<>(Map.of("n", "\"n\"")), false, "\"tag\" = 'x'");
+        assertEquals("SELECT * FROM infino_search('os_a')", InfinoSql.view(List.of(a), true));
+        assertEquals("SELECT \"n\", \"score\" FROM infino_search('os_b') WHERE \"tag\" = 'x'", InfinoSql.view(List.of(b), true));
+        assertEquals(
+            "SELECT coalesce(\"n\", NULL) AS \"n\", coalesce(\"score\", NULL) AS \"score\" FROM infino_search('os_a') UNION ALL "
+                + "SELECT coalesce(\"n\", NULL) AS \"n\", coalesce(\"score\", NULL) AS \"score\" FROM infino_search('os_b') WHERE \"tag\" = 'x'",
+            InfinoSql.view(List.of(a, b), true)
+        );
+    }
+
+    public void testAHashSqlCannotGiveIsLeftToTheResult() {
         // The default: a BLAKE2b keyed with the cluster's salt.
-        expectThrows(OpenSearchSecurityException.class, () -> InfinoSql.masked(IP, "ip", null));
-        expectThrows(OpenSearchSecurityException.class, () -> InfinoSql.masked(IP, "ip", "BLAKE2B_LEGACY_DEFAULT"));
-        expectThrows(OpenSearchSecurityException.class, () -> InfinoSql.masked(IP, "ip::SHA-1", null));
+        assertNull(InfinoSql.masked(IP, "ip", null));
+        assertNull(InfinoSql.masked(IP, "ip", "BLAKE2B_LEGACY_DEFAULT"));
+        assertNull(InfinoSql.masked(IP, "ip::SHA-1", null));
+        // A rule the security plugin would not read is refused.
         expectThrows(OpenSearchSecurityException.class, () -> InfinoSql.masked(IP, "ip::\\.x::y", null));
+    }
+
+    public void testAResultColumnGivenAsOutputIsMaskedByItsField() {
+        UnaryOperator<String> mask = v -> "h(" + v + ")";
+        String answer = "{\"schema\":[{\"name\":\"addr\",\"type\":\"Int64\"},{\"name\":\"n\",\"type\":\"Int64\"}],"
+            + "\"rows\":[{\"addr\":7,\"n\":1},{\"addr\":null,\"n\":2}],\"masked\":{\"addr\":\"ip\"}}";
+        assertEquals(
+            "{\"schema\":[{\"name\":\"addr\",\"type\":\"Utf8\"},{\"name\":\"n\",\"type\":\"Int64\"}],"
+                + "\"rows\":[{\"addr\":\"h(7)\",\"n\":1},{\"addr\":null,\"n\":2}]}",
+            InfinoSql.maskResult(answer, Map.of("ip", mask))
+        );
+        // A column the bridge names for a field with no mask is refused rather than served.
+        expectThrows(OpenSearchSecurityException.class, () -> InfinoSql.maskResult(answer, Map.of("other", mask)));
     }
 }

@@ -105,25 +105,91 @@
   - match: { rows.1.ip: "10.0.0.0" }
 
   # The security plugin's default hash is a BLAKE2b keyed with the cluster's salt, which
-  # SQL has no function to give: a field masked by it is refused, never served unmasked.
+  # SQL has no function to give: the field is masked in the result by the security
+  # plugin's own mask, value for value as a search gives it, and read only as a column
+  # of the result (selected, renamed, by *, or grouped by itself).
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      search:
+        index: sec_sql1
+        body: { sort: [ { n: asc } ] }
+  - set: { hits.hits.0._source.ip: default_ip }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      infino.sql:
+        body: { query: "SELECT ip, n FROM sec_sql1 ORDER BY n" }
+  - match: { rows.0.ip: $default_ip }
+  - match: { rows.2.ip: $default_ip }
+  - match: { schema.0.type: Utf8 }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      infino.sql:
+        body: { query: "SELECT * FROM sec_sql1 ORDER BY n" }
+  - match: { rows.0.ip: $default_ip }
+  - is_false: rows.0.source
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      infino.sql:
+        body: { query: "SELECT ip AS addr, count(*) AS c FROM sec_sql1 GROUP BY ip ORDER BY c DESC" }
+  - length: { rows: 2 }
+  - match: { rows.0.addr: $default_ip }
+  - match: { rows.0.c: 2 }
+  # Any other use would read the stored value: refused.
   - do:
       headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
       catch: forbidden
       infino.sql:
-        body: { query: "SELECT n FROM sec_sql1" }
+        body: { query: "SELECT n FROM sec_sql1 WHERE ip = '10.0.0.1'" }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT n FROM sec_sql1 ORDER BY ip" }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT upper(ip) AS u FROM sec_sql1" }
 
-  # An engine search reads its table whole: served with no rule, refused under one.
+  # An engine search reads the index as the view does: its rows, its columns, its masks.
   - do:
       headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
       infino.sql:
-        body: { query: "SELECT osid FROM bm25_search('sec_sql1', 'title', 'wool', 10) ORDER BY osid" }
-  - length: { rows: 2 }
-  - match: { rows.0.osid: s1 }
+        body: { query: "SELECT osid FROM bm25_search('sec_sql1', 'title', 'wool silk', 10) ORDER BY osid" }
+  - length: { rows: 3 }
   - do:
       headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT osid FROM bm25_search('sec_sql1', 'title', 'wool silk', 10) ORDER BY osid" }
+  - length: { rows: 2 }
+  - match: { rows.0.osid: s1 }
+  - match: { rows.1.osid: s3 }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT * FROM bm25_search('sec_sql1', 'title', 'wool', 10) ORDER BY n" }
+  - length: { rows: 2 }
+  - match: { rows.0.tag: x }
+  - is_true: rows.0.score
+  - is_false: rows.0.secret
+  - is_false: rows.0.source
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      infino.sql:
+        body: { query: "SELECT ip, score FROM bm25_search('sec_sql1', 'title', 'wool', 10) ORDER BY score DESC" }
+  - length: { rows: 2 }
+  - match: { rows.0.ip: $default_ip }
+  # A search that names a hidden or masked field would match its stored values: refused.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
       catch: forbidden
       infino.sql:
-        body: { query: "SELECT osid FROM bm25_search('sec_sql1', 'title', 'silk', 10)" }
+        body: { query: "SELECT osid FROM bm25_search('sec_sql1', 'secret', 'alpha', 10)" }
+  - do:
+      headers: { Authorization: "Basic aGFzaF91c2VyOmFkbWlu" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sec_sql1', 'ip', '10.0.0.1')" }
 
 ---
 "SQL reads a pattern, an alias over several indices and a filtered alias as a search does":
@@ -177,19 +243,25 @@
   - length: { rows: 2 }
   - match: { rows.0.osid: a }
   - match: { rows.1.osid: c }
-  # An engine search reads one table whole: not over a pattern, nor through a filtered alias.
-  - do:
-      catch: forbidden
-      infino.sql:
-        body: { query: "SELECT osid FROM token_match('sql_w*', 'tag', 'a')" }
-  - do:
-      catch: forbidden
-      infino.sql:
-        body: { query: "SELECT osid FROM token_match('sql_wa', 'tag', 'b')" }
+  # An engine search reads the same: over every index a pattern matches, and only what a
+  # filtered alias keeps.
   - do:
       infino.sql:
         body: { query: "SELECT osid FROM token_match('sql_w1', 'osid', 'b')" }
   - match: { rows.0.osid: b }
+  - do:
+      infino.sql:
+        body: { query: "SELECT osid, extra FROM token_match('sql_w*', 'osid', 'c')" }
+  - length: { rows: 1 }
+  - match: { rows.0.extra: x }
+  - do:
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sql_wa', 'osid', 'b')" }
+  - length: { rows: 0 }
+  - do:
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sql_wa', 'osid', 'a')" }
+  - length: { rows: 1 }
 
   # A user who may not read what a pattern matches is refused, as a search over it is.
   - do:

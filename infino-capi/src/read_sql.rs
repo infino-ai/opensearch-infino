@@ -6,18 +6,26 @@
 //! plugin authorizes the caller for each, and the plugin hands back, for
 //! each one, a view: the query over its table that leaves out what the
 //! caller may not see. [`rewrite`] puts each view where its index was named,
-//! so the engine reads only through those views. What the walk cannot hold
-//! to the views is refused rather than run: anything but one query, a
-//! qualified name, a table function other than the engine's searches and
-//! row generators, a `WITH` name that is also a table's.
+//! so the engine reads only through those views. An engine search over an
+//! index is put in place the same way, as the search over its table read
+//! through the same rules. What the walk cannot hold to the views is
+//! refused rather than run: anything but one query, a qualified name, a
+//! table function other than the engine's searches and row generators, a
+//! `WITH` name that is also a table's, a search naming a column the caller
+//! may not read as it is.
+//!
+//! A column the caller may read only as output (masked by a rule SQL cannot
+//! compute, so the plugin masks it in the result) is held to that
+//! ([`output_columns`]): given as a column of the result and nothing else.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, Ident, LimitClause, ObjectName, ObjectNamePart, Query,
-    SetExpr, Statement, TableAlias, TableFactor, Value, Visit, VisitMut, Visitor, VisitorMut,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause,
+    ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
+    TableAlias, TableFactor, Value, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 /// The engine's search functions, each naming the table it searches as its
@@ -32,6 +40,14 @@ const SEARCH_FUNCTIONS: [&str; 6] = [
 ];
 /// Table functions that generate rows and read no table.
 const GENERATORS: [&str; 2] = ["generate_series", "range"];
+/// The table function a search view reads, with the table as its one
+/// argument, where the statement's own search goes: the walk gives it the
+/// search's name and the rest of its arguments. The plugin writes the same
+/// name (`InfinoSql.SEARCH_PLACEHOLDER`).
+pub(crate) const SEARCH_PLACEHOLDER: &str = "infino_search";
+/// The one function a bare `*` may be an argument of: `count(*)` counts
+/// rows and reads no column.
+const COUNT: &str = "count";
 /// The status of a statement the route does not serve as written.
 pub(crate) const BAD_REQUEST: u16 = 400;
 /// The status of a statement that would read around a security rule.
@@ -66,22 +82,43 @@ pub(crate) fn indices(sql: &str) -> Result<Vec<String>, Box<Refusal>> {
     Ok(walk.found)
 }
 
-/// `sql` with each index it names replaced by its view from `views` (the
-/// query over the index's table the caller may read), and each search
-/// function's index by its table from `functions`, rendered for the engine.
-/// An index with no view, or a search over one with no table (the plugin
-/// gives none where a rule applies, since a search reads the table whole),
-/// is refused. A `WITH` name that is one of `tables` is refused too: where
+/// What the plugin gives the walk, by the index names a statement reads.
+#[derive(Default)]
+pub(crate) struct Reads {
+    /// The view of each: the query over its table (or tables) the caller may read.
+    pub(crate) views: HashMap<String, String>,
+    /// The search over each: a view reading [`SEARCH_PLACEHOLDER`] in place
+    /// of the search, with each table as its argument.
+    pub(crate) searches: HashMap<String, String>,
+    /// The columns of each a search may not name: hidden or masked for the
+    /// caller, since a search matches the stored values.
+    pub(crate) unsearchable: HashMap<String, HashSet<String>>,
+    /// The columns the caller may read only as output (see [`output_columns`]).
+    pub(crate) output_only: HashSet<String>,
+}
+
+/// A statement as the engine runs it, and the columns of its result the
+/// plugin masks, each as (result column, column it gives).
+#[derive(Debug)]
+pub(crate) struct Rewritten {
+    pub(crate) sql: String,
+    pub(crate) masked: Vec<(String, String)>,
+}
+
+/// `sql` with each index it names replaced by its view, and each search
+/// over an index by its search view, from `reads`, rendered for the engine.
+/// An index with no view is refused, as is a search naming a column it may
+/// not, and a use of a column the caller may read only as output other than
+/// as output. A `WITH` name that is one of `tables` is refused too: where
 /// that name is out of the `WITH`'s scope it would read the table itself.
 /// The statement is held to `max_rows + 1` rows ([`limit_rows`]), so the
 /// caller can tell a result that was cut.
 pub(crate) fn rewrite(
     sql: &str,
-    views: &HashMap<String, String>,
-    functions: &HashMap<String, String>,
+    reads: &Reads,
     tables: &[String],
     max_rows: usize,
-) -> Result<String, Box<Refusal>> {
+) -> Result<Rewritten, Box<Refusal>> {
     let mut query = parse_query(sql)?;
     let ctes = ctes(&query);
     for name in &ctes {
@@ -92,22 +129,234 @@ pub(crate) fn rewrite(
             ));
         }
     }
-    let mut parsed = HashMap::with_capacity(views.len());
-    for (index, view) in views {
-        parsed.insert(index.clone(), parse_query(view)?);
+    let masked = output_columns(&query, &reads.output_only)?;
+    let mut views = HashMap::with_capacity(reads.views.len());
+    for (index, view) in &reads.views {
+        views.insert(index.clone(), parse_query(view)?);
+    }
+    let mut searches = HashMap::with_capacity(reads.searches.len());
+    for (index, search) in &reads.searches {
+        searches.insert(index.clone(), parse_query(search)?);
     }
     let mut walk = Walk::new(
         ctes,
         Mode::Rewrite {
-            views: parsed,
-            functions,
+            views,
+            searches,
+            unsearchable: &reads.unsearchable,
         },
     );
     if let ControlFlow::Break(refusal) = VisitMut::visit(&mut query, &mut walk) {
         return Err(refusal);
     }
     limit_rows(&mut query, max_rows)?;
-    Ok(Statement::Query(Box::new(query)).to_string())
+    Ok(Rewritten {
+        sql: Statement::Query(Box::new(query)).to_string(),
+        masked,
+    })
+}
+
+/// The columns of the result that give a column the caller may read only
+/// as output (`output_only`), each as (result column, column), for the
+/// plugin to mask. Such a column is given as a column of the result and
+/// used for nothing else: named alone (or renamed) in the outermost
+/// `SELECT`, reached by its `*`, or grouped on alone, which reads only
+/// which values are equal, as their masks would. Any other use is refused:
+/// in a condition, a join, an order, an expression, a subquery's column
+/// list, so no value of it reaches the result except as the plugin masks
+/// it.
+fn output_columns(
+    query: &Query,
+    output_only: &HashSet<String>,
+) -> Result<Vec<(String, String)>, Box<Refusal>> {
+    if output_only.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut rest = query.clone();
+    let mut masked = Vec::new();
+    let mut names = output_only.clone();
+    let outermost = match rest.body.as_mut() {
+        SetExpr::Select(select) => Some(select),
+        _ => None,
+    };
+    if let Some(select) = outermost {
+        given_as_output(select, output_only, &mut masked, &mut names)?;
+        // An order by position or by all of the result orders by the values.
+        if !masked.is_empty() {
+            if let Some(order_by) = &rest.order_by {
+                let by_position = match &order_by.kind {
+                    OrderByKind::All(_) => true,
+                    OrderByKind::Expressions(exprs) => {
+                        exprs.iter().any(|e| matches!(e.expr, Expr::Value(_)))
+                    }
+                };
+                if by_position {
+                    return Err(only_as_output("the result's columns"));
+                }
+            }
+        }
+    }
+    let mut uses = Uses {
+        names,
+        // Below a set operation a `*` gives the result columns no one masks.
+        wildcards_pass: matches!(query.body.as_ref(), SetExpr::Select(_)),
+    };
+    if let ControlFlow::Break(refusal) = Visit::visit(&rest, &mut uses) {
+        return Err(refusal);
+    }
+    Ok(masked)
+}
+
+/// Take the outermost `SELECT`'s plain uses of `output_only` columns out of
+/// `select`, noting each result column they give onto `masked` and each
+/// name they are given onto `names`.
+fn given_as_output(
+    select: &mut Select,
+    output_only: &HashSet<String>,
+    masked: &mut Vec<(String, String)>,
+    names: &mut HashSet<String>,
+) -> Result<(), Box<Refusal>> {
+    for item in select.projection.iter_mut() {
+        match item {
+            SelectItem::UnnamedExpr(expr) => {
+                if let Some(column) = bare(expr, output_only) {
+                    masked.push((column.clone(), column));
+                    *expr = Expr::value(Value::Null);
+                }
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                if let Some(column) = bare(expr, output_only) {
+                    let given = folded(alias);
+                    names.insert(given.clone());
+                    masked.push((given, column));
+                    *expr = Expr::value(Value::Null);
+                }
+            }
+            SelectItem::Wildcard(options) | SelectItem::QualifiedWildcard(_, options) => {
+                if !options.to_string().is_empty() {
+                    return Err(only_as_output("a `*` that renames or replaces columns"));
+                }
+                for column in output_only {
+                    masked.push((column.clone(), column.clone()));
+                }
+            }
+            SelectItem::ExprWithAliases { .. } => {}
+        }
+    }
+    if let GroupByExpr::Expressions(exprs, _) = &mut select.group_by {
+        exprs.retain(|e| bare(e, output_only).is_none());
+    }
+    Ok(())
+}
+
+/// The column of `names` `expr` is, alone; none for anything else.
+fn bare(expr: &Expr, names: &HashSet<String>) -> Option<String> {
+    let column = match expr {
+        Expr::Identifier(ident) => folded(ident),
+        Expr::CompoundIdentifier(parts) => folded(parts.last()?),
+        Expr::Nested(inner) => return bare(inner, names),
+        _ => return None,
+    };
+    names.contains(&column).then_some(column)
+}
+
+fn only_as_output(what: &str) -> Box<Refusal> {
+    refuse(
+        format!(
+            "{what} would read a field masked for you, which SQL gives only as a column of the result: \
+             filter, join, sort or compute on other fields"
+        ),
+        FORBIDDEN,
+    )
+}
+
+/// The check for any use of `names` left once the plain ones are taken out:
+/// a reference, a join on same-named columns, a column list renaming what a
+/// subquery gives, a whole row handed to a function, and (where `*` cannot
+/// be followed to the result) any `*`.
+struct Uses {
+    names: HashSet<String>,
+    wildcards_pass: bool,
+}
+
+impl Visitor for Uses {
+    type Break = Box<Refusal>;
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        if let Some(with) = &query.with {
+            if with
+                .cte_tables
+                .iter()
+                .any(|cte| !cte.alias.columns.is_empty())
+            {
+                return ControlFlow::Break(only_as_output("a WITH column list"));
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<Self::Break> {
+        for from in &select.from {
+            for join in &from.joins {
+                // The join operator has a variant per kind of join; its text
+                // names a join on same-named columns the same way for all.
+                let text = join.to_string();
+                if text.starts_with("NATURAL ") || text.contains(" USING(") {
+                    return ControlFlow::Break(only_as_output("a NATURAL or USING join"));
+                }
+            }
+        }
+        if !self.wildcards_pass
+            && select.projection.iter().any(|item| {
+                matches!(
+                    item,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+                )
+            })
+        {
+            return ControlFlow::Break(only_as_output("a `*` below a set operation"));
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        let alias = match factor {
+            TableFactor::Table { alias, .. }
+            | TableFactor::Derived { alias, .. }
+            | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
+            _ => None,
+        };
+        if alias.is_some_and(|a| !a.columns.is_empty()) {
+            return ControlFlow::Break(only_as_output("a column list renaming a table's columns"));
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if let Some(column) = bare(expr, &self.names) {
+            return ControlFlow::Break(only_as_output(&format!("[{column}]")));
+        }
+        if let Expr::Function(f) = expr {
+            if let FunctionArguments::List(list) = &f.args {
+                let counts = f.name.to_string().eq_ignore_ascii_case(COUNT);
+                for arg in &list.args {
+                    let (FunctionArg::Unnamed(a)
+                    | FunctionArg::Named { arg: a, .. }
+                    | FunctionArg::ExprNamed { arg: a, .. }) = arg;
+                    let whole_row = match a {
+                        FunctionArgExpr::Wildcard => !counts,
+                        FunctionArgExpr::QualifiedWildcard(_)
+                        | FunctionArgExpr::WildcardWithOptions(_) => true,
+                        FunctionArgExpr::Expr(_) => false,
+                    };
+                    if whole_row {
+                        return ControlFlow::Break(only_as_output("a function given a whole row"));
+                    }
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// The one query `sql` holds; anything else is refused.
@@ -174,11 +423,54 @@ fn single(name: &ObjectName) -> Result<&Ident, Box<Refusal>> {
 enum Mode<'a> {
     /// Note it.
     Collect,
-    /// Put its view in its place.
+    /// Put its view in its place, or its search view in place of a search over it.
     Rewrite {
         views: HashMap<String, Query>,
-        functions: &'a HashMap<String, String>,
+        searches: HashMap<String, Query>,
+        unsearchable: &'a HashMap<String, HashSet<String>>,
     },
+}
+
+/// Gives a search view the statement's own search: [`SEARCH_PLACEHOLDER`]
+/// takes the search's name and, after the table, the rest of its arguments.
+struct Fill {
+    name: ObjectName,
+    rest: Vec<FunctionArg>,
+    filled: bool,
+}
+
+impl VisitorMut for Fill {
+    type Break = ();
+
+    fn post_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
+        if let TableFactor::Table {
+            name,
+            args: Some(args),
+            ..
+        } = factor
+        {
+            if name.to_string() == SEARCH_PLACEHOLDER {
+                *name = self.name.clone();
+                args.args.extend(self.rest.iter().cloned());
+                self.filled = true;
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// A string an argument gives, as written.
+fn string_arg(arg: &FunctionArg) -> Option<&str> {
+    let (FunctionArg::Unnamed(a)
+    | FunctionArg::Named { arg: a, .. }
+    | FunctionArg::ExprNamed { arg: a, .. }) = arg;
+    match a {
+        FunctionArgExpr::Expr(Expr::Value(v)) => match &v.value {
+            Value::SingleQuotedString(s) => Some(s),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The walk over a query and every query inside it.
@@ -269,18 +561,21 @@ impl<'a> Walk<'a> {
     }
 
     /// A table function: an engine search names its index, noted or
-    /// replaced by its table; a row generator reads none; any other is
-    /// refused.
+    /// replaced by its search view, read under the name the statement gave
+    /// it (the function's own when it gave none); a row generator reads
+    /// none; any other is refused.
     fn function(&mut self, factor: &mut TableFactor) -> ControlFlow<Box<Refusal>> {
         let TableFactor::Table {
             name,
             args: Some(args),
+            alias,
             ..
         } = factor
         else {
             return ControlFlow::Continue(());
         };
-        let function = match single(name) {
+        let (name, args, alias) = (name.clone(), args.clone(), alias.clone());
+        let function = match single(&name) {
             Ok(ident) => ident.value.to_lowercase(),
             Err(refusal) => return ControlFlow::Break(refusal),
         };
@@ -293,36 +588,70 @@ impl<'a> Walk<'a> {
                 BAD_REQUEST,
             ));
         }
-        let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(first)))) =
-            args.args.first_mut()
+        let index = match args.args.first() {
+            Some(first @ FunctionArg::Unnamed(_)) => string_arg(first).map(str::to_string),
+            _ => None,
+        };
+        let Some(index) = index else {
+            return ControlFlow::Break(refuse(
+                format!("{function} takes the index it searches as its first argument, a string"),
+                BAD_REQUEST,
+            ));
+        };
+        let Mode::Rewrite {
+            searches,
+            unsearchable,
+            ..
+        } = &self.mode
         else {
+            self.note(index);
+            return ControlFlow::Continue(());
+        };
+        let Some(search) = searches.get(&index) else {
             return ControlFlow::Break(refuse(
-                format!("{function} takes the index it searches as its first argument, a string"),
-                BAD_REQUEST,
+                format!("no index [{index}] is readable here"),
+                FORBIDDEN,
             ));
         };
-        let Value::SingleQuotedString(index) = &first.value else {
-            return ControlFlow::Break(refuse(
-                format!("{function} takes the index it searches as its first argument, a string"),
-                BAD_REQUEST,
-            ));
-        };
-        let index = index.clone();
-        match &self.mode {
-            Mode::Collect => self.note(index),
-            Mode::Rewrite { functions, .. } => match functions.get(&index) {
-                Some(table) => first.value = Value::SingleQuotedString(table.clone()),
-                None => {
+        // A search matches the stored values of the columns it names, so it
+        // names none the caller may not read as stored.
+        if let Some(closed) = unsearchable.get(&index) {
+            for arg in &args.args[1..] {
+                if let Some(column) = string_arg(arg).filter(|c| closed.contains(*c)) {
                     return ControlFlow::Break(refuse(
                         format!(
-                            "{function} over [{index}] is not served: it searches one table whole, so it reads \
-                             only an index that is one table and under no rule for you; read [{index}] by name instead"
+                            "[{column}] is hidden or masked for you in [{index}]; {function} over it would match its values"
                         ),
                         FORBIDDEN,
-                    ))
+                    ));
                 }
-            },
+            }
         }
+        let mut view = search.clone();
+        let mut fill = Fill {
+            name,
+            rest: args.args[1..].to_vec(),
+            filled: false,
+        };
+        let _ = VisitMut::visit(&mut view, &mut fill);
+        if !fill.filled {
+            return ControlFlow::Break(refuse(
+                format!("the search view of [{index}] reads no search"),
+                BAD_REQUEST,
+            ));
+        }
+        let alias = alias.unwrap_or(TableAlias {
+            explicit: true,
+            name: Ident::new(function),
+            columns: Vec::new(),
+            at: None,
+        });
+        *factor = TableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(view),
+            alias: Some(alias),
+            sample: None,
+        };
         ControlFlow::Continue(())
     }
 }
@@ -430,6 +759,19 @@ mod tests {
             .collect()
     }
 
+    /// Reads with these views and nothing else.
+    fn reading(pairs: &[(&str, &str)]) -> Reads {
+        Reads {
+            views: views(pairs),
+            ..Reads::default()
+        }
+    }
+
+    /// `sql` rewritten under `reads`, as the engine is handed it.
+    fn rewritten(sql: &str, reads: &Reads, tables: &[String]) -> Result<String, Box<Refusal>> {
+        rewrite(sql, reads, tables, MAX_ROWS).map(|r| r.sql)
+    }
+
     fn refusal(r: Result<impl std::fmt::Debug, Box<Refusal>>) -> Box<Refusal> {
         r.expect_err("the statement is refused")
     }
@@ -486,18 +828,16 @@ mod tests {
     #[test]
     fn each_index_is_read_through_its_view_under_the_name_it_was_given() {
         let sql = "SELECT l.msg, (SELECT count(*) FROM users) FROM logs l WHERE l.id IN (SELECT id FROM logs)";
-        let out = rewrite(
+        let out = rewritten(
             sql,
-            &views(&[
+            &reading(&[
                 (
                     "logs",
                     "SELECT \"id\", \"msg\" FROM \"os_logs\" WHERE \"tenant\" = 'a'",
                 ),
                 ("users", "SELECT * FROM \"os_users\""),
             ]),
-            &HashMap::new(),
             &[],
-            MAX_ROWS,
         )
         .unwrap();
         assert_eq!(
@@ -513,34 +853,36 @@ mod tests {
 
     #[test]
     fn an_index_without_a_view_is_refused() {
-        let r = refusal(rewrite(
+        let r = refusal(rewritten(
             "SELECT * FROM logs JOIN secrets ON true",
-            &views(&[("logs", "SELECT * FROM \"os_logs\"")]),
-            &HashMap::new(),
+            &reading(&[("logs", "SELECT * FROM \"os_logs\"")]),
             &[],
-            MAX_ROWS,
         ));
         assert_eq!(r.status, FORBIDDEN);
         assert!(r.message.contains("secrets"), "{}", r.message);
     }
 
     #[test]
-    fn a_search_reads_its_table_only_where_no_rule_applies() {
-        let sql = "SELECT osid FROM bm25_search('logs', 'msg', 'disk', 10)";
-        let tables = HashMap::from([("logs".to_string(), "os_logs".to_string())]);
-        let out = rewrite(sql, &HashMap::new(), &tables, &[], MAX_ROWS).unwrap();
+    fn a_search_is_read_through_its_search_view() {
+        let sql =
+            "SELECT osid, score FROM bm25_search('logs', 'msg', 'disk', 10) ORDER BY score DESC";
+        let reads = Reads {
+            searches: views(&[(
+                "logs",
+                "SELECT \"osid\", \"msg\", \"score\" FROM infino_search('os_logs') WHERE \"tenant\" = 'a'",
+            )]),
+            ..Reads::default()
+        };
         assert_eq!(
-            out,
-            "SELECT osid FROM bm25_search('os_logs', 'msg', 'disk', 10) LIMIT 11"
+            rewritten(sql, &reads, &[]).unwrap(),
+            "SELECT osid, score FROM (SELECT \"osid\", \"msg\", \"score\" FROM bm25_search('os_logs', 'msg', 'disk', 10) \
+             WHERE \"tenant\" = 'a') AS bm25_search ORDER BY score DESC LIMIT 11"
         );
-        let r = refusal(rewrite(
-            sql,
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-            MAX_ROWS,
-        ));
-        assert_eq!(r.status, FORBIDDEN);
+        // An index with no search view is not read.
+        assert_eq!(
+            refusal(rewritten(sql, &Reads::default(), &[])).status,
+            FORBIDDEN
+        );
         assert_eq!(
             refusal(indices(
                 "SELECT * FROM bm25_search(concat('lo', 'gs'), 'msg', 'x', 1)"
@@ -551,62 +893,108 @@ mod tests {
     }
 
     #[test]
+    fn a_search_naming_a_column_the_caller_may_not_read_is_refused() {
+        let reads = Reads {
+            searches: views(&[("logs", "SELECT * FROM infino_search('os_logs')")]),
+            unsearchable: HashMap::from([(
+                "logs".to_string(),
+                HashSet::from(["secret".to_string()]),
+            )]),
+            ..Reads::default()
+        };
+        let r = refusal(rewritten(
+            "SELECT osid FROM bm25_search('logs', 'secret', 'alpha', 10)",
+            &reads,
+            &[],
+        ));
+        assert_eq!(r.status, FORBIDDEN);
+        assert!(r.message.contains("secret"), "{}", r.message);
+        assert!(rewritten(
+            "SELECT osid FROM bm25_search('logs', 'msg', 'alpha', 10)",
+            &reads,
+            &[]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_column_read_only_as_output_is_given_and_nothing_else() {
+        let reads = Reads {
+            views: views(&[("logs", "SELECT \"ip\", \"n\" FROM \"os_logs\"")]),
+            output_only: HashSet::from(["ip".to_string()]),
+            ..Reads::default()
+        };
+        let masked = |sql: &str| rewrite(sql, &reads, &[], MAX_ROWS).map(|r| r.masked);
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            masked("SELECT ip, n FROM logs WHERE n > 1 ORDER BY n").unwrap(),
+            [pair("ip", "ip")]
+        );
+        assert_eq!(
+            masked("SELECT l.ip AS addr FROM logs l").unwrap(),
+            [pair("addr", "ip")]
+        );
+        assert_eq!(masked("SELECT * FROM logs").unwrap(), [pair("ip", "ip")]);
+        // Grouping reads only which values are equal, as their masks would.
+        assert_eq!(
+            masked("SELECT ip, count(*) AS c FROM logs GROUP BY ip").unwrap(),
+            [pair("ip", "ip")]
+        );
+        assert_eq!(
+            masked("SELECT n FROM (SELECT * FROM logs) t WHERE n > 1").unwrap(),
+            []
+        );
+        for sql in [
+            "SELECT n FROM logs WHERE ip = '10.0.0.1'",
+            "SELECT n FROM logs ORDER BY ip",
+            "SELECT ip AS a FROM logs ORDER BY a",
+            "SELECT ip FROM logs ORDER BY 1",
+            "SELECT upper(ip) FROM logs",
+            "SELECT count(DISTINCT ip) FROM logs",
+            "SELECT x FROM (SELECT ip AS x FROM logs) t",
+            "SELECT * FROM logs a JOIN logs b ON a.ip = b.ip",
+            "SELECT * FROM logs a JOIN logs b USING (ip)",
+            "SELECT * FROM logs a NATURAL JOIN logs b",
+            "SELECT z FROM (SELECT * FROM logs) AS t(z, m)",
+            "WITH t(z, m) AS (SELECT * FROM logs) SELECT z FROM t",
+            "SELECT * FROM logs UNION ALL SELECT * FROM logs",
+            "SELECT * REPLACE (upper(ip) AS ip) FROM logs",
+            "SELECT array_agg(logs.*) FROM logs",
+        ] {
+            assert_eq!(refusal(masked(sql)).status, FORBIDDEN, "{sql}");
+        }
+        // With nothing read only as output, all of these are served.
+        assert!(rewritten(
+            "SELECT n FROM logs WHERE ip = '10.0.0.1'",
+            &reading(&[("logs", "SELECT * FROM \"os_logs\"")]),
+            &[]
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn a_with_name_stays_and_one_naming_a_table_is_refused() {
         let sql = "WITH logs AS (SELECT 1 AS x) SELECT * FROM logs";
         assert_eq!(refusal(indices(sql)).status, BAD_REQUEST); // it reads no index
         let sql = "WITH recent AS (SELECT * FROM logs) SELECT * FROM recent";
-        let logs = views(&[("logs", "SELECT * FROM \"os_logs\"")]);
-        let out = rewrite(
-            sql,
-            &logs,
-            &HashMap::new(),
-            &["os_logs".to_string()],
-            MAX_ROWS,
-        )
-        .unwrap();
+        let logs = reading(&[("logs", "SELECT * FROM \"os_logs\"")]);
+        let out = rewritten(sql, &logs, &["os_logs".to_string()]).unwrap();
         assert!(out.ends_with("SELECT * FROM recent LIMIT 11"), "{out}");
         // Out of its scope the name would read the table itself.
         let sql = "SELECT * FROM (WITH os_index AS (SELECT * FROM logs) SELECT * FROM os_index) t, os_index";
-        let r = refusal(rewrite(
-            sql,
-            &logs,
-            &HashMap::new(),
-            &["os_index".to_string()],
-            MAX_ROWS,
-        ));
+        let r = refusal(rewritten(sql, &logs, &["os_index".to_string()]));
         assert_eq!(r.status, BAD_REQUEST);
     }
 
     #[test]
     fn a_limit_within_the_cap_stands_and_a_larger_one_is_held_to_it() {
-        let logs = views(&[("logs", "SELECT * FROM \"os_logs\"")]);
-        let out = rewrite(
-            "SELECT * FROM logs LIMIT 3",
-            &logs,
-            &HashMap::new(),
-            &[],
-            MAX_ROWS,
-        )
-        .unwrap();
+        let logs = reading(&[("logs", "SELECT * FROM \"os_logs\"")]);
+        let out = rewritten("SELECT * FROM logs LIMIT 3", &logs, &[]).unwrap();
         assert!(out.ends_with("LIMIT 3"), "{out}");
-        let out = rewrite(
-            "SELECT * FROM logs OFFSET 5",
-            &logs,
-            &HashMap::new(),
-            &[],
-            MAX_ROWS,
-        )
-        .unwrap();
+        let out = rewritten("SELECT * FROM logs OFFSET 5", &logs, &[]).unwrap();
         assert!(out.contains("LIMIT 11"), "{out}");
         // The engine stops at the cap rather than building a larger result first.
-        let out = rewrite(
-            "SELECT * FROM logs LIMIT 1000000",
-            &logs,
-            &HashMap::new(),
-            &[],
-            MAX_ROWS,
-        )
-        .unwrap();
+        let out = rewritten("SELECT * FROM logs LIMIT 1000000", &logs, &[]).unwrap();
         assert!(out.ends_with("LIMIT 11"), "{out}");
     }
 }

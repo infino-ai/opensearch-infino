@@ -13,6 +13,7 @@ import org.opensearch.common.xcontent.LoggingDeprecationHandler;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.IndexNotFoundException;
@@ -30,6 +31,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.UnaryOperator;
 
 /**
  * A caller's read-only SQL over Infino-backed indices, held to what the
@@ -50,15 +52,23 @@ import java.util.Set;
  * name as an index the caller may read: not the registry, not the security
  * plugin's own index, not another index's table.
  *
- * <p>A masked field is masked in SQL as the security plugin masks it: a
- * regular-expression mask as its replacements, a named algorithm (MD5, the
- * SHA-2 family) as that digest in hex. The security plugin's default hash, a
- * BLAKE2b keyed with the cluster's salt, has no SQL function to give it, so
- * a field masked by it is refused rather than served unmasked.
+ * <p>A masked field is masked in SQL as the security plugin masks it where
+ * SQL has the same function: a regular-expression mask as its replacements,
+ * a named algorithm (MD5, the SHA-2 family) as that digest in hex, so the
+ * statement filters, groups and joins on the mask. A mask SQL has no
+ * function for (the security plugin's default, a BLAKE2b keyed with the
+ * cluster's salt, or another named algorithm) is applied to the result by
+ * the security plugin's own function, as a search's source is masked; the
+ * field is then read only as a column of the result, and a statement using
+ * it otherwise is refused (see the bridge's {@code output_columns}).
+ *
+ * <p>An engine search over an index reads it the same way: the search over
+ * each table the index resolves to, its columns and rows as the view's (see
+ * {@link #view}). A search naming a column hidden or masked for the caller
+ * is refused, since it matches the stored values.
  *
  * <p>Also refused: an index whose reads the audit log records document by
- * document, an engine search over anything but one index under no rule (it
- * searches the whole table), a system index, an index Infino does not back.
+ * document, a system index, an index Infino does not back.
  */
 final class InfinoSql {
 
@@ -75,6 +85,25 @@ final class InfinoSql {
     private static final String WHAT = "a SQL read";
     /** Joins the parts of the indices one name resolves to, row set after row set. */
     private static final String UNION = " UNION ALL ";
+    /**
+     * The table function a search view reads, with the table as its one
+     * argument, where the bridge puts the statement's own search (the
+     * bridge's {@code SEARCH_PLACEHOLDER}).
+     */
+    static final String SEARCH_PLACEHOLDER = "infino_search";
+    /** The column an engine search ranks its rows by, beside the table's own. */
+    private static final String SCORE = "score";
+    /**
+     * The keys of the bridge's answer: its columns (each a name and an Arrow
+     * type), its rows, and the result columns it names to mask.
+     */
+    private static final String SCHEMA = "schema";
+    private static final String NAME = "name";
+    private static final String TYPE = "type";
+    private static final String ROWS = "rows";
+    private static final String MASKED = "masked";
+    /** The Arrow type of a masked column in the answer: its mask is text, whatever the field's type. */
+    private static final String TEXT_TYPE = "Utf8";
     /** What separates the parts of a masked-field expression, as the security plugin splits it. */
     private static final String MASK_SEPARATOR = "::";
     /** What a regular expression in a masked-field expression is written between. */
@@ -110,11 +139,16 @@ final class InfinoSql {
         }
         long now = System.currentTimeMillis();
         Map<String, String> views = new LinkedHashMap<>();
-        Map<String, String> searchable = new LinkedHashMap<>();
+        Map<String, String> searches = new LinkedHashMap<>();
+        Map<String, Set<String>> unsearchable = new LinkedHashMap<>();
+        // The fields masked in the result, each with the security plugin's mask
+        // (one rule per field, as the result does not say which index a value
+        // came from), and those masked in SQL: one field is not masked both ways.
+        Map<String, UnaryOperator<String>> onOutput = new LinkedHashMap<>();
+        Map<String, String> outputRules = new LinkedHashMap<>();
+        Set<String> inSql = new LinkedHashSet<>();
         for (String name : named) {
             List<Part> parts = new ArrayList<>();
-            boolean restricted = false;
-            String onlyTable = null;
             String[] concrete = resolver.concreteIndexNames(state, OPTIONS, name);
             for (String index : concrete) {
                 if (!authorized.contains(index)) {
@@ -131,19 +165,83 @@ final class InfinoSql {
                     throw new IllegalStateException("[infino] table " + table + " has not been declared");
                 }
                 String aliasFilter = aliasFilter(state, resolver, md, name, columns, table, now);
-                parts.add(part(table, columns, access, aliasFilter, now));
-                restricted |= !access.unrestricted() || aliasFilter != null;
-                onlyTable = table;
+                Part part = part(table, columns, access, aliasFilter, now);
+                parts.add(part);
+                for (Map.Entry<String, UnaryOperator<String>> e : part.onOutput().entrySet()) {
+                    String rule = access.maskRuleOf().apply(e.getKey());
+                    if (!rule.equals(outputRules.getOrDefault(e.getKey(), rule))) {
+                        throw InfinoAccess.refused("[" + e.getKey() + "] is masked for you by different rules in the indices the statement reads");
+                    }
+                    outputRules.put(e.getKey(), rule);
+                    onOutput.putIfAbsent(e.getKey(), e.getValue());
+                }
+                part.masked().stream().filter(c -> !part.onOutput().containsKey(c)).forEach(inSql::add);
             }
             if (parts.isEmpty()) {
                 throw InfinoAccess.refused("the statement reads [" + name + "], and no index it names was authorized for the request");
             }
-            views.put(name, view(parts));
-            if (parts.size() == 1 && !restricted) {
-                searchable.put(name, onlyTable);
+            views.put(name, view(parts, false));
+            searches.put(name, view(parts, true));
+            Set<String> closed = new LinkedHashSet<>();
+            parts.forEach(p -> closed.addAll(p.unsearchable()));
+            if (!closed.isEmpty()) {
+                unsearchable.put(name, closed);
             }
         }
-        return InfinoNative.sqlRead(request.query(), viewsJson(views, searchable), MAX_ROWS);
+        for (String field : onOutput.keySet()) {
+            if (inSql.contains(field)) {
+                throw InfinoAccess.refused("[" + field + "] is masked for you by rules SQL reads two ways in the indices the statement reads");
+            }
+        }
+        String answer = InfinoNative.sqlRead(request.query(), readsJson(views, searches, unsearchable, onOutput.keySet()), MAX_ROWS);
+        return onOutput.isEmpty() ? answer : maskResult(answer, onOutput);
+    }
+
+    /**
+     * The bridge's answer with each result column it names under
+     * {@code masked} masked by its field's mask, as the security plugin masks
+     * a search's source: each value as text through the mask, null left null,
+     * the column typed as text.
+     */
+    @SuppressWarnings("unchecked")
+    static String maskResult(String answer, Map<String, UnaryOperator<String>> masks) {
+        Map<String, Object> result;
+        try (XContentParser parser = JsonXContent.jsonXContent.createParser(NamedXContentRegistry.EMPTY, LoggingDeprecationHandler.INSTANCE, answer)) {
+            result = parser.mapOrdered();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        Object given = result.remove(MASKED);
+        if (given instanceof Map<?, ?> columns && result.get(ROWS) instanceof List<?> rows) {
+            if (result.get(SCHEMA) instanceof List<?> schema) {
+                for (Object field : schema) {
+                    Map<String, Object> f = (Map<String, Object>) field;
+                    if (columns.containsKey(f.get(NAME))) {
+                        f.put(TYPE, TEXT_TYPE);
+                    }
+                }
+            }
+            for (Object row : rows) {
+                Map<String, Object> values = (Map<String, Object>) row;
+                for (Map.Entry<?, ?> column : columns.entrySet()) {
+                    UnaryOperator<String> mask = masks.get(String.valueOf(column.getValue()));
+                    if (mask == null) {
+                        throw InfinoAccess.refused("[" + column.getValue() + "] is read only as a masked column, and no mask was found for it");
+                    }
+                    String name = String.valueOf(column.getKey());
+                    Object value = values.get(name);
+                    if (value != null) {
+                        values.put(name, mask.apply(String.valueOf(value)));
+                    }
+                }
+            }
+        }
+        try (XContentBuilder b = XContentFactory.jsonBuilder()) {
+            b.map(result);
+            return BytesReference.bytes(b).utf8ToString();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /** {@code index}, which {@code name} resolved to, when SQL reads it: Infino-backed, and not a system index. */
@@ -208,20 +306,45 @@ final class InfinoSql {
     /**
      * One index's part of a view: the expression each column the caller
      * reads is given by, by column name ({@code whole} when that is every
-     * column as stored), and the rows it keeps (null for all).
+     * column as stored), and the rows it keeps (null for all); the masked
+     * columns, those of them masked in the result rather than in SQL (given
+     * as stored, with the mask), and the columns a search may not name (the
+     * masked ones and the hidden ones).
      */
-    record Part(String table, Map<String, String> columns, boolean whole, String where) {}
+    record Part(
+        String table,
+        Map<String, String> columns,
+        boolean whole,
+        String where,
+        Set<String> masked,
+        Map<String, UnaryOperator<String>> onOutput,
+        Set<String> unsearchable
+    ) {
+        Part(String table, Map<String, String> columns, boolean whole, String where) {
+            this(table, columns, whole, where, Set.of(), Map.of(), Set.of());
+        }
+    }
 
     /**
      * The part of {@code table} the caller reads: every column when no field
      * or masking rule applies; else the visible ones, each masked one as its
-     * mask, without the source; the rows the document rule and
-     * {@code aliasFilter} keep.
+     * mask (or as stored, to be masked in the result, where SQL has no
+     * function for the mask), without the source; the rows the document rule
+     * and {@code aliasFilter} keep.
      */
     static Part part(String table, Map<String, Column> columns, InfinoAccess access, String aliasFilter, long nowMillis) {
         boolean whole = !access.restrictsFields() && !access.masks();
+        Map<String, Column> visible = whole ? columns : access.columns(columns);
         Map<String, String> projected = new LinkedHashMap<>();
-        for (Column c : (whole ? columns : access.columns(columns)).values()) {
+        Set<String> masked = new LinkedHashSet<>();
+        Map<String, UnaryOperator<String>> onOutput = new LinkedHashMap<>();
+        Set<String> unsearchable = new LinkedHashSet<>();
+        for (Column c : columns.values()) {
+            if (!visible.containsKey(c.name())) {
+                unsearchable.add(c.name());
+            }
+        }
+        for (Column c : visible.values()) {
             String quoted = InfinoQueryTranslator.quoteIdent(c.name());
             if (projected.containsKey(c.name()) || (!whole && c.name().equals(InfinoQueryTranslator.SOURCE))) {
                 continue;
@@ -230,17 +353,25 @@ final class InfinoSql {
                 projected.put(c.name(), quoted);
                 continue;
             }
+            masked.add(c.name());
+            unsearchable.add(c.name());
             String rule = access.maskRuleOf() == null ? null : access.maskRuleOf().apply(c.name());
             if (rule == null) {
                 throw InfinoAccess.refused("[" + c.name() + "] is masked for you by a rule SQL cannot read");
             }
-            projected.put(c.name(), masked(quoted, rule, access.maskAlgorithm()));
+            String expr = masked(quoted, rule, access.maskAlgorithm());
+            if (expr != null) {
+                projected.put(c.name(), expr);
+                continue;
+            }
+            onOutput.put(c.name(), c.mask());
+            projected.put(c.name(), quoted);
         }
         String where = access.documentsWhere(columns, table, nowMillis);
         if (aliasFilter != null) {
             where = where == null ? aliasFilter : "(" + where + ") AND (" + aliasFilter + ")";
         }
-        return new Part(table, projected, whole, where);
+        return new Part(table, projected, whole, where, masked, onOutput, unsearchable);
     }
 
     /**
@@ -250,25 +381,35 @@ final class InfinoSql {
      * field id, and the engine refuses a union whose inputs' ids differ (as
      * two indices' tables do), so in a union each column is read through
      * {@code coalesce(.., NULL)}, which is the value without the id.
+     *
+     * <p>With {@code search}, the view of an engine search over the same
+     * indices: each part reads {@link #SEARCH_PLACEHOLDER} over its table in
+     * place of the table, which the bridge makes the statement's own search,
+     * and gives the search's score beside its columns.
      */
-    static String view(List<Part> parts) {
+    static String view(List<Part> parts, boolean search) {
+        String score = InfinoQueryTranslator.quoteIdent(SCORE);
         if (parts.size() == 1) {
             Part p = parts.get(0);
-            return select(p, p.whole() ? "*" : String.join(", ", aliased(p.columns()).values()));
+            String list = p.whole() ? "*" : String.join(", ", aliased(p.columns()).values()) + (search ? ", " + score : "");
+            return select(p, list, search);
         }
         Set<String> names = new LinkedHashSet<>();
         for (Part p : parts) {
             names.addAll(p.columns().keySet());
         }
+        if (search) {
+            names.add(SCORE);
+        }
         List<String> selects = new ArrayList<>();
         for (Part p : parts) {
             List<String> list = new ArrayList<>(names.size());
             for (String name : names) {
-                String expr = p.columns().get(name);
+                String expr = search && name.equals(SCORE) ? score : p.columns().get(name);
                 String quoted = InfinoQueryTranslator.quoteIdent(name);
                 list.add((expr == null ? "NULL" : "coalesce(" + expr + ", NULL)") + " AS " + quoted);
             }
-            selects.add(select(p, String.join(", ", list)));
+            selects.add(select(p, String.join(", ", list), search));
         }
         return String.join(UNION, selects);
     }
@@ -283,17 +424,21 @@ final class InfinoSql {
         return out;
     }
 
-    private static String select(Part p, String list) {
-        return "SELECT " + list + " FROM " + InfinoQueryTranslator.quoteIdent(p.table()) + (p.where() == null ? "" : " WHERE " + p.where());
+    private static String select(Part p, String list, boolean search) {
+        String from = search
+            ? SEARCH_PLACEHOLDER + "(" + InfinoQueryTranslator.literal(p.table()) + ")"
+            : InfinoQueryTranslator.quoteIdent(p.table());
+        return "SELECT " + list + " FROM " + from + (p.where() == null ? "" : " WHERE " + p.where());
     }
 
     /**
      * {@code column} masked as the security plugin masks it by {@code rule}
      * (its masked-field expression), in SQL: a regular-expression mask as its
      * replacements in order; a hash as the digest its algorithm names, or
-     * {@code defaultAlgorithm} when it names none, in lower-case hex. A
-     * rule SQL has no equal for is refused: the default salted BLAKE2b, and
-     * an algorithm outside MD5 and the SHA-2 family.
+     * {@code defaultAlgorithm} when it names none, in lower-case hex. Null
+     * for a rule SQL has no equal for, which is masked in the result: the
+     * default salted BLAKE2b, and an algorithm outside MD5 and the SHA-2
+     * family. A rule the security plugin would not read is refused.
      */
     static String masked(String column, String rule, String defaultAlgorithm) {
         List<String> parts = Arrays.asList(rule.split(MASK_SEPARATOR, -1));
@@ -312,17 +457,15 @@ final class InfinoSql {
             }
             return out;
         }
+        if (parts.size() > 2) {
+            throw InfinoAccess.refused("the masking rule [" + rule + "] is not one the security plugin reads");
+        }
         String algorithm = parts.size() == 2 ? parts.get(1) : defaultAlgorithm;
-        if (parts.size() > 2 || algorithm == null || algorithm.isEmpty() || algorithm.equalsIgnoreCase(LEGACY_DEFAULT_ALGORITHM)) {
-            throw InfinoAccess.refused(
-                "the field masked by [" + rule + "] is hashed by the security plugin's default, a BLAKE2b keyed with the cluster's salt, which SQL has no function to give"
-            );
+        if (algorithm == null || algorithm.isEmpty() || algorithm.equalsIgnoreCase(LEGACY_DEFAULT_ALGORITHM)) {
+            return null; // the default, a BLAKE2b keyed with the cluster's salt
         }
         String digest = DIGESTS.get(algorithm.replace("-", "").toUpperCase(Locale.ROOT));
-        if (digest == null) {
-            throw InfinoAccess.refused("the field masked by [" + rule + "] is hashed with " + algorithm + ", which SQL has no function to give");
-        }
-        return "encode(digest(" + text + ", '" + digest + "'), 'hex')";
+        return digest == null ? null : "encode(digest(" + text + ", '" + digest + "'), 'hex')";
     }
 
     /**
@@ -363,12 +506,19 @@ final class InfinoSql {
         return out.toString();
     }
 
-    /** The views and searchable tables as the bridge takes them. */
-    private static String viewsJson(Map<String, String> views, Map<String, String> searchable) {
+    /** What the statement may read, as the bridge takes it (its {@code Reads}). */
+    private static String readsJson(
+        Map<String, String> views,
+        Map<String, String> searches,
+        Map<String, Set<String>> unsearchable,
+        Set<String> outputOnly
+    ) {
         try (XContentBuilder b = XContentFactory.jsonBuilder()) {
             b.startObject();
             b.field("relations", views);
-            b.field("functions", searchable);
+            b.field("searches", searches);
+            b.field("unsearchable", unsearchable);
+            b.field("output_only", outputOnly);
             b.endObject();
             return BytesReference.bytes(b).utf8ToString();
         } catch (IOException e) {
