@@ -121,8 +121,12 @@ public final class InfinoWriter {
      */
     private record Written(long seq, boolean existed, Exception conflict) {}
 
-    /** What a flush did: the ids the engine refused with the reason, and what each write became. */
-    private record Applied(Map<String, String> refused, Map<Outcome, Written> written) {}
+    /**
+     * What a flush did: the ids the engine refused with the reason, what each
+     * write became, and the ids whose delete failed after the append had
+     * committed, with why (empty and null when every delete landed).
+     */
+    private record Applied(Map<String, String> refused, Map<Outcome, Written> written, Set<String> undeleted, Exception deleteFailure) {}
 
     /** Whether an outcome carries a row to append: its prepared batch holds these, in the bulk's order. */
     private static boolean carriesRow(Outcome o) {
@@ -270,9 +274,11 @@ public final class InfinoWriter {
     /**
      * Write the batch: the rows of ids the table already holds replace
      * those rows in the same mutation as the append (so a failed write
-     * leaves the old rows), ids whose last write is a delete are tombstoned,
-     * and a write that meets a conflict (a create over a document, or a
-     * sequence-number condition the document does not meet) is left out.
+     * leaves the old rows), ids whose last write is a delete are tombstoned
+     * in a mutation after it (the engine replaces rows one for one, so a
+     * delete with no row in its place is a mutation of its own), and a write
+     * that meets a conflict (a create over a document, or a sequence-number
+     * condition the document does not meet) is left out.
      *
      * <p>Owns the prepared handles. The engine releases every handle it is
      * handed, on success and on failure alike, and the folded path releases
@@ -379,13 +385,19 @@ public final class InfinoWriter {
             // A read after the write must see the table, not a prefetched copy.
             InfinoNative.forgetSources(table, last.keySet());
         }
+        // The deletes are a mutation of their own after the append, which has
+        // committed by now: when they fail, the appended writes are answered as
+        // written and only the deletes as failed, so a client retries just those,
+        // and a delete retried removes what it names.
         if (!tombstones.isEmpty()) {
             int rc = InfinoNative.deleteOsids(table, tombstones.toArray(new String[0]), tombstones.size());
             if (rc != 0) {
-                throw new IllegalStateException("[infino] delete of " + tombstones.size() + " ids from " + table + " returned " + rc);
+                IllegalStateException failed = new IllegalStateException("[infino] delete of " + tombstones.size() + " ids from " + table + " returned " + rc);
+                log.warn("[infino] the batch's writes to {} committed, its deletes did not", table, failed);
+                return new Applied(refused, written, Set.copyOf(tombstones), failed);
             }
         }
-        return new Applied(refused, written);
+        return new Applied(refused, written, Set.of(), null);
     }
 
     /** The copy of the batch's index that writes its table, as this node's cluster state names it; null when unknown. */
@@ -484,6 +496,14 @@ public final class InfinoWriter {
                     o.slot(),
                     o.item().opType(),
                     new BulkItemResponse.Failure(w.indexName(), write.id(), done.conflict(), RestStatus.CONFLICT)
+                );
+                continue;
+            }
+            if (write.source() == null && applied.undeleted().contains(write.id())) {
+                w.items()[o.slot()] = new BulkItemResponse(
+                    o.slot(),
+                    o.item().opType(),
+                    new BulkItemResponse.Failure(w.indexName(), write.id(), applied.deleteFailure(), RestStatus.INTERNAL_SERVER_ERROR)
                 );
                 continue;
             }
