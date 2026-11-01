@@ -691,6 +691,33 @@ public final class InfinoNative {
         return out;
     }
 
+    /**
+     * The indices a caller's read-only statement reads, each once, in the
+     * order it names them (see {@link InfinoSql}); a statement the SQL route
+     * does not serve throws with the status that says why.
+     */
+    static List<String> sqlIndices(String sql) {
+        init();
+        Object listed = object(takeOrThrow(lib.infino_sql_indices(sql))).get("indices");
+        List<String> out = new ArrayList<>();
+        if (listed instanceof List<?> names) {
+            for (Object name : names) {
+                out.add(String.valueOf(name));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * A caller's read-only statement, each index it reads replaced by its
+     * view in {@code views} (see {@link InfinoSql}): its schema and rows as
+     * JSON, or a throw with the status that says why it was not run.
+     */
+    static String sqlRead(String sql, String views, int maxRows) {
+        init();
+        return takeOrThrow(lib.infino_sql_read(conn, sql, views, maxRows));
+    }
+
     public static List<Map<String, Object>> sqlRows(String q) {
         return rows(sql(q));
     }

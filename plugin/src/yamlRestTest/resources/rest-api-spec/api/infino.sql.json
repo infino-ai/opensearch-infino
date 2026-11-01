@@ -1,0 +1,21 @@
+{
+  "infino.sql": {
+    "documentation": {
+      "description": "One read-only SQL statement over Infino-backed indices, read as the caller may read them."
+    },
+    "stability": "experimental",
+    "url": {
+      "paths": [
+        {
+          "path": "/_plugins/_infino/sql",
+          "methods": ["POST"]
+        }
+      ]
+    },
+    "params": {},
+    "body": {
+      "description": "{\"query\": \"<statement>\"}",
+      "required": true
+    }
+  }
+}

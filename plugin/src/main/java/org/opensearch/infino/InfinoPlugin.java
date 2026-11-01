@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.action.ActionRequest;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -19,6 +20,7 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.env.Environment;
@@ -448,7 +450,16 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         );
     }
 
-    /** The account route: what the cluster's tables are served from, and how to accept or store a hosted account. */
+    /** The plugin's own action: a caller's SQL over Infino-backed indices, authorized as a read of each (see {@link InfinoSql}). */
+    @Override
+    public List<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> getActions() {
+        return List.of(new ActionHandler<>(InfinoSqlAction.INSTANCE, TransportInfinoSqlAction.class));
+    }
+
+    /**
+     * The account route: what the cluster's tables are served from, and how
+     * to accept or store a hosted account; and the SQL route.
+     */
     @Override
     public List<RestHandler> getRestHandlers(
         Settings settings,
@@ -459,7 +470,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
-        return List.of(new InfinoAccountRestHandler(account));
+        return List.of(new InfinoAccountRestHandler(account), new InfinoSqlRestHandler());
     }
 
     @Override

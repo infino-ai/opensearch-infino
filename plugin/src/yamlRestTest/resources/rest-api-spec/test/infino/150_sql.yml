@@ -1,0 +1,153 @@
+---
+"SQL reads an index as the caller may read it":
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: sec_sql1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              secret: { type: keyword }
+              ip: { type: keyword }
+              n: { type: long }
+              title: { type: text }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec_sql1, _id: "s1" }
+          - { tag: x, secret: alpha, ip: "10.0.0.1", n: 1, title: "wool coat" }
+          - index: { _index: sec_sql1, _id: "s2" }
+          - { tag: y, secret: beta, ip: "10.0.0.2", n: 2, title: "silk scarf" }
+          - index: { _index: sec_sql1, _id: "s3" }
+          - { tag: x, secret: gamma, ip: "10.0.0.1", n: 3, title: "wool hat" }
+  - match: { errors: false }
+
+  # Read whole by a user with plain read access, answered with the schema and the rows.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      infino.sql:
+        body: { query: "SELECT osid, n, secret FROM sec_sql1 ORDER BY n" }
+  - length: { rows: 3 }
+  - match: { rows.0.osid: s1 }
+  - match: { rows.2.secret: gamma }
+  - match: { schema.1.name: n }
+
+  # The document rule (tag is x) narrows what the statement reads, a count and a join alike.
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT count(*) AS c, sum(n) AS total FROM sec_sql1" }
+  - match: { rows.0.c: 2 }
+  - match: { rows.0.total: 4 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT a.osid FROM sec_sql1 a JOIN sec_sql1 b ON a.osid = b.osid WHERE b.tag = 'y'" }
+  - length: { rows: 0 }
+
+  # The field rule (no secret): the field is not there to name, and the source, which holds it, is left out.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT * FROM sec_sql1 ORDER BY n" }
+  - length: { rows: 3 }
+  - match: { rows.0.tag: x }
+  - is_false: rows.0.secret
+  - is_false: rows.0.source
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      catch: bad_request
+      infino.sql:
+        body: { query: "SELECT secret FROM sec_sql1" }
+
+  # A masked field is refused: SQL cannot give a value as its hash.
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT n FROM sec_sql1" }
+
+  # An engine search reads its table whole: served with no rule, refused under one.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      infino.sql:
+        body: { query: "SELECT osid FROM bm25_search('sec_sql1', 'title', 'wool', 10) ORDER BY osid" }
+  - length: { rows: 2 }
+  - match: { rows.0.osid: s1 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM bm25_search('sec_sql1', 'title', 'silk', 10)" }
+
+---
+"SQL reaches only indices the caller may read, and only reads them":
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: other_sql1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      index:
+        index: other_sql1
+        id: "o1"
+        refresh: true
+        body: { n: 1 }
+
+  # The security plugin refuses an index the user may not read, as it refuses a search of it.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT n FROM other_sql1" }
+  - do:
+      infino.sql:
+        body: { query: "SELECT n FROM other_sql1" }
+  - match: { rows.0.n: 1 }
+
+  # A statement names indices, never tables: the registry's table is no index, and a schema-qualified name is refused.
+  - do:
+      catch: missing
+      infino.sql:
+        body: { query: "SELECT * FROM os_index" }
+  - do:
+      catch: bad_request
+      infino.sql:
+        body: { query: "SELECT * FROM public.os_other_sql1" }
+  - do:
+      catch: bad_request
+      infino.sql:
+        body: { query: "SELECT * FROM information_schema.tables" }
+
+  # The security plugin's own index is a system index, which SQL does not read.
+  - do:
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT * FROM \".opendistro_security\"" }
+
+  # Only one query: anything that writes, or a second statement, is refused before it runs.
+  - do:
+      catch: bad_request
+      infino.sql:
+        body: { query: "DROP TABLE other_sql1" }
+  - do:
+      catch: bad_request
+      infino.sql:
+        body: { query: "SELECT n FROM other_sql1; DELETE FROM other_sql1" }
+  - do:
+      catch: bad_request
+      infino.sql:
+        body: { query: "COPY (SELECT * FROM other_sql1) TO '/tmp/out.csv'" }
+  - do:
+      infino.sql:
+        body: { query: "SELECT count(*) AS c FROM other_sql1" }
+  - match: { rows.0.c: 1 }

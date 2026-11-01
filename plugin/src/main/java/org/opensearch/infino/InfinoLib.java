@@ -87,6 +87,12 @@ public interface InfinoLib extends Library {
 
     Pointer infino_sql(Pointer h, String sql);
 
+    /** The indices a caller's read-only statement reads, as {@code {"indices": [..]}}, or an error with its status. */
+    Pointer infino_sql_indices(String sql);
+
+    /** A caller's read-only statement run through the views {@code views} gives each index it reads (see {@link InfinoSql}). */
+    Pointer infino_sql_read(Pointer h, String sql, String views, int maxRows);
+
     Pointer infino_bm25(Pointer h, String name, String column, String query, String mode, int k);
 
     Pointer infino_count(Pointer h, String name, String column, String query, String mode);
