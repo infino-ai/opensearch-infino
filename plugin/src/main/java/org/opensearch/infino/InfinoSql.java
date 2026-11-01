@@ -73,7 +73,7 @@ import java.util.function.UnaryOperator;
  * whole: one table, under no document, field or masking rule or filtering
  * alias.
  *
- * <p>An index in engine mode of several shards keeps a table per shard: its
+ * <p>An index in default mode of several shards keeps a table per shard: its
  * view reads them as one row set, as an alias over several indices does, and
  * a ranked search over it gives the best rows of the shards' searches
  * together (the bridge merges them by score, to the search's own row count),
@@ -123,7 +123,7 @@ final class InfinoSql {
     /** The Arrow type of a masked column in the answer: its mask is text, whatever the field's type. */
     private static final String TEXT_TYPE = "Utf8";
     /**
-     * The columns an engine-mode index's engine stamps its rows with for its
+     * The columns a default-mode index's engine stamps its rows with for its
      * own bookkeeping (the write that created a row, a commit's newest
      * operation, the index generation): no field of a document, never read.
      */
@@ -184,7 +184,7 @@ final class InfinoSql {
                 }
                 IndexMetadata md = infinoIndex(state, name, index);
                 InfinoAccess access = InfinoSecurity.access(index, WHAT);
-                // An index in engine mode keeps its rows in a table per shard: each is a part.
+                // An index in default mode keeps its rows in a table per shard: each is a part.
                 for (String table : InfinoPlugin.tables().ensureAll(md)) {
                     Map<String, Column> columns = InfinoNative.columns(table);
                     if (columns.isEmpty()) {

@@ -271,7 +271,7 @@
         body: { query: "SELECT count(*) AS c FROM \"sql_w*\"" }
 
 ---
-"SQL reads an engine-mode index of several shards as one":
+"SQL reads a default-mode index of several shards as one":
   - skip:
       features: headers
   - do:
@@ -280,7 +280,7 @@
         body:
           settings:
             index.infino.enabled: true
-            index.infino.mode: engine
+            index.infino.mode: default
             number_of_shards: 2
             number_of_replicas: 0
           mappings:
