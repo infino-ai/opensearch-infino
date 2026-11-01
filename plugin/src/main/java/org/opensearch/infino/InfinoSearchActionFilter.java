@@ -105,10 +105,13 @@ public class InfinoSearchActionFilter implements ActionFilter {
             SearchSourceBuilder source = search.source() == null ? new SearchSourceBuilder() : search.source();
             InfinoTables tables = InfinoPlugin.tables();
             Function<Index, String> tableOf = index -> tables.ensure(metadata.get(infino.indexOf(index)));
-            // Each index is read under what the security plugin lets this user see of it.
+            // Each index is read under what the security plugin lets this user see
+            // of it, and what a filtering alias the request reached it through keeps.
             Map<Index, InfinoAccess> access = new HashMap<>();
-            for (Index index : infino) {
-                access.put(index, InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH));
+            for (int i = 0; i < infino.size(); i++) {
+                Index index = infino.get(i);
+                InfinoAccess own = InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH);
+                access.put(index, own.filteredBy(InfinoAliasFilter.of(state, names, metadata.get(i), search.indices())));
             }
             // A repeated request is answered from the responses kept for it,
             // as the shard request cache answers it for a Lucene index.

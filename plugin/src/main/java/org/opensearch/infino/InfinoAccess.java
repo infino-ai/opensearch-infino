@@ -15,6 +15,7 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.infino.InfinoNative.Column;
 
 import java.io.IOException;
@@ -74,6 +75,26 @@ record InfinoAccess(
 
     boolean unrestricted() {
         return !restrictsDocuments() && !restrictsFields() && !masks();
+    }
+
+    /**
+     * This access with its rows narrowed to what {@code filter} keeps too, as
+     * a filtering alias narrows a search: a row is kept when the document
+     * rule keeps it and so does the filter. Null keeps this access as it is.
+     */
+    InfinoAccess filteredBy(QueryBuilder filter) {
+        if (filter == null) {
+            return this;
+        }
+        List<QueryBuilder> narrowed = new ArrayList<>();
+        if (documents == null) {
+            narrowed.add(filter);
+        } else {
+            for (QueryBuilder rule : documents) {
+                narrowed.add(QueryBuilders.boolQuery().filter(rule).filter(filter));
+            }
+        }
+        return new InfinoAccess(narrowed, fieldVisible, maskOf, onRead);
     }
 
     /**
