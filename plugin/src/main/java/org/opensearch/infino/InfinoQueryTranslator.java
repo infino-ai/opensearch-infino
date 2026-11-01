@@ -97,8 +97,14 @@ final class InfinoQueryTranslator {
     private static final String KEYWORD_SUFFIX = ".keyword";
     /** How a date range or histogram bound is read when the request names no format. */
     private static final String DEFAULT_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
+    /**
+     * How a clause joins the relation by id, through a subquery: a text
+     * clause other than the ranked one over its token index, or a field's
+     * values over its list column.
+     */
+    private static final String ID_SUBQUERY = " IN (SELECT ";
     /** How a text clause that is not the FROM source reads the token index: a subquery over its ids. */
-    private static final String TEXT_SUBQUERY = OSID + " IN (SELECT " + OSID + " FROM token_match(";
+    private static final String TEXT_SUBQUERY = OSID + ID_SUBQUERY + OSID + " FROM token_match(";
     /** Predicate that keeps every row. */
     static final String ALL = "1=1";
     /** Predicate that keeps no row. */
@@ -281,7 +287,7 @@ final class InfinoQueryTranslator {
             return null;
         }
         String read = LIST_SOURCE + "." + list;
-        String any = OSID + " IN (SELECT " + LIST_ROWS + "." + LIST_ID + " FROM (SELECT " + LIST_SOURCE + "." + OSID + " AS " + LIST_ID + ", unnest(" + read
+        String any = OSID + ID_SUBQUERY + LIST_ROWS + "." + LIST_ID + " FROM (SELECT " + LIST_SOURCE + "." + OSID + " AS " + LIST_ID + ", unnest(" + read
             + ") AS " + LIST_VALUE + " FROM " + quoteIdent(table) + " " + LIST_SOURCE + " WHERE " + read + " IS NOT NULL) " + LIST_ROWS + " WHERE " + each
             + ")";
         return own == null ? any : "((" + list + " IS NULL AND " + mine + ") OR " + any + ")";
@@ -315,6 +321,17 @@ final class InfinoQueryTranslator {
             }
         }
         return present.isEmpty() ? NONE : "(" + String.join(" OR ", present) + ")";
+    }
+
+    /**
+     * Whether a predicate holds a subquery by id (a text clause on a column
+     * other than the ranked one, or a field's list values): one the engine
+     * joins above a ranked search, so the rows it removes go after the
+     * ranking. A string literal that happens to hold the same text only
+     * costs that search a wider candidate window.
+     */
+    static boolean joinsAfterRanking(String predicate) {
+        return predicate.contains(ID_SUBQUERY);
     }
 
     static String quoteIdent(String name) {
