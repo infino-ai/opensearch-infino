@@ -66,7 +66,12 @@ import java.util.function.UnaryOperator;
  * <p>An engine search over an index reads it the same way: the search over
  * each table the index resolves to, its columns and rows as the view's (see
  * {@link #view}). A search naming a column hidden or masked for the caller
- * is refused, since it matches the stored values.
+ * is refused, since it matches the stored values. A graph walk
+ * ({@code graph_walk}, {@code graph_rank}) returns rows of the index it
+ * names the same way, through that index's search view; it reads its edge
+ * index and its seed index whole, so each must be one the caller reads
+ * whole: one table, under no document, field or masking rule or filtering
+ * alias.
  *
  * <p>An index in engine mode of several shards keeps a table per shard: its
  * view reads them as one row set, as an alias over several indices does, and
@@ -160,6 +165,9 @@ final class InfinoSql {
         Map<String, String> views = new LinkedHashMap<>();
         Map<String, String> searches = new LinkedHashMap<>();
         Map<String, Set<String>> unsearchable = new LinkedHashMap<>();
+        // The one table of each name the caller reads whole: what a graph walk
+        // may take as its edges or seeds, since it reads them whole.
+        Map<String, String> whole = new LinkedHashMap<>();
         // The fields masked in the result, each with the security plugin's mask
         // (one rule per field, as the result does not say which index a value
         // came from), and those masked in SQL: one field is not masked both ways.
@@ -168,6 +176,7 @@ final class InfinoSql {
         Set<String> inSql = new LinkedHashSet<>();
         for (String name : named) {
             List<Part> parts = new ArrayList<>();
+            boolean readWhole = true;
             String[] concrete = resolver.concreteIndexNames(state, OPTIONS, name);
             for (String index : concrete) {
                 if (!authorized.contains(index)) {
@@ -184,6 +193,7 @@ final class InfinoSql {
                     String aliasFilter = aliasFilter(state, resolver, md, name, columns, table, now);
                     Part part = part(table, columns, access, aliasFilter, now);
                     parts.add(part);
+                    readWhole &= access.unrestricted() && aliasFilter == null;
                     for (Map.Entry<String, UnaryOperator<String>> e : part.onOutput().entrySet()) {
                         String rule = access.maskRuleOf().apply(e.getKey());
                         if (!rule.equals(outputRules.getOrDefault(e.getKey(), rule))) {
@@ -200,6 +210,9 @@ final class InfinoSql {
             }
             views.put(name, view(parts, false));
             searches.put(name, view(parts, true));
+            if (readWhole && parts.size() == 1) {
+                whole.put(name, parts.get(0).table());
+            }
             Set<String> closed = new LinkedHashSet<>();
             parts.forEach(p -> closed.addAll(p.unsearchable()));
             if (!closed.isEmpty()) {
@@ -211,7 +224,7 @@ final class InfinoSql {
                 throw InfinoAccess.refused("[" + field + "] is masked for you by rules SQL reads two ways in the indices the statement reads");
             }
         }
-        String answer = InfinoNative.sqlRead(request.query(), readsJson(views, searches, unsearchable, onOutput.keySet()));
+        String answer = InfinoNative.sqlRead(request.query(), readsJson(views, searches, unsearchable, onOutput.keySet(), whole));
         return onOutput.isEmpty() ? answer : maskResult(answer, onOutput);
     }
 
@@ -531,7 +544,8 @@ final class InfinoSql {
         Map<String, String> views,
         Map<String, String> searches,
         Map<String, Set<String>> unsearchable,
-        Set<String> outputOnly
+        Set<String> outputOnly,
+        Map<String, String> whole
     ) {
         try (XContentBuilder b = XContentFactory.jsonBuilder()) {
             b.startObject();
@@ -539,6 +553,7 @@ final class InfinoSql {
             b.field("searches", searches);
             b.field("unsearchable", unsearchable);
             b.field("output_only", outputOnly);
+            b.field("whole", whole);
             b.endObject();
             return BytesReference.bytes(b).utf8ToString();
         } catch (IOException e) {

@@ -44,9 +44,9 @@ use std::time::Duration;
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::prelude::{col, lit};
 use infino::arrow_array::{
-    new_null_array, Array, BooleanArray, Float32Array, Float64Array, Int64Array, LargeStringArray,
-    RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+    new_null_array, Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int64Array,
+    LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
 };
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
@@ -1721,7 +1721,8 @@ pub unsafe extern "C" fn infino_sql_indices(sql: *const c_char) -> *mut c_char {
 /// Run a caller's read-only statement with each index it names read
 /// through the view `views` gives for it, as `{"relations": {index: query},
 /// "searches": {index: query}, "unsearchable": {index: [column]},
-/// "output_only": [column]}` (see [`read_sql::Reads`]). Answers
+/// "output_only": [column], "whole": {index: table}}` (see
+/// [`read_sql::Reads`]). Answers
 /// `{"schema": [{"name", "type"}], "rows": [..], "masked": {column: field}}`
 /// (`masked`, left out when empty: the result's columns that give a field
 /// read only as output, for the plugin to mask), or an error with its status: a statement the
@@ -1760,6 +1761,7 @@ pub unsafe extern "C" fn infino_sql_read(
                 })
                 .unwrap_or_default(),
             output_only: string_set(&views["output_only"]),
+            whole: string_map(&views["whole"]),
         };
         let statement = match read_sql::rewrite(sql, &reads, &tables) {
             Ok(statement) => statement,
@@ -2150,6 +2152,11 @@ fn cell_json(col: &dyn Array, r: usize) -> String {
     if let Some(a) = any.downcast_ref::<TimestampSecondArray>() {
         return (a.value(r) * 1_000).to_string();
     }
+    // A decimal, the engine's `_id` among them, as its digits in a string: an
+    // id is past what a JSON number holds exactly.
+    if let Some(a) = any.downcast_ref::<Decimal128Array>() {
+        return json_str(&a.value_as_string(r));
+    }
     "\"<unsupported>\"".into()
 }
 
@@ -2166,6 +2173,11 @@ mod tests {
         "http":{"properties":{"method":{"type":"keyword"}}},
         "geo":{"type":"geo_point"}
     }}"#;
+
+    /// The engine's id type, which every `_id` column has, and so an edge
+    /// table's id columns.
+    const ID_PRECISION: u8 = 38;
+    const ID_SCALE: i8 = 0;
 
     fn c(s: &str) -> CString {
         CString::new(s).unwrap()
@@ -2324,6 +2336,111 @@ mod tests {
              SELECT coalesce(n, NULL) AS n, coalesce(tag, NULL) AS tag, coalesce(extra, NULL) AS extra FROM w2) t",
         );
         assert_eq!(rows, json!([{ "c": 3, "s": 6, "e": 1 }]));
+        close(h);
+    }
+
+    /// A graph walk as the SQL route runs it: rows of an index within some
+    /// hops of a seed row, over an edge table read whole, returned through
+    /// the index's search view; the `_id`s a caller writes edges and seeds
+    /// with read back as their digits.
+    #[test]
+    fn a_walk_runs_through_the_routes_views() {
+        let h = open_logs();
+        index(
+            h,
+            &[
+                ("a", r#"{"level":"error"}"#),
+                ("b", r#"{"level":"info"}"#),
+                ("c", r#"{"level":"warn"}"#),
+                ("d", r#"{"level":"info"}"#),
+            ],
+        );
+        let rows = sql(h, "SELECT osid, _id FROM logs ORDER BY osid");
+        let id = |osid: &str| -> i128 {
+            let row = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["osid"] == osid)
+                .unwrap();
+            row["_id"].as_str().unwrap().parse().unwrap()
+        };
+        // a -> b -> c; d is no row's neighbour.
+        let precision_scale = |values: Vec<i128>| {
+            Arc::new(
+                Decimal128Array::from(values)
+                    .with_precision_and_scale(ID_PRECISION, ID_SCALE)
+                    .unwrap(),
+            )
+        };
+        let id_type = DataType::Decimal128(ID_PRECISION, ID_SCALE);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("src_table", DataType::Utf8, false),
+            Field::new("src_id", id_type.clone(), false),
+            Field::new("dst_table", DataType::Utf8, false),
+            Field::new("dst_id", id_type, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["logs", "logs"])),
+                precision_scale(vec![id("a"), id("b")]),
+                Arc::new(StringArray::from(vec!["logs", "logs"])),
+                precision_scale(vec![id("b"), id("c")]),
+            ],
+        )
+        .unwrap();
+        let bridge = unsafe { &*h };
+        let edges = bridge
+            .conn
+            .create_table("edges", schema, IndexSpec::new())
+            .unwrap();
+        edges.append(&batch).unwrap();
+        edges
+            .optimize(&OptimizeOptions::default().with_adjacency(
+                "src_table",
+                "src_id",
+                "dst_table",
+                "dst_id",
+            ))
+            .unwrap();
+
+        let reads = read_sql::Reads {
+            searches: HashMap::from([(
+                "logs".to_string(),
+                "SELECT * FROM infino_search('logs')".to_string(),
+            )]),
+            whole: HashMap::from([
+                ("links".to_string(), "edges".to_string()),
+                ("logs".to_string(), "logs".to_string()),
+            ]),
+            ..read_sql::Reads::default()
+        };
+        let statement = read_sql::rewrite(
+            &format!(
+                "SELECT osid FROM graph_walk('links', 'logs', 'logs', {}, 2, 10) \
+                 WHERE osid <> 'a' ORDER BY score, osid",
+                id("a")
+            ),
+            &reads,
+            &[],
+        )
+        .unwrap();
+        let out = bridge.conn.query_sql(&statement.sql).unwrap();
+        let reached: Vec<String> = out
+            .iter()
+            .flat_map(|b| {
+                let a = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .unwrap();
+                (0..a.len())
+                    .map(|i| a.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(reached, vec!["b", "c"]);
         close(h);
     }
 

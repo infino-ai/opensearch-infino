@@ -10,17 +10,20 @@
 //! index is put in place the same way, as the search over its table read
 //! through the same rules; over several tables (an index's shards, a
 //! pattern's indices), a ranked search gives their best rows together, to
-//! its own row count. What the walk cannot hold to the views is
-//! refused rather than run: anything but one query, a qualified name, a
-//! table function other than the engine's searches and row generators, a
-//! `WITH` name that is also a table's, a search naming a column the caller
-//! may not read as it is.
+//! its own row count. A graph walk returns rows of its table through that
+//! table's search view, and reads its edges and seeds whole, so those are
+//! taken only from an index the caller may read whole. What the walk
+//! cannot hold to the views is refused rather than run: anything but one
+//! query, a qualified name, a table function other than the engine's
+//! searches, walks and row generators, a `WITH` name that is also a
+//! table's, a search naming a column the caller may not read as it is.
 //!
 //! A column the caller may read only as output (masked by a rule SQL cannot
 //! compute, so the plugin masks it in the result) is held to that
 //! ([`output_columns`]): given as a column of the result and nothing else.
 
 use std::collections::{HashMap, HashSet};
+use std::mem::take;
 use std::ops::ControlFlow;
 
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
@@ -40,14 +43,26 @@ const SEARCH_FUNCTIONS: [&str; 6] = [
     "exact_match",
     "hybrid_search",
 ];
-/// The engine's ranked searches, each with where its row count `k` is among
-/// its arguments (the table first) and the order its score ranks rows in:
-/// BM25 and hybrid relevance higher first, vector distance nearer first.
-const RANKED: [(&str, usize, &str); 4] = [
+/// The engine's graph walks: `(edges, table, seed_table, seed_ids, hops,
+/// k)`, the rows of `table` within `hops` edges of the seed rows of
+/// `seed_table`, over the edge table `edges`. Each names three indices.
+const GRAPH_FUNCTIONS: [&str; 2] = ["graph_walk", "graph_rank"];
+/// Where a graph walk names its edge table, the table whose rows it
+/// returns, and the table its seeds are rows of.
+const GRAPH_EDGES_AT: usize = 0;
+const GRAPH_TABLE_AT: usize = 1;
+const GRAPH_SEEDS_AT: usize = 2;
+/// The engine's ranked searches and walks, each with where its row count
+/// `k` is among its arguments and the order its score ranks rows in: BM25,
+/// hybrid relevance and a graph rank higher first; a vector distance and a
+/// walk's hop count nearer first.
+const RANKED: [(&str, usize, &str); 6] = [
     ("bm25_search", 3, "DESC"),
     ("bm25_search_prefix", 3, "DESC"),
     ("vector_search", 3, "ASC"),
     ("hybrid_search", 5, "DESC"),
+    ("graph_walk", 5, "ASC"),
+    ("graph_rank", 5, "DESC"),
 ];
 /// The column an engine search ranks its rows by.
 const SCORE: &str = "score";
@@ -110,6 +125,10 @@ pub(crate) struct Reads {
     pub(crate) unsearchable: HashMap<String, HashSet<String>>,
     /// The columns the caller may read only as output (see [`output_columns`]).
     pub(crate) output_only: HashSet<String>,
+    /// The one table of each index the caller may read whole (one table, no
+    /// document, field or masking rule, no filtering alias): what a graph
+    /// walk may take as its edges or its seeds, since it reads them whole.
+    pub(crate) whole: HashMap<String, String>,
 }
 
 /// A statement as the engine runs it, and the columns of its result the
@@ -156,6 +175,7 @@ pub(crate) fn rewrite(
             views,
             searches,
             unsearchable: &reads.unsearchable,
+            whole: &reads.whole,
         },
     );
     if let ControlFlow::Break(refusal) = VisitMut::visit(&mut query, &mut walk) {
@@ -439,14 +459,18 @@ enum Mode<'a> {
         views: HashMap<String, Query>,
         searches: HashMap<String, Query>,
         unsearchable: &'a HashMap<String, HashSet<String>>,
+        whole: &'a HashMap<String, String>,
     },
 }
 
 /// Gives a search view the statement's own search: [`SEARCH_PLACEHOLDER`]
-/// takes the search's name and, after the table, the rest of its arguments.
+/// takes the search's name, and around the table it names the arguments
+/// the search gives before and after its table (a walk names its edges
+/// before it, its seeds and the rest after).
 struct Fill {
     name: ObjectName,
-    rest: Vec<FunctionArg>,
+    before: Vec<FunctionArg>,
+    after: Vec<FunctionArg>,
     filled: bool,
 }
 
@@ -462,12 +486,39 @@ impl VisitorMut for Fill {
         {
             if name.to_string() == SEARCH_PLACEHOLDER {
                 *name = self.name.clone();
-                args.args.extend(self.rest.iter().cloned());
+                let table = take(&mut args.args);
+                args.args = self.before.clone();
+                args.args.extend(table);
+                args.args.extend(self.after.iter().cloned());
                 self.filled = true;
             }
         }
         ControlFlow::Continue(())
     }
+}
+
+/// The index a table function names at argument `at`, a string as written.
+fn index_arg(args: &[FunctionArg], at: usize, function: &str) -> Result<String, Box<Refusal>> {
+    match args.get(at) {
+        Some(arg @ FunctionArg::Unnamed(_)) => string_arg(arg).map(str::to_string),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        refuse(
+            format!(
+                "{function} takes an index as its argument {}, a string",
+                at + 1
+            ),
+            BAD_REQUEST,
+        )
+    })
+}
+
+/// An engine table named as a table function's argument.
+fn table_arg(table: &str) -> FunctionArg {
+    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::value(
+        Value::SingleQuotedString(table.to_string()),
+    )))
 }
 
 /// A string an argument gives, as written.
@@ -593,55 +644,92 @@ impl<'a> Walk<'a> {
         if GENERATORS.contains(&function.as_str()) {
             return ControlFlow::Continue(());
         }
-        if !SEARCH_FUNCTIONS.contains(&function.as_str()) {
+        let graph = GRAPH_FUNCTIONS.contains(&function.as_str());
+        if !graph && !SEARCH_FUNCTIONS.contains(&function.as_str()) {
             return ControlFlow::Break(refuse(
                 format!("the table function {function} is not served"),
                 BAD_REQUEST,
             ));
         }
-        let index = match args.args.first() {
-            Some(first @ FunctionArg::Unnamed(_)) => string_arg(first).map(str::to_string),
-            _ => None,
+        // A search names the index it searches first; a walk names its edges,
+        // the index whose rows it returns, and the index of its seeds.
+        let (at, named): (usize, &[usize]) = if graph {
+            (
+                GRAPH_TABLE_AT,
+                &[GRAPH_EDGES_AT, GRAPH_TABLE_AT, GRAPH_SEEDS_AT],
+            )
+        } else {
+            (0, &[0])
         };
-        let Some(index) = index else {
-            return ControlFlow::Break(refuse(
-                format!("{function} takes the index it searches as its first argument, a string"),
-                BAD_REQUEST,
-            ));
-        };
+        let mut indices = Vec::with_capacity(named.len());
+        for &i in named {
+            match index_arg(&args.args, i, &function) {
+                Ok(index) => indices.push(index),
+                Err(refusal) => return ControlFlow::Break(refusal),
+            }
+        }
         let Mode::Rewrite {
             searches,
             unsearchable,
+            whole,
             ..
         } = &self.mode
         else {
-            self.note(index);
+            for index in indices {
+                self.note(index);
+            }
             return ControlFlow::Continue(());
         };
+        let index = indices[named.iter().position(|&i| i == at).unwrap_or(0)].clone();
         let Some(search) = searches.get(&index) else {
             return ControlFlow::Break(refuse(
                 format!("no index [{index}] is readable here"),
                 FORBIDDEN,
             ));
         };
-        // A search matches the stored values of the columns it names, so it
-        // names none the caller may not read as stored.
-        if let Some(closed) = unsearchable.get(&index) {
-            for arg in &args.args[1..] {
-                if let Some(column) = string_arg(arg).filter(|c| closed.contains(*c)) {
+        let (before, after) = if graph {
+            // A walk reads its edges and its seeds whole: each is an index
+            // the caller may read whole, as its one table.
+            let mut tables = Vec::with_capacity(2);
+            for (i, what) in [(GRAPH_EDGES_AT, "edges"), (GRAPH_SEEDS_AT, "seeds")] {
+                let named_index = &indices[named.iter().position(|&n| n == i).unwrap_or(0)];
+                let Some(table) = whole.get(named_index) else {
                     return ControlFlow::Break(refuse(
                         format!(
-                            "[{column}] is hidden or masked for you in [{index}]; {function} over it would match its values"
+                            "{function} reads its {what} in [{named_index}] whole: name an index you may read whole, \
+                             as one table, with no document, field or masking rule over it"
                         ),
                         FORBIDDEN,
                     ));
+                };
+                tables.push(table_arg(table));
+            }
+            let seeds = tables.pop();
+            let mut after: Vec<FunctionArg> = seeds.into_iter().collect();
+            after.extend(args.args[GRAPH_SEEDS_AT + 1..].iter().cloned());
+            (tables, after)
+        } else {
+            // A search matches the stored values of the columns it names, so
+            // it names none the caller may not read as stored.
+            if let Some(closed) = unsearchable.get(&index) {
+                for arg in &args.args[1..] {
+                    if let Some(column) = string_arg(arg).filter(|c| closed.contains(*c)) {
+                        return ControlFlow::Break(refuse(
+                            format!(
+                                "[{column}] is hidden or masked for you in [{index}]; {function} over it would match its values"
+                            ),
+                            FORBIDDEN,
+                        ));
+                    }
                 }
             }
-        }
+            (Vec::new(), args.args[1..].to_vec())
+        };
         let mut view = search.clone();
         let mut fill = Fill {
             name,
-            rest: args.args[1..].to_vec(),
+            before,
+            after,
             filled: false,
         };
         let _ = VisitMut::visit(&mut view, &mut fill);
@@ -800,7 +888,6 @@ mod tests {
             "SELECT * FROM public.os_index",
             "SELECT * FROM datafusion.public.os_logs",
             "SELECT * FROM information_schema.tables",
-            "SELECT * FROM graph_walk('edges', 'logs', '1', 2, 10)",
             "SELECT * FROM read_parquet('/etc/passwd')",
         ] {
             assert_eq!(refusal(indices(sql)).status, BAD_REQUEST, "{sql}");
@@ -905,6 +992,34 @@ mod tests {
         )
         .unwrap()
         .contains(MERGED));
+    }
+
+    #[test]
+    fn a_walk_returns_rows_through_its_tables_search_view_over_whole_edges_and_seeds() {
+        let sql = "SELECT osid, score FROM graph_walk('links', 'logs', 'logs', [7, 9], 2, 50)";
+        assert_eq!(indices(sql).unwrap(), vec!["links", "logs"]);
+        let reads = Reads {
+            searches: views(&[(
+                "logs",
+                "SELECT \"osid\", \"score\" FROM infino_search('os_logs') WHERE \"tenant\" = 'a'",
+            )]),
+            whole: views(&[("links", "os_links"), ("logs", "os_logs")]),
+            ..Reads::default()
+        };
+        assert_eq!(
+            rewritten(sql, &reads, &[]).unwrap(),
+            "SELECT osid, score FROM (SELECT \"osid\", \"score\" FROM \
+             graph_walk('os_links', 'os_logs', 'os_logs', [7, 9], 2, 50) \
+             WHERE \"tenant\" = 'a') AS graph_walk"
+        );
+        // Edges or seeds the caller may not read whole are not walked.
+        let partial = Reads {
+            whole: views(&[("logs", "os_logs")]),
+            ..reads
+        };
+        let r = refusal(rewritten(sql, &partial, &[]));
+        assert_eq!(r.status, FORBIDDEN);
+        assert!(r.message.contains("links"), "{}", r.message);
     }
 
     #[test]
