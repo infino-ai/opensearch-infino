@@ -46,7 +46,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * index, is found by name, so the rows are there before the first request.
  * Cluster state is a cache of this, rebuilt at boot, never the source.
  *
- * <p>An engine-mode index comes back marked {@link InfinoPlugin#INFINO_REBUILT}:
+ * <p>A default-mode index comes back marked {@link InfinoPlugin#INFINO_REBUILT}:
  * its Lucene skeleton lived on the old node, and the new one starts empty
  * over a table that already holds rows.
  *
@@ -286,7 +286,7 @@ final class InfinoRegistry {
         if (settings instanceof Map<?, ?> s) {
             request.settings((Map<String, ?>) s);
         }
-        if (InfinoPlugin.atEngine(request.settings())) {
+        if (InfinoPlugin.inDefaultMode(request.settings())) {
             // Its new Lucene skeleton starts empty over a table that holds rows.
             request.settings(Settings.builder().put(request.settings()).put(InfinoPlugin.INFINO_REBUILT.getKey(), true));
         }

@@ -36,7 +36,7 @@ final class InfinoTermsLookup {
             throw new IllegalArgumentException("[infino] terms lookup names index [" + lookup.index() + "], which the plugin does not back");
         }
         String table = InfinoPlugin.tables().ensureForDocument(md, lookup.id(), lookup.routing());
-        String source = InfinoPlugin.atEngine(md.getSettings()) ? InfinoEngine.currentSource(table, lookup.id()) : InfinoNative.getSourceFresh(table, lookup.id());
+        String source = InfinoPlugin.inDefaultMode(md.getSettings()) ? InfinoEngine.currentSource(table, lookup.id()) : InfinoNative.getSourceFresh(table, lookup.id());
         if (source == null || source.isEmpty()) {
             return List.of();
         }

@@ -19,9 +19,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The fetch phase of an engine-mode shard: each hit gets what its query
+ * The fetch phase of a default-mode shard: each hit gets what its query
  * phase built for it from the table ({@link InfinoQueryPhaseSearcher}) —
- * its source, filtered and masked as the action layer serves it, and the
+ * its source, filtered and masked as cloud mode serves it, and the
  * requested fields, script fields and collapse value — since the shard's
  * Lucene skeleton keeps no source and no values. A hit whose kept copy is
  * gone (it waited past its time) is read from the table again by the same
@@ -31,7 +31,7 @@ public class InfinoFetchSubPhase implements FetchSubPhase {
 
     @Override
     public FetchSubPhaseProcessor getProcessor(FetchContext context) {
-        if (!InfinoPlugin.atEngine(context.getIndexSettings().getSettings())) {
+        if (!InfinoPlugin.inDefaultMode(context.getIndexSettings().getSettings())) {
             return null;
         }
         if (!(context.getSearchExt(InfinoQueryExt.NAME) instanceof InfinoQueryExt carried)) {

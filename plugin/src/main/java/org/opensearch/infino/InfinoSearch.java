@@ -75,7 +75,7 @@ import java.util.function.Function;
 
 /**
  * Answers one {@code _search} for one Infino-backed index from its table,
- * at the action layer: no shard, no Lucene, no fetch phase.
+ * in cloud mode at the action layer: no shard, no Lucene, no fetch phase.
  *
  * <p>Hits come one of three ways: an {@code infino_knn} / {@code infino_hybrid}
  * query, or the k-NN plugin's own {@code knn} query (see {@link InfinoStockKnn}),
@@ -1003,6 +1003,20 @@ public final class InfinoSearch {
     }
 
     /**
+     * Whether a scroll of {@code source} pages by the id alone: its request
+     * names no sort but {@code _doc} or the score, which a scroll reads in
+     * the id's order (see {@link #scrollSource}).
+     */
+    static boolean scrollsById(SearchSourceBuilder source) {
+        return source.sorts() == null || source.sorts().stream().allMatch(InfinoSearch::ordersNothing);
+    }
+
+    /** A sort a scroll pages past in the id's order: {@code _doc}, or the score. */
+    private static boolean ordersNothing(SortBuilder<?> sort) {
+        return sort instanceof ScoreSortBuilder || sort instanceof FieldSortBuilder fs && FieldSortBuilder.DOC_FIELD_NAME.equals(fs.getFieldName());
+    }
+
+    /**
      * The request a scroll's later pages run: the first page's query, sorts,
      * window and fields, without its aggregations (a scroll computes them
      * once) and without a count (the first page's total is repeated). A
@@ -1017,20 +1031,14 @@ public final class InfinoSearch {
             out.postFilter(source.postFilter());
         }
         out.size(source.size() < 0 ? DEFAULT_SIZE : source.size());
-        boolean sorted = false;
         if (source.sorts() != null) {
             for (SortBuilder<?> sort : source.sorts()) {
-                if (sort instanceof FieldSortBuilder fs && FieldSortBuilder.DOC_FIELD_NAME.equals(fs.getFieldName())) {
-                    continue;
+                if (!ordersNothing(sort)) {
+                    out.sort(sort);
                 }
-                if (sort instanceof ScoreSortBuilder) {
-                    continue;
-                }
-                out.sort(sort);
-                sorted = true;
             }
         }
-        if (!sorted) {
+        if (scrollsById(source)) {
             out.sort(ID_SORT_FIELD);
         }
         if (source.fetchSource() != null) {

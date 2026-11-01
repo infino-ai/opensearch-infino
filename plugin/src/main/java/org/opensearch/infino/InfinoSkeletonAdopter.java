@@ -35,7 +35,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Rebuilds the Lucene skeleton of an engine-mode index the registry
+ * Rebuilds the Lucene skeleton of a default-mode index the registry
  * recreated over a table that holds rows ({@link InfinoPlugin#INFINO_REBUILT}).
  * A search hit names a document of the skeleton, so until every row has
  * one, the index's searches miss the rows written before the rebuild.

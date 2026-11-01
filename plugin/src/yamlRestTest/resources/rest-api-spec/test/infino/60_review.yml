@@ -4,7 +4,9 @@
       indices.create:
         index: rev1
         body:
-          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          # Cloud mode, both indices (a search spans them, and one search is served in one mode):
+          # the writes below hold its versioning, every document at version 1.
+          settings: { index.infino.enabled: true, index.infino.mode: cloud, number_of_shards: 1, number_of_replicas: 0 }
           mappings:
             properties:
               "@timestamp": { type: date }
@@ -15,7 +17,7 @@
       indices.create:
         index: rev2
         body:
-          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          settings: { index.infino.enabled: true, index.infino.mode: cloud, number_of_shards: 1, number_of_replicas: 0 }
           mappings:
             properties:
               "@timestamp": { type: date }
@@ -320,13 +322,20 @@
         index: rev4
   - match: { rev4.settings.index.infino.enabled: "false" }
 
-  # A text field mapped after creation cannot have a text index; the index says so instead of serving it as exact.
+  # A text field mapped after creation is added with its text index, so a match on it finds its rows.
   - do:
       indices.put_mapping:
         index: rev2
         body: { properties: { note: { type: text } } }
   - do:
-      catch: /cannot be applied to its table/
+      index:
+        index: rev2
+        id: n1
+        refresh: true
+        body: { note: "a field mapped late" }
+  - do:
       search:
         index: rev2
-        body: { size: 0 }
+        body: { query: { match: { note: late } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "n1" }

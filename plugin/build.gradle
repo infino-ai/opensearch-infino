@@ -134,7 +134,7 @@ def knnSuite = 'infino/100_knn'
 def knnTests = 'org.opensearch.infino.InfinoStockKnnIT'
 def knnData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-knn"
 
-// Engine mode with a replica needs a second node: a copy recovers from the
+// Default mode with a replica needs a second node: a copy recovers from the
 // primary's history, and a replica takes over as primary. That test runs in
 // a task of its own, on a two-node cluster over one catalog both nodes
 // share, as the hosted service's tables are shared by every node.
@@ -183,9 +183,6 @@ testClusters.all {
     systemProperty 'infino.data', System.getProperty('infino.data', defaultData)
     // The SQL each request runs, in the node log, so a wrong answer can be read back.
     setting 'logger.org.opensearch.infino', 'DEBUG'
-    // Engine mode on, so its suite runs and every other suite's indices take
-    // the stock path past the engine-mode query phase.
-    setting 'infino.engine.enabled', 'true'
 
     plugin(layout.file(provider { configurations.securityPlugin.singleFile }))
     // Plain HTTP with basic authentication; the build's own wait for cluster
@@ -268,7 +265,7 @@ def knnYamlRestTest = tasks.register(knnTask, RestIntegTestTask) {
 }
 
 def engineReplicaTest = tasks.register(replicaTask, RestIntegTestTask) {
-    description = 'Runs the engine-mode replica tests on a two-node cluster.'
+    description = 'Runs the default-mode replica tests on a two-node cluster.'
     group = 'verification'
     testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
     classpath = sourceSets.yamlRestTest.runtimeClasspath

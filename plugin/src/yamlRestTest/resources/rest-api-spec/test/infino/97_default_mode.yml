@@ -1,12 +1,12 @@
 ---
-"Engine mode: writes through the shard's engine, reads from the table":
+"Default mode: writes through the shard's engine, reads from the table":
   - do:
       indices.create:
         index: em
         body:
           settings:
             index.infino.enabled: true
-            index.infino.mode: engine
+            index.infino.mode: default
             number_of_shards: 1
             number_of_replicas: 0
             refresh_interval: -1
@@ -104,8 +104,8 @@
         id: b
   - match: { _source.message: "request served" }
 
-  # A partial update merges into the document, a scripted one is refused as at
-  # the action layer, and a write that replaces a document replaces its row.
+  # A partial update merges into the document, a scripted one is refused as in
+  # cloud mode, and a write that replaces a document replaces its row.
   - do:
       update:
         index: em
@@ -160,14 +160,14 @@
   - match: { count: 2 }
 
 ---
-"Engine mode: a scroll, and the requests built on it":
+"Default mode: a scroll, and the requests built on it":
   - do:
       indices.create:
         index: ems
         body:
           settings:
             index.infino.enabled: true
-            index.infino.mode: engine
+            index.infino.mode: default
             number_of_shards: 2
             number_of_replicas: 0
           mappings:
@@ -251,7 +251,7 @@
         scroll_id: $scroll
 
 ---
-"Engine mode: terms over two shards ranks from more than each shard's top":
+"Default mode: terms over two shards ranks from more than each shard's top":
   # Routed so the overall top term is neither shard's top: shard 0 holds
   # a x3 and b x2, shard 1 holds c x3 and b x2, so b leads with 4. A shard
   # that returned only its own top for size 1 would leave b out.
@@ -261,7 +261,7 @@
         body:
           settings:
             index.infino.enabled: true
-            index.infino.mode: engine
+            index.infino.mode: default
             number_of_shards: 2
             number_of_replicas: 0
           mappings:
@@ -331,7 +331,7 @@
   - match: { aggregations.kinds.sum_other_doc_count: 6 }
 
 ---
-"Engine mode: a search sees what the skeleton's reader sees, a get every acknowledged write":
+"Default mode: a search sees what the skeleton's reader sees, a get every acknowledged write":
   # With refresh off, each write is in the table once acknowledged, which a
   # get reads; a search sees it after the refresh that follows, as on a stock
   # index, and its hits, total and aggregations agree before and after.
@@ -341,7 +341,7 @@
         body:
           settings:
             index.infino.enabled: true
-            index.infino.mode: engine
+            index.infino.mode: default
             index.refresh_interval: -1
             number_of_shards: 1
             number_of_replicas: 0
@@ -405,7 +405,7 @@
   - match: { count: 2 }
 
 ---
-"Engine mode: cardinality and percentiles over two shards are the whole index's":
+"Default mode: cardinality and percentiles over two shards are the whole index's":
   # Each shard's table holds five users, two of them in both: the index holds
   # eight. A shard that answered from its own table alone would report five,
   # and the coordinating node could not merge two exact counts into eight.
@@ -415,7 +415,7 @@
         body:
           settings:
             index.infino.enabled: true
-            index.infino.mode: engine
+            index.infino.mode: default
             number_of_shards: 2
             number_of_replicas: 0
           mappings:
@@ -479,7 +479,7 @@
         body:
           settings:
             index.infino.enabled: true
-            index.infino.mode: engine
+            index.infino.mode: default
             number_of_shards: 1
             number_of_replicas: 0
           mappings:
@@ -529,7 +529,7 @@
   - match: { aggregations.users.value: 5 }
 
 ---
-"Engine mode: delete by query scrolls the tables and deletes through the shards":
+"Default mode: delete by query scrolls the tables and deletes through the shards":
   # The reindex module is in the test distributions from 3.6.
   - skip:
       version: " - 3.5.99"
@@ -540,7 +540,7 @@
         body:
           settings:
             index.infino.enabled: true
-            index.infino.mode: engine
+            index.infino.mode: default
             number_of_shards: 2
             number_of_replicas: 0
           mappings:
@@ -572,7 +572,7 @@
   - match: { count: 2 }
 
 ---
-"Engine mode under the security plugin's document and masking rules":
+"Default mode under the security plugin's document and masking rules":
   - skip:
       features: headers
   - do:
@@ -581,7 +581,7 @@
         body:
           settings:
             index.infino.enabled: true
-            index.infino.mode: engine
+            index.infino.mode: default
             number_of_shards: 1
             number_of_replicas: 0
           mappings:

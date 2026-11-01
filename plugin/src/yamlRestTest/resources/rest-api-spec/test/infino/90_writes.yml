@@ -128,7 +128,8 @@
       indices.stats:
         index: new2
         metric: docs
-  - match: { indices.new2.primaries.docs.count: 0 }
+  # Created in default mode, the index's shard keeps each document's id, so its stats count them as a stock index's do.
+  - match: { indices.new2.primaries.docs.count: 5 }
 
   # An array of objects under a nested mapping (what Dashboards' saved objects carry as references) is written whole and read back whole.
   - do:

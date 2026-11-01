@@ -75,11 +75,11 @@ final class InfinoQueryTranslator {
     static final String OSID = "osid";
     /** The reserved column holding each document's JSON source. */
     static final String SOURCE = "source";
-    /** The reserved column holding the routing value an engine-mode document was written with, when it was. */
+    /** The reserved column holding the routing value a default-mode document was written with, when it was. */
     static final String ROUTING = "osrouting";
-    /** The reserved column holding the sequence number of the write that created an engine-mode row, when it was stamped. */
+    /** The reserved column holding the sequence number of the write that created a default-mode row, when it was stamped. */
     static final String SEQ = "osseq";
-    /** The reserved column holding the sequence number of the operation that wrote each engine-mode commit's newest row. */
+    /** The reserved column holding the sequence number of the operation that wrote each default-mode commit's newest row. */
     static final String OP = "osop";
     /**
      * The reserved column naming the index whose write stamped a row's {@link #SEQ} and {@link #OP}: sequence
