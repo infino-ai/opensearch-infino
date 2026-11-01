@@ -8,7 +8,9 @@
 //! caller may not see. [`rewrite`] puts each view where its index was named,
 //! so the engine reads only through those views. An engine search over an
 //! index is put in place the same way, as the search over its table read
-//! through the same rules. What the walk cannot hold to the views is
+//! through the same rules; over several tables (an index's shards, a
+//! pattern's indices), a ranked search gives their best rows together, to
+//! its own row count. What the walk cannot hold to the views is
 //! refused rather than run: anything but one query, a qualified name, a
 //! table function other than the engine's searches and row generators, a
 //! `WITH` name that is also a table's, a search naming a column the caller
@@ -38,6 +40,19 @@ const SEARCH_FUNCTIONS: [&str; 6] = [
     "exact_match",
     "hybrid_search",
 ];
+/// The engine's ranked searches, each with where its row count `k` is among
+/// its arguments (the table first) and the order its score ranks rows in:
+/// BM25 and hybrid relevance higher first, vector distance nearer first.
+const RANKED: [(&str, usize, &str); 4] = [
+    ("bm25_search", 3, "DESC"),
+    ("bm25_search_prefix", 3, "DESC"),
+    ("vector_search", 3, "ASC"),
+    ("hybrid_search", 5, "DESC"),
+];
+/// The column an engine search ranks its rows by.
+const SCORE: &str = "score";
+/// The name a ranked search over several tables is merged under.
+const MERGED: &str = "infino_merged";
 /// Table functions that generate rows and read no table.
 const GENERATORS: [&str; 2] = ["generate_series", "range"];
 /// The table function a search view reads, with the table as its one
@@ -640,6 +655,22 @@ impl<'a> Walk<'a> {
                 BAD_REQUEST,
             ));
         }
+        // A view over several tables (shards, or the indices of a pattern)
+        // runs the search over each; a ranked one gives its best `k` rows
+        // together, as a search over several shards does.
+        if matches!(view.body.as_ref(), SetExpr::SetOperation { .. }) {
+            let ranked = RANKED.iter().find(|(f, ..)| *f == function);
+            if let Some((_, at, order)) = ranked {
+                if let Some(k) = args.args.get(*at) {
+                    view = match parse_query(&format!(
+                        "SELECT * FROM ({view}) AS {MERGED} ORDER BY \"{SCORE}\" {order} LIMIT {k}"
+                    )) {
+                        Ok(merged) => merged,
+                        Err(refusal) => return ControlFlow::Break(refusal),
+                    };
+                }
+            }
+        }
         let alias = alias.unwrap_or(TableAlias {
             explicit: true,
             name: Ident::new(function),
@@ -890,6 +921,40 @@ mod tests {
             .status,
             BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn a_ranked_search_over_several_tables_gives_their_best_rows_together() {
+        let reads = Reads {
+            searches: views(&[(
+                "logs",
+                "SELECT \"msg\", \"score\" FROM infino_search('os_logs_shard0') \
+                 UNION ALL SELECT \"msg\", \"score\" FROM infino_search('os_logs_shard1')",
+            )]),
+            ..Reads::default()
+        };
+        assert_eq!(
+            rewritten("SELECT msg FROM bm25_search('logs', 'msg', 'disk', 5)", &reads, &[]).unwrap(),
+            "SELECT msg FROM (SELECT * FROM (SELECT \"msg\", \"score\" FROM bm25_search('os_logs_shard0', 'msg', 'disk', 5) \
+             UNION ALL SELECT \"msg\", \"score\" FROM bm25_search('os_logs_shard1', 'msg', 'disk', 5)) AS infino_merged \
+             ORDER BY \"score\" DESC LIMIT 5) AS bm25_search LIMIT 11"
+        );
+        // A vector distance ranks the nearest first.
+        assert!(rewritten(
+            "SELECT msg FROM vector_search('logs', 'emb', '0.1,0.2', 3)",
+            &reads,
+            &[]
+        )
+        .unwrap()
+        .contains("ORDER BY \"score\" ASC LIMIT 3"));
+        // An unranked match gives every row it matches.
+        assert!(!rewritten(
+            "SELECT msg FROM token_match('logs', 'msg', 'disk')",
+            &reads,
+            &[]
+        )
+        .unwrap()
+        .contains(MERGED));
     }
 
     #[test]

@@ -271,6 +271,97 @@
         body: { query: "SELECT count(*) AS c FROM \"sql_w*\"" }
 
 ---
+"SQL reads an engine-mode index of several shards as one":
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: sec_sqlem
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: engine
+            number_of_shards: 2
+            number_of_replicas: 0
+          mappings:
+            properties:
+              tag: { type: keyword }
+              n: { type: long }
+              title: { type: text }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec_sqlem, _id: "w1" }
+          - { tag: x, n: 1, title: "wool coat" }
+          - index: { _index: sec_sqlem, _id: "w2" }
+          - { tag: y, n: 2, title: "wool hat" }
+          - index: { _index: sec_sqlem, _id: "w3" }
+          - { tag: x, n: 3, title: "wool scarf" }
+          - index: { _index: sec_sqlem, _id: "w4" }
+          - { tag: y, n: 4, title: "wool sock" }
+          - index: { _index: sec_sqlem, _id: "w5" }
+          - { tag: x, n: 5, title: "wool glove" }
+          - index: { _index: sec_sqlem, _id: "w6" }
+          - { tag: y, n: 6, title: "wool rug" }
+          - index: { _index: sec_sqlem, _id: "w7" }
+          - { tag: x, n: 7, title: "wool cap" }
+          - index: { _index: sec_sqlem, _id: "w8" }
+          - { tag: y, n: 8, title: "wool vest" }
+  - match: { errors: false }
+  # Each shard holds several of the documents, so a search over each finds more than three.
+  - do:
+      search:
+        index: sec_sqlem
+        preference: _shards:0
+        body: { size: 0, query: { match: { title: wool } } }
+  - gte: { hits.total.value: 2 }
+  - do:
+      search:
+        index: sec_sqlem
+        preference: _shards:1
+        body: { size: 0, query: { match: { title: wool } } }
+  - gte: { hits.total.value: 2 }
+
+  # Every shard's rows, read as one; the engine's own bookkeeping columns are no column of it.
+  - do:
+      infino.sql:
+        body: { query: "SELECT count(*) AS c, sum(n) AS s FROM sec_sqlem" }
+  - match: { rows.0.c: 8 }
+  - match: { rows.0.s: 36 }
+  - do:
+      infino.sql:
+        body: { query: "SELECT * FROM sec_sqlem ORDER BY n" }
+  - length: { rows: 8 }
+  - match: { rows.0.osid: w1 }
+  - match: { rows.7.osid: w8 }
+  - is_false: rows.0.osseq
+  - is_false: rows.0.osop
+  - is_false: rows.0.osgen
+  - is_true: rows.0.source
+
+  # A ranked search gives the best rows of the shards' searches together, to its own row count.
+  - do:
+      infino.sql:
+        body: { query: "SELECT osid, score FROM bm25_search('sec_sqlem', 'title', 'wool', 3) ORDER BY score DESC" }
+  - length: { rows: 3 }
+
+  # The document rule holds on every shard (tag is x).
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT count(*) AS c, sum(n) AS s FROM sec_sqlem" }
+  - match: { rows.0.c: 4 }
+  - match: { rows.0.s: 16 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT osid, tag FROM bm25_search('sec_sqlem', 'title', 'wool', 10) ORDER BY n" }
+  - length: { rows: 4 }
+  - match: { rows.0.osid: w1 }
+  - match: { rows.3.tag: x }
+
+---
 "SQL reaches only indices the caller may read, and only reads them":
   - skip:
       features: headers

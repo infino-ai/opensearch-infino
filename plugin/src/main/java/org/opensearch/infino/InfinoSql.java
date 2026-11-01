@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -67,6 +68,15 @@ import java.util.function.UnaryOperator;
  * {@link #view}). A search naming a column hidden or masked for the caller
  * is refused, since it matches the stored values.
  *
+ * <p>An index in engine mode of several shards keeps a table per shard: its
+ * view reads them as one row set, as an alias over several indices does, and
+ * a ranked search over it gives the best rows of the shards' searches
+ * together (the bridge merges them by score, to the search's own row count),
+ * as a search over its shards does. The engine's own bookkeeping columns are
+ * left out. A table is read as committed: a write is there once every copy
+ * of its shard holds it, which may be before the shard's next refresh shows
+ * it to a search.
+ *
  * <p>Also refused: an index whose reads the audit log records document by
  * document, a system index, an index Infino does not back.
  */
@@ -104,6 +114,12 @@ final class InfinoSql {
     private static final String MASKED = "masked";
     /** The Arrow type of a masked column in the answer: its mask is text, whatever the field's type. */
     private static final String TEXT_TYPE = "Utf8";
+    /**
+     * The columns an engine-mode index's engine stamps its rows with for its
+     * own bookkeeping (the write that created a row, a commit's newest
+     * operation, the index generation): no field of a document, never read.
+     */
+    private static final Set<String> STAMPS = Set.of(InfinoQueryTranslator.SEQ, InfinoQueryTranslator.OP, InfinoQueryTranslator.GEN);
     /** What separates the parts of a masked-field expression, as the security plugin splits it. */
     private static final String MASK_SEPARATOR = "::";
     /** What a regular expression in a masked-field expression is written between. */
@@ -159,23 +175,25 @@ final class InfinoSql {
                 if (access.onRead() != null) {
                     throw InfinoAccess.refused("reads of [" + index + "] are audited document by document, which a SQL result cannot report");
                 }
-                String table = InfinoPlugin.tables().ensure(md);
-                Map<String, Column> columns = InfinoNative.columns(table);
-                if (columns.isEmpty()) {
-                    throw new IllegalStateException("[infino] table " + table + " has not been declared");
-                }
-                String aliasFilter = aliasFilter(state, resolver, md, name, columns, table, now);
-                Part part = part(table, columns, access, aliasFilter, now);
-                parts.add(part);
-                for (Map.Entry<String, UnaryOperator<String>> e : part.onOutput().entrySet()) {
-                    String rule = access.maskRuleOf().apply(e.getKey());
-                    if (!rule.equals(outputRules.getOrDefault(e.getKey(), rule))) {
-                        throw InfinoAccess.refused("[" + e.getKey() + "] is masked for you by different rules in the indices the statement reads");
+                // An index in engine mode keeps its rows in a table per shard: each is a part.
+                for (String table : InfinoPlugin.tables().ensureAll(md)) {
+                    Map<String, Column> columns = InfinoNative.columns(table);
+                    if (columns.isEmpty()) {
+                        throw new IllegalStateException("[infino] table " + table + " has not been declared");
                     }
-                    outputRules.put(e.getKey(), rule);
-                    onOutput.putIfAbsent(e.getKey(), e.getValue());
+                    String aliasFilter = aliasFilter(state, resolver, md, name, columns, table, now);
+                    Part part = part(table, columns, access, aliasFilter, now);
+                    parts.add(part);
+                    for (Map.Entry<String, UnaryOperator<String>> e : part.onOutput().entrySet()) {
+                        String rule = access.maskRuleOf().apply(e.getKey());
+                        if (!rule.equals(outputRules.getOrDefault(e.getKey(), rule))) {
+                            throw InfinoAccess.refused("[" + e.getKey() + "] is masked for you by different rules in the indices the statement reads");
+                        }
+                        outputRules.put(e.getKey(), rule);
+                        onOutput.putIfAbsent(e.getKey(), e.getValue());
+                    }
+                    part.masked().stream().filter(c -> !part.onOutput().containsKey(c)).forEach(inSql::add);
                 }
-                part.masked().stream().filter(c -> !part.onOutput().containsKey(c)).forEach(inSql::add);
             }
             if (parts.isEmpty()) {
                 throw InfinoAccess.refused("the statement reads [" + name + "], and no index it names was authorized for the request");
@@ -329,12 +347,14 @@ final class InfinoSql {
      * The part of {@code table} the caller reads: every column when no field
      * or masking rule applies; else the visible ones, each masked one as its
      * mask (or as stored, to be masked in the result, where SQL has no
-     * function for the mask), without the source; the rows the document rule
-     * and {@code aliasFilter} keep.
+     * function for the mask), without the source; never the engine's
+     * bookkeeping columns; the rows the document rule and {@code aliasFilter}
+     * keep.
      */
     static Part part(String table, Map<String, Column> columns, InfinoAccess access, String aliasFilter, long nowMillis) {
-        boolean whole = !access.restrictsFields() && !access.masks();
-        Map<String, Column> visible = whole ? columns : access.columns(columns);
+        boolean restricted = access.restrictsFields() || access.masks();
+        boolean whole = !restricted && Collections.disjoint(columns.keySet(), STAMPS);
+        Map<String, Column> visible = restricted ? access.columns(columns) : columns;
         Map<String, String> projected = new LinkedHashMap<>();
         Set<String> masked = new LinkedHashSet<>();
         Map<String, UnaryOperator<String>> onOutput = new LinkedHashMap<>();
@@ -346,7 +366,7 @@ final class InfinoSql {
         }
         for (Column c : visible.values()) {
             String quoted = InfinoQueryTranslator.quoteIdent(c.name());
-            if (projected.containsKey(c.name()) || (!whole && c.name().equals(InfinoQueryTranslator.SOURCE))) {
+            if (projected.containsKey(c.name()) || STAMPS.contains(c.name()) || (restricted && c.name().equals(InfinoQueryTranslator.SOURCE))) {
                 continue;
             }
             if (!c.masked()) {

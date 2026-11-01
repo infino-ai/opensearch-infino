@@ -16,7 +16,9 @@ import org.opensearch.core.xcontent.XContentBuilder;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -54,6 +56,18 @@ public final class InfinoTables {
     /** The table holding one shard's rows, declared from the index's current mapping if it has not been. */
     public String ensure(IndexMetadata md, int shard) {
         return declare(shardTable(InfinoNative.tableFor(md.getIndex(), md.getSettings()), shard, md.getSettings()), md);
+    }
+
+    /** Every table holding the index's rows, each declared as {@link #ensure(IndexMetadata, int)} declares it: one per shard in engine mode, else the one. */
+    public List<String> ensureAll(IndexMetadata md) {
+        if (!InfinoPlugin.atEngine(md.getSettings()) || md.getNumberOfShards() == 1) {
+            return List.of(ensure(md));
+        }
+        List<String> out = new ArrayList<>(md.getNumberOfShards());
+        for (int shard = 0; shard < md.getNumberOfShards(); shard++) {
+            out.add(ensure(md, shard));
+        }
+        return out;
     }
 
     /** The table holding the document {@code id} (routed by {@code routing} when given), as its shard is chosen for a write. */
