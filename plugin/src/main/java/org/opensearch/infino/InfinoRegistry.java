@@ -80,6 +80,11 @@ final class InfinoRegistry {
         IndexMetadata.SETTING_HISTORY_UUID
     );
 
+    /** The key of a row that records the metadata version of its index as the cluster held it. */
+    private static final String VERSION = "version";
+    /** The version of a row that records none (a loader's may not). */
+    private static final long UNVERSIONED = -1L;
+
     /** The metadata version of each index as last recorded, so a state that moved nothing writes nothing. */
     private static final Map<String, Long> recorded = new ConcurrentHashMap<>();
     /** Indices whose metadata moved and are not yet recorded, by name; the latest metadata wins. */
@@ -206,16 +211,52 @@ final class InfinoRegistry {
 
     /** The registry's rows: one object per recorded index, by name, after what moved is written. */
     static List<Map<String, Object>> rows() {
-        Map<String, Map<String, Object>> byName = new LinkedHashMap<>();
-        for (Map<String, Object> row : rawRows()) {
-            Object source = row.get(InfinoQueryTranslator.SOURCE);
-            Object name = row.get(InfinoQueryTranslator.OSID);
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (Map.Entry<String, String> row : sources().entrySet()) {
             // The cluster state a loader registered beside the indices is no index.
-            if (source != null && name != null && !InfinoClusterState.isClusterRow(name.toString())) {
-                byName.put(name.toString(), InfinoNative.object(source.toString()));
+            if (!InfinoClusterState.isClusterRow(row.getKey())) {
+                rows.add(InfinoNative.object(row.getValue()));
             }
         }
-        return new ArrayList<>(byName.values());
+        return rows;
+    }
+
+    /**
+     * The source of every row of the registry by its id, one per id, after
+     * what moved is written. Two writers registering one id at once (a
+     * loader's parts) can leave two rows under it until the next write of the
+     * row makes them one; of two, every read takes the same one
+     * ({@link #later}), whatever order the table returns them in.
+     */
+    static Map<String, String> sources() {
+        Map<String, String> byId = new LinkedHashMap<>();
+        for (Map<String, Object> row : rawRows()) {
+            Object source = row.get(InfinoQueryTranslator.SOURCE);
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            if (source != null && id != null) {
+                byId.merge(id.toString(), source.toString(), InfinoRegistry::later);
+            }
+        }
+        return byId;
+    }
+
+    /**
+     * Of two rows under one id, the one recording the later metadata version
+     * of its index, and of two recording the same (or none), the greater
+     * source: a choice every read makes alike.
+     */
+    static String later(String a, String b) {
+        long va = version(a);
+        long vb = version(b);
+        if (va != vb) {
+            return va > vb ? a : b;
+        }
+        return a.compareTo(b) >= 0 ? a : b;
+    }
+
+    /** The metadata version a row records, or {@link #UNVERSIONED}. */
+    private static long version(String source) {
+        return InfinoNative.object(source).get(VERSION) instanceof Number n ? n.longValue() : UNVERSIONED;
     }
 
     /** Every row of the registry table, each its id and source, after what moved is written. */
@@ -339,12 +380,13 @@ final class InfinoRegistry {
         }
     }
 
-    /** One row: the index as a create request would describe it, plus its table. */
+    /** One row: the index as a create request would describe it, plus its table and the metadata version it was recorded at. */
     static String rowOf(IndexMetadata md) {
         try (XContentBuilder b = XContentFactory.jsonBuilder()) {
             b.startObject();
             b.field("name", md.getIndex().getName());
             b.field("table", InfinoNative.tableFor(md.getIndex(), md.getSettings()));
+            b.field(VERSION, md.getVersion());
             Settings.Builder settings = Settings.builder().put(md.getSettings());
             for (String owned : CLUSTER_OWNED_SETTINGS) {
                 settings.remove(owned);

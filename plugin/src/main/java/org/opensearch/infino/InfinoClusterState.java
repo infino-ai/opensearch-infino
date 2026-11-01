@@ -12,6 +12,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
@@ -49,7 +50,8 @@ import java.util.TreeMap;
  * tenants, roles, users and role mappings. A user comes without its password
  * hash, which stays on the cluster it came from: it is created with a
  * password no one is told, and signs in once an administrator sets one
- * ({@link #sentBody}). One row of the indices' registry
+ * ({@link #sentBody}); a user of that name the cluster already has is left
+ * as it is, password and all. One row of the indices' registry
  * ({@link InfinoRegistry#TABLE}) holds all of it ({@link #STATE_ROW}, an id
  * beginning with {@link #ROW_PREFIX}, which no index name can): each item's
  * kind, its name, and the body the cluster's own REST API takes to create
@@ -78,7 +80,8 @@ import java.util.TreeMap;
  * <p>Nothing is rolled back. Items apply one at a time and the row is
  * rewritten once the pass ends, so a node that stops during a pass applies
  * the items it had reached again on the next call, over any change made to
- * them in between.
+ * them in between; a user it had created is the exception, found present and
+ * left with the password an administrator may have set since.
  *
  * <p>The items are configuration the cluster trusts, roles and users among
  * them, and an administrator's call applies whatever the registry holds:
@@ -174,8 +177,12 @@ final class InfinoClusterState {
     /** One registered item: its kind (null for one this node does not know), its name and its body. */
     record Item(String kindKey, Kind kind, String name, Map<String, Object> body) {}
 
-    /** What became of an item: applied, or failed with the cluster's status and answer. */
-    record Applied(String kind, String name, boolean applied, int status, String reason, List<String> leftOut) {}
+    /**
+     * What became of an item: applied; {@code present}, a user the cluster
+     * already had, left as it is; or failed with the cluster's status and
+     * answer.
+     */
+    record Applied(String kind, String name, boolean applied, boolean present, int status, String reason, List<String> leftOut) {}
 
     private static volatile RestController controller;
     private static volatile NamedXContentRegistry xContentRegistry;
@@ -205,17 +212,12 @@ final class InfinoClusterState {
     /**
      * The registered items, in the order they are applied: those of the
      * state row. Two loader parts registering together can leave the row
-     * twice, each the same state, so the first is read. Reads the engine:
-     * never on a transport or applier thread.
+     * twice, and every read takes the same one ({@link InfinoRegistry#sources}).
+     * Reads the engine: never on a transport or applier thread.
      */
     static List<Item> registered() {
-        for (Map<String, Object> row : InfinoRegistry.rawRows()) {
-            Object source = row.get(InfinoQueryTranslator.SOURCE);
-            if (STATE_ROW.equals(row.get(InfinoQueryTranslator.OSID)) && source != null) {
-                return items(source.toString());
-            }
-        }
-        return List.of();
+        String source = InfinoRegistry.sources().get(STATE_ROW);
+        return source == null ? List.of() : items(source);
     }
 
     /** The items a state row's source lists, in the order they are applied. */
@@ -338,20 +340,57 @@ final class InfinoClusterState {
             });
         }
 
+        /**
+         * Send {@code item}. A user that would be created with a password no
+         * one is told is looked up first and left as it is when the cluster
+         * has it: applied again (a pass a node did not finish, or a user of
+         * that name already there), it would get a new such password and
+         * lock out whoever signs in as it.
+         */
         private void send(Item item, int at) throws IOException {
+            if (!createdWithUnknowablePassword(item)) {
+                put(item, at);
+                return;
+            }
+            dispatch(RestRequest.Method.GET, item.kind().uri(item.name()), BytesArray.EMPTY, response -> {
+                int status = response.status().getStatus();
+                if (status == RestStatus.OK.getStatus()) {
+                    present(item);
+                    next(at + 1);
+                } else if (status == RestStatus.NOT_FOUND.getStatus()) {
+                    try {
+                        put(item, at);
+                    } catch (Exception e) {
+                        note(item, RestStatus.INTERNAL_SERVER_ERROR.getStatus(), e.toString(), List.of());
+                        next(at + 1);
+                    }
+                } else {
+                    note(item, status, content(response), List.of());
+                    next(at + 1);
+                }
+            });
+        }
+
+        /** Create or replace {@code item} with the body the cluster's API takes for it. */
+        private void put(Item item, int at) throws IOException {
             List<String> leftOut = new ArrayList<>();
             BytesReference body;
             try (XContentBuilder b = XContentFactory.jsonBuilder()) {
                 body = BytesReference.bytes(b.map(sentBody(item, InfinoServices.indexScopedSettings(), leftOut)));
             }
-            HttpRequest http = new Sent(RestRequest.Method.PUT, item.kind().uri(item.name()), body, headers);
-            RestRequest request = RestRequest.request(xContentRegistry, http, channel);
-            Answer answer = new Answer(request, response -> {
-                note(item, response.status().getStatus(), response.content() == null ? "" : response.content().utf8ToString(), leftOut);
+            dispatch(RestRequest.Method.PUT, item.kind().uri(item.name()), body, response -> {
+                note(item, response.status().getStatus(), content(response), leftOut);
                 next(at + 1);
             });
+        }
+
+        /** Send one request as the caller, and hand its answer to {@code then}. */
+        private void dispatch(RestRequest.Method method, String uri, BytesReference body, Answered then) {
+            HttpRequest http = new Sent(method, uri, body, headers);
+            RestRequest request = RestRequest.request(xContentRegistry, http, channel);
+            Answer answer = new Answer(request, then);
             ThreadContext context = threadPool.getThreadContext();
-            // An empty context, so the node authenticates the item from the
+            // An empty context, so the node authenticates the request from the
             // caller's headers alone, as it would the caller's own request;
             // the context this thread had comes back once it is sent.
             try (ThreadContext.StoredContext ignored = context.newStoredContext(false)) {
@@ -360,10 +399,20 @@ final class InfinoClusterState {
             }
         }
 
+        private static String content(RestResponse response) {
+            return response.content() == null ? "" : response.content().utf8ToString();
+        }
+
+        /** A user the cluster already has: left as it is, and out of the registry as an applied item is. */
+        private synchronized void present(Item item) {
+            applied.add(new Applied(item.kindKey(), item.name(), true, true, RestStatus.OK.getStatus(), null, List.of()));
+            log.info("[infino] the registered {} [{}] is already on the cluster and was left as it is", item.kindKey(), item.name());
+        }
+
         private synchronized void note(Item item, int status, String answer, List<String> leftOut) {
             boolean ok = status < RestStatus.MULTIPLE_CHOICES.getStatus();
             String reason = ok ? null : answer.length() > MAX_REASON_CHARS ? answer.substring(0, MAX_REASON_CHARS) : answer;
-            applied.add(new Applied(item.kindKey(), item.name(), ok, status, reason, List.copyOf(leftOut)));
+            applied.add(new Applied(item.kindKey(), item.name(), ok, false, status, reason, List.copyOf(leftOut)));
             if (ok) {
                 if (!leftOut.isEmpty()) {
                     log.warn("[infino] the registered {} [{}] was applied without the settings this cluster does not know: {}", item.kindKey(), item.name(), leftOut);
@@ -526,7 +575,7 @@ final class InfinoClusterState {
                 b.startObject();
                 b.field("kind", a.kind());
                 b.field("name", a.name());
-                b.field("result", a.applied() ? "applied" : "failed");
+                b.field("result", a.present() ? "present" : a.applied() ? "applied" : "failed");
                 if (!a.applied()) {
                     b.field("status", a.status());
                     b.field("reason", a.reason());
@@ -552,10 +601,15 @@ final class InfinoClusterState {
      */
     static Map<String, Object> sentBody(Item item, IndexScopedSettings known, List<String> leftOut) {
         Map<String, Object> body = heldToKnownSettings(item, known, leftOut);
-        if (item.kind() == Kind.USER && !body.containsKey(USER_HASH) && !body.containsKey(USER_PASSWORD)) {
+        if (createdWithUnknowablePassword(item)) {
             body.put(USER_PASSWORD, unknowablePassword());
         }
         return body;
+    }
+
+    /** Whether {@code item} is a user that arrives with no credential, so is created with a password no one is told. */
+    static boolean createdWithUnknowablePassword(Item item) {
+        return item.kind() == Kind.USER && !item.body().containsKey(USER_HASH) && !item.body().containsKey(USER_PASSWORD);
     }
 
     /**

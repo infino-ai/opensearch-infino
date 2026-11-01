@@ -48,6 +48,21 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
         assertTrue(leftOut.isEmpty());
     }
 
+    public void testOfTwoRowsUnderOneIdEveryReadTakesTheSameOne() {
+        String older = "{\"name\":\"logs\",\"version\":3}";
+        String newer = "{\"name\":\"logs\",\"version\":5}";
+        String unversioned = "{\"name\":\"logs\"}";
+        // The row recording the later metadata version, whichever the table returns first.
+        assertEquals(newer, InfinoRegistry.later(older, newer));
+        assertEquals(newer, InfinoRegistry.later(newer, older));
+        // A row a loader wrote records no version: one the cluster recorded is later.
+        assertEquals(older, InfinoRegistry.later(unversioned, older));
+        // Two alike in version: still the same one either way round.
+        String a = "{\"name\":\"logs\",\"table\":\"a\"}";
+        String b = "{\"name\":\"logs\",\"table\":\"b\"}";
+        assertEquals(InfinoRegistry.later(a, b), InfinoRegistry.later(b, a));
+    }
+
     public void testARowFromAnotherEngineIsCreatedWithoutWhatTheClusterDoesNotKnow() {
         Map<String, Object> row = Map.of("settings", Map.of("index.number_of_shards", "1", "index.lifecycle.name", "logs"));
         List<String> leftOut = new ArrayList<>();

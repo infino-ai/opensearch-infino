@@ -6,8 +6,14 @@ package org.opensearch.infino;
 
 import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -124,6 +130,47 @@ public class InfinoClusterStateTests extends OpenSearchTestCase {
             role,
             InfinoClusterState.sentBody(new InfinoClusterState.Item("role", InfinoClusterState.Kind.ROLE, "reader", role), KNOWN, new ArrayList<>())
         );
+    }
+
+    public void testOnlyAUserWithNoCredentialIsLookedUpBeforeItIsCreated() {
+        // Applied again over a user the cluster has, it would get a new password no one is told.
+        assertTrue(
+            InfinoClusterState.createdWithUnknowablePassword(
+                new InfinoClusterState.Item("user", InfinoClusterState.Kind.USER, "ana", Map.of("backend_roles", List.of("reader")))
+            )
+        );
+        assertFalse(
+            InfinoClusterState.createdWithUnknowablePassword(
+                new InfinoClusterState.Item("user", InfinoClusterState.Kind.USER, "bo", Map.of("hash", "$2y$12$x"))
+            )
+        );
+        assertFalse(
+            InfinoClusterState.createdWithUnknowablePassword(
+                new InfinoClusterState.Item("user", InfinoClusterState.Kind.USER, "cy", Map.of("password", "chosen"))
+            )
+        );
+        assertFalse(
+            InfinoClusterState.createdWithUnknowablePassword(
+                new InfinoClusterState.Item("role", InfinoClusterState.Kind.ROLE, "reader", Map.of())
+            )
+        );
+    }
+
+    @SuppressWarnings("unchecked")
+    public void testAUserTheClusterHadIsReportedPresent() throws IOException {
+        XContentBuilder b = XContentFactory.jsonBuilder().startObject();
+        InfinoClusterState.write(
+            b,
+            List.of(
+                new InfinoClusterState.Applied("user", "ana", true, true, 200, null, List.of()),
+                new InfinoClusterState.Applied("role", "reader", true, false, 200, null, List.of()),
+                new InfinoClusterState.Applied("user", "bo", false, false, 403, "no permission", List.of())
+            )
+        );
+        Map<String, Object> out = XContentHelper.convertToMap(BytesReference.bytes(b.endObject()), false, MediaTypeRegistry.JSON).v2();
+        List<Map<String, Object>> state = (List<Map<String, Object>>) out.get("state");
+        assertEquals(List.of("present", "applied", "failed"), state.stream().map(s -> s.get("result")).toList());
+        assertEquals(403, state.get(2).get("status"));
     }
 
     public void testAStateRowListsItsItemsInTheOrderTheyAreApplied() {
