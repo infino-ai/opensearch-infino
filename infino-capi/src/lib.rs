@@ -30,6 +30,8 @@
 // The safety contract is the same for every entry point and stated once above.
 #![allow(clippy::missing_safety_doc)]
 
+mod read_sql;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
@@ -90,6 +92,13 @@ const TRIAL_TIMEOUT: Duration = Duration::from_secs(30);
 const STATUS_MARKER: &str = "server returned ";
 /// Digits of an HTTP status code.
 const STATUS_DIGITS: usize = 3;
+/// HTTP status of a caller's statement that is wrong: it does not parse or
+/// plan, or asks for what the engine does not do.
+const STATUS_BAD_REQUEST: u16 = 400;
+/// HTTP status of a caller's statement naming a column or table that is not there.
+const STATUS_NOT_FOUND: u16 = 404;
+/// HTTP status of a caller's statement past the connection's memory budget.
+const STATUS_TOO_MANY_REQUESTS: u16 = 429;
 
 thread_local! {
     /// Why the last `infino_open_with` on this thread returned null, as the
@@ -1689,6 +1698,135 @@ pub unsafe extern "C" fn infino_sql(h: *mut Bridge, sql: *const c_char) -> *mut 
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// The indices a caller's read-only statement reads, as
+/// `{"indices": [..]}`, for the plugin to have the caller authorized for
+/// before it runs ([`infino_sql_read`]); a statement the route does not
+/// serve is refused with the reason and its status.
+#[no_mangle]
+pub unsafe extern "C" fn infino_sql_indices(sql: *const c_char) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(sql) = (unsafe { cstr(sql) }) else {
+            return ptr::null_mut();
+        };
+        match read_sql::indices(sql) {
+            Ok(indices) => out_json(json!({ "indices": indices })),
+            Err(refusal) => refused_json(&refusal),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Run a caller's read-only statement with each index it names read
+/// through the view `views` gives for it, as
+/// `{"relations": {index: query}, "functions": {index: table}}`: the query
+/// over the index's table the caller may read, and the table an engine
+/// search over the index may read (only where no rule applies). Answers
+/// `{"schema": [{"name", "type"}], "rows": [..]}`, or an error with its
+/// status: a statement the route does not serve (400), an index without a
+/// view (403), more than `max_rows` rows (400).
+#[no_mangle]
+pub unsafe extern "C" fn infino_sql_read(
+    h: *mut Bridge,
+    sql: *const c_char,
+    views: *const c_char,
+    max_rows: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(sql), Some(views)) =
+            (bridge_ref(h), unsafe { cstr(sql) }, unsafe { cstr(views) })
+        else {
+            return ptr::null_mut();
+        };
+        let views: Value = match serde_json::from_str(views) {
+            Ok(v) => v,
+            Err(e) => return err_json(&format!("views: {e}")),
+        };
+        let max_rows = usize::try_from(max_rows).unwrap_or(0);
+        let tables = match conn.conn.list_tables() {
+            Ok(tables) => tables,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let statement = match read_sql::rewrite(
+            sql,
+            &string_map(&views["relations"]),
+            &string_map(&views["functions"]),
+            &tables,
+            max_rows,
+        ) {
+            Ok(statement) => statement,
+            Err(refusal) => return refused_json(&refusal),
+        };
+        match conn.conn.query_sql(&statement) {
+            Ok(batches) => {
+                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                if rows > max_rows {
+                    return refused_json(&read_sql::Refusal {
+                        message: format!(
+                            "the statement returns more than {max_rows} rows; narrow it or give it a LIMIT"
+                        ),
+                        status: read_sql::BAD_REQUEST,
+                    });
+                }
+                out_string(format!(
+                    "{{\"schema\":{},\"rows\":{}}}",
+                    schema_json(&batches),
+                    batches_to_json(&batches)
+                ))
+            }
+            Err(e) => out_json(sql_error_value(&e)),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// A JSON object of strings as a map; anything else is empty.
+fn string_map(v: &Value) -> HashMap<String, String> {
+    v.as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A statement refused, with the status that says why.
+fn refused_json(refusal: &read_sql::Refusal) -> *mut c_char {
+    out_json(json!({ "error": refusal.message, "status": refusal.status }))
+}
+
+/// The error a caller's statement failed with, under the status that tells
+/// the caller's mistake from the engine's.
+fn sql_error_value(e: &InfinoError) -> Value {
+    let status = match e {
+        InfinoError::Query(_) | InfinoError::Unsupported(_) => Some(STATUS_BAD_REQUEST),
+        InfinoError::NotFound(_) => Some(STATUS_NOT_FOUND),
+        InfinoError::OverBudget(_) => Some(STATUS_TOO_MANY_REQUESTS),
+        _ => None,
+    };
+    let mut v = error_value(&e.to_string());
+    if let Some(status) = status {
+        v["status"] = json!(status);
+    }
+    v
+}
+
+/// The columns of a result, each its name and Arrow type; none for a
+/// result with no batch.
+fn schema_json(batches: &[RecordBatch]) -> String {
+    let fields: Vec<Value> = batches
+        .first()
+        .map(|b| {
+            b.schema()
+                .fields()
+                .iter()
+                .map(|f| json!({ "name": f.name(), "type": f.data_type().to_string() }))
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Array(fields).to_string()
 }
 
 /// Ranked BM25 over one text column (`mode` is `"and"` or `"or"`), the top
