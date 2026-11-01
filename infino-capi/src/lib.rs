@@ -1726,13 +1726,13 @@ pub unsafe extern "C" fn infino_sql_indices(sql: *const c_char) -> *mut c_char {
 /// (`masked`, left out when empty: the result's columns that give a field
 /// read only as output, for the plugin to mask), or an error with its status: a statement the
 /// route does not serve (400), an index without a view or a use of a field
-/// the caller may not make (403), more than `max_rows` rows (400).
+/// the caller may not make (403), a statement past the engine's memory
+/// budget (429).
 #[no_mangle]
 pub unsafe extern "C" fn infino_sql_read(
     h: *mut Bridge,
     sql: *const c_char,
     views: *const c_char,
-    max_rows: c_int,
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(sql), Some(views)) =
@@ -1744,7 +1744,6 @@ pub unsafe extern "C" fn infino_sql_read(
             Ok(v) => v,
             Err(e) => return err_json(&format!("views: {e}")),
         };
-        let max_rows = usize::try_from(max_rows).unwrap_or(0);
         let tables = match conn.conn.list_tables() {
             Ok(tables) => tables,
             Err(e) => return err_json(&e.to_string()),
@@ -1762,7 +1761,7 @@ pub unsafe extern "C" fn infino_sql_read(
                 .unwrap_or_default(),
             output_only: string_set(&views["output_only"]),
         };
-        let statement = match read_sql::rewrite(sql, &reads, &tables, max_rows) {
+        let statement = match read_sql::rewrite(sql, &reads, &tables) {
             Ok(statement) => statement,
             Err(refusal) => return refused_json(&refusal),
         };
@@ -1773,15 +1772,6 @@ pub unsafe extern "C" fn infino_sql_read(
             .collect();
         match conn.conn.query_sql(&statement.sql) {
             Ok(batches) => {
-                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-                if rows > max_rows {
-                    return refused_json(&read_sql::Refusal {
-                        message: format!(
-                            "the statement returns more than {max_rows} rows; narrow it or give it a LIMIT"
-                        ),
-                        status: read_sql::BAD_REQUEST,
-                    });
-                }
                 let masked = if masked.is_empty() {
                     String::new()
                 } else {

@@ -77,13 +77,16 @@ import java.util.function.UnaryOperator;
  * of its shard holds it, which may be before the shard's next refresh shows
  * it to a search.
  *
- * <p>Also refused: an index whose reads the audit log records document by
- * document, a system index, an index Infino does not back.
+ * <p>The security plugin audits the statement as it audits any action it
+ * authorizes: the caller and the indices. Its read history, which records
+ * each document a search hands out, has no document to record for a row
+ * of a SQL result in general (an aggregate, a join), so a statement over an
+ * index it watches is audited as that action only.
+ *
+ * <p>Refused: a system index, an index Infino does not back.
  */
 final class InfinoSql {
 
-    /** The most rows a statement returns: OpenSearch's own default cap on a page of hits ({@code index.max_result_window}). */
-    static final int MAX_ROWS = 10_000;
     /**
      * How a name in a statement resolves, as a search resolves its indices:
      * a pattern to the open indices it matches (not the hidden ones), an
@@ -172,9 +175,6 @@ final class InfinoSql {
                 }
                 IndexMetadata md = infinoIndex(state, name, index);
                 InfinoAccess access = InfinoSecurity.access(index, WHAT);
-                if (access.onRead() != null) {
-                    throw InfinoAccess.refused("reads of [" + index + "] are audited document by document, which a SQL result cannot report");
-                }
                 // An index in engine mode keeps its rows in a table per shard: each is a part.
                 for (String table : InfinoPlugin.tables().ensureAll(md)) {
                     Map<String, Column> columns = InfinoNative.columns(table);
@@ -211,7 +211,7 @@ final class InfinoSql {
                 throw InfinoAccess.refused("[" + field + "] is masked for you by rules SQL reads two ways in the indices the statement reads");
             }
         }
-        String answer = InfinoNative.sqlRead(request.query(), readsJson(views, searches, unsearchable, onOutput.keySet()), MAX_ROWS);
+        String answer = InfinoNative.sqlRead(request.query(), readsJson(views, searches, unsearchable, onOutput.keySet()));
         return onOutput.isEmpty() ? answer : maskResult(answer, onOutput);
     }
 

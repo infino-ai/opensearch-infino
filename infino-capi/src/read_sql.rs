@@ -25,9 +25,9 @@ use std::ops::ControlFlow;
 
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause,
-    ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
-    TableAlias, TableFactor, Value, Visit, VisitMut, Visitor, VisitorMut,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, ObjectName,
+    ObjectNamePart, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor, Value, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 /// The engine's search functions, each naming the table it searches as its
@@ -126,13 +126,10 @@ pub(crate) struct Rewritten {
 /// not, and a use of a column the caller may read only as output other than
 /// as output. A `WITH` name that is one of `tables` is refused too: where
 /// that name is out of the `WITH`'s scope it would read the table itself.
-/// The statement is held to `max_rows + 1` rows ([`limit_rows`]), so the
-/// caller can tell a result that was cut.
 pub(crate) fn rewrite(
     sql: &str,
     reads: &Reads,
     tables: &[String],
-    max_rows: usize,
 ) -> Result<Rewritten, Box<Refusal>> {
     let mut query = parse_query(sql)?;
     let ctes = ctes(&query);
@@ -164,7 +161,6 @@ pub(crate) fn rewrite(
     if let ControlFlow::Break(refusal) = VisitMut::visit(&mut query, &mut walk) {
         return Err(refusal);
     }
-    limit_rows(&mut query, max_rows)?;
     Ok(Rewritten {
         sql: Statement::Query(Box::new(query)).to_string(),
         masked,
@@ -734,54 +730,9 @@ fn check_body(body: &SetExpr) -> ControlFlow<Box<Refusal>> {
     }
 }
 
-/// Hold the query to `max_rows + 1` rows: a query that names no row count,
-/// or a larger one, is given that, so the engine stops there and a result
-/// that would be cut shows it by its one row too many. A count that is not
-/// a number as written stays, and the result is held to the cap after.
-fn limit_rows(query: &mut Query, max_rows: usize) -> Result<(), Box<Refusal>> {
-    let cap = max_rows + 1;
-    let within = |limit: &Expr| match limit {
-        Expr::Value(v) => v
-            .to_string()
-            .parse::<u128>()
-            .map_or(true, |n| n <= cap as u128),
-        _ => true,
-    };
-    let keep = match &query.limit_clause {
-        None => false,
-        Some(LimitClause::LimitOffset { limit, .. }) => limit.as_ref().is_some_and(within),
-        Some(LimitClause::OffsetCommaLimit { limit, .. }) => within(limit),
-    };
-    if keep {
-        return Ok(());
-    }
-    let template = parse_query(&format!("SELECT 1 LIMIT {cap}"))?;
-    let Some(LimitClause::LimitOffset {
-        limit: Some(count), ..
-    }) = template.limit_clause
-    else {
-        return Err(refuse("the row limit could not be written", BAD_REQUEST));
-    };
-    match &mut query.limit_clause {
-        Some(LimitClause::LimitOffset { limit, .. }) => *limit = Some(count),
-        Some(LimitClause::OffsetCommaLimit { limit, .. }) => *limit = count,
-        clause => {
-            *clause = Some(LimitClause::LimitOffset {
-                limit: Some(count),
-                offset: None,
-                limit_by: Vec::new(),
-            })
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The largest result the tests let a statement return.
-    const MAX_ROWS: usize = 10;
 
     fn views(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -800,7 +751,7 @@ mod tests {
 
     /// `sql` rewritten under `reads`, as the engine is handed it.
     fn rewritten(sql: &str, reads: &Reads, tables: &[String]) -> Result<String, Box<Refusal>> {
-        rewrite(sql, reads, tables, MAX_ROWS).map(|r| r.sql)
+        rewrite(sql, reads, tables).map(|r| r.sql)
     }
 
     fn refusal(r: Result<impl std::fmt::Debug, Box<Refusal>>) -> Box<Refusal> {
@@ -875,8 +826,7 @@ mod tests {
             out,
             "SELECT l.msg, (SELECT count(*) FROM (SELECT * FROM \"os_users\") AS users) \
              FROM (SELECT \"id\", \"msg\" FROM \"os_logs\" WHERE \"tenant\" = 'a') l \
-             WHERE l.id IN (SELECT id FROM (SELECT \"id\", \"msg\" FROM \"os_logs\" WHERE \"tenant\" = 'a') AS logs) \
-             LIMIT 11"
+             WHERE l.id IN (SELECT id FROM (SELECT \"id\", \"msg\" FROM \"os_logs\" WHERE \"tenant\" = 'a') AS logs)"
         );
         // What the engine is handed reads as the same single query.
         assert!(parse_query(&out).is_ok());
@@ -907,7 +857,7 @@ mod tests {
         assert_eq!(
             rewritten(sql, &reads, &[]).unwrap(),
             "SELECT osid, score FROM (SELECT \"osid\", \"msg\", \"score\" FROM bm25_search('os_logs', 'msg', 'disk', 10) \
-             WHERE \"tenant\" = 'a') AS bm25_search ORDER BY score DESC LIMIT 11"
+             WHERE \"tenant\" = 'a') AS bm25_search ORDER BY score DESC"
         );
         // An index with no search view is not read.
         assert_eq!(
@@ -937,7 +887,7 @@ mod tests {
             rewritten("SELECT msg FROM bm25_search('logs', 'msg', 'disk', 5)", &reads, &[]).unwrap(),
             "SELECT msg FROM (SELECT * FROM (SELECT \"msg\", \"score\" FROM bm25_search('os_logs_shard0', 'msg', 'disk', 5) \
              UNION ALL SELECT \"msg\", \"score\" FROM bm25_search('os_logs_shard1', 'msg', 'disk', 5)) AS infino_merged \
-             ORDER BY \"score\" DESC LIMIT 5) AS bm25_search LIMIT 11"
+             ORDER BY \"score\" DESC LIMIT 5) AS bm25_search"
         );
         // A vector distance ranks the nearest first.
         assert!(rewritten(
@@ -989,7 +939,7 @@ mod tests {
             output_only: HashSet::from(["ip".to_string()]),
             ..Reads::default()
         };
-        let masked = |sql: &str| rewrite(sql, &reads, &[], MAX_ROWS).map(|r| r.masked);
+        let masked = |sql: &str| rewrite(sql, &reads, &[]).map(|r| r.masked);
         let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
         assert_eq!(
             masked("SELECT ip, n FROM logs WHERE n > 1 ORDER BY n").unwrap(),
@@ -1044,22 +994,10 @@ mod tests {
         let sql = "WITH recent AS (SELECT * FROM logs) SELECT * FROM recent";
         let logs = reading(&[("logs", "SELECT * FROM \"os_logs\"")]);
         let out = rewritten(sql, &logs, &["os_logs".to_string()]).unwrap();
-        assert!(out.ends_with("SELECT * FROM recent LIMIT 11"), "{out}");
+        assert!(out.ends_with("SELECT * FROM recent"), "{out}");
         // Out of its scope the name would read the table itself.
         let sql = "SELECT * FROM (WITH os_index AS (SELECT * FROM logs) SELECT * FROM os_index) t, os_index";
         let r = refusal(rewritten(sql, &logs, &["os_index".to_string()]));
         assert_eq!(r.status, BAD_REQUEST);
-    }
-
-    #[test]
-    fn a_limit_within_the_cap_stands_and_a_larger_one_is_held_to_it() {
-        let logs = reading(&[("logs", "SELECT * FROM \"os_logs\"")]);
-        let out = rewritten("SELECT * FROM logs LIMIT 3", &logs, &[]).unwrap();
-        assert!(out.ends_with("LIMIT 3"), "{out}");
-        let out = rewritten("SELECT * FROM logs OFFSET 5", &logs, &[]).unwrap();
-        assert!(out.contains("LIMIT 11"), "{out}");
-        // The engine stops at the cap rather than building a larger result first.
-        let out = rewritten("SELECT * FROM logs LIMIT 1000000", &logs, &[]).unwrap();
-        assert!(out.ends_with("LIMIT 11"), "{out}");
     }
 }

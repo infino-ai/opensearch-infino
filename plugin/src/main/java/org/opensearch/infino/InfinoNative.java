@@ -713,9 +713,9 @@ public final class InfinoNative {
      * view in {@code views} (see {@link InfinoSql}): its schema and rows as
      * JSON, or a throw with the status that says why it was not run.
      */
-    static String sqlRead(String sql, String views, int maxRows) {
+    static String sqlRead(String sql, String views) {
         init();
-        return takeOrThrow(lib.infino_sql_read(conn, sql, views, maxRows));
+        return takeOrThrow(lib.infino_sql_read(conn, sql, views));
     }
 
     public static List<Map<String, Object>> sqlRows(String q) {
