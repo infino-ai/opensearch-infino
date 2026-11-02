@@ -9,6 +9,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.LoggingDeprecationHandler;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.json.JsonXContent;
@@ -88,7 +89,9 @@ import java.util.function.UnaryOperator;
  * of a SQL result in general (an aggregate, a join), so a statement over an
  * index it watches is audited as that action only.
  *
- * <p>Refused: a system index, an index Infino does not back.
+ * <p>Refused: a system index, an index Infino does not back, a statement
+ * whose result passes {@link InfinoPlugin#SQL_MAX_RESULT_SIZE} as JSON (the
+ * bridge stops building it there, before it reaches the node's heap).
  */
 final class InfinoSql {
 
@@ -131,10 +134,16 @@ final class InfinoSql {
     private static final String TEXT_TYPE = "Utf8";
     /**
      * The columns a default-mode index's engine stamps its rows with for its
-     * own bookkeeping (the write that created a row, a commit's newest
-     * operation, the index generation): no field of a document, never read.
+     * own bookkeeping (the routing a row was written with, the write that
+     * created it, a commit's newest operation, the index generation): no
+     * field of a document, never read.
      */
-    private static final Set<String> STAMPS = Set.of(InfinoQueryTranslator.SEQ, InfinoQueryTranslator.OP, InfinoQueryTranslator.GEN);
+    private static final Set<String> STAMPS = Set.of(
+        InfinoQueryTranslator.ROUTING,
+        InfinoQueryTranslator.SEQ,
+        InfinoQueryTranslator.OP,
+        InfinoQueryTranslator.GEN
+    );
     /** What separates the parts of a masked-field expression, as the security plugin splits it. */
     private static final String MASK_SEPARATOR = "::";
     /** What a regular expression in a masked-field expression is written between. */
@@ -155,7 +164,15 @@ final class InfinoSql {
         "sha512"
     );
 
+    /** The most bytes of JSON a result may hold ({@link InfinoPlugin#SQL_MAX_RESULT_SIZE}). */
+    private static volatile long maxResultBytes = InfinoPlugin.SQL_MAX_RESULT_SIZE.get(Settings.EMPTY).getBytes();
+
     private InfinoSql() {}
+
+    /** Bound the node's results from its settings; called once, when the plugin is constructed. */
+    static void configure(Settings settings) {
+        maxResultBytes = InfinoPlugin.SQL_MAX_RESULT_SIZE.get(settings).getBytes();
+    }
 
     /** Run the request's statement as its caller may read it: the result as JSON. */
     static String run(InfinoSqlRequest request) {
@@ -384,6 +401,11 @@ final class InfinoSql {
                 unsearchable.add(c.name());
             }
         }
+        // The source holds every field as written, the hidden and masked ones
+        // too: under either rule a search may not match on it, as it is not read.
+        if (restricted && columns.containsKey(InfinoQueryTranslator.SOURCE)) {
+            unsearchable.add(InfinoQueryTranslator.SOURCE);
+        }
         for (Column c : visible.values()) {
             String quoted = InfinoQueryTranslator.quoteIdent(c.name());
             if (projected.containsKey(c.name()) || STAMPS.contains(c.name()) || (restricted && c.name().equals(InfinoQueryTranslator.SOURCE))) {
@@ -577,6 +599,7 @@ final class InfinoSql {
             b.field("unsearchable", unsearchable);
             b.field("output_only", outputOnly);
             b.field("whole", whole);
+            b.field("max_result_bytes", maxResultBytes);
             b.endObject();
             return BytesReference.bytes(b).utf8ToString();
         } catch (IOException e) {

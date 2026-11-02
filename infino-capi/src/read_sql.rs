@@ -64,6 +64,18 @@ const RANKED: [(&str, usize, &str); 6] = [
     ("graph_walk", 5, "ASC"),
     ("graph_rank", 5, "DESC"),
 ];
+/// Where each engine search names the columns it matches among its
+/// arguments: the column after the table, and a hybrid search's vector
+/// column after its text query. The other arguments are queries, vectors
+/// and counts, which a column's name may appear in as plain text.
+const SEARCH_COLUMNS: [(&str, &[usize]); 6] = [
+    ("bm25_search", &[1]),
+    ("bm25_search_prefix", &[1]),
+    ("vector_search", &[1]),
+    ("token_match", &[1]),
+    ("exact_match", &[1]),
+    ("hybrid_search", &[1, 3]),
+];
 /// The column an engine search ranks its rows by.
 const SCORE: &str = "score";
 /// The name a ranked search over several tables is merged under.
@@ -712,7 +724,11 @@ impl<'a> Walk<'a> {
             // A search matches the stored values of the columns it names, so
             // it names none the caller may not read as stored.
             if let Some(closed) = unsearchable.get(&index) {
-                for arg in &args.args[1..] {
+                let at: &[usize] = SEARCH_COLUMNS
+                    .iter()
+                    .find(|(f, _)| *f == function)
+                    .map_or(&[], |(_, at)| *at);
+                for arg in at.iter().filter_map(|&i| args.args.get(i)) {
                     if let Some(column) = string_arg(arg).filter(|c| closed.contains(*c)) {
                         return ControlFlow::Break(refuse(
                             format!(
@@ -1045,6 +1061,20 @@ mod tests {
             &[]
         )
         .is_ok());
+        // The column a search names, not its query text: the word is only a word.
+        assert!(rewritten(
+            "SELECT osid FROM token_match('logs', 'msg', 'secret')",
+            &reads,
+            &[]
+        )
+        .is_ok());
+        // A hybrid search names a vector column too.
+        let r = refusal(rewritten(
+            "SELECT osid FROM hybrid_search('logs', 'msg', 'alpha', 'secret', '[1.0]', 10)",
+            &reads,
+            &[],
+        ));
+        assert_eq!(r.status, FORBIDDEN);
     }
 
     #[test]

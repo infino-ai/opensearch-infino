@@ -22,8 +22,10 @@ import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.settings.SecureString;
+import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.env.Environment;
+import org.opensearch.http.HttpTransportSettings;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
@@ -196,6 +198,20 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      */
     public static final Setting<String> CACHE_DIR = Setting.simpleString("infino.cache.dir", Setting.Property.NodeScope);
 
+    /**
+     * The most a SQL result may hold, as the JSON the route answers with (see
+     * {@link InfinoSql}). The engine's memory budget bounds a statement while
+     * it runs, not the answer handed to the node: a statement whose result
+     * passes this is refused before the answer is built whole, so one
+     * authorized read cannot fill the node's heap. The largest request body
+     * the node takes over HTTP when unset.
+     */
+    public static final Setting<ByteSizeValue> SQL_MAX_RESULT_SIZE = Setting.byteSizeSetting(
+        "infino.sql.max_result_size",
+        HttpTransportSettings.SETTING_HTTP_MAX_CONTENT_LENGTH,
+        Setting.Property.NodeScope
+    );
+
     /** The directory {@link #CACHE_DIR} names under the node's data path by default. */
     static final String DEFAULT_CACHE_SUBDIR = "infino-cache";
 
@@ -211,6 +227,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         this.account = new InfinoAccount(PLATFORM_DEFAULT_URL.get(settings));
         InfinoNative.cacheDir(cacheDir(settings));
         InfinoRequestCache.configure(settings);
+        InfinoSql.configure(settings);
         String url = PLATFORM_URL.get(settings);
         if (url.isEmpty()) {
             return;
@@ -482,7 +499,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             PLATFORM_DATABASE,
             PLATFORM_API_KEY,
             PLATFORM_DEFAULT_URL,
-            CACHE_DIR
+            CACHE_DIR,
+            SQL_MAX_RESULT_SIZE
         );
     }
 

@@ -190,6 +190,42 @@
       catch: forbidden
       infino.sql:
         body: { query: "SELECT osid FROM token_match('sec_sql1', 'ip', '10.0.0.1')" }
+  # The source holds the hidden and masked fields as written: under a field or masking
+  # rule a search may not match on it either.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sec_sql1', 'source', 'alpha')" }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM exact_match('sec_sql1', 'source', 'alpha')" }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sec_sql1', 'source', '10.0.0.1')" }
+  # A column's name as a search's query text is only text, not the column.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sec_sql1', 'title', 'secret source')" }
+  - length: { rows: 0 }
+
+  # A graph walk reads its edges and seeds whole, so a user with a document or masking
+  # rule over the index walks nothing in it.
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM graph_walk('sec_sql1', 'sec_sql1', 'sec_sql1', 1, 1, 10)" }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM graph_rank('sec_sql1', 'sec_sql1', 'sec_sql1', 1, 1, 10)" }
 
 ---
 "SQL reads a pattern, an alias over several indices and a filtered alias as a search does":
@@ -338,7 +374,12 @@
   - is_false: rows.0.osseq
   - is_false: rows.0.osop
   - is_false: rows.0.osgen
+  - is_false: rows.0.osrouting
   - is_true: rows.0.source
+  - do:
+      catch: bad_request
+      infino.sql:
+        body: { query: "SELECT osrouting FROM sec_sqlem" }
 
   # A ranked search gives the best rows of the shards' searches together, to its own row count.
   - do:

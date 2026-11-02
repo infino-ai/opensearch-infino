@@ -33,6 +33,7 @@
 mod read_sql;
 
 use std::cell::RefCell;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
@@ -107,6 +108,9 @@ const ENGINE_ID_TYPE: &str = "infino_engine_id";
 /// table's id columns.
 const ID_PRECISION: u8 = 38;
 const ID_SCALE: i8 = 0;
+/// The first whole number past what [`ID_PRECISION`] digits hold: a row id
+/// is below it.
+const ROW_ID_BOUND: i128 = 10_i128.pow(ID_PRECISION as u32);
 /// The columns of an edge table, as the engine's adjacency index reads them:
 /// each end of an edge as the table its row is in and the row's `_id`.
 const SRC_TABLE: &str = "src_table";
@@ -829,13 +833,20 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
             Value::Null => Ok(value),
         },
         // A row id: a whole number, as digits in a string where it is past
-        // what a JSON number holds exactly (as a SQL read gives an `_id`).
+        // what a JSON number holds exactly (as a SQL read gives an `_id`),
+        // and no wider than the column's precision.
         DataType::Decimal128(ID_PRECISION, ID_SCALE) => match &value {
             Value::Number(n) if n.is_u64() => Ok(value),
             Value::String(s)
                 if !s.trim().is_empty() && s.trim().bytes().all(|b| b.is_ascii_digit()) =>
             {
-                Ok(Value::String(s.trim().to_string()))
+                match s.trim().parse::<i128>() {
+                    Ok(id) if id < ROW_ID_BOUND => Ok(Value::String(id.to_string())),
+                    _ => Err(format!(
+                        "not a row id: '{}' has more than the {ID_PRECISION} digits a row's `_id` holds",
+                        s.trim()
+                    )),
+                }
             }
             _ => Err("not a row id: a row's `_id` is a whole number, its digits".into()),
         },
@@ -1799,14 +1810,14 @@ pub unsafe extern "C" fn infino_sql_indices(sql: *const c_char) -> *mut c_char {
 /// Run a caller's read-only statement with each index it names read
 /// through the view `views` gives for it, as `{"relations": {index: query},
 /// "searches": {index: query}, "unsearchable": {index: [column]},
-/// "output_only": [column], "whole": {index: table}}` (see
-/// [`read_sql::Reads`]). Answers
+/// "output_only": [column], "whole": {index: table}, "max_result_bytes": n}`
+/// (see [`read_sql::Reads`]). Answers
 /// `{"schema": [{"name", "type"}], "rows": [..], "masked": {column: field}}`
 /// (`masked`, left out when empty: the result's columns that give a field
 /// read only as output, for the plugin to mask), or an error with its status: a statement the
-/// route does not serve (400), an index without a view or a use of a field
-/// the caller may not make (403), a statement past the engine's memory
-/// budget (429).
+/// route does not serve or whose rows pass `max_result_bytes` as JSON (400),
+/// an index without a view or a use of a field the caller may not make
+/// (403), a statement past the engine's memory budget (429).
 #[no_mangle]
 pub unsafe extern "C" fn infino_sql_read(
     h: *mut Bridge,
@@ -1850,20 +1861,39 @@ pub unsafe extern "C" fn infino_sql_read(
             .iter()
             .map(|(column, field)| (column.clone(), json!(field)))
             .collect();
+        // No bound given reads as none: the plugin always sends its setting.
+        let max_bytes = views["max_result_bytes"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(usize::MAX);
         match conn.conn.query_sql(&statement.sql) {
             Ok(batches) => {
+                let Some(rows) = batches_to_json_within(&batches, max_bytes) else {
+                    return refused_json(&read_sql::Refusal {
+                        message: format!(
+                            "the result is larger than infino.sql.max_result_size ({max_bytes} bytes as JSON): \
+                             read fewer rows or columns, or aggregate"
+                        ),
+                        status: read_sql::BAD_REQUEST,
+                    });
+                };
                 let masked = if masked.is_empty() {
                     String::new()
                 } else {
                     format!(",\"masked\":{}", Value::Object(masked))
                 };
                 out_string(format!(
-                    "{{\"schema\":{},\"rows\":{}{masked}}}",
+                    "{{\"schema\":{},\"rows\":{rows}{masked}}}",
                     schema_json(&batches),
-                    batches_to_json(&batches),
                 ))
             }
-            Err(e) => out_json(sql_error_value(&e)),
+            Err(e) => {
+                let mut v = sql_error_value(&e);
+                if let Some(message) = v["error"].as_str() {
+                    v["error"] = json!(in_index_names(message, &reads, &tables));
+                }
+                out_json(v)
+            }
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -1889,6 +1919,33 @@ fn string_map(v: &Value) -> HashMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// `message`, an engine error over a caller's statement, with each table a
+/// view reads named as the index the statement read it through: the tables
+/// are the plugin's, the caller named indices. A table several views read
+/// is named by the first; longer table names are replaced first, so one
+/// that begins another's name is never replaced inside it.
+fn in_index_names(message: &str, reads: &read_sql::Reads, tables: &[String]) -> String {
+    let mut by_table: Vec<(&str, &str)> = Vec::new();
+    let mut indices: Vec<&String> = reads.views.keys().collect();
+    indices.sort();
+    for table in tables {
+        // A view names its tables quoted: as an identifier, or as a search's argument.
+        let (ident, literal) = (format!("\"{table}\""), format!("'{table}'"));
+        if let Some(index) = indices.iter().find(|index| {
+            let view = &reads.views[index.as_str()];
+            view.contains(&ident) || view.contains(&literal)
+        }) {
+            by_table.push((table.as_str(), index.as_str()));
+        }
+    }
+    by_table.sort_by_key(|(table, _)| Reverse(table.len()));
+    let mut out = message.to_string();
+    for (table, index) in by_table {
+        out = out.replace(table, &format!("[{index}]"));
+    }
+    out
 }
 
 /// A statement refused, with the status that says why.
@@ -2174,22 +2231,36 @@ fn json_str(s: &str) -> String {
 /// Rows as a JSON array of flat objects. Timestamps are epoch milliseconds,
 /// which is what OpenSearch's date formats and histogram keys take.
 fn batches_to_json(batches: &[RecordBatch]) -> String {
-    let mut rows: Vec<String> = Vec::new();
+    batches_to_json_within(batches, usize::MAX).unwrap_or_default()
+}
+
+/// [`batches_to_json`], or `None` as soon as the text passes `max_bytes`:
+/// a result too large to hand over is never built whole.
+fn batches_to_json_within(batches: &[RecordBatch], max_bytes: usize) -> Option<String> {
+    let mut out = String::from("[");
     for batch in batches {
         let schema = batch.schema();
         for r in 0..batch.num_rows() {
-            let mut cells: Vec<String> = Vec::new();
-            for (c, field) in schema.fields().iter().enumerate() {
-                cells.push(format!(
-                    "{}:{}",
-                    json_str(field.name()),
-                    cell_json(batch.column(c).as_ref(), r)
-                ));
+            if out.len() > 1 {
+                out.push(',');
             }
-            rows.push(format!("{{{}}}", cells.join(",")));
+            out.push('{');
+            for (c, field) in schema.fields().iter().enumerate() {
+                if c > 0 {
+                    out.push(',');
+                }
+                out.push_str(&json_str(field.name()));
+                out.push(':');
+                out.push_str(&cell_json(batch.column(c).as_ref(), r));
+            }
+            out.push('}');
+            if out.len() > max_bytes {
+                return None;
+            }
         }
     }
-    format!("[{}]", rows.join(","))
+    out.push(']');
+    Some(out)
 }
 
 fn cell_json(col: &dyn Array, r: usize) -> String {
@@ -3394,5 +3465,66 @@ mod tests {
             "{why}"
         );
         assert!(unsafe { infino_open_error() }.is_null(), "read once");
+    }
+
+    /// A result's JSON is built up to the bound and no further, and within
+    /// it is the same text as unbounded.
+    #[test]
+    fn a_result_past_its_bound_is_never_built_whole() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batches = [RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1, 22, 333])) as Arc<dyn Array>],
+        )
+        .unwrap()];
+        let whole = batches_to_json(&batches);
+        assert_eq!(whole, r#"[{"n":1},{"n":22},{"n":333}]"#);
+        assert_eq!(
+            batches_to_json_within(&batches, whole.len()).as_deref(),
+            Some(whole.as_str())
+        );
+        assert!(batches_to_json_within(&batches, whole.len() / 2).is_none());
+        assert_eq!(batches_to_json(&[]), "[]");
+    }
+
+    /// A row id holds at most the column's precision in digits.
+    #[test]
+    fn a_row_id_wider_than_its_column_is_refused() {
+        let id = DataType::Decimal128(ID_PRECISION, ID_SCALE);
+        let widest = "9".repeat(ID_PRECISION as usize);
+        assert_eq!(conform(json!(widest.clone()), &id), Ok(json!(widest)));
+        assert_eq!(conform(json!("0042"), &id), Ok(json!("42")));
+        let wider = "1".repeat(ID_PRECISION as usize + 1);
+        assert!(conform(json!(wider), &id).unwrap_err().contains("digits"));
+        assert!(conform(json!("9".repeat(60)), &id).is_err());
+    }
+
+    /// An engine error over a caller's statement names the indices the
+    /// statement read, not the plugin's tables.
+    #[test]
+    fn an_engine_error_names_indices_not_tables() {
+        let reads = read_sql::Reads {
+            views: HashMap::from([
+                ("logs".to_string(), "SELECT * FROM \"os_logs\"".to_string()),
+                (
+                    "logs_1".to_string(),
+                    "SELECT * FROM \"os_logs_1\"".to_string(),
+                ),
+            ]),
+            ..read_sql::Reads::default()
+        };
+        let tables = vec![
+            "os_logs".to_string(),
+            "os_logs_1".to_string(),
+            "os_index".to_string(),
+        ];
+        assert_eq!(
+            in_index_names(
+                "table os_logs_1 has no column x; os_logs neither",
+                &reads,
+                &tables
+            ),
+            "table [logs_1] has no column x; [logs] neither"
+        );
     }
 }

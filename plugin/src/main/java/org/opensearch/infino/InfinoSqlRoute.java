@@ -74,8 +74,12 @@ final class InfinoSqlRoute {
         }
     }
 
-    /** The methods the route answers. */
+    /**
+     * The methods the route answers: POST only, as its spec declares. A
+     * statement may hold sensitive literals, and a GET's body is the kind
+     * proxies and logs mishandle.
+     */
     static List<RestRequest.Method> methods() {
-        return List.of(RestRequest.Method.GET, RestRequest.Method.POST);
+        return List.of(RestRequest.Method.POST);
     }
 }
