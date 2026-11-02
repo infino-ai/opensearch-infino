@@ -236,13 +236,13 @@ public class InfinoAggregationProcessor {
 
     /**
      * The requested aggregations over the rows each of {@code shardPlans}
-     * matches, one plan for each table of an index's reached shards, read
-     * as one relation, with the request's exact match count over all of
-     * them. A cardinality or percentiles result is built from the engine's
-     * exact values, which the coordinating node cannot merge from the
-     * shards' parts; one shard answers the whole tree this way, so the
-     * coordinating node's reduction returns it unchanged (see
-     * {@link InfinoQueryPhaseSearcher}). {@code plan} is that shard's own.
+     * matches, one plan for each table of the reached shards, read as one
+     * relation, with the request's exact match count over all of them. A
+     * cardinality or percentiles result is built from the engine's exact
+     * values, which cannot be merged from the shards' parts; the
+     * coordinating node answers such an aggregation once this way (see
+     * {@link InfinoExactAggregation}). {@code plan} is the first shard's,
+     * which the aggregations are planned against.
      */
     Counted evaluateOver(Collection<AggregationBuilder> builders, Plan plan, List<Plan> shardPlans) {
         String from = unionOf(shardPlans);
@@ -254,16 +254,6 @@ public class InfinoAggregationProcessor {
         Supplier<Long> counter = () -> asLong(oneRow("SELECT COUNT(*) AS c FROM " + from).get("c"));
         // One answer for the whole index: each terms level at its final size.
         return evaluate(builders, plan, shardTables, from, InfinoQueryTranslator.ALL, predicates, counter, null, false, null);
-    }
-
-    /**
-     * The requested aggregations over no rows, as a shard reports them when
-     * another reached shard answers for all of them (see {@link #evaluateOver}):
-     * every count, size and background is zero, so the coordinating node's
-     * reduction adds nothing to that shard's answer.
-     */
-    Counted evaluateNothing(Collection<AggregationBuilder> builders, Plan plan) {
-        return evaluate(builders, plan, List.of(), InfinoQueryTranslator.quoteIdent(plan.table()), InfinoQueryTranslator.NONE, predicates(plan), () -> 0L, null, false, 0L);
     }
 
     /**
@@ -1927,11 +1917,10 @@ public class InfinoAggregationProcessor {
             "SELECT * FROM (SELECT " + select + " FROM " + from + " WHERE (" + where + ") AND " + key + " IS NOT NULL GROUP BY 1" + having
                 + ") t ORDER BY doc_count DESC, k0 ASC LIMIT " + s.candidates
         );
-        // No tables: this shard answers over no rows (see evaluateNothing), its background included.
-        String backgroundRows = tables.isEmpty() ? null : backgroundRows(s);
-        long supersetSize = backgroundRows == null ? 0 : asLong(oneRow("SELECT COUNT(*) AS c FROM " + backgroundRows).get("c"));
+        String backgroundRows = backgroundRows(s);
+        long supersetSize = asLong(oneRow("SELECT COUNT(*) AS c FROM " + backgroundRows).get("c"));
         Map<String, Long> background = new HashMap<>();
-        if (!foreground.isEmpty() && backgroundRows != null) {
+        if (!foreground.isEmpty()) {
             List<String> literals = new ArrayList<>();
             for (Map<String, Object> row : foreground) {
                 literals.add(Grouped.keyLiteral(s.keyKind, row.get("k0")));

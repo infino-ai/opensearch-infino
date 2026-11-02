@@ -15,7 +15,6 @@ import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
-import org.opensearch.cluster.routing.ShardIterator;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
@@ -25,12 +24,10 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -111,7 +108,23 @@ public class InfinoSearchActionFilter implements ActionFilter {
             // InfinoQueryExt): the cluster routes it as it routes any search,
             // a scroll included, and merges the shards' results.
             SearchSourceBuilder written = search.source() == null ? new SearchSourceBuilder() : search.source();
-            search.source(InfinoQueryExt.route(written, reachedShards(clusters, names, state, search, concrete)));
+            String id = InfinoQueryExt.newRequestId();
+            long now = System.currentTimeMillis();
+            // A cardinality or percentiles aggregation over more than one shard is
+            // answered here, once, over every reached shard's table (see
+            // InfinoExactAggregation): the search is recorded for it, with what the
+            // user may see of each index, read now under the user's own identity.
+            boolean exactAtCoordinator = reachedShardCount(clusters, names, state, search, concrete) > 1
+                && written.aggregations() != null
+                && InfinoAggregationProcessor.needsExactValues(written.aggregations().getAggregatorFactories());
+            if (exactAtCoordinator) {
+                Map<String, InfinoAccess> access = new HashMap<>();
+                for (String name : concrete) {
+                    access.put(name, InfinoSecurity.access(name, InfinoSecurityCalls.SEARCH));
+                }
+                InfinoExactAggregation.record(id, written, now, access);
+            }
+            search.source(InfinoQueryExt.route(written, id, exactAtCoordinator, now));
             chain.proceed(task, action, request, listener);
             return;
         }
@@ -167,23 +180,11 @@ public class InfinoSearchActionFilter implements ActionFilter {
     }
 
     /**
-     * The shard numbers of each index the search reaches, as the cluster
-     * will route it (its routing values and shard preference applied),
-     * ascending, by index name.
+     * How many shards the search reaches, over every index it names, as the
+     * cluster will route it (its routing values and shard preference applied).
      */
-    private static Map<String, List<Integer>> reachedShards(
-        ClusterService clusters,
-        IndexNameExpressionResolver names,
-        ClusterState state,
-        SearchRequest search,
-        String[] concrete
-    ) {
+    private static int reachedShardCount(ClusterService clusters, IndexNameExpressionResolver names, ClusterState state, SearchRequest search, String[] concrete) {
         Map<String, Set<String>> routing = names.resolveSearchRouting(state, search.routing(), search.indices());
-        Map<String, List<Integer>> out = new TreeMap<>();
-        for (ShardIterator shard : clusters.operationRouting().searchShards(state, concrete, routing, search.preference())) {
-            out.computeIfAbsent(shard.shardId().getIndexName(), k -> new ArrayList<>()).add(shard.shardId().id());
-        }
-        out.values().forEach(Collections::sort);
-        return out;
+        return clusters.operationRouting().searchShards(state, concrete, routing, search.preference()).size();
     }
 }

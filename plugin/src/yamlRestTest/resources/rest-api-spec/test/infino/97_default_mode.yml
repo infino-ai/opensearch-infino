@@ -529,6 +529,100 @@
   - match: { aggregations.users.value: 5 }
 
 ---
+"Default mode: cardinality and percentiles over two indices are both indices' together":
+  # Each index holds four users, one of them in both: the two hold seven. Two
+  # exact counts of four cannot be merged into seven, so the coordinating node
+  # answers over both indices' tables at once.
+  - do:
+      indices.create:
+        index: emx1
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { user: { type: keyword }, n: { type: long } } }
+  - do:
+      indices.create:
+        index: emx2
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { user: { type: keyword }, n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emx1, _id: "1" }
+          - { user: u1, n: 1 }
+          - index: { _index: emx1, _id: "2" }
+          - { user: u2, n: 2 }
+          - index: { _index: emx1, _id: "3" }
+          - { user: u3, n: 3 }
+          - index: { _index: emx1, _id: "4" }
+          - { user: u4, n: 4 }
+          - index: { _index: emx2, _id: "5" }
+          - { user: u4, n: 5 }
+          - index: { _index: emx2, _id: "6" }
+          - { user: u5, n: 6 }
+          - index: { _index: emx2, _id: "7" }
+          - { user: u6, n: 7 }
+          - index: { _index: emx2, _id: "8" }
+          - { user: u7, n: 8 }
+  - match: { errors: false }
+  - do:
+      search:
+        index: emx1,emx2
+        body:
+          size: 0
+          aggs:
+            users: { cardinality: { field: user } }
+            n_pct: { percentiles: { field: n, percents: [ 50 ] } }
+            n_sum: { sum: { field: n } }
+  - match: { hits.total.value: 8 }
+  - match: { aggregations.users.value: 7 }
+  - match: { aggregations.n_sum.value: 36.0 }
+  - set: { aggregations.n_pct.values.50\.0: median_both }
+  # The same rows in one index give the same median.
+  - do:
+      indices.create:
+        index: emx3
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emx3, _id: "1" }
+          - { n: 1 }
+          - index: { _index: emx3, _id: "2" }
+          - { n: 2 }
+          - index: { _index: emx3, _id: "3" }
+          - { n: 3 }
+          - index: { _index: emx3, _id: "4" }
+          - { n: 4 }
+          - index: { _index: emx3, _id: "5" }
+          - { n: 5 }
+          - index: { _index: emx3, _id: "6" }
+          - { n: 6 }
+          - index: { _index: emx3, _id: "7" }
+          - { n: 7 }
+          - index: { _index: emx3, _id: "8" }
+          - { n: 8 }
+  - do:
+      search:
+        index: emx3
+        body: { size: 0, aggs: { n_pct: { percentiles: { field: n, percents: [ 50 ] } } } }
+  - match: { aggregations.n_pct.values.50\.0: $median_both }
+  # Under a query too: n of 4 or more keeps u4 in both indices, counted once, and u5 to u7.
+  - do:
+      search:
+        index: emx1,emx2
+        body:
+          size: 0
+          query: { range: { n: { gte: 4 } } }
+          aggs: { users: { cardinality: { field: user } } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.users.value: 4 }
+
+---
 "Default mode: delete by query scrolls the tables and deletes through the shards":
   # The reindex module is in the test distributions from 3.6.
   - skip:

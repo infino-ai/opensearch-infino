@@ -14,6 +14,7 @@ import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
@@ -25,6 +26,7 @@ import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.mapper.ParseContext.Document;
 import org.opensearch.index.mapper.SourceFieldMapper;
 import org.opensearch.index.seqno.ReplicationTracker;
+import org.opensearch.index.seqno.RetentionLease;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.threadpool.ThreadPool;
@@ -108,7 +110,7 @@ import java.util.function.LongSupplier;
  * source, so a copy can recover from another's history; Lucene drops it
  * from merged segments once no copy can need it. A copy that becomes primary
  * (a promotion, or a restart of the primary) writes into the table the
- * operations of its history past the highest the table records (see
+ * operations of its history the table may not hold (see
  * {@link #fillSeqNoGaps}): the writes its old primary had not committed,
  * which are now the shard's. A primary that hands the shard to another node
  * has committed every acknowledged write by then, commits what it still
@@ -126,10 +128,27 @@ import java.util.function.LongSupplier;
  * not find deletes the table's row and reports it found. A row written with
  * a routing value keeps it, so the rebuilt document is routed as it was.
  *
- * <p>A table refusal after Lucene has acknowledged a write leaves that
- * document out of the table; it is logged. The mapper refuses what the
- * mapping cannot hold first, so this is a document the table's columns
- * refuse beyond the mapping.
+ * <p>The table holds a retention lease on the shard's history from the first
+ * operation it may not hold, which the primary moves forward as commits
+ * land and which every copy is given as it is given every lease: a copy
+ * keeps the history a new primary writes the table from however long
+ * commits fail, and a promotion whose history is not whole from there fails
+ * rather than serving without acknowledged writes.
+ *
+ * <p>A document the table does not take after Lucene has acknowledged it is
+ * checked against the table's columns again. One they refuse (the mapper
+ * refuses what the mapping cannot hold first, so a document the columns
+ * refuse beyond the mapping) is refused on every try: it is logged as an
+ * error and is not in the table. Any other is put back for the next commit,
+ * and the lease stays below it until a commit takes it.
+ *
+ * <p>Not covered: a primary cut off from its copies may still commit, late,
+ * writes at or below the global checkpoint it last knew, which its copies
+ * held and which the new primary took over. If the new primary has written
+ * a document since, such a late commit undoes that write: an index or
+ * update brings back the older version, or a document the new primary
+ * deleted; a delete removes a document the new primary wrote. Closing it
+ * needs the table to refuse a stale primary's commit.
  */
 public class InfinoEngine extends InternalEngine {
     private static final Logger log = LogManager.getLogger(InfinoEngine.class);
@@ -174,6 +193,14 @@ public class InfinoEngine extends InternalEngine {
     private static final String FILL_SOURCE = "infino_fill";
     /** A sequence number below every operation's: what a primary that handed its shard off may commit through. */
     private static final long NOTHING = Long.MIN_VALUE;
+    /**
+     * The retention lease the table holds on its shard's history (see
+     * {@link #holdHistoryThrough}): from the first operation the table may
+     * not hold, which is where a new primary writes the table from.
+     */
+    static final String TABLE_LEASE = "infino_table";
+    /** What the lease names as the one holding it. */
+    private static final String TABLE_LEASE_SOURCE = "infino table";
 
     /**
      * One write of an id waiting for its commit: its source (null for a
@@ -245,6 +272,17 @@ public class InfinoEngine extends InternalEngine {
         void add(String id, Base base, Version v) {
             entries.computeIfAbsent(id, k -> new Entry(base)).versions.add(v);
             count(v);
+        }
+
+        /** The lowest sequence number among these writes; {@code Long.MAX_VALUE} when there are none. */
+        long lowestSeq() {
+            long lowest = Long.MAX_VALUE;
+            for (Entry e : entries.values()) {
+                for (Version v : e.versions) {
+                    lowest = Math.min(lowest, v.seq());
+                }
+            }
+            return lowest;
         }
 
         /** The newest write of {@code id}, or null when the batch has none. */
@@ -490,12 +528,6 @@ public class InfinoEngine extends InternalEngine {
             h = h * GENERATION_MULTIPLIER + indexUuid.charAt(i);
         }
         return h;
-    }
-
-    /** {@link #visibleSeqNo} for the latest skeleton reader of {@code table}'s shard on this node; null when there is none here. */
-    static Long latestVisibleSeqNo(String table) {
-        InfinoEngine engine = BY_TABLE.get(table);
-        return engine == null ? null : engine.cutAt(engine.latestCovered);
     }
 
     /** The cut for a reader covering {@code covered}: none while no operation past it has been applied. */
@@ -881,18 +913,64 @@ public class InfinoEngine extends InternalEngine {
             } finally {
                 recordLock.writeLock().unlock();
             }
-            boolean committed = false;
+            Batch retry = null;
             try {
-                commit(b);
-                committed = true;
+                retry = commit(b);
             } finally {
                 synchronized (batchLock) {
                     committing = null;
-                    if (!committed) {
+                    if (retry == null) {
                         batch.putBack(b);
+                    } else if (!retry.isEmpty()) {
+                        batch.putBack(retry);
                     }
                 }
             }
+            // Every write through `through` is in the table now, but for those to retry.
+            holdHistoryThrough(retry.isEmpty() ? through : Math.min(through, retry.lowestSeq() - 1));
+        }
+    }
+
+    /** The table's lease on this shard's history as this copy was last given it, or null when it has none. */
+    private RetentionLease tableLease() {
+        if (!(config().getGlobalCheckpointSupplier() instanceof ReplicationTracker tracker)) {
+            return null;
+        }
+        return tracker.getRetentionLeases().get(TABLE_LEASE);
+    }
+
+    /**
+     * Hold the shard's history from the first operation the table may not
+     * hold, {@code covered + 1}: a retention lease ({@link #TABLE_LEASE}) the
+     * primary keeps and its copies are given, as they are given every lease.
+     * The history a copy keeps is what a new primary writes into the table
+     * from ({@link #fillTable}), so it is never trimmed past what the table
+     * holds, however long commits fail. Only the primary moves the lease,
+     * and only forward.
+     */
+    private void holdHistoryThrough(long covered) {
+        if (covered == NOTHING || !(config().getGlobalCheckpointSupplier() instanceof ReplicationTracker tracker)) {
+            return;
+        }
+        long retaining = covered + 1;
+        try {
+            if (!tracker.isPrimaryMode()) {
+                return;
+            }
+            RetentionLease held = tracker.getRetentionLeases().get(TABLE_LEASE);
+            if (held == null) {
+                tracker.addRetentionLease(
+                    TABLE_LEASE,
+                    retaining,
+                    TABLE_LEASE_SOURCE,
+                    ActionListener.wrap(r -> {}, e -> log.debug("[infino] the copies of {} were not given its table's lease yet", shardId, e))
+                );
+            } else if (held.retainingSequenceNumber() < retaining) {
+                tracker.renewRetentionLease(TABLE_LEASE, retaining, TABLE_LEASE_SOURCE);
+            }
+        } catch (RuntimeException | AssertionError e) {
+            // A hand-off in progress refuses lease changes; the new primary holds its own.
+            log.debug("[infino] the lease on the history of {} was not moved to {}", shardId, retaining, e);
         }
     }
 
@@ -939,9 +1017,15 @@ public class InfinoEngine extends InternalEngine {
         }
     }
 
-    private void commit(Batch b) {
+    /**
+     * Commit {@code b}'s writes to the table; the writes the table did not
+     * take and may take on a later try, to be retried (see
+     * {@link #notTaken}). A failure that takes nothing is thrown.
+     */
+    private Batch commit(Batch b) {
         long start = System.nanoTime();
         List<String> ids = new ArrayList<>();
+        List<Version> written = new ArrayList<>();
         List<String> sources = new ArrayList<>();
         List<String> routings = new ArrayList<>();
         List<Long> stamps = new ArrayList<>();
@@ -960,6 +1044,7 @@ public class InfinoEngine extends InternalEngine {
                 continue;
             }
             ids.add(id);
+            written.add(last);
             sources.add(last.source());
             routings.add(last.routing());
             stamps.add(last.stamp());
@@ -973,6 +1058,7 @@ public class InfinoEngine extends InternalEngine {
         if (!lookedUp.isEmpty()) {
             replaced.addAll(InfinoNative.existingOsids(table, lookedUp));
         }
+        Batch retry = new Batch();
         // Deletes go first: until a commit's rows are in, the highest operation the
         // table records is an earlier commit's, from which a new primary writes on.
         if (!deleted.isEmpty()) {
@@ -1006,14 +1092,46 @@ public class InfinoEngine extends InternalEngine {
                 throw new IllegalStateException("[infino] the bridge could not prepare a batch for " + table);
             }
             InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced);
-            for (InfinoNative.PreparedFailure f : result.failed()) {
-                log.warn("[infino] table {} refused document {} after Lucene acknowledged it: {}", table, ids.get(f.index()), f.reason());
-            }
+            retry = notTaken(result.failed(), ids, written);
         }
         Set<String> touched = new HashSet<>(ids);
         touched.addAll(deleted);
         InfinoNative.forgetSources(table, touched);
         log.debug("[infino] engine committed {} writes and {} deletes to {} in {} ms", ids.size(), deleted.size(), table, (System.nanoTime() - start) / 1_000_000L);
+        return retry;
+    }
+
+    /**
+     * Of the documents a commit's append did not take ({@code failed}, by
+     * position in {@code ids} and {@code written}), the ones a later commit
+     * may: each is checked against the table's columns again. One the
+     * columns refuse is refused the same way on every try, so it is logged
+     * as lost and not retried. Any other failed for a reason of the moment
+     * (the engine refused the append or the replace, or storage failed); it
+     * is put back for the next commit, and the table's hold on the shard's
+     * history stays below it until a commit takes it (see
+     * {@link #holdHistoryThrough}), so a new primary writes it too.
+     */
+    private Batch notTaken(List<InfinoNative.PreparedFailure> failed, List<String> ids, List<Version> written) {
+        Batch retry = new Batch();
+        for (InfinoNative.PreparedFailure f : failed) {
+            String id = ids.get(f.index());
+            Version v = written.get(f.index());
+            String refused = InfinoNative.checkDoc(table, v.source());
+            if (refused != null) {
+                log.error(
+                    "[infino] table {} refuses document {} (operation {}) after OpenSearch acknowledged it, so the table does not hold it: {}",
+                    table,
+                    id,
+                    v.seq(),
+                    refused
+                );
+                continue;
+            }
+            log.warn("[infino] table {} did not take document {} (operation {}); the next commit tries again: {}", table, id, v.seq(), f.reason());
+            retry.add(id, Base.UNKNOWN, v);
+        }
+        return retry;
     }
 
     /**
@@ -1120,10 +1238,10 @@ public class InfinoEngine extends InternalEngine {
     /**
      * A copy becoming primary (a promotion, or the primary's restart) fills
      * the gaps in its history, then writes into the table the operations of
-     * its history past the highest the table records: the writes its old
-     * primary had not committed, which are now the shard's. The table may
-     * hold some of them already; a write is looked up, so writing it again
-     * leaves one row.
+     * its history the table may not hold (see {@link #fillTable}): the writes
+     * its old primary had not committed, which are now the shard's. The table
+     * may hold some of them already; a write is looked up, so writing it
+     * again leaves one row.
      */
     @Override
     public int fillSeqNoGaps(long primaryTerm) throws IOException {
@@ -1136,20 +1254,50 @@ public class InfinoEngine extends InternalEngine {
         return filled;
     }
 
+    /**
+     * Write into the table the operations of this copy's history it may not
+     * hold: from where the table's lease holds the history
+     * ({@link #holdHistoryThrough}), which the copy kept for exactly this.
+     * That history must be whole: when it is not, writes acknowledged to
+     * clients would be missing from the table that serves them, so the
+     * promotion fails rather than serving without them. A shard with no
+     * lease (its table has not committed under this engine since it was
+     * given one) starts past the highest operation a row records, as far as
+     * its history reaches.
+     */
     private void fillTable() throws IOException {
-        Long highest = InfinoNative.highestOp(table, generation);
         long retained = getMinRetainedSeqNo();
-        long from = highest == null ? retained : highest + 1;
         long to = getSeqNoStats(SequenceNumbers.UNASSIGNED_SEQ_NO).getMaxSeqNo();
+        RetentionLease lease = tableLease();
+        long from;
+        if (lease != null) {
+            from = lease.retainingSequenceNumber();
+            if (from <= to && from < retained) {
+                throw new IllegalStateException(
+                    "[infino] "
+                        + shardId
+                        + " keeps its history from "
+                        + retained
+                        + " only, past where its table's lease holds it ("
+                        + from
+                        + "): acknowledged writes would be missing from "
+                        + table
+                );
+            }
+        } else {
+            Long highest = InfinoNative.highestOp(table, generation);
+            from = highest == null ? retained : highest + 1;
+            if (from < retained) {
+                log.warn("[infino] {} keeps its history from {} only; the writes from {} before it may be missing from {}", shardId, retained, from, table);
+                from = retained;
+            }
+        }
         if (from > to) {
             return;
         }
-        if (from < retained) {
-            log.warn("[infino] {} keeps its history from {} only; the writes from {} before it may be missing from {}", shardId, retained, from, table);
-        }
         long start = System.nanoTime();
         int written = 0;
-        try (Translog.Snapshot history = newChangesSnapshot(FILL_SOURCE, from, to, false, false)) {
+        try (Translog.Snapshot history = newChangesSnapshot(FILL_SOURCE, from, to, lease != null, false)) {
             Translog.Operation op;
             while ((op = history.next()) != null) {
                 Version v;
@@ -1179,7 +1327,12 @@ public class InfinoEngine extends InternalEngine {
                 }
                 written++;
                 if (full) {
-                    commitBatch();
+                    try {
+                        commitBatch();
+                    } catch (RuntimeException e) {
+                        // The writes stay in the batch for the next commit, as the last one's do.
+                        log.warn("[infino] committing part of the history {} took over to {} failed", shardId, table, e);
+                    }
                 }
             }
         }

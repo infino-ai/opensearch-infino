@@ -19,6 +19,7 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.env.Environment;
@@ -34,6 +35,7 @@ import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchPlugin;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
+import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.fetch.FetchSubPhase;
 import org.opensearch.search.query.QueryPhaseSearcher;
 import org.opensearch.threadpool.Scheduler;
@@ -269,6 +271,12 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     @Override
     public List<SearchExtSpec<?>> getSearchExts() {
         return List.of(new SearchExtSpec<>(InfinoQueryExt.NAME, InfinoQueryExt::new, InfinoQueryExt::fromXContent));
+    }
+
+    /** A shard's part of an aggregation the coordinating node answers, as it travels to that node (see {@link InfinoExactAggregation}). */
+    @Override
+    public List<NamedWriteableRegistry.Entry> getNamedWriteables() {
+        return List.of(new NamedWriteableRegistry.Entry(InternalAggregation.class, InfinoExactAggregation.NAME, InfinoExactAggregation::new));
     }
 
     /** The node services arrive by injection (see {@link InfinoServices}). */
