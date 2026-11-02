@@ -105,7 +105,7 @@
   - match: { _source.message: "request served" }
 
   # A partial update merges into the document, a scripted one is refused as in
-  # cloud mode, and a write that replaces a document replaces its row.
+  # proxy mode, and a write that replaces a document replaces its row.
   - do:
       update:
         index: em

@@ -75,7 +75,7 @@ import java.util.function.Function;
 
 /**
  * Answers one {@code _search} for one Infino-backed index from its table,
- * in cloud mode at the action layer: no shard, no Lucene, no fetch phase.
+ * in proxy mode at the action layer: no shard, no Lucene, no fetch phase.
  *
  * <p>Hits come one of three ways: an {@code infino_knn} / {@code infino_hybrid}
  * query, or the k-NN plugin's own {@code knn} query (see {@link InfinoStockKnn}),

@@ -57,10 +57,10 @@ import java.util.List;
  * answered from the shard's table; every other shard gets the stock phase.
  *
  * <p>The shard plans from the search as the client wrote it (see
- * {@link InfinoQueryExt}) with cloud mode's planner and hit statement
+ * {@link InfinoQueryExt}) with proxy mode's planner and hit statement
  * ({@link InfinoSearch#plan}, {@link InfinoSearch#page}), under what the
  * security plugin lets the user see, so both modes serve the same requests
- * the same way. Each hit is kept whole, as cloud mode builds it
+ * the same way. Each hit is kept whole, as proxy mode builds it
  * (source filtered and masked, requested fields, script fields, collapse
  * value), for the shard's fetch phase to hand out ({@link InfinoFetchSubPhase});
  * the shard result names each hit by its document in the shard's Lucene
@@ -79,7 +79,7 @@ import java.util.List;
  * reads {@code now} as the coordinating node set it. A scroll pages in a
  * fixed order, the id's when the request names none: each round resumes
  * after the last hit the coordinating node handed out from this shard, as
- * cloud mode's scroll resumes after its last.
+ * proxy mode's scroll resumes after its last.
  */
 public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
 
@@ -287,7 +287,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
     }
 
     /**
-     * The search one round of a scroll runs: cloud mode's scroll
+     * The search one round of a scroll runs: proxy mode's scroll
      * source ({@link InfinoSearch#scrollSource}), which pages in a fixed
      * order; the first round also keeps the request's total and
      * aggregations, and every later one resumes after the last hit the

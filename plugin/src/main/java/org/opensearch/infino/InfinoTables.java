@@ -26,10 +26,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * columns carry their mapped types. Fields the mapping does not name are
  * typed by the engine from the documents.
  *
- * <p>An index in cloud mode has one table whatever its shard count: nothing
+ * <p>An index in proxy mode has one table whatever its shard count: nothing
  * is routed to a shard. An index in default mode is written by each
  * primary's engine, and one table has one writer, so an index of several
- * shards keeps a table per shard; one of a single shard keeps cloud mode's
+ * shards keeps a table per shard; one of a single shard keeps proxy mode's
  * name for its one table.
  */
 public final class InfinoTables {

@@ -92,7 +92,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
             if (md == null) {
                 continue;
             }
-            if (InfinoPlugin.inCloudMode(md.getSettings())) {
+            if (InfinoPlugin.inProxyMode(md.getSettings())) {
                 infino.add(md.getIndex());
                 metadata.add(md);
             } else if (InfinoPlugin.inDefaultMode(md.getSettings())) {
