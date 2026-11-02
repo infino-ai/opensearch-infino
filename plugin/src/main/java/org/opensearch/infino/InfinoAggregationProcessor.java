@@ -202,8 +202,8 @@ public class InfinoAggregationProcessor {
      * The requested aggregations over the plan's relation, in request order,
      * as the stock response objects, with the request's exact match count.
      * {@code total} is that count when the hit path already has it; when
-     * null it is counted here, beside the root metrics when there are any,
-     * so it costs no statement of its own.
+     * null it is counted here, beside the root metrics or a counting range's
+     * buckets when there are any, so it costs no statement of its own.
      */
     Counted evaluate(Collection<AggregationBuilder> builders, Plan plan, Long total) {
         Translation q = plan.query();
@@ -217,6 +217,13 @@ public class InfinoAggregationProcessor {
         for (Spec spec : specs) {
             if (spec instanceof Metric m) {
                 rootMetrics.add(m);
+                continue;
+            }
+            if (total == null && spec instanceof Explicit e && countsOnly(e)) {
+                // The buckets' statement counts the request's matches too.
+                Map<String, Object> counted = explicitCounts(e, q.from(), q.where(), true);
+                total = asLong(counted.get(TOTAL_ALIAS));
+                byName.put(spec.name(), buildExplicitCounts(e, counted));
                 continue;
             }
             if (total == null) {
@@ -1685,10 +1692,8 @@ public class InfinoAggregationProcessor {
     }
 
     private InternalAggregation evalExplicit(Explicit e, String from, String where) {
-        // A filters bucket may hold a query the table answers through a subquery, which an
-        // aggregate's FILTER clause cannot carry; range buckets are plain comparisons.
-        if (e.kind != ExplicitKind.FILTERS && e.metrics.isEmpty() && e.hits.isEmpty() && e.child == null && !e.buckets.isEmpty()) {
-            return evalExplicitCounts(e, from, where);
+        if (countsOnly(e)) {
+            return buildExplicitCounts(e, explicitCounts(e, from, where, false));
         }
         List<Map<String, Object>> rows = new ArrayList<>();
         List<List<InternalAggregation>> topHits = new ArrayList<>();
@@ -1706,16 +1711,33 @@ public class InfinoAggregationProcessor {
     }
 
     /**
-     * Range or date_range buckets that only count, all in one statement: a
-     * {@code COUNT(*) FILTER (WHERE ...)} per bucket. The table reads the relation once rather
+     * Whether {@code e} is range or date_range buckets that only count. A filters bucket may
+     * hold a query the table answers through a subquery, which an aggregate's FILTER clause
+     * cannot carry; range buckets are plain comparisons.
+     */
+    private static boolean countsOnly(Explicit e) {
+        return e.kind != ExplicitKind.FILTERS && e.metrics.isEmpty() && e.hits.isEmpty() && e.child == null && !e.buckets.isEmpty();
+    }
+
+    /**
+     * The counts of {@link #countsOnly} buckets, all in one statement: a
+     * {@code COUNT(*) FILTER (WHERE ...)} per bucket, and the relation's own count as
+     * {@link #TOTAL_ALIAS} when {@code withTotal}. The table reads the relation once rather
      * than once per bucket, and counts a range-indexed field's buckets from its range index.
      */
-    private InternalAggregation evalExplicitCounts(Explicit e, String from, String where) {
+    private Map<String, Object> explicitCounts(Explicit e, String from, String where, boolean withTotal) {
         List<String> counts = new ArrayList<>();
+        if (withTotal) {
+            counts.add("COUNT(*) AS " + TOTAL_ALIAS);
+        }
         for (int i = 0; i < e.buckets.size(); i++) {
             counts.add("COUNT(*) FILTER (WHERE " + e.buckets.get(i).predicate() + ") AS " + bucketCount(i));
         }
-        Map<String, Object> counted = oneRow("SELECT " + String.join(", ", counts) + " FROM " + from + " WHERE " + where);
+        return oneRow("SELECT " + String.join(", ", counts) + " FROM " + from + " WHERE " + where);
+    }
+
+    /** The response of {@link #countsOnly} buckets from their {@link #explicitCounts} row. */
+    private InternalAggregation buildExplicitCounts(Explicit e, Map<String, Object> counted) {
         List<Map<String, Object>> rows = new ArrayList<>();
         List<List<InternalAggregation>> topHits = new ArrayList<>();
         List<InternalAggregation> nested = new ArrayList<>();
@@ -1729,7 +1751,7 @@ public class InfinoAggregationProcessor {
         return e.build(rows, topHits, nested);
     }
 
-    /** The column a bucket's count comes back in from {@link #evalExplicitCounts}. */
+    /** The column a bucket's count comes back in from {@link #explicitCounts}. */
     private static String bucketCount(int bucket) {
         return "bucket_" + bucket;
     }
