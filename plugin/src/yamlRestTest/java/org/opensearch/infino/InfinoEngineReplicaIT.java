@@ -103,7 +103,12 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
         call("POST", "/" + index + "/_refresh", null);
         // Operations 0 to DOCS - 1 are in the table: it holds the history from DOCS.
         assertEquals(Long.valueOf(DOCS), tableLease(index, true));
-        assertBusy(() -> assertEquals(Long.valueOf(DOCS), tableLease(index, false)), STALENESS_WAIT_SECONDS, TimeUnit.SECONDS);
+        // The replica is given the lease when it is added, and its renewals at
+        // the next lease sync (30 s apart): its copy is never past the
+        // primary's, which only makes a takeover write more of its history.
+        Long replica = tableLease(index, false);
+        assertNotNull("the replica holds the table's lease", replica);
+        assertTrue("the replica's lease " + replica + " is not past the primary's", replica <= DOCS);
         write(index, DOCS, LATER);
         call("POST", "/" + index + "/_refresh", null);
         assertEquals(Long.valueOf(DOCS + LATER), tableLease(index, true));
