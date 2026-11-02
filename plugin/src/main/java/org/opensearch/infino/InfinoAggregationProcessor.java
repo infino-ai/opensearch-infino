@@ -1685,6 +1685,11 @@ public class InfinoAggregationProcessor {
     }
 
     private InternalAggregation evalExplicit(Explicit e, String from, String where) {
+        // A filters bucket may hold a query the table answers through a subquery, which an
+        // aggregate's FILTER clause cannot carry; range buckets are plain comparisons.
+        if (e.kind != ExplicitKind.FILTERS && e.metrics.isEmpty() && e.hits.isEmpty() && e.child == null && !e.buckets.isEmpty()) {
+            return evalExplicitCounts(e, from, where);
+        }
         List<Map<String, Object>> rows = new ArrayList<>();
         List<List<InternalAggregation>> topHits = new ArrayList<>();
         List<InternalAggregation> nested = new ArrayList<>();
@@ -1698,6 +1703,35 @@ public class InfinoAggregationProcessor {
             nested.add(e.child == null ? null : evalBucket(e.child, from, w, docCount));
         }
         return e.build(rows, topHits, nested);
+    }
+
+    /**
+     * Range or date_range buckets that only count, all in one statement: a
+     * {@code COUNT(*) FILTER (WHERE ...)} per bucket. The table reads the relation once rather
+     * than once per bucket, and counts a range-indexed field's buckets from its range index.
+     */
+    private InternalAggregation evalExplicitCounts(Explicit e, String from, String where) {
+        List<String> counts = new ArrayList<>();
+        for (int i = 0; i < e.buckets.size(); i++) {
+            counts.add("COUNT(*) FILTER (WHERE " + e.buckets.get(i).predicate() + ") AS " + bucketCount(i));
+        }
+        Map<String, Object> counted = oneRow("SELECT " + String.join(", ", counts) + " FROM " + from + " WHERE " + where);
+        List<Map<String, Object>> rows = new ArrayList<>();
+        List<List<InternalAggregation>> topHits = new ArrayList<>();
+        List<InternalAggregation> nested = new ArrayList<>();
+        for (int i = 0; i < e.buckets.size(); i++) {
+            Map<String, Object> row = new HashMap<>();
+            row.put("doc_count", counted.get(bucketCount(i)));
+            rows.add(row);
+            topHits.add(List.of());
+            nested.add(null);
+        }
+        return e.build(rows, topHits, nested);
+    }
+
+    /** The column a bucket's count comes back in from {@link #evalExplicitCounts}. */
+    private static String bucketCount(int bucket) {
+        return "bucket_" + bucket;
     }
 
     /** The top hits of one bucket of {@code spec}, one statement per top_hits over {@code from WHERE where}. */
