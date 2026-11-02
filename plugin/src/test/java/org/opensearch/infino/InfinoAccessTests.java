@@ -98,6 +98,11 @@ public class InfinoAccessTests extends OpenSearchTestCase {
         String where = either.filteredBy(QueryBuilders.termQuery("n", 3)).documentsWhere(cols, "t", 0);
         assertTrue(where, where.contains("\"tag\" = 'x'") && where.contains("\"tag\" = 'y'") && where.contains("\"n\" = 3"));
         assertTrue(where, where.startsWith("(") && where.contains(" OR "));
+        // The filter is read as the user's own query: a field the user may not see
+        // is as if unmapped, and keeps nothing.
+        InfinoAccess hidden = new InfinoAccess(null, field -> !field.equals("n"), null).filteredBy(QueryBuilders.termQuery("n", 3));
+        assertEquals(InfinoQueryTranslator.NONE, hidden.documentsWhere(cols, "t", 0));
+        assertTrue(hidden.restrictsDocuments());
     }
 
     public void testDocumentRuleTheTableCannotAnswerRefuses() {

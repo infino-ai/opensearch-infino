@@ -19,6 +19,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.index.Index;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
@@ -107,11 +108,17 @@ public class InfinoSearchActionFilter implements ActionFilter {
             Function<Index, String> tableOf = index -> tables.ensure(metadata.get(infino.indexOf(index)));
             // Each index is read under what the security plugin lets this user see
             // of it, and what a filtering alias the request reached it through keeps.
+            long now = System.currentTimeMillis();
             Map<Index, InfinoAccess> access = new HashMap<>();
+            List<InfinoAccess> rules = new ArrayList<>();
+            List<QueryBuilder> filters = new ArrayList<>();
             for (int i = 0; i < infino.size(); i++) {
                 Index index = infino.get(i);
                 InfinoAccess own = InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH);
-                access.put(index, own.filteredBy(InfinoAliasFilter.of(state, names, metadata.get(i), search.indices())));
+                QueryBuilder filter = InfinoAliasFilter.of(state, names, metadata.get(i), search.indices(), tableOf.apply(index), now);
+                rules.add(own);
+                filters.add(filter);
+                access.put(index, own.filteredBy(filter));
             }
             // A repeated request is answered from the responses kept for it,
             // as the shard request cache answers it for a Lucene index.
@@ -122,7 +129,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
                 for (Index index : infino) {
                     tableNames.add(tableOf.apply(index));
                 }
-                key = InfinoRequestCache.key(search, source, metadata, tableNames, access.values());
+                key = InfinoRequestCache.key(search, source, metadata, tableNames, rules, filters);
                 SearchResponse hit = key == null ? null : kept.get(key, start);
                 if (hit != null) {
                     @SuppressWarnings("unchecked")
