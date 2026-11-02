@@ -227,6 +227,15 @@ stream of new documents pays no lookup. A document the declared columns
 cannot hold is refused as its own item with the reason. A bulk must address
 one Infino-backed index.
 
+A batch's writes and its deletes are two mutations, the deletes after the
+append (the engine replaces rows one for one, so a delete with no row in its
+place cannot join the append). A node that stops between the two leaves the
+batch unacknowledged, its writes durable and its deletes not; the client's
+retry applies both again, and both are idempotent (a write replaces by id,
+and an id deleted twice stays deleted). A delete that fails after its append
+committed fails only the delete items (500); the writes are answered as
+written.
+
 ## What the table answers
 
 Query DSL: `match_all`, `term`, `terms`, `range` (numbers and dates, with date
