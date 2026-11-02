@@ -21,7 +21,7 @@ import java.util.Map;
 /**
  * The fetch phase of a default-mode shard: each hit gets what its query
  * phase built for it from the table ({@link InfinoQueryPhaseSearcher}) —
- * its source, filtered and masked as cloud mode serves it, and the
+ * its source, filtered and masked as proxy mode serves it, and the
  * requested fields, script fields and collapse value — since the shard's
  * Lucene skeleton keeps no source and no values. A hit whose kept copy is
  * gone (it waited past its time) is read from the table again by the same

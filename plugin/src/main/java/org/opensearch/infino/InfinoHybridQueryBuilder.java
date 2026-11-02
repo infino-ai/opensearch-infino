@@ -110,7 +110,7 @@ public class InfinoHybridQueryBuilder extends AbstractQueryBuilder<InfinoHybridQ
 
     @Override
     protected Query doToQuery(QueryShardContext context) {
-        // Served from the table (at the action layer in cloud mode, by the
+        // Served from the table (at the action layer in proxy mode, by the
         // shard's query phase in default mode); Lucene never runs it.
         return new MatchNoDocsQuery(NAME + " is served by the Infino table");
     }

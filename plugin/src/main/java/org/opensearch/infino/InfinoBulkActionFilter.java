@@ -177,7 +177,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
      * update reads the current document from Lucene, which keeps no source
      * in default mode, so each update is merged here into the document as a
      * read sees it now (the shard's write not yet committed, else the
-     * table), by cloud mode's rule ({@link #merge}), and goes on as a
+     * table), by proxy mode's rule ({@link #merge}), and goes on as a
      * write of the whole document, carrying any sequence-number condition
      * for the shard to check. An update the table cannot serve (a script) or
      * whose document is missing is answered here.
@@ -310,7 +310,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
         for (String name : concrete) {
             IndexMetadata md = name == null ? null : clusters.state().metadata().index(name);
             // An index in default mode takes its writes through its shard's engine, as any index does.
-            if (md != null && InfinoPlugin.inCloudMode(md.getSettings())) {
+            if (md != null && InfinoPlugin.inProxyMode(md.getSettings())) {
                 infino.put(name, md);
                 infinoItems++;
             }

@@ -127,7 +127,7 @@ public class InfinoGetActionFilter implements ActionFilter {
     /**
      * A document's source as a read sees it now: in default mode a write its
      * shard has acknowledged and not yet committed counts, as a stock get
-     * reads the translog; in cloud mode an acknowledged write is in the
+     * reads the translog; in proxy mode an acknowledged write is in the
      * table already.
      */
     static String sourceOf(IndexMetadata index, String table, String id) {
@@ -154,7 +154,7 @@ public class InfinoGetActionFilter implements ActionFilter {
     /**
      * The routing value a found default-mode document was written with, which
      * a stock get reports as {@code _routing}; null when it was written with
-     * none, when {@code source} says it was not found, or in cloud mode,
+     * none, when {@code source} says it was not found, or in proxy mode,
      * which routes nothing.
      */
     static String routingOf(IndexMetadata index, String table, String id, String source) {

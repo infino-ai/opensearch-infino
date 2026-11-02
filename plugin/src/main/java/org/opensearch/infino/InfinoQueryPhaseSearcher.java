@@ -16,7 +16,6 @@ import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.grouping.CollapseTopFieldDocs;
 import org.apache.lucene.util.BytesRef;
-import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.document.DocumentField;
@@ -34,6 +33,8 @@ import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregationProcessor;
+import org.opensearch.search.aggregations.InternalAggregation;
+import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.PipelineAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.ContextIndexSearcher;
@@ -56,10 +57,10 @@ import java.util.List;
  * answered from the shard's table; every other shard gets the stock phase.
  *
  * <p>The shard plans from the search as the client wrote it (see
- * {@link InfinoQueryExt}) with cloud mode's planner and hit statement
+ * {@link InfinoQueryExt}) with proxy mode's planner and hit statement
  * ({@link InfinoSearch#plan}, {@link InfinoSearch#page}), under what the
  * security plugin lets the user see, so both modes serve the same requests
- * the same way. Each hit is kept whole, as cloud mode builds it
+ * the same way. Each hit is kept whole, as proxy mode builds it
  * (source filtered and masked, requested fields, script fields, collapse
  * value), for the shard's fetch phase to hand out ({@link InfinoFetchSubPhase});
  * the shard result names each hit by its document in the shard's Lucene
@@ -71,12 +72,14 @@ import java.util.List;
  * aggregations are the table's, which the coordinating node reduces. A
  * cardinality or percentiles result is built from the engine's exact values
  * and cannot be merged from the shards' parts, so when one is asked for
- * over several shards, the first reached shard answers the aggregations
- * over every reached shard's table and the others over no rows. Every shard
+ * over several shards (of one index or of several), each shard gives where
+ * its rows are in its place, and the coordinating node answers it once over
+ * every reached shard's table, each at its shard's cut (see
+ * {@link InfinoExactAggregation}). Every shard
  * reads {@code now} as the coordinating node set it. A scroll pages in a
  * fixed order, the id's when the request names none: each round resumes
  * after the last hit the coordinating node handed out from this shard, as
- * cloud mode's scroll resumes after its last.
+ * proxy mode's scroll resumes after its last.
  */
 public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
 
@@ -176,12 +179,20 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         Collection<AggregationBuilder> builders = InfinoSearch.builders(source);
         // A cardinality or percentiles result is built from the engine's exact
         // values, and the coordinating node cannot merge such results from the
-        // shards' parts: the first reached shard answers the aggregations over
-        // every reached shard's table, the others over no rows.
-        List<Integer> reached = carried.shards(index.getName());
-        boolean overShards = !builders.isEmpty() && reached != null && reached.size() > 1 && InfinoAggregationProcessor.needsExactValues(builders);
+        // shards' parts: when the search reaches more shards than this one, the
+        // coordinating node answers each such aggregation once, over every
+        // reached shard's table (see InfinoExactAggregation), and this shard
+        // gives where its rows are in its place.
+        boolean atCoordinator = carried.exactAtCoordinator();
+        List<AggregationBuilder> here = new ArrayList<>();
+        for (AggregationBuilder b : builders) {
+            if (!atCoordinator || !InfinoAggregationProcessor.needsExactValues(List.of(b))) {
+                here.add(b);
+            }
+        }
+        boolean deferred = here.size() < builders.size();
         boolean exact = trackTotal(source);
-        boolean sharedTotal = !builders.isEmpty() && !overShards && plan.vector() == null && plan.postWhere() == null && exact;
+        boolean sharedTotal = !here.isEmpty() && !deferred && plan.vector() == null && plan.postWhere() == null && exact;
         boolean countWithAggs = sharedTotal && source.size() == 0;
         InfinoSearch.Page page = InfinoSearch.page(index, plan, source, !countWithAggs);
         long total = page.total();
@@ -190,18 +201,25 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             // is reduced on the coordinating node from each shard's groups.
             boolean shardOfMany = context.request().numberOfShards() > 1;
             InfinoAggregationProcessor processor = new InfinoAggregationProcessor(index, shardOfMany);
-            InfinoAggregationProcessor.Counted counted;
-            if (!overShards) {
-                counted = processor.evaluate(builders, plan, sharedTotal && !countWithAggs ? page.total() : null);
-            } else if (reached.get(0) == shardId.id()) {
-                counted = processor.evaluateOver(builders, plan, shardPlans(context, reached, source, now, access, cut, generation));
-            } else {
-                counted = processor.evaluateNothing(builders, plan);
+            InternalAggregations answered = InternalAggregations.EMPTY;
+            if (!here.isEmpty()) {
+                InfinoAggregationProcessor.Counted counted = processor.evaluate(here, plan, sharedTotal && !countWithAggs ? page.total() : null);
+                answered = counted.aggregations();
+                if (countWithAggs) {
+                    total = counted.total();
+                }
             }
-            context.queryResult().aggregations(counted.aggregations());
-            if (countWithAggs) {
-                total = counted.total();
+            InfinoExactAggregation.Part rows = new InfinoExactAggregation.Part(index.getName(), index.getUUID(), table, cut, generation);
+            List<InternalAggregation> ordered = new ArrayList<>(builders.size());
+            for (AggregationBuilder b : builders) {
+                if (here.contains(b)) {
+                    InternalAggregation a = answered.get(b.getName());
+                    ordered.add(a);
+                } else {
+                    ordered.add(new InfinoExactAggregation(b.getName(), b.getMetadata(), carried.request(), List.of(rows)));
+                }
             }
+            context.queryResult().aggregations(InternalAggregations.from(ordered));
         }
         TotalHits totalHits = laterRound
             ? scroll.totalHits
@@ -269,7 +287,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
     }
 
     /**
-     * The search one round of a scroll runs: cloud mode's scroll
+     * The search one round of a scroll runs: proxy mode's scroll
      * source ({@link InfinoSearch#scrollSource}), which pages in a fixed
      * order; the first round also keeps the request's total and
      * aggregations, and every later one resumes after the last hit the
@@ -313,31 +331,6 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         return round;
     }
 
-    /**
-     * The plan of the search over each reached shard's table, in shard order,
-     * each over the rows its shard's reader holds: this shard's by this
-     * search's reader ({@code cut}), another's on this node by its latest.
-     */
-    private static List<InfinoSearch.Plan> shardPlans(
-        SearchContext context,
-        List<Integer> reached,
-        SearchSourceBuilder source,
-        long now,
-        InfinoAccess access,
-        Long cut,
-        long generation
-    ) {
-        IndexMetadata md = context.indexShard().indexSettings().getIndexMetadata();
-        int own = context.indexShard().shardId().id();
-        List<InfinoSearch.Plan> out = new ArrayList<>(reached.size());
-        for (int shard : reached) {
-            String table = InfinoPlugin.tables().ensure(md, shard);
-            Long shardCut = shard == own ? cut : InfinoEngine.latestVisibleSeqNo(table);
-            out.add(visibleTo(InfinoSearch.plan(table, source, now, access), shardCut, generation));
-        }
-        return out;
-    }
-
     /** The version of the skeleton reader a search holds. */
     private static long readerVersion(ContextIndexSearcher searcher) {
         return searcher.getIndexReader() instanceof DirectoryReader reader ? reader.getVersion() : -1L;
@@ -348,7 +341,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
      * generation {@code generation} created by an operation past {@code cut};
      * the plan itself when {@code cut} is null or the table stamps no row.
      */
-    private static InfinoSearch.Plan visibleTo(InfinoSearch.Plan plan, Long cut, long generation) {
+    static InfinoSearch.Plan visibleTo(InfinoSearch.Plan plan, Long cut, long generation) {
         if (cut == null || plan.vector() != null || !InfinoNative.columns(plan.table()).containsKey(InfinoQueryTranslator.SEQ)) {
             return plan;
         }

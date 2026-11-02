@@ -13,9 +13,9 @@ index keeps OpenSearch's own write path through its shards: each primary's
 engine writes the documents to its shard's table and keeps a Lucene index of
 document ids only, and each shard's query phase is answered from the table.
 A node started with `infino.default_mode.enabled: false` (for a search
-plugin that needs the query phase itself) creates its indices in cloud mode.
+plugin that needs the query phase itself) creates its indices in proxy mode.
 
-In **cloud mode** (`index.infino.mode: cloud`) the plugin answers at the
+In **proxy mode** (`index.infino.mode: proxy`) the plugin answers at the
 **action layer**: bulk, search (so also `_count` and each request of an
 `_msearch`) and get for an Infino-backed index are served from the table
 before they are routed to any shard. The index's one shard stays empty.

@@ -21,6 +21,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionResponse;
+import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.index.shard.ShardId;
@@ -38,6 +39,7 @@ import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchPlugin;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
+import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.fetch.FetchSubPhase;
 import org.opensearch.search.query.QueryPhaseSearcher;
 import org.opensearch.threadpool.Scheduler;
@@ -62,7 +64,7 @@ import java.util.function.Supplier;
  * answered from its table by the same planner
  * ({@link InfinoQueryPhaseSearcher}).
  *
- * <p>In cloud mode ({@code index.infino.mode: cloud}) bulk, search and get
+ * <p>In proxy mode ({@code index.infino.mode: proxy}) bulk, search and get
  * are answered from the table at the action layer, before they are routed
  * to a shard, so no document is ever written to Lucene and the node holds
  * no index data of its own. The index itself exists in cluster state as a
@@ -81,7 +83,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     public static final Setting<Boolean> INFINO_ENABLED = Setting.boolSetting("index.infino.enabled", false, Setting.Property.IndexScope);
 
     /** {@link #INFINO_MODE}: served before any shard, from the table; no Lucene. */
-    public static final String MODE_CLOUD = "cloud";
+    public static final String MODE_PROXY = "proxy";
     /** {@link #INFINO_MODE}: served through the shard's engine and query phase, over a Lucene skeleton. The setting's default. */
     public static final String MODE_DEFAULT = "default";
 
@@ -91,13 +93,13 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      * {@link InfinoEngine}, whose Lucene index holds each document's identity
      * only, and answers the shard's query phase from the table
      * ({@link InfinoQueryPhaseSearcher}), a table per shard; it needs
-     * {@link #DEFAULT_MODE_ENABLED} on the node. {@code cloud} answers bulk,
+     * {@link #DEFAULT_MODE_ENABLED} on the node. {@code proxy} answers bulk,
      * search and get before the request reaches a shard, and nothing is
      * written to Lucene.
      */
     public static final Setting<String> INFINO_MODE = new Setting<>("index.infino.mode", MODE_DEFAULT, mode -> {
-        if (!MODE_CLOUD.equals(mode) && !MODE_DEFAULT.equals(mode)) {
-            throw new IllegalArgumentException("[index.infino.mode] must be [" + MODE_CLOUD + "] or [" + MODE_DEFAULT + "], got [" + mode + "]");
+        if (!MODE_PROXY.equals(mode) && !MODE_DEFAULT.equals(mode)) {
+            throw new IllegalArgumentException("[index.infino.mode] must be [" + MODE_PROXY + "] or [" + MODE_DEFAULT + "], got [" + mode + "]");
         }
         return mode;
     }, Setting.Property.IndexScope, Setting.Property.Final);
@@ -107,7 +109,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      * default mode is every index's default. A node turns it off where
      * another search plugin needs the node's one query-phase searcher
      * (neural search's hybrid query, for one); its indices are then created
-     * in cloud mode.
+     * in proxy mode.
      */
     public static final Setting<Boolean> DEFAULT_MODE_ENABLED = Setting.boolSetting("infino.default_mode.enabled", true, Setting.Property.NodeScope);
 
@@ -268,8 +270,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         return TABLES;
     }
 
-    /** Whether an index with these settings is Infino-backed and in cloud mode, served at the action layer. */
-    static boolean inCloudMode(Settings indexSettings) {
+    /** Whether an index with these settings is Infino-backed and in proxy mode, served at the action layer. */
+    static boolean inProxyMode(Settings indexSettings) {
         return indexSettings.getAsBoolean(INFINO_ENABLED.getKey(), false) && !MODE_DEFAULT.equals(INFINO_MODE.get(indexSettings));
     }
 
@@ -306,6 +308,12 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     @Override
     public List<SearchExtSpec<?>> getSearchExts() {
         return List.of(new SearchExtSpec<>(InfinoQueryExt.NAME, InfinoQueryExt::new, InfinoQueryExt::fromXContent));
+    }
+
+    /** A shard's part of an aggregation the coordinating node answers, as it travels to that node (see {@link InfinoExactAggregation}). */
+    @Override
+    public List<NamedWriteableRegistry.Entry> getNamedWriteables() {
+        return List.of(new NamedWriteableRegistry.Entry(InternalAggregation.class, InfinoExactAggregation.NAME, InfinoExactAggregation::new));
     }
 
     /** The node services arrive by injection (see {@link InfinoServices}). */
@@ -457,7 +465,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      * which is the state the plugin exists to keep off the node.
      *
      * <p>An Infino-backed index created without a mode is stamped with the
-     * one the creating node serves: default mode, or cloud mode where
+     * one the creating node serves: default mode, or proxy mode where
      * {@link #DEFAULT_MODE_ENABLED} is off. The mode is final, so the index
      * keeps it on every node.
      */
@@ -477,7 +485,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
                     }
                 }
                 if (enabled && !templateAndRequestSettings.hasValue(INFINO_MODE.getKey())) {
-                    out.put(INFINO_MODE.getKey(), defaultModeEnabled ? MODE_DEFAULT : MODE_CLOUD);
+                    out.put(INFINO_MODE.getKey(), defaultModeEnabled ? MODE_DEFAULT : MODE_PROXY);
                 }
                 return out.build();
             }
