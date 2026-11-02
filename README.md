@@ -18,8 +18,9 @@ with its mapping and aliases; the rows are where they were.
 The original spike and its findings are in [HANDOVER.md](HANDOVER.md). Since
 then the plugin has been shaped for log and event streams: the table is
 declared from the index **mapping** (dates are timestamp columns, text fields
-carry their own BM25 index, keywords are exact columns, the id column carries
-a term index), search serves date ranges with date math, field sorts,
+carry their own BM25 index, keywords are exact columns, numeric and date
+fields carry a range index unless the mapping says `"index": false`, the id
+column carries a term index), search serves date ranges with date math, field sorts,
 field-scoped text search with filters, and the aggregations dashboards ask
 for (`date_histogram`, `terms`, `histogram`, `filters`, `range`, metrics
 including `cardinality` and `percentiles`, nested to any depth), writes group

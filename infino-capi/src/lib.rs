@@ -351,6 +351,10 @@ struct MappedField {
     data_type: DataType,
     fts: bool,
     vector: Option<(usize, Metric)>,
+    /// A numeric or date field the mapping indexes, as OpenSearch indexes
+    /// every such field for ranges unless it says `"index": false`: the
+    /// table gives it a range index.
+    range: bool,
 }
 
 /// The `properties` object of a mapping, whether the caller passed the
@@ -396,6 +400,21 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             format!("{prefix}.{name}")
         };
         let ty = def.get("type").and_then(|t| t.as_str());
+        let indexed = def.get("index").and_then(|i| i.as_bool()) != Some(false);
+        let ranged = matches!(
+            ty,
+            Some("date")
+                | Some("date_nanos")
+                | Some("long")
+                | Some("integer")
+                | Some("short")
+                | Some("byte")
+                | Some("unsigned_long")
+                | Some("double")
+                | Some("float")
+                | Some("half_float")
+                | Some("scaled_float")
+        );
         let (data_type, fts, vector) = match ty {
             Some("date") | Some("date_nanos") => (date_type(), false, None),
             Some("keyword")
@@ -440,6 +459,7 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             data_type,
             fts,
             vector,
+            range: ranged && indexed,
         });
     }
 }
@@ -505,9 +525,14 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                 .iter()
                 .filter(|f| schema.field_with_name(&f.path).is_err())
                 .map(|f| {
-                    FieldPatch::named(f.path.clone())
+                    let patch = FieldPatch::named(f.path.clone())
                         .with_type(f.data_type.clone())
-                        .with_nullable(true)
+                        .with_nullable(true);
+                    if f.range {
+                        patch.with_index(ColumnIndex::Range)
+                    } else {
+                        patch
+                    }
                 })
                 .collect();
             let added = patches.len();
@@ -540,6 +565,9 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                 }
                 if let Some((dim, metric)) = f.vector {
                     spec = spec.vector(f.path.clone(), dim, metric);
+                }
+                if f.range {
+                    spec = spec.range(f.path.clone());
                 }
             }
             conn.create_table(name, Arc::new(Schema::new(fields)), spec)
@@ -2054,6 +2082,27 @@ mod tests {
             .iter()
             .all(|cc| cc["vector"] == false));
         close(h);
+    }
+
+    #[test]
+    fn numeric_and_date_fields_get_a_range_index_unless_unindexed() {
+        let mapping = json!({"properties": {
+            "@timestamp": {"type": "date"},
+            "status": {"type": "integer"},
+            "took": {"type": "float"},
+            "bytes": {"type": "long", "index": false},
+            "level": {"type": "keyword"},
+            "message": {"type": "text"},
+            "ok": {"type": "boolean"},
+            "http": {"properties": {"code": {"type": "short"}}}
+        }});
+        let mut ranged: Vec<String> = mapped_fields(&mapping)
+            .into_iter()
+            .filter(|f| f.range)
+            .map(|f| f.path)
+            .collect();
+        ranged.sort();
+        assert_eq!(ranged, ["@timestamp", "http.code", "status", "took"]);
     }
 
     #[test]
