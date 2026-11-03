@@ -75,7 +75,15 @@ final class InfinoAliasFilter {
         return any;
     }
 
-    /** {@code filter}, the filter of {@code alias}, when the table answers it; refused otherwise. */
+    /**
+     * {@code filter}, the filter of {@code alias}, when the table answers it; refused otherwise.
+     *
+     * <p>The filter is translated here only to check it, over every column of the table, and
+     * translated again where the search reads it ({@link InfinoAccess#documentsWhere}), over the
+     * columns the user may name: under a field rule, a field hidden from the user is unmapped there
+     * and matches nothing. The two are different predicates for such a user, so the one made here
+     * is never kept for the search.
+     */
     private static QueryBuilder served(QueryBuilder filter, String alias, Map<String, Column> columns, String table, long nowMillis) {
         if (InfinoQueryTranslator.rulePredicate(filter, columns, table, nowMillis) == null) {
             throw new IllegalArgumentException(
