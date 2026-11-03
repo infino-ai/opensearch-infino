@@ -126,7 +126,7 @@ jobs:
         with:
           name: plugin
           path: |
-            plugin/build/distributions/infino-engine-${{ inputs.os_version }}.zip
+            plugin/build/distributions/infino-engine.zip
             infino-capi/target/release/libinfino_capi.so
           if-no-files-found: error
 
@@ -170,7 +170,7 @@ jobs:
           ENGINE_MACHINE: ${{ inputs.machine_type }}
           RUNNER_MACHINE: ${{ inputs.machine_type }}
           ENGINE_SSDS: ${{ inputs.engine_ssds }}
-          PLUGIN_ZIP: ${{ runner.temp }}/plugin/plugin/build/distributions/infino-engine-${{ inputs.os_version }}.zip
+          PLUGIN_ZIP: ${{ runner.temp }}/plugin/plugin/build/distributions/infino-engine.zip
           BRIDGE_LIB: ${{ runner.temp }}/plugin/infino-capi/target/release/libinfino_capi.so
           INFINO_PLATFORM_URL: ${{ matrix.engine == 'opensearch-infino-proxy' && inputs.platform_url || '' }}
           INFINO_DATABASE: ${{ inputs.platform_database }}

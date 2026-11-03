@@ -67,7 +67,7 @@ failure or Ctrl-C, unless `KEEP=1`.
 ## Run
 
 ```bash
-PLUGIN_ZIP=plugin/build/distributions/infino-engine-3.9.0.zip \
+PLUGIN_ZIP=plugin/build/distributions/infino-engine.zip \
 BRIDGE_LIB=infino-capi/target/release/libinfino_capi.so \
 ENGINES=elasticsearch,opensearch,opensearch-infino \
 TRACK=http_logs \

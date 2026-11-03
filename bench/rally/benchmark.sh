@@ -82,7 +82,7 @@ for e in "${ENGINE_LIST[@]}"; do
   case "$e" in
     elasticsearch|opensearch) ;;
     opensearch-infino|opensearch-infino-proxy)
-      : "${PLUGIN_ZIP:?$e needs PLUGIN_ZIP (plugin/build/distributions/infino-engine-*.zip)}"
+      : "${PLUGIN_ZIP:?$e needs PLUGIN_ZIP (plugin/build/distributions/infino-engine.zip)}"
       : "${BRIDGE_LIB:?$e needs BRIDGE_LIB (libinfino_capi.so)}" ;;
     *) echo "unknown engine: $e" >&2; exit 1 ;;
   esac
