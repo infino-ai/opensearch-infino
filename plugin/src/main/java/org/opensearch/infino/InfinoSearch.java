@@ -680,7 +680,7 @@ public final class InfinoSearch {
         return returnsSource(source) || !requestedFields(source.docValueFields(), source.fetchFields()).isEmpty();
     }
 
-    /** {@code rows} up to {@code fetch}, each with its source from the table, read for those ids in one statement. */
+    /** {@code rows} up to {@code fetch}, each with its source from the table, looked up by its id. */
     private static List<Map<String, Object>> withSources(String table, List<Map<String, Object>> rows, int fetch) {
         List<Map<String, Object>> page = rows.subList(0, Math.min(rows.size(), fetch));
         List<String> ids = new ArrayList<>(page.size());
