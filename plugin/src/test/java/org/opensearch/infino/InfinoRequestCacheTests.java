@@ -12,6 +12,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.functionscore.ScoreFunctionBuilders;
 import org.opensearch.indices.IndicesRequestCache;
@@ -21,6 +22,7 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.InternalSearchResponse;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.Collections;
 import java.util.List;
 
 /** Which searches the request cache keeps, under what key, and for how long. */
@@ -40,7 +42,18 @@ public class InfinoRequestCacheTests extends OpenSearchTestCase {
     }
 
     private static String key(SearchRequest search, SearchSourceBuilder source, Settings indexSettings, InfinoAccess access) {
-        return InfinoRequestCache.key(search, source, List.of(index(indexSettings)), List.of(TABLE), List.of(access));
+        return key(search, source, indexSettings, access, null);
+    }
+
+    private static String key(SearchRequest search, SearchSourceBuilder source, Settings indexSettings, InfinoAccess access, QueryBuilder filter) {
+        return InfinoRequestCache.key(
+            search,
+            source,
+            List.of(index(indexSettings)),
+            List.of(TABLE),
+            List.of(access),
+            Collections.singletonList(filter)
+        );
     }
 
     private static String key(SearchSourceBuilder source) {
@@ -101,6 +114,27 @@ public class InfinoRequestCacheTests extends OpenSearchTestCase {
         assertNull(key(new SearchRequest(), aggregationOnly(), Settings.EMPTY, hidden));
         InfinoAccess documents = new InfinoAccess(List.of(QueryBuilders.termQuery("tag", "x")), null, null);
         assertNull(key(new SearchRequest(), aggregationOnly(), Settings.EMPTY, documents));
+    }
+
+    /**
+     * A search through a filtering alias is kept, under its filter: two
+     * aliases over the index with the same body never share a response, nor
+     * does either with the index read whole.
+     */
+    public void testAFilteredAliasIsKeptUnderItsFilter() {
+        SearchRequest search = new SearchRequest();
+        String whole = key(search, aggregationOnly(), Settings.EMPTY, InfinoAccess.NONE, null);
+        String tagX = key(search, aggregationOnly(), Settings.EMPTY, InfinoAccess.NONE, QueryBuilders.termQuery("tag", "x"));
+        String tagY = key(search, aggregationOnly(), Settings.EMPTY, InfinoAccess.NONE, QueryBuilders.termQuery("tag", "y"));
+        assertNotNull(tagX);
+        assertNotEquals(whole, tagX);
+        assertNotEquals(tagX, tagY);
+        assertEquals(tagX, key(search, aggregationOnly(), Settings.EMPTY, InfinoAccess.NONE, QueryBuilders.termQuery("tag", "x")));
+        // A filter whose date math reads the time keeps different rows as time passes.
+        assertNull(key(search, aggregationOnly(), Settings.EMPTY, InfinoAccess.NONE, QueryBuilders.rangeQuery("ts").gte("now-1d")));
+        // A user the security plugin narrows is still not kept, alias or not.
+        InfinoAccess documents = new InfinoAccess(List.of(QueryBuilders.termQuery("tag", "x")), null, null);
+        assertNull(key(search, aggregationOnly(), Settings.EMPTY, documents, QueryBuilders.termQuery("tag", "x")));
     }
 
     public void testAWriteMovesTheKeyAwayFromWhatWasReadBefore() {

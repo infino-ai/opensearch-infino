@@ -19,6 +19,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.index.Index;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
@@ -41,6 +42,12 @@ import java.util.function.Supplier;
 public class InfinoSearchActionFilter implements ActionFilter {
 
     private static final Logger log = LogManager.getLogger(InfinoSearchActionFilter.class);
+    /**
+     * The shard whose table a default-mode index's alias filters are checked
+     * against: every shard's table holds the index's mapped columns, and a
+     * filter the engine cannot serve is refused whatever the shard.
+     */
+    private static final int ALIAS_CHECK_SHARD = 0;
 
     private final Supplier<ClusterService> clusterService;
     private final Supplier<IndexNameExpressionResolver> resolver;
@@ -110,10 +117,29 @@ public class InfinoSearchActionFilter implements ActionFilter {
             SearchSourceBuilder written = search.source() == null ? new SearchSourceBuilder() : search.source();
             String id = InfinoQueryExt.newRequestId();
             long now = System.currentTimeMillis();
+            // A filtering alias the search reaches an index through is checked
+            // here, before any shard reads, as proxy mode checks it: one the
+            // table cannot answer is refused naming the alias. Each shard reads
+            // through the filter the cluster resolves for it.
+            Map<String, QueryBuilder> filters = new HashMap<>();
+            try {
+                for (String name : concrete) {
+                    IndexMetadata md = state.metadata().index(name);
+                    if (md.getAliases().isEmpty()) {
+                        continue; // no alias, so none that filters
+                    }
+                    String table = InfinoPlugin.tables().ensure(md, ALIAS_CHECK_SHARD);
+                    filters.put(name, InfinoAliasFilter.of(state, names, md, search.indices(), table, now));
+                }
+            } catch (Exception e) {
+                listener.onFailure(e);
+                return;
+            }
             // A cardinality or percentiles aggregation over more than one shard is
             // answered here, once, over every reached shard's table (see
             // InfinoExactAggregation): the search is recorded for it, with what the
-            // user may see of each index, read now under the user's own identity.
+            // user may see of each index, read now under the user's own identity,
+            // and what an alias filter keeps of it.
             boolean exactAtCoordinator = reachedShardCount(clusters, names, state, search, concrete) > 1
                 && written.aggregations() != null
                 && InfinoAggregationProcessor.needsExactValues(written.aggregations().getAggregatorFactories());
@@ -121,7 +147,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
             if (exactAtCoordinator) {
                 Map<String, InfinoAccess> access = new HashMap<>();
                 for (String name : concrete) {
-                    access.put(name, InfinoSecurity.access(name, InfinoSecurityCalls.SEARCH));
+                    access.put(name, InfinoSecurity.access(name, InfinoSecurityCalls.SEARCH).filteredBy(filters.get(name)));
                 }
                 InfinoExactAggregation.record(id, written, now, access);
                 // Its final reduce runs before the search answers, so the record
@@ -145,10 +171,19 @@ public class InfinoSearchActionFilter implements ActionFilter {
             SearchSourceBuilder source = search.source() == null ? new SearchSourceBuilder() : search.source();
             InfinoTables tables = InfinoPlugin.tables();
             Function<Index, String> tableOf = index -> tables.ensure(metadata.get(infino.indexOf(index)));
-            // Each index is read under what the security plugin lets this user see of it.
+            // Each index is read under what the security plugin lets this user see
+            // of it, and what a filtering alias the request reached it through keeps.
+            long now = System.currentTimeMillis();
             Map<Index, InfinoAccess> access = new HashMap<>();
-            for (Index index : infino) {
-                access.put(index, InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH));
+            List<InfinoAccess> rules = new ArrayList<>();
+            List<QueryBuilder> filters = new ArrayList<>();
+            for (int i = 0; i < infino.size(); i++) {
+                Index index = infino.get(i);
+                InfinoAccess own = InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH);
+                QueryBuilder filter = InfinoAliasFilter.of(state, names, metadata.get(i), search.indices(), tableOf.apply(index), now);
+                rules.add(own);
+                filters.add(filter);
+                access.put(index, own.filteredBy(filter));
             }
             // A repeated request is answered from the responses kept for it,
             // as the shard request cache answers it for a Lucene index.
@@ -159,7 +194,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
                 for (Index index : infino) {
                     tableNames.add(tableOf.apply(index));
                 }
-                key = InfinoRequestCache.key(search, source, metadata, tableNames, access.values());
+                key = InfinoRequestCache.key(search, source, metadata, tableNames, rules, filters);
                 SearchResponse hit = key == null ? null : kept.get(key, start);
                 if (hit != null) {
                     @SuppressWarnings("unchecked")

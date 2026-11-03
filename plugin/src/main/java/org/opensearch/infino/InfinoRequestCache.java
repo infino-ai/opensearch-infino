@@ -17,6 +17,7 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.indices.IndicesRequestCache;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
@@ -40,7 +41,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * request, one whose answer depends on the time it runs ({@code now} in date
  * math), on a script or on a random score ({@link #changesWithoutWrites}),
  * or one the security plugin narrows for its user: a document- or
- * field-level rule, or a masked field.
+ * field-level rule, or a masked field. A search through a filtering alias
+ * is kept under its alias filters (see {@link #key}).
  *
  * <p>A response is kept under its tables' write generations: every write
  * this node makes to a table moves the table's generation, before the write
@@ -149,8 +151,22 @@ final class InfinoRequestCache {
      * of {@code metadata}, in the same order), or null when the request is not
      * one to keep. Taken before the search runs, so a write that lands while
      * it runs moves the key away from what it reads.
+     *
+     * <p>{@code access} is what the security plugin lets the user see of each
+     * index, and {@code filters} what the filtering aliases the request
+     * reached each index through keep of it (null for one read whole). A
+     * filter is part of what is read, so it is part of the key: two aliases
+     * over one index with the same body but different filters answer
+     * differently, and must never be served each other's response.
      */
-    static String key(SearchRequest search, SearchSourceBuilder source, List<IndexMetadata> metadata, List<String> tables, Collection<InfinoAccess> access) {
+    static String key(
+        SearchRequest search,
+        SearchSourceBuilder source,
+        List<IndexMetadata> metadata,
+        List<String> tables,
+        Collection<InfinoAccess> access,
+        List<QueryBuilder> filters
+    ) {
         if (search.scroll() != null || source.profile()) {
             return null;
         }
@@ -183,8 +199,18 @@ final class InfinoRequestCache {
             return null;
         }
         StringBuilder key = new StringBuilder().append(CONNECTION.get());
-        for (String table : tables) {
+        for (int i = 0; i < tables.size(); i++) {
+            String table = tables.get(i);
             key.append('\u0000').append(table).append('\u0000').append(generation(table));
+            QueryBuilder filter = filters.get(i);
+            if (filter != null) {
+                String kept = filter.toString();
+                // A filter whose date math reads `now` keeps different rows as time passes.
+                if (changesWithoutWrites(XContentHelper.convertToMap(new BytesArray(kept), false, MediaTypeRegistry.JSON).v2())) {
+                    return null;
+                }
+                key.append('\u0000').append(kept);
+            }
         }
         return key.append('\u0000').append(body).toString();
     }
