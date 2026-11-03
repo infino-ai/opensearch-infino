@@ -4,6 +4,7 @@
 
 package org.opensearch.infino;
 
+import org.opensearch.OpenSearchParseException;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateMathParser;
 import org.opensearch.index.query.BoolQueryBuilder;
@@ -241,8 +242,10 @@ final class InfinoQueryTranslator {
 
     /**
      * The column a query names, resolving {@code name.keyword} to the string
-     * column {@code name}. A field's list column ({@link #LIST_SUFFIX}) is no
-     * field of its own: a query naming one names an unmapped field.
+     * column {@code name} read by its whole value (as a keyword multi-field
+     * the mapping declares is, see {@link InfinoNative#columns}). A field's
+     * list column ({@link #LIST_SUFFIX}) is no field of its own: a query
+     * naming one names an unmapped field.
      */
     Column column(String field) {
         if (field == null || field.endsWith(LIST_SUFFIX)) {
@@ -252,7 +255,7 @@ final class InfinoQueryTranslator {
         if (c == null && field.endsWith(KEYWORD_SUFFIX)) {
             Column base = cols.get(field.substring(0, field.length() - KEYWORD_SUFFIX.length()));
             if (base != null && base.isString()) {
-                return base;
+                return base.exact();
             }
         }
         return c;
@@ -928,16 +931,18 @@ final class InfinoQueryTranslator {
         // Each bound as a comparison and its literal, applied to whichever values the field has.
         List<String> bounds = new ArrayList<>();
         ZoneId zone = r.timeZone() == null ? null : ZoneId.of(r.timeZone());
+        // A date bound is read as OpenSearch reads it: in the request's format, else the field's own.
+        String format = r.format() != null ? r.format() : typed.dateFormat();
         if (r.from() != null) {
             // An exclusive lower date bound rounds up (gt 2026-10-24 means after that day).
-            String lit = typed.isTimestamp() ? dateLiteral(r.from(), r.format(), !r.includeLower(), zone) : scalar(typed, r.from(), false);
+            String lit = typed.isTimestamp() ? dateBound(r.from(), format, !r.includeLower(), zone) : scalar(typed, r.from(), false);
             if (lit == null) {
                 return null;
             }
             bounds.add((r.includeLower() ? " >= " : " > ") + lit);
         }
         if (r.to() != null) {
-            String lit = typed.isTimestamp() ? dateLiteral(r.to(), r.format(), r.includeUpper(), zone) : scalar(typed, r.to(), false);
+            String lit = typed.isTimestamp() ? dateBound(r.to(), format, r.includeUpper(), zone) : scalar(typed, r.to(), false);
             if (lit == null) {
                 return null;
             }
@@ -996,11 +1001,26 @@ final class InfinoQueryTranslator {
 
     /** A literal of {@code value} for an expression's type, or null when it cannot be one. */
     static String literalForType(SqlType type, Object value, long nowMillis) {
+        return literalForType(type, value, nowMillis, null);
+    }
+
+    /**
+     * {@link #literalForType(SqlType, Object, long)} for a value of a field whose date format
+     * is {@code dateFormat} (null for the default), read as stock reads a search_after value:
+     * a number is epoch milliseconds, as a hit's sort values give it, and text is read by the
+     * field's format (an {@code epoch_second} field's {@code "897436800"} is seconds).
+     */
+    static String literalForType(SqlType type, Object value, long nowMillis, String dateFormat) {
         return switch (type) {
             case STRING -> literal(value.toString());
             case BOOL -> Boolean.parseBoolean(value.toString()) ? "true" : "false";
             case INT, FLOAT -> number(value);
-            case DATE -> new InfinoQueryTranslator(Map.of(), "", nowMillis, false).dateLiteral(value, null, false, null);
+            case DATE -> new InfinoQueryTranslator(Map.of(), "", nowMillis, false).dateLiteral(
+                value,
+                value instanceof Number ? null : dateFormat,
+                false,
+                null
+            );
             default -> null;
         };
     }
@@ -1017,7 +1037,7 @@ final class InfinoQueryTranslator {
             return number(value);
         }
         if (c.isTimestamp()) {
-            return dateLiteral(value, null, roundUp, null);
+            return dateLiteral(value, c.dateFormat(), roundUp, null);
         }
         return null;
     }
@@ -1034,10 +1054,31 @@ final class InfinoQueryTranslator {
         }
     }
 
-    /** A timestamp literal from a date, epoch milliseconds, or date math, in the engine's ISO form. */
+    /**
+     * A range's date bound as {@link #dateLiteral}; a bound {@code format} cannot read is refused
+     * as OpenSearch refuses it, rather than matching nothing.
+     */
+    private String dateBound(Object value, String format, boolean roundUp, ZoneId zone) {
+        String lit = dateLiteral(value, format, roundUp, zone);
+        if (lit == null) {
+            throw new OpenSearchParseException(
+                "failed to parse date field [{}] with format [{}]",
+                value,
+                format == null ? DEFAULT_DATE_FORMAT : format
+            );
+        }
+        return lit;
+    }
+
+    /**
+     * A timestamp literal from a date, epoch milliseconds, or date math, in the engine's ISO form.
+     * A number is epoch milliseconds in the default format and read by {@code format} when one is
+     * given, as OpenSearch reads a number by the field's format (an {@code epoch_second} field's
+     * {@code 893966296} is seconds).
+     */
     private String dateLiteral(Object value, String format, boolean roundUp, ZoneId zone) {
         Instant at;
-        if (value instanceof Number n) {
+        if (value instanceof Number n && format == null) {
             at = Instant.ofEpochMilli(n.longValue());
         } else {
             DateMathParser parser = DateFormatter.forPattern(format == null ? DEFAULT_DATE_FORMAT : format).toDateMathParser();

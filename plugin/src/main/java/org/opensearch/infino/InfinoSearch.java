@@ -65,6 +65,7 @@ import java.io.UncheckedIOException;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -742,7 +743,9 @@ public final class InfinoSearch {
                 strict = InfinoQueryTranslator.NONE;
                 same = col + " IS NULL";
             } else {
-                String lit = InfinoQueryTranslator.literalForType(s.type(), value, now);
+                // A date sort's value as text is read by its field's own format, as stock reads it.
+                Column sorted = plan.cols().get(s.name());
+                String lit = InfinoQueryTranslator.literalForType(s.type(), value, now, sorted == null ? null : sorted.dateFormat());
                 if (lit == null) {
                     throw new IllegalArgumentException("[infino] search_after value [" + value + "] is not a " + s.type().name().toLowerCase(Locale.ROOT));
                 }
@@ -1103,6 +1106,46 @@ public final class InfinoSearch {
             SearchResponse.Clusters.EMPTY
         );
         return new Searched(response, cursor);
+    }
+
+    /**
+     * How many sort values each hit hands the client: one per field or script
+     * sort its request names ({@code _score} and {@code _doc} give none here),
+     * as stock gives one per sort it names. What the plugin adds past them,
+     * the id it breaks ties on and a scroll's own order by the id, orders and
+     * resumes its pages and is not handed out.
+     */
+    static int requestedSortValues(SearchSourceBuilder source) {
+        if (source == null || source.sorts() == null) {
+            return 0;
+        }
+        int count = 0;
+        for (SortBuilder<?> sort : source.sorts()) {
+            if (!ordersNothing(sort)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * {@code response} with each hit's sort values cut to the {@code count}
+     * its request names ({@link #requestedSortValues}), as the client reads
+     * them: the values kept as formatted, the plugin's own after them gone.
+     */
+    static SearchResponse handOut(SearchResponse response, int count) {
+        if (response == null || response.getHits() == null) {
+            return response;
+        }
+        for (SearchHit h : response.getHits().getHits()) {
+            Object[] values = h.getSortValues();
+            if (values.length > count) {
+                DocValueFormat[] asFormatted = new DocValueFormat[count];
+                Arrays.fill(asFormatted, DocValueFormat.RAW);
+                h.sortValues(Arrays.copyOf(values, count), asFormatted);
+            }
+        }
+        return response;
     }
 
     /** The request with its page starting after {@code values}, the rest as it is. */

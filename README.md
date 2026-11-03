@@ -53,7 +53,7 @@ One source tree builds for 2.19 through 3.9; the full check passes on
 8.12.1, those of 3.0 want 8.14, 3.3 and later take 9.x).
 
 ```bash
-./scripts/build.sh                      # infino-capi/target/release/libinfino_capi.{so,dylib} + plugin/build/distributions/infino-engine-<ver>.zip
+./scripts/build.sh                      # infino-capi/target/release/libinfino_capi.{so,dylib} + plugin/build/distributions/infino-engine.zip
 cd plugin && gradle check               # precommit gates, unit tests, YAML REST suites on a test cluster with the bridge
 ./scripts/check-all.sh                  # the same check on every supported release
 ```
@@ -69,13 +69,41 @@ for each release's build tools from `GRADLE_8_12`, `GRADLE_8_14` and `GRADLE`.
 There is no published release yet, so the two artifacts come from the build
 above: the native bridge (`infino-capi/target/release/libinfino_capi.so`, or
 `.dylib` on macOS) and the plugin zip for one OpenSearch version
-(`plugin/build/distributions/infino-engine-<version>.zip`).
+(`plugin/build/distributions/infino-engine.zip`).
 
 **1. Install the plugin on every node**, into the exact OpenSearch version
 the zip was built for:
 
 ```bash
-bin/opensearch-plugin install -b file:///path/infino-engine-3.9.0.zip
+bin/opensearch-plugin install -b file:///path/infino-engine.zip
+```
+
+The standard OpenSearch bundle ships the neural search plugin, which
+registers the node's one query-phase searcher for its hybrid query, as
+default mode does. Beside it the node starts with its indices in proxy mode
+(over the same storage) and says so in its log; remove it to serve them in
+default mode:
+
+```bash
+bin/opensearch-plugin remove opensearch-neural-search
+```
+
+`infino.default_mode.enabled: true` set beside neural search stops the node,
+naming the two ways out. Neural search's queries run on Lucene's vectors,
+which an Infino-backed index does not keep; the plugin serves `infino_knn`
+and `infino_hybrid` instead. To embed documents as they are indexed, use
+ml-commons' `ml_inference` ingest processor, which stays installed, in place
+of neural search's `text_embedding`: the same model, its input and output
+mapped to the document's fields (the names a model takes and gives are in
+the processor's documentation):
+
+```json
+PUT _ingest/pipeline/embed
+{"processors": [{"ml_inference": {
+  "model_id": "<model id>",
+  "input_map": [{"<model input>": "message"}],
+  "output_map": [{"message_embedding": "<model output>"}]
+}}]}
 ```
 
 **2. Point the JVM at the bridge**, in `config/jvm.options` or

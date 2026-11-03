@@ -54,7 +54,11 @@ final class InfinoScrolls {
 
     private InfinoScrolls() {}
 
-    /** One open scroll. {@code after} is the cursor per index: the sort values of the last hit handed out from it. */
+    /**
+     * One open scroll. {@code after} is the cursor per index: the sort values
+     * of the last hit handed out from it. {@code sortValues} is how many sort
+     * values each hit hands the client (see {@link InfinoSearch#requestedSortValues}).
+     */
     static final class Scroll {
         final String id;
         final String principal;
@@ -62,6 +66,7 @@ final class InfinoScrolls {
         final SearchSourceBuilder source;
         final Map<Index, InfinoAccess> access;
         final TotalHits total;
+        final int sortValues;
         volatile Map<Index, Object[]> after;
         volatile long expiresAtMillis;
 
@@ -72,6 +77,7 @@ final class InfinoScrolls {
             SearchSourceBuilder source,
             Map<Index, InfinoAccess> access,
             TotalHits total,
+            int sortValues,
             Map<Index, Object[]> after,
             long expiresAtMillis
         ) {
@@ -81,12 +87,18 @@ final class InfinoScrolls {
             this.source = source;
             this.access = access;
             this.total = total;
+            this.sortValues = sortValues;
             this.after = after;
             this.expiresAtMillis = expiresAtMillis;
         }
     }
 
+    /** How many sort values the hits of a scroll OpenSearch serves over default-mode indices hand the client, until it expires. */
+    private record HandedOut(int sortValues, long expiresAtMillis) {}
+
     private static final Map<String, Scroll> OPEN = new ConcurrentHashMap<>();
+    /** By the scroll ids OpenSearch issued for scrolls over default-mode indices (see {@link #handsOut}). */
+    private static final Map<String, HandedOut> HANDED_OUT = new ConcurrentHashMap<>();
     private static volatile Scheduler.Cancellable sweep;
 
     /** Start the sweep of expired scrolls; once per node. */
@@ -102,6 +114,7 @@ final class InfinoScrolls {
             sweep = null;
         }
         OPEN.clear();
+        HANDED_OUT.clear();
     }
 
     /** Whether an id is one of this node's. */
@@ -126,10 +139,40 @@ final class InfinoScrolls {
         SearchSourceBuilder source,
         Map<Index, InfinoAccess> access,
         TotalHits total,
+        int sortValues,
         Map<Index, Object[]> after,
         TimeValue keepAlive
     ) {
-        OPEN.put(id, new Scroll(id, principal, indices, source, access, total, after, expiry(keepAlive)));
+        OPEN.put(id, new Scroll(id, principal, indices, source, access, total, sortValues, after, expiry(keepAlive)));
+    }
+
+    /**
+     * Record that the hits of the scroll OpenSearch issued {@code scrollId}
+     * for, over default-mode indices, hand the client {@code sortValues} sort
+     * values: its shards' hits carry the id their tables break ties on after
+     * them. Kept until the scroll's keep-alive passes; each page renews it.
+     */
+    static void handsOut(String scrollId, int sortValues, TimeValue keepAlive) {
+        if (scrollId != null) {
+            HANDED_OUT.put(scrollId, new HandedOut(sortValues, expiry(keepAlive)));
+        }
+    }
+
+    /** How many sort values the hits of the scroll {@code scrollId} hand the client ({@link #handsOut}); null for one not recorded. */
+    static Integer handedOut(String scrollId) {
+        HandedOut kept = scrollId == null ? null : HANDED_OUT.get(scrollId);
+        return kept == null ? null : kept.sortValues();
+    }
+
+    /** Forget what {@link #handsOut} recorded for the scrolls named (every one for {@link #ALL}). */
+    static void forgetHandedOut(Collection<String> scrollIds) {
+        for (String id : scrollIds) {
+            if (ALL.equals(id)) {
+                HANDED_OUT.clear();
+                return;
+            }
+            HANDED_OUT.remove(id);
+        }
     }
 
     /**
@@ -188,5 +231,6 @@ final class InfinoScrolls {
         if (!expired.isEmpty()) {
             log.debug("[infino] dropped {} expired scroll(s)", expired.size());
         }
+        HANDED_OUT.values().removeIf(kept -> kept.expiresAtMillis() < now);
     }
 }

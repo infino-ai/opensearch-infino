@@ -63,7 +63,9 @@
   - match: { hits.hits.1._id: "b2" }
   - match: { hits.hits.2._id: "a3" }
 
-  # search_after through rows sharing the sort value: the id breaks the tie and comes back in the sort values.
+  # search_after through rows sharing the sort value, as stock pages them: the sort values are
+  # the request's own, so the page after a value starts past every row holding it, and a client
+  # pages through ties by a sort of its own that breaks them.
   - do:
       search:
         index: rev1
@@ -71,7 +73,7 @@
           size: 2
           sort: [ { "@timestamp": asc } ]
   - length: { hits.hits: 2 }
-  - length: { hits.hits.1.sort: 2 }
+  - length: { hits.hits.1.sort: 1 }
   - match: { hits.hits.0._id: "a1" }
   - match: { hits.hits.1._id: "a2" }
   - set: { hits.hits.1.sort: after }
@@ -81,6 +83,22 @@
         body:
           size: 2
           sort: [ { "@timestamp": asc } ]
+          search_after: $after
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: rev1
+        body:
+          size: 2
+          sort: [ { "@timestamp": asc }, { n: asc } ]
+  - length: { hits.hits.1.sort: 2 }
+  - set: { hits.hits.1.sort: after }
+  - do:
+      search:
+        index: rev1
+        body:
+          size: 2
+          sort: [ { "@timestamp": asc }, { n: asc } ]
           search_after: $after
   - length: { hits.hits: 2 }
   - match: { hits.hits.0._id: "a3" }
@@ -92,7 +110,7 @@
         index: rev2
         body:
           size: 2
-          sort: [ { tag: asc } ]
+          sort: [ { tag: asc }, { n: asc } ]
   - match: { hits.hits.0._id: "b1" }
   - match: { hits.hits.1._id: "b2" }
   - set: { hits.hits.1.sort: after2 }
@@ -101,7 +119,7 @@
         index: rev2
         body:
           size: 2
-          sort: [ { tag: asc } ]
+          sort: [ { tag: asc }, { n: asc } ]
           search_after: $after2
   - length: { hits.hits: 1 }
   - match: { hits.hits.0._id: "b3" }

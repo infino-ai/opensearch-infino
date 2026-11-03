@@ -157,6 +157,8 @@ const YEAR_DIGITS: usize = 4;
 const PART_DIGITS: usize = 2;
 /// The most digits a fraction of a second carries: nanoseconds.
 const FRACTION_DIGITS: usize = 9;
+/// The digits of a second's fraction a millisecond column keeps.
+const MILLI_DIGITS: usize = 3;
 /// The widest zone offset a date may carry, in hours.
 const MAX_OFFSET_HOURS: i64 = 18;
 /// Days in each month of a common year.
@@ -254,6 +256,78 @@ fn date_optional_time_millis(s: &str) -> Option<i64> {
     Some(seconds * MILLIS_PER_SECOND + nanos / NANOS_PER_MILLI)
 }
 
+/// Epoch milliseconds of `s` as a whole or fractional number of
+/// `unit_millis` (1 for `epoch_millis`, [`MILLIS_PER_SECOND`] for
+/// `epoch_second`), signed, as OpenSearch's epoch formats read it; `None`
+/// for anything else. A fraction finer than the column's milliseconds is
+/// dropped.
+fn epoch_millis(s: &str, unit_millis: i64) -> Option<i64> {
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (whole, fraction) = match digits.split_once('.') {
+        Some((_, "")) => return None,
+        Some((whole, fraction)) => (whole, fraction),
+        None => (digits, ""),
+    };
+    if whole.is_empty()
+        || fraction.len() > FRACTION_DIGITS
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    // A second's fraction, in the milliseconds it holds.
+    let fraction_millis = if unit_millis == MILLIS_PER_SECOND {
+        let mut millis: String = fraction.chars().take(MILLI_DIGITS).collect();
+        while millis.len() < MILLI_DIGITS {
+            millis.push('0');
+        }
+        millis.parse::<i64>().ok()?
+    } else {
+        0
+    };
+    let millis = whole
+        .parse::<i64>()
+        .ok()?
+        .checked_mul(unit_millis)?
+        .checked_add(fraction_millis)?;
+    Some(if negative { -millis } else { millis })
+}
+
+/// `value` as a date field of `formats` holds it: the first form that reads
+/// it gives its epoch milliseconds, as OpenSearch tries a field's formats in
+/// order (a number by its digits, so an `epoch_second` field's `893966296`
+/// is a day of 1998, not of 1970). A form this bridge does not read (a
+/// custom pattern) leaves the value to [`conform`], as a field of the
+/// default format. A value no form reads fails its document, as OpenSearch
+/// fails it.
+fn conform_date(value: Value, formats: &[DateFormat]) -> Result<Value, String> {
+    let text = match &value {
+        Value::Null => return Ok(value),
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return Err("not a date".into()),
+    };
+    for format in formats {
+        let millis = match format {
+            DateFormat::OptionalTime => date_optional_time_millis(&text),
+            DateFormat::EpochMillis => epoch_millis(&text, 1),
+            DateFormat::EpochSecond => epoch_millis(&text, MILLIS_PER_SECOND),
+            DateFormat::Other(_) => return conform(value, &date_type()),
+        };
+        if let Some(millis) = millis {
+            return Ok(json!(millis));
+        }
+    }
+    let names: Vec<&str> = formats.iter().map(DateFormat::name).collect();
+    Err(format!(
+        "failed to parse date field [{text}] with format [{}]",
+        names.join("||")
+    ))
+}
+
 /// Exactly `n` ASCII digits of `b` from `at`, as a number, moving `at` past them.
 fn fixed_digits(b: &[u8], at: &mut usize, n: usize) -> Option<i64> {
     let digits = b.get(*at..*at + n)?;
@@ -322,32 +396,33 @@ pub struct Bridge {
     /// Whether the connection forwards to the hosted service (an `http(s)://`
     /// URI) rather than running the engine over storage of its own.
     hosted: bool,
-    /// Each table's fields kept at less than a double's precision
-    /// ([`Precision`]), by path, from the mapping it was last declared from
+    /// How each table's fields keep their values beyond their column's type
+    /// ([`Kept`]: a float at less than a double's precision, a date by its
+    /// own format), by path, from the mapping it was last declared from
     /// (`infino_ensure_table`, which the plugin calls before a node first
     /// writes to an index and whenever its mapping moves).
-    precisions: RwLock<HashMap<String, Arc<HashMap<String, Precision>>>>,
+    kept: RwLock<HashMap<String, Arc<HashMap<String, Kept>>>>,
 }
 
 impl Bridge {
-    /// The fields of `name` kept at less than a double's precision; none for
-    /// a table no mapping has declared.
-    fn precisions(&self, name: &str) -> Arc<HashMap<String, Precision>> {
-        self.precisions
+    /// How the fields of `name` keep their values ([`Kept`]); none for a
+    /// table no mapping has declared.
+    fn kept(&self, name: &str) -> Arc<HashMap<String, Kept>> {
+        self.kept
             .read()
             .ok()
             .and_then(|all| all.get(name).cloned())
             .unwrap_or_default()
     }
 
-    /// Record the precisions `mapped` declares for `name`, replacing the
-    /// mapping's earlier ones.
-    fn keep_precisions(&self, name: &str, mapped: &[MappedField]) {
-        let kept: HashMap<String, Precision> = mapped
+    /// Record how the fields `mapped` declares keep their values for
+    /// `name`, replacing the mapping's earlier ones.
+    fn keep_rules(&self, name: &str, mapped: &[MappedField]) {
+        let kept: HashMap<String, Kept> = mapped
             .iter()
-            .filter_map(|f| f.precision.map(|p| (f.path.clone(), p)))
+            .filter_map(|f| f.kept().map(|k| (f.path.clone(), k)))
             .collect();
-        if let Ok(mut all) = self.precisions.write() {
+        if let Ok(mut all) = self.kept.write() {
             all.insert(name.to_string(), Arc::new(kept));
         }
     }
@@ -449,7 +524,7 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
         conn,
         tables: RwLock::new(HashMap::new()),
         hosted,
-        precisions: RwLock::new(HashMap::new()),
+        kept: RwLock::new(HashMap::new()),
     })
 }
 
@@ -589,6 +664,80 @@ struct MappedField {
     /// How OpenSearch keeps the field's values, when at less than a
     /// double's precision.
     precision: Option<Precision>,
+    /// The formats a date field's mapping declares, in order; `None` for the
+    /// default format, which [`default_format_millis`] reads.
+    date_formats: Option<Vec<DateFormat>>,
+}
+
+impl MappedField {
+    /// How the field keeps its values beyond its column's type, if it does.
+    fn kept(&self) -> Option<Kept> {
+        self.precision
+            .map(Kept::Precision)
+            .or_else(|| self.date_formats.clone().map(Kept::Date))
+    }
+}
+
+/// How a mapped field's values are kept beyond its column's type, as
+/// OpenSearch keeps them.
+#[derive(Clone, Debug, PartialEq)]
+enum Kept {
+    /// A float at less than a double's precision.
+    Precision(Precision),
+    /// A date read by the formats its mapping declares, in order.
+    Date(Vec<DateFormat>),
+}
+
+impl Kept {
+    fn precision(&self) -> Option<Precision> {
+        match self {
+            Self::Precision(p) => Some(*p),
+            Self::Date(_) => None,
+        }
+    }
+}
+
+/// One of the formats a date field's mapping declares (`format`, its forms
+/// joined by `||`).
+#[derive(Clone, Debug, PartialEq)]
+enum DateFormat {
+    /// `strict_date_optional_time` or `date_optional_time`, as
+    /// [`date_optional_time_millis`] reads it.
+    OptionalTime,
+    /// `epoch_millis`: milliseconds since the epoch, a fraction allowed.
+    EpochMillis,
+    /// `epoch_second`: seconds since the epoch, a fraction allowed.
+    EpochSecond,
+    /// Any other form (a custom pattern, a named format this bridge does not
+    /// read); a value reaching it is read as a field of the default format.
+    Other(String),
+}
+
+impl DateFormat {
+    /// The forms of a mapping's `format`, in order.
+    fn parse_all(format: &str) -> Vec<Self> {
+        format
+            .split("||")
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .map(|f| match f {
+                "strict_date_optional_time" | "date_optional_time" => Self::OptionalTime,
+                "epoch_millis" => Self::EpochMillis,
+                "epoch_second" => Self::EpochSecond,
+                other => Self::Other(other.to_string()),
+            })
+            .collect()
+    }
+
+    /// The form's name, as the mapping gives it.
+    fn name(&self) -> &str {
+        match self {
+            Self::OptionalTime => "strict_date_optional_time",
+            Self::EpochMillis => "epoch_millis",
+            Self::EpochSecond => "epoch_second",
+            Self::Other(f) => f,
+        }
+    }
 }
 
 /// How OpenSearch keeps a mapped floating-point field's values when at less
@@ -792,7 +941,7 @@ fn vector_metric(def: &Map<String, Value>) -> Metric {
 
 /// Walk a `properties` object, emitting one field per mapped leaf with its
 /// dot path. Objects recurse; multi-fields (`fields`) are not columns, the
-/// plugin maps `name.keyword` onto `name` itself. Types the engine has no
+/// plugin maps a keyword multi-field onto its field's column. Types the engine has no
 /// column for (geo, binary, alias, …) are left to `source`.
 fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<MappedField>) {
     for (name, def) in props {
@@ -843,12 +992,17 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             }
             Some(_) => continue,
         };
+        let date_formats = matches!(ty, Some("date") | Some("date_nanos"))
+            .then(|| def.get("format").and_then(Value::as_str))
+            .flatten()
+            .map(DateFormat::parse_all);
         out.push(MappedField {
             path,
             data_type,
             fts,
             vector,
             precision: ty.and_then(|ty| Precision::of(ty, def)),
+            date_formats,
         });
     }
 }
@@ -873,7 +1027,7 @@ fn mapped_fields(mapping: &Value) -> Vec<MappedField> {
 /// it is not.
 fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, String> {
     let mapped = mapped_fields(mapping);
-    bridge.keep_precisions(name, &mapped);
+    bridge.keep_rules(name, &mapped);
     let conn = &bridge.conn;
     // The cached handle, if any, predates whatever this changes.
     bridge.forget(name);
@@ -1417,7 +1571,7 @@ pub unsafe extern "C" fn infino_check_doc(
             Err(e) => return out_string(e.to_string()),
         };
         let schema = table.schema();
-        out_string(match conform_doc(source, &schema, &conn.precisions(name)) {
+        out_string(match conform_doc(source, &schema, &conn.kept(name)) {
             Ok(_) => String::new(),
             Err(why) => why,
         })
@@ -1429,12 +1583,13 @@ pub unsafe extern "C" fn infino_check_doc(
 /// row it returns is what the engine is given. A declared field the document
 /// gives several values goes to its list column ([`LIST_SUFFIX`]), each
 /// value conformed as the field's own would be; one value in an array is
-/// that value, as OpenSearch reads it. A field `precisions` names holds each
-/// value as OpenSearch keeps it ([`Precision`]).
+/// that value, as OpenSearch reads it. A field `kept` names holds each value
+/// as OpenSearch keeps it ([`Kept`]): a float at its precision, a date read
+/// by its own format.
 fn conform_doc(
     source: &str,
     schema: &Schema,
-    precisions: &HashMap<String, Precision>,
+    kept: &HashMap<String, Kept>,
 ) -> Result<Map<String, Value>, String> {
     let doc: Value = serde_json::from_str(source).map_err(|e| format!("malformed JSON: {e}"))?;
     let obj = doc
@@ -1448,8 +1603,13 @@ fn conform_doc(
             continue;
         };
         let dt = field.data_type();
-        let precision = precisions.get(path).copied();
-        let fit = |v: Value| conform(v, dt).and_then(|v| keep(v, precision));
+        let rule = kept.get(path);
+        let fit = |v: Value| match rule {
+            Some(Kept::Date(formats)) if matches!(dt, DataType::Timestamp(..)) => {
+                conform_date(v, formats)
+            }
+            _ => conform(v, dt).and_then(|v| keep(v, rule.and_then(Kept::precision))),
+        };
         let why = |why: String| format!("field [{path}]: {why}");
         *value = match value.take() {
             Value::Array(items) if list_type(dt).is_some() => {
@@ -1590,14 +1750,14 @@ pub unsafe extern "C" fn infino_index_batch(
             Err(e) => return err_json(&e.to_string()),
         };
         let schema = table.schema();
-        let precisions = conn.precisions(name);
+        let kept = conn.kept(name);
 
         let mut failed: Vec<Value> = Vec::new();
         let mut rows: Vec<(usize, Map<String, Value>)> = Vec::with_capacity(n);
         for i in 0..n {
             let osid = unsafe { cstr(os_p[i]) }.unwrap_or("");
             let source = unsafe { cstr(sr_p[i]) }.unwrap_or("{}");
-            let mut flat = match conform_doc(source, &schema, &precisions) {
+            let mut flat = match conform_doc(source, &schema, &kept) {
                 Ok(flat) => flat,
                 Err(why) => {
                     failed.push(json!({ "i": i, "reason": why }));
@@ -1740,7 +1900,7 @@ unsafe fn prepare(
     let table = conn.table(name).map_err(|e| e.to_string())?;
     let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
     let schema = table.schema();
-    let precisions = conn.precisions(name);
+    let kept = conn.kept(name);
 
     // Each row's id, source and routing value as borrowed slices of the
     // buffer, with its stamp and operation.
@@ -1768,7 +1928,7 @@ unsafe fn prepare(
     let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
         .par_iter()
         .map(|(id, src, routing, seq, op)| {
-            conform_doc(src, &schema, &precisions).map(|mut flat| {
+            conform_doc(src, &schema, &kept).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 flat.insert(SOURCE.into(), Value::String((*src).to_string()));
                 if !routing.is_empty() {
@@ -3694,8 +3854,7 @@ mod tests {
                 let mut rows: Vec<Map<String, Value>> = docs
                     .iter()
                     .map(|(id, src)| {
-                        let mut flat =
-                            conform_doc(src, &schema, &conn.precisions("bench")).unwrap();
+                        let mut flat = conform_doc(src, &schema, &conn.kept("bench")).unwrap();
                         flat.insert(OSID.into(), Value::String(id.clone()));
                         flat.insert(SOURCE.into(), Value::String(src.clone()));
                         flat
@@ -4429,6 +4588,52 @@ mod tests {
         assert_eq!(
             conform(json!("2026-11-23 10:30:15"), &date_type()).unwrap(),
             json!("2026-11-23 10:30:15")
+        );
+    }
+
+    /// A date field is read by the format its mapping declares: an
+    /// `epoch_second` value is seconds (the logs track's `@timestamp`), the
+    /// field's forms are tried in order, and a value none of them reads is
+    /// refused, as OpenSearch refuses it.
+    #[test]
+    fn a_date_field_is_read_by_its_own_format() {
+        let seconds = DateFormat::parse_all("epoch_second");
+        assert_eq!(
+            conform_date(json!(893966296), &seconds),
+            Ok(json!(893_966_296_000i64))
+        );
+        assert_eq!(
+            conform_date(json!("893966296.25"), &seconds),
+            Ok(json!(893_966_296_250i64))
+        );
+        assert_eq!(conform_date(json!(-1), &seconds), Ok(json!(-1_000i64)));
+        assert_eq!(conform_date(Value::Null, &seconds), Ok(Value::Null));
+        assert_eq!(
+            conform_date(json!("1998-04-30T00:00:00Z"), &seconds),
+            Err(
+                "failed to parse date field [1998-04-30T00:00:00Z] with format [epoch_second]"
+                    .into()
+            )
+        );
+        let either = DateFormat::parse_all("strict_date_optional_time||epoch_second");
+        assert_eq!(
+            conform_date(json!("1998-04-30T00:00:00Z"), &either),
+            Ok(json!(893_894_400_000i64))
+        );
+        assert_eq!(
+            conform_date(json!(893966296), &either),
+            Ok(json!(893_966_296_000i64))
+        );
+        let millis = DateFormat::parse_all("epoch_millis");
+        assert_eq!(
+            conform_date(json!(893966296000i64), &millis),
+            Ok(json!(893_966_296_000i64))
+        );
+        // A custom pattern's value is read as the default format's, as before.
+        let custom = DateFormat::parse_all("yyyy-MM-dd HH:mm:ss||strict_date_optional_time");
+        assert_eq!(
+            conform_date(json!("2026-11-23 10:30:15"), &custom),
+            Ok(json!("2026-11-23 10:30:15"))
         );
     }
 

@@ -16,6 +16,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.index.Index;
@@ -143,7 +144,20 @@ public class InfinoSearchActionFilter implements ActionFilter {
             boolean exactAtCoordinator = reachedShardCount(clusters, names, state, search, concrete) > 1
                 && written.aggregations() != null
                 && InfinoAggregationProcessor.needsExactValues(written.aggregations().getAggregatorFactories());
-            ActionListener<Response> answered = listener;
+            // The shards' hits carry the id their table breaks ties on after the
+            // request's own sort values; the client is handed the request's only,
+            // as stock hands them, and so is each page of a scroll it opens.
+            int sortValues = InfinoSearch.requestedSortValues(written);
+            TimeValue keepAlive = search.scroll() == null ? null : search.scroll().keepAlive();
+            ActionListener<Response> answered = ActionListener.map(listener, response -> {
+                if (response instanceof SearchResponse r) {
+                    InfinoSearch.handOut(r, sortValues);
+                    if (search.scroll() != null) {
+                        InfinoScrolls.handsOut(r.getScrollId(), sortValues, keepAlive);
+                    }
+                }
+                return response;
+            });
             if (exactAtCoordinator) {
                 Map<String, InfinoAccess> access = new HashMap<>();
                 for (String name : concrete) {
@@ -152,7 +166,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
                 InfinoExactAggregation.record(id, written, now, access);
                 // Its final reduce runs before the search answers, so the record
                 // goes once it has: the records held are the searches in flight.
-                answered = ActionListener.runAfter(listener, () -> InfinoExactAggregation.forget(id));
+                answered = ActionListener.runAfter(answered, () -> InfinoExactAggregation.forget(id));
             }
             search.source(InfinoQueryExt.route(written, id, exactAtCoordinator, now));
             chain.proceed(task, action, request, answered);
@@ -206,6 +220,9 @@ public class InfinoSearchActionFilter implements ActionFilter {
             SearchResponse response = search.scroll() == null
                 ? InfinoSearch.search(infino, tableOf, access::get, source, scripts.get(), start)
                 : InfinoScrollActionFilter.open(search, infino, tableOf, access, source, scripts.get(), start);
+            // The hits carry the id the table breaks ties on after the request's own
+            // sort values; the client is handed the request's only, as stock hands them.
+            InfinoSearch.handOut(response, InfinoSearch.requestedSortValues(source));
             if (key != null) {
                 kept.put(key, response, InfinoRequestCache.lifetime(metadata));
             }

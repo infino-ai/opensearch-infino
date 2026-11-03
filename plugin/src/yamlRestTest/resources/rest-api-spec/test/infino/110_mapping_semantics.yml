@@ -177,6 +177,220 @@
   - match: { aggregations.t.sum_other_doc_count: 0 }
 
 ---
+"A keyword multi-field of any name is read as its field's whole value, in both modes":
+  # The logs track's mapping: a text field whose exact form is the keyword multi-field `raw`.
+  - do:
+      indices.create:
+        index: semantics_raw_default
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              request:
+                type: match_only_text
+                fields:
+                  raw: { type: keyword, ignore_above: 256 }
+              status: { type: integer }
+  - do:
+      indices.create:
+        index: semantics_raw_proxy
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: proxy
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              request:
+                type: match_only_text
+                fields:
+                  raw: { type: keyword, ignore_above: 256 }
+              status: { type: integer }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: semantics_raw_default, _id: "1" }
+          - { request: "GET / HTTP/1.0", status: 200 }
+          - index: { _index: semantics_raw_default, _id: "2" }
+          - { request: "GET /images/a.gif HTTP/1.0", status: 200 }
+          - index: { _index: semantics_raw_default, _id: "3" }
+          - { request: "GET / HTTP/1.0", status: 304 }
+          - index: { _index: semantics_raw_proxy, _id: "1" }
+          - { request: "GET / HTTP/1.0", status: 200 }
+          - index: { _index: semantics_raw_proxy, _id: "2" }
+          - { request: "GET /images/a.gif HTTP/1.0", status: 200 }
+          - index: { _index: semantics_raw_proxy, _id: "3" }
+          - { request: "GET / HTTP/1.0", status: 304 }
+  - match: { errors: false }
+
+  # The track's term query on the multi-field: the whole value, not its words.
+  - do:
+      search:
+        index: semantics_raw_default
+        body:
+          size: 0
+          query: { term: { request.raw: { value: "GET / HTTP/1.0" } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: semantics_raw_proxy
+        body:
+          size: 0
+          query: { term: { request.raw: { value: "GET / HTTP/1.0" } } }
+  - match: { hits.total.value: 2 }
+
+  # Bucketed by the whole value.
+  - do:
+      search:
+        index: semantics_raw_default
+        body:
+          size: 0
+          aggs:
+            r: { terms: { field: request.raw } }
+  - length: { aggregations.r.buckets: 2 }
+  - match: { aggregations.r.buckets.0: { key: "GET / HTTP/1.0", doc_count: 2 } }
+  - match: { aggregations.r.buckets.1: { key: "GET /images/a.gif HTTP/1.0", doc_count: 1 } }
+  - do:
+      search:
+        index: semantics_raw_proxy
+        body:
+          size: 0
+          aggs:
+            r: { terms: { field: request.raw } }
+  - length: { aggregations.r.buckets: 2 }
+  - match: { aggregations.r.buckets.0: { key: "GET / HTTP/1.0", doc_count: 2 } }
+  - match: { aggregations.r.buckets.1: { key: "GET /images/a.gif HTTP/1.0", doc_count: 1 } }
+
+  # Fetched under its own name, as stock reads a multi-field.
+  - do:
+      search:
+        index: semantics_raw_default
+        body:
+          size: 1
+          _source: false
+          query: { ids: { values: [ "2" ] } }
+          fields: [ request.raw ]
+  - match: { hits.hits.0.fields.request\.raw: [ "GET /images/a.gif HTTP/1.0" ] }
+
+---
+"An epoch_second date is written, queried and bucketed as seconds, in both modes":
+  # The logs track's @timestamp: whole seconds, sent as numbers.
+  - do:
+      indices.create:
+        index: semantics_seconds_default
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              "@timestamp": { type: date, format: epoch_second }
+              status: { type: integer }
+  - do:
+      indices.create:
+        index: semantics_seconds_proxy
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: proxy
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              "@timestamp": { type: date, format: epoch_second }
+              status: { type: integer }
+  # 893964617 and 893966296 are 1998-04-30, 895000000 is 1998-05-12.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: semantics_seconds_default, _id: "1" }
+          - { "@timestamp": 893964617, status: 200 }
+          - index: { _index: semantics_seconds_default, _id: "2" }
+          - { "@timestamp": 893966296, status: 304 }
+          - index: { _index: semantics_seconds_default, _id: "3" }
+          - { "@timestamp": 895000000, status: 200 }
+          - index: { _index: semantics_seconds_proxy, _id: "1" }
+          - { "@timestamp": 893964617, status: 200 }
+          - index: { _index: semantics_seconds_proxy, _id: "2" }
+          - { "@timestamp": 893966296, status: 304 }
+          - index: { _index: semantics_seconds_proxy, _id: "3" }
+          - { "@timestamp": 895000000, status: 200 }
+  - match: { errors: false }
+
+  - do:
+      search:
+        index: semantics_seconds_default
+        body:
+          size: 0
+          query: { range: { "@timestamp": { gte: "1998-05-01T00:00:00Z", format: strict_date_optional_time } } }
+          aggs:
+            lo: { min: { field: "@timestamp" } }
+            d: { date_histogram: { field: "@timestamp", calendar_interval: 1d, format: yyyy-MM-dd } }
+  - match: { hits.total.value: 1 }
+  - match: { aggregations.lo.value: 895000000000.0 }
+  - match: { aggregations.d.buckets.0: { key: 894931200000, key_as_string: "1998-05-12", doc_count: 1 } }
+
+  - do:
+      search:
+        index: semantics_seconds_proxy
+        body:
+          size: 0
+          query: { range: { "@timestamp": { gte: "1998-05-01T00:00:00Z", format: strict_date_optional_time } } }
+          aggs:
+            lo: { min: { field: "@timestamp" } }
+            d: { date_histogram: { field: "@timestamp", calendar_interval: 1d, format: yyyy-MM-dd } }
+  - match: { hits.total.value: 1 }
+  - match: { aggregations.lo.value: 895000000000.0 }
+  - match: { aggregations.d.buckets.0: { key: 894931200000, key_as_string: "1998-05-12", doc_count: 1 } }
+
+  # A bound in the field's own format is seconds, as stock reads it.
+  - do:
+      search:
+        index: semantics_seconds_default
+        body:
+          size: 0
+          query: { range: { "@timestamp": { gte: 893966296 } } }
+  - match: { hits.total.value: 2 }
+
+  # search_after, as stock reads it: text in the field's format (seconds), a number as the
+  # epoch milliseconds a hit's sort values give.
+  - do:
+      search:
+        index: semantics_seconds_default
+        body:
+          sort: [ { "@timestamp": asc } ]
+          search_after: [ "893966296" ]
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.0.sort: [ 895000000000 ] }
+  - do:
+      search:
+        index: semantics_seconds_proxy
+        body:
+          sort: [ { "@timestamp": asc } ]
+          search_after: [ 893966296000 ]
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "3" }
+
+  # A bound the field's format cannot read is refused, as stock refuses it.
+  - do:
+      catch: bad_request
+      search:
+        index: semantics_seconds_proxy
+        body:
+          query: { range: { "@timestamp": { gte: "1998-05-01T00:00:00Z" } } }
+  - match: { error.root_cause.0.type: parse_exception }
+
+---
 "A date field's own format reads its values and prints its keys":
   - do:
       indices.create:

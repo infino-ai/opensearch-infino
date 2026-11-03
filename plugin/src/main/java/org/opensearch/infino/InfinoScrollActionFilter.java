@@ -84,7 +84,24 @@ public class InfinoScrollActionFilter implements ActionFilter {
             page(scroll, cast);
             return;
         }
+        if (SearchScrollAction.NAME.equals(action) && request instanceof SearchScrollRequest scroll) {
+            Integer sortValues = InfinoScrolls.handedOut(scroll.scrollId());
+            if (sortValues != null) {
+                // A page of a scroll OpenSearch serves over default-mode indices: its
+                // hits hand the client the request's own sort values, as the first did.
+                TimeValue keepAlive = scroll.scroll() == null ? null : scroll.scroll().keepAlive();
+                chain.proceed(task, action, request, ActionListener.map(listener, response -> {
+                    if (response instanceof SearchResponse r) {
+                        InfinoSearch.handOut(r, sortValues);
+                        InfinoScrolls.handsOut(r.getScrollId(), sortValues, keepAlive);
+                    }
+                    return response;
+                }));
+                return;
+            }
+        }
         if (ClearScrollAction.NAME.equals(action) && request instanceof ClearScrollRequest clear) {
+            InfinoScrolls.forgetHandedOut(clear.getScrollIds());
             List<String> ours = new ArrayList<>();
             boolean all = false;
             for (String id : clear.getScrollIds()) {
@@ -167,6 +184,7 @@ public class InfinoScrollActionFilter implements ActionFilter {
             pages,
             access,
             out.response().getHits().getTotalHits(),
+            InfinoSearch.requestedSortValues(source),
             out.after(),
             keepAlive
         );
@@ -193,7 +211,7 @@ public class InfinoScrollActionFilter implements ActionFilter {
             TotalHits total = scroll.total;
             Searched out = InfinoSearch.search(scroll.indices, tableOf::get, scroll.access::get, scroll.source, scroll.after, total, scroll.id, scripts.get(), start);
             scroll.after = out.after();
-            listener.onResponse(out.response());
+            listener.onResponse(InfinoSearch.handOut(out.response(), scroll.sortValues));
         } catch (Exception e) {
             log.debug("[infino] scroll {} failed: {}", request.scrollId(), e.getMessage());
             listener.onFailure(e);
