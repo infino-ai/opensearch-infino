@@ -13,3 +13,6 @@ bench/*.out
 
 # OS / editor
 .DS_Store
+
+# Rally head-to-head run directories (bench/rally/benchmark.sh, local.sh)
+bench/rally/results/
