@@ -15,6 +15,7 @@ AWS harness (`utils/perf-test-scripts/rally/` and `deploy/terraform/rally/` in
 | `sampler.py` | each engine VM | CPU and memory samples every 5 s during the race |
 | `compare.py` | your machine | the comparison report (`comparison.txt`, `comparison.json`) |
 | `local.sh` | your machine | races engines that are already running, then compares them |
+| `.github/workflows/rally-bench.yml` | GitHub Actions | builds the plugin, runs `benchmark.sh` once per engine, compares |
 
 ## Engines
 
@@ -30,7 +31,26 @@ replicas, as on AWS. All engines run from tarballs on Ubuntu 24.04: the bridge l
 newer glibc than the OpenSearch container image has, and running all of them the same way
 keeps the comparison even.
 
-## Before you run
+## Run from GitHub
+
+The `rally-bench` workflow (Actions → rally-bench → Run workflow) runs everything below with
+no local setup: it builds the plugin zip and bridge at the chosen ref, races each engine in
+its own job on its own runner and engine VMs (`benchmark.sh` with one engine), then writes the
+comparison into the run's summary and uploads every run directory as an artifact. Each race
+job's timeout is the ceiling on its VMs' billing; cancelling the run deletes them.
+
+It signs in to GCP by workload identity federation as the engine repo's bench service
+account, and needs once:
+
+- the workload identity provider (`GCP_BENCH_WIF_PROVIDER`) to admit
+  `infino-ai/opensearch-infino`, and the bench service account (`GCP_BENCH_SA`) to grant
+  `roles/iam.workloadIdentityUser` to this repository's principal;
+- for the proxy-mode engine, the repository secret `INFINO_API_KEY`.
+
+The repository variables `GCP_BENCH_PROJECT`, `GCP_BENCH_SA` and `GCP_BENCH_WIF_PROVIDER`
+override the defaults the workflow carries, which are the engine repo's.
+
+## Before you run from your machine
 
 - `gcloud` signed in with rights to create instances and firewall rules in `PROJECT`
   (default `infino-ai-engine`), whose network `NETWORK` (default `bench-vpc`) has the subnet
@@ -86,7 +106,8 @@ A short end-to-end check, with Rally's test mode (1,000 documents per corpus):
 | `HEAP_GB` | `16` | engine heap |
 | `ENGINE_MACHINE`, `RUNNER_MACHINE` | `n2-highmem-4` | 4 vCPU, 32 GB: the i3en.xlarge the AWS harness used |
 | `ENGINE_SSDS`, `RUNNER_SSDS` | `1` | 375 GB local NVMe SSDs per VM; several are striped |
-| `PROJECT`, `ZONE`, `NETWORK`, `SUBNET`, `VM_SA` | see above | where the VMs go; `VM_SA` attaches a service account |
+| `PROJECT`, `ZONE`, `NETWORK`, `SUBNET` | see above | where the VMs go |
+| `VM_SA` | none | a service account for the VMs (with `storage-rw`); by default they have none, since they call no Google API |
 | `INFINO_YAML` | none | an `infino.yaml` for the Infino engines' engine settings |
 | `INFINO_MODES` | `1` | `0` for a plugin build without index modes, where proxy mode is the only mode |
 | `ENGINE_PRICE_PER_HOUR` | none | the hourly price of one engine VM; adds each engine's cost of the race |

@@ -131,7 +131,8 @@ trap 'exit 130' INT TERM
 echo "run $RUN in $PROJECT/$ZONE: engines ${ENGINE_LIST[*]}, track $TRACK"
 
 # 1. VMs and firewall rules.
-SA_ARGS=()
+# The VMs call no Google API, so by default they run with no service account.
+SA_ARGS=(--no-service-account --no-scopes)
 [ -n "$VM_SA" ] && SA_ARGS=(--service-account "$VM_SA" --scopes storage-rw)
 create_vm() {
   local vm=$1 machine=$2 ssds=$3 tag=$4 ssd_args=()
