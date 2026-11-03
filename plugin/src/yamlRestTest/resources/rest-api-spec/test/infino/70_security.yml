@@ -309,6 +309,127 @@
       hits.hits.0.fields.ip.0: /^[0-9a-f]{64}$/
 
 ---
+"Security parity: a filtered alias under a document or field rule reads as over Lucene":
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: sec5
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { tag: { type: keyword }, secret: { type: keyword }, n: { type: long } } }
+  - do:
+      indices.create:
+        index: sec5l
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { tag: { type: keyword }, secret: { type: keyword }, n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec5, _id: "f1" }
+          - { tag: x, secret: alpha, n: 1 }
+          - index: { _index: sec5, _id: "f2" }
+          - { tag: y, secret: beta, n: 2 }
+          - index: { _index: sec5, _id: "f3" }
+          - { tag: x, secret: gamma, n: 3 }
+          - index: { _index: sec5, _id: "f4" }
+          - { tag: x, secret: beta, n: 4 }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec5l, _id: "f1" }
+          - { tag: x, secret: alpha, n: 1 }
+          - index: { _index: sec5l, _id: "f2" }
+          - { tag: y, secret: beta, n: 2 }
+          - index: { _index: sec5l, _id: "f3" }
+          - { tag: x, secret: gamma, n: 3 }
+          - index: { _index: sec5l, _id: "f4" }
+          - { tag: x, secret: beta, n: 4 }
+  - match: { errors: false }
+  - do:
+      indices.update_aliases:
+        body:
+          actions:
+            - add: { index: sec5, alias: sec5_big, filter: { range: { n: { gte: 2 } } } }
+            - add: { index: sec5l, alias: sec5l_big, filter: { range: { n: { gte: 2 } } } }
+            - add: { index: sec5, alias: sec5_beta, filter: { term: { secret: beta } } }
+            - add: { index: sec5l, alias: sec5l_beta, filter: { term: { secret: beta } } }
+
+  # The document rule (tag is x) and the alias's filter (n of 2 or more) both hold, in
+  # the hits, the total and an aggregation alike.
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec5l_big
+        body: { aggs: { total_n: { sum: { field: n } } } }
+  - set: { hits.total.value: lucene_total }
+  - set: { aggregations.total_n.value: lucene_sum }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec5_big
+        body: { sort: [ { n: asc } ], aggs: { total_n: { sum: { field: n } } } }
+  - match: { hits.total.value: $lucene_total }
+  - match: { aggregations.total_n.value: $lucene_sum }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: f3 }
+  - match: { hits.hits.1._id: f4 }
+  - match: { aggregations.total_n.value: 7 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      count:
+        index: sec5_big
+  - match: { count: 2 }
+
+  # Every page of a scroll reads through both: no page widens to the index whole.
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec5_big
+        scroll: 1m
+        body: { size: 1, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: f3 }
+  - set: { _scroll_id: scroll_id }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      scroll:
+        body: { scroll_id: $scroll_id, scroll: 1m }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: f4 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      scroll:
+        body: { scroll_id: $scroll_id, scroll: 1m }
+  - length: { hits.hits: 0 }
+
+  # An alias whose filter names a field the field rule hides: the filter reads the field
+  # as the user's own query would, as unmapped, on both.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec5l_beta
+        body: { size: 0 }
+  - set: { hits.total.value: lucene_hidden }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec5_beta
+        body: { size: 0 }
+  - match: { hits.total.value: $lucene_hidden }
+  # A user who may see the field reads what the filter keeps.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      search:
+        index: sec5_beta
+        body: { size: 0 }
+  - match: { hits.total.value: 2 }
+
+---
 "Security: a user authenticated by an API token is answered as the security plugin answers over Lucene":
   - skip:
       version: " - 3.8.99"
