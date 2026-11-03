@@ -152,9 +152,15 @@ curl localhost:9200/logs/_search -H 'Content-Type: application/json' -d '{
 Settings: `index.infino.table` names the table explicitly (set it to reattach
 a recreated index to its rows; such a table is kept when the index is
 deleted); `index.infino.optimize_interval` (default 60s) compacts the table on
-a schedule. JVM properties `infino.batch.docs` (50000) and
+a schedule; `index.infino.edges: true` makes the index a graph's edges for
+`graph_walk` and `graph_rank` over the SQL route: each document is an edge
+`{src_table, src_id, dst_table, dst_id}` naming its two rows as the engine
+does, by the `_table` and `_id` a SQL read gives each row, and each compaction
+(and, in default mode, a force merge) builds the index the walks read. JVM properties `infino.batch.docs` (50000) and
 `infino.batch.bytes` (64 MiB) bound the writes a batch may hold while an
-append runs.
+append runs. The node setting `infino.sql.max_result_size` (the node's
+`http.max_content_length` when unset) bounds a SQL route result as JSON: a
+statement whose result passes it is refused with a 400.
 
 ## Hosted account, and stateless nodes
 

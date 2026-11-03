@@ -31,8 +31,11 @@
 // The safety contract is the same for every entry point and stated once above.
 #![allow(clippy::missing_safety_doc)]
 
+mod read_sql;
+
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -43,9 +46,9 @@ use std::time::Duration;
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::prelude::{col, lit};
 use infino::arrow_array::{
-    new_null_array, Array, BooleanArray, Float32Array, Float64Array, Int64Array, LargeStringArray,
-    RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+    new_null_array, Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int64Array,
+    LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
 };
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
@@ -104,6 +107,30 @@ const TRIAL_TIMEOUT: Duration = Duration::from_secs(30);
 const STATUS_MARKER: &str = "server returned ";
 /// Digits of an HTTP status code.
 const STATUS_DIGITS: usize = 3;
+/// HTTP status of a caller's statement that is wrong: it does not parse or
+/// plan, or asks for what the engine does not do.
+const STATUS_BAD_REQUEST: u16 = 400;
+/// HTTP status of a caller's statement naming a column or table that is not there.
+const STATUS_NOT_FOUND: u16 = 404;
+/// HTTP status of a caller's statement past the connection's memory budget.
+const STATUS_TOO_MANY_REQUESTS: u16 = 429;
+/// The mapping type a column of the engine's row ids is declared with: no
+/// OpenSearch field type is the engine's `_id` type, so the plugin names it
+/// so for the id columns of an edge index.
+const ENGINE_ID_TYPE: &str = "infino_engine_id";
+/// The engine's id type, which every `_id` column has, and so an edge
+/// table's id columns.
+const ID_PRECISION: u8 = 38;
+const ID_SCALE: i8 = 0;
+/// The first whole number past what [`ID_PRECISION`] digits hold: a row id
+/// is below it.
+const ROW_ID_BOUND: i128 = 10_i128.pow(ID_PRECISION as u32);
+/// The columns of an edge table, as the engine's adjacency index reads them:
+/// each end of an edge as the table its row is in and the row's `_id`.
+const SRC_TABLE: &str = "src_table";
+const SRC_ID: &str = "src_id";
+const DST_TABLE: &str = "dst_table";
+const DST_ID: &str = "dst_id";
 
 thread_local! {
     /// Why the last `infino_open_with` on this thread returned null, as the
@@ -795,6 +822,7 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
                 (DataType::Float64, false, None)
             }
             Some("boolean") => (DataType::Boolean, false, None),
+            Some(ENGINE_ID_TYPE) => (DataType::Decimal128(ID_PRECISION, ID_SCALE), false, None),
             Some("knn_vector") => {
                 let dim = def.get("dimension").and_then(|d| d.as_u64()).unwrap_or(0) as usize;
                 if dim == 0 {
@@ -1191,6 +1219,24 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
             }
             Value::Object(_) => Err("an object for a string field".into()),
             Value::Null => Ok(value),
+        },
+        // A row id: a whole number, as digits in a string where it is past
+        // what a JSON number holds exactly (as a SQL read gives an `_id`),
+        // and no wider than the column's precision.
+        DataType::Decimal128(ID_PRECISION, ID_SCALE) => match &value {
+            Value::Number(n) if n.is_u64() => Ok(value),
+            Value::String(s)
+                if !s.trim().is_empty() && s.trim().bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                match s.trim().parse::<i128>() {
+                    Ok(id) if id < ROW_ID_BOUND => Ok(Value::String(id.to_string())),
+                    _ => Err(format!(
+                        "not a row id: '{}' has more than the {ID_PRECISION} digits a row's `_id` holds",
+                        s.trim()
+                    )),
+                }
+            }
+            _ => Err("not a row id: a row's `_id` is a whole number, its digits".into()),
         },
         DataType::FixedSizeList(_, dim) => match &value {
             Value::Array(items)
@@ -2356,6 +2402,22 @@ pub unsafe extern "C" fn infino_drop(h: *mut Bridge, name: *const c_char) -> c_i
 /// what the merge superseded. Returns 0, or -2 with the reason on stderr.
 #[no_mangle]
 pub unsafe extern "C" fn infino_optimize(h: *mut Bridge, name: *const c_char) -> c_int {
+    unsafe { optimize_with(h, name, &OptimizeOptions::default()) }
+}
+
+/// Compact an edge table as [`infino_optimize`] does, and build the
+/// adjacency index the engine's graph walks read over its rows: each row an
+/// edge from the row [`SRC_ID`] of the table [`SRC_TABLE`] to the row
+/// [`DST_ID`] of the table [`DST_TABLE`]. The engine builds it again only
+/// when the rows changed since it last did. Returns what
+/// [`infino_optimize`] returns.
+#[no_mangle]
+pub unsafe extern "C" fn infino_optimize_edges(h: *mut Bridge, name: *const c_char) -> c_int {
+    let options = OptimizeOptions::default().with_adjacency(SRC_TABLE, SRC_ID, DST_TABLE, DST_ID);
+    unsafe { optimize_with(h, name, &options) }
+}
+
+unsafe fn optimize_with(h: *mut Bridge, name: *const c_char, options: &OptimizeOptions) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return -1;
@@ -2364,7 +2426,7 @@ pub unsafe extern "C" fn infino_optimize(h: *mut Bridge, name: *const c_char) ->
             Ok(t) => t,
             Err(_) => return 0,
         };
-        match table.optimize(&OptimizeOptions::default()) {
+        match table.optimize(options) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("[capi] optimize {name}: {e}");
@@ -2391,6 +2453,202 @@ pub unsafe extern "C" fn infino_sql(h: *mut Bridge, sql: *const c_char) -> *mut 
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// The indices a caller's read-only statement reads, as
+/// `{"indices": [..]}`, for the plugin to have the caller authorized for
+/// before it runs ([`infino_sql_read`]); a statement the route does not
+/// serve is refused with the reason and its status.
+#[no_mangle]
+pub unsafe extern "C" fn infino_sql_indices(sql: *const c_char) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(sql) = (unsafe { cstr(sql) }) else {
+            return ptr::null_mut();
+        };
+        match read_sql::indices(sql) {
+            Ok(indices) => out_json(json!({ "indices": indices })),
+            Err(refusal) => refused_json(&refusal),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Run a caller's read-only statement with each index it names read
+/// through the view `views` gives for it, as `{"relations": {index: query},
+/// "searches": {index: query}, "unsearchable": {index: [column]},
+/// "output_only": [column], "whole": {index: table}, "max_result_bytes": n}`
+/// (see [`read_sql::Reads`]). Answers
+/// `{"schema": [{"name", "type"}], "rows": [..], "masked": {column: field}}`
+/// (`masked`, left out when empty: the result's columns that give a field
+/// read only as output, for the plugin to mask), or an error with its status: a statement the
+/// route does not serve or whose rows pass `max_result_bytes` as JSON (400),
+/// an index without a view or a use of a field the caller may not make
+/// (403), a statement past the engine's memory budget (429).
+#[no_mangle]
+pub unsafe extern "C" fn infino_sql_read(
+    h: *mut Bridge,
+    sql: *const c_char,
+    views: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(sql), Some(views)) =
+            (bridge_ref(h), unsafe { cstr(sql) }, unsafe { cstr(views) })
+        else {
+            return ptr::null_mut();
+        };
+        let views: Value = match serde_json::from_str(views) {
+            Ok(v) => v,
+            Err(e) => return err_json(&format!("views: {e}")),
+        };
+        let tables = match conn.conn.list_tables() {
+            Ok(tables) => tables,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let reads = read_sql::Reads {
+            views: string_map(&views["relations"]),
+            searches: string_map(&views["searches"]),
+            unsearchable: views["unsearchable"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .map(|(index, columns)| (index.clone(), string_set(columns)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            output_only: string_set(&views["output_only"]),
+            whole: string_map(&views["whole"]),
+        };
+        let statement = match read_sql::rewrite(sql, &reads, &tables) {
+            Ok(statement) => statement,
+            Err(refusal) => return refused_json(&refusal),
+        };
+        let masked: Map<String, Value> = statement
+            .masked
+            .iter()
+            .map(|(column, field)| (column.clone(), json!(field)))
+            .collect();
+        // No bound given reads as none: the plugin always sends its setting.
+        let max_bytes = views["max_result_bytes"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(usize::MAX);
+        match conn.conn.query_sql(&statement.sql) {
+            Ok(batches) => {
+                let Some(rows) = batches_to_json_within(&batches, max_bytes) else {
+                    return refused_json(&read_sql::Refusal {
+                        message: format!(
+                            "the result is larger than infino.sql.max_result_size ({max_bytes} bytes as JSON): \
+                             read fewer rows or columns, or aggregate"
+                        ),
+                        status: read_sql::BAD_REQUEST,
+                    });
+                };
+                let masked = if masked.is_empty() {
+                    String::new()
+                } else {
+                    format!(",\"masked\":{}", Value::Object(masked))
+                };
+                out_string(format!(
+                    "{{\"schema\":{},\"rows\":{rows}{masked}}}",
+                    schema_json(&batches),
+                ))
+            }
+            Err(e) => {
+                let mut v = sql_error_value(&e);
+                if let Some(message) = v["error"].as_str() {
+                    v["error"] = json!(in_index_names(message, &reads, &tables));
+                }
+                out_json(v)
+            }
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// A JSON array of strings as a set; anything else is empty.
+fn string_set(v: &Value) -> HashSet<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A JSON object of strings as a map; anything else is empty.
+fn string_map(v: &Value) -> HashMap<String, String> {
+    v.as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `message`, an engine error over a caller's statement, with each table a
+/// view reads named as the index the statement read it through: the tables
+/// are the plugin's, the caller named indices. A table several views read
+/// is named by the first; longer table names are replaced first, so one
+/// that begins another's name is never replaced inside it.
+fn in_index_names(message: &str, reads: &read_sql::Reads, tables: &[String]) -> String {
+    let mut by_table: Vec<(&str, &str)> = Vec::new();
+    let mut indices: Vec<&String> = reads.views.keys().collect();
+    indices.sort();
+    for table in tables {
+        // A view names its tables quoted: as an identifier, or as a search's argument.
+        let (ident, literal) = (format!("\"{table}\""), format!("'{table}'"));
+        if let Some(index) = indices.iter().find(|index| {
+            let view = &reads.views[index.as_str()];
+            view.contains(&ident) || view.contains(&literal)
+        }) {
+            by_table.push((table.as_str(), index.as_str()));
+        }
+    }
+    by_table.sort_by_key(|(table, _)| Reverse(table.len()));
+    let mut out = message.to_string();
+    for (table, index) in by_table {
+        out = out.replace(table, &format!("[{index}]"));
+    }
+    out
+}
+
+/// A statement refused, with the status that says why.
+fn refused_json(refusal: &read_sql::Refusal) -> *mut c_char {
+    out_json(json!({ "error": refusal.message, "status": refusal.status }))
+}
+
+/// The error a caller's statement failed with, under the status that tells
+/// the caller's mistake from the engine's.
+fn sql_error_value(e: &InfinoError) -> Value {
+    let status = match e {
+        InfinoError::Query(_) | InfinoError::Unsupported(_) => Some(STATUS_BAD_REQUEST),
+        InfinoError::NotFound(_) => Some(STATUS_NOT_FOUND),
+        InfinoError::OverBudget(_) => Some(STATUS_TOO_MANY_REQUESTS),
+        _ => None,
+    };
+    let mut v = error_value(&e.to_string());
+    if let Some(status) = status {
+        v["status"] = json!(status);
+    }
+    v
+}
+
+/// The columns of a result, each its name and Arrow type; none for a
+/// result with no batch.
+fn schema_json(batches: &[RecordBatch]) -> String {
+    let fields: Vec<Value> = batches
+        .first()
+        .map(|b| {
+            b.schema()
+                .fields()
+                .iter()
+                .map(|f| json!({ "name": f.name(), "type": f.data_type().to_string() }))
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Array(fields).to_string()
 }
 
 /// Ranked BM25 over one text column (`mode` is `"and"` or `"or"`), the top
@@ -2639,22 +2897,36 @@ fn json_str(s: &str) -> String {
 /// Rows as a JSON array of flat objects. Timestamps are epoch milliseconds,
 /// which is what OpenSearch's date formats and histogram keys take.
 fn batches_to_json(batches: &[RecordBatch]) -> String {
-    let mut rows: Vec<String> = Vec::new();
+    batches_to_json_within(batches, usize::MAX).unwrap_or_default()
+}
+
+/// [`batches_to_json`], or `None` as soon as the text passes `max_bytes`:
+/// a result too large to hand over is never built whole.
+fn batches_to_json_within(batches: &[RecordBatch], max_bytes: usize) -> Option<String> {
+    let mut out = String::from("[");
     for batch in batches {
         let schema = batch.schema();
         for r in 0..batch.num_rows() {
-            let mut cells: Vec<String> = Vec::new();
-            for (c, field) in schema.fields().iter().enumerate() {
-                cells.push(format!(
-                    "{}:{}",
-                    json_str(field.name()),
-                    cell_json(batch.column(c).as_ref(), r)
-                ));
+            if out.len() > 1 {
+                out.push(',');
             }
-            rows.push(format!("{{{}}}", cells.join(",")));
+            out.push('{');
+            for (c, field) in schema.fields().iter().enumerate() {
+                if c > 0 {
+                    out.push(',');
+                }
+                out.push_str(&json_str(field.name()));
+                out.push(':');
+                out.push_str(&cell_json(batch.column(c).as_ref(), r));
+            }
+            out.push('}');
+            if out.len() > max_bytes {
+                return None;
+            }
         }
     }
-    format!("[{}]", rows.join(","))
+    out.push(']');
+    Some(out)
 }
 
 fn cell_json(col: &dyn Array, r: usize) -> String {
@@ -2694,6 +2966,11 @@ fn cell_json(col: &dyn Array, r: usize) -> String {
     }
     if let Some(a) = any.downcast_ref::<TimestampSecondArray>() {
         return (a.value(r) * 1_000).to_string();
+    }
+    // A decimal, the engine's `_id` among them, as its digits in a string: an
+    // id is past what a JSON number holds exactly.
+    if let Some(a) = any.downcast_ref::<Decimal128Array>() {
+        return json_str(&a.value_as_string(r));
     }
     "\"<unsupported>\"".into()
 }
@@ -2837,6 +3114,148 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    /// The rows of several tables read as one row set, as the plugin's SQL
+    /// route reads an index pattern: each column through `coalesce(.., NULL)`,
+    /// a column a table lacks as null. A column read as stored carries its
+    /// table's Parquet field id, and the engine refuses a union whose inputs'
+    /// ids differ, as two tables' do.
+    #[test]
+    fn several_tables_read_as_one_row_set() {
+        let h = open_logs();
+        let w1 = r#"{"properties":{"n":{"type":"long"},"tag":{"type":"keyword"}}}"#;
+        let w2 = r#"{"properties":{"n":{"type":"long"},"tag":{"type":"keyword"},"extra":{"type":"keyword"}}}"#;
+        take(unsafe { infino_ensure_table(h, c("w1").as_ptr(), c(w1).as_ptr()) });
+        take(unsafe { infino_ensure_table(h, c("w2").as_ptr(), c(w2).as_ptr()) });
+        for (table, id, src) in [
+            ("w1", "a", r#"{"n":1,"tag":"a"}"#),
+            ("w1", "b", r#"{"n":2,"tag":"b"}"#),
+            ("w2", "c", r#"{"n":3,"tag":"a","extra":"x"}"#),
+        ] {
+            let ids = [c(id)];
+            let srcs = [c(src)];
+            let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+            let sp: Vec<*const c_char> = srcs.iter().map(|x| x.as_ptr()).collect();
+            take(unsafe { infino_index_batch(h, c(table).as_ptr(), idp.as_ptr(), sp.as_ptr(), 1) });
+        }
+        let rows = sql(
+            h,
+            "SELECT count(*) AS c, sum(n) AS s, count(extra) AS e FROM (\
+             SELECT coalesce(n, NULL) AS n, coalesce(tag, NULL) AS tag, NULL AS extra FROM w1 UNION ALL \
+             SELECT coalesce(n, NULL) AS n, coalesce(tag, NULL) AS tag, coalesce(extra, NULL) AS extra FROM w2) t",
+        );
+        assert_eq!(rows, json!([{ "c": 3, "s": 6, "e": 1 }]));
+        close(h);
+    }
+
+    /// A graph walk as the SQL route runs it: rows of an index within some
+    /// hops of a seed row, over an edge index read whole, returned through
+    /// the index's search view. The edges are documents naming each end as
+    /// its table and the `_id` a SQL read gives, as digits; the edge table
+    /// is declared as the plugin declares an edge index's, and its adjacency
+    /// index is built when it is compacted.
+    #[test]
+    fn a_walk_runs_through_the_routes_views() {
+        let h = open_logs();
+        index(
+            h,
+            &[
+                ("a", r#"{"level":"error"}"#),
+                ("b", r#"{"level":"info"}"#),
+                ("c", r#"{"level":"warn"}"#),
+                ("d", r#"{"level":"info"}"#),
+            ],
+        );
+        let rows = sql(h, "SELECT osid, _id FROM logs ORDER BY osid");
+        let id = |osid: &str| -> String {
+            let row = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["osid"] == osid)
+                .unwrap();
+            row["_id"].as_str().unwrap().to_string()
+        };
+        let edge_mapping = json!({"properties": {
+            SRC_TABLE: {"type": "keyword"},
+            SRC_ID: {"type": ENGINE_ID_TYPE},
+            DST_TABLE: {"type": "keyword"},
+            DST_ID: {"type": ENGINE_ID_TYPE},
+        }})
+        .to_string();
+        let declared =
+            take(unsafe { infino_ensure_table(h, c("edges").as_ptr(), c(&edge_mapping).as_ptr()) });
+        assert!(declared.contains("\"created\":true"), "{declared}");
+        // a -> b -> c; d is no row's neighbour.
+        let edge = |from: &str, to: &str| {
+            json!({SRC_TABLE: "logs", SRC_ID: id(from), DST_TABLE: "logs", DST_ID: id(to)})
+                .to_string()
+        };
+        let ids = [c("ab"), c("bc"), c("bad")];
+        let docs = [
+            c(&edge("a", "b")),
+            c(&edge("b", "c")),
+            c(
+                &json!({SRC_TABLE: "logs", SRC_ID: "a", DST_TABLE: "logs", DST_ID: id("d")})
+                    .to_string(),
+            ),
+        ];
+        let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+        let dp: Vec<*const c_char> = docs.iter().map(|x| x.as_ptr()).collect();
+        let written: Value = serde_json::from_str(&take(unsafe {
+            infino_index_batch(h, c("edges").as_ptr(), idp.as_ptr(), dp.as_ptr(), 3)
+        }))
+        .unwrap();
+        // An edge whose end is no row id is refused, with why.
+        assert_eq!(written["ok"], 2, "{written}");
+        assert!(
+            written["failed"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("not a row id"),
+            "{written}"
+        );
+        assert_eq!(unsafe { infino_optimize_edges(h, c("edges").as_ptr()) }, 0);
+        let bridge = unsafe { &*h };
+
+        let reads = read_sql::Reads {
+            searches: HashMap::from([(
+                "logs".to_string(),
+                "SELECT * FROM infino_search('logs')".to_string(),
+            )]),
+            whole: HashMap::from([
+                ("links".to_string(), "edges".to_string()),
+                ("logs".to_string(), "logs".to_string()),
+            ]),
+            ..read_sql::Reads::default()
+        };
+        let statement = read_sql::rewrite(
+            &format!(
+                "SELECT osid FROM graph_walk('links', 'logs', 'logs', {}, 2, 10) \
+                 WHERE osid <> 'a' ORDER BY score, osid",
+                id("a")
+            ),
+            &reads,
+            &[],
+        )
+        .unwrap();
+        let out = bridge.conn.query_sql(&statement.sql).unwrap();
+        let reached: Vec<String> = out
+            .iter()
+            .flat_map(|b| {
+                let a = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .unwrap();
+                (0..a.len())
+                    .map(|i| a.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(reached, vec!["b", "c"]);
+        close(h);
     }
 
     #[test]
@@ -3899,6 +4318,67 @@ mod tests {
             "{why}"
         );
         assert!(unsafe { infino_open_error() }.is_null(), "read once");
+    }
+
+    /// A result's JSON is built up to the bound and no further, and within
+    /// it is the same text as unbounded.
+    #[test]
+    fn a_result_past_its_bound_is_never_built_whole() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batches = [RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1, 22, 333])) as Arc<dyn Array>],
+        )
+        .unwrap()];
+        let whole = batches_to_json(&batches);
+        assert_eq!(whole, r#"[{"n":1},{"n":22},{"n":333}]"#);
+        assert_eq!(
+            batches_to_json_within(&batches, whole.len()).as_deref(),
+            Some(whole.as_str())
+        );
+        assert!(batches_to_json_within(&batches, whole.len() / 2).is_none());
+        assert_eq!(batches_to_json(&[]), "[]");
+    }
+
+    /// A row id holds at most the column's precision in digits.
+    #[test]
+    fn a_row_id_wider_than_its_column_is_refused() {
+        let id = DataType::Decimal128(ID_PRECISION, ID_SCALE);
+        let widest = "9".repeat(ID_PRECISION as usize);
+        assert_eq!(conform(json!(widest.clone()), &id), Ok(json!(widest)));
+        assert_eq!(conform(json!("0042"), &id), Ok(json!("42")));
+        let wider = "1".repeat(ID_PRECISION as usize + 1);
+        assert!(conform(json!(wider), &id).unwrap_err().contains("digits"));
+        assert!(conform(json!("9".repeat(60)), &id).is_err());
+    }
+
+    /// An engine error over a caller's statement names the indices the
+    /// statement read, not the plugin's tables.
+    #[test]
+    fn an_engine_error_names_indices_not_tables() {
+        let reads = read_sql::Reads {
+            views: HashMap::from([
+                ("logs".to_string(), "SELECT * FROM \"os_logs\"".to_string()),
+                (
+                    "logs_1".to_string(),
+                    "SELECT * FROM \"os_logs_1\"".to_string(),
+                ),
+            ]),
+            ..read_sql::Reads::default()
+        };
+        let tables = vec![
+            "os_logs".to_string(),
+            "os_logs_1".to_string(),
+            "os_index".to_string(),
+        ];
+        assert_eq!(
+            in_index_names(
+                "table os_logs_1 has no column x; os_logs neither",
+                &reads,
+                &tables
+            ),
+            "table [logs_1] has no column x; [logs] neither"
+        );
     }
 
     /// Every form OpenSearch's default date format takes is read as the

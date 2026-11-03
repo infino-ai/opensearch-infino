@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.action.ActionRequest;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -19,10 +20,13 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.settings.SecureString;
+import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.env.Environment;
+import org.opensearch.http.HttpTransportSettings;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
@@ -122,6 +126,24 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         Setting.Property.Final
     );
 
+    /**
+     * Whether the index holds a graph's edges, for the engine's graph walks
+     * over the SQL route ({@code graph_walk}, {@code graph_rank}): each
+     * document is one edge, from the row {@code src_id} of the table
+     * {@code src_table} to the row {@code dst_id} of the table
+     * {@code dst_table}, each row named as the engine names it, by its table
+     * and its {@code _id} (as a SQL read gives them). The index's table
+     * declares those columns with the engine's types, and builds the
+     * adjacency index the walks read each time it is compacted, so an edge
+     * is walked from the compaction after its write.
+     */
+    public static final Setting<Boolean> INFINO_EDGES = Setting.boolSetting(
+        "index.infino.edges",
+        false,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
     /** The table behind the index, when it is to be named explicitly (to reattach an index to its rows). */
     public static final Setting<String> INFINO_TABLE = Setting.simpleString(
         "index.infino.table",
@@ -178,6 +200,20 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      */
     public static final Setting<String> CACHE_DIR = Setting.simpleString("infino.cache.dir", Setting.Property.NodeScope);
 
+    /**
+     * The most a SQL result may hold, as the JSON the route answers with (see
+     * {@link InfinoSql}). The engine's memory budget bounds a statement while
+     * it runs, not the answer handed to the node: a statement whose result
+     * passes this is refused before the answer is built whole, so one
+     * authorized read cannot fill the node's heap. The largest request body
+     * the node takes over HTTP when unset.
+     */
+    public static final Setting<ByteSizeValue> SQL_MAX_RESULT_SIZE = Setting.byteSizeSetting(
+        "infino.sql.max_result_size",
+        HttpTransportSettings.SETTING_HTTP_MAX_CONTENT_LENGTH,
+        Setting.Property.NodeScope
+    );
+
     /** The directory {@link #CACHE_DIR} names under the node's data path by default. */
     static final String DEFAULT_CACHE_SUBDIR = "infino-cache";
 
@@ -193,6 +229,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         this.account = new InfinoAccount(PLATFORM_DEFAULT_URL.get(settings));
         InfinoNative.cacheDir(cacheDir(settings));
         InfinoRequestCache.configure(settings);
+        InfinoSql.configure(settings);
         String url = PLATFORM_URL.get(settings);
         if (url.isEmpty()) {
             return;
@@ -398,11 +435,12 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             return;
         }
         TimeValue interval = shard.indexSettings().getValue(OPTIMIZE_INTERVAL);
+        Settings indexSettings = shard.indexSettings().getSettings();
         ShardId shardId = shard.shardId();
         Scheduler.Cancellable task = threadPool.scheduleWithFixedDelay(() -> {
             try {
                 long start = System.nanoTime();
-                int rc = InfinoNative.optimize(table);
+                int rc = InfinoNative.optimize(table, indexSettings);
                 long millis = (System.nanoTime() - start) / 1_000_000L;
                 if (rc != 0) {
                     log.warn("[infino] optimize of {} returned {} after {} ms", table, rc, millis);
@@ -463,17 +501,28 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             INFINO_MODE,
             DEFAULT_MODE_ENABLED,
             INFINO_REBUILT,
+            INFINO_EDGES,
             INFINO_TABLE,
             OPTIMIZE_INTERVAL,
             PLATFORM_URL,
             PLATFORM_DATABASE,
             PLATFORM_API_KEY,
             PLATFORM_DEFAULT_URL,
-            CACHE_DIR
+            CACHE_DIR,
+            SQL_MAX_RESULT_SIZE
         );
     }
 
-    /** The account route: what the cluster's tables are served from, and how to accept or store a hosted account. */
+    /** The plugin's own action: a caller's SQL over Infino-backed indices, authorized as a read of each (see {@link InfinoSql}). */
+    @Override
+    public List<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> getActions() {
+        return List.of(new ActionHandler<>(InfinoSqlAction.INSTANCE, TransportInfinoSqlAction.class));
+    }
+
+    /**
+     * The account route: what the cluster's tables are served from, and how
+     * to accept or store a hosted account; and the SQL route.
+     */
     @Override
     public List<RestHandler> getRestHandlers(
         Settings settings,
@@ -486,7 +535,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     ) {
         // Registered cluster state is applied through the node's own REST API.
         InfinoClusterState.bind(restController);
-        return List.of(new InfinoAccountRestHandler(account));
+        return List.of(new InfinoAccountRestHandler(account), new InfinoSqlRestHandler());
     }
 
     @Override

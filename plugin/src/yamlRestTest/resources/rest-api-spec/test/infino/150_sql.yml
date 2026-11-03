@@ -1,0 +1,544 @@
+---
+"SQL reads an index as the caller may read it":
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: sec_sql1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              secret: { type: keyword }
+              ip: { type: keyword }
+              n: { type: long }
+              title: { type: text }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec_sql1, _id: "s1" }
+          - { tag: x, secret: alpha, ip: "10.0.0.1", n: 1, title: "wool coat" }
+          - index: { _index: sec_sql1, _id: "s2" }
+          - { tag: y, secret: beta, ip: "10.0.0.2", n: 2, title: "silk scarf" }
+          - index: { _index: sec_sql1, _id: "s3" }
+          - { tag: x, secret: gamma, ip: "10.0.0.1", n: 3, title: "wool hat" }
+  - match: { errors: false }
+
+  # Read whole by a user with plain read access, answered with the schema and the rows.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      infino.sql:
+        body: { query: "SELECT osid, n, secret FROM sec_sql1 ORDER BY n" }
+  - length: { rows: 3 }
+  - match: { rows.0.osid: s1 }
+  - match: { rows.2.secret: gamma }
+  - match: { schema.1.name: n }
+
+  # The document rule (tag is x) narrows what the statement reads, a count and a join alike.
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT count(*) AS c, sum(n) AS total FROM sec_sql1" }
+  - match: { rows.0.c: 2 }
+  - match: { rows.0.total: 4 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT a.osid FROM sec_sql1 a JOIN sec_sql1 b ON a.osid = b.osid WHERE b.tag = 'y'" }
+  - length: { rows: 0 }
+
+  # The field rule (no secret): the field is not there to name, and the source, which holds it, is left out.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT * FROM sec_sql1 ORDER BY n" }
+  - length: { rows: 3 }
+  - match: { rows.0.tag: x }
+  - is_false: rows.0.secret
+  - is_false: rows.0.source
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      catch: bad_request
+      infino.sql:
+        body: { query: "SELECT secret FROM sec_sql1" }
+
+  # A field masked by a named hash reads as its hash in SQL, value for value as a search
+  # gives it: selected, compared and counted by the hash, never by the value.
+  - do:
+      headers: { Authorization: "Basic aGFzaF91c2VyOmFkbWlu" }
+      search:
+        index: sec_sql1
+        body: { sort: [ { n: asc } ] }
+  - set: { hits.hits.0._source.ip: hashed_ip }
+  - do:
+      headers: { Authorization: "Basic aGFzaF91c2VyOmFkbWlu" }
+      infino.sql:
+        body: { query: "SELECT * FROM sec_sql1 ORDER BY n" }
+  - match: { rows.0.ip: $hashed_ip }
+  - match: { rows.0.tag: x }
+  - is_false: rows.0.source
+  - do:
+      headers: { Authorization: "Basic aGFzaF91c2VyOmFkbWlu" }
+      infino.sql:
+        body: { query: "SELECT count(*) AS c FROM sec_sql1 WHERE ip = '${hashed_ip}'" }
+  - match: { rows.0.c: 2 }
+  - do:
+      headers: { Authorization: "Basic aGFzaF91c2VyOmFkbWlu" }
+      infino.sql:
+        body: { query: "SELECT count(*) AS c FROM sec_sql1 WHERE ip = '10.0.0.1' OR ip LIKE '10.%'" }
+  - match: { rows.0.c: 0 }
+
+  # A regular-expression mask reads as its replacement, as a search gives it.
+  - do:
+      headers: { Authorization: "Basic cmVnZXhfdXNlcjphZG1pbg==" }
+      search:
+        index: sec_sql1
+        body: { sort: [ { n: asc } ] }
+  - set: { hits.hits.1._source.ip: replaced_ip }
+  - do:
+      headers: { Authorization: "Basic cmVnZXhfdXNlcjphZG1pbg==" }
+      infino.sql:
+        body: { query: "SELECT ip FROM sec_sql1 ORDER BY n" }
+  - match: { rows.1.ip: $replaced_ip }
+  - match: { rows.1.ip: "10.0.0.0" }
+
+  # The security plugin's default hash is a BLAKE2b keyed with the cluster's salt, which
+  # SQL has no function to give: the field is masked in the result by the security
+  # plugin's own mask, value for value as a search gives it, and read only as a column
+  # of the result (selected, renamed, by *, or grouped by itself).
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      search:
+        index: sec_sql1
+        body: { sort: [ { n: asc } ] }
+  - set: { hits.hits.0._source.ip: default_ip }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      infino.sql:
+        body: { query: "SELECT ip, n FROM sec_sql1 ORDER BY n" }
+  - match: { rows.0.ip: $default_ip }
+  - match: { rows.2.ip: $default_ip }
+  - match: { schema.0.type: Utf8 }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      infino.sql:
+        body: { query: "SELECT * FROM sec_sql1 ORDER BY n" }
+  - match: { rows.0.ip: $default_ip }
+  - is_false: rows.0.source
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      infino.sql:
+        body: { query: "SELECT ip AS addr, count(*) AS c FROM sec_sql1 GROUP BY ip ORDER BY c DESC" }
+  - length: { rows: 2 }
+  - match: { rows.0.addr: $default_ip }
+  - match: { rows.0.c: 2 }
+  # Any other use would read the stored value: refused.
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT n FROM sec_sql1 WHERE ip = '10.0.0.1'" }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT n FROM sec_sql1 ORDER BY ip" }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT upper(ip) AS u FROM sec_sql1" }
+
+  # An engine search reads the index as the view does: its rows, its columns, its masks.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      infino.sql:
+        body: { query: "SELECT osid FROM bm25_search('sec_sql1', 'title', 'wool silk', 10) ORDER BY osid" }
+  - length: { rows: 3 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT osid FROM bm25_search('sec_sql1', 'title', 'wool silk', 10) ORDER BY osid" }
+  - length: { rows: 2 }
+  - match: { rows.0.osid: s1 }
+  - match: { rows.1.osid: s3 }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT * FROM bm25_search('sec_sql1', 'title', 'wool', 10) ORDER BY n" }
+  - length: { rows: 2 }
+  - match: { rows.0.tag: x }
+  - is_true: rows.0.score
+  - is_false: rows.0.secret
+  - is_false: rows.0.source
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      infino.sql:
+        body: { query: "SELECT ip, score FROM bm25_search('sec_sql1', 'title', 'wool', 10) ORDER BY score DESC" }
+  - length: { rows: 2 }
+  - match: { rows.0.ip: $default_ip }
+  # A search that names a hidden or masked field would match its stored values: refused.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM bm25_search('sec_sql1', 'secret', 'alpha', 10)" }
+  - do:
+      headers: { Authorization: "Basic aGFzaF91c2VyOmFkbWlu" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sec_sql1', 'ip', '10.0.0.1')" }
+  # The source holds the hidden and masked fields as written: under a field or masking
+  # rule a search may not match on it either.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sec_sql1', 'source', 'alpha')" }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM exact_match('sec_sql1', 'source', 'alpha')" }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sec_sql1', 'source', '10.0.0.1')" }
+  # A column's name as a search's query text is only text, not the column.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sec_sql1', 'title', 'secret source')" }
+  - length: { rows: 0 }
+
+  # A graph walk reads its edges and seeds whole, so a user with a document or masking
+  # rule over the index walks nothing in it.
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM graph_walk('sec_sql1', 'sec_sql1', 'sec_sql1', 1, 1, 10)" }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT osid FROM graph_rank('sec_sql1', 'sec_sql1', 'sec_sql1', 1, 1, 10)" }
+
+---
+"SQL reads a pattern, an alias over several indices and a filtered alias as a search does":
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: sql_w1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long }, tag: { type: keyword } } }
+  - do:
+      indices.create:
+        index: sql_w2
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long }, tag: { type: keyword }, extra: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sql_w1, _id: "a" }
+          - { n: 1, tag: a }
+          - index: { _index: sql_w1, _id: "b" }
+          - { n: 2, tag: b }
+          - index: { _index: sql_w2, _id: "c" }
+          - { n: 3, tag: a, extra: x }
+  - match: { errors: false }
+  - do:
+      indices.update_aliases:
+        body:
+          actions:
+            - add: { indices: [ sql_w1, sql_w2 ], alias: sql_wall }
+            - add: { indices: [ sql_w1, sql_w2 ], alias: sql_wa, filter: { term: { tag: a } } }
+
+  # A pattern reads every index it matches, joined by column name: a column one index lacks is null there.
+  - do:
+      infino.sql:
+        body: { query: "SELECT count(*) AS c, sum(n) AS s, count(extra) AS e FROM \"sql_w*\"" }
+  - match: { rows.0.c: 3 }
+  - match: { rows.0.s: 6 }
+  - match: { rows.0.e: 1 }
+  # So does an alias over several indices, and a filtered alias keeps what its filter keeps.
+  - do:
+      infino.sql:
+        body: { query: "SELECT count(*) AS c FROM sql_wall" }
+  - match: { rows.0.c: 3 }
+  - do:
+      infino.sql:
+        body: { query: "SELECT osid FROM sql_wa ORDER BY n" }
+  - length: { rows: 2 }
+  - match: { rows.0.osid: a }
+  - match: { rows.1.osid: c }
+  # An engine search reads the same: over every index a pattern matches, and only what a
+  # filtered alias keeps.
+  - do:
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sql_w1', 'osid', 'b')" }
+  - match: { rows.0.osid: b }
+  - do:
+      infino.sql:
+        body: { query: "SELECT osid, extra FROM token_match('sql_w*', 'osid', 'c')" }
+  - length: { rows: 1 }
+  - match: { rows.0.extra: x }
+  - do:
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sql_wa', 'osid', 'b')" }
+  - length: { rows: 0 }
+  - do:
+      infino.sql:
+        body: { query: "SELECT osid FROM token_match('sql_wa', 'osid', 'a')" }
+  - length: { rows: 1 }
+
+  # A user who may not read what a pattern matches is refused, as a search over it is.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT count(*) AS c FROM \"sql_w*\"" }
+
+---
+"SQL reads a default-mode index of several shards as one":
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: sec_sqlem
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 2
+            number_of_replicas: 0
+          mappings:
+            properties:
+              tag: { type: keyword }
+              n: { type: long }
+              title: { type: text }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec_sqlem, _id: "w1" }
+          - { tag: x, n: 1, title: "wool coat" }
+          - index: { _index: sec_sqlem, _id: "w2" }
+          - { tag: y, n: 2, title: "wool hat" }
+          - index: { _index: sec_sqlem, _id: "w3" }
+          - { tag: x, n: 3, title: "wool scarf" }
+          - index: { _index: sec_sqlem, _id: "w4" }
+          - { tag: y, n: 4, title: "wool sock" }
+          - index: { _index: sec_sqlem, _id: "w5" }
+          - { tag: x, n: 5, title: "wool glove" }
+          - index: { _index: sec_sqlem, _id: "w6" }
+          - { tag: y, n: 6, title: "wool rug" }
+          - index: { _index: sec_sqlem, _id: "w7" }
+          - { tag: x, n: 7, title: "wool cap" }
+          - index: { _index: sec_sqlem, _id: "w8" }
+          - { tag: y, n: 8, title: "wool vest" }
+  - match: { errors: false }
+  # Each shard holds several of the documents, so a search over each finds more than three.
+  - do:
+      search:
+        index: sec_sqlem
+        preference: _shards:0
+        body: { size: 0, query: { match: { title: wool } } }
+  - gte: { hits.total.value: 2 }
+  - do:
+      search:
+        index: sec_sqlem
+        preference: _shards:1
+        body: { size: 0, query: { match: { title: wool } } }
+  - gte: { hits.total.value: 2 }
+
+  # Every shard's rows, read as one; the engine's own bookkeeping columns are no column of it.
+  - do:
+      infino.sql:
+        body: { query: "SELECT count(*) AS c, sum(n) AS s FROM sec_sqlem" }
+  - match: { rows.0.c: 8 }
+  - match: { rows.0.s: 36 }
+  - do:
+      infino.sql:
+        body: { query: "SELECT * FROM sec_sqlem ORDER BY n" }
+  - length: { rows: 8 }
+  - match: { rows.0.osid: w1 }
+  - match: { rows.7.osid: w8 }
+  - is_false: rows.0.osseq
+  - is_false: rows.0.osop
+  - is_false: rows.0.osgen
+  - is_false: rows.0.osrouting
+  - is_true: rows.0.source
+  - do:
+      catch: bad_request
+      infino.sql:
+        body: { query: "SELECT osrouting FROM sec_sqlem" }
+
+  # A ranked search gives the best rows of the shards' searches together, to its own row count.
+  - do:
+      infino.sql:
+        body: { query: "SELECT osid, score FROM bm25_search('sec_sqlem', 'title', 'wool', 3) ORDER BY score DESC" }
+  - length: { rows: 3 }
+
+  # The document rule holds on every shard (tag is x).
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT count(*) AS c, sum(n) AS s FROM sec_sqlem" }
+  - match: { rows.0.c: 4 }
+  - match: { rows.0.s: 16 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT osid, tag FROM bm25_search('sec_sqlem', 'title', 'wool', 10) ORDER BY n" }
+  - length: { rows: 4 }
+  - match: { rows.0.osid: w1 }
+  - match: { rows.3.tag: x }
+
+---
+"A graph walks an edge index that names its rows as the engine does":
+  - do:
+      indices.create:
+        index: sql_people
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { name: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sql_people, _id: "p1" }
+          - { name: ann }
+          - index: { _index: sql_people, _id: "p2" }
+          - { name: bob }
+          - index: { _index: sql_people, _id: "p3" }
+          - { name: cid }
+          - index: { _index: sql_people, _id: "p4" }
+          - { name: dee }
+  - match: { errors: false }
+
+  # Every row's name in the engine: its table, and its _id as digits.
+  - do:
+      infino.sql:
+        body: { query: "SELECT _table, _id FROM sql_people ORDER BY osid" }
+  - length: { rows: 4 }
+  - match: { rows.0._table: os_sql_people }
+  - set: { rows.0._table: people }
+  - set: { rows.0._id: ann }
+  - set: { rows.1._id: bob }
+  - set: { rows.2._id: cid }
+
+  # An edge index: each document an edge between two rows, named by table and _id.
+  - do:
+      indices.create:
+        index: sql_knows
+        body:
+          settings: { index.infino.edges: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              src_table: { type: keyword }
+              src_id: { type: keyword }
+              dst_table: { type: keyword }
+              dst_id: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sql_knows, _id: "e1" }
+          - { src_table: $people, src_id: $ann, dst_table: $people, dst_id: $bob }
+          - index: { _index: sql_knows, _id: "e2" }
+          - { src_table: $people, src_id: $bob, dst_table: $people, dst_id: $cid }
+  - match: { errors: false }
+  # An end that is no row id is refused, with the reason.
+  - do:
+      catch: bad_request
+      index:
+        index: sql_knows
+        id: "e3"
+        body: { src_table: $people, src_id: "ann", dst_table: $people, dst_id: $cid }
+
+  # Compacting the edge index builds the adjacency index a walk reads.
+  - do:
+      indices.forcemerge:
+        index: sql_knows
+  - do:
+      infino.sql:
+        body: { query: "SELECT name, score FROM graph_walk('sql_knows', 'sql_people', 'sql_people', ${ann}, 2, 10) WHERE name <> 'ann' ORDER BY score, name" }
+  - length: { rows: 2 }
+  - match: { rows.0.name: bob }
+  - match: { rows.1.name: cid }
+
+---
+"SQL reaches only indices the caller may read, and only reads them":
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: other_sql1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      index:
+        index: other_sql1
+        id: "o1"
+        refresh: true
+        body: { n: 1 }
+
+  # The security plugin refuses an index the user may not read, as it refuses a search of it.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT n FROM other_sql1" }
+  - do:
+      infino.sql:
+        body: { query: "SELECT n FROM other_sql1" }
+  - match: { rows.0.n: 1 }
+
+  # A statement names indices, never tables: the registry's table is no index, and a schema-qualified name is refused.
+  - do:
+      catch: missing
+      infino.sql:
+        body: { query: "SELECT * FROM os_index" }
+  - do:
+      catch: bad_request
+      infino.sql:
+        body: { query: "SELECT * FROM public.os_other_sql1" }
+  - do:
+      catch: bad_request
+      infino.sql:
+        body: { query: "SELECT * FROM information_schema.tables" }
+
+  # The security plugin's own index is a system index, which SQL does not read.
+  - do:
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT * FROM \".opendistro_security\"" }
+
+  # Only one query: anything that writes, or a second statement, is refused before it runs.
+  - do:
+      catch: bad_request
+      infino.sql:
+        body: { query: "DROP TABLE other_sql1" }
+  - do:
+      catch: bad_request
+      infino.sql:
+        body: { query: "SELECT n FROM other_sql1; DELETE FROM other_sql1" }
+  - do:
+      catch: bad_request
+      infino.sql:
+        body: { query: "COPY (SELECT * FROM other_sql1) TO '/tmp/out.csv'" }
+  - do:
+      infino.sql:
+        body: { query: "SELECT count(*) AS c FROM other_sql1" }
+  - match: { rows.0.c: 1 }

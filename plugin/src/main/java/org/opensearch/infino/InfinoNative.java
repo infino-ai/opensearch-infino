@@ -576,11 +576,16 @@ public final class InfinoNative {
         }
     }
 
-    public static int optimize(String name) {
+    /**
+     * Compact the table; for an edge index's ({@link InfinoPlugin#INFINO_EDGES}),
+     * also build the adjacency index the engine's graph walks read over its rows.
+     */
+    public static int optimize(String name, Settings indexSettings) {
         init();
+        boolean edges = InfinoPlugin.INFINO_EDGES.get(indexSettings);
         InfinoRequestCache.changed(name);
         try {
-            return lib.infino_optimize(conn, name);
+            return edges ? lib.infino_optimize_edges(conn, name) : lib.infino_optimize(conn, name);
         } finally {
             InfinoRequestCache.changed(name);
         }
@@ -864,6 +869,33 @@ public final class InfinoNative {
         String out = takeOrThrow(lib.infino_sql(conn, q));
         log.debug("[infino] sql: {} -> {} chars", q, out.length());
         return out;
+    }
+
+    /**
+     * The indices a caller's read-only statement reads, each once, in the
+     * order it names them (see {@link InfinoSql}); a statement the SQL route
+     * does not serve throws with the status that says why.
+     */
+    static List<String> sqlIndices(String sql) {
+        init();
+        Object listed = object(takeOrThrow(lib.infino_sql_indices(sql))).get("indices");
+        List<String> out = new ArrayList<>();
+        if (listed instanceof List<?> names) {
+            for (Object name : names) {
+                out.add(String.valueOf(name));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * A caller's read-only statement, each index it reads replaced by its
+     * view in {@code views} (see {@link InfinoSql}): its schema and rows as
+     * JSON, or a throw with the status that says why it was not run.
+     */
+    static String sqlRead(String sql, String views) {
+        init();
+        return takeOrThrow(lib.infino_sql_read(conn, sql, views));
     }
 
     public static List<Map<String, Object>> sqlRows(String q) {

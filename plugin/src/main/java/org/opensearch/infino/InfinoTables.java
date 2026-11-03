@@ -16,7 +16,9 @@ import org.opensearch.core.xcontent.XContentBuilder;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -42,6 +44,15 @@ public final class InfinoTables {
     private static final String TYPE = "type";
     private static final String KEYWORD = "keyword";
     private static final String LONG = "long";
+    /**
+     * The type the bridge declares a column of the engine's row ids with, the
+     * engine's {@code _id} type, which no field type of a mapping is (the
+     * bridge's {@code ENGINE_ID_TYPE}).
+     */
+    private static final String ENGINE_ID = "infino_engine_id";
+    /** An edge index's columns (see {@link InfinoPlugin#INFINO_EDGES}): each end of an edge as its row's table and {@code _id}. */
+    private static final List<String> EDGE_TABLES = List.of("src_table", "dst_table");
+    private static final List<String> EDGE_IDS = List.of("src_id", "dst_id");
 
     /** The mapping version each table was last declared from, by table. */
     private final Map<String, Long> declared = new ConcurrentHashMap<>();
@@ -54,6 +65,18 @@ public final class InfinoTables {
     /** The table holding one shard's rows, declared from the index's current mapping if it has not been. */
     public String ensure(IndexMetadata md, int shard) {
         return declare(shardTable(InfinoNative.tableFor(md.getIndex(), md.getSettings()), shard, md.getSettings()), md);
+    }
+
+    /** Every table holding the index's rows, each declared as {@link #ensure(IndexMetadata, int)} declares it: one per shard in default mode, else the one. */
+    public List<String> ensureAll(IndexMetadata md) {
+        if (!InfinoPlugin.inDefaultMode(md.getSettings()) || md.getNumberOfShards() == 1) {
+            return List.of(ensure(md));
+        }
+        List<String> out = new ArrayList<>(md.getNumberOfShards());
+        for (int shard = 0; shard < md.getNumberOfShards(); shard++) {
+            out.add(ensure(md, shard));
+        }
+        return out;
     }
 
     /** The table holding the document {@code id} (routed by {@code routing} when given), as its shard is chosen for a write. */
@@ -94,12 +117,16 @@ public final class InfinoTables {
      * (a row's routing value, the sequence numbers it is stamped and was
      * written with, and their generation), declared so that every batch is
      * converted against declared columns rather than typed from its
-     * documents.
+     * documents. An edge index's table declares its edge columns as the
+     * engine's graph walks read them, whatever the mapping says of them: the
+     * tables as strings, the ids as the engine's id type.
      */
     @SuppressWarnings("unchecked")
     private static String tableMapping(IndexMetadata md) {
         MappingMetadata mapping = md.mapping();
-        if (!InfinoPlugin.inDefaultMode(md.getSettings())) {
+        boolean stamped = InfinoPlugin.inDefaultMode(md.getSettings());
+        boolean edges = InfinoPlugin.INFINO_EDGES.get(md.getSettings());
+        if (!stamped && !edges) {
             return mapping == null ? "{}" : mapping.source().string();
         }
         Map<String, Object> properties = new LinkedHashMap<>();
@@ -107,10 +134,16 @@ public final class InfinoTables {
         if (declared instanceof Map<?, ?> m) {
             properties.putAll((Map<String, Object>) m);
         }
-        properties.put(InfinoQueryTranslator.ROUTING, Map.of(TYPE, KEYWORD));
-        properties.put(InfinoQueryTranslator.SEQ, Map.of(TYPE, LONG));
-        properties.put(InfinoQueryTranslator.OP, Map.of(TYPE, LONG));
-        properties.put(InfinoQueryTranslator.GEN, Map.of(TYPE, LONG));
+        if (stamped) {
+            properties.put(InfinoQueryTranslator.ROUTING, Map.of(TYPE, KEYWORD));
+            properties.put(InfinoQueryTranslator.SEQ, Map.of(TYPE, LONG));
+            properties.put(InfinoQueryTranslator.OP, Map.of(TYPE, LONG));
+            properties.put(InfinoQueryTranslator.GEN, Map.of(TYPE, LONG));
+        }
+        if (edges) {
+            EDGE_TABLES.forEach(column -> properties.put(column, Map.of(TYPE, KEYWORD)));
+            EDGE_IDS.forEach(column -> properties.put(column, Map.of(TYPE, ENGINE_ID)));
+        }
         try (XContentBuilder b = XContentFactory.jsonBuilder()) {
             b.map(Map.of(PROPERTIES, properties));
             return BytesReference.bytes(b).utf8ToString();
