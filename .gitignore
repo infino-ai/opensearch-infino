@@ -13,3 +13,4 @@ bench/*.out
 
 # OS / editor
 .DS_Store
+.infino/
