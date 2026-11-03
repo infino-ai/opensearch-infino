@@ -109,6 +109,10 @@ public class InfinoScriptTranslatorTests extends OpenSearchTestCase {
 
     public void testDatesAndMath() {
         assertEquals("CAST(date_part('hour', \"@timestamp\") AS BIGINT)", sql("doc['@timestamp'].value.getHour()").expr());
+        // Painless's getter shortcut, as the Dashboards sample flights' hour_of_day scripted field reads it.
+        assertEquals("CAST(date_part('hour', \"@timestamp\") AS BIGINT)", sql("doc['@timestamp'].value.hour").expr());
+        assertEquals(sql("doc['@timestamp'].value.getDayOfWeekEnum().getValue()").expr(), sql("doc['@timestamp'].value.dayOfWeekEnum.value").expr());
+        assertEquals("CAST(date_part('month', \"@timestamp\") AS BIGINT)", sql("doc['@timestamp'].value.monthValue").expr());
         assertEquals("arrow_cast(\"@timestamp\", 'Int64')", sql("doc['@timestamp'].value.toInstant().toEpochMilli()").expr());
         assertEquals("arrow_cast(\"@timestamp\", 'Int64')", sql("doc['@timestamp'].value.getMillis()").expr());
         assertEquals("arrow_cast(\"@timestamp\", 'Int64')", sql("new Date(doc['@timestamp'].value).getTime()").expr());

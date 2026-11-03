@@ -294,7 +294,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             new InfinoSearchActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, InfinoServices::scriptService),
             new InfinoScrollActionFilter(InfinoServices::clusterService, InfinoServices::scriptService),
             new InfinoGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES),
-            new InfinoMultiGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES)
+            new InfinoMultiGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES),
+            new InfinoStatsActionFilter(InfinoServices::clusterService, TABLES)
         );
     }
 
@@ -483,6 +484,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
+        // Registered cluster state is applied through the node's own REST API.
+        InfinoClusterState.bind(restController);
         return List.of(new InfinoAccountRestHandler(account));
     }
 

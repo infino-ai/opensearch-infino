@@ -1,0 +1,203 @@
+---
+# A proxy-mode index's writes run their pipelines in the plugin; a default-mode
+# index's go through the stock bulk, which runs them itself.
+"Ingest pipelines run on a write, as a stock bulk runs them":
+  - do:
+      ingest.put_pipeline:
+        id: ing_tag
+        body:
+          processors:
+            - set: { field: tagged, value: by-pipeline }
+  - do:
+      ingest.put_pipeline:
+        id: ing_drop_three
+        body:
+          processors:
+            - drop: { if: "ctx.n == 3" }
+  - do:
+      ingest.put_pipeline:
+        id: ing_fail
+        body:
+          processors:
+            - fail: { message: "refused by the pipeline" }
+  - do:
+      ingest.put_pipeline:
+        id: ing_final
+        body:
+          processors:
+            - set: { field: stamped, value: final }
+  - do:
+      indices.create:
+        index: ing1
+        body:
+          settings:
+            number_of_shards: 1
+            number_of_replicas: 0
+            index.infino.mode: proxy
+            index.default_pipeline: ing_drop_three
+            index.final_pipeline: ing_final
+          mappings:
+            properties:
+              n: { type: long }
+              tagged: { type: keyword }
+              stamped: { type: keyword }
+
+  # The pipeline a request names takes the place of the index's default one; the final one runs after it.
+  - do:
+      index:
+        index: ing1
+        id: "1"
+        pipeline: ing_tag
+        refresh: true
+        body: { n: 1 }
+  - do:
+      get:
+        index: ing1
+        id: "1"
+  - match: { _source.tagged: by-pipeline }
+  - match: { _source.stamped: final }
+
+  # In a bulk, the default pipeline drops one document and a named one fails another: each is
+  # answered as stock answers it and neither is written, and the rest of the bulk is.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ing1, _id: "2" }
+          - { n: 2 }
+          - index: { _index: ing1, _id: "3" }
+          - { n: 3 }
+          - index: { _index: ing1, _id: "4", pipeline: ing_fail }
+          - { n: 4 }
+  - match: { errors: true }
+  - match: { items.0.index.result: created }
+  - match: { items.1.index.result: noop }
+  - match: { items.2.index.status: 500 }
+  - match: { items.2.index.error.type: fail_processor_exception }
+  - match: { items.2.index.error.reason: "refused by the pipeline" }
+  - do:
+      get:
+        index: ing1
+        id: "2"
+  - match: { _source.stamped: final }
+  - do:
+      catch: missing
+      get:
+        index: ing1
+        id: "3"
+  - do:
+      search:
+        index: ing1
+        body: { query: { match_all: {} } }
+  - match: { hits.total.value: 2 }
+
+  # A pipeline that sets the document's index sends it there, an Infino-backed index created
+  # for it; the index the request named is not created, as on stock.
+  - do:
+      ingest.put_pipeline:
+        id: ing_route
+        body:
+          processors:
+            - set: { field: _index, value: ing_routed }
+  - do:
+      index:
+        index: ing_unrouted
+        id: "r1"
+        pipeline: ing_route
+        refresh: true
+        body: { n: 9 }
+  - match: { _index: ing_routed }
+  - do:
+      get:
+        index: ing_routed
+        id: "r1"
+  - match: { _source.n: 9 }
+  - do:
+      indices.get_settings:
+        index: ing_routed
+  - match: { ing_routed.settings.index.infino.enabled: "true" }
+  - do:
+      indices.exists:
+        index: ing_unrouted
+  - is_false: ''
+
+  # A pipeline that sends a document to an index Infino does not back hands it to the stock
+  # bulk, which writes it there, as on stock; the pipeline does not run again.
+  - do:
+      indices.create:
+        index: ing_lucene
+        body:
+          settings:
+            number_of_shards: 1
+            number_of_replicas: 0
+            index.infino.enabled: false
+          mappings:
+            properties:
+              n: { type: long }
+              tagged: { type: keyword }
+  - do:
+      ingest.put_pipeline:
+        id: ing_to_lucene
+        body:
+          processors:
+            - set: { field: _index, value: ing_lucene }
+            - set: { field: tagged, value: once }
+  - do:
+      index:
+        index: ing1
+        id: "l1"
+        pipeline: ing_to_lucene
+        refresh: true
+        body: { n: 7 }
+  - match: { _index: ing_lucene }
+  - match: { result: created }
+  - do:
+      get:
+        index: ing_lucene
+        id: "l1"
+  - match: { _source.n: 7 }
+  - match: { _source.tagged: once }
+
+  # A bulk over an Infino-backed index and one it does not back serves both, every item
+  # answered in its own slot, with a document a pipeline dropped among them.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ing_lucene, _id: "l2" }
+          - { n: 20 }
+          - index: { _index: ing1, _id: "m1" }
+          - { n: 21 }
+          - index: { _index: ing1, _id: "m2" }
+          - { n: 3 }
+          - index: { _index: ing_lucene, _id: "l3" }
+          - { n: 22 }
+  - match: { errors: false }
+  - match: { items.0.index._index: ing_lucene }
+  - match: { items.0.index._id: l2 }
+  - match: { items.0.index.result: created }
+  - match: { items.1.index._index: ing1 }
+  - match: { items.1.index._id: m1 }
+  - match: { items.1.index.result: created }
+  - match: { items.2.index.result: noop }
+  - match: { items.3.index._index: ing_lucene }
+  - match: { items.3.index._id: l3 }
+  - do:
+      count:
+        index: ing_lucene
+  - match: { count: 3 }
+  - do:
+      get:
+        index: ing1
+        id: "m1"
+  - match: { _source.stamped: final }
+
+  # A pipeline that does not exist fails the document, as on stock.
+  - do:
+      bulk:
+        body:
+          - index: { _index: ing1, _id: "5", pipeline: ing_missing }
+          - { n: 5 }
+  - match: { errors: true }
+  - match: { items.0.index.status: 400 }
+  - match: { items.0.index.error.reason: "pipeline with id [ing_missing] does not exist" }

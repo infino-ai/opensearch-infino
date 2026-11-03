@@ -32,7 +32,8 @@ import static org.opensearch.infino.InfinoQueryTranslator.quoteIdent;
  * contains, startsWith, endsWith, indexOf, substring, replace, equals,
  * isEmpty, matches, concat, toString); date methods (toInstant, toEpochMilli,
  * getMillis, getTime, getHour, getMinute, getSecond, getDayOfMonth, getMonth,
- * getMonthValue, getYear, getDayOfWeek, getDayOfYear), {@code new Date(x)},
+ * getMonthValue, getYear, getDayOfWeek, getDayOfYear, and each as Painless's
+ * getter shortcut: {@code .hour}, {@code .dayOfWeek}), {@code new Date(x)},
  * {@code Instant.ofEpochMilli}, {@code ChronoUnit.X.between} and
  * {@code System.currentTimeMillis}; statements: {@code def} / typed variable
  * declarations, {@code return}, {@code if} / {@code else} (as CASE), a
@@ -98,6 +99,8 @@ final class InfinoScriptTranslator {
     private static final long HOUR_MS = 3_600_000L;
     private static final long MINUTE_MS = 60_000L;
     private static final long SECOND_MS = 1_000L;
+    /** What Painless puts before a member's name to call it as a getter ({@code .hour} is {@code getHour()}). */
+    private static final String GETTER_PREFIX = "get";
 
     private final Map<String, Column> cols;
     private final Map<String, Object> params;
@@ -938,7 +941,8 @@ final class InfinoScriptTranslator {
             case "millis" -> millis(target);
             case "length" -> target.type() == SqlType.STRING ? new Sql("length(" + target.expr() + ")", SqlType.INT) : noSuch(target, a.name());
             case "empty" -> new Sql("(" + target.expr() + " IS NULL)", SqlType.BOOL);
-            default -> noSuch(target, a.name());
+            // Painless reads any other member as its getter: a date's .hour is getHour().
+            default -> method(target, GETTER_PREFIX + Character.toUpperCase(a.name().charAt(0)) + a.name().substring(1), List.of(), scope);
         };
     }
 

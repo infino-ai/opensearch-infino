@@ -28,8 +28,6 @@ import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.tasks.Task;
 
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
@@ -38,7 +36,8 @@ import java.util.function.Supplier;
  * Serves {@code GET /index/_doc/id} for an Infino-backed index from the
  * table, through the id column's term index, before the request is routed to
  * the shard that holds nothing. The index may be named through an alias.
- * Version and sequence number are not carried; {@code _source} includes and
+ * The document carries the sequence number it was written under, which a
+ * conditional write on it is checked against; {@code _source} includes and
  * excludes are applied.
  */
 public class InfinoGetActionFilter implements ActionFilter {
@@ -85,13 +84,12 @@ public class InfinoGetActionFilter implements ActionFilter {
             // cut to the fields the user may read.
             InfinoAccess access = InfinoSecurity.access(index.getIndex().getName(), "get");
             String table = tables.ensureForDocument(index, get.id(), get.routing());
-            String source = access.restrictsDocuments()
-                ? restrictedSources(table, List.of(get.id()), access).get(get.id())
-                : sourceOf(index, table, get.id());
-            String shown = access.read(get.id(), source);
+            InfinoNative.Doc doc = access.restrictsDocuments()
+                ? restrictedDocs(table, List.of(get.id()), access).get(get.id())
+                : docOf(index, table, get.id());
             @SuppressWarnings("unchecked")
             Response response = (Response) new GetResponse(
-                result(index.getIndex().getName(), get.id(), shown, get.fetchSourceContext(), routingOf(index, table, get.id(), shown))
+                result(index.getIndex().getName(), get.id(), doc, access, get.fetchSourceContext(), routingOf(index, table, get.id(), doc))
             );
             listener.onResponse(response);
         } catch (Exception e) {
@@ -101,37 +99,23 @@ public class InfinoGetActionFilter implements ActionFilter {
     }
 
     /**
-     * The sources of {@code ids} the document-level rule lets the user see,
-     * by id: one statement over the table with the rule as its predicate. An
-     * id the rule hides is absent, as a missing document is.
+     * The documents of {@code ids} the document-level rule lets the user
+     * see, by id: one statement over the table with the rule as its
+     * predicate. An id the rule hides is absent, as a missing document is.
      */
-    static Map<String, String> restrictedSources(String table, List<String> ids, InfinoAccess access) {
-        String rule = access.documentsWhere(InfinoNative.columns(table), table, System.currentTimeMillis());
-        List<String> literals = new ArrayList<>(ids.size());
-        for (String id : ids) {
-            literals.add(InfinoQueryTranslator.literal(id));
-        }
-        String sql = "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM " + InfinoQueryTranslator.quoteIdent(table)
-            + " WHERE " + InfinoQueryTranslator.OSID + " IN (" + String.join(", ", literals) + ") AND (" + rule + ")";
-        Map<String, String> out = new HashMap<>();
-        for (Map<String, Object> row : InfinoNative.sqlRows(sql)) {
-            Object id = row.get(InfinoQueryTranslator.OSID);
-            Object source = row.get(InfinoQueryTranslator.SOURCE);
-            if (id != null && source != null) {
-                out.put(id.toString(), source.toString());
-            }
-        }
-        return out;
+    static Map<String, InfinoNative.Doc> restrictedDocs(String table, List<String> ids, InfinoAccess access) {
+        return InfinoNative.docs(table, ids, access.documentsWhere(InfinoNative.columns(table), table, System.currentTimeMillis()));
     }
 
     /**
-     * A document's source as a read sees it now: in default mode a write its
-     * shard has acknowledged and not yet committed counts, as a stock get
-     * reads the translog; in proxy mode an acknowledged write is in the
-     * table already.
+     * A document as a read sees it now, with the sequence number it was
+     * written under: in default mode a write its shard has acknowledged and
+     * not yet committed counts, as a stock get reads the translog; in proxy
+     * mode an acknowledged write is in the table already. Null when it is
+     * missing or deleted.
      */
-    static String sourceOf(IndexMetadata index, String table, String id) {
-        return InfinoPlugin.inDefaultMode(index.getSettings()) ? InfinoEngine.currentSource(table, id) : InfinoNative.getSource(table, id);
+    static InfinoNative.Doc docOf(IndexMetadata index, String table, String id) {
+        return InfinoPlugin.inDefaultMode(index.getSettings()) ? InfinoEngine.currentDoc(table, id) : InfinoNative.getDoc(table, id);
     }
 
     /** The Infino-backed index a request names, directly or through an alias; null when it names something else. */
@@ -154,23 +138,24 @@ public class InfinoGetActionFilter implements ActionFilter {
     /**
      * The routing value a found default-mode document was written with, which
      * a stock get reports as {@code _routing}; null when it was written with
-     * none, when {@code source} says it was not found, or in proxy mode,
-     * which routes nothing.
+     * none, when it was not found, or in proxy mode, which routes nothing.
      */
-    static String routingOf(IndexMetadata index, String table, String id, String source) {
-        if (source == null || source.isEmpty() || !InfinoPlugin.inDefaultMode(index.getSettings())) {
+    static String routingOf(IndexMetadata index, String table, String id, InfinoNative.Doc doc) {
+        if (doc == null || !InfinoPlugin.inDefaultMode(index.getSettings())) {
             return null;
         }
         return InfinoEngine.currentRouting(table, id);
     }
 
-    /** A get result from a source string (null or empty when the document is missing), with the request's source filter applied. */
-    static GetResult result(String index, String id, String source, FetchSourceContext fetch) {
-        return result(index, id, source, fetch, null);
-    }
-
-    /** {@link #result(String, String, String, FetchSourceContext)} reporting {@code routing} (null for none) as the document's {@code _routing}. */
-    static GetResult result(String index, String id, String source, FetchSourceContext fetch, String routing) {
+    /**
+     * A get result from the table's document (null when it is missing): its
+     * source as the user may see it (the read reported to the audit log when
+     * it watches the index), with the request's source filter applied, the
+     * sequence number it was written under, and {@code routing} (null for
+     * none) as its {@code _routing}.
+     */
+    static GetResult result(String index, String id, InfinoNative.Doc doc, InfinoAccess access, FetchSourceContext fetch, String routing) {
+        String source = doc == null ? null : access.read(id, doc.source());
         boolean exists = source != null && !source.isEmpty();
         BytesReference bytes = null;
         if (exists && (fetch == null || fetch.fetchSource())) {
@@ -178,11 +163,11 @@ public class InfinoGetActionFilter implements ActionFilter {
             boolean excludes = fetch != null && fetch.excludes() != null && fetch.excludes().length > 0;
             bytes = includes || excludes ? InfinoSearch.filtered(source, fetch) : new BytesArray(source);
         }
-        // A found document carries the constants the table reports as its version (see InfinoDocumentVersion).
+        // A found document carries its sequence number, and the version and primary term the table reports (see InfinoDocumentVersion).
         return new GetResult(
             index,
             id,
-            exists ? InfinoDocumentVersion.SEQ_NO : SequenceNumbers.UNASSIGNED_SEQ_NO,
+            exists ? doc.seq() : SequenceNumbers.UNASSIGNED_SEQ_NO,
             exists ? InfinoDocumentVersion.PRIMARY_TERM : SequenceNumbers.UNASSIGNED_PRIMARY_TERM,
             exists ? InfinoDocumentVersion.VERSION : -1L,
             exists,

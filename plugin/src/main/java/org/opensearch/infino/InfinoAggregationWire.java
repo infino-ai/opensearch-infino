@@ -15,6 +15,7 @@ import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.InternalOrder;
 import org.opensearch.search.aggregations.bucket.composite.InternalComposite;
+import org.opensearch.search.aggregations.bucket.filter.InternalFilter;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
 import org.opensearch.search.aggregations.bucket.histogram.LongBounds;
 import org.opensearch.search.aggregations.bucket.missing.MissingOrder;
@@ -52,6 +53,23 @@ final class InfinoAggregationWire {
     private static final int LINEAR_COUNTING_BITS = 25;
     /** Iterations of the register search; the estimator is monotone in the register split. */
     private static final int REGISTER_SEARCH_STEPS = 24;
+
+    /** An {@code InternalFilter}: the one bucket of a {@code filter} aggregation, its count and its sub-aggregations. */
+    static InternalFilter filter(String name, Map<String, Object> metadata, long docCount, InternalAggregations subAggregations) {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            // InternalAggregation.writeTo
+            out.writeString(name);
+            out.writeGenericValue(metadata);
+            // InternalSingleBucketAggregation.doWriteTo
+            out.writeVLong(docCount);
+            subAggregations.writeTo(out);
+            try (StreamInput in = new NamedWriteableAwareStreamInput(out.bytes().streamInput(), registry())) {
+                return new InternalFilter(in);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
 
     /** An {@code InternalDateHistogram}, as the reduce phase expects one from a shard. */
     static InternalDateHistogram dateHistogram(

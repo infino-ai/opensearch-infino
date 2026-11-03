@@ -29,16 +29,6 @@ final class InfinoClient {
         client = injector.getInstance(Client.class);
     }
 
-    /** Run {@code request} as the caller, through the cluster's bulk action and its filters. */
-    static void bulk(BulkRequest request, ActionListener<BulkResponse> listener) {
-        Client c = client;
-        if (c == null) {
-            listener.onFailure(new IllegalStateException("[infino] the node client is not available yet"));
-            return;
-        }
-        c.bulk(request, listener);
-    }
-
     /** Create {@code index} with the cluster's defaults; one that appeared meanwhile counts as created. */
     static void createIndex(String index, ActionListener<Void> listener) {
         createIndex(new CreateIndexRequest(index), listener);
@@ -61,6 +51,21 @@ final class InfinoClient {
             return;
         }
         c.admin().cluster().reroute(new ClusterRerouteRequest().dryRun(true), ActionListener.wrap(response -> listener.onResponse(null), listener::onFailure));
+    }
+
+    /**
+     * Run {@code request} as a bulk on this node, as the caller, through the
+     * cluster's bulk action and its filters: the part of a bulk whose items
+     * write to indices Infino does not back, which the stock bulk serves, and
+     * the writes an update or an adopted skeleton turns into.
+     */
+    static void bulk(BulkRequest request, ActionListener<BulkResponse> listener) {
+        Client c = client;
+        if (c == null) {
+            listener.onFailure(new IllegalStateException("[infino] the node client is not available yet"));
+            return;
+        }
+        c.bulk(request, listener);
     }
 
     /** Create the index {@code request} describes; one that appeared meanwhile counts as created. */

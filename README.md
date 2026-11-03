@@ -197,6 +197,7 @@ its credit and its limits. Nothing is kept in any shard either way.
 ```bash
 curl localhost:9200/_plugins/_infino/account           # what the tables are served from; the notice when no account is in use
 curl localhost:9200/_plugins/_infino/account/indices   # what the registry would bring back on a fresh cluster (?name=<index> for one)
+curl -XPOST localhost:9200/_plugins/_infino/account/indices  # bring them back now: apply the cluster state a loader registered (templates, pipelines, scripts, settings, users and roles), then create every index the cluster lacks (?name=<index> for one)
 curl -XPOST localhost:9200/_plugins/_infino/account/trial -H 'Content-Type: application/json' -d '{"accept": true}'
 curl -XPUT  localhost:9200/_plugins/_infino/account -H 'Content-Type: application/json' -d '{"platform": "https://host", "api_key": "..."}'
 curl -XDELETE localhost:9200/_plugins/_infino/account  # stop using the account on this node; the tables stay on the service
@@ -233,6 +234,15 @@ exist is answered by the id column's term index in one statement, so a
 stream of new documents pays no lookup. A document the declared columns
 cannot hold is refused as its own item with the reason. A bulk must address
 one Infino-backed index.
+
+A batch's writes and its deletes are two mutations, the deletes after the
+append (the engine replaces rows one for one, so a delete with no row in its
+place cannot join the append). A node that stops between the two leaves the
+batch unacknowledged, its writes durable and its deletes not; the client's
+retry applies both again, and both are idempotent (a write replaces by id,
+and an id deleted twice stays deleted). A delete that fails after its append
+committed fails only the delete items (500); the writes are answered as
+written.
 
 ## What the table answers
 

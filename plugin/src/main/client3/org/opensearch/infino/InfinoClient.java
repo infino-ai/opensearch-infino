@@ -53,7 +53,12 @@ final class InfinoClient {
         c.admin().cluster().reroute(new ClusterRerouteRequest().dryRun(true), ActionListener.wrap(response -> listener.onResponse(null), listener::onFailure));
     }
 
-    /** Run {@code request} as the caller, through the cluster's bulk action and its filters. */
+    /**
+     * Run {@code request} as a bulk on this node, as the caller, through the
+     * cluster's bulk action and its filters: the part of a bulk whose items
+     * write to indices Infino does not back, which the stock bulk serves, and
+     * the writes an update or an adopted skeleton turns into.
+     */
     static void bulk(BulkRequest request, ActionListener<BulkResponse> listener) {
         Client c = client;
         if (c == null) {
