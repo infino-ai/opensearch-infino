@@ -182,6 +182,8 @@ public class InfinoAggregationProcessor {
      * with more groups than are picked here (see {@link #totalFromTopTerms}).
      */
     private final Map<String, List<Map<String, Object>>> readAhead = new HashMap<>();
+    /** The table {@link #evaluate} reads, whose plain relation {@link #explicitCounts} counts directly. */
+    private String table;
 
     /** A processor whose top hits name {@code index}; null for planning only. */
     InfinoAggregationProcessor(Index index) {
@@ -207,6 +209,7 @@ public class InfinoAggregationProcessor {
      */
     Counted evaluate(Collection<AggregationBuilder> builders, Plan plan, Long total) {
         Translation q = plan.query();
+        this.table = plan.table();
         List<Spec> specs = new ArrayList<>();
         int position = 0;
         for (AggregationBuilder b : builders) {
@@ -1720,12 +1723,32 @@ public class InfinoAggregationProcessor {
     }
 
     /**
-     * The counts of {@link #countsOnly} buckets, all in one statement: a
-     * {@code COUNT(*) FILTER (WHERE ...)} per bucket, and the relation's own count as
-     * {@link #TOTAL_ALIAS} when {@code withTotal}. The table reads the relation once rather
-     * than once per bucket, and counts a range-indexed field's buckets from its range index.
+     * The counts of {@link #countsOnly} buckets, all in one call: each bucket's, and the
+     * relation's own as {@link #TOTAL_ALIAS} when {@code withTotal}. Over the plain table
+     * the engine counts a range-indexed field's buckets from its range index, with no
+     * statement; over any other relation they are one statement of a
+     * {@code COUNT(*) FILTER (WHERE ...)} per bucket, which reads the relation once.
      */
     private Map<String, Object> explicitCounts(Explicit e, String from, String where, boolean withTotal) {
+        if (table != null && from.equals(InfinoQueryTranslator.quoteIdent(table))) {
+            List<String> predicates = new ArrayList<>();
+            if (withTotal) {
+                predicates.add(where);
+            }
+            for (ExplicitBucket b : e.buckets) {
+                predicates.add("(" + where + ") AND (" + b.predicate() + ")");
+            }
+            long[] counted = InfinoNative.countWhere(table, predicates);
+            Map<String, Object> row = new HashMap<>();
+            int next = 0;
+            if (withTotal) {
+                row.put(TOTAL_ALIAS, counted[next++]);
+            }
+            for (int i = 0; i < e.buckets.size(); i++) {
+                row.put(bucketCount(i), counted[next++]);
+            }
+            return row;
+        }
         List<String> counts = new ArrayList<>();
         if (withTotal) {
             counts.add("COUNT(*) AS " + TOTAL_ALIAS);

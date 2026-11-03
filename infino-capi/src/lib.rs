@@ -36,11 +36,12 @@ use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
-use datafusion::prelude::{col, lit};
+use datafusion::common::DFSchema;
+use datafusion::prelude::{col, lit, SessionContext};
 use infino::arrow_array::{
     new_null_array, Array, BooleanArray, Float32Array, Float64Array, Int64Array, LargeStringArray,
     RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -1657,6 +1658,93 @@ pub unsafe extern "C" fn infino_count(
     .unwrap_or(ptr::null_mut())
 }
 
+/// The rows each of `predicates` holds: a JSON array of SQL boolean
+/// expressions over the table's columns in, a JSON array of their counts out,
+/// in order, as `COUNT(*) FILTER (WHERE p)` gives each. The engine counts a
+/// range on a range-indexed column (or `1=1`, every row) from the range index
+/// with no statement, and runs one aggregate otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn infino_count_where(
+    h: *mut Bridge,
+    name: *const c_char,
+    predicates: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(predicates)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(predicates) })
+        else {
+            return ptr::null_mut();
+        };
+        let predicates: Vec<String> = match serde_json::from_str(predicates) {
+            Ok(p) => p,
+            Err(e) => return err_json(&format!("predicates: {e}")),
+        };
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let schema = match DFSchema::try_from(table.schema().as_ref().clone()) {
+            Ok(s) => s,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        // A predicate over another relation (a subquery) is no expression of
+        // this table's columns alone: such counts run as one statement.
+        let Ok(exprs) = predicates
+            .iter()
+            .map(|p| predicate_parser().parse_sql_expr(p, &schema))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return count_where_by_sql(&conn.conn, name, &predicates);
+        };
+        match table.count_where(&exprs) {
+            Ok(counts) => out_string(json!(counts).to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// [`infino_count_where`]'s counts as one `COUNT(*) FILTER` statement over
+/// table `name`.
+fn count_where_by_sql(conn: &Connection, name: &str, predicates: &[String]) -> *mut c_char {
+    let counts: Vec<String> = predicates
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("COUNT(*) FILTER (WHERE {p}) AS c{i}"))
+        .collect();
+    let sql = format!(
+        "SELECT {} FROM \"{}\"",
+        counts.join(", "),
+        name.replace('"', "\"\"")
+    );
+    let batches = match conn.query_sql(&sql) {
+        Ok(b) => b,
+        Err(e) => return err_json(&e.to_string()),
+    };
+    let Some(row) = batches.iter().find(|b| b.num_rows() > 0) else {
+        return err_json("count_where: the counts came back with no row");
+    };
+    let counts: Option<Vec<i64>> = (0..predicates.len())
+        .map(|i| {
+            row.column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|c| c.value(0))
+        })
+        .collect();
+    match counts {
+        Some(counts) => out_string(json!(counts).to_string()),
+        None => err_json("count_where: a count came back as no Int64"),
+    }
+}
+
+/// The context [`infino_count_where`] parses predicates with: one for the
+/// process, as building a context registers every function anew.
+fn predicate_parser() -> &'static SessionContext {
+    static PARSER: OnceLock<SessionContext> = OnceLock::new();
+    PARSER.get_or_init(SessionContext::new)
+}
+
 /// A column's rows counted per value: rows of the value (under the column's
 /// name, null for the rows without one) and `count(*)`, with no statement.
 /// The engine reads them from the table's statistics when those count every
@@ -2048,6 +2136,49 @@ mod tests {
             counted(&value_counts(h, "level", GROUPS), "level", "count(*)"),
             counted(&sql(h, grouped_sql), "level", "n")
         );
+        close(h);
+    }
+
+    #[test]
+    fn count_where_counts_each_predicate_as_a_filtered_count() {
+        let h = open_logs();
+        index(
+            h,
+            &[
+                ("a", r#"{"status":200,"took":1.5,"level":"info"}"#),
+                ("b", r#"{"status":404,"took":30.0,"level":"warn"}"#),
+                ("c", r#"{"status":500,"took":2.5,"level":"error"}"#),
+                ("d", r#"{"message":"no status"}"#),
+            ],
+        );
+        // Every row, ranges the index counts, and two shapes it leaves to the
+        // aggregate: a keyword column and an OR.
+        let predicates = [
+            "1=1",
+            r#"(1=1 AND ("status" >= 400))"#,
+            r#"("took") < 10"#,
+            r#""level" = 'info'"#,
+            r#""status" < 300 OR "took" > 20"#,
+        ];
+        let filtered: Vec<String> = predicates
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("COUNT(*) FILTER (WHERE {p}) AS c{i}"))
+            .collect();
+        let expected = sql(h, &format!("SELECT {} FROM logs", filtered.join(", ")));
+        let expected: Vec<u64> = (0..predicates.len())
+            .map(|i| expected[0][format!("c{i}")].as_u64().expect("a count"))
+            .collect();
+        let out = take(unsafe {
+            infino_count_where(
+                h,
+                c("logs").as_ptr(),
+                c(&json!(predicates).to_string()).as_ptr(),
+            )
+        });
+        let counts: Vec<u64> = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert_eq!(counts, expected);
+        assert_eq!(counts, [4, 2, 2, 1, 2]);
         close(h);
     }
 
