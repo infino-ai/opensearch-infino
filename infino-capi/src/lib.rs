@@ -1722,38 +1722,29 @@ fn holds_subquery(expr: &Expr) -> bool {
     .unwrap_or(true)
 }
 
-/// [`infino_count_where`]'s counts as one `COUNT(*) FILTER` statement over
-/// table `name`.
+/// [`infino_count_where`]'s counts as statements over table `name`, one
+/// `COUNT(*) ... WHERE p` per predicate: a FILTER clause cannot hold the
+/// subquery these predicates read.
 fn count_where_by_sql(conn: &Connection, name: &str, predicates: &[String]) -> *mut c_char {
-    let counts: Vec<String> = predicates
-        .iter()
-        .enumerate()
-        .map(|(i, p)| format!("COUNT(*) FILTER (WHERE {p}) AS c{i}"))
-        .collect();
-    let sql = format!(
-        "SELECT {} FROM \"{}\"",
-        counts.join(", "),
-        name.replace('"', "\"\"")
-    );
-    let batches = match conn.query_sql(&sql) {
-        Ok(b) => b,
-        Err(e) => return err_json(&e.to_string()),
-    };
-    let Some(row) = batches.iter().find(|b| b.num_rows() > 0) else {
-        return err_json("count_where: the counts came back with no row");
-    };
-    let counts: Option<Vec<i64>> = (0..predicates.len())
-        .map(|i| {
-            row.column(i)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .map(|c| c.value(0))
-        })
-        .collect();
-    match counts {
-        Some(counts) => out_string(json!(counts).to_string()),
-        None => err_json("count_where: a count came back as no Int64"),
+    let table = name.replace('"', "\"\"");
+    let mut counts = Vec::with_capacity(predicates.len());
+    for p in predicates {
+        let sql = format!("SELECT COUNT(*) AS c FROM \"{table}\" WHERE {p}");
+        let batches = match conn.query_sql(&sql) {
+            Ok(b) => b,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let count = batches
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .and_then(|row| row.column(0).as_any().downcast_ref::<Int64Array>())
+            .map(|c| c.value(0));
+        match count {
+            Some(count) => counts.push(count),
+            None => return err_json("count_where: a count came back as no Int64"),
+        }
     }
+    out_string(json!(counts).to_string())
 }
 
 /// The context [`infino_count_where`] parses predicates with: one for the
@@ -2197,6 +2188,21 @@ mod tests {
         let counts: Vec<u64> = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
         assert_eq!(counts, expected);
         assert_eq!(counts, [4, 2, 2, 1, 2]);
+        // A text clause joined by id, which reads the token index through a
+        // subquery, beside the whole table.
+        let joined = [
+            r#""osid" IN (SELECT "osid" FROM token_match('logs', 'message', 'status', 'or'))"#,
+            "1=1",
+        ];
+        let out = take(unsafe {
+            infino_count_where(
+                h,
+                c("logs").as_ptr(),
+                c(&json!(joined).to_string()).as_ptr(),
+            )
+        });
+        let counts: Vec<u64> = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert_eq!(counts, [1, 4]);
         close(h);
     }
 
