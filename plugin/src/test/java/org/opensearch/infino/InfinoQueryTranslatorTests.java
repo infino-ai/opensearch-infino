@@ -142,6 +142,32 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertTrue(collapsed, collapsed.startsWith("SELECT osid, source, "));
     }
 
+    public void testTiesBreakByTheEngineRowId() {
+        // Rows sharing the sort value are ordered by the engine's row id, which
+        // the engine answers from its range index; a page continuing from a row
+        // reads the id back as a decimal, past what an integer literal holds.
+        String id = "31415926535897932384626433832795";
+        InfinoSearch.Plan plan = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchAllQuery()),
+            java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true), InfinoSearch.SortSpec.rowId()),
+            null,
+            null,
+            null,
+            new Object[] { 404, id },
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        String sql = InfinoSearch.hitStatement(plan, 10, false);
+        assertTrue(sql, sql.startsWith("SELECT osid, \"status\" AS \"status\", \"_id\" AS \"_id\" FROM \"os_logs_0\" WHERE "));
+        assertTrue(sql, sql.contains("\"_id\" > CAST('" + id + "' AS DECIMAL(38, 0))"));
+        assertTrue(sql, sql.endsWith("ORDER BY \"status\" DESC NULLS LAST, \"_id\" ASC NULLS LAST LIMIT 10"));
+        assertNull(InfinoSearch.rowIdLiteral("12; DROP TABLE x"));
+        assertNull(InfinoSearch.rowIdLiteral(""));
+    }
+
     public void testRankedSearchUnderAFilterAsksForThePage() {
         // The engine ranks within the rows the filter keeps, as Lucene filters
         // while it collects: the filter rides with the ranked search, which is

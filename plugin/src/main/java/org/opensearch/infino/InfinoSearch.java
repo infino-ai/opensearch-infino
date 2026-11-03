@@ -118,6 +118,8 @@ public final class InfinoSearch {
     private static final String MAPPING_FORMAT = "use_field_mapping";
     /** The format that prints a date as its epoch milliseconds. */
     private static final String EPOCH_MILLIS_FORMAT = "epoch_millis";
+    /** Digits of the engine's row id: its type is {@code DECIMAL(38, 0)}. */
+    private static final int ROW_ID_DIGITS = 38;
     /** The sort a scroll without one pages by: the document id, which {@link #columnFor} resolves to the id column. */
     private static final String ID_SORT_FIELD = "_id";
 
@@ -188,6 +190,18 @@ public final class InfinoSearch {
                 : "CASE WHEN " + InfinoQueryTranslator.quoteIdent(values.name()) + " IS NULL THEN " + InfinoQueryTranslator.quoteIdent(c.name())
                     + " ELSE " + pick + " END";
             return new SortSpec(expr, c.name(), InfinoScriptTranslator.typeOf(c.element()), desc);
+        }
+
+        /**
+         * The engine's row id, which orders the rows sharing every sort value
+         * of a request: the order they were written in, as stock orders them
+         * by their place in the index. The engine answers a sort broken this
+         * way from the first rows of each superfile's range index rather than
+         * every row tied with the page's last value. Its value is the id's
+         * digits ({@link #rowIdLiteral} reads it back).
+         */
+        static SortSpec rowId() {
+            return new SortSpec(InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID), InfinoSql.ROW_ID, SqlType.UNKNOWN, false);
         }
 
         /** The sort on {@code _seq_no}: the sequence column, a row written without a number at the one it reports. */
@@ -315,13 +329,12 @@ public final class InfinoSearch {
                 scriptFields.add(new ScriptedField(sf.fieldName(), sql.expr(), "sf" + scriptFields.size()));
             }
         }
-        // A sorted request orders by the id last, so rows sharing a sort value
-        // have one order and a page boundary falls between rows, never through
-        // a value: the id is the tiebreak search_after needs, and the hit's sort
-        // values carry it for the next page.
-        Column idColumn = cols.get(InfinoQueryTranslator.OSID);
-        if (!sorts.isEmpty() && idColumn != null && sorts.stream().noneMatch(s -> s.name().equals(InfinoQueryTranslator.OSID))) {
-            sorts.add(SortSpec.of(idColumn, false));
+        // A sorted request orders by the engine's row id last, so rows sharing
+        // a sort value have one order and a page boundary falls between rows,
+        // never through a value; a scroll's next page continues from it. A
+        // request sorted by the document id already has one order.
+        if (!sorts.isEmpty() && sorts.stream().noneMatch(s -> s.name().equals(InfinoQueryTranslator.OSID))) {
+            sorts.add(SortSpec.rowId());
         }
         Object[] searchAfter = source.searchAfter();
         if (searchAfter != null) {
@@ -794,7 +807,9 @@ public final class InfinoSearch {
             } else {
                 // A date sort's value as text is read by its field's own format, as stock reads it.
                 Column sorted = plan.cols().get(s.name());
-                String lit = InfinoQueryTranslator.literalForType(s.type(), value, now, sorted == null ? null : sorted.dateFormat());
+                String lit = s.name().equals(InfinoSql.ROW_ID)
+                    ? rowIdLiteral(value)
+                    : InfinoQueryTranslator.literalForType(s.type(), value, now, sorted == null ? null : sorted.dateFormat());
                 if (lit == null) {
                     throw new IllegalArgumentException("[infino] search_after value [" + value + "] is not a " + s.type().name().toLowerCase(Locale.ROOT));
                 }
@@ -807,6 +822,19 @@ public final class InfinoSearch {
             equal.add(same);
         }
         return "(" + String.join(" OR ", alternatives) + ")";
+    }
+
+    /**
+     * The engine row id {@code value} (its digits, as a hit's sort values carry
+     * it) as a literal of the id's type, or null when it is not one: the
+     * digits as text cast, since an id is past what a SQL integer literal holds.
+     */
+    static String rowIdLiteral(Object value) {
+        String digits = value.toString();
+        if (digits.isEmpty() || digits.length() > ROW_ID_DIGITS || !digits.chars().allMatch(Character::isDigit)) {
+            return null;
+        }
+        return "CAST('" + digits + "' AS DECIMAL(" + ROW_ID_DIGITS + ", 0))";
     }
 
     /** Whether the request asks for the exact total (the default, and what dashboards send). */
