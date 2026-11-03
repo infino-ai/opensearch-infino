@@ -33,49 +33,104 @@ use datafusion::sql::sqlparser::ast::{
     TableFactor, Value, Visit, VisitMut, Visitor, VisitorMut,
 };
 
-/// The engine's search functions, each naming the table it searches as its
-/// first argument, a string literal.
-const SEARCH_FUNCTIONS: [&str; 6] = [
-    "bm25_search",
-    "bm25_search_prefix",
-    "vector_search",
-    "token_match",
-    "exact_match",
-    "hybrid_search",
+/// One of the engine's search functions, each naming the table it searches
+/// as its first argument, a string literal.
+///
+/// One entry per search holds all the walk needs of it, so a search it lets
+/// through is one whose columns it checks: kept as separate lists, a search
+/// added to the list of those served but not to the list of the columns it
+/// matches would rank while matching a column the caller may not read.
+struct EngineSearch {
+    name: &'static str,
+    /// Where it names the columns it matches among its arguments: the
+    /// column after the table, and a hybrid search's vector column after
+    /// its text query. The other arguments are queries, vectors and counts,
+    /// which a column's name may appear in as plain text.
+    columns: &'static [usize],
+    /// For a ranked search, where its row count `k` is among its arguments
+    /// and the order its score ranks rows in ([`Ranked`]).
+    ranked: Option<Ranked>,
+}
+/// Where a ranked search or walk has its row count `k` among its arguments,
+/// and the order its score ranks rows in: BM25, hybrid relevance and a graph
+/// rank higher first; a vector distance and a walk's hop count nearer first.
+#[derive(Clone, Copy)]
+struct Ranked {
+    k_at: usize,
+    order: &'static str,
+}
+const HIGHER_FIRST: &str = "DESC";
+const NEARER_FIRST: &str = "ASC";
+const SEARCHES: [EngineSearch; 6] = [
+    EngineSearch {
+        name: "bm25_search",
+        columns: &[1],
+        ranked: Some(Ranked {
+            k_at: 3,
+            order: HIGHER_FIRST,
+        }),
+    },
+    EngineSearch {
+        name: "bm25_search_prefix",
+        columns: &[1],
+        ranked: Some(Ranked {
+            k_at: 3,
+            order: HIGHER_FIRST,
+        }),
+    },
+    EngineSearch {
+        name: "vector_search",
+        columns: &[1],
+        ranked: Some(Ranked {
+            k_at: 3,
+            order: NEARER_FIRST,
+        }),
+    },
+    EngineSearch {
+        name: "token_match",
+        columns: &[1],
+        ranked: None,
+    },
+    EngineSearch {
+        name: "exact_match",
+        columns: &[1],
+        ranked: None,
+    },
+    EngineSearch {
+        name: "hybrid_search",
+        columns: &[1, 3],
+        ranked: Some(Ranked {
+            k_at: 5,
+            order: HIGHER_FIRST,
+        }),
+    },
 ];
 /// The engine's graph walks: `(edges, table, seed_table, seed_ids, hops,
 /// k)`, the rows of `table` within `hops` edges of the seed rows of
-/// `seed_table`, over the edge table `edges`. Each names three indices.
-const GRAPH_FUNCTIONS: [&str; 2] = ["graph_walk", "graph_rank"];
+/// `seed_table`, over the edge table `edges`. Each names three indices,
+/// and is ranked. A walk matches no column: it reads its edges and seeds
+/// whole, so only from an index the caller may read whole.
+const GRAPH_WALKS: [(&str, Ranked); 2] = [
+    (
+        "graph_walk",
+        Ranked {
+            k_at: 5,
+            order: NEARER_FIRST,
+        },
+    ),
+    (
+        "graph_rank",
+        Ranked {
+            k_at: 5,
+            order: HIGHER_FIRST,
+        },
+    ),
+];
 /// Where a graph walk names its edge table, the table whose rows it
 /// returns, and the table its seeds are rows of.
 const GRAPH_EDGES_AT: usize = 0;
 const GRAPH_TABLE_AT: usize = 1;
 const GRAPH_SEEDS_AT: usize = 2;
-/// The engine's ranked searches and walks, each with where its row count
-/// `k` is among its arguments and the order its score ranks rows in: BM25,
-/// hybrid relevance and a graph rank higher first; a vector distance and a
-/// walk's hop count nearer first.
-const RANKED: [(&str, usize, &str); 6] = [
-    ("bm25_search", 3, "DESC"),
-    ("bm25_search_prefix", 3, "DESC"),
-    ("vector_search", 3, "ASC"),
-    ("hybrid_search", 5, "DESC"),
-    ("graph_walk", 5, "ASC"),
-    ("graph_rank", 5, "DESC"),
-];
-/// Where each engine search names the columns it matches among its
-/// arguments: the column after the table, and a hybrid search's vector
-/// column after its text query. The other arguments are queries, vectors
-/// and counts, which a column's name may appear in as plain text.
-const SEARCH_COLUMNS: [(&str, &[usize]); 6] = [
-    ("bm25_search", &[1]),
-    ("bm25_search_prefix", &[1]),
-    ("vector_search", &[1]),
-    ("token_match", &[1]),
-    ("exact_match", &[1]),
-    ("hybrid_search", &[1, 3]),
-];
 /// The column an engine search ranks its rows by.
 const SCORE: &str = "score";
 /// The name a ranked search over several tables is merged under.
@@ -656,13 +711,19 @@ impl<'a> Walk<'a> {
         if GENERATORS.contains(&function.as_str()) {
             return ControlFlow::Continue(());
         }
-        let graph = GRAPH_FUNCTIONS.contains(&function.as_str());
-        if !graph && !SEARCH_FUNCTIONS.contains(&function.as_str()) {
-            return ControlFlow::Break(refuse(
-                format!("the table function {function} is not served"),
-                BAD_REQUEST,
-            ));
-        }
+        let walk = GRAPH_WALKS.iter().find(|(name, _)| *name == function);
+        let engine = SEARCHES.iter().find(|search| search.name == function);
+        let graph = walk.is_some();
+        let ranked = match (walk, engine) {
+            (Some((_, ranked)), _) => Some(*ranked),
+            (None, Some(engine)) => engine.ranked,
+            (None, None) => {
+                return ControlFlow::Break(refuse(
+                    format!("the table function {function} is not served"),
+                    BAD_REQUEST,
+                ));
+            }
+        };
         // A search names the index it searches first; a walk names its edges,
         // the index whose rows it returns, and the index of its seeds.
         let (at, named): (usize, &[usize]) = if graph {
@@ -724,10 +785,7 @@ impl<'a> Walk<'a> {
             // A search matches the stored values of the columns it names, so
             // it names none the caller may not read as stored.
             if let Some(closed) = unsearchable.get(&index) {
-                let at: &[usize] = SEARCH_COLUMNS
-                    .iter()
-                    .find(|(f, _)| *f == function)
-                    .map_or(&[], |(_, at)| *at);
+                let at: &[usize] = engine.map_or(&[], |engine| engine.columns);
                 for arg in at.iter().filter_map(|&i| args.args.get(i)) {
                     if let Some(column) = string_arg(arg).filter(|c| closed.contains(*c)) {
                         return ControlFlow::Break(refuse(
@@ -759,9 +817,8 @@ impl<'a> Walk<'a> {
         // runs the search over each; a ranked one gives its best `k` rows
         // together, as a search over several shards does.
         if matches!(view.body.as_ref(), SetExpr::SetOperation { .. }) {
-            let ranked = RANKED.iter().find(|(f, ..)| *f == function);
-            if let Some((_, at, order)) = ranked {
-                if let Some(k) = args.args.get(*at) {
+            if let Some(Ranked { k_at, order }) = ranked {
+                if let Some(k) = args.args.get(k_at) {
                     view = match parse_query(&format!(
                         "SELECT * FROM ({view}) AS {MERGED} ORDER BY \"{SCORE}\" {order} LIMIT {k}"
                     )) {
