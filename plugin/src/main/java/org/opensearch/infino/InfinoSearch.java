@@ -541,6 +541,9 @@ public final class InfinoSearch {
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
         } else {
             rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+            if (sourcesById(plan) && wantsSource(source)) {
+                rows = withSources(plan.table(), rows, fetch);
+            }
         }
 
         boolean exact = trackTotal(source);
@@ -558,7 +561,7 @@ public final class InfinoSearch {
         }
 
         FetchSourceContext sourceFilter = sourceFilter(source.fetchSource());
-        boolean withSource = source.fetchSource() == null || source.fetchSource().fetchSource();
+        boolean withSource = returnsSource(source);
         List<FieldAndFormat> fields = requestedFields(source.docValueFields(), source.fetchFields());
         boolean version = Boolean.TRUE.equals(source.version());
         SearchShardTarget target = target(index);
@@ -657,10 +660,53 @@ public final class InfinoSearch {
     }
 
     /**
-     * The statement that fetches the page's hits: each hit's id, source,
-     * sort values, its sequence number when {@code withSeq} (the request
-     * asks for {@code seq_no_primary_term}) and, under a collapse, its
-     * collapse value. A sorted request
+     * Whether the page's sources are read by id once its rows are chosen,
+     * rather than in the hit statement: a sorted page without a collapse.
+     * The sort weighs every row the predicate keeps, and every row that ties
+     * on the first key competes on the next, so a source in the statement
+     * would be read for each of those rows to keep a page's worth.
+     */
+    static boolean sourcesById(Plan plan) {
+        return !plan.sorts().isEmpty() && plan.collapse() == null;
+    }
+
+    /** Whether a hit's response carries its source. */
+    private static boolean returnsSource(SearchSourceBuilder source) {
+        return source.fetchSource() == null || source.fetchSource().fetchSource();
+    }
+
+    /** Whether a hit needs its source: to return it, or to read requested fields from it. */
+    private static boolean wantsSource(SearchSourceBuilder source) {
+        return returnsSource(source) || !requestedFields(source.docValueFields(), source.fetchFields()).isEmpty();
+    }
+
+    /** {@code rows} up to {@code fetch}, each with its source from the table, read for those ids in one statement. */
+    private static List<Map<String, Object>> withSources(String table, List<Map<String, Object>> rows, int fetch) {
+        List<Map<String, Object>> page = rows.subList(0, Math.min(rows.size(), fetch));
+        List<String> ids = new ArrayList<>(page.size());
+        for (Map<String, Object> row : page) {
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            if (id != null) {
+                ids.add(id.toString());
+            }
+        }
+        Map<String, String> sources = InfinoNative.sources(table, ids);
+        List<Map<String, Object>> out = new ArrayList<>(page.size());
+        for (Map<String, Object> row : page) {
+            Map<String, Object> withSource = new HashMap<>(row);
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            withSource.put(InfinoQueryTranslator.SOURCE, id == null ? null : sources.get(id.toString()));
+            out.add(withSource);
+        }
+        return out;
+    }
+
+    /**
+     * The statement that fetches the page's hits: each hit's id, its source
+     * unless {@link #sourcesById} reads it afterwards, sort values, its
+     * sequence number when {@code withSeq} (the request asks for
+     * {@code seq_no_primary_term}) and, under a collapse, its collapse value.
+     * A sorted request
      * orders the filtered relation; a text-ranked one orders the engine's
      * ranked candidates by score; anything else is a filtered scan. A
      * search_after narrows the relation to the rows past the given sort values
@@ -669,7 +715,10 @@ public final class InfinoSearch {
      */
     static String hitStatement(Plan plan, int fetch, boolean withSeq) {
         Translation q = plan.query();
-        StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE);
+        StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID);
+        if (!sourcesById(plan)) {
+            hit.append(", ").append(InfinoQueryTranslator.SOURCE);
+        }
         if (withSeq) {
             hit.append(", ").append(InfinoQueryTranslator.SEQ);
         }

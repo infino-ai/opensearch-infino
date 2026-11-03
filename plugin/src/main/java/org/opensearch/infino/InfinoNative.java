@@ -868,6 +868,22 @@ public final class InfinoNative {
         return out;
     }
 
+    /** The sources of these ids, by id, in one statement: an id the table does not hold is absent. */
+    public static Map<String, String> sources(String name, Collection<String> osids) {
+        Map<String, String> out = new HashMap<>();
+        if (osids.isEmpty()) {
+            return out;
+        }
+        for (Map<String, Object> row : sqlRows(byIds(name, InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE, osids, null))) {
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            Object source = row.get(InfinoQueryTranslator.SOURCE);
+            if (id != null && source != null) {
+                out.put(id.toString(), source.toString());
+            }
+        }
+        return out;
+    }
+
     /** A sequence number as a row holds it: a row written without one reads as {@link InfinoDocumentVersion#UNTRACKED_SEQ_NO}. */
     static long seq(Object value) {
         return value instanceof Number n ? n.longValue() : InfinoDocumentVersion.UNTRACKED_SEQ_NO;

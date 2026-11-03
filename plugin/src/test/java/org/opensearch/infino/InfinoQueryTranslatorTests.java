@@ -113,6 +113,35 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         return InfinoSearch.hitStatement(plan, fetch, false);
     }
 
+    /** The hit statement for a match_all sorted by {@code status}, under {@code collapse} (null for none). */
+    private static String sortedHits(Column collapse) {
+        InfinoSearch.Plan plan = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchAllQuery()),
+            java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true)),
+            null,
+            null,
+            collapse,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        return InfinoSearch.hitStatement(plan, 10, false);
+    }
+
+    public void testASortedPageReadsItsSourcesAfterTheSort() {
+        // The sort weighs every row it keeps; its statement selects ids and sort
+        // values only, and the page's sources are read by id afterwards.
+        String sorted = sortedHits(null);
+        assertTrue(sorted, sorted.startsWith("SELECT osid, \"status\" AS \"status\" FROM \"os_logs_0\" WHERE 1=1 ORDER BY "));
+        assertFalse(sorted, sorted.contains("source"));
+        // A collapse keeps the first row of each value through a window, whose rows carry their sources.
+        String collapsed = sortedHits(columns().get("level"));
+        assertTrue(collapsed, collapsed.startsWith("SELECT osid, source, "));
+    }
+
     public void testRankedSearchUnderAFilterAsksForThePage() {
         // The engine ranks within the rows the filter keeps, as Lucene filters
         // while it collects: the filter rides with the ranked search, which is
