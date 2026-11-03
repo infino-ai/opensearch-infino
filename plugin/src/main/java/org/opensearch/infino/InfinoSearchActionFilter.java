@@ -117,15 +117,19 @@ public class InfinoSearchActionFilter implements ActionFilter {
             boolean exactAtCoordinator = reachedShardCount(clusters, names, state, search, concrete) > 1
                 && written.aggregations() != null
                 && InfinoAggregationProcessor.needsExactValues(written.aggregations().getAggregatorFactories());
+            ActionListener<Response> answered = listener;
             if (exactAtCoordinator) {
                 Map<String, InfinoAccess> access = new HashMap<>();
                 for (String name : concrete) {
                     access.put(name, InfinoSecurity.access(name, InfinoSecurityCalls.SEARCH));
                 }
                 InfinoExactAggregation.record(id, written, now, access);
+                // Its final reduce runs before the search answers, so the record
+                // goes once it has: the records held are the searches in flight.
+                answered = ActionListener.runAfter(listener, () -> InfinoExactAggregation.forget(id));
             }
             search.source(InfinoQueryExt.route(written, id, exactAtCoordinator, now));
-            chain.proceed(task, action, request, listener);
+            chain.proceed(task, action, request, answered);
             return;
         }
         if (infino.isEmpty()) {
