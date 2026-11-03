@@ -121,3 +121,63 @@
       infino.account_indices:
         name: reg1
   - match: { registered: false }
+
+---
+"Bringing the registry's indices back now leaves a present one as it is and names it":
+  - do:
+      indices.create:
+        index: reg2
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text }
+  - do:
+      cluster.health:
+        index: reg2
+        wait_for_status: green
+  - do:
+      index:
+        index: reg2
+        id: "1"
+        refresh: true
+        body: { "message": "kept as it is" }
+
+  - do:
+      infino.account_indices_restore:
+        name: reg2
+  - match: { registered: true }
+  - match: { indices.0.name: reg2 }
+  - match: { indices.0.result: present }
+  # No loader registered any cluster state, so none was applied first.
+  - length: { state: 0 }
+  - do:
+      count:
+        index: reg2
+  - match: { count: 1 }
+
+  # An index the registry does not name is reported unregistered, and nothing is created.
+  - do:
+      infino.account_indices_restore:
+        name: reg-none
+  - match: { registered: false }
+  - length: { indices: 0 }
+  - do:
+      indices.exists:
+        index: reg-none
+  - is_false: ''
+
+  - do:
+      indices.delete:
+        index: reg2
+
+---
+"Only a caller who may manage the cluster can bring the registry's indices back":
+  - skip:
+      version: "3.0.0 - 3.5.99"
+      reason: the test cluster runs without the security plugin on these releases, so every caller has the right
+      features: headers
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      catch: forbidden
+      infino.account_indices_restore: {}

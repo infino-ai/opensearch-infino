@@ -22,7 +22,6 @@ import org.opensearch.core.action.ActionResponse;
 import org.opensearch.tasks.Task;
 
 import java.util.List;
-import java.util.Map;
 import java.util.function.Supplier;
 
 /**
@@ -32,9 +31,10 @@ import java.util.function.Supplier;
  * first; the shard holds nothing, so the update is turned into a one-item
  * bulk here and served the same way as an update inside a bulk, its item's
  * response handed back as the update's. An index the update names before
- * it exists is created first, as for a bulk. An update to an index in engine
- * mode goes to the cluster as that one-item bulk, which the bulk filter
- * merges and hands to the shard as a write of the whole document.
+ * it exists is created first, and its upsert goes through its ingest
+ * pipelines, as for a bulk. An update to an index in default mode goes to
+ * the cluster as that one-item bulk, which the bulk filter merges and hands
+ * to the shard as a write of the whole document.
  */
 public class InfinoUpdateActionFilter implements ActionFilter {
 
@@ -75,43 +75,32 @@ public class InfinoUpdateActionFilter implements ActionFilter {
             return;
         }
         BulkRequest bulk = new BulkRequest().add(update).setRefreshPolicy(update.getRefreshPolicy());
-        InfinoBulkActionFilter.createMissing(InfinoBulkActionFilter.missingIndices(clusters, bulk), ActionListener.wrap(created -> {
-            Map<String, IndexMetadata> infino;
+        ActionListener<BulkResponse> answer = ActionListener.wrap(response -> {
+            BulkItemResponse item = response.getItems()[0];
+            if (item.isFailed()) {
+                listener.onFailure(item.getFailure().getCause());
+                return;
+            }
+            @SuppressWarnings("unchecked")
+            Response cast = (Response) item.getResponse();
+            listener.onResponse(cast);
+        }, e -> {
+            log.debug("[infino] update of {} in {} failed: {}", update.id(), update.index(), e.getMessage());
+            listener.onFailure(e);
+        });
+        InfinoBulkActionFilter.route(bulk, clusters, writes, tables, answer, () -> {
             List<String> concrete = InfinoBulkActionFilter.concreteIndices(clusters.state(), bulk);
-            try {
-                infino = InfinoBulkActionFilter.infinoIndices(clusters, concrete);
-            } catch (Exception e) {
-                listener.onFailure(e);
+            IndexMetadata md = concrete.get(0) == null ? null : clusters.state().metadata().index(concrete.get(0));
+            if (md != null && InfinoPlugin.inDefaultMode(md.getSettings())) {
+                // The stock update reads the document's source from Lucene, which a
+                // default-mode index keeps no copy of: as a one-item bulk, the bulk
+                // path merges it here and writes it whole through the shard. The
+                // bulk carries the refresh policy, which a bulk's item may not.
+                update.setRefreshPolicy(WriteRequest.RefreshPolicy.NONE);
+                InfinoClient.bulk(bulk, answer);
                 return;
             }
-            ActionListener<BulkResponse> answer = ActionListener.wrap(response -> {
-                BulkItemResponse item = response.getItems()[0];
-                if (item.isFailed()) {
-                    listener.onFailure(item.getFailure().getCause());
-                    return;
-                }
-                @SuppressWarnings("unchecked")
-                Response cast = (Response) item.getResponse();
-                listener.onResponse(cast);
-            }, e -> {
-                log.debug("[infino] update of {} in {} failed: {}", update.id(), update.index(), e.getMessage());
-                listener.onFailure(e);
-            });
-            if (infino.isEmpty()) {
-                IndexMetadata md = concrete.get(0) == null ? null : clusters.state().metadata().index(concrete.get(0));
-                if (md != null && InfinoPlugin.inDefaultMode(md.getSettings())) {
-                    // The stock update reads the document's source from Lucene, which a
-                    // default-mode index keeps no copy of: as a one-item bulk, the bulk
-                    // path merges it here and writes it whole through the shard. The
-                    // bulk carries the refresh policy, which a bulk's item may not.
-                    update.setRefreshPolicy(WriteRequest.RefreshPolicy.NONE);
-                    InfinoClient.bulk(bulk, answer);
-                    return;
-                }
-                chain.proceed(task, action, request, listener);
-                return;
-            }
-            InfinoBulkActionFilter.serve(bulk, concrete, infino, writes, tables, answer);
-        }, listener::onFailure));
+            chain.proceed(task, action, request, listener);
+        });
     }
 }

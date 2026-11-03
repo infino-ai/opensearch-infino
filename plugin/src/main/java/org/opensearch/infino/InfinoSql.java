@@ -6,7 +6,6 @@ package org.opensearch.infino;
 
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.cluster.ClusterState;
-import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.common.settings.Settings;
@@ -18,8 +17,6 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.IndexNotFoundException;
-import org.opensearch.index.query.AbstractQueryBuilder;
-import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 
 import java.io.IOException;
@@ -214,10 +211,12 @@ final class InfinoSql {
                     if (columns.isEmpty()) {
                         throw new IllegalStateException("[infino] table " + table + " has not been declared");
                     }
-                    String aliasFilter = aliasFilter(state, resolver, md, name, columns, table, now);
-                    Part part = part(table, columns, access, aliasFilter, now);
+                    // The rows a filtering alias the name reached the index through
+                    // keep, read as a search through it reads them.
+                    InfinoAccess read = access.filteredBy(InfinoAliasFilter.of(state, resolver, md, new String[] { name }, table, now));
+                    Part part = part(table, columns, read, now);
                     parts.add(part);
-                    readWhole &= access.unrestricted() && aliasFilter == null;
+                    readWhole &= read.unrestricted();
                     for (Map.Entry<String, UnaryOperator<String>> e : part.onOutput().entrySet()) {
                         String rule = access.maskRuleOf().apply(e.getKey());
                         if (!rule.equals(outputRules.getOrDefault(e.getKey(), rule))) {
@@ -315,50 +314,6 @@ final class InfinoSql {
     }
 
     /**
-     * The rows the aliases {@code name} reached {@code md} through keep, as a
-     * search through them keeps them (any one alias's filter); null when the
-     * index is read whole, as when it is named itself.
-     */
-    private static String aliasFilter(
-        ClusterState state,
-        IndexNameExpressionResolver resolver,
-        IndexMetadata md,
-        String name,
-        Map<String, Column> columns,
-        String table,
-        long now
-    ) {
-        String index = md.getIndex().getName();
-        Set<String> resolved = resolver.resolveExpressions(state, name);
-        String[] filtering = resolver.filteringAliases(state, index, resolved);
-        if (filtering == null || filtering.length == 0) {
-            return null;
-        }
-        List<String> any = new ArrayList<>();
-        for (String alias : filtering) {
-            AliasMetadata am = md.getAliases().get(alias);
-            if (am == null || am.filter() == null) {
-                return null; // one alias that filters nothing reads the index whole
-            }
-            QueryBuilder filter = parse(am.filter().string());
-            String p = InfinoQueryTranslator.rulePredicate(filter, columns, table, now);
-            if (p == null) {
-                throw new IllegalArgumentException("[infino] the filter of alias [" + alias + "] is not served by the table");
-            }
-            any.add(p);
-        }
-        return any.size() == 1 ? any.get(0) : "(" + String.join(" OR ", any) + ")";
-    }
-
-    private static QueryBuilder parse(String json) {
-        try (XContentParser parser = JsonXContent.jsonXContent.createParser(InfinoServices.namedXContentRegistry(), LoggingDeprecationHandler.INSTANCE, json)) {
-            return AbstractQueryBuilder.parseInnerQueryBuilder(parser);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-    }
-
-    /**
      * One index's part of a view: the expression each column the caller
      * reads is given by, by column name ({@code whole} when that is every
      * column as stored), and the rows it keeps (null for all); the masked
@@ -385,10 +340,10 @@ final class InfinoSql {
      * or masking rule applies; else the visible ones, each masked one as its
      * mask (or as stored, to be masked in the result, where SQL has no
      * function for the mask), without the source; never the engine's
-     * bookkeeping columns; the rows the document rule and {@code aliasFilter}
-     * keep.
+     * bookkeeping columns; the rows the document rule and any alias filter
+     * keep ({@link InfinoAccess#documentsWhere}).
      */
-    static Part part(String table, Map<String, Column> columns, InfinoAccess access, String aliasFilter, long nowMillis) {
+    static Part part(String table, Map<String, Column> columns, InfinoAccess access, long nowMillis) {
         boolean restricted = access.restrictsFields() || access.masks();
         boolean whole = !restricted && Collections.disjoint(columns.keySet(), STAMPS);
         Map<String, Column> visible = restricted ? access.columns(columns) : columns;
@@ -430,9 +385,6 @@ final class InfinoSql {
             projected.put(c.name(), quoted);
         }
         String where = access.documentsWhere(columns, table, nowMillis);
-        if (aliasFilter != null) {
-            where = where == null ? aliasFilter : "(" + where + ") AND (" + aliasFilter + ")";
-        }
         return new Part(table, projected, whole, where, masked, onOutput, unsearchable);
     }
 

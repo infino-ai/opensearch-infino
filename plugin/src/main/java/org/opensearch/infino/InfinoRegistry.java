@@ -15,6 +15,8 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.common.settings.AbstractScopedSettings;
+import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.action.ActionListener;
@@ -27,6 +29,7 @@ import org.opensearch.threadpool.ThreadPool;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -55,6 +58,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * row. The security plugin's configuration index and Dashboards' saved
  * objects come back the same way, so a fresh node needs neither
  * {@code securityadmin} nor a saved-objects migration.
+ *
+ * <p>A row can also come from outside the cluster: a loader that writes a
+ * table in this shape writes its index's row beside it (a load of a Lucene
+ * index's snapshot into such a table does), and
+ * {@code POST /_plugins/_infino/account/indices} creates it on a running
+ * cluster, as a fresh one would at boot ({@link #restore}). Such a loader
+ * may register the cluster state its source held besides the indices too,
+ * one row per item, which that call applies first ({@link InfinoClusterState}).
  */
 final class InfinoRegistry {
 
@@ -72,6 +83,11 @@ final class InfinoRegistry {
         IndexMetadata.SETTING_INDEX_PROVIDED_NAME,
         IndexMetadata.SETTING_HISTORY_UUID
     );
+
+    /** The key of a row that records the metadata version of its index as the cluster held it. */
+    private static final String VERSION = "version";
+    /** The version of a row that records none (a loader's may not). */
+    private static final long UNVERSIONED = -1L;
 
     /** The metadata version of each index as last recorded, so a state that moved nothing writes nothing. */
     private static final Map<String, Long> recorded = new ConcurrentHashMap<>();
@@ -139,24 +155,50 @@ final class InfinoRegistry {
     static void record(IndexMetadata md) {
         String name = md.getIndex().getName();
         try {
-            declare();
-            // A row the registry holds under this name is replaced in the same
-            // mutation as the append; a first row is appended. The engine's
-            // update replaces only what it matches, so the row is looked up
-            // first, as the writer looks ids up.
-            List<String> replaced = InfinoNative.existingOsids(TABLE, List.of(name)).isEmpty() ? List.of() : List.of(name);
-            Pointer prepared = InfinoNative.prepare(TABLE, List.of(name), List.of(rowOf(md)));
-            if (prepared == null) {
-                throw new IllegalStateException("the registry row could not be prepared");
-            }
-            InfinoNative.PreparedResult result = InfinoNative.appendPrepared(TABLE, List.of(prepared), replaced);
-            if (!result.failed().isEmpty()) {
-                throw new IllegalStateException(result.failed().get(0).reason());
-            }
+            write(name, rowOf(md));
             recorded.put(name, md.getVersion());
         } catch (Exception e) {
             log.warn("[infino] index {} could not be recorded in the registry", name, e);
         }
+    }
+
+    /**
+     * Write the registry row {@code id} with {@code source}. A row the
+     * registry holds under the id is replaced in the same mutation as the
+     * append; a first row is appended. The engine's update replaces only what
+     * it matches, one row for one, so the rows are counted first. Two writers
+     * registering at once (a loader's parts) can leave two rows, which a
+     * replace of one refuses: those rows go, and one is appended.
+     */
+    static void write(String id, String source) {
+        declare();
+        long held = heldRows(id);
+        if (held > 1) {
+            InfinoNative.deleteOsids(TABLE, new String[] { id }, 1);
+        }
+        List<String> replaced = held == 1 ? List.of(id) : List.of();
+        Pointer prepared = InfinoNative.prepare(TABLE, List.of(id), List.of(source));
+        if (prepared == null) {
+            throw new IllegalStateException("the registry row could not be prepared");
+        }
+        // The registry's rows are the node's own bookkeeping: no client conditions a write on them.
+        InfinoNative.PreparedResult result = InfinoNative.appendPrepared(TABLE, List.of(prepared), replaced, null);
+        if (!result.failed().isEmpty()) {
+            throw new IllegalStateException(result.failed().get(0).reason());
+        }
+    }
+
+    /** How many rows the registry holds under {@code name}. */
+    private static long heldRows(String name) {
+        List<Map<String, Object>> counted = InfinoNative.sqlRows(
+            "SELECT count(*) AS held FROM "
+                + InfinoQueryTranslator.quoteIdent(TABLE)
+                + " WHERE "
+                + InfinoQueryTranslator.OSID
+                + " = "
+                + InfinoQueryTranslator.literal(name)
+        );
+        return counted.isEmpty() || !(counted.get(0).get("held") instanceof Number n) ? 0 : n.longValue();
     }
 
     /** The index is gone: so is its row. */
@@ -173,58 +215,166 @@ final class InfinoRegistry {
 
     /** The registry's rows: one object per recorded index, by name, after what moved is written. */
     static List<Map<String, Object>> rows() {
-        drain();
-        declare();
-        Map<String, Map<String, Object>> byName = new LinkedHashMap<>();
-        for (Map<String, Object> row : InfinoNative.sqlRows(
-            "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM " + InfinoQueryTranslator.quoteIdent(TABLE)
-        )) {
-            Object source = row.get(InfinoQueryTranslator.SOURCE);
-            Object name = row.get(InfinoQueryTranslator.OSID);
-            if (source != null && name != null) {
-                byName.put(name.toString(), InfinoNative.object(source.toString()));
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (Map.Entry<String, String> row : sources().entrySet()) {
+            // The cluster state a loader registered beside the indices is no index.
+            if (!InfinoClusterState.isClusterRow(row.getKey())) {
+                rows.add(InfinoNative.object(row.getValue()));
             }
         }
-        return new ArrayList<>(byName.values());
+        return rows;
     }
 
-    /** Create every index the registry names that the cluster lacks, one after another. */
+    /**
+     * The source of every row of the registry by its id, one per id, after
+     * what moved is written. Two writers registering one id at once (a
+     * loader's parts) can leave two rows under it until the next write of the
+     * row makes them one; of two, every read takes the same one
+     * ({@link #later}), whatever order the table returns them in.
+     */
+    static Map<String, String> sources() {
+        Map<String, String> byId = new LinkedHashMap<>();
+        for (Map<String, Object> row : rawRows()) {
+            Object source = row.get(InfinoQueryTranslator.SOURCE);
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            if (source != null && id != null) {
+                byId.merge(id.toString(), source.toString(), InfinoRegistry::later);
+            }
+        }
+        return byId;
+    }
+
+    /**
+     * Of two rows under one id, the one recording the later metadata version
+     * of its index, and of two recording the same (or none), the greater
+     * source: a choice every read makes alike.
+     */
+    static String later(String a, String b) {
+        long va = version(a);
+        long vb = version(b);
+        if (va != vb) {
+            return va > vb ? a : b;
+        }
+        return a.compareTo(b) >= 0 ? a : b;
+    }
+
+    /** The metadata version a row records, or {@link #UNVERSIONED}. */
+    private static long version(String source) {
+        return InfinoNative.object(source).get(VERSION) instanceof Number n ? n.longValue() : UNVERSIONED;
+    }
+
+    /** Every row of the registry table, each its id and source, after what moved is written. */
+    static List<Map<String, Object>> rawRows() {
+        drain();
+        declare();
+        return InfinoNative.sqlRows(
+            "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM " + InfinoQueryTranslator.quoteIdent(TABLE)
+        );
+    }
+
+    /** What became of a registered index when the registry was restored. */
+    enum Outcome {
+        /** The cluster lacked it, and it was created from its row. */
+        CREATED,
+        /** The cluster already has an index or an alias of that name. */
+        PRESENT,
+        /** Its row could not be read as a create request, or the create failed. */
+        FAILED
+    }
+
+    /** One registered index, what became of it, and why when it failed. */
+    record Restored(String name, Outcome outcome, String reason) {}
+
+    /** Create every index the registry names that the cluster lacks, one after another: once per node life, at boot. */
     static void rebuild(ClusterState state) {
+        restore(state, null, ActionListener.wrap(restored -> {
+            long created = restored.stream().filter(r -> r.outcome() == Outcome.CREATED).count();
+            if (created == 0 && restored.stream().noneMatch(r -> r.outcome() == Outcome.FAILED)) {
+                log.info("[infino] the registry names {} indices, all present", restored.size());
+            } else {
+                log.info("[infino] rebuilt {} of the {} indices the registry names", created, restored.size());
+            }
+        }, e -> log.warn("[infino] the registry could not be read; the indices are not rebuilt", e)));
+    }
+
+    /**
+     * Create every index the registry names that {@code state} lacks, now,
+     * as {@link #rebuild} does at boot; with {@code only}, that one index
+     * alone. What brings up an index whose table and row a loader wrote
+     * beside the others while the cluster runs (a snapshot load into the
+     * plugin's table), with no restart. The listener gets every registered
+     * index considered, with what became of it; a row that fails is
+     * reported and the rest still created. Reads the engine: never call it
+     * on a transport or applier thread.
+     */
+    static void restore(ClusterState state, String only, ActionListener<List<Restored>> listener) {
         List<Map<String, Object>> rows;
         try {
             rows = rows();
         } catch (Exception e) {
-            log.warn("[infino] the registry could not be read; the indices are not rebuilt", e);
+            listener.onFailure(e);
             return;
         }
-        List<CreateIndexRequest> missing = new ArrayList<>();
+        List<Restored> restored = Collections.synchronizedList(new ArrayList<>());
+        List<Pending> missing = new ArrayList<>();
         for (Map<String, Object> row : rows) {
-            Object name = row.get("name");
-            if (name instanceof String n && !state.metadata().hasIndex(n) && !state.metadata().hasAlias(n)) {
-                try {
-                    missing.add(requestOf(n, row));
-                } catch (Exception e) {
-                    log.warn("[infino] index {} could not be rebuilt from its registry row", n, e);
-                }
+            if (!(row.get("name") instanceof String name) || (only != null && !only.equals(name))) {
+                continue;
+            }
+            if (state.metadata().hasIndex(name) || state.metadata().hasAlias(name)) {
+                restored.add(new Restored(name, Outcome.PRESENT, null));
+                continue;
+            }
+            try {
+                List<String> leftOut = new ArrayList<>();
+                missing.add(new Pending(requestOf(name, row, InfinoServices.indexScopedSettings(), leftOut), leftOut));
+            } catch (Exception e) {
+                log.warn("[infino] index {} could not be rebuilt from its registry row", name, e);
+                restored.add(new Restored(name, Outcome.FAILED, "its registry row is not a create request: " + e.getMessage()));
             }
         }
-        if (missing.isEmpty()) {
-            log.info("[infino] the registry names {} indices, all present", rows.size());
-            return;
-        }
-        log.info("[infino] rebuilding {} of the {} indices the registry names", missing.size(), rows.size());
-        createNext(missing, 0);
+        createNext(missing, 0, restored, () -> listener.onResponse(List.copyOf(restored)));
     }
 
-    private static void createNext(List<CreateIndexRequest> requests, int at) {
-        if (at == requests.size()) {
-            log.info("[infino] rebuilt {} indices from the registry", requests.size());
+    /** An index to create, and the settings of its row the cluster does not know, left out of its request. */
+    private record Pending(CreateIndexRequest request, List<String> leftOut) {}
+
+    /**
+     * {@code given} without the settings {@code known} does not know or
+     * finds invalid, each named onto {@code leftOut}, as the cluster sets
+     * them aside when it restores an index; {@code given} as it is with no
+     * {@code known} to hold it to.
+     */
+    static Settings knownSettings(Settings given, IndexScopedSettings known, List<String> leftOut) {
+        if (known == null) {
+            return given;
+        }
+        Settings archived = known.archiveUnknownOrInvalidSettings(
+            given,
+            unknown -> leftOut.add(unknown.getKey()),
+            (invalid, why) -> leftOut.add(invalid.getKey())
+        );
+        return archived.filter(key -> !key.startsWith(AbstractScopedSettings.ARCHIVED_SETTINGS_PREFIX));
+    }
+
+    private static void createNext(List<Pending> pending, int at, List<Restored> restored, Runnable done) {
+        if (at == pending.size()) {
+            done.run();
             return;
         }
-        CreateIndexRequest request = requests.get(at);
-        InfinoClient.createIndex(request, ActionListener.wrap(created -> createNext(requests, at + 1), e -> {
+        CreateIndexRequest request = pending.get(at).request();
+        List<String> leftOut = pending.get(at).leftOut();
+        InfinoClient.createIndex(request, ActionListener.wrap(created -> {
+            String note = leftOut.isEmpty() ? null : "created without the settings this cluster does not know: " + String.join(", ", leftOut);
+            if (note != null) {
+                log.warn("[infino] index {} was {}", request.index(), note);
+            }
+            restored.add(new Restored(request.index(), Outcome.CREATED, note));
+            createNext(pending, at + 1, restored, done);
+        }, e -> {
             log.warn("[infino] index {} could not be rebuilt", request.index(), e);
-            createNext(requests, at + 1);
+            restored.add(new Restored(request.index(), Outcome.FAILED, e.getMessage()));
+            createNext(pending, at + 1, restored, done);
         }));
     }
 
@@ -234,12 +384,13 @@ final class InfinoRegistry {
         }
     }
 
-    /** One row: the index as a create request would describe it, plus its table. */
+    /** One row: the index as a create request would describe it, plus its table and the metadata version it was recorded at. */
     static String rowOf(IndexMetadata md) {
         try (XContentBuilder b = XContentFactory.jsonBuilder()) {
             b.startObject();
             b.field("name", md.getIndex().getName());
             b.field("table", InfinoNative.tableFor(md.getIndex(), md.getSettings()));
+            b.field(VERSION, md.getVersion());
             Settings.Builder settings = Settings.builder().put(md.getSettings());
             for (String owned : CLUSTER_OWNED_SETTINGS) {
                 settings.remove(owned);
@@ -278,13 +429,21 @@ final class InfinoRegistry {
         }
     }
 
-    /** The create request a row describes. */
+    /**
+     * The create request a row describes, without the settings
+     * {@code known} (the cluster's index settings; null for none to hold
+     * them to) does not know or cannot take as given, each named onto
+     * {@code leftOut}: the cluster refuses a create request carrying such a
+     * setting, where a restore sets it aside. A row a loader wrote from
+     * another cluster's snapshot can carry one, from a plugin this cluster
+     * does not run or from another engine altogether.
+     */
     @SuppressWarnings("unchecked")
-    static CreateIndexRequest requestOf(String name, Map<String, Object> row) {
+    static CreateIndexRequest requestOf(String name, Map<String, Object> row, IndexScopedSettings known, List<String> leftOut) {
         CreateIndexRequest request = new CreateIndexRequest(name);
         Object settings = row.get("settings");
         if (settings instanceof Map<?, ?> s) {
-            request.settings((Map<String, ?>) s);
+            request.settings(knownSettings(Settings.builder().loadFromMap((Map<String, ?>) s).build(), known, leftOut));
         }
         if (InfinoPlugin.inDefaultMode(request.settings())) {
             // Its new Lucene skeleton starts empty over a table that holds rows.

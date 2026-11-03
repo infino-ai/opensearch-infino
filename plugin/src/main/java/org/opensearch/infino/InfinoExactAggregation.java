@@ -45,9 +45,18 @@ final class InfinoExactAggregation extends InternalAggregation {
 
     static final String NAME = "infino_exact";
 
-    /** How long a routed search's record is kept for its reduce. */
+    /**
+     * How long a routed search's record is kept unread. A search forgets its
+     * record when it answers ({@link #forget}), so this bounds only a search
+     * that never does.
+     */
     private static final TimeValue RECORD_TTL = TimeValue.timeValueMinutes(5);
-    /** Routed searches recorded at once at most; past this the oldest go. */
+    /**
+     * Records held at once at most; past this the least recently read go. A
+     * search forgets its record when it answers, so this counts searches in
+     * flight on this node: one evicted fails its search by name, never with
+     * a wrong answer.
+     */
     private static final long MAX_RECORDS = 10_000;
 
     /** What the coordinating node recorded of a search when it routed it. */
@@ -92,6 +101,11 @@ final class InfinoExactAggregation extends InternalAggregation {
     /** Record, on the node routing it, the search {@code request} whose exact aggregations it answers. */
     static void record(String request, SearchSourceBuilder source, long nowMillis, Map<String, InfinoAccess> access) {
         ROUTED.put(request, new Routed(source, nowMillis, access));
+    }
+
+    /** Forget the record of {@code request}, once its search has answered or failed: its final reduce is done. */
+    static void forget(String request) {
+        ROUTED.invalidate(request);
     }
 
     @Override

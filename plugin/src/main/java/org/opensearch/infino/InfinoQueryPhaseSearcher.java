@@ -37,6 +37,7 @@ import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.PipelineAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.internal.AliasFilter;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.ScrollContext;
 import org.opensearch.search.internal.SearchContext;
@@ -164,7 +165,13 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         ShardId shardId = context.indexShard().shardId();
         Index index = shardId.getIndex();
         String table = InfinoPlugin.tables().ensure(context.indexShard().indexSettings().getIndexMetadata(), shardId.id());
-        InfinoAccess access = InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH);
+        // What the security plugin lets the user see, narrowed to what a filtering
+        // alias the search reached the index through keeps: the cluster resolved
+        // it for this shard, as it does for a stock shard (null: the index whole).
+        // The coordinating node checked the table answers it (InfinoAliasFilter).
+        AliasFilter aliases = context.request().getAliasFilter();
+        InfinoAccess access = InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH)
+            .filteredBy(aliases == null ? null : aliases.getQueryBuilder());
 
         ScrollContext scroll = context.scrollContext();
         boolean laterRound = scroll != null && scroll.totalHits != null;

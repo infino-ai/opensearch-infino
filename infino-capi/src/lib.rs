@@ -10,8 +10,9 @@
 //! not name are typed by the engine from the documents as they arrive
 //! (`Supertable::append_rows` adds unknown paths to the schema itself).
 //!
-//! Two reserved columns are always present: `osid` (the OpenSearch `_id`)
-//! and `source` (the raw `_source` JSON, served back on fetch).
+//! Three reserved columns are always present: `osid` (the OpenSearch `_id`),
+//! `source` (the raw `_source` JSON, served back on fetch) and `osseq` (the
+//! sequence number the plugin wrote the row under).
 //!
 //! Documents are checked against the declared columns before they reach
 //! the engine, OpenSearch-style: a value a column cannot hold fails that
@@ -66,9 +67,11 @@ const SOURCE: &str = "source";
 /// what rebuilding a shard's documents from its table routes them by. The
 /// column appears with the first routed write.
 const ROUTING: &str = "osrouting";
-/// The sequence number of the write that created a row, when the writer
-/// stamps one: a search over a reader that does not hold that write yet
-/// leaves the row out. The column appears with the first stamped write.
+/// The sequence number of the write that put the row there: in proxy mode
+/// the one the plugin hands out, which a conditional write is checked
+/// against; in default mode the shard's own, stamped by its writer, and a
+/// search over a reader that does not hold that write yet leaves the row
+/// out. Null for a row written without one (it reads as 0).
 const SEQ: &str = "osseq";
 /// The sequence number of the operation that wrote a row, when the writer
 /// records one: the highest in a table says how far into the writer's
@@ -82,6 +85,17 @@ const GEN: &str = "osgen";
 /// column: the values are joined so a text index sees every token. The
 /// original array is still in `source`.
 const MULTI_VALUE_SEPARATOR: &str = " ";
+/// What the column holding a field's values is named after the field's own,
+/// for a document that gives the field more than one: `<path>[]`, a list of
+/// the field's own type, declared the first time a document needs it. The
+/// field's own column is null for that document, except a string field's,
+/// which keeps the values joined so its text index sees every token.
+const LIST_SUFFIX: &str = "[]";
+/// The name Arrow gives a list column's element.
+const LIST_ITEM: &str = "item";
+/// A float of this magnitude or more is past the whole numbers a float holds
+/// exactly (under 2^53), so an integer column does not take it as one.
+const WHOLE_FLOAT_LIMIT: f64 = 9.0e15;
 /// The hosted service's trial route: the one call made without a key, since
 /// it is the call that asks for one.
 const TRIAL_PATH: &str = "/v1/trial";
@@ -131,6 +145,156 @@ fn date_type() -> DataType {
     DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
 }
 
+/// The calendar's units, in the smaller one.
+const MILLIS_PER_SECOND: i64 = 1_000;
+const NANOS_PER_MILLI: i64 = 1_000_000;
+const SECONDS_PER_MINUTE: i64 = 60;
+const MINUTES_PER_HOUR: i64 = 60;
+const HOURS_PER_DAY: i64 = 24;
+const MONTHS_PER_YEAR: i64 = 12;
+/// Digits of a year, and of each of the date's other parts.
+const YEAR_DIGITS: usize = 4;
+const PART_DIGITS: usize = 2;
+/// The most digits a fraction of a second carries: nanoseconds.
+const FRACTION_DIGITS: usize = 9;
+/// The widest zone offset a date may carry, in hours.
+const MAX_OFFSET_HOURS: i64 = 18;
+/// Days in each month of a common year.
+const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/// Epoch milliseconds of `s` as OpenSearch's default date format reads it,
+/// `strict_date_optional_time||epoch_millis`: a date `yyyy[-MM[-dd]]`, then
+/// optionally `T` and `HH[:mm[:ss[.fraction]]]`, any of it (`2026-11-23T`
+/// is a day), then optionally a zone (`Z`, `±HH`, `±HHmm`, `±HH:mm`), UTC
+/// when there is none; failing that, a whole number of milliseconds. `None`
+/// for any other string, which the engine's own parser then reads.
+fn default_format_millis(s: &str) -> Option<i64> {
+    date_optional_time_millis(s).or_else(|| {
+        let digits = s.strip_prefix('-').unwrap_or(s);
+        (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<i64>().ok())
+            .flatten()
+    })
+}
+
+/// `strict_date_optional_time` (see [`default_format_millis`]).
+fn date_optional_time_millis(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let mut at = 0;
+    let year = fixed_digits(b, &mut at, YEAR_DIGITS)?;
+    let (mut month, mut day) = (1, 1);
+    if skip_byte(b, &mut at, b'-') {
+        month = fixed_digits(b, &mut at, PART_DIGITS)?;
+        if skip_byte(b, &mut at, b'-') {
+            day = fixed_digits(b, &mut at, PART_DIGITS)?;
+        }
+    }
+    let (mut hour, mut minute, mut second, mut nanos) = (0, 0, 0, 0);
+    if skip_byte(b, &mut at, b'T') && b.get(at).is_some_and(u8::is_ascii_digit) {
+        hour = fixed_digits(b, &mut at, PART_DIGITS)?;
+        if skip_byte(b, &mut at, b':') {
+            minute = fixed_digits(b, &mut at, PART_DIGITS)?;
+            if skip_byte(b, &mut at, b':') {
+                second = fixed_digits(b, &mut at, PART_DIGITS)?;
+                if skip_byte(b, &mut at, b'.') || skip_byte(b, &mut at, b',') {
+                    let start = at;
+                    while at < b.len() && b[at].is_ascii_digit() && at - start < FRACTION_DIGITS {
+                        at += 1;
+                    }
+                    if at == start {
+                        return None;
+                    }
+                    let fraction: i64 = s[start..at].parse().ok()?;
+                    nanos = fraction * 10i64.pow((FRACTION_DIGITS - (at - start)) as u32);
+                }
+            }
+        }
+    }
+    let offset_minutes = match b.get(at) {
+        None => 0,
+        Some(b'Z') => {
+            at += 1;
+            0
+        }
+        Some(&sign @ (b'+' | b'-')) => {
+            at += 1;
+            let hours = fixed_digits(b, &mut at, PART_DIGITS)?;
+            let minutes =
+                if skip_byte(b, &mut at, b':') || b.get(at).is_some_and(u8::is_ascii_digit) {
+                    fixed_digits(b, &mut at, PART_DIGITS)?
+                } else {
+                    0
+                };
+            if hours > MAX_OFFSET_HOURS || minutes >= MINUTES_PER_HOUR {
+                return None;
+            }
+            let offset = hours * MINUTES_PER_HOUR + minutes;
+            if sign == b'-' {
+                -offset
+            } else {
+                offset
+            }
+        }
+        Some(_) => return None,
+    };
+    if at != b.len()
+        || !(1..=MONTHS_PER_YEAR).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+        || hour >= HOURS_PER_DAY
+        || minute >= MINUTES_PER_HOUR
+        || second >= SECONDS_PER_MINUTE
+    {
+        return None;
+    }
+    let seconds =
+        days_from_civil(year, month, day) * HOURS_PER_DAY * MINUTES_PER_HOUR * SECONDS_PER_MINUTE
+            + ((hour * MINUTES_PER_HOUR + minute) - offset_minutes) * SECONDS_PER_MINUTE
+            + second;
+    Some(seconds * MILLIS_PER_SECOND + nanos / NANOS_PER_MILLI)
+}
+
+/// Exactly `n` ASCII digits of `b` from `at`, as a number, moving `at` past them.
+fn fixed_digits(b: &[u8], at: &mut usize, n: usize) -> Option<i64> {
+    let digits = b.get(*at..*at + n)?;
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    *at += n;
+    Some(
+        digits
+            .iter()
+            .fold(0, |value, d| value * 10 + i64::from(d - b'0')),
+    )
+}
+
+/// Whether `b` holds `byte` at `at`, moving `at` past it when it does.
+fn skip_byte(b: &[u8], at: &mut usize, byte: u8) -> bool {
+    let found = b.get(*at) == Some(&byte);
+    if found {
+        *at += 1;
+    }
+    found
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    DAYS_IN_MONTH[(month - 1) as usize] + i64::from(leap && month == 2)
+}
+
+/// Days from 1970-01-01 to the proleptic Gregorian date: Howard Hinnant's
+/// `days_from_civil`, with the year starting in March so the leap day is
+/// the last of it.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let year_of_era = y - era * 400;
+    let month_from_march = (month + 9) % 12;
+    let day_of_year = (153 * month_from_march + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
     if p.is_null() {
         return None;
@@ -158,9 +322,36 @@ pub struct Bridge {
     /// Whether the connection forwards to the hosted service (an `http(s)://`
     /// URI) rather than running the engine over storage of its own.
     hosted: bool,
+    /// Each table's fields kept at less than a double's precision
+    /// ([`Precision`]), by path, from the mapping it was last declared from
+    /// (`infino_ensure_table`, which the plugin calls before a node first
+    /// writes to an index and whenever its mapping moves).
+    precisions: RwLock<HashMap<String, Arc<HashMap<String, Precision>>>>,
 }
 
 impl Bridge {
+    /// The fields of `name` kept at less than a double's precision; none for
+    /// a table no mapping has declared.
+    fn precisions(&self, name: &str) -> Arc<HashMap<String, Precision>> {
+        self.precisions
+            .read()
+            .ok()
+            .and_then(|all| all.get(name).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Record the precisions `mapped` declares for `name`, replacing the
+    /// mapping's earlier ones.
+    fn keep_precisions(&self, name: &str, mapped: &[MappedField]) {
+        let kept: HashMap<String, Precision> = mapped
+            .iter()
+            .filter_map(|f| f.precision.map(|p| (f.path.clone(), p)))
+            .collect();
+        if let Ok(mut all) = self.precisions.write() {
+            all.insert(name.to_string(), Arc::new(kept));
+        }
+    }
+
     fn table(&self, name: &str) -> Result<Supertable, InfinoError> {
         if let Some(t) = self.tables.read().map_err(poisoned)?.get(name) {
             return Ok(t.clone());
@@ -258,6 +449,7 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
         conn,
         tables: RwLock::new(HashMap::new()),
         hosted,
+        precisions: RwLock::new(HashMap::new()),
     })
 }
 
@@ -394,6 +586,178 @@ struct MappedField {
     data_type: DataType,
     fts: bool,
     vector: Option<(usize, Metric)>,
+    /// How OpenSearch keeps the field's values, when at less than a
+    /// double's precision.
+    precision: Option<Precision>,
+}
+
+/// How OpenSearch keeps a mapped floating-point field's values when at less
+/// than a double's precision: what its aggregations, sorts and range
+/// queries read, while `_source` keeps each value as sent. The field's
+/// column holds each value as OpenSearch reads it back ([`kept_as`]), so a
+/// `half_float` price of 53.98 sums as the 53.96875 OpenSearch sums.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Precision {
+    /// `float`: a 32-bit float.
+    Single,
+    /// `half_float`: a 16-bit float, rounded from the 32-bit one OpenSearch
+    /// parses the value as.
+    Half,
+    /// `scaled_float`: the value times its scaling factor, rounded to a long.
+    Scaled(f64),
+}
+
+impl Precision {
+    /// The precision a mapped field of type `ty` (with its definition `def`)
+    /// keeps its values at; `None` for a type kept whole.
+    fn of(ty: &str, def: &Map<String, Value>) -> Option<Self> {
+        match ty {
+            "float" => Some(Self::Single),
+            "half_float" => Some(Self::Half),
+            "scaled_float" => def
+                .get(SCALING_FACTOR)
+                .and_then(|f| f.as_f64().or_else(|| f.as_str()?.trim().parse().ok()))
+                .map(Self::Scaled),
+            _ => None,
+        }
+    }
+
+    /// The mapping type, as OpenSearch names it in a refusal.
+    fn type_name(self) -> &'static str {
+        match self {
+            Self::Single => "float",
+            Self::Half => "half_float",
+            Self::Scaled(_) => "scaled_float",
+        }
+    }
+}
+
+/// The mapping key of a `scaled_float`'s scaling factor.
+const SCALING_FACTOR: &str = "scaling_factor";
+/// What Java's `Math.round` adds before it floors, as OpenSearch rounds a
+/// `scaled_float`: a half rounds up, toward positive infinity.
+const ROUND_HALF_UP: f64 = 0.5;
+/// The layout of a 32-bit float (Lucene's `HalfFloatPoint` reads it): its
+/// mantissa's bits and mask, the implicit leading bit, its exponent's bias
+/// and the exponent of an infinity or a NaN.
+const F32_MANTISSA_BITS: u32 = 23;
+const F32_MANTISSA_MASK: u32 = (1 << F32_MANTISSA_BITS) - 1;
+const F32_IMPLICIT_BIT: u32 = 1 << F32_MANTISSA_BITS;
+const F32_EXP_BIAS: i32 = 127;
+const F32_EXP_MAX: i32 = 0xff;
+/// The same of a 16-bit float, and where its sign bit sits.
+const F16_MANTISSA_BITS: u32 = 10;
+const F16_MANTISSA_MASK: u32 = (1 << F16_MANTISSA_BITS) - 1;
+const F16_EXP_BIAS: i32 = 15;
+const F16_EXP_MAX: i32 = 0x1f;
+const F16_SIGN_SHIFT: u32 = 15;
+/// Where a 32-bit float's sign bit sits, and a shift past a word's bits.
+const F32_SIGN_SHIFT: u32 = 31;
+const WORD_BITS: i32 = 32;
+
+/// `i` divided by 2^`shift`, rounded to the nearest, ties to even
+/// (Lucene's `HalfFloatPoint.roundShift`).
+fn round_shift(i: u32, shift: u32) -> u32 {
+    let i = i + (1 << (shift - 1));
+    let i = i - ((i >> shift) & 1);
+    i >> shift
+}
+
+/// The bits of the 16-bit float nearest `v`, as Lucene encodes a
+/// `half_float` (`HalfFloatPoint.halfFloatToShortBits`): ties to even, a
+/// 32-bit subnormal to zero, a value past the largest half to infinity.
+fn half_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = bits >> F32_SIGN_SHIFT;
+    let mut exp = ((bits >> F32_MANTISSA_BITS) as i32) & F32_EXP_MAX;
+    let mut mantissa = bits & F32_MANTISSA_MASK;
+    if exp == F32_EXP_MAX {
+        // An infinity or a NaN stays one.
+        exp = F16_EXP_MAX;
+        mantissa >>= F32_MANTISSA_BITS - F16_MANTISSA_BITS;
+    } else if exp == 0 {
+        // Even the largest 32-bit subnormal is below the smallest half.
+        mantissa = 0;
+    } else {
+        exp = exp - F32_EXP_BIAS + F16_EXP_BIAS;
+        if exp >= F16_EXP_MAX {
+            exp = F16_EXP_MAX;
+            mantissa = 0;
+        } else if exp <= 0 {
+            // A half subnormal.
+            let shift = F32_MANTISSA_BITS as i32 - F16_MANTISSA_BITS as i32 - exp + 1;
+            if shift >= WORD_BITS {
+                exp = 0;
+                mantissa = 0;
+            } else {
+                mantissa = round_shift(mantissa | F32_IMPLICIT_BIT, shift as u32);
+                exp = (mantissa >> F16_MANTISSA_BITS) as i32;
+                mantissa &= F16_MANTISSA_MASK;
+            }
+        } else {
+            // A carry out of the mantissa moves the exponent up.
+            mantissa = round_shift(
+                ((exp as u32) << F32_MANTISSA_BITS) | mantissa,
+                F32_MANTISSA_BITS - F16_MANTISSA_BITS,
+            );
+            exp = (mantissa >> F16_MANTISSA_BITS) as i32;
+            mantissa &= F16_MANTISSA_MASK;
+        }
+    }
+    ((sign << F16_SIGN_SHIFT) | ((exp as u32) << F16_MANTISSA_BITS) | mantissa) as u16
+}
+
+/// The 32-bit float a 16-bit float's `bits` hold, exactly
+/// (`HalfFloatPoint.shortBitsToHalfFloat`).
+fn half_value(bits: u16) -> f32 {
+    let bits = u32::from(bits);
+    let sign = bits >> F16_SIGN_SHIFT;
+    let mut exp = ((bits >> F16_MANTISSA_BITS) as i32) & F16_EXP_MAX;
+    let mut mantissa = bits & F16_MANTISSA_MASK;
+    if exp == F16_EXP_MAX {
+        exp = F32_EXP_MAX;
+        mantissa <<= F32_MANTISSA_BITS - F16_MANTISSA_BITS;
+    } else if mantissa != 0 || exp != 0 {
+        if exp == 0 {
+            // A half subnormal is a normal 32-bit float.
+            let shift =
+                mantissa.leading_zeros() as i32 - (WORD_BITS - F16_MANTISSA_BITS as i32 - 1);
+            mantissa = (mantissa << shift) & F16_MANTISSA_MASK;
+            exp = exp - shift + 1;
+        }
+        exp = exp + F32_EXP_BIAS - F16_EXP_BIAS;
+        mantissa <<= F32_MANTISSA_BITS - F16_MANTISSA_BITS;
+    }
+    f32::from_bits((sign << F32_SIGN_SHIFT) | ((exp as u32) << F32_MANTISSA_BITS) | mantissa)
+}
+
+/// `value` as OpenSearch keeps a field of `precision` and reads it back, or
+/// why it refuses it: a value the field's type holds only as an infinity is
+/// refused, as OpenSearch refuses it.
+fn kept_as(value: f64, precision: Precision) -> Result<f64, String> {
+    let kept = match precision {
+        Precision::Single => f64::from(value as f32),
+        Precision::Half => f64::from(half_value(half_bits(value as f32))),
+        // OpenSearch reads the long back divided by the factor.
+        Precision::Scaled(factor) => (value * factor + ROUND_HALF_UP).floor() / factor,
+    };
+    if kept.is_finite() {
+        Ok(kept)
+    } else {
+        Err(format!(
+            "[{}] supports only finite values, but got [{value}]",
+            precision.type_name()
+        ))
+    }
+}
+
+/// A conformed value of a field kept at `precision`, as OpenSearch keeps it
+/// ([`kept_as`]); a null stays null.
+fn keep(value: Value, precision: Option<Precision>) -> Result<Value, String> {
+    match (precision, value.as_f64()) {
+        (Some(precision), Some(number)) => Ok(json!(kept_as(number, precision)?)),
+        _ => Ok(value),
+    }
 }
 
 /// The `properties` object of a mapping, whether the caller passed the
@@ -484,6 +848,7 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             data_type,
             fts,
             vector,
+            precision: ty.and_then(|ty| Precision::of(ty, def)),
         });
     }
 }
@@ -508,6 +873,7 @@ fn mapped_fields(mapping: &Value) -> Vec<MappedField> {
 /// it is not.
 fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, String> {
     let mapped = mapped_fields(mapping);
+    bridge.keep_precisions(name, &mapped);
     let conn = &bridge.conn;
     // The cached handle, if any, predates whatever this changes.
     bridge.forget(name);
@@ -577,9 +943,9 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                     conflicts.join("; ")
                 ));
             }
-            let patches: Vec<FieldPatch> = mapped
+            let mut patches: Vec<FieldPatch> = mapped
                 .iter()
-                .filter(|f| schema.field_with_name(&f.path).is_err())
+                .filter(|f| f.path != SEQ && schema.field_with_name(&f.path).is_err())
                 .map(|f| {
                     let patch = FieldPatch::named(f.path.clone())
                         .with_type(f.data_type.clone())
@@ -590,6 +956,15 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                     }
                 })
                 .collect();
+            // A table made before the plugin kept sequence numbers gains the
+            // column; its rows read as written at 0.
+            if schema.field_with_name(SEQ).is_err() {
+                patches.push(
+                    FieldPatch::named(SEQ.to_string())
+                        .with_type(DataType::Int64)
+                        .with_nullable(true),
+                );
+            }
             let added = patches.len();
             if added > 0 {
                 table
@@ -602,6 +977,7 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
             let mut fields = vec![
                 Field::new(OSID, DataType::LargeUtf8, false),
                 Field::new(SOURCE, DataType::LargeUtf8, true),
+                Field::new(SEQ, DataType::Int64, true),
             ];
             // The id column carries an FTS index: a GET by id is then a term
             // lookup (`exact_match`) instead of a scan of the column, and the
@@ -609,7 +985,7 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
             // hold the id. Scalar columns have only min/max per superfile.
             let mut spec = IndexSpec::new().fts(FtsField::new(OSID.to_string()));
             for f in &mapped {
-                if f.path == OSID || f.path == SOURCE {
+                if f.path == OSID || f.path == SOURCE || f.path == SEQ {
                     continue;
                 }
                 fields.push(Field::new(&f.path, f.data_type.clone(), true));
@@ -673,8 +1049,9 @@ fn type_name(dt: &DataType) -> &'static str {
     }
 }
 
-/// Columns of a table as JSON `[{"name","type","fts","vector"}]`, type in
-/// {i64,f64,bool,str,ts,vec,list,other}. `""` if the table is absent.
+/// Columns of a table as JSON `[{"name","type","elem","fts","vector"}]`,
+/// type in {i64,f64,bool,str,ts,vec,list,other}, `elem` a list column's
+/// element type (null for any other). `""` if the table is absent.
 #[no_mangle]
 pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
@@ -687,9 +1064,17 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                     .fields()
                     .iter()
                     .map(|f| {
+                        // A list column's element type: what its values compare as.
+                        let elem = match &f.data_type {
+                            DataType::List(item) | DataType::LargeList(item) => {
+                                Some(type_name(item.data_type()))
+                            }
+                            _ => None,
+                        };
                         json!({
                             "name": f.name,
                             "type": type_name(&f.data_type),
+                            "elem": elem,
                             "fts": matches!(f.index, Some(ColumnIndex::Fts { .. })),
                             "vector": matches!(f.index, Some(ColumnIndex::Vector { .. })),
                         })
@@ -770,10 +1155,19 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
     }
     match dt {
         DataType::Int64 => match &value {
-            Value::Number(n) if n.is_i64() || n.is_u64() => Ok(value),
+            Value::Number(n) if n.is_i64() => Ok(value),
+            // An `unsigned_long` past the largest signed 64-bit integer.
+            Value::Number(n) if n.is_u64() => Err(format!(
+                "{n} is past the largest value an integer column holds"
+            )),
             Value::Number(n) => match n.as_f64() {
-                Some(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => Ok(json!(f as i64)),
-                _ => Err("a fractional number for an integer field".into()),
+                Some(f) if f.fract() != 0.0 => {
+                    Err("a fractional number for an integer field".into())
+                }
+                Some(f) if f.abs() < WHOLE_FLOAT_LIMIT => Ok(json!(f as i64)),
+                _ => Err(format!(
+                    "{n} is past the whole numbers a float holds exactly, so it is no integer"
+                )),
             },
             Value::String(s) => s
                 .trim()
@@ -807,8 +1201,10 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
             _ => Err("not a boolean".into()),
         },
         DataType::Timestamp(..) => match &value {
-            // The engine parses the string; an epoch-millisecond integer is taken as is.
-            Value::String(_) => Ok(value),
+            // A string in OpenSearch's default date format is read as it
+            // reads it; any other is left to the engine's parser. An
+            // epoch-millisecond integer is taken as is.
+            Value::String(s) => Ok(default_format_millis(s).map_or(value.clone(), |ms| json!(ms))),
             Value::Number(n) if n.is_i64() || n.is_u64() => Ok(value),
             _ => Err("not a date".into()),
         },
@@ -818,15 +1214,7 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
             Value::Bool(b) => Ok(Value::String(b.to_string())),
             Value::Array(items) => {
                 let mut parts = Vec::with_capacity(items.len());
-                for item in items {
-                    match item {
-                        Value::String(s) => parts.push(s.clone()),
-                        Value::Number(n) => parts.push(n.to_string()),
-                        Value::Bool(b) => parts.push(b.to_string()),
-                        Value::Null => {}
-                        _ => return Err("an array of objects for a string field".into()),
-                    }
-                }
+                string_values(items, &mut parts)?;
                 Ok(Value::String(parts.join(MULTI_VALUE_SEPARATOR)))
             }
             Value::Object(_) => Err("an object for a string field".into()),
@@ -864,6 +1252,55 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
         },
         _ => Ok(value),
     }
+}
+
+/// The type of the list column a field of type `dt` keeps several values in
+/// ([`LIST_SUFFIX`]): a list of `dt` itself, for the scalar types a document
+/// may give several of; `None` for any other type.
+fn list_type(dt: &DataType) -> Option<DataType> {
+    match dt {
+        DataType::Int64
+        | DataType::Float64
+        | DataType::Boolean
+        | DataType::Timestamp(..)
+        | DataType::LargeUtf8
+        | DataType::Utf8
+        | DataType::Utf8View => Some(DataType::List(Arc::new(Field::new(
+            LIST_ITEM,
+            dt.clone(),
+            true,
+        )))),
+        _ => None,
+    }
+}
+
+/// The values an array gives a field, in order, onto `out`, as OpenSearch
+/// indexes them: an array inside it is read through and a null is no value.
+fn array_values(items: Vec<Value>, out: &mut Vec<Value>) {
+    for item in items {
+        match item {
+            Value::Array(inner) => array_values(inner, out),
+            Value::Null => {}
+            other => out.push(other),
+        }
+    }
+}
+
+/// The values of a multi-valued string field, in order, onto `out`: an array
+/// inside the array is read through, as OpenSearch flattens arrays of
+/// arrays (`[["@timestamp", "desc"]]` is two values), and a null is no value.
+fn string_values(items: &[Value], out: &mut Vec<String>) -> Result<(), String> {
+    for item in items {
+        match item {
+            Value::String(s) => out.push(s.clone()),
+            Value::Number(n) => out.push(n.to_string()),
+            Value::Bool(b) => out.push(b.to_string()),
+            Value::Array(inner) => string_values(inner, out)?,
+            Value::Null => {}
+            Value::Object(_) => return Err("an array of objects for a string field".into()),
+        }
+    }
+    Ok(())
 }
 
 /// The kinds one path carries across a batch.
@@ -980,7 +1417,7 @@ pub unsafe extern "C" fn infino_check_doc(
             Err(e) => return out_string(e.to_string()),
         };
         let schema = table.schema();
-        out_string(match conform_doc(source, &schema) {
+        out_string(match conform_doc(source, &schema, &conn.precisions(name)) {
             Ok(_) => String::new(),
             Err(why) => why,
         })
@@ -989,21 +1426,121 @@ pub unsafe extern "C" fn infino_check_doc(
 }
 
 /// Parse, flatten and conform one document to the declared columns. The
-/// row it returns is what the engine is given.
-fn conform_doc(source: &str, schema: &Schema) -> Result<Map<String, Value>, String> {
+/// row it returns is what the engine is given. A declared field the document
+/// gives several values goes to its list column ([`LIST_SUFFIX`]), each
+/// value conformed as the field's own would be; one value in an array is
+/// that value, as OpenSearch reads it. A field `precisions` names holds each
+/// value as OpenSearch keeps it ([`Precision`]).
+fn conform_doc(
+    source: &str,
+    schema: &Schema,
+    precisions: &HashMap<String, Precision>,
+) -> Result<Map<String, Value>, String> {
     let doc: Value = serde_json::from_str(source).map_err(|e| format!("malformed JSON: {e}"))?;
     let obj = doc
         .as_object()
         .ok_or_else(|| "the document is not an object".to_string())?;
     let mut flat = Map::new();
     flatten(obj, "", &mut flat);
+    let mut lists: Vec<(String, Value)> = Vec::new();
     for (path, value) in flat.iter_mut() {
-        if let Ok(field) = schema.field_with_name(path) {
-            *value = conform(value.take(), field.data_type())
-                .map_err(|why| format!("field [{path}]: {why}"))?;
-        }
+        let Ok(field) = schema.field_with_name(path) else {
+            continue;
+        };
+        let dt = field.data_type();
+        let precision = precisions.get(path).copied();
+        let fit = |v: Value| conform(v, dt).and_then(|v| keep(v, precision));
+        let why = |why: String| format!("field [{path}]: {why}");
+        *value = match value.take() {
+            Value::Array(items) if list_type(dt).is_some() => {
+                let mut values = Vec::with_capacity(items.len());
+                array_values(items, &mut values);
+                if values.len() > 1 {
+                    let conformed = values
+                        .into_iter()
+                        .map(fit)
+                        .collect::<Result<Vec<Value>, String>>()
+                        .map_err(why)?;
+                    // A string field keeps its values joined, for its text index.
+                    let own = if matches!(
+                        dt,
+                        DataType::LargeUtf8 | DataType::Utf8 | DataType::Utf8View
+                    ) {
+                        Value::String(
+                            conformed
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<&str>>()
+                                .join(MULTI_VALUE_SEPARATOR),
+                        )
+                    } else {
+                        Value::Null
+                    };
+                    lists.push((format!("{path}{LIST_SUFFIX}"), Value::Array(conformed)));
+                    own
+                } else {
+                    values.pop().map_or(Ok(Value::Null), fit).map_err(why)?
+                }
+            }
+            other => fit(other).map_err(why)?,
+        };
+    }
+    for (path, values) in lists {
+        flat.insert(path, values);
     }
     Ok(flat)
+}
+
+/// Declare the list columns ([`LIST_SUFFIX`]) the rows need and the table
+/// lacks, each a list of its field's own type, so a list of dates is one of
+/// timestamps rather than of the integers the engine would infer. Whether
+/// the schema changed; a list a batch running beside this one declared
+/// first is no error.
+fn ensure_list_columns(
+    bridge: &Bridge,
+    name: &str,
+    schema: &Schema,
+    rows: &[Map<String, Value>],
+) -> Result<bool, String> {
+    let mut wanted: Vec<String> = Vec::new();
+    let mut patches: Vec<FieldPatch> = Vec::new();
+    for row in rows {
+        for key in row.keys() {
+            let Some(path) = key.strip_suffix(LIST_SUFFIX) else {
+                continue;
+            };
+            if schema.field_with_name(key).is_ok() || wanted.contains(key) {
+                continue;
+            }
+            let Some(dt) = schema
+                .field_with_name(path)
+                .ok()
+                .and_then(|f| list_type(f.data_type()))
+            else {
+                continue;
+            };
+            wanted.push(key.clone());
+            patches.push(
+                FieldPatch::named(key.clone())
+                    .with_type(dt)
+                    .with_nullable(true),
+            );
+        }
+    }
+    if patches.is_empty() {
+        return Ok(false);
+    }
+    let table = bridge.table(name).map_err(|e| e.to_string())?;
+    let applied = table.apply_schema(&SchemaPatch::new(patches), None);
+    // The cached handle predates the change either way.
+    bridge.forget(name);
+    if let Err(e) = applied {
+        let now = bridge.table(name).map_err(|e| e.to_string())?.schema();
+        if wanted.iter().any(|w| now.field_with_name(w).is_err()) {
+            return Err(e.to_string());
+        }
+    }
+    Ok(true)
 }
 
 /// Append rows, isolating the ones the engine refuses: a refused batch is
@@ -1053,13 +1590,14 @@ pub unsafe extern "C" fn infino_index_batch(
             Err(e) => return err_json(&e.to_string()),
         };
         let schema = table.schema();
+        let precisions = conn.precisions(name);
 
         let mut failed: Vec<Value> = Vec::new();
         let mut rows: Vec<(usize, Map<String, Value>)> = Vec::with_capacity(n);
         for i in 0..n {
             let osid = unsafe { cstr(os_p[i]) }.unwrap_or("");
             let source = unsafe { cstr(sr_p[i]) }.unwrap_or("{}");
-            let mut flat = match conform_doc(source, &schema) {
+            let mut flat = match conform_doc(source, &schema, &precisions) {
                 Ok(flat) => flat,
                 Err(why) => {
                     failed.push(json!({ "i": i, "reason": why }));
@@ -1072,6 +1610,17 @@ pub unsafe extern "C" fn infino_index_batch(
         }
 
         let mut maps: Vec<Map<String, Value>> = rows.iter().map(|(_, m)| m.clone()).collect();
+        let (table, schema) = match ensure_list_columns(conn, name, &schema, &maps) {
+            Ok(true) => match conn.table(name) {
+                Ok(t) => {
+                    let s = t.schema();
+                    (t, s)
+                }
+                Err(e) => return err_json(&e.to_string()),
+            },
+            Ok(false) => (table, schema),
+            Err(why) => return err_json(&why),
+        };
         unify_new_paths(&mut maps, &schema);
         let indexed: Vec<(usize, Value)> = rows
             .iter()
@@ -1130,7 +1679,7 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             Err(e) => return err_json(&e.to_string()),
         };
         let n = prepared.n;
-        let failed = append_prepared(&table, vec![prepared], &[]);
+        let failed = append_prepared(&table, vec![prepared], &[], &[]);
         let failed: Vec<Value> = failed
             .into_iter()
             .map(|(_, i, reason)| json!({ "i": i, "reason": reason }))
@@ -1191,6 +1740,7 @@ unsafe fn prepare(
     let table = conn.table(name).map_err(|e| e.to_string())?;
     let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
     let schema = table.schema();
+    let precisions = conn.precisions(name);
 
     // Each row's id, source and routing value as borrowed slices of the
     // buffer, with its stamp and operation.
@@ -1218,7 +1768,7 @@ unsafe fn prepare(
     let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
         .par_iter()
         .map(|(id, src, routing, seq, op)| {
-            conform_doc(src, &schema).map(|mut flat| {
+            conform_doc(src, &schema, &precisions).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 flat.insert(SOURCE.into(), Value::String((*src).to_string()));
                 if !routing.is_empty() {
@@ -1249,6 +1799,16 @@ unsafe fn prepare(
             Err(why) => failed.push((i, why)),
         }
     }
+    // A field given several values may need its list column declared first;
+    // the rows are then converted against the schema that holds it.
+    let (table_schema, schema) = if ensure_list_columns(conn, name, &schema, &rows)? {
+        (
+            conn.conn.schema(name).map_err(|e| e.to_string())?,
+            conn.table(name).map_err(|e| e.to_string())?.schema(),
+        )
+    } else {
+        (table_schema, schema)
+    };
     unify_new_paths(&mut rows, &schema);
     let values: Vec<Value> = rows.into_iter().map(Value::Object).collect();
     let batch = if values.is_empty() {
@@ -1344,6 +1904,40 @@ fn replaced_rows(prepared: &[Prepared], replaced: &[String]) -> Vec<(usize, usiz
     out
 }
 
+/// Stamp each document of a prepared batch with its sequence number,
+/// `seqs[i]` for document `i` of the batch: in the row it falls back to, and
+/// in its Arrow batch, where the column is replaced when the batch carries
+/// it and added when it does not.
+fn stamp_seqs(p: &mut Prepared, seqs: &[i64]) -> Result<(), String> {
+    for (j, v) in p.values.iter_mut().enumerate() {
+        if let (Some(seq), Value::Object(row)) = (seqs.get(p.index_of[j]), v) {
+            row.insert(SEQ.into(), json!(seq));
+        }
+    }
+    let Some(batch) = p.batch.take() else {
+        return Ok(());
+    };
+    let column: Arc<dyn Array> = Arc::new(Int64Array::from(
+        p.index_of
+            .iter()
+            .map(|&i| seqs.get(i).copied())
+            .collect::<Vec<Option<i64>>>(),
+    ));
+    let schema = batch.schema();
+    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+    let mut columns = batch.columns().to_vec();
+    match schema.index_of(SEQ) {
+        Ok(at) => columns[at] = column,
+        Err(_) => {
+            fields.push(Arc::new(Field::new(SEQ, DataType::Int64, true)));
+            columns.push(column);
+        }
+    }
+    let stamped = Schema::new_with_metadata(fields, schema.metadata().clone());
+    p.batch = Some(RecordBatch::try_new(Arc::new(stamped), columns).map_err(|e| e.to_string())?);
+    Ok(())
+}
+
 /// Append prepared batches as one commit. When `replaced` names ids, the
 /// rows under those ids are replaced in the same mutation as their
 /// tombstones (the engine's update), whatever shape the batches take: they
@@ -1354,17 +1948,29 @@ fn replaced_rows(prepared: &[Prepared], replaced: &[String]) -> Vec<(usize, usiz
 /// halving append that names each refused document, over the documents
 /// that replace nothing. A document whose batch could not be converted and
 /// whose id is replaced is refused rather than appended beside the row it
-/// was to replace. Returns every refused document as (batch index,
-/// document index, reason).
+/// was to replace. `seqs[b]`, when given, holds the sequence number of each
+/// document of batch `b` ([`stamp_seqs`]). Returns every refused document as
+/// (batch index, document index, reason).
 fn append_prepared(
     table: &Supertable,
-    prepared: Vec<Prepared>,
+    mut prepared: Vec<Prepared>,
     replaced: &[String],
+    seqs: &[Vec<i64>],
 ) -> Vec<(usize, usize, String)> {
     let mut failed: Vec<(usize, usize, String)> = Vec::new();
-    for (b, p) in prepared.iter().enumerate() {
+    for (b, p) in prepared.iter_mut().enumerate() {
         for (i, why) in &p.failed {
             failed.push((b, *i, why.clone()));
+        }
+        if let Some(seqs) = seqs.get(b) {
+            if let Err(why) = stamp_seqs(p, seqs) {
+                for i in &p.index_of {
+                    failed.push((b, *i, format!("sequence number: {why}")));
+                }
+                p.batch = None;
+                p.values.clear();
+                p.index_of.clear();
+            }
         }
     }
     let replace_pred =
@@ -1567,9 +2173,12 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
 /// Append prepared batches in one commit (see [`append_prepared`]) and
 /// release them; the rows whose ids are among the `replaced_count` strings
 /// of `replaced` (null for none) replace the table's rows under those ids
-/// in the same mutation. Returns `{"ok":n,"failed":[{"b":batch,"i":doc,"reason":..}]}`,
-/// where `b` indexes `prepared` and `i` the documents of that batch, or
-/// `{"error":..}` when nothing ran (the handles are released either way).
+/// in the same mutation. `seqs` (null for none) holds `seqs_count` sequence
+/// numbers, one per document of every batch, batch after batch in order: the
+/// number each document is written under. Returns
+/// `{"ok":n,"failed":[{"b":batch,"i":doc,"reason":..}]}`, where `b` indexes
+/// `prepared` and `i` the documents of that batch, or `{"error":..}` when
+/// nothing ran (the handles are released either way).
 #[no_mangle]
 pub unsafe extern "C" fn infino_append_prepared(
     h: *mut Bridge,
@@ -1578,6 +2187,8 @@ pub unsafe extern "C" fn infino_append_prepared(
     count: c_int,
     replaced: *const *const c_char,
     replaced_count: c_int,
+    seqs: *const i64,
+    seqs_count: c_int,
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         if prepared.is_null() || count <= 0 {
@@ -1606,7 +2217,23 @@ pub unsafe extern "C" fn infino_append_prepared(
             Err(e) => return err_json(&e.to_string()),
         };
         let n: usize = owned.iter().map(|p| p.n).sum();
-        let failed = append_prepared(&table, owned, &replaced);
+        let per_batch: Vec<Vec<i64>> = if seqs.is_null() || seqs_count <= 0 {
+            Vec::new()
+        } else if seqs_count as usize != n {
+            return err_json(&format!("{seqs_count} sequence numbers for {n} documents"));
+        } else {
+            let all = unsafe { std::slice::from_raw_parts(seqs, n) };
+            let mut at = 0;
+            owned
+                .iter()
+                .map(|p| {
+                    let these = all[at..at + p.n].to_vec();
+                    at += p.n;
+                    these
+                })
+                .collect()
+        };
+        let failed = append_prepared(&table, owned, &replaced, &per_batch);
         let ok = n - failed.len();
         let failed: Vec<Value> = failed
             .into_iter()
@@ -1665,6 +2292,52 @@ pub unsafe extern "C" fn infino_delete_osids(
     .unwrap_or(-99)
 }
 
+/// The source of the row under `osid` and the sequence number it was
+/// written under (0 for a row written without one), or None when the table
+/// holds no such row.
+fn get_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
+    let table = conn.table(name).ok()?;
+    // A term lookup through the id column's FTS index, projected to the
+    // source and the sequence number. A table declared before the id column
+    // carried that index refuses the lookup; it falls back to an equality on
+    // the column.
+    let batches = match table.exact_match(OSID, osid, Some(&[SOURCE, SEQ])) {
+        Ok(batches) => batches,
+        Err(_) => {
+            let esc = osid.replace('\'', "''");
+            let sql = format!("SELECT {SOURCE}, {SEQ} FROM {name} WHERE {OSID} = '{esc}' LIMIT 1");
+            match conn.conn.query_sql(&sql) {
+                Ok(batches) => batches,
+                Err(e) => {
+                    eprintln!("[capi] get: {e}");
+                    return None;
+                }
+            }
+        }
+    };
+    for b in &batches {
+        if b.num_rows() == 0 {
+            continue;
+        }
+        let Some(source) = b
+            .column_by_name(SOURCE)
+            .and_then(|c| c.as_any().downcast_ref::<LargeStringArray>())
+        else {
+            continue;
+        };
+        if source.is_null(0) {
+            continue;
+        }
+        let seq = b
+            .column_by_name(SEQ)
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .filter(|a| !a.is_null(0))
+            .map_or(0, |a| a.value(0));
+        return Some((source.value(0).to_string(), seq));
+    }
+    None
+}
+
 /// The raw `_source` JSON for one osid, or "" if absent.
 #[no_mangle]
 pub unsafe extern "C" fn infino_get(
@@ -1678,36 +2351,29 @@ pub unsafe extern "C" fn infino_get(
         else {
             return ptr::null_mut();
         };
-        let Ok(table) = conn.table(name) else {
-            return out_string(String::new());
+        out_string(get_row(conn, name, osid).map_or_else(String::new, |(source, _)| source))
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// One osid's document as `{"source": .., "seq": n}`, its sequence number
+/// what a conditional write on it is checked against; "" if absent.
+#[no_mangle]
+pub unsafe extern "C" fn infino_get_doc(
+    h: *mut Bridge,
+    name: *const c_char,
+    osid: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(osid)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(osid) })
+        else {
+            return ptr::null_mut();
         };
-        // A term lookup through the id column's FTS index, projected to the
-        // source. A table declared before the id column carried that index
-        // refuses the lookup; it falls back to an equality on the column.
-        let batches = match table.exact_match(OSID, osid, Some(&[SOURCE])) {
-            Ok(batches) => batches,
-            Err(_) => {
-                let esc = osid.replace('\'', "''");
-                let sql = format!("SELECT {SOURCE} FROM {name} WHERE {OSID} = '{esc}' LIMIT 1");
-                match conn.conn.query_sql(&sql) {
-                    Ok(batches) => batches,
-                    Err(e) => {
-                        eprintln!("[capi] get: {e}");
-                        return out_string(String::new());
-                    }
-                }
-            }
-        };
-        for b in &batches {
-            if b.num_rows() > 0 {
-                if let Some(a) = b.column(0).as_any().downcast_ref::<LargeStringArray>() {
-                    if !a.is_null(0) {
-                        return out_string(a.value(0).to_string());
-                    }
-                }
-            }
+        match get_row(conn, name, osid) {
+            Some((source, seq)) => out_json(json!({ "source": source, "seq": seq })),
+            None => out_string(String::new()),
         }
-        out_string(String::new())
     }))
     .unwrap_or(ptr::null_mut())
 }
@@ -3028,7 +3694,8 @@ mod tests {
                 let mut rows: Vec<Map<String, Value>> = docs
                     .iter()
                     .map(|(id, src)| {
-                        let mut flat = conform_doc(src, &schema).unwrap();
+                        let mut flat =
+                            conform_doc(src, &schema, &conn.precisions("bench")).unwrap();
                         flat.insert(OSID.into(), Value::String(id.clone()));
                         flat.insert(SOURCE.into(), Value::String(src.clone()));
                         flat
@@ -3087,24 +3754,7 @@ mod tests {
     }
 
     fn append_replacing(h: *mut Bridge, p: *mut Prepared, replaced: &[&str]) -> Value {
-        let ids: Vec<CString> = replaced.iter().map(|x| c(x)).collect();
-        let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
-        let handles = [p];
-        let out = take(unsafe {
-            infino_append_prepared(
-                h,
-                c("logs").as_ptr(),
-                handles.as_ptr(),
-                1,
-                if idp.is_empty() {
-                    ptr::null()
-                } else {
-                    idp.as_ptr()
-                },
-                idp.len() as c_int,
-            )
-        });
-        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+        append_with_seqs(h, &[p], replaced, &[])
     }
 
     #[test]
@@ -3147,6 +3797,17 @@ mod tests {
         handles: &[*mut Prepared],
         replaced: &[&str],
     ) -> Value {
+        append_with_seqs(h, handles, replaced, &[])
+    }
+
+    /// Append prepared batches replacing `replaced`, each document under its
+    /// number in `seqs` (none when empty), as the plugin's writer does.
+    fn append_with_seqs(
+        h: *mut Bridge,
+        handles: &[*mut Prepared],
+        replaced: &[&str],
+        seqs: &[i64],
+    ) -> Value {
         let ids: Vec<CString> = replaced.iter().map(|x| c(x)).collect();
         let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
         let out = take(unsafe {
@@ -3161,9 +3822,201 @@ mod tests {
                     idp.as_ptr()
                 },
                 idp.len() as c_int,
+                if seqs.is_empty() {
+                    ptr::null()
+                } else {
+                    seqs.as_ptr()
+                },
+                seqs.len() as c_int,
             )
         });
         serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
+    /// One id's document as `infino_get_doc` returns it; Null when it is absent.
+    fn get_doc(h: *mut Bridge, id: &str) -> Value {
+        let out = take(unsafe { infino_get_doc(h, c("logs").as_ptr(), c(id).as_ptr()) });
+        if out.is_empty() {
+            return Value::Null;
+        }
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
+    /// A field a document gives several values keeps them in its list column,
+    /// declared the first time on either append path with the field's own
+    /// type, the field's own column null for that document (a string's keeps
+    /// them joined, for its text index); one value in an array is that value.
+    #[test]
+    fn several_values_go_to_the_field_s_list_column() {
+        let h = open_logs();
+        let mapping = r#"{"properties":{"n":{"type":"long"},"d":{"type":"date"},"ok":{"type":"boolean"},
+            "kw":{"type":"keyword"},"items":{"properties":{"price":{"type":"double"}}}}}"#;
+        let out = ensure(h, mapping);
+        assert!(out.contains("\"created\":false"), "{out}");
+        let out = index(
+            h,
+            &[
+                (
+                    "m1",
+                    r#"{"n":[1,2,2],"d":["2026-10-01T00:00:00Z","2026-10-02T00:00:00Z"],"kw":["a","b"]}"#,
+                ),
+                (
+                    "m2",
+                    r#"{"n":[3],"d":"2026-10-03T00:00:00Z","kw":["c"],"items":[{"price":1.0}]}"#,
+                ),
+            ],
+        );
+        assert_eq!(out["ok"], 2, "{out}");
+        // The prepared path declares the lists its own batch needs.
+        let p = prepared(
+            h,
+            &[(
+                "m3",
+                r#"{"ok":[true,false],"items":[{"price":5.5},{"price":7.0}],"kw":"d"}"#,
+            )],
+        );
+        let out = append_with_seqs(h, &[p], &[], &[]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let cols = columns(h);
+        let elem = |name: &str| {
+            cols.as_array()
+                .and_then(|all| all.iter().find(|c| c["name"] == name))
+                .map(|c| c["elem"].clone())
+        };
+        assert_eq!(elem("n[]"), Some(json!("i64")), "{cols}");
+        assert_eq!(elem("d[]"), Some(json!("ts")), "{cols}");
+        assert_eq!(elem("kw[]"), Some(json!("str")), "{cols}");
+        assert_eq!(elem("ok[]"), Some(json!("bool")), "{cols}");
+        assert_eq!(elem("items.price[]"), Some(json!("f64")), "{cols}");
+        // The answer's JSON carries no lists; their values are read as text.
+        let rows = sql(
+            h,
+            r#"SELECT osid, n, array_to_string("n[]", ',') AS ns, cardinality("d[]") AS dates, kw,
+                array_to_string("kw[]", ',') AS kws, "items.price", array_to_string("items.price[]", ',') AS prices
+                FROM logs ORDER BY osid"#,
+        );
+        assert_eq!(rows[0]["n"], Value::Null, "{rows}");
+        assert_eq!(rows[0]["ns"], "1,2,2", "{rows}");
+        assert_eq!(rows[0]["dates"], 2, "{rows}");
+        assert_eq!(rows[0]["kw"], "a b", "{rows}");
+        assert_eq!(rows[0]["kws"], "a,b", "{rows}");
+        assert_eq!(rows[1]["n"], 3, "{rows}");
+        assert_eq!(rows[1]["ns"], Value::Null, "{rows}");
+        assert_eq!(rows[1]["kw"], "c", "{rows}");
+        assert_eq!(rows[1]["items.price"], 1.0, "{rows}");
+        assert_eq!(rows[2]["items.price"], Value::Null, "{rows}");
+        assert_eq!(rows[2]["prices"], "5.5,7", "{rows}");
+        let hits = sql(h, r#"SELECT osid FROM logs WHERE array_has("n[]", 2)"#);
+        assert_eq!(hits, json!([{ "osid": "m1" }]), "{hits}");
+        close(h);
+    }
+
+    /// An `unsigned_long` past the largest signed 64-bit integer, and a
+    /// whole float past those a float holds exactly, are refused by what
+    /// they are rather than taken for fractions.
+    #[test]
+    fn an_integer_past_the_column_s_range_is_refused_by_what_it_is() {
+        let past = conform(json!(u64::MAX), &DataType::Int64).expect_err("refused");
+        assert!(past.contains("past the largest value"), "{past}");
+        let whole = conform(json!(1.0e16), &DataType::Int64).expect_err("refused");
+        assert!(
+            whole.contains("whole numbers a float holds exactly"),
+            "{whole}"
+        );
+        let fraction = conform(json!(1.5), &DataType::Int64).expect_err("refused");
+        assert!(fraction.contains("fractional"), "{fraction}");
+        assert_eq!(
+            conform(json!(i64::MAX), &DataType::Int64).expect("held"),
+            json!(i64::MAX)
+        );
+    }
+
+    /// A `float`, `half_float` or `scaled_float` field holds each value as
+    /// OpenSearch keeps it and reads it back, on both append paths and in
+    /// its list column: a 32-bit float; a 16-bit float rounded from it, a
+    /// tie to the even one; the value times the scaling factor rounded half
+    /// up, over the factor. A `double` keeps the value whole, and a value a
+    /// half holds only as an infinity is refused, as OpenSearch refuses it.
+    #[test]
+    fn a_narrow_float_field_holds_its_values_as_opensearch_keeps_them() {
+        let h = open_logs();
+        let mapping = r#"{"properties":{"f":{"type":"float"},"hf":{"type":"half_float"},
+            "sf":{"type":"scaled_float","scaling_factor":100},"dd":{"type":"double"}}}"#;
+        ensure(h, mapping);
+        let out = index(
+            h,
+            &[
+                // 0.125 and -0.125 scale to exact ties: up, toward positive infinity.
+                ("p1", r#"{"f":0.1,"hf":53.98,"sf":0.125,"dd":0.1}"#),
+                ("p2", r#"{"hf":[53.98,0.1],"sf":-0.125}"#),
+                ("p3", r#"{"hf":70000}"#),
+            ],
+        );
+        assert_eq!(out["ok"], 2, "{out}");
+        assert!(
+            out["failed"][0]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("[half_float] supports only finite values")),
+            "{out}"
+        );
+        // Halfway between two halves either side of 1: each goes to the even one.
+        let p = prepared(h, &[("p4", r#"{"hf":[1.00048828125,"1.00146484375"]}"#)]);
+        let out = append_with_seqs(h, &[p], &[], &[]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let rows = sql(
+            h,
+            r#"SELECT osid, f, hf, sf, dd, array_to_string("hf[]", ',') AS hfs FROM logs
+                WHERE osid IN ('p1', 'p2', 'p4') ORDER BY osid"#,
+        );
+        assert_eq!(rows[0]["f"], json!(f64::from(0.1_f32)), "{rows}");
+        assert_eq!(rows[0]["hf"], 53.96875, "{rows}");
+        assert_eq!(rows[0]["sf"], 0.13, "{rows}");
+        assert_eq!(rows[0]["dd"], 0.1, "{rows}");
+        assert_eq!(rows[1]["hfs"], "53.96875,0.0999755859375", "{rows}");
+        assert_eq!(rows[1]["sf"], -0.12, "{rows}");
+        assert_eq!(rows[2]["hfs"], "1,1.001953125", "{rows}");
+        close(h);
+    }
+
+    /// Each document is stored under the sequence number it was appended
+    /// with, batch after batch in order, whatever shape each batch takes; a
+    /// replacement carries its new number; a row written without one reads as
+    /// 0; and a count that does not match the documents writes nothing.
+    #[test]
+    fn appended_rows_keep_their_sequence_numbers() {
+        let h = open_logs();
+        let out = index(h, &[("s0", r#"{"level":"info","status":1}"#)]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let first = prepared(h, &[("s1", r#"{"level":"info","status":2}"#)]);
+        let second = prepared(
+            h,
+            &[
+                ("s2", r#"{"level":"info","status":3}"#),
+                ("s3", r#"{"level":"warn","status":4,"extra":"yes"}"#),
+            ],
+        );
+        let out = append_with_seqs(h, &[first, second], &[], &[7, 8, 9]);
+        assert_eq!(out["ok"], 3, "{out}");
+        for (id, seq) in [("s0", 0), ("s1", 7), ("s2", 8), ("s3", 9)] {
+            assert_eq!(get_doc(h, id)["seq"], seq, "{id}: {}", get_doc(h, id));
+        }
+        let replacing = prepared(h, &[("s1", r#"{"level":"error","status":22}"#)]);
+        let out = append_with_seqs(h, &[replacing], &["s1"], &[10]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let doc = get_doc(h, "s1");
+        assert_eq!(doc["seq"], 10, "{doc}");
+        assert!(
+            doc["source"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("\"status\":22"),
+            "{doc}"
+        );
+        let miscounted = prepared(h, &[("s4", r#"{"level":"info","status":5}"#)]);
+        let out = append_with_seqs(h, &[miscounted], &[], &[11, 12]);
+        assert!(out.get("error").is_some(), "{out}");
+        assert_eq!(get_doc(h, "s4"), Value::Null);
+        close(h);
     }
 
     /// Two batches of different shape (the second adds a path the mapping
@@ -3526,5 +4379,72 @@ mod tests {
             ),
             "table [logs_1] has no column x; [logs] neither"
         );
+    }
+
+    /// Every form OpenSearch's default date format takes is read as the
+    /// instant OpenSearch indexes it at, `2026-11-23T` (a day with an empty
+    /// time, as the sample flights write it) included; what it refuses is
+    /// left to the engine's parser.
+    #[test]
+    fn a_date_is_read_as_opensearch_s_default_format_reads_it() {
+        let cases = [
+            ("2026-11-23T", 1_795_392_000_000),
+            ("2026-11-23", 1_795_392_000_000),
+            ("2026-11", 1_793_491_200_000),
+            ("2026", 1_767_225_600_000),
+            ("2026-11-23T10", 1_795_428_000_000),
+            ("2026-11-23T10:30", 1_795_429_800_000),
+            ("2026-11-23T10:30:15", 1_795_429_815_000),
+            ("2026-11-23T10:30:15.250Z", 1_795_429_815_250),
+            ("2026-11-23T10:30:15.250123456Z", 1_795_429_815_250),
+            ("2026-11-23T10:30:15+02:00", 1_795_422_615_000),
+            ("2026-11-23T10:30:15-0530", 1_795_449_615_000),
+            ("2026-11-23T10:30:15+02", 1_795_422_615_000),
+            ("1969-12-31T23:59:59Z", -1_000),
+            ("2024-02-29", 1_709_164_800_000),
+            ("1795392000000", 1_795_392_000_000),
+            ("-1000", -1_000),
+        ];
+        for (sent, millis) in cases {
+            assert_eq!(default_format_millis(sent), Some(millis), "{sent}");
+        }
+        for refused in [
+            "2026-11-23 10:30:15",
+            "2026-13-01",
+            "2025-02-29",
+            "2026-11-23T24:00",
+            "2026-11-23T10:30:15.",
+            "26-11-23",
+            "2026-11-23Tnoon",
+            "",
+            "yesterday",
+        ] {
+            assert_eq!(default_format_millis(refused), None, "{refused}");
+        }
+        assert_eq!(
+            conform(json!("2026-11-23T"), &date_type()).unwrap(),
+            json!(1_795_392_000_000i64)
+        );
+        // A form only the engine reads is left to it, as before.
+        assert_eq!(
+            conform(json!("2026-11-23 10:30:15"), &date_type()).unwrap(),
+            json!("2026-11-23 10:30:15")
+        );
+    }
+
+    /// A string field's arrays of arrays are read through, as OpenSearch
+    /// flattens them: a saved search's `sort` (`[["@timestamp", "desc"]]`)
+    /// is two values, not a refusal.
+    #[test]
+    fn a_string_field_s_nested_arrays_are_its_values() {
+        assert_eq!(
+            conform(json!([["@timestamp", "desc"]]), &DataType::LargeUtf8).unwrap(),
+            json!("@timestamp desc")
+        );
+        assert_eq!(
+            conform(json!(["a", ["b", null, ["c"]], 7]), &DataType::LargeUtf8).unwrap(),
+            json!("a b c 7")
+        );
+        assert!(conform(json!(["a", [{"b": 1}]]), &DataType::LargeUtf8).is_err());
     }
 }

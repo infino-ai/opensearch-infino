@@ -78,13 +78,13 @@ public class InfinoSqlTests extends OpenSearchTestCase {
             columns.put(name, new InfinoNative.Column(name, "str", false, false));
         }
         InfinoAccess fls = new InfinoAccess(null, field -> !field.equals("secret"), null);
-        InfinoSql.Part part = InfinoSql.part("os_a", columns, fls, null, 0);
+        InfinoSql.Part part = InfinoSql.part("os_a", columns, fls, 0);
         assertFalse(part.columns().containsKey("source"));
         // The source holds the hidden field as written: no search may match on it.
         assertTrue(part.unsearchable().contains("source"));
         assertTrue(part.unsearchable().contains("secret"));
         // Read whole, the source is a column like any other.
-        InfinoSql.Part whole = InfinoSql.part("os_a", columns, InfinoAccess.NONE, null, 0);
+        InfinoSql.Part whole = InfinoSql.part("os_a", columns, InfinoAccess.NONE, 0);
         assertFalse(whole.unsearchable().contains("source"));
     }
 
@@ -93,7 +93,7 @@ public class InfinoSqlTests extends OpenSearchTestCase {
         for (String name : List.of("osid", "tag", "osrouting", "osseq", "osop", "osgen")) {
             columns.put(name, new InfinoNative.Column(name, "str", false, false));
         }
-        InfinoSql.Part part = InfinoSql.part("os_a", columns, InfinoAccess.NONE, null, 0);
+        InfinoSql.Part part = InfinoSql.part("os_a", columns, InfinoAccess.NONE, 0);
         assertEquals(List.of("osid", "tag"), List.copyOf(part.columns().keySet()));
         assertFalse(part.whole());
     }

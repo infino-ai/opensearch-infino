@@ -13,6 +13,7 @@ import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.bucket.composite.CompositeAggregation;
 import org.opensearch.search.aggregations.bucket.composite.InternalComposite;
+import org.opensearch.search.aggregations.bucket.filter.InternalFilter;
 import org.opensearch.search.aggregations.bucket.missing.MissingOrder;
 import org.opensearch.search.aggregations.bucket.terms.DoubleTerms;
 import org.opensearch.search.aggregations.bucket.terms.SignificantLongTerms;
@@ -63,6 +64,19 @@ public class InfinoAggregationWireTests extends OpenSearchTestCase {
         assertEquals(4, buckets.get(0).getDocCount());
         assertEquals(2.25, buckets.get(1).getKeyAsNumber().doubleValue(), 0.0);
         assertEquals(7, terms.getSumOfOtherDocCounts());
+    }
+
+    public void testFilterReadsBackItsCountMetaAndSubAggregations() {
+        InternalCardinality sub = InfinoAggregationWire.cardinality("u", null, 2);
+        InternalFilter filter = InfinoAggregationWire.filter("f", Map.of("panel", "tsvb"), 3, InternalAggregations.from(List.of(sub)));
+        assertEquals("f", filter.getName());
+        assertEquals(3, filter.getDocCount());
+        assertEquals(Map.of("panel", "tsvb"), filter.getMetadata());
+        InternalCardinality back = filter.getAggregations().get("u");
+        assertEquals(2, back.getValue());
+        assertNull(back.getMetadata());
+        // No meta in the request is none in the answer, as stock's.
+        assertNull(InfinoAggregationWire.filter("g", null, 0, InternalAggregations.EMPTY).getMetadata());
     }
 
     public void testSignificantLongTermsReadsBackItsBuckets() {

@@ -577,16 +577,21 @@ public class InfinoEngine extends InternalEngine {
      * them from its translog.
      */
     static Pending pending(String table, String id) {
+        Version v = latestPending(table, id);
+        return v == null ? null : new Pending(v.source());
+    }
+
+    /** The newest write to {@code id} a shard holds for {@code table} and has not committed: the open batch's, else the one committing. */
+    private static Version latestPending(String table, String id) {
         InfinoEngine engine = BY_TABLE.get(table);
         if (engine == null) {
             return null;
         }
         synchronized (engine.batchLock) {
-            // The newest write wins: the open batch's, else the one committing.
             for (Batch b : new Batch[] { engine.batch, engine.committing }) {
                 Version v = b == null ? null : b.latest(id);
                 if (v != null) {
-                    return new Pending(v.source());
+                    return v;
                 }
             }
             return null;
@@ -600,21 +605,27 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /**
+     * {@code id}'s document as a read sees it now, with the sequence number
+     * it was written under: a pending write's, else the table's; null when it
+     * is deleted or missing.
+     */
+    static InfinoNative.Doc currentDoc(String table, String id) {
+        Version v = latestPending(table, id);
+        if (v != null) {
+            return v.source() == null ? null : new InfinoNative.Doc(v.source(), v.seq());
+        }
+        return InfinoNative.getDoc(table, id);
+    }
+
+    /**
      * The routing value {@code id} was last written with, as a read sees it
      * now: a pending write's, else the table's; null when it was written with
      * none.
      */
     static String currentRouting(String table, String id) {
-        InfinoEngine engine = BY_TABLE.get(table);
-        if (engine != null) {
-            synchronized (engine.batchLock) {
-                for (Batch b : new Batch[] { engine.batch, engine.committing }) {
-                    Version v = b == null ? null : b.latest(id);
-                    if (v != null && v.source() != null) {
-                        return v.routing();
-                    }
-                }
-            }
+        Version v = latestPending(table, id);
+        if (v != null && v.source() != null) {
+            return v.routing();
         }
         return InfinoNative.routingOf(table, id);
     }
@@ -1104,7 +1115,8 @@ public class InfinoEngine extends InternalEngine {
             if (prepared == null) {
                 throw new IllegalStateException("[infino] the bridge could not prepare a batch for " + table);
             }
-            InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced);
+            // The batch carries each row's sequence number from prepare, so the append names none.
+            InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced, null);
             retry = notTaken(result.failed(), ids, written);
         }
         Set<String> touched = new HashSet<>(ids);
