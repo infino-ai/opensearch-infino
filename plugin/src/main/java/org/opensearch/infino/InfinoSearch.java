@@ -315,16 +315,12 @@ public final class InfinoSearch {
                 scriptFields.add(new ScriptedField(sf.fieldName(), sql.expr(), "sf" + scriptFields.size()));
             }
         }
-        // A sorted request that continues from an earlier page orders by the id
-        // last, so rows sharing a sort value have one order and a page boundary
-        // falls between rows, never through a value: the id is the tiebreak
-        // search_after and a later from need. A first page takes any of the rows
-        // tied at its end, as stock takes the first its index reaches: ordering
-        // every tied row by the id would read all of them, every row of a value
-        // most documents share. A scroll sorts by the id itself (scrollSource).
+        // A sorted request orders by the id last, so rows sharing a sort value
+        // have one order and a page boundary falls between rows, never through
+        // a value: the id is the tiebreak search_after needs, and the hit's sort
+        // values carry it for the next page.
         Column idColumn = cols.get(InfinoQueryTranslator.OSID);
-        boolean continues = source.searchAfter() != null || source.from() > 0;
-        if (continues && !sorts.isEmpty() && idColumn != null && sorts.stream().noneMatch(s -> s.name().equals(InfinoQueryTranslator.OSID))) {
+        if (!sorts.isEmpty() && idColumn != null && sorts.stream().noneMatch(s -> s.name().equals(InfinoQueryTranslator.OSID))) {
             sorts.add(SortSpec.of(idColumn, false));
         }
         Object[] searchAfter = source.searchAfter();
@@ -1224,10 +1220,9 @@ public final class InfinoSearch {
      * The request a scroll's later pages run: the first page's query, sorts,
      * window and fields, without its aggregations (a scroll computes them
      * once) and without a count (the first page's total is repeated). A
-     * scroll pages in a fixed order, so it is ordered by the id last: alone
-     * when the request names no sort ({@code _doc}, which the reindex family
-     * sends, reads the same way), else after the request's sorts, so rows
-     * sharing their values keep one order from page to page.
+     * scroll pages in a fixed order, so a request that names no sort is
+     * ordered by the id; {@code _doc}, which the reindex family sends,
+     * reads the same way.
      */
     static SearchSourceBuilder scrollSource(SearchSourceBuilder source) {
         SearchSourceBuilder out = new SearchSourceBuilder();
@@ -1236,16 +1231,14 @@ public final class InfinoSearch {
             out.postFilter(source.postFilter());
         }
         out.size(source.size() < 0 ? DEFAULT_SIZE : source.size());
-        boolean byId = false;
         if (source.sorts() != null) {
             for (SortBuilder<?> sort : source.sorts()) {
                 if (!ordersNothing(sort)) {
                     out.sort(sort);
-                    byId |= sort instanceof FieldSortBuilder fs && ID_SORT_FIELD.equals(fs.getFieldName());
                 }
             }
         }
-        if (!byId) {
+        if (scrollsById(source)) {
             out.sort(ID_SORT_FIELD);
         }
         if (source.fetchSource() != null) {
