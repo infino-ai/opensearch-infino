@@ -124,11 +124,13 @@
         index: new-alias
         id: m5
   - match: { _source.n: 7 }
+  # The index's stats count the table's documents, and its shard holds no segment: nothing reached Lucene.
   - do:
       indices.stats:
         index: new2
-        metric: docs
-  - match: { indices.new2.primaries.docs.count: 0 }
+        metric: [ docs, segments ]
+  - match: { indices.new2.primaries.docs.count: 5 }
+  - match: { indices.new2.primaries.segments.count: 0 }
 
   # An array of objects under a nested mapping (what Dashboards' saved objects carry as references) is written whole and read back whole.
   - do:
@@ -164,3 +166,43 @@
         body: { query: { term: { title: levels } } }
   - match: { hits.total.value: 1 }
   - match: { hits.hits.0._source.references.0.name: panel_0 }
+
+---
+"A bulk over an index with no active primary answers its items, and the other index's items are written":
+  - do:
+      indices.create:
+        index: up1
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+  # Its primary needs a node the cluster does not have, so it never becomes active.
+  - do:
+      indices.create:
+        index: down1
+        wait_for_active_shards: "0"
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0, index.routing.allocation.require._name: no-such-node }
+  - do:
+      bulk:
+        refresh: true
+        timeout: 1s
+        body:
+          - index: { _index: up1, _id: "u1" }
+          - { n: 1 }
+          - index: { _index: down1, _id: "d1" }
+          - { n: 2 }
+          - create: { _index: up1, _id: "u2" }
+          - { n: 3 }
+  # As stock answers it: the bulk succeeds, the items of the index with no primary fail
+  # with the primary unavailable, and the others are written.
+  - match: { errors: true }
+  - match: { items.0.index._index: up1 }
+  - match: { items.0.index.result: created }
+  - match: { items.1.index._index: down1 }
+  - match: { items.1.index.status: 503 }
+  - match: { items.1.index.error.type: unavailable_shards_exception }
+  - match: { items.2.create._index: up1 }
+  - match: { items.2.create.result: created }
+  - do:
+      count:
+        index: up1
+  - match: { count: 2 }

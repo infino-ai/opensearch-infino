@@ -297,9 +297,11 @@
           size: 0
           aggs:
             flags: { terms: { field: flag, order: { _key: asc } } }
-  - match: { aggregations.flags.buckets.0.key: "false" }
+  - match: { aggregations.flags.buckets.0.key: 0 }
+  - match: { aggregations.flags.buckets.0.key_as_string: "false" }
   - match: { aggregations.flags.buckets.0.doc_count: 3 }
-  - match: { aggregations.flags.buckets.1.key: "true" }
+  - match: { aggregations.flags.buckets.1.key: 1 }
+  - match: { aggregations.flags.buckets.1.key_as_string: "true" }
   - match: { aggregations.flags.buckets.1.doc_count: 5 }
   - do:
       search:
@@ -317,5 +319,7 @@
           size: 0
           aggs:
             flags: { terms: { field: flag, order: { _key: desc } } }
-  - match: { aggregations.flags.buckets.0.key: "true" }
-  - match: { aggregations.flags.buckets.1.key: "false" }
+  - match: { aggregations.flags.buckets.0.key: 1 }
+  - match: { aggregations.flags.buckets.0.key_as_string: "true" }
+  - match: { aggregations.flags.buckets.1.key: 0 }
+  - match: { aggregations.flags.buckets.1.key_as_string: "false" }

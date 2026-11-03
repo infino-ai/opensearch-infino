@@ -9,12 +9,15 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.inject.Injector;
+import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.ingest.IngestService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
 
@@ -34,6 +37,9 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     private static volatile IndexNameExpressionResolver indexNameExpressionResolver;
     private static volatile InfinoWriter writer;
     private static volatile AutoCreateIndex autoCreateIndex;
+    private static volatile IngestService ingestService;
+    private static volatile IndexScopedSettings indexScopedSettings;
+    private static volatile TransportService transportService;
 
     @Inject
     public InfinoServices(
@@ -54,9 +60,19 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoServices.writer = new InfinoWriter(threadPool);
         // The node's own rule for creating an index a write names before it exists.
         InfinoServices.autoCreateIndex = injector.getInstance(AutoCreateIndex.class);
+        // The node's ingest pipelines, which a write to the table runs as a stock bulk runs them.
+        InfinoServices.ingestService = injector.getInstance(IngestService.class);
+        // The index settings this node knows, which a registered index is created with.
+        InfinoServices.indexScopedSettings = injector.getInstance(IndexScopedSettings.class);
+        // A write to a table another node writes is sent there (see InfinoBulkActionFilter).
+        InfinoServices.transportService = injector.getInstance(TransportService.class);
         InfinoClient.bind(injector);
         // The security plugin's components, when it runs, come from the same injector.
         InfinoSecurity.bind(injector);
+        // Registered cluster state is sent as REST requests, whose bodies the
+        // node parses with this, each in the empty context the node starts
+        // with (no request has run on this thread yet).
+        InfinoClusterState.bind(namedXContentRegistry, threadPool.getThreadContext().newStoredContext(false));
         // The indices come back from the tables on a fresh cluster, and every
         // index's shape is recorded as it moves (see InfinoRegistry).
         clusterService.addListener(InfinoRegistry::onClusterChanged);
@@ -67,8 +83,23 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         return autoCreateIndex;
     }
 
+    /** The node's ingest service, or null before the services are injected. */
+    static IngestService ingestService() {
+        return ingestService;
+    }
+
+    /** The index settings this node knows, or null before the services are injected. */
+    static IndexScopedSettings indexScopedSettings() {
+        return indexScopedSettings;
+    }
+
     static ClusterService clusterService() {
         return clusterService;
+    }
+
+    /** The node's transport, or null before the services are injected. */
+    static TransportService transportService() {
+        return transportService;
     }
 
     static ThreadPool threadPool() {

@@ -134,6 +134,14 @@ def knnSuite = 'infino/100_knn'
 def knnTests = 'org.opensearch.infino.InfinoStockKnnIT'
 def knnData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-knn"
 
+// Writes that arrive at every node of a cluster need more than one node: a
+// table is written by the node holding its index's primary, and the others
+// send their writes there. That test runs in a task of its own, on a
+// two-node cluster over one catalog both nodes share.
+def multiNodeTask = 'multiNodeTest'
+def multiNodeTests = 'org.opensearch.infino.InfinoMultiNodeWriteIT'
+def multiNodeData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-multinode"
+
 // The test cluster runs the security plugin, enabled, with the demo node
 // certificates on the transport layer and plain HTTP with basic
 // authentication: the suites run as admin, and the security suite sends
@@ -166,6 +174,12 @@ testClusters.all {
     // installed by then.
     if (needsRuleFrameworkModule) {
         plugin(ruleFrameworkModule.flatMap { it.archiveFile })
+    }
+    // The integration-test distribution before 3.6 leaves out the
+    // ingest-common module, whose processors (set, drop, fail) the ingest
+    // suite's pipelines use; the archive carries every module.
+    if (versionMajor < 3 || (versionMajor == 3 && versionMinor < 6)) {
+        testDistribution = 'ARCHIVE'
     }
     systemProperty 'infino.lib', System.getProperty('infino.lib', defaultLib)
     systemProperty 'infino.uri', System.getProperty('infino.uri', defaultUri)
@@ -217,11 +231,20 @@ testClusters.matching { it.name == knnTask }.all {
     systemProperty 'infino.data', System.getProperty('infino.data', knnData)
 }
 
+testClusters.maybeCreate(multiNodeTask)
+testClusters.matching { it.name == multiNodeTask }.all {
+    numberOfNodes = 2
+    plugin(tasks.named('bundlePlugin').flatMap { it.archiveFile })
+    systemProperty 'infino.uri', System.getProperty('infino.uri', "file://${multiNodeData}")
+    systemProperty 'infino.data', System.getProperty('infino.data', multiNodeData)
+}
+
 // A run that dies before its shards are deleted leaves their tables; each run starts clean.
 tasks.named('yamlRestTest').configure {
     systemProperty 'tests.rest.denylist', "${knnSuite}/*"
     filter {
         excludeTestsMatching knnTests
+        excludeTestsMatching multiNodeTests
     }
     doFirst {
         delete layout.buildDirectory.dir('infino-catalog')
@@ -234,10 +257,27 @@ def knnYamlRestTest = tasks.register(knnTask, RestIntegTestTask) {
     testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
     classpath = sourceSets.yamlRestTest.runtimeClasspath
     systemProperty 'tests.rest.suite', knnSuite
+    filter {
+        excludeTestsMatching multiNodeTests
+    }
     doFirst {
         delete knnData
     }
 }
+
+def multiNodeTest = tasks.register(multiNodeTask, RestIntegTestTask) {
+    description = 'Runs the multi-node write tests on a two-node cluster.'
+    group = 'verification'
+    testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
+    classpath = sourceSets.yamlRestTest.runtimeClasspath
+    filter {
+        includeTestsMatching multiNodeTests
+    }
+    doFirst {
+        delete multiNodeData
+    }
+}
 tasks.named('check').configure {
     dependsOn knnYamlRestTest
+    dependsOn multiNodeTest
 }

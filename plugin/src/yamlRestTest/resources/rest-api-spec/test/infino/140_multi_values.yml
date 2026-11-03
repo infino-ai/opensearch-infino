@@ -1,0 +1,234 @@
+---
+"A field a document gives several values matches on any of them, as on stock":
+  - do:
+      indices.create:
+        index: mv1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              d: { type: date }
+              tag: { type: keyword }
+              cat: { type: text }
+              items: { properties: { price: { type: double } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: mv1, _id: "1" }
+          - { n: [1, 5], d: ["2026-10-01", "2026-10-05"], tag: ["a", "b"], cat: ["Men's Clothing", "Women's Shoes"], items: [{ price: 10.5 }, { price: 99.0 }] }
+          - index: { _index: mv1, _id: "2" }
+          - { n: 3, d: "2026-10-03", tag: "b", cat: "Men's Clothing", items: [{ price: 20.0 }] }
+          - index: { _index: mv1, _id: "3" }
+          - { n: [7], tag: ["c"] }
+  - match: { errors: false }
+
+  # A term matches any value; a one-value array is that value.
+  - do:
+      search:
+        index: mv1
+        body: { query: { term: { n: 5 } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: mv1
+        body: { query: { term: { n: 7 } } }
+  - match: { hits.hits.0._id: "3" }
+
+  # A range matches a document with any value inside it, not one whose values only straddle it.
+  - do:
+      search:
+        index: mv1
+        body: { query: { range: { n: { gte: 2, lte: 4 } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do:
+      search:
+        index: mv1
+        body: { query: { range: { n: { gte: 4, lte: 6 } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: mv1
+        body: { query: { range: { d: { gte: "2026-10-04" } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: mv1
+        body: { query: { range: { items.price: { gt: 50 } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+  # Terms, prefix and exists over the values; an exact value never matches the values joined.
+  - do:
+      search:
+        index: mv1
+        body: { query: { terms: { tag: [ "a", "c" ] } }, sort: [ { _id: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: mv1
+        body: { query: { prefix: { tag: "b" } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: mv1
+        body: { query: { term: { tag: "a b" } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: mv1
+        body: { query: { exists: { field: d } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: mv1
+        body: { query: { exists: { field: n } } }
+  - match: { hits.total.value: 3 }
+
+  # Full text sees every value of a text field.
+  - do:
+      search:
+        index: mv1
+        body: { query: { match: { cat: "shoes" } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+  # A sort takes the least value ascending and the greatest descending.
+  - do:
+      search:
+        index: mv1
+        body: { sort: [ { n: asc } ] }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.sort.0: 1 }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - do:
+      search:
+        index: mv1
+        body: { sort: [ { n: desc } ] }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+  - match: { hits.hits.1.sort.0: 5 }
+  - match: { hits.hits.2._id: "2" }
+
+  # The source comes back as it was sent.
+  - do:
+      get:
+        index: mv1
+        id: "1"
+  - match: { _source.n: [ 1, 5 ] }
+  - match: { _source.tag: [ "a", "b" ] }
+
+---
+"Aggregations count a document in every bucket one of its values falls in, as on stock":
+  - do:
+      indices.create:
+        index: mv2
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              d: { type: date }
+              tag: { type: keyword }
+              items: { properties: { price: { type: double } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: mv2, _id: "1" }
+          - { n: [1, 5], d: ["2026-10-01", "2026-10-05"], tag: ["a", "b"], items: [{ price: 10.5 }, { price: 99.0 }] }
+          - index: { _index: mv2, _id: "2" }
+          - { n: 3, d: "2026-10-03", tag: "b", items: [{ price: 20.0 }] }
+          - index: { _index: mv2, _id: "3" }
+          - { n: [7], tag: ["c"] }
+
+  # Terms: a document in each of its values' buckets, once; a metric under it reads all its values.
+  - do:
+      search:
+        index: mv2
+        body: { size: 0, aggs: { t: { terms: { field: tag }, aggs: { s: { sum: { field: n } } } } } }
+  - length: { aggregations.t.buckets: 3 }
+  - match: { aggregations.t.buckets.0.key: b }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.0.s.value: 9.0 }
+  - match: { aggregations.t.buckets.1.key: a }
+  - match: { aggregations.t.buckets.1.doc_count: 1 }
+  - match: { aggregations.t.buckets.1.s.value: 6.0 }
+  - match: { aggregations.t.buckets.2.key: c }
+  - match: { aggregations.t.buckets.2.s.value: 7.0 }
+
+  # Nested terms: under b, the values of the documents in b.
+  - do:
+      search:
+        index: mv2
+        body: { size: 0, aggs: { t: { terms: { field: tag }, aggs: { m: { terms: { field: n } } } } } }
+  - length: { aggregations.t.buckets.0.m.buckets: 3 }
+  - match: { aggregations.t.buckets.0.m.buckets.0.key: 1 }
+  - match: { aggregations.t.buckets.0.m.buckets.1.key: 3 }
+  - match: { aggregations.t.buckets.0.m.buckets.2.key: 5 }
+
+  # Histograms and ranges: a document in each bucket a value falls in.
+  - do:
+      search:
+        index: mv2
+        body: { size: 0, aggs: { h: { histogram: { field: n, interval: 4 } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.doc_count: 2 }
+  - match: { aggregations.h.buckets.1.doc_count: 2 }
+  - do:
+      search:
+        index: mv2
+        body: { size: 0, aggs: { h: { date_histogram: { field: d, calendar_interval: day } } } }
+  - length: { aggregations.h.buckets: 5 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.doc_count: 0 }
+  - match: { aggregations.h.buckets.4.doc_count: 1 }
+  - do:
+      search:
+        index: mv2
+        body: { size: 0, aggs: { r: { range: { field: n, ranges: [ { to: 4 }, { from: 4, to: 10 } ] } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.doc_count: 2 }
+
+  # Composite terms over the values, in key order.
+  - do:
+      search:
+        index: mv2
+        body: { size: 0, aggs: { c: { composite: { sources: [ { t: { terms: { field: tag } } } ] } } } }
+  - length: { aggregations.c.buckets: 3 }
+  - match: { aggregations.c.buckets.1.key.t: b }
+  - match: { aggregations.c.buckets.1.doc_count: 2 }
+
+  # Metrics read every value.
+  - do:
+      search:
+        index: mv2
+        body:
+          size: 0
+          aggs:
+            avg: { avg: { field: items.price } }
+            count: { value_count: { field: items.price } }
+            low: { min: { field: items.price } }
+            high: { max: { field: items.price } }
+            total: { sum: { field: n } }
+  - match: { aggregations.count.value: 3 }
+  - match: { aggregations.low.value: 10.5 }
+  - match: { aggregations.high.value: 99.0 }
+  - match: { aggregations.total.value: 16.0 }
+
+  # A query on a value keeps the document whole: all of its values key buckets.
+  - do:
+      search:
+        index: mv2
+        body: { size: 0, query: { term: { tag: a } }, aggs: { t: { terms: { field: tag } } } }
+  - length: { aggregations.t.buckets: 2 }
+  - match: { aggregations.t.buckets.0.key: a }
+  - match: { aggregations.t.buckets.1.key: b }

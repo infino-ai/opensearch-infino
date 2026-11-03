@@ -45,6 +45,7 @@ import org.opensearch.search.aggregations.bucket.composite.CompositeValuesSource
 import org.opensearch.search.aggregations.bucket.composite.DateHistogramValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.composite.HistogramValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.composite.TermsValuesSourceBuilder;
+import org.opensearch.search.aggregations.bucket.filter.FilterAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator;
 import org.opensearch.search.aggregations.bucket.filter.InternalFilters;
@@ -103,6 +104,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -162,6 +164,8 @@ public class InfinoAggregationProcessor {
     private static final String TOTAL_ALIAS = "request_total";
     /** Parent buckets a nested grouped level is restricted to; past this the key list is not worth a predicate. */
     private static final int MAX_PARENT_TUPLES = 1_000;
+    /** The Arrow type a mapped date's column holds, which a date the index does not map is read as. */
+    private static final String UNMAPPED_DATE_TYPE = "Timestamp(ms, \"UTC\")";
     /** How bucket keys are printed when the request names no format. */
     private static final String DEFAULT_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
     /** The t-digest compression OpenSearch uses when the request names none. */
@@ -174,6 +178,28 @@ public class InfinoAggregationProcessor {
     private static final char KEY_SEPARATOR = '\u0001';
     /** Stand-in for a missing key in a tuple's string form. */
     private static final String NULL_KEY = "\u0000";
+    /** What separates a field's name from the name of one of its per-document figures ({@link Values#figure}). */
+    private static final String PER_DOCUMENT = "#";
+    /** The per-document figures a metric over a field some document gives several values reads. */
+    private static final String FIGURE_SUM = "sum";
+    private static final String FIGURE_COUNT = "count";
+    private static final String FIGURE_MIN = "min";
+    private static final String FIGURE_MAX = "max";
+    /**
+     * The aliases of the relations a statement over several values reads:
+     * each layer of values ({@link #valuesRelation}), the rows it ends in,
+     * a grouped level's bucket keys per document and the documents joined
+     * back to them, and the documents with their per-document figures.
+     */
+    private static final String VALUE_LAYER = "value_layer_";
+    private static final String VALUE_ROWS = "value_rows";
+    private static final String BUCKET_KEYS = "bucket_keys";
+    private static final String BUCKET_DOC = "bucket_doc";
+    private static final String BUCKET_DOCS = "bucket_docs";
+    private static final String METRIC_DOCS = "metric_docs";
+    private static final String FIGURES = "figures_";
+    private static final String FIGURE_DOC = "figure_doc";
+    private static final String FIGURE_VALUE = "figure_value";
 
     private final Index index;
     /**
@@ -186,6 +212,25 @@ public class InfinoAggregationProcessor {
     /** A processor whose top hits name {@code index}; null for planning only. */
     InfinoAggregationProcessor(Index index) {
         this.index = index;
+    }
+
+    /**
+     * An aggregation's {@code meta} as stock answers it: the request's, or
+     * none when the request names none. The builder reads an empty map then,
+     * which a response would print as {@code "meta": {}}.
+     */
+    static Map<String, Object> metadataOf(AggregationBuilder b) {
+        Map<String, Object> meta = b.getMetadata();
+        return meta.isEmpty() ? null : meta;
+    }
+
+    /** A {@code filter} aggregation's query as a predicate, or an {@link Unsupported} naming it. */
+    static String filterPredicate(FilterAggregationBuilder f, Map<String, Column> cols, String table) {
+        String p = InfinoQueryTranslator.predicate(f.getFilter(), cols, table, System.currentTimeMillis());
+        if (p == null) {
+            throw new Unsupported("aggregation [" + f.getName() + "] has a filter the table cannot answer: " + f.getFilter());
+        }
+        return p;
     }
 
     /** An aggregation the table cannot serve; the request fails with this reason. */
@@ -212,6 +257,11 @@ public class InfinoAggregationProcessor {
         for (AggregationBuilder b : builders) {
             specs.add(Spec.of(b, plan.cols(), plan.table(), plan.access(), position++));
         }
+        // A metric over a field some document gives several values reads each
+        // document's figures over them, joined in once for the whole request.
+        List<Source> figured = new ArrayList<>();
+        multiMetricSources(specs, figured);
+        String from = figured.isEmpty() ? q.from() : perDocument(q.from(), figured);
         Map<String, InternalAggregation> byName = new HashMap<>();
         List<Metric> rootMetrics = new ArrayList<>();
         for (Spec spec : specs) {
@@ -226,15 +276,15 @@ public class InfinoAggregationProcessor {
                 total = InfinoSearch.count(plan.table(), q);
             }
             if (spec instanceof TopHits th) {
-                byName.put(spec.name(), th.build(topHitRows(th, q.from(), q.where()), total, index));
+                byName.put(spec.name(), th.build(topHitRows(th, from, q.where()), total, index));
                 continue;
             }
-            byName.put(spec.name(), evalBucket((BucketSpec) spec, q.from(), q.where(), total));
+            byName.put(spec.name(), evalBucket((BucketSpec) spec, from, q.where(), total));
         }
         if (!rootMetrics.isEmpty()) {
             boolean counting = total == null;
             String select = (counting ? "COUNT(*) AS " + TOTAL_ALIAS + ", " : "") + metricColumns(rootMetrics);
-            Map<String, Object> row = oneRow("SELECT " + select + " FROM " + q.from() + " WHERE " + q.where());
+            Map<String, Object> row = oneRow("SELECT " + select + " FROM " + from + " WHERE " + q.where());
             if (counting) {
                 total = asLong(row.get(TOTAL_ALIAS));
             }
@@ -252,6 +302,117 @@ public class InfinoAggregationProcessor {
         }
         log.debug("[infino] served {} aggregation(s) from {}", ordered.size(), plan.table());
         return new Counted(InternalAggregations.from(ordered), total);
+    }
+
+    /** The sources the metrics of {@code specs} read, at any depth, that some document gives several values, onto {@code out}. */
+    private static void multiMetricSources(Collection<? extends Spec> specs, List<Source> out) {
+        for (Spec s : specs) {
+            if (s instanceof Metric m) {
+                m.multiSources(out);
+            } else if (s instanceof BucketSpec b) {
+                multiMetricSources(b.metrics, out);
+                if (b.child instanceof Siblings siblings) {
+                    multiMetricSources(siblings.children, out);
+                } else if (b.child != null) {
+                    multiMetricSources(List.of(b.child), out);
+                }
+            }
+        }
+    }
+
+    /**
+     * {@code from} with each document's figures over the values of every
+     * field of {@code fields} joined in (their count, a keyword's distinct
+     * ones; for numbers and dates their least and greatest; for numbers their
+     * sum), named by {@link Values#figure}: what a metric over such a field
+     * reads, each document once wherever it is counted, as stock reads a
+     * multi-valued field's values per document.
+     */
+    static String perDocument(String from, Collection<Source> fields) {
+        StringBuilder select = new StringBuilder("SELECT " + METRIC_DOCS + ".*");
+        StringBuilder joins = new StringBuilder();
+        List<String> done = new ArrayList<>();
+        for (Source s : fields) {
+            Values v = s.values();
+            if (done.contains(v.field())) {
+                continue;
+            }
+            String alias = FIGURES + done.size();
+            done.add(v.field());
+            // Each figure's name and how it is computed over the document's values.
+            Map<String, String> figures = new LinkedHashMap<>();
+            figures.put(FIGURE_COUNT, (s.isString() ? "COUNT(DISTINCT " : "COUNT(") + FIGURE_VALUE + ")");
+            if (s.isNumeric()) {
+                figures.put(FIGURE_SUM, "SUM(" + FIGURE_VALUE + ")");
+            }
+            if (s.isNumeric() || s.isTimestamp()) {
+                figures.put(FIGURE_MIN, "MIN(" + FIGURE_VALUE + ")");
+                figures.put(FIGURE_MAX, "MAX(" + FIGURE_VALUE + ")");
+            }
+            List<String> computed = new ArrayList<>();
+            for (Map.Entry<String, String> figure : figures.entrySet()) {
+                computed.add(figure.getValue() + " AS " + v.figure(figure.getKey()));
+                select.append(", ").append(alias).append('.').append(v.figure(figure.getKey()));
+            }
+            String values = "SELECT " + InfinoQueryTranslator.OSID + " AS " + FIGURE_DOC + ", unnest(" + v.each(s.expr()) + ") AS " + FIGURE_VALUE + " FROM "
+                + quoteIdent(v.table());
+            joins.append(" LEFT JOIN (SELECT " + FIGURE_DOC + ", " + String.join(", ", computed) + " FROM (" + values + ") GROUP BY " + FIGURE_DOC + ") " + alias)
+                .append(" ON " + alias + "." + FIGURE_DOC + " = " + METRIC_DOCS + "." + InfinoQueryTranslator.OSID);
+        }
+        return "(" + select + " FROM " + from + " " + METRIC_DOCS + joins + ")";
+    }
+
+    /**
+     * {@code from} read as one row per value of each source of {@code multi}
+     * (fields some document gives several values): each such field's column
+     * holds one of the document's values, its own or one of its list's, and a
+     * document with several stands on a row per combination, so a GROUP BY
+     * over the rows keys every value a document has.
+     */
+    static String valuesRelation(String from, Collection<Source> multi) {
+        String relation = from;
+        List<String> done = new ArrayList<>();
+        for (Source s : multi) {
+            if (done.contains(s.expr())) {
+                continue;
+            }
+            relation = "(SELECT * EXCLUDE (" + s.expr() + "), unnest(" + s.values().each(s.expr()) + ") AS " + s.expr() + " FROM " + relation + " " + VALUE_LAYER
+                + done.size() + ")";
+            done.add(s.expr());
+        }
+        return relation;
+    }
+
+    /**
+     * The GROUP BY of {@code keyCols} ({@code expression AS kN}, in order),
+     * with each group's row count and {@code metrics} (empty for none), over
+     * {@code from WHERE where}, then {@code having}. When a key reads a field
+     * some document gives several values ({@code multi}), the keys are read
+     * per value ({@link #valuesRelation}) and kept once per document, so a
+     * document counts once in each bucket one of its values falls in, and the
+     * metrics are read from the documents themselves, joined back to them by
+     * id, each once per bucket, as stock counts a multi-valued field.
+     */
+    static String groupStatement(List<String> keyCols, String metrics, String from, String where, List<Source> multi, String having) {
+        StringBuilder positions = new StringBuilder();
+        for (int j = 1; j <= keyCols.size(); j++) {
+            positions.append(j == 1 ? "" : ", ").append(j);
+        }
+        String tail = metrics.isEmpty() ? "" : ", " + metrics;
+        if (multi.isEmpty()) {
+            return "SELECT " + String.join(", ", keyCols) + ", COUNT(*) AS doc_count" + tail + " FROM " + from + " WHERE " + where + " GROUP BY " + positions + having;
+        }
+        List<String> keys = new ArrayList<>();
+        for (int j = 0; j < keyCols.size(); j++) {
+            keys.add(BUCKET_KEYS + ".k" + j + " AS k" + j);
+        }
+        String perDocument = "SELECT DISTINCT " + InfinoQueryTranslator.OSID + " AS " + BUCKET_DOC + ", " + String.join(", ", keyCols) + " FROM "
+            + valuesRelation(from, multi) + " " + VALUE_ROWS + " WHERE " + where;
+        String documents = metrics.isEmpty()
+            ? ""
+            : " JOIN " + from + " " + BUCKET_DOCS + " ON " + BUCKET_DOCS + "." + InfinoQueryTranslator.OSID + " = " + BUCKET_KEYS + "." + BUCKET_DOC;
+        return "SELECT " + String.join(", ", keys) + ", COUNT(*) AS doc_count" + tail + " FROM (" + perDocument + ") " + BUCKET_KEYS + documents + " GROUP BY "
+            + positions + having;
     }
 
     // ---- servability (shared with the hit path's plan) ----
@@ -291,14 +452,21 @@ public class InfinoAggregationProcessor {
                 if (!b.getSubAggregations().isEmpty()) {
                     throw new Unsupported("metric aggregation [" + b.getName() + "] cannot have sub-aggregations");
                 }
-                return Metric.of(b, cols, index);
+                return Metric.of(b, cols, table, index);
+            }
+            if (Metric.filterOfMetrics(b)) {
+                Metric folded = Metric.filter((FilterAggregationBuilder) b, cols, table, "m" + index, null);
+                if (folded.foldable()) {
+                    return folded;
+                }
+                // Otherwise the filter is a level of its own, its predicate a WHERE.
             }
             if (b instanceof TopHitsAggregationBuilder th) {
                 return TopHits.of(th, cols, access);
             }
             List<Metric> metrics = new ArrayList<>();
             List<TopHits> hits = new ArrayList<>();
-            BucketSpec child = null;
+            List<BucketSpec> children = new ArrayList<>();
             int i = 0;
             for (AggregationBuilder sub : b.getSubAggregations()) {
                 Spec s = of(sub, cols, table, access, i++);
@@ -306,36 +474,38 @@ public class InfinoAggregationProcessor {
                     metrics.add(m);
                 } else if (s instanceof TopHits t) {
                     hits.add(t);
-                } else if (child == null) {
-                    child = (BucketSpec) s;
                 } else {
-                    throw new Unsupported("aggregation [" + b.getName() + "] has more than one nested bucket aggregation");
+                    children.add((BucketSpec) s);
                 }
             }
+            BucketSpec child = children.isEmpty() ? null : children.size() == 1 ? children.get(0) : new Siblings(children);
             Leaves leaves = new Leaves(metrics, hits);
             if (b instanceof TermsAggregationBuilder t) {
-                return Grouped.terms(t, cols, leaves, child);
+                return Grouped.terms(t, cols, table, leaves, child);
             }
             if (b instanceof DateHistogramAggregationBuilder dh) {
-                return Grouped.dateHistogram(dh, cols, leaves, child);
+                return Grouped.dateHistogram(dh, cols, table, leaves, child);
             }
             if (b instanceof HistogramAggregationBuilder h) {
-                return Grouped.histogram(h, cols, leaves, child);
+                return Grouped.histogram(h, cols, table, leaves, child);
+            }
+            if (b instanceof FilterAggregationBuilder f) {
+                return Explicit.filter(f, cols, table, leaves, child);
             }
             if (b instanceof FiltersAggregationBuilder f) {
                 return Explicit.filters(f, cols, table, leaves, child);
             }
             if (b instanceof RangeAggregationBuilder r) {
-                return Explicit.range(r, cols, leaves, child);
+                return Explicit.range(r, cols, table, leaves, child);
             }
             if (b instanceof DateRangeAggregationBuilder dr) {
-                return Explicit.dateRange(dr, cols, leaves, child);
+                return Explicit.dateRange(dr, cols, table, leaves, child);
             }
             if (b instanceof SignificantTermsAggregationBuilder st) {
                 return Significant.of(st, cols, table, leaves, child);
             }
             if (b instanceof CompositeAggregationBuilder c) {
-                return Composite.of(c, cols, leaves, child);
+                return Composite.of(c, cols, table, leaves, child);
             }
             throw new Unsupported("aggregation [" + b.getName() + "] of type [" + b.getType() + "] is not served");
         }
@@ -343,13 +513,20 @@ public class InfinoAggregationProcessor {
         /**
          * What the aggregation reads: its field's column, or its script as a
          * column expression (a value script, one given beside a field, reads
-         * that field as {@code _value}).
+         * that field as {@code _value}). A field the index does not map is
+         * read as no value in every document, as OpenSearch reads an unmapped
+         * field, so a search over several indices answers from the ones that
+         * map it; a field the index maps and the table has no column for is
+         * refused, since its values exist and cannot be read.
          */
-        static Source sourceOf(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols) {
+        static Source sourceOf(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols, String table) {
             Column c = null;
             if (b.field() != null) {
                 c = InfinoSearch.columnFor(cols, b.field());
                 if (c == null) {
+                    if (!InfinoNative.maps(table, b.field())) {
+                        return Source.unmapped(b.field(), unmappedType(b));
+                    }
                     throw new Unsupported("aggregation [" + b.getName() + "] names field [" + b.field() + "], which the table has no column for");
                 }
             }
@@ -357,12 +534,23 @@ public class InfinoAggregationProcessor {
                 // A script reads values themselves, so it sees no masked column, the value script's included.
                 Column valueColumn = c != null && c.masked() ? null : c;
                 Sql sql = InfinoScriptTranslator.translate(b.script(), InfinoAccess.scriptColumns(cols), valueColumn, System.currentTimeMillis());
-                return new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]", null, null);
+                return new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]", null);
             }
             if (c == null) {
                 throw new Unsupported("aggregation [" + b.getName() + "] needs a field or a script");
             }
-            return Source.of(c);
+            return Source.of(c, cols, table);
+        }
+
+        /** The type an aggregation reads an unmapped field as: what its values would have been. */
+        static SqlType unmappedType(AggregationBuilder b) {
+            if (b instanceof DateHistogramAggregationBuilder || b instanceof DateRangeAggregationBuilder) {
+                return SqlType.DATE;
+            }
+            if (b instanceof TermsAggregationBuilder || b instanceof SignificantTermsAggregationBuilder) {
+                return SqlType.STRING;
+            }
+            return SqlType.FLOAT;
         }
     }
 
@@ -370,11 +558,89 @@ public class InfinoAggregationProcessor {
      * What an aggregation reads, as a column expression with its type;
      * {@code label} names it in a refusal, {@code mask} is how a key of it
      * leaves the node when the field is masked for the user (null when not),
-     * {@code column} the column it reads as is (null for a script).
+     * {@code column} the column it reads as is (null for a script, or for a
+     * field read under a filter), {@code dateFormat} is the format a date
+     * field's mapping declares (null for the default one, and for anything
+     * but a mapped field). {@code values} is where a field keeps its values
+     * for the documents that give it several (null when none does), and
+     * {@code onlyWhere} the predicate a metric under a filter reads such a
+     * field's values where.
      */
-    record Source(String expr, SqlType type, String label, UnaryOperator<String> mask, String column) {
-        static Source of(Column c) {
-            return new Source(quoteIdent(c.name()), InfinoScriptTranslator.typeOf(c), "[" + c.name() + "]", c.mask(), c.name());
+    record Source(
+        String expr,
+        SqlType type,
+        String label,
+        UnaryOperator<String> mask,
+        String column,
+        String dateFormat,
+        Values values,
+        String onlyWhere
+    ) {
+        Source(String expr, SqlType type, String label, UnaryOperator<String> mask) {
+            this(expr, type, label, mask, null, null, null, null);
+        }
+
+        /** A field's column, and the list column it keeps several values in when a document gives it some. */
+        static Source of(Column c, Map<String, Column> cols, String table) {
+            Column list = c.isList() ? c : InfinoQueryTranslator.listOf(cols, c);
+            Values values = list == null ? null : new Values(c.name(), quoteIdent(list.name()), c.isList(), table);
+            return new Source(
+                quoteIdent(c.name()),
+                InfinoScriptTranslator.typeOf(c.element()),
+                "[" + c.name() + "]",
+                c.mask(),
+                c.name(),
+                c.dateFormat(),
+                values,
+                null
+            );
+        }
+
+        /** Whether some document gives the field several values. */
+        boolean multi() {
+            return values != null;
+        }
+
+        /**
+         * Where any value of this source passes {@code test}, a predicate over
+         * an expression of its type: the column's own value, or, for a document
+         * that gives the field several, any of them.
+         */
+        String anyValue(Function<String, String> test) {
+            if (values == null) {
+                return test.apply(expr);
+            }
+            return InfinoQueryTranslator.anyValue(values.table(), values.listOnly() ? null : expr, values.list(), test);
+        }
+
+        /** The documents with no value of this source: neither the field's own column nor its list holds one. */
+        String noValue() {
+            if (values == null) {
+                return expr + " IS NULL";
+            }
+            return "(" + (values.listOnly() ? "" : expr + " IS NULL AND ") + values.list() + " IS NULL)";
+        }
+
+        /** A field the index does not map: no value in any document, of the type the aggregation reads. */
+        static Source unmapped(String field, SqlType type) {
+            String nothing = switch (type) {
+                case DATE -> "arrow_cast(NULL, '" + UNMAPPED_DATE_TYPE + "')";
+                case STRING -> "CAST(NULL AS VARCHAR)";
+                case BOOL -> "CAST(NULL AS BOOLEAN)";
+                case INT -> "CAST(NULL AS BIGINT)";
+                default -> "CAST(NULL AS DOUBLE)";
+            };
+            return new Source(nothing, type, "[" + field + "] (unmapped)", null);
+        }
+
+        /** This source where {@code predicate} holds and no value elsewhere: what a metric under a filter reads. */
+        Source where(String predicate) {
+            if (values != null) {
+                // Its values are read from each document's own figures ({@link Values}), under the predicate.
+                String both = onlyWhere == null ? predicate : "(" + onlyWhere + ") AND (" + predicate + ")";
+                return new Source(expr, type, label, mask, null, dateFormat, values, both);
+            }
+            return new Source("CASE WHEN " + predicate + " THEN (" + expr + ") END", type, label, mask, null, dateFormat, null, null);
         }
 
         boolean masked() {
@@ -408,6 +674,27 @@ public class InfinoAggregationProcessor {
         }
     }
 
+    /**
+     * Where a field keeps its values for the documents that give it several:
+     * {@code field} its name, {@code list} its list column (quoted),
+     * {@code listOnly} whether the field has no column of its own (one the
+     * mapping does not name, which the engine made a list), and the
+     * {@code table} a subquery over the list reads. A metric reads such a
+     * field from each document's own figures over its values, which
+     * {@link #perDocument} joins in under {@link #figure}.
+     */
+    record Values(String field, String list, boolean listOnly, String table) {
+        /** A document's figure over its values, as the column {@link #perDocument} names it. */
+        String figure(String what) {
+            return quoteIdent(field + PER_DOCUMENT + what);
+        }
+
+        /** Every value of a document, its own or its list's, as one list. */
+        String each(String own) {
+            return listOnly ? list : "CASE WHEN " + list + " IS NULL THEN make_array(" + own + ") ELSE " + list + " END";
+        }
+    }
+
     /** What a metric computes. */
     enum MetricKind {
         VALUE_COUNT,
@@ -417,10 +704,19 @@ public class InfinoAggregationProcessor {
         MAX,
         CARDINALITY,
         PERCENTILES,
-        PERCENTILE_RANKS
+        PERCENTILE_RANKS,
+        /** A filter whose sub-aggregations are all metrics: its count and theirs, where its predicate holds. */
+        FILTER
     }
 
-    /** A metric over one column: the SQL aggregate columns it needs and the result it builds. */
+    /**
+     * A metric over one column: the SQL aggregate columns it needs and the
+     * result it builds. A {@code filter} aggregation whose sub-aggregations
+     * are all metrics is one too: it needs no level of its own, since its
+     * count and its metrics are conditional aggregates in its parent's
+     * statement, so any number of them sit beside each other under one
+     * bucket (as TSVB's filter ratios do).
+     */
     static final class Metric extends Spec {
         final Source source;
         final String alias;
@@ -428,8 +724,25 @@ public class InfinoAggregationProcessor {
         final double[] percents;
         final boolean keyed;
         final double compression;
+        /** For a filter: where it holds, and the metrics under it. */
+        final String predicate;
+        final List<Metric> inner;
 
         private Metric(AggregationBuilder b, Source source, String alias, MetricKind kind, double[] percents, boolean keyed, double compression) {
+            this(b, source, alias, kind, percents, keyed, compression, null, List.of());
+        }
+
+        private Metric(
+            AggregationBuilder b,
+            Source source,
+            String alias,
+            MetricKind kind,
+            double[] percents,
+            boolean keyed,
+            double compression,
+            String predicate,
+            List<Metric> inner
+        ) {
             super(b);
             this.source = source;
             this.alias = alias;
@@ -437,6 +750,55 @@ public class InfinoAggregationProcessor {
             this.percents = percents;
             this.keyed = keyed;
             this.compression = compression;
+            this.predicate = predicate;
+            this.inner = inner;
+        }
+
+        /** Whether {@code b} is a filter served as a metric: every aggregation under it a metric, or such a filter. */
+        static boolean filterOfMetrics(AggregationBuilder b) {
+            if (!(b instanceof FilterAggregationBuilder)) {
+                return false;
+            }
+            for (AggregationBuilder sub : b.getSubAggregations()) {
+                if (!(handles(sub) && sub.getSubAggregations().isEmpty()) && !filterOfMetrics(sub)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /**
+         * A filter of metrics ({@link #filterOfMetrics}) under {@code where}
+         * (null at the top): its predicate joins {@code where}, and each
+         * metric under it reads its value only where both hold.
+         */
+        static Metric filter(FilterAggregationBuilder f, Map<String, Column> cols, String table, String alias, String where) {
+            String p = filterPredicate(f, cols, table);
+            String holds = where == null ? "(" + p + ")" : "(" + where + " AND (" + p + "))";
+            List<Metric> inner = new ArrayList<>();
+            int i = 0;
+            for (AggregationBuilder sub : f.getSubAggregations()) {
+                String subAlias = alias + "_" + i++;
+                inner.add(sub instanceof FilterAggregationBuilder g ? filter(g, cols, table, subAlias, holds) : of(sub, cols, table, subAlias, holds));
+            }
+            return new Metric(f, null, alias, MetricKind.FILTER, null, false, 0, holds, inner);
+        }
+
+        /**
+         * Whether this filter's predicates can sit inside its parent's
+         * aggregate expressions: none reads the token index, whose subquery
+         * the engine plans only in a WHERE clause.
+         */
+        boolean foldable() {
+            if (predicate != null && InfinoQueryTranslator.readsTextIndex(predicate)) {
+                return false;
+            }
+            for (Metric m : inner) {
+                if (!m.foldable()) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         static boolean handles(AggregationBuilder b) {
@@ -450,12 +812,27 @@ public class InfinoAggregationProcessor {
                 || b instanceof PercentileRanksAggregationBuilder;
         }
 
-        static Metric of(AggregationBuilder b, Map<String, Column> cols, int index) {
-            Source c = sourceOf((ValuesSourceAggregationBuilder<?>) b, cols);
-            if (c.masked()) {
-                throw masked(b, c); // a count, sum or bound would read the values themselves
+        static Metric of(AggregationBuilder b, Map<String, Column> cols, String table, int index) {
+            return of(b, cols, table, "m" + index, null);
+        }
+
+        /** The metric {@code b}, its columns named after {@code alias}, reading its value only where {@code where} holds (null: everywhere). */
+        static Metric of(AggregationBuilder b, Map<String, Column> cols, String table, String alias, String where) {
+            Source source = sourceOf((ValuesSourceAggregationBuilder<?>) b, cols, table);
+            if (source.masked()) {
+                throw masked(b, source); // a count, sum or bound would read the values themselves
             }
-            String alias = "m" + index;
+            Source c = where == null ? source : source.where(where);
+            // Over a field some document gives several values, a metric reads each document's
+            // figures over them (its sum, count, least, greatest), which serve these kinds alone.
+            boolean figured = b instanceof ValueCountAggregationBuilder
+                || b instanceof SumAggregationBuilder
+                || b instanceof AvgAggregationBuilder
+                || b instanceof MinAggregationBuilder
+                || b instanceof MaxAggregationBuilder;
+            if (c.multi() && !figured) {
+                throw new Unsupported("aggregation [" + b.getName() + "] of type [" + b.getType() + "] over " + c.label() + ", which documents give several values, is not served");
+            }
             boolean numeric = c.isNumeric() || c.isTimestamp();
             if (b instanceof ValueCountAggregationBuilder) {
                 return new Metric(b, c, alias, MetricKind.VALUE_COUNT, null, false, 0);
@@ -505,8 +882,27 @@ public class InfinoAggregationProcessor {
 
         /** The SELECT list entries for this metric. */
         String columns() {
+            if (kind == MetricKind.FILTER) {
+                List<String> cols = new ArrayList<>();
+                cols.add("SUM(CASE WHEN " + predicate + " THEN 1 ELSE 0 END) AS " + alias + "_fc");
+                for (Metric m : inner) {
+                    cols.add(m.columns());
+                }
+                return String.join(", ", cols);
+            }
+            if (source.multi()) {
+                return switch (kind) {
+                    case VALUE_COUNT -> "SUM(" + figure(FIGURE_COUNT) + ") AS " + alias + "_c";
+                    case SUM -> "SUM(" + figure(FIGURE_SUM) + ") AS " + alias + "_s";
+                    case AVG -> "SUM(" + figure(FIGURE_SUM) + ") AS " + alias + "_s, SUM(" + figure(FIGURE_COUNT) + ") AS " + alias + "_c";
+                    case MIN -> "MIN(" + figure(FIGURE_MIN) + ") AS " + alias + "_v";
+                    case MAX -> "MAX(" + figure(FIGURE_MAX) + ") AS " + alias + "_v";
+                    default -> throw new IllegalStateException("a " + kind + " metric is not read from figures");
+                };
+            }
             String f = "(" + source.expr() + ")";
             return switch (kind) {
+                case FILTER -> throw new IllegalStateException("a filter's columns are its count's and its metrics'");
                 case VALUE_COUNT -> "COUNT(" + f + ") AS " + alias + "_c";
                 case SUM -> "SUM(" + f + ") AS " + alias + "_s";
                 case AVG -> "SUM(" + f + ") AS " + alias + "_s, COUNT(" + f + ") AS " + alias + "_c";
@@ -540,6 +936,23 @@ public class InfinoAggregationProcessor {
             };
         }
 
+        /** A document's figure {@code what} over this metric's values, where its filter holds when it is under one. */
+        private String figure(String what) {
+            String figure = source.values().figure(what);
+            return source.onlyWhere() == null ? figure : "CASE WHEN " + source.onlyWhere() + " THEN " + figure + " END";
+        }
+
+        /** The sources this metric (or any under it) reads that some document gives several values, onto {@code out}. */
+        void multiSources(List<Source> out) {
+            if (kind == MetricKind.FILTER) {
+                for (Metric m : inner) {
+                    m.multiSources(out);
+                }
+            } else if (source != null && source.multi()) {
+                out.add(source);
+            }
+        }
+
         /** The alias a terms order by this metric sorts on, or null when it has no single column. */
         String orderAlias() {
             return switch (kind) {
@@ -547,13 +960,13 @@ public class InfinoAggregationProcessor {
                 case SUM -> alias + "_s";
                 case MIN, MAX -> alias + "_v";
                 case CARDINALITY -> alias + "_d";
-                case AVG, PERCENTILES, PERCENTILE_RANKS -> null;
+                case AVG, PERCENTILES, PERCENTILE_RANKS, FILTER -> null;
             };
         }
 
         InternalAggregation build(Map<String, Object> row) {
             String name = builder.getName();
-            Map<String, Object> meta = builder.getMetadata();
+            Map<String, Object> meta = metadataOf(builder);
             return switch (kind) {
                 case VALUE_COUNT -> new InternalValueCount(name, asLong(row.get(alias + "_c")), meta);
                 case SUM -> new InternalSum(name, asDouble(row.get(alias + "_s"), 0.0), DocValueFormat.RAW, meta);
@@ -563,6 +976,13 @@ public class InfinoAggregationProcessor {
                 case CARDINALITY -> InfinoAggregationWire.cardinality(name, meta, asLong(row.get(alias + "_d")));
                 case PERCENTILES -> percentiles(row);
                 case PERCENTILE_RANKS -> percentileRanks(row);
+                case FILTER -> {
+                    List<InternalAggregation> subs = new ArrayList<>();
+                    for (Metric m : inner) {
+                        subs.add(m.build(row));
+                    }
+                    yield InfinoAggregationWire.filter(name, meta, asLong(row.get(alias + "_fc")), InternalAggregations.from(subs));
+                }
             };
         }
 
@@ -581,7 +1001,7 @@ public class InfinoAggregationProcessor {
                 values[i] = asDouble(row.get(alias + "_p" + i), Double.NaN);
             }
             TDigestState state = digest(row, percents, values);
-            return new InternalTDigestPercentiles(builder.getName(), percents, state, keyed, DocValueFormat.RAW, builder.getMetadata());
+            return new InternalTDigestPercentiles(builder.getName(), percents, state, keyed, DocValueFormat.RAW, metadataOf(builder));
         }
 
         /**
@@ -598,7 +1018,7 @@ public class InfinoAggregationProcessor {
                 ranks[i] = count == 0 ? 0.0 : 100.0 * asLong(row.get(alias + "_r" + i)) / count;
             }
             TDigestState state = digest(row, ranks, values);
-            return new InternalTDigestPercentileRanks(builder.getName(), values, state, keyed, DocValueFormat.RAW, builder.getMetadata());
+            return new InternalTDigestPercentileRanks(builder.getName(), values, state, keyed, DocValueFormat.RAW, metadataOf(builder));
         }
 
         /**
@@ -753,7 +1173,10 @@ public class InfinoAggregationProcessor {
         static final Leaves NONE = new Leaves(List.of(), List.of());
     }
 
-    /** A bucket aggregation: the metrics and top hits under it and at most one nested bucket aggregation. */
+    /**
+     * A bucket aggregation: the metrics and top hits under it and its nested
+     * bucket aggregation, if any; several nested ones are one {@link Siblings}.
+     */
     abstract static class BucketSpec extends Spec {
         final List<Metric> metrics;
         final List<TopHits> hits;
@@ -768,23 +1191,36 @@ public class InfinoAggregationProcessor {
 
         /**
          * The sub-aggregations of a bucket: its metrics from the row, its top
-         * hits (one per top_hits spec, in order) and the nested aggregation given.
+         * hits (one per top_hits spec, in order) and the nested aggregations given.
          */
-        InternalAggregations subs(Map<String, Object> row, List<InternalAggregation> topHits, InternalAggregation nested) {
+        InternalAggregations subs(Map<String, Object> row, List<InternalAggregation> topHits, List<InternalAggregation> nested) {
             List<InternalAggregation> out = new ArrayList<>();
             for (Metric m : metrics) {
                 out.add(m.build(row));
             }
             out.addAll(topHits);
-            if (nested != null) {
-                out.add(nested);
-            }
+            out.addAll(nested);
             return out.isEmpty() ? InternalAggregations.EMPTY : InternalAggregations.from(out);
         }
 
         /** The sub-aggregations of an empty bucket. */
         InternalAggregations emptySubs() {
-            return subs(Map.of(), emptyHits(), child == null ? null : child.empty());
+            return subs(Map.of(), emptyHits(), emptyChildren(child));
+        }
+
+        /** The nested aggregations of an empty bucket under {@code child}. */
+        static List<InternalAggregation> emptyChildren(BucketSpec child) {
+            if (child == null) {
+                return List.of();
+            }
+            if (child instanceof Siblings s) {
+                List<InternalAggregation> out = new ArrayList<>();
+                for (BucketSpec c : s.children) {
+                    out.add(c.empty());
+                }
+                return out;
+            }
+            return List.of(child.empty());
         }
 
         /** One empty top_hits per spec. */
@@ -798,6 +1234,26 @@ public class InfinoAggregationProcessor {
 
         /** This aggregation with no buckets. */
         abstract InternalAggregation empty();
+    }
+
+    /**
+     * Several bucket aggregations under one bucket (TSVB's table puts one
+     * filter per series under its pivot): no aggregation of its own, but
+     * where a bucket's nested aggregation goes, each of them evaluated over
+     * that bucket's rows ({@link #evalChildren}) and placed beside the others.
+     */
+    static final class Siblings extends BucketSpec {
+        final List<BucketSpec> children;
+
+        Siblings(List<BucketSpec> children) {
+            super(children.get(0).builder, Leaves.NONE, null);
+            this.children = List.copyOf(children);
+        }
+
+        @Override
+        InternalAggregation empty() {
+            throw new IllegalStateException("siblings have no aggregation of their own; see emptyChildren");
+        }
     }
 
     /** The type of a grouped level's key. */
@@ -851,10 +1307,15 @@ public class InfinoAggregationProcessor {
             this.orderTemplate = orderTemplate;
             this.date = date;
             this.hist = hist;
+            // A level's top hits are a window over the documents partitioned by its key,
+            // which a document with several values would stand in once per value.
+            if (source.multi() && !leaves.hits().isEmpty()) {
+                throw new Unsupported("top hits under aggregation [" + b.getName() + "], which buckets " + source.label() + ", a field documents give several values, are not served");
+            }
         }
 
-        static Grouped terms(TermsAggregationBuilder t, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Source c = sourceOf(t, cols);
+        static Grouped terms(TermsAggregationBuilder t, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
+            Source c = sourceOf(t, cols, table);
             if (t.size() > MAX_TERMS_SIZE) {
                 throw new Unsupported("aggregation [" + t.getName() + "] asks for " + t.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
             }
@@ -866,17 +1327,30 @@ public class InfinoAggregationProcessor {
             if (order == null) {
                 throw new Unsupported("aggregation [" + t.getName() + "] has an order the table cannot sort by: " + t.order());
             }
-            return new Grouped(t, leaves, child, c, c.expr(), kind, true, t.size(), t.minDocCount(), order, null, null);
+            return new Grouped(t, leaves, child, c, c.expr(), kind, true, shardSize(t), t.minDocCount(), order, null, null);
         }
 
-        static Grouped dateHistogram(DateHistogramAggregationBuilder dh, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Source c = sourceOf(dh, cols);
+        /**
+         * The buckets a terms level takes from each index, as a stock shard
+         * does: the request's shard size, else past the requested size by
+         * stock's heuristic, never fewer than the requested size. The reduce
+         * keeps the requested size, and the buckets it drops are what
+         * {@code sum_other_doc_count} and {@code doc_count_error_upper_bound}
+         * are counted from, as they are over stock's shards.
+         */
+        static int shardSize(TermsAggregationBuilder t) {
+            int shardSize = t.shardSize() < 0 ? BucketUtils.suggestShardSideQueueSize(t.size()) : t.shardSize();
+            return Math.min(MAX_TERMS_SIZE, Math.max(shardSize, t.size()));
+        }
+
+        static Grouped dateHistogram(DateHistogramAggregationBuilder dh, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
+            Source c = sourceOf(dh, cols, table);
             if (c.masked()) {
                 throw masked(dh, c);
             }
             ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
             DateExpr expr = dateExpr(dh.getName(), c, tz, dh.getFixedInterval(), dh.getCalendarInterval(), dh.offset());
-            DocValueFormat format = dateFormat(dh.format(), tz);
+            DocValueFormat format = dateFormat(dh.format(), c, tz);
             LongBounds bounds = null;
             if (dh.extendedBounds() != null) {
                 // Bounds given as epoch milliseconds (what dashboards send) are rounded to the
@@ -893,8 +1367,8 @@ public class InfinoAggregationProcessor {
             return new Grouped(dh, leaves, child, c, expr.keyExpr(), KeyKind.DATE, false, Integer.MAX_VALUE, dh.minDocCount(), "{key} ASC", date, null);
         }
 
-        static Grouped histogram(HistogramAggregationBuilder h, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Source c = sourceOf(h, cols);
+        static Grouped histogram(HistogramAggregationBuilder h, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
+            Source c = sourceOf(h, cols, table);
             if (c.masked()) {
                 throw masked(h, c);
             }
@@ -957,10 +1431,14 @@ public class InfinoAggregationProcessor {
             return new DateExpr(keyExpr, wrapper.createRounding(tz, offset));
         }
 
-        /** How a date key prints: the request's format, else the default. */
-        static DocValueFormat dateFormat(String format, ZoneId tz) {
-            String fmt = format == null ? DEFAULT_DATE_FORMAT : format;
-            return new DocValueFormat.DateTime(DateFormatter.forPattern(fmt), tz, DateFieldMapper.Resolution.MILLISECONDS);
+        /** How a date of {@code c} reads and prints: the request's format, else the one its field's mapping declares, else the default. */
+        static String dateFormatName(String format, Source c) {
+            return format != null ? format : c.dateFormat() != null ? c.dateFormat() : DEFAULT_DATE_FORMAT;
+        }
+
+        /** How a date key of {@code c} prints ({@link #dateFormatName}). */
+        static DocValueFormat dateFormat(String format, Source c, ZoneId tz) {
+            return new DocValueFormat.DateTime(DateFormatter.forPattern(dateFormatName(format, c)), tz, DateFieldMapper.Resolution.MILLISECONDS);
         }
 
         /** The numeric bucket of {@code c} at the interval and offset given. */
@@ -1005,9 +1483,54 @@ public class InfinoAggregationProcessor {
             return orderTemplate.replace("{key}", keyAlias);
         }
 
-        /** The key as an SQL literal, for restricting a nested level to a parent's bucket. */
-        String keyLiteral(Object key) {
-            return keyLiteral(keyKind, key);
+        /**
+         * The rows of this level's bucket keyed {@code key}, as a row returned
+         * it, for restricting a nested level to a parent's bucket. A date
+         * bucket is its rounding's range over the date itself, from its key
+         * to the next: a zoned histogram's key ends in a cast from wall-clock
+         * time that the engine's planner rewrites wrongly inside a
+         * comparison, and a range on the column is one it prunes files by.
+         */
+        String rowPredicate(Object key) {
+            if (key == null) {
+                return keyExpr + " IS NULL";
+            }
+            if (date != null) {
+                return dateBucket(asLong(key), "(" + source.expr() + ")");
+            }
+            return keyExpr + " = " + keyLiteral(keyKind, key);
+        }
+
+        /**
+         * The documents in this level's bucket keyed {@code key}: as
+         * {@link #rowPredicate} for a field each document gives one value,
+         * and a document any of whose values falls in the bucket for a field
+         * some give several; for the aggregations nested under the bucket,
+         * which read the documents themselves.
+         */
+        String docPredicate(Object key) {
+            if (!source.multi()) {
+                return rowPredicate(key);
+            }
+            if (key == null) {
+                return source.noValue();
+            }
+            if (date != null) {
+                long start = asLong(key);
+                return source.anyValue(value -> dateBucket(start, value));
+            }
+            if (hist != null) {
+                double low = asDouble(key, 0.0);
+                return source.anyValue(value -> "(" + value + " >= " + low + " AND " + value + " < " + (low + hist.interval()) + ")");
+            }
+            String literal = keyLiteral(keyKind, key);
+            return source.anyValue(value -> value + " = " + literal);
+        }
+
+        /** A date bucket from {@code start} to the rounding's next value, over the date {@code at}. */
+        private String dateBucket(long start, String at) {
+            long end = date.rounding().prepareForUnknown().nextRoundingValue(start);
+            return "(" + at + " >= " + keyLiteral(KeyKind.DATE, start) + " AND " + at + " < " + keyLiteral(KeyKind.DATE, end) + ")";
         }
 
         /** A key of {@code kind}, as a row returned it, as an SQL literal. */
@@ -1043,6 +1566,9 @@ public class InfinoAggregationProcessor {
             List<StringTerms.Bucket> sBuckets = new ArrayList<>();
             List<LongTerms.Bucket> lBuckets = new ArrayList<>();
             List<InfinoAggregationWire.DoubleBucket> dBuckets = new ArrayList<>();
+            // As stock keys a boolean field: 1 and 0, printed true and false. A
+            // masked one is keyed by its hash, as any masked field.
+            boolean booleanKeys = keyKind == KeyKind.BOOL && !source.masked();
             for (Map<String, Object> row : rows) {
                 Object key = row.get(keyAlias);
                 if (key == null) {
@@ -1051,6 +1577,10 @@ public class InfinoAggregationProcessor {
                 long docCount = asLong(row.get("doc_count"));
                 sumTop += docCount;
                 InternalAggregations subs = subsOf.apply(row);
+                if (booleanKeys) {
+                    lBuckets.add(new LongTerms.Bucket(asBoolean(key) ? 1 : 0, docCount, subs, false, 0L, DocValueFormat.BOOLEAN));
+                    continue;
+                }
                 switch (keyKind) {
                     case STR, BOOL -> sBuckets.add(new StringTerms.Bucket(new BytesRef(source.shown(key)), docCount, subs, false, 0L, DocValueFormat.RAW));
                     case LONG, DATE -> lBuckets.add(new LongTerms.Bucket(asLong(key), docCount, subs, false, 0L, DocValueFormat.RAW));
@@ -1059,15 +1589,21 @@ public class InfinoAggregationProcessor {
             }
             // The rows with a value under this parent (the window statement counts
             // them as keyed_total), less those in the buckets returned; the rows
-            // without the field are in no bucket, as stock counts it.
-            long keyed = rows.isEmpty() || rows.get(0).get("keyed_total") == null ? parentTotal : asLong(rows.get(0).get("keyed_total"));
+            // without the field are in no bucket, as stock counts it. The rows
+            // without one never reach this level, so none here means no row has
+            // a value (a field no document holds, or one the index does not map).
+            long keyed = rows.isEmpty() ? 0 : rows.get(0).get("keyed_total") == null ? parentTotal : asLong(rows.get(0).get("keyed_total"));
             long otherDocCount = Math.max(0, keyed - sumTop);
-            TermsAggregator.BucketCountThresholds thresholds = new TermsAggregator.BucketCountThresholds(t.minDocCount(), t.shardMinDocCount(), t.size(), t.shardSize());
+            // This level took `size` buckets from the index, its shard size (see shardSize).
+            TermsAggregator.BucketCountThresholds thresholds = new TermsAggregator.BucketCountThresholds(t.minDocCount(), t.shardMinDocCount(), t.size(), size);
+            if (booleanKeys) {
+                return new LongTerms(t.getName(), t.order(), t.order(), metadataOf(t), DocValueFormat.BOOLEAN, size, false, otherDocCount, lBuckets, 0L, thresholds);
+            }
             return switch (keyKind) {
-                case STR, BOOL -> new StringTerms(t.getName(), t.order(), t.order(), t.getMetadata(), DocValueFormat.RAW, t.shardSize(), false, otherDocCount, sBuckets, 0L, thresholds);
-                case LONG, DATE -> new LongTerms(t.getName(), t.order(), t.order(), t.getMetadata(), DocValueFormat.RAW, t.shardSize(), false, otherDocCount, lBuckets, 0L, thresholds);
+                case STR, BOOL -> new StringTerms(t.getName(), t.order(), t.order(), metadataOf(t), DocValueFormat.RAW, size, false, otherDocCount, sBuckets, 0L, thresholds);
+                case LONG, DATE -> new LongTerms(t.getName(), t.order(), t.order(), metadataOf(t), DocValueFormat.RAW, size, false, otherDocCount, lBuckets, 0L, thresholds);
                 // The double bucket class is not public in every release built against; the object comes through its stream form.
-                case DOUBLE -> InfinoAggregationWire.doubleTerms(t.getName(), t.getMetadata(), t.order(), t.size(), t.minDocCount(), otherDocCount, dBuckets);
+                case DOUBLE -> InfinoAggregationWire.doubleTerms(t.getName(), metadataOf(t), t.order(), t.size(), size, t.minDocCount(), otherDocCount, dBuckets);
             };
         }
 
@@ -1083,7 +1619,7 @@ public class InfinoAggregationProcessor {
             InternalAggregations empty = minDocCount == 0 ? emptySubs() : null;
             return InfinoAggregationWire.dateHistogram(
                 builder.getName(),
-                builder.getMetadata(),
+                metadataOf(builder),
                 buckets,
                 minDocCount,
                 date.offset(),
@@ -1108,7 +1644,7 @@ public class InfinoAggregationProcessor {
                 ? new InternalHistogram.EmptyBucketInfo(hist.interval(), hist.offset(), Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, emptySubs())
                 : null;
             HistogramAggregationBuilder h = (HistogramAggregationBuilder) builder;
-            return new InternalHistogram(h.getName(), buckets, h.order(), minDocCount, empty, DocValueFormat.RAW, hist.keyed(), h.getMetadata());
+            return new InternalHistogram(h.getName(), buckets, h.order(), minDocCount, empty, DocValueFormat.RAW, hist.keyed(), metadataOf(h));
         }
     }
 
@@ -1117,12 +1653,14 @@ public class InfinoAggregationProcessor {
 
     /** What an explicit level is. */
     enum ExplicitKind {
+        /** One bucket, the documents a filter matches, answered as a single-bucket aggregation. */
+        FILTER,
         FILTERS,
         RANGE,
         DATE_RANGE
     }
 
-    /** An explicit bucket level: filters, range or date_range, each bucket its own predicate. */
+    /** An explicit bucket level: filter, filters, range or date_range, each bucket its own predicate. */
     static final class Explicit extends BucketSpec {
         final ExplicitKind kind;
         final List<ExplicitBucket> buckets;
@@ -1135,6 +1673,13 @@ public class InfinoAggregationProcessor {
             this.buckets = buckets;
             this.keyed = keyed;
             this.format = format;
+        }
+
+        /** A {@code filter} aggregation: the one bucket of the documents its query matches. */
+        static Explicit filter(FilterAggregationBuilder f, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
+            String p = filterPredicate(f, cols, table);
+            List<ExplicitBucket> buckets = List.of(new ExplicitBucket(f.getName(), p, Double.NaN, Double.NaN));
+            return new Explicit(f, leaves, child, ExplicitKind.FILTER, buckets, false, DocValueFormat.RAW);
         }
 
         static Explicit filters(FiltersAggregationBuilder f, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
@@ -1155,8 +1700,8 @@ public class InfinoAggregationProcessor {
             return new Explicit(f, leaves, child, ExplicitKind.FILTERS, buckets, f.isKeyed(), DocValueFormat.RAW);
         }
 
-        static Explicit range(RangeAggregationBuilder r, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Source c = sourceOf(r, cols);
+        static Explicit range(RangeAggregationBuilder r, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
+            Source c = sourceOf(r, cols, table);
             if (!c.isNumeric()) {
                 throw new Unsupported("aggregation [" + r.getName() + "] needs a numeric value, " + c.label() + " is " + c.typeName());
             }
@@ -1169,14 +1714,14 @@ public class InfinoAggregationProcessor {
             return new Explicit(r, leaves, child, ExplicitKind.RANGE, buckets, r.keyed(), DocValueFormat.RAW);
         }
 
-        static Explicit dateRange(DateRangeAggregationBuilder r, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
-            Source c = sourceOf(r, cols);
+        static Explicit dateRange(DateRangeAggregationBuilder r, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
+            Source c = sourceOf(r, cols, table);
             if (!c.isTimestamp()) {
                 throw new Unsupported("aggregation [" + r.getName() + "] needs a date value, " + c.label() + " is " + c.typeName());
             }
             ZoneId tz = r.timeZone() == null ? ZoneOffset.UTC : r.timeZone();
-            String fmt = r.format() == null ? DEFAULT_DATE_FORMAT : r.format();
-            DocValueFormat format = new DocValueFormat.DateTime(DateFormatter.forPattern(fmt), tz, DateFieldMapper.Resolution.MILLISECONDS);
+            String fmt = Grouped.dateFormatName(r.format(), c);
+            DocValueFormat format = Grouped.dateFormat(r.format(), c, tz);
             long now = System.currentTimeMillis();
             List<ExplicitBucket> buckets = new ArrayList<>();
             for (RangeAggregator.Range range : r.ranges()) {
@@ -1200,17 +1745,25 @@ public class InfinoAggregationProcessor {
             return asNumber;
         }
 
-        /** {@code from <= f < to}, each side only when bounded. */
+        /** {@code from <= f < to}, each side only when bounded; a document any of whose values is in range, for a field some give several. */
         private static String between(Source c, double from, double to) {
-            String f = "(" + c.expr() + ")";
-            List<String> parts = new ArrayList<>();
+            List<String> bounds = new ArrayList<>();
             if (!Double.isInfinite(from) && !Double.isNaN(from)) {
-                parts.add(f + " >= " + bound(c, from));
+                bounds.add(" >= " + bound(c, from));
             }
             if (!Double.isInfinite(to) && !Double.isNaN(to)) {
-                parts.add(f + " < " + bound(c, to));
+                bounds.add(" < " + bound(c, to));
             }
-            return parts.isEmpty() ? InfinoQueryTranslator.ALL : "(" + String.join(" AND ", parts) + ")";
+            if (bounds.isEmpty()) {
+                return InfinoQueryTranslator.ALL;
+            }
+            return c.anyValue(value -> {
+                List<String> parts = new ArrayList<>(bounds.size());
+                for (String b : bounds) {
+                    parts.add("(" + value + ")" + b);
+                }
+                return "(" + String.join(" AND ", parts) + ")";
+            });
         }
 
         private static String bound(Source c, double v) {
@@ -1220,11 +1773,14 @@ public class InfinoAggregationProcessor {
             return v == Math.rint(v) && Math.abs(v) < 9.0e15 ? Long.toString((long) v) : Double.toString(v);
         }
 
-        /** Build from one row per bucket (doc_count and metrics), each bucket's top hits and its nested aggregation. */
-        InternalAggregation build(List<Map<String, Object>> rows, List<List<InternalAggregation>> topHits, List<InternalAggregation> nested) {
+        /** Build from one row per bucket (doc_count and metrics), each bucket's top hits and its nested aggregations. */
+        InternalAggregation build(List<Map<String, Object>> rows, List<List<InternalAggregation>> topHits, List<List<InternalAggregation>> nested) {
             String name = builder.getName();
-            Map<String, Object> meta = builder.getMetadata();
+            Map<String, Object> meta = metadataOf(builder);
             switch (kind) {
+                case FILTER -> {
+                    return InfinoAggregationWire.filter(name, meta, asLong(rows.get(0).get("doc_count")), subs(rows.get(0), topHits.get(0), nested.get(0)));
+                }
                 case FILTERS -> {
                     List<InternalFilters.InternalBucket> out = new ArrayList<>();
                     for (int i = 0; i < buckets.size(); i++) {
@@ -1256,11 +1812,11 @@ public class InfinoAggregationProcessor {
         InternalAggregation empty() {
             List<Map<String, Object>> rows = new ArrayList<>();
             List<List<InternalAggregation>> topHits = new ArrayList<>();
-            List<InternalAggregation> nested = new ArrayList<>();
+            List<List<InternalAggregation>> nested = new ArrayList<>();
             for (int i = 0; i < buckets.size(); i++) {
                 rows.add(Map.of());
                 topHits.add(emptyHits());
-                nested.add(child == null ? null : child.empty());
+                nested.add(emptyChildren(child));
             }
             return build(rows, topHits, nested);
         }
@@ -1309,7 +1865,10 @@ public class InfinoAggregationProcessor {
         }
 
         static Significant of(SignificantTermsAggregationBuilder st, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
-            Source c = sourceOf(st, cols);
+            Source c = sourceOf(st, cols, table);
+            if (c.multi()) {
+                throw new Unsupported("aggregation [" + st.getName() + "] over " + c.label() + ", which documents give several values, is not served");
+            }
             KeyKind kind = Grouped.kindOf(c);
             if (kind == KeyKind.DOUBLE) {
                 throw new Unsupported("aggregation [" + st.getName() + "] needs a keyword, boolean, integer or date value, " + c.label() + " is " + c.typeName());
@@ -1347,10 +1906,16 @@ public class InfinoAggregationProcessor {
         /** One candidate term with both of its counts. */
         record Candidate(Object key, long subsetDf, long supersetDf, Map<String, Object> row) {}
 
-        /** Build from the candidates, each with its top hits and nested aggregation, and the two population sizes. */
-        InternalAggregation build(List<Candidate> candidates, List<List<InternalAggregation>> topHits, List<InternalAggregation> nested, long subsetSize, long supersetSize) {
+        /** Build from the candidates, each with its top hits and nested aggregations, and the two population sizes. */
+        InternalAggregation build(
+            List<Candidate> candidates,
+            List<List<InternalAggregation>> topHits,
+            List<List<InternalAggregation>> nested,
+            long subsetSize,
+            long supersetSize
+        ) {
             String name = builder.getName();
-            Map<String, Object> meta = builder.getMetadata();
+            Map<String, Object> meta = metadataOf(builder);
             // The score is left for the reduction, which computes it from the four counts.
             if (keyKind == KeyKind.STR || keyKind == KeyKind.BOOL) {
                 List<SignificantStringTerms.Bucket> out = new ArrayList<>();
@@ -1402,13 +1967,13 @@ public class InfinoAggregationProcessor {
             this.after = after;
         }
 
-        static Composite of(CompositeAggregationBuilder c, Map<String, Column> cols, Leaves leaves, BucketSpec child) {
+        static Composite of(CompositeAggregationBuilder c, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child) {
             if (c.size() > MAX_TERMS_SIZE) {
                 throw new Unsupported("aggregation [" + c.getName() + "] asks for " + c.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
             }
             List<CompositeSource> sources = new ArrayList<>();
             for (CompositeValuesSourceBuilder<?> s : c.sources()) {
-                sources.add(source(c.getName(), s, cols));
+                sources.add(source(c.getName(), s, cols, table));
             }
             Object[] after = null;
             Map<String, Object> afterKey = afterOf(c);
@@ -1449,22 +2014,30 @@ public class InfinoAggregationProcessor {
             }
         }
 
-        private static CompositeSource source(String agg, CompositeValuesSourceBuilder<?> s, Map<String, Column> cols) {
+        private static CompositeSource source(String agg, CompositeValuesSourceBuilder<?> s, Map<String, Column> cols, String table) {
             Column column = null;
+            Source unmapped = null;
             if (s.field() != null) {
                 column = InfinoSearch.columnFor(cols, s.field());
-                if (column == null) {
+                if (column == null && !InfinoNative.maps(table, s.field())) {
+                    // As for any aggregation: a field the index does not map has no value here.
+                    SqlType type = s instanceof DateHistogramValuesSourceBuilder ? SqlType.DATE
+                        : s instanceof HistogramValuesSourceBuilder ? SqlType.FLOAT : SqlType.STRING;
+                    unmapped = Source.unmapped(s.field(), type);
+                } else if (column == null) {
                     throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] names field [" + s.field() + "], which the table has no column for");
                 }
             }
             Source c;
-            if (s.script() != null) {
+            if (unmapped != null) {
+                c = unmapped;
+            } else if (s.script() != null) {
                 // A script reads values themselves, so it sees no masked column, the value script's included.
                 Column valueColumn = column != null && column.masked() ? null : column;
                 Sql sql = InfinoScriptTranslator.translate(s.script(), InfinoAccess.scriptColumns(cols), valueColumn, System.currentTimeMillis());
-                c = new Source(sql.expr(), sql.type(), "script [" + s.script().getIdOrCode() + "]", null, null);
+                c = new Source(sql.expr(), sql.type(), "script [" + s.script().getIdOrCode() + "]", null);
             } else if (column != null) {
-                c = Source.of(column);
+                c = Source.of(column, cols, table);
             } else {
                 throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] names no field or script");
             }
@@ -1474,10 +2047,15 @@ public class InfinoAggregationProcessor {
             }
             boolean desc = s.order() == SortOrder.DESC;
             MissingOrder missing = s.missingOrder() == null ? MissingOrder.DEFAULT : s.missingOrder();
+            if (c.multi() && !(s instanceof TermsValuesSourceBuilder)) {
+                throw new Unsupported(
+                    "aggregation [" + agg + "] source [" + s.name() + "] buckets " + c.label() + ", which documents give several values, by interval; only terms over it are served"
+                );
+            }
             if (s instanceof TermsValuesSourceBuilder) {
                 KeyKind kind = Grouped.kindOf(c);
                 DocValueFormat format = kind == KeyKind.DATE
-                    ? Grouped.dateFormat(s.format(), ZoneOffset.UTC)
+                    ? Grouped.dateFormat(s.format(), c, ZoneOffset.UTC)
                     : kind == KeyKind.BOOL ? DocValueFormat.BOOLEAN : DocValueFormat.RAW;
                 return new CompositeSource(s.name(), c, "(" + c.expr() + ")", kind, format, desc, s.missingBucket(), missing);
             }
@@ -1485,7 +2063,7 @@ public class InfinoAggregationProcessor {
                 ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
                 Grouped.DateExpr expr = Grouped.dateExpr(agg, c, tz, dh.getIntervalAsFixed(), dh.getIntervalAsCalendar(), dh.offset());
                 // As stock: the key is epoch milliseconds unless the source names a format.
-                DocValueFormat format = s.format() == null ? DocValueFormat.RAW : Grouped.dateFormat(s.format(), tz);
+                DocValueFormat format = s.format() == null ? DocValueFormat.RAW : Grouped.dateFormat(s.format(), c, tz);
                 return new CompositeSource(s.name(), c, expr.keyExpr(), KeyKind.DATE, format, desc, s.missingBucket(), missing);
             }
             if (s instanceof HistogramValuesSourceBuilder h) {
@@ -1571,8 +2149,8 @@ public class InfinoAggregationProcessor {
             return key;
         }
 
-        /** Build from the page's rows in order, each with its top hits and nested aggregation. */
-        InternalAggregation build(List<Map<String, Object>> rows, List<List<InternalAggregation>> topHits, List<InternalAggregation> nested) {
+        /** Build from the page's rows in order, each with its top hits and nested aggregations. */
+        InternalAggregation build(List<Map<String, Object>> rows, List<List<InternalAggregation>> topHits, List<List<InternalAggregation>> nested) {
             List<String> names = new ArrayList<>();
             List<DocValueFormat> formats = new ArrayList<>();
             int[] reverseMuls = new int[sources.size()];
@@ -1590,7 +2168,7 @@ public class InfinoAggregationProcessor {
                 buckets.add(new InfinoAggregationWire.CompositeBucket(keyOf(row), asLong(row.get("doc_count")), subs(row, topHits.get(i), nested.get(i))));
             }
             Comparable<?>[] afterKey = rows.isEmpty() ? null : keyOf(rows.get(rows.size() - 1));
-            return InfinoAggregationWire.composite(builder.getName(), builder.getMetadata(), size, names, formats, reverseMuls, missingOrders, buckets, afterKey);
+            return InfinoAggregationWire.composite(builder.getName(), metadataOf(builder), size, names, formats, reverseMuls, missingOrders, buckets, afterKey);
         }
 
         @Override
@@ -1687,7 +2265,7 @@ public class InfinoAggregationProcessor {
     private InternalAggregation evalExplicit(Explicit e, String from, String where) {
         List<Map<String, Object>> rows = new ArrayList<>();
         List<List<InternalAggregation>> topHits = new ArrayList<>();
-        List<InternalAggregation> nested = new ArrayList<>();
+        List<List<InternalAggregation>> nested = new ArrayList<>();
         for (ExplicitBucket b : e.buckets) {
             String w = "(" + where + ") AND (" + b.predicate() + ")";
             String select = "COUNT(*) AS doc_count" + (e.metrics.isEmpty() ? "" : ", " + metricColumns(e.metrics));
@@ -1695,9 +2273,24 @@ public class InfinoAggregationProcessor {
             long docCount = asLong(row.get("doc_count"));
             rows.add(row);
             topHits.add(bucketHits(e, from, w, docCount));
-            nested.add(e.child == null ? null : evalBucket(e.child, from, w, docCount));
+            nested.add(evalChildren(e.child, from, w, docCount));
         }
         return e.build(rows, topHits, nested);
+    }
+
+    /** The nested aggregations of one bucket, {@code child} (or each of its {@link Siblings}) over the bucket's rows. */
+    private List<InternalAggregation> evalChildren(BucketSpec child, String from, String where, long docCount) {
+        if (child == null) {
+            return List.of();
+        }
+        if (child instanceof Siblings s) {
+            List<InternalAggregation> out = new ArrayList<>();
+            for (BucketSpec c : s.children) {
+                out.add(evalBucket(c, from, where, docCount));
+            }
+            return out;
+        }
+        return List.of(evalBucket(child, from, where, docCount));
     }
 
     /** The top hits of one bucket of {@code spec}, one statement per top_hits over {@code from WHERE where}. */
@@ -1747,7 +2340,7 @@ public class InfinoAggregationProcessor {
         }
         List<Significant.Candidate> candidates = new ArrayList<>();
         List<List<InternalAggregation>> topHits = new ArrayList<>();
-        List<InternalAggregation> nested = new ArrayList<>();
+        List<List<InternalAggregation>> nested = new ArrayList<>();
         for (Map<String, Object> row : foreground) {
             Object k = row.get("k0");
             long subsetDf = asLong(row.get("doc_count"));
@@ -1755,7 +2348,7 @@ public class InfinoAggregationProcessor {
             candidates.add(new Significant.Candidate(k, subsetDf, Math.max(subsetDf, supersetDf), row));
             String w = "(" + where + ") AND " + key + " = " + Grouped.keyLiteral(s.keyKind, k);
             topHits.add(bucketHits(s, from, w, subsetDf));
-            nested.add(s.child == null ? null : evalBucket(s.child, from, w, subsetDf));
+            nested.add(evalChildren(s.child, from, w, subsetDf));
         }
         return s.build(candidates, topHits, nested, subsetSize, supersetSize);
     }
@@ -1764,37 +2357,52 @@ public class InfinoAggregationProcessor {
     private InternalAggregation evalComposite(Composite c, String from, String where) {
         List<String> keyCols = new ArrayList<>();
         List<String> present = new ArrayList<>();
-        StringBuilder positions = new StringBuilder();
+        // The sources that read a field some document gives several values.
+        List<Source> multi = new ArrayList<>();
         for (int i = 0; i < c.sources.size(); i++) {
             CompositeSource s = c.sources.get(i);
             keyCols.add(s.keyExpr() + " AS k" + i);
             if (!s.missingBucket()) {
                 present.add(s.keyExpr() + " IS NOT NULL");
             }
-            positions.append(i == 0 ? "" : ", ").append(i + 1);
+            if (s.source().multi()) {
+                multi.add(s.source());
+            }
         }
-        String select = String.join(", ", keyCols) + ", COUNT(*) AS doc_count" + (c.metrics.isEmpty() ? "" : ", " + metricColumns(c.metrics));
+        String metrics = c.metrics.isEmpty() ? "" : metricColumns(c.metrics);
         String w = present.isEmpty() ? where : "(" + where + ") AND " + String.join(" AND ", present);
-        String inner = "SELECT " + select + " FROM " + from + " WHERE " + w + " GROUP BY " + positions;
+        String inner = groupStatement(keyCols, metrics, from, w, multi, "");
         String page = c.after == null ? "" : " WHERE " + c.keysetPredicate();
         List<Map<String, Object>> rows = InfinoNative.sqlRows("SELECT * FROM (" + inner + ") t" + page + " ORDER BY " + c.order() + " LIMIT " + c.size);
         List<List<InternalAggregation>> topHits = new ArrayList<>();
-        List<InternalAggregation> nested = new ArrayList<>();
+        List<List<InternalAggregation>> nested = new ArrayList<>();
         for (Map<String, Object> row : rows) {
             long docCount = asLong(row.get("doc_count"));
             String bucket = "(" + where + ") AND " + bucketRestriction(c, row);
             topHits.add(bucketHits(c, from, bucket, docCount));
-            nested.add(c.child == null ? null : evalBucket(c.child, from, bucket, docCount));
+            nested.add(evalChildren(c.child, from, bucket, docCount));
         }
         return c.build(rows, topHits, nested);
     }
 
-    /** {@code (k0 = a AND k1 = b ...)} over a composite's key expressions, for one of its buckets. */
+    /**
+     * {@code (k0 = a AND k1 = b ...)} over a composite's key expressions, for
+     * one of its buckets: the documents its nested aggregations read. A
+     * terms source over a field some document gives several values holds a
+     * document any of whose values is the key ({@link Composite#source}
+     * serves only terms over such a field).
+     */
     private static String bucketRestriction(Composite c, Map<String, Object> row) {
         List<String> ands = new ArrayList<>();
         for (int i = 0; i < c.sources.size(); i++) {
             CompositeSource s = c.sources.get(i);
             Object key = row.get("k" + i);
+            Source source = s.source();
+            if (source.multi()) {
+                String literal = key == null ? null : Grouped.keyLiteral(s.keyKind(), key);
+                ands.add(literal == null ? source.noValue() : source.anyValue(value -> value + " = " + literal));
+                continue;
+            }
             ands.add(key == null ? s.keyExpr() + " IS NULL" : s.keyExpr() + " = " + Grouped.keyLiteral(s.keyKind(), key));
         }
         return "(" + String.join(" AND ", ands) + ")";
@@ -1826,7 +2434,8 @@ public class InfinoAggregationProcessor {
             for (int j = 0; j <= i; j++) {
                 aliases.add("k" + j);
             }
-            String restriction = kept == null ? "" : " AND " + tupleRestriction(chain, kept, i);
+            // Over a value per row, a parent's bucket is the row's value in it.
+            String restriction = kept == null ? "" : " AND " + tupleRestriction(chain, kept, i, true);
             // A terms level has no bucket for the missing value, so rows without
             // one leave before the window: they take no slot and count as other to no one.
             String inner = levelInner(chain, i, from, where, restriction, level.terms);
@@ -1874,23 +2483,24 @@ public class InfinoAggregationProcessor {
      * and every parent's, the row count and the level's metrics, over
      * {@code from WHERE where} narrowed by {@code restriction}, without rows
      * missing the level's key when {@code present}, and with the level's
-     * minimum count as a HAVING.
+     * minimum count as a HAVING. A key over a field some document gives
+     * several values is read per value ({@link #groupStatement}).
      */
     private static String levelInner(List<Grouped> chain, int i, String from, String where, String restriction, boolean present) {
         Grouped level = chain.get(i);
         List<String> keyCols = new ArrayList<>();
-        StringBuilder positions = new StringBuilder();
+        // The keys of this depth that read a field some document gives several values.
+        List<Source> multi = new ArrayList<>();
         for (int j = 0; j <= i; j++) {
             keyCols.add(chain.get(j).keyExpr + " AS k" + j);
-            positions.append(j == 0 ? "" : ", ").append(j + 1);
+            if (chain.get(j).source.multi()) {
+                multi.add(chain.get(j).source);
+            }
         }
-        String select = String.join(", ", keyCols) + ", COUNT(*) AS doc_count" + (level.metrics.isEmpty() ? "" : ", " + metricColumns(level.metrics));
+        String metrics = level.metrics.isEmpty() ? "" : metricColumns(level.metrics);
         String keep = present ? " AND " + level.keyExpr + " IS NOT NULL" : "";
-        String inner = "SELECT " + select + " FROM " + from + " WHERE " + where + restriction + keep + " GROUP BY " + positions;
-        if (level.minDocCount > 1) {
-            inner += " HAVING COUNT(*) >= " + level.minDocCount;
-        }
-        return inner;
+        String having = level.minDocCount > 1 ? " HAVING COUNT(*) >= " + level.minDocCount : "";
+        return groupStatement(keyCols, metrics, from, where + restriction + keep, multi, having);
     }
 
     /**
@@ -1902,14 +2512,16 @@ public class InfinoAggregationProcessor {
      * would have run. Null, and the count is left to its own statement, when
      * that count is not a statement (a bare text query's count is a direct
      * call), when the level's buckets are not picked from its groups, when a
-     * minimum count leaves groups out of the sum, or when the level has more
-     * groups than are picked here.
+     * minimum count leaves groups out of the sum, when the level reads a field
+     * some document gives several values (that document counts once in each of
+     * its values' groups, so the groups add up to more than the rows), or when
+     * the level has more groups than are picked here.
      */
     private Long totalFromTopTerms(Spec spec, Translation q) {
         if (q.principal() != null && InfinoQueryTranslator.ALL.equals(q.where())) {
             return null;
         }
-        if (!(spec instanceof Grouped level) || !level.terms || level.minDocCount > 1 || termsOrder(level) == null) {
+        if (!(spec instanceof Grouped level) || !level.terms || level.minDocCount > 1 || level.source.multi() || termsOrder(level) == null) {
             return null;
         }
         List<Grouped> chain = List.of(level);
@@ -1943,10 +2555,16 @@ public class InfinoAggregationProcessor {
 
     /**
      * Whether a top terms level's groups are the table's value counts: a
-     * request that does not filter the table, over a column, with no metrics.
+     * request that does not filter the table, over a column no document gives
+     * several values (the counts are the column's own, not its list's), with
+     * no metrics.
      */
     private static boolean readsValueCounts(Grouped level, Translation q) {
-        return q.principal() == null && InfinoQueryTranslator.ALL.equals(q.where()) && level.source.column() != null && level.metrics.isEmpty();
+        return q.principal() == null
+            && InfinoQueryTranslator.ALL.equals(q.where())
+            && level.source.column() != null
+            && !level.source.multi()
+            && level.metrics.isEmpty();
     }
 
     /**
@@ -2076,7 +2694,7 @@ public class InfinoAggregationProcessor {
             keyCols.add(chain.get(j).keyExpr + " AS k" + j);
             aliases.add("k" + j);
         }
-        String restriction = tupleRestriction(chain, kept, i + 1);
+        String restriction = tupleRestriction(chain, kept, i + 1, true);
         for (int h = 0; h < level.hits.size(); h++) {
             TopHits th = level.hits.get(h);
             List<String> cols = new ArrayList<>(aliases);
@@ -2101,14 +2719,19 @@ public class InfinoAggregationProcessor {
         return out;
     }
 
-    /** {@code ((k0 = a AND k1 = b) OR ...)} over the key expressions, for the tuples the parent levels kept. */
-    private static String tupleRestriction(List<Grouped> chain, List<List<Object>> kept, int level) {
+    /**
+     * {@code ((k0 = a AND k1 = b) OR ...)} over the parent levels' buckets,
+     * for the tuples they kept: over rows that each hold one value of a
+     * field ({@code perValue}, {@link Grouped#rowPredicate}), else over the
+     * documents ({@link Grouped#docPredicate}).
+     */
+    private static String tupleRestriction(List<Grouped> chain, List<List<Object>> kept, int level, boolean perValue) {
         List<String> ors = new ArrayList<>();
         for (List<Object> tuple : kept) {
             List<String> ands = new ArrayList<>();
             for (int j = 0; j < level; j++) {
-                Object key = tuple.get(j);
-                ands.add(key == null ? chain.get(j).keyExpr + " IS NULL" : chain.get(j).keyExpr + " = " + chain.get(j).keyLiteral(key));
+                Grouped g = chain.get(j);
+                ands.add(perValue ? g.rowPredicate(tuple.get(j)) : g.docPredicate(tuple.get(j)));
             }
             ors.add("(" + String.join(" AND ", ands) + ")");
         }
@@ -2145,12 +2768,9 @@ public class InfinoAggregationProcessor {
                 List<Map<String, Object>> hits = hitRows == null || h >= hitRows.size() ? List.of() : hitRows.get(h);
                 topHits.add(level.hits.get(h).build(hits, docCount, index));
             }
-            InternalAggregation nested = null;
-            if (depth + 1 < chain.size()) {
-                nested = fold(chain, depth + 1, keys, rowsByLevel, hitsByLevel, docCount, leafChild, from, where);
-            } else if (leafChild != null) {
-                nested = evalBucket(leafChild, from, "(" + where + ") AND " + tupleRestriction(chain, List.of(keys), keys.size()), docCount);
-            }
+            List<InternalAggregation> nested = depth + 1 < chain.size()
+                ? List.of(fold(chain, depth + 1, keys, rowsByLevel, hitsByLevel, docCount, leafChild, from, where))
+                : evalChildren(leafChild, from, "(" + where + ") AND " + tupleRestriction(chain, List.of(keys), keys.size(), false), docCount);
             return level.subs(row, topHits, nested);
         }, parentTotal);
     }

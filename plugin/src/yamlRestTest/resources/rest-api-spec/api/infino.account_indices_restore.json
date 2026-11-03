@@ -1,0 +1,22 @@
+{
+  "infino.account_indices_restore": {
+    "documentation": {
+      "description": "Create every index the registry beside the tables names that the cluster lacks, now, as a fresh cluster does at boot; with name, that one."
+    },
+    "stability": "experimental",
+    "url": {
+      "paths": [
+        {
+          "path": "/_plugins/_infino/account/indices",
+          "methods": ["POST"]
+        }
+      ]
+    },
+    "params": {
+      "name": {
+        "type": "string",
+        "description": "One index to bring back"
+      }
+    }
+  }
+}

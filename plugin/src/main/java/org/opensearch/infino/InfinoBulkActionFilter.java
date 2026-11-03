@@ -6,8 +6,11 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.action.ActionListenerResponseHandler;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.DocWriteRequest;
+import org.opensearch.action.DocWriteResponse;
+import org.opensearch.action.UnavailableShardsException;
 import org.opensearch.action.bulk.BulkAction;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
@@ -17,18 +20,30 @@ import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.support.AutoCreateIndex;
+import org.opensearch.action.support.ContextPreservingActionListener;
 import org.opensearch.action.update.UpdateRequest;
+import org.opensearch.action.update.UpdateResponse;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.ClusterStateObserver;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.MetadataIndexTemplateService;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.UUIDs;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaType;
@@ -36,21 +51,28 @@ import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.engine.DocumentMissingException;
+import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.infino.InfinoWriter.Outcome;
 import org.opensearch.infino.InfinoWriter.Waiter;
 import org.opensearch.infino.InfinoWriter.Write;
+import org.opensearch.ingest.IngestService;
+import org.opensearch.node.NodeClosedException;
 import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Supplier;
 
 /**
@@ -67,17 +89,44 @@ import java.util.function.Supplier;
  * Infino-backed indices is served per index, the items answered in the
  * bulk's own order.
  *
+ * <p>The documents go through their ingest pipelines first (the one the
+ * request names, the index's default and final pipelines), here on the node
+ * as the stock bulk runs them before any shard; a document a pipeline fails
+ * or drops is answered as stock answers it and not written.
+ *
  * <p>An update is merged here into the document it targets. The writes then
  * go to the table's {@link InfinoWriter}, which batches them across requests
  * and answers the bulk once they are committed; a document the declared
  * columns cannot hold comes back from that append as its own item with the
  * reason, as a mapping parse failure would be.
  *
- * <p>A bulk mixing Infino-backed and other indices is refused as a whole.
+ * <p>Each Infino-backed index's table is written by one node, the one
+ * holding its primary shard; a write that arrives elsewhere is sent there
+ * ({@link #dispatch}). A bulk mixing Infino-backed and other indices sends
+ * the others' items to the stock bulk, and answers every item in its slot.
  */
 public class InfinoBulkActionFilter implements ActionFilter {
 
     private static final Logger log = LogManager.getLogger(InfinoBulkActionFilter.class);
+    /**
+     * The header of a bulk sent to the node that writes its tables. Only a
+     * node sets it: it is no REST header, so no client request carries it.
+     */
+    static final String FORWARDED = "_infino_forwarded";
+    /**
+     * The header of a forwarded bulk sent on once more, because the node it
+     * reached no longer wrote its tables by that node's newer cluster state;
+     * the node it reaches next never sends it on again (see {@link #dispatch}).
+     */
+    static final String FORWARDED_AGAIN = "_infino_forwarded_again";
+    /** How many times a bulk may be sent on to the node that writes its tables. */
+    private static final int MAX_FORWARDS = 2;
+    /** The destination of the items a bulk writes to indices Infino does not back: the stock bulk on this node. */
+    private static final String STOCK = "";
+    /** The id stock answers a dropped document under when the request gave it none. */
+    private static final String DROPPED_GENERATED_ID = "auto-generated";
+    /** The primary term stock answers a dropped document with: it was never written. */
+    private static final long DROPPED_PRIMARY_TERM = 0L;
 
     private final Supplier<ClusterService> clusterService;
     private final InfinoTables tables;
@@ -115,6 +164,68 @@ public class InfinoBulkActionFilter implements ActionFilter {
         }
         @SuppressWarnings("unchecked")
         ActionListener<BulkResponse> cast = (ActionListener<BulkResponse>) listener;
+        route(bulk, clusters, writes, tables, cast, () -> chain.proceed(task, action, request, listener));
+    }
+
+    /**
+     * Serve a bulk from the tables when its items write to Infino-backed
+     * indices, as the stock bulk would serve it from the shards: its ingest
+     * pipelines run first, then the indices its documents name that do not
+     * exist are created, so a document a pipeline sends to another index is
+     * served there and the index it named is not created for it. When no
+     * item writes to an Infino-backed index, {@code stock} runs instead and
+     * the bulk goes on as it came.
+     */
+    static void route(BulkRequest bulk, ClusterService clusters, InfinoWriter writes, InfinoTables tables, ActionListener<BulkResponse> listener, Runnable stock) {
+        if (forwards() > 0) {
+            // Its pipelines ran on the node it arrived at, which marked each document
+            // resolved; they never run again here, whatever the documents carry.
+            createAndServe(bulk, clusters, new BulkItemResponse[bulk.requests().size()], writes, tables, listener, stock);
+            return;
+        }
+        if (!resolvePipelines(bulk, clusters.state())) {
+            createAndServe(bulk, clusters, new BulkItemResponse[bulk.requests().size()], writes, tables, listener, stock);
+            return;
+        }
+        if (!infinoBound(clusters, bulk)) {
+            stock.run();
+            return;
+        }
+        ingest(
+            bulk,
+            clusters,
+            ActionListener.wrap(
+                answered -> createAndServe(
+                    bulk,
+                    clusters,
+                    answered,
+                    writes,
+                    tables,
+                    listener,
+                    // Its pipelines sent every document elsewhere: the stock bulk takes
+                    // them as they now stand, past their pipelines.
+                    () -> dispatch(bulk, concreteIndices(clusters.state(), bulk), Map.of(), answered, writes, tables, clusters, listener)
+                ),
+                listener::onFailure
+            )
+        );
+    }
+
+    /**
+     * Create the indices the bulk's items name that do not exist, then serve
+     * it from the tables with {@code answered} (the items its pipelines
+     * answered), or run {@code instead} when none of its indices is
+     * Infino-backed.
+     */
+    private static void createAndServe(
+        BulkRequest bulk,
+        ClusterService clusters,
+        BulkItemResponse[] answered,
+        InfinoWriter writes,
+        InfinoTables tables,
+        ActionListener<BulkResponse> listener,
+        Runnable instead
+    ) {
         createMissing(missingIndices(clusters, bulk), ActionListener.wrap(created -> {
             Map<String, IndexMetadata> infino;
             List<String> concrete = concreteIndices(clusters.state(), bulk);
@@ -125,11 +236,411 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 return;
             }
             if (infino.isEmpty()) {
-                chain.proceed(task, action, request, listener);
+                instead.run();
                 return;
             }
-            serve(bulk, concrete, infino, writes, tables, cast);
+            dispatch(bulk, concrete, infino, answered, writes, tables, clusters, listener);
         }, listener::onFailure));
+    }
+
+    /**
+     * Send each item where it is written, and answer the bulk with every
+     * item in its own slot once all are. An Infino-backed index is written
+     * by one node, the one holding its primary shard, as a stock index is:
+     * a table's sequence numbers and its id lookups are then one node's, so
+     * two nodes never give two writes the same number, and never both append
+     * an id neither found. Items for an index this node writes are served
+     * here; the others go to their node as one bulk per node, past their
+     * pipelines, and that node serves them without sending them on. Items
+     * for an index Infino does not back (a mixed bulk, or a document a
+     * pipeline sent elsewhere) go to the stock bulk on this node, past their
+     * pipelines too.
+     *
+     * <p>A bulk forwarded here is checked against this node's own cluster
+     * state, which may be newer than the sender's: the items of an index
+     * whose primary has moved on are sent on once more, to the node holding
+     * it now, and a bulk sent on that way that still misses the writer is
+     * answered with the primary unavailable for those items rather than
+     * written here, so a moving shard sends a bulk on at most twice and two
+     * nodes never write one table. While an index has no active primary its
+     * items wait for one, up to the bulk's timeout, as the stock bulk's do.
+     *
+     * <p>Each destination is a part of the bulk answered on its own: a part
+     * that fails, or whose index gets no primary in time, answers each of its
+     * items with the failure, as the stock bulk answers the items of a shard
+     * that failed, and the other parts keep their results.
+     */
+    static void dispatch(
+        BulkRequest bulk,
+        List<String> concrete,
+        Map<String, IndexMetadata> infino,
+        BulkItemResponse[] answered,
+        InfinoWriter writes,
+        InfinoTables tables,
+        ClusterService clusters,
+        ActionListener<BulkResponse> listener
+    ) {
+        int forwards = forwards();
+        ClusterState state = clusters.state();
+        String local = state.nodes().getLocalNodeId();
+        long start = System.nanoTime();
+        BulkItemResponse[] items = new BulkItemResponse[bulk.requests().size()];
+        // Where each index's items go, and each destination's slots. An item its
+        // pipeline answered keeps that answer and goes nowhere; so does one this node
+        // answers now because its primary moved on after the bulk was sent on twice.
+        Map<String, Destination> byIndex = new HashMap<>();
+        Map<Destination, List<Integer>> slotsByDestination = new LinkedHashMap<>();
+        boolean anyAnswered = false;
+        for (int slot = 0; slot < bulk.requests().size(); slot++) {
+            if (answered[slot] != null) {
+                items[slot] = answered[slot];
+                anyAnswered = true;
+                continue;
+            }
+            String index = concrete.get(slot);
+            Destination destination = byIndex.computeIfAbsent(index, name -> destination(state, infino.get(name), local, forwards));
+            if (destination.moved()) {
+                items[slot] = failure(slot, bulk.requests().get(slot), index, movedOn(infino.get(index).getIndex()));
+                anyAnswered = true;
+                continue;
+            }
+            slotsByDestination.computeIfAbsent(destination, k -> new ArrayList<>()).add(slot);
+        }
+        Destination here = new Destination(local, null, false);
+        if (!anyAnswered && slotsByDestination.size() == 1 && slotsByDestination.containsKey(here)) {
+            serve(bulk, concrete, infino, answered, writes, tables, listener);
+            return;
+        }
+        if (slotsByDestination.isEmpty()) {
+            finish(items, start, listener);
+            return;
+        }
+        AtomicInteger pending = new AtomicInteger(slotsByDestination.size());
+        for (Map.Entry<Destination, List<Integer>> group : slotsByDestination.entrySet()) {
+            List<Integer> slots = group.getValue();
+            BulkRequest part = new BulkRequest();
+            part.setRefreshPolicy(bulk.getRefreshPolicy());
+            part.timeout(bulk.timeout());
+            part.waitForActiveShards(bulk.waitForActiveShards());
+            List<String> partConcrete = new ArrayList<>(slots.size());
+            Map<String, IndexMetadata> partInfino = new LinkedHashMap<>();
+            for (int slot : slots) {
+                part.add(bulk.requests().get(slot));
+                partConcrete.add(concrete.get(slot));
+                IndexMetadata md = infino.get(concrete.get(slot));
+                if (md != null) {
+                    partInfino.put(concrete.get(slot), md);
+                }
+            }
+            ActionListener<BulkResponse> partListener = slotted(bulk, concrete, slots, items, pending, start, listener);
+            Destination destination = group.getKey();
+            if (destination.waitingFor() != null) {
+                // Its index has no active primary: once one is, the part goes where it is.
+                awaitWriter(
+                    part,
+                    destination.waitingFor(),
+                    clusters,
+                    partListener,
+                    () -> dispatch(part, partConcrete, partInfino, new BulkItemResponse[slots.size()], writes, tables, clusters, partListener)
+                );
+            } else if (STOCK.equals(destination.node())) {
+                InfinoClient.bulk(part, partListener);
+            } else if (destination.equals(here)) {
+                serve(part, partConcrete, partInfino, new BulkItemResponse[slots.size()], writes, tables, partListener);
+            } else {
+                // The write lands on another node, which this node's request cache
+                // does not hear from: its responses over these tables move away here
+                // before the write, and once it is answered nothing read from them is
+                // kept until this node's reads are sure to see it.
+                Map<String, IndexMetadata> written = new LinkedHashMap<>();
+                try {
+                    for (IndexMetadata md : partInfino.values()) {
+                        written.put(tables.ensure(md), md);
+                    }
+                } catch (Exception e) {
+                    partListener.onFailure(e);
+                    continue;
+                }
+                written.keySet().forEach(InfinoRequestCache::changed);
+                Runnable settle = () -> written.forEach((t, md) -> InfinoRequestCache.writtenElsewhere(t, InfinoRequestCache.lifetime(List.of(md))));
+                forward(state.nodes().get(destination.node()), part, ActionListener.wrap(response -> {
+                    settle.run();
+                    partListener.onResponse(response);
+                }, e -> {
+                    settle.run();
+                    partListener.onFailure(e);
+                }));
+            }
+        }
+    }
+
+    /**
+     * Where a bulk's items for one index go: {@code node}, the one that
+     * writes its table ({@link #STOCK} for an index Infino does not back);
+     * or, while it has no active primary, {@code waitingFor} it; or nowhere
+     * when it has {@code moved} on from this node after the bulk was sent on
+     * as often as it may be.
+     */
+    private record Destination(String node, Index waitingFor, boolean moved) {}
+
+    /** Where the items for {@code md} (null for an index Infino does not back) go from this node, the bulk sent on {@code forwards} times so far. */
+    private static Destination destination(ClusterState state, IndexMetadata md, String local, int forwards) {
+        if (md == null) {
+            return new Destination(STOCK, null, false);
+        }
+        String node = writerNode(state, md.getIndex());
+        if (node == null) {
+            return new Destination(null, md.getIndex(), false);
+        }
+        return new Destination(node, null, forwards == MAX_FORWARDS && !node.equals(local));
+    }
+
+    /** What an item of {@code index} is answered with when its primary moved on while the bulk was sent on to it twice: a client retries it. */
+    private static UnavailableShardsException movedOn(Index index) {
+        return new UnavailableShardsException(new ShardId(index, 0), "the primary moved to another node while the bulk was sent on to this one");
+    }
+
+    /** How many times the bulk this thread serves was sent on to the node that writes its tables: 0 when it arrived here from its client. */
+    private static int forwards() {
+        ThreadContext context = InfinoServices.threadContext();
+        if (context == null || context.getHeader(FORWARDED) == null) {
+            return 0;
+        }
+        return context.getHeader(FORWARDED_AGAIN) == null ? 1 : MAX_FORWARDS;
+    }
+
+    /**
+     * The listener of one part of a bulk, whose items sit at {@code slots}
+     * of the whole: it puts the part's answers in those slots, or when the
+     * part fails answers each of its items with the failure, as the stock
+     * bulk answers the items of a shard that failed. The bulk is answered
+     * once every part is.
+     */
+    private static ActionListener<BulkResponse> slotted(
+        BulkRequest bulk,
+        List<String> concrete,
+        List<Integer> slots,
+        BulkItemResponse[] items,
+        AtomicInteger pending,
+        long start,
+        ActionListener<BulkResponse> listener
+    ) {
+        return ActionListener.wrap(response -> {
+            for (int i = 0; i < slots.size(); i++) {
+                items[slots.get(i)] = reslot(response.getItems()[i], slots.get(i));
+            }
+            if (pending.decrementAndGet() == 0) {
+                finish(items, start, listener);
+            }
+        }, e -> {
+            log.debug("[infino] {} items of a bulk failed", slots.size(), e);
+            for (int slot : slots) {
+                items[slot] = failure(slot, bulk.requests().get(slot), concrete.get(slot), e);
+            }
+            if (pending.decrementAndGet() == 0) {
+                finish(items, start, listener);
+            }
+        });
+    }
+
+    /**
+     * The node that writes {@code index}'s table: the one holding its active
+     * primary shard; null while it has none.
+     */
+    static String writerNode(ClusterState state, Index index) {
+        ShardRouting primary = primary(state, index);
+        return primary == null ? null : primary.currentNodeId();
+    }
+
+    /**
+     * Which copy writes {@code index}'s table: its active primary's
+     * allocation; null while it has none. It changes whenever the primary
+     * moves or another copy takes over, which a writer that hands out
+     * sequence numbers needs to know (see {@link InfinoWriter}).
+     */
+    static String writerAllocation(ClusterState state, Index index) {
+        ShardRouting primary = primary(state, index);
+        return primary == null || primary.allocationId() == null ? null : primary.allocationId().getId();
+    }
+
+    private static ShardRouting primary(ClusterState state, Index index) {
+        IndexRoutingTable routing = state.routingTable().index(index);
+        if (routing == null || routing.shard(0) == null) {
+            return null;
+        }
+        ShardRouting primary = routing.shard(0).primaryShard();
+        return primary != null && primary.active() ? primary : null;
+    }
+
+    /**
+     * Wait for {@code index} to have an active primary, then {@code retry};
+     * past the bulk's timeout, answer that it has none, as the stock bulk
+     * does.
+     */
+    private static void awaitWriter(BulkRequest bulk, Index index, ClusterService clusters, ActionListener<BulkResponse> listener, Runnable retry) {
+        ThreadContext context = InfinoServices.threadContext();
+        ClusterStateObserver observer = new ClusterStateObserver(clusters, bulk.timeout(), log, context);
+        observer.waitForNextChange(new ClusterStateObserver.Listener() {
+            @Override
+            public void onNewClusterState(ClusterState state) {
+                retry.run();
+            }
+
+            @Override
+            public void onClusterServiceClose() {
+                listener.onFailure(new NodeClosedException(clusters.localNode()));
+            }
+
+            @Override
+            public void onTimeout(TimeValue timeout) {
+                listener.onFailure(
+                    new UnavailableShardsException(new ShardId(index, 0), "primary shard is not active Timeout: [{}]", timeout)
+                );
+            }
+        }, state -> writerNode(state, index) != null);
+    }
+
+    /**
+     * Send {@code part} to {@code node}, which writes its tables, as a bulk
+     * marked forwarded (forwarded again when it arrived here forwarded), so
+     * it serves it there. It goes as the caller: the node authorizes it
+     * again, and the answer comes back in the caller's context.
+     */
+    private static void forward(DiscoveryNode node, BulkRequest part, ActionListener<BulkResponse> listener) {
+        TransportService transport = InfinoServices.transportService();
+        ThreadContext context = InfinoServices.threadContext();
+        if (transport == null || context == null || node == null) {
+            listener.onFailure(new IllegalStateException("[infino] the node that writes the table cannot be reached"));
+            return;
+        }
+        ActionListener<BulkResponse> inCallerContext = new ContextPreservingActionListener<>(context.newRestorableContext(false), listener);
+        try (ThreadContext.StoredContext ignored = context.newStoredContext(true)) {
+            // A header once set stays for the request's life: one sent on again carries a second.
+            context.putHeader(context.getHeader(FORWARDED) == null ? FORWARDED : FORWARDED_AGAIN, "true");
+            transport.sendRequest(node, BulkAction.NAME, part, new ActionListenerResponseHandler<>(inCallerContext, BulkResponse::new));
+        }
+    }
+
+    /**
+     * Whether any item writes to an Infino-backed index as the bulk stands:
+     * one that exists with the setting, or one that does not exist yet and
+     * that the cluster would create Infino-backed.
+     */
+    static boolean infinoBound(ClusterService clusters, BulkRequest bulk) {
+        ClusterState state = clusters.state();
+        Set<String> missing = new HashSet<>(missingIndices(clusters, bulk));
+        for (String name : concreteIndices(state, bulk)) {
+            IndexMetadata md = name == null ? null : state.metadata().index(name);
+            boolean backed = md != null ? InfinoPlugin.INFINO_ENABLED.get(md.getSettings()) : missing.contains(name) && createdInfinoBacked(clusters, name);
+            if (backed) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether an index the cluster created under {@code name} now would be
+     * Infino-backed: the plugin stamps every new index unless the node turns
+     * that off, and a template's own setting wins (see
+     * {@link InfinoPlugin#getAdditionalIndexSettingProviders}), the template
+     * found as index creation finds it: a composable one when one matches,
+     * else the legacy ones.
+     */
+    static boolean createdInfinoBacked(ClusterService clusters, String name) {
+        Metadata metadata = clusters.state().metadata();
+        String composable = MetadataIndexTemplateService.findV2Template(metadata, name, false);
+        Settings fromTemplates = composable != null
+            ? MetadataIndexTemplateService.resolveSettings(metadata, composable)
+            : MetadataIndexTemplateService.resolveSettings(MetadataIndexTemplateService.findV1Templates(metadata, name, null));
+        return fromTemplates.getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), InfinoPlugin.INFINO_DEFAULT_ENABLED.get(clusters.getSettings()));
+    }
+
+    /**
+     * Resolve onto each document the pipelines that apply to it (the one the
+     * request names, its index's default and final pipelines), as the stock
+     * bulk resolves them; whether any document has one to run.
+     */
+    static boolean resolvePipelines(BulkRequest bulk, ClusterState state) {
+        IngestService ingest = InfinoServices.ingestService();
+        if (ingest == null) {
+            return false;
+        }
+        boolean any = false;
+        for (DocWriteRequest<?> item : bulk.requests()) {
+            IndexRequest doc = indexWriteRequest(item);
+            if (doc != null) {
+                any |= ingest.resolvePipelines(item, doc, state.metadata());
+            }
+        }
+        return any;
+    }
+
+    /**
+     * Run the resolved pipelines over the bulk's documents on the write
+     * pool, as the stock bulk runs them before any shard: each document is
+     * rewritten in place, and the answer stock gives an item a pipeline failed
+     * or dropped is handed back under the item's slot (null for the rest).
+     */
+    static void ingest(BulkRequest bulk, ClusterService clusters, ActionListener<BulkItemResponse[]> then) {
+        if (!clusters.localNode().isIngestNode()) {
+            then.onFailure(new IllegalArgumentException("[infino] the bulk's documents go through an ingest pipeline, and this node has no ingest role"));
+            return;
+        }
+        int n = bulk.requests().size();
+        // Pipelines may answer items from several threads; the first answer for a slot stands, as in stock.
+        AtomicReferenceArray<BulkItemResponse> answered = new AtomicReferenceArray<>(n);
+        InfinoIngest.executeBulkRequest(
+            InfinoServices.ingestService(),
+            bulk,
+            (slot, e) -> answered.compareAndSet(slot, null, pipelineFailure(bulk.requests().get(slot), slot, e)),
+            (thread, e) -> {
+                if (e != null) {
+                    then.onFailure(e);
+                    return;
+                }
+                BulkItemResponse[] out = new BulkItemResponse[n];
+                for (int i = 0; i < n; i++) {
+                    out[i] = answered.get(i);
+                }
+                then.onResponse(out);
+            },
+            slot -> answered.compareAndSet(slot, null, dropped(bulk.requests().get(slot), slot)),
+            ThreadPool.Names.WRITE
+        );
+    }
+
+    /**
+     * The document an item writes, which its pipelines run over: an index
+     * request's own, an update's upsert (its partial document when that is
+     * the upsert); null for a delete. The stock bulk's rule.
+     */
+    static IndexRequest indexWriteRequest(DocWriteRequest<?> item) {
+        if (item instanceof IndexRequest index) {
+            return index;
+        }
+        if (item instanceof UpdateRequest update) {
+            return update.docAsUpsert() ? update.doc() : update.upsertRequest();
+        }
+        return null;
+    }
+
+    /** The answer stock gives an item whose pipeline failed. */
+    private static BulkItemResponse pipelineFailure(DocWriteRequest<?> item, int slot, Exception e) {
+        IndexRequest doc = indexWriteRequest(item);
+        return new BulkItemResponse(slot, doc.opType(), new BulkItemResponse.Failure(doc.index(), doc.id(), e));
+    }
+
+    /** The answer stock gives an item whose pipeline dropped its document: a no-op, under a placeholder id when it had none. */
+    private static BulkItemResponse dropped(DocWriteRequest<?> item, int slot) {
+        IndexRequest doc = indexWriteRequest(item);
+        String id = doc.id() == null ? DROPPED_GENERATED_ID : doc.id();
+        ShardId shard = new ShardId(doc.index(), IndexMetadata.INDEX_UUID_NA_VALUE, 0);
+        return new BulkItemResponse(
+            slot,
+            doc.opType(),
+            new UpdateResponse(shard, id, SequenceNumbers.UNASSIGNED_SEQ_NO, DROPPED_PRIMARY_TERM, doc.version(), DocWriteResponse.Result.NOOP)
+        );
     }
 
     /**
@@ -195,27 +706,18 @@ public class InfinoBulkActionFilter implements ActionFilter {
     /**
      * The Infino-backed indices a bulk's items write to (the concrete names
      * {@link #concreteIndices} gave, one per slot), by name; empty when none
-     * is. A bulk that mixes them with other indices is refused, and so is a
-     * write to an index the security plugin restricts for this user by
-     * document, field or mask: a write reads the document it replaces or
-     * merges into and puts fields the rule hides, so under a rule it is
-     * refused whole rather than served outside the rule.
+     * is. A write to one the security plugin restricts for this user by
+     * document, field or mask is refused: a write reads the document it
+     * replaces or merges into and puts fields the rule hides, so under a rule
+     * it is refused whole rather than served outside the rule.
      */
     static Map<String, IndexMetadata> infinoIndices(ClusterService clusters, List<String> concrete) {
         Map<String, IndexMetadata> infino = new LinkedHashMap<>();
-        int infinoItems = 0;
         for (String name : concrete) {
             IndexMetadata md = name == null ? null : clusters.state().metadata().index(name);
             if (md != null && md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
                 infino.put(name, md);
-                infinoItems++;
             }
-        }
-        if (infinoItems == 0) {
-            return Map.of();
-        }
-        if (infinoItems != concrete.size()) {
-            throw new IllegalArgumentException("[infino] a bulk mixing Infino-backed indices with others is not served");
         }
         for (String name : infino.keySet()) {
             if (!InfinoSecurity.access(name, "write").unrestricted()) {
@@ -229,12 +731,16 @@ public class InfinoBulkActionFilter implements ActionFilter {
      * Serve a bulk over Infino-backed indices: stage the items of each index
      * and hand them to its table's writer. With several indices, each index's
      * items go to their own waiter and the bulk is answered when every waiter
-     * has, each item in the bulk's own slot.
+     * has, each item in the bulk's own slot; an index whose write fails
+     * answers its own items with the failure, and the others keep their
+     * results. An item {@code answered} holds an answer for (one its ingest
+     * pipeline failed or dropped) is given that answer and not written.
      */
     static void serve(
         BulkRequest bulk,
         List<String> concrete,
         Map<String, IndexMetadata> infino,
+        BulkItemResponse[] answered,
         InfinoWriter writes,
         InfinoTables tables,
         ActionListener<BulkResponse> listener
@@ -246,7 +752,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 IndexMetadata md = infino.values().iterator().next();
                 String table = tables.ensure(md);
                 ShardId shardId = new ShardId(md.getIndex(), 0);
-                Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, bulk.requests(), writes), items, start, listener);
+                Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, bulk.requests(), answered, writes), items, start, listener);
                 writes.submit(table, waiter);
                 return;
             }
@@ -255,32 +761,26 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 slotsByIndex.computeIfAbsent(concrete.get(slot), k -> new ArrayList<>()).add(slot);
             }
             AtomicInteger pending = new AtomicInteger(slotsByIndex.size());
-            AtomicReference<Exception> failure = new AtomicReference<>();
             for (Map.Entry<String, List<Integer>> group : slotsByIndex.entrySet()) {
                 IndexMetadata md = infino.get(group.getKey());
                 List<Integer> slots = group.getValue();
                 List<DocWriteRequest<?>> requests = new ArrayList<>(slots.size());
-                for (int slot : slots) {
-                    requests.add(bulk.requests().get(slot));
+                BulkItemResponse[] partAnswered = new BulkItemResponse[slots.size()];
+                for (int i = 0; i < slots.size(); i++) {
+                    requests.add(bulk.requests().get(slots.get(i)));
+                    partAnswered[i] = answered[slots.get(i)];
                 }
                 BulkItemResponse[] part = new BulkItemResponse[slots.size()];
-                ActionListener<BulkResponse> partListener = ActionListener.wrap(response -> {
-                    for (int i = 0; i < slots.size(); i++) {
-                        items[slots.get(i)] = reslot(response.getItems()[i], slots.get(i));
-                    }
-                    if (pending.decrementAndGet() == 0) {
-                        finish(items, failure.get(), start, listener);
-                    }
-                }, e -> {
-                    failure.compareAndSet(null, e);
-                    if (pending.decrementAndGet() == 0) {
-                        finish(items, failure.get(), start, listener);
-                    }
-                });
-                String table = tables.ensure(md);
-                ShardId shardId = new ShardId(md.getIndex(), 0);
-                Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, requests, writes), part, start, partListener);
-                writes.submit(table, waiter);
+                ActionListener<BulkResponse> partListener = slotted(bulk, concrete, slots, items, pending, start, listener);
+                try {
+                    String table = tables.ensure(md);
+                    ShardId shardId = new ShardId(md.getIndex(), 0);
+                    Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, requests, partAnswered, writes), part, start, partListener);
+                    writes.submit(table, waiter);
+                } catch (Exception e) {
+                    log.warn("[infino] bulk items for {} failed", group.getKey(), e);
+                    partListener.onFailure(e);
+                }
             }
         } catch (Exception e) {
             log.warn("[infino] bulk failed", e);
@@ -288,11 +788,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
         }
     }
 
-    private static void finish(BulkItemResponse[] items, Exception failure, long start, ActionListener<BulkResponse> listener) {
-        if (failure != null) {
-            listener.onFailure(failure);
-            return;
-        }
+    private static void finish(BulkItemResponse[] items, long start, ActionListener<BulkResponse> listener) {
         listener.onResponse(new BulkResponse(items, (System.nanoTime() - start) / 1_000_000L));
     }
 
@@ -301,14 +797,22 @@ public class InfinoBulkActionFilter implements ActionFilter {
         return r.isFailed() ? new BulkItemResponse(slot, r.getOpType(), r.getFailure()) : new BulkItemResponse(slot, r.getOpType(), r.getResponse());
     }
 
-    /** Check every item against the table and turn it into a write, or answer it now when it cannot be written. */
-    private static List<Outcome> stage(String table, ShardId shardId, List<DocWriteRequest<?>> requests, InfinoWriter writes) {
+    /**
+     * Check every item against the table and turn it into a write, or answer
+     * it now when it cannot be written or {@code answered} already holds its
+     * answer (by slot, as {@code requests}).
+     */
+    private static List<Outcome> stage(String table, ShardId shardId, List<DocWriteRequest<?>> requests, BulkItemResponse[] answered, InfinoWriter writes) {
         String indexName = shardId.getIndexName();
         List<Outcome> outcomes = new ArrayList<>(requests.size());
         for (int slot = 0; slot < requests.size(); slot++) {
             DocWriteRequest<?> item = requests.get(slot);
-            // The table keeps no versions or sequence numbers: a write conditioned on the
-            // constants it reports is served as unconditioned, one on anything else refused.
+            if (answered[slot] != null) {
+                outcomes.add(new Outcome(slot, item, null, answered[slot]));
+                continue;
+            }
+            // The table keeps no per-document version, so a version condition is refused here;
+            // a sequence-number condition is checked when the item's batch is written.
             String conditioned = conditioned(item);
             if (conditioned != null) {
                 outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, new IllegalArgumentException("[infino] " + conditioned), RestStatus.BAD_REQUEST)));
@@ -358,13 +862,18 @@ public class InfinoBulkActionFilter implements ActionFilter {
         return outcomes;
     }
 
-    /** Why a write's condition cannot be served, or null when it is unconditioned or on the values the table reports (see {@link InfinoDocumentVersion}). */
+    /** Why a write's version condition cannot be served, or null when it has none (see {@link InfinoDocumentVersion}). */
     static String conditioned(DocWriteRequest<?> item) {
         return InfinoDocumentVersion.conditioned(item);
     }
 
     private static BulkItemResponse failure(int slot, DocWriteRequest<?> item, String index, Exception cause, RestStatus status) {
         return new BulkItemResponse(slot, item.opType(), new BulkItemResponse.Failure(index, item.id(), cause, status));
+    }
+
+    /** An item failed by {@code cause}, under the status the cause carries. */
+    private static BulkItemResponse failure(int slot, DocWriteRequest<?> item, String index, Exception cause) {
+        return new BulkItemResponse(slot, item.opType(), new BulkItemResponse.Failure(index, item.id(), cause));
     }
 
     /** The source in whatever content type the client sent, as JSON for the bridge. */
