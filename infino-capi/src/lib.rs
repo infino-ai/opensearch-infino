@@ -40,8 +40,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
+use datafusion::common::tree_node::TreeNode;
 use datafusion::common::DFSchema;
-use datafusion::prelude::{col, lit, SessionContext};
+use datafusion::prelude::{col, lit, Expr, SessionContext};
 use infino::arrow_array::{
     new_null_array, Array, BooleanArray, Float32Array, Float64Array, Int64Array, LargeStringArray,
     RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -1688,7 +1689,9 @@ pub unsafe extern "C" fn infino_count_where(
             Err(e) => return err_json(&e.to_string()),
         };
         // A predicate over another relation (a subquery) is no expression of
-        // this table's columns alone: such counts run as one statement.
+        // this table's columns alone, and the parser plans its subquery
+        // against its own context, not the table's: such counts run as one
+        // statement.
         let Ok(exprs) = predicates
             .iter()
             .map(|p| predicate_parser().parse_sql_expr(p, &schema))
@@ -1696,12 +1699,27 @@ pub unsafe extern "C" fn infino_count_where(
         else {
             return count_where_by_sql(&conn.conn, name, &predicates);
         };
+        if exprs.iter().any(holds_subquery) {
+            return count_where_by_sql(&conn.conn, name, &predicates);
+        }
         match table.count_where(&exprs) {
             Ok(counts) => out_string(json!(counts).to_string()),
             Err(e) => err_json(&e.to_string()),
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// Whether `expr` reads another relation: an `IN`, `EXISTS` or scalar
+/// subquery anywhere in it.
+fn holds_subquery(expr: &Expr) -> bool {
+    expr.exists(|e| {
+        Ok(matches!(
+            e,
+            Expr::InSubquery(_) | Expr::Exists(_) | Expr::ScalarSubquery(_)
+        ))
+    })
+    .unwrap_or(true)
 }
 
 /// [`infino_count_where`]'s counts as one `COUNT(*) FILTER` statement over
