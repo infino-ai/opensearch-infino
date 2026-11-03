@@ -85,30 +85,46 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             }
         }
         try {
-            // One fetch per index, over all of its ids: through the document
-            // rule when the security plugin has one for this user.
-            Map<String, List<String>> idsByIndex = new HashMap<>();
-            for (MultiGetRequest.Item item : mget.getItems()) {
-                idsByIndex.computeIfAbsent(item.index(), k -> new ArrayList<>()).add(item.id());
-            }
+            // One fetch per table, over all of its ids: through the document
+            // rule when the security plugin has one for this user. An index in
+            // default mode with several shards has a table per shard, so each
+            // id goes to its shard's; a default-mode table is read item by item,
+            // as a write its shard has not committed yet counts.
             Map<String, InfinoAccess> accessOf = new HashMap<>();
+            for (Map.Entry<String, IndexMetadata> e : indices.entrySet()) {
+                accessOf.put(e.getKey(), InfinoSecurity.access(e.getValue().getIndex().getName(), "mget"));
+            }
+            String[] tableOfItem = new String[mget.getItems().size()];
+            Map<String, List<String>> idsByTable = new HashMap<>();
+            Map<String, String> indexOfTable = new HashMap<>();
+            for (int i = 0; i < tableOfItem.length; i++) {
+                MultiGetRequest.Item item = mget.getItems().get(i);
+                String table = tables.ensureForDocument(indices.get(item.index()), item.id(), item.routing());
+                tableOfItem[i] = table;
+                idsByTable.computeIfAbsent(table, k -> new ArrayList<>()).add(item.id());
+                indexOfTable.put(table, item.index());
+            }
             Map<String, Map<String, InfinoNative.Doc>> docsOf = new HashMap<>();
-            for (Map.Entry<String, List<String>> e : idsByIndex.entrySet()) {
-                IndexMetadata md = indices.get(e.getKey());
-                InfinoAccess access = InfinoSecurity.access(md.getIndex().getName(), "mget");
-                accessOf.put(e.getKey(), access);
-                String table = tables.ensure(md);
-                docsOf.put(
-                    e.getKey(),
-                    access.restrictsDocuments() ? InfinoGetActionFilter.restrictedDocs(table, e.getValue(), access) : InfinoNative.docs(table, e.getValue(), null)
-                );
+            for (Map.Entry<String, List<String>> e : idsByTable.entrySet()) {
+                String index = indexOfTable.get(e.getKey());
+                IndexMetadata md = indices.get(index);
+                InfinoAccess access = accessOf.get(index);
+                if (access.restrictsDocuments()) {
+                    docsOf.put(e.getKey(), InfinoGetActionFilter.restrictedDocs(e.getKey(), e.getValue(), access));
+                } else if (!InfinoPlugin.inDefaultMode(md.getSettings())) {
+                    docsOf.put(e.getKey(), InfinoNative.docs(e.getKey(), e.getValue(), null));
+                }
             }
             MultiGetItemResponse[] responses = new MultiGetItemResponse[mget.getItems().size()];
             for (int i = 0; i < responses.length; i++) {
                 MultiGetRequest.Item item = mget.getItems().get(i);
-                InfinoNative.Doc doc = docsOf.get(item.index()).get(item.id());
-                String index = indices.get(item.index()).getIndex().getName();
-                GetResponse get = new GetResponse(InfinoGetActionFilter.result(index, item.id(), doc, accessOf.get(item.index()), item.fetchSourceContext()));
+                IndexMetadata md = indices.get(item.index());
+                Map<String, InfinoNative.Doc> byId = docsOf.get(tableOfItem[i]);
+                InfinoNative.Doc doc = byId != null ? byId.get(item.id()) : InfinoGetActionFilter.docOf(md, tableOfItem[i], item.id());
+                String routing = InfinoGetActionFilter.routingOf(md, tableOfItem[i], item.id(), doc);
+                GetResponse get = new GetResponse(
+                    InfinoGetActionFilter.result(md.getIndex().getName(), item.id(), doc, accessOf.get(item.index()), item.fetchSourceContext(), routing)
+                );
                 responses[i] = new MultiGetItemResponse(get, null);
             }
             @SuppressWarnings("unchecked")

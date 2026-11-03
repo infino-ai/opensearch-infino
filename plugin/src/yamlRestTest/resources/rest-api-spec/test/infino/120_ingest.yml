@@ -1,4 +1,6 @@
 ---
+# A proxy-mode index's writes run their pipelines in the plugin; a default-mode
+# index's go through the stock bulk, which runs them itself.
 "Ingest pipelines run on a write, as a stock bulk runs them":
   - do:
       ingest.put_pipeline:
@@ -31,6 +33,7 @@
           settings:
             number_of_shards: 1
             number_of_replicas: 0
+            index.infino.mode: proxy
             index.default_pipeline: ing_drop_three
             index.final_pipeline: ing_final
           mappings:

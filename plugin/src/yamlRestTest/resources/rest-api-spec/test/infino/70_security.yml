@@ -429,6 +429,23 @@
         body: { size: 0 }
   - match: { hits.total.value: 2 }
 
+  # SQL through the aliases reads as a search through them does.
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT count(*) AS c FROM sec5_big" }
+  - match: { rows.0.c: 2 }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      infino.sql:
+        body: { query: "SELECT count(*) AS c FROM sec5_beta" }
+  - match: { rows.0.c: $lucene_hidden }
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      infino.sql:
+        body: { query: "SELECT count(*) AS c FROM sec5_beta" }
+  - match: { rows.0.c: 2 }
+
 ---
 "Security: a user authenticated by an API token is answered as the security plugin answers over Lucene":
   - skip:

@@ -60,3 +60,30 @@ sec_mask:
       allowed_actions:
         - "read"
         - "indices:admin/mappings/get"
+
+# The same, masked with a named hash, and with a regular-expression replacement.
+sec_mask_hash:
+  reserved: false
+  cluster_permissions:
+    - "cluster_composite_ops_ro"
+  index_permissions:
+    - index_patterns:
+        - "sec*"
+      masked_fields:
+        - "ip::SHA-256"
+      allowed_actions:
+        - "read"
+        - "indices:admin/mappings/get"
+
+sec_mask_regex:
+  reserved: false
+  cluster_permissions:
+    - "cluster_composite_ops_ro"
+  index_permissions:
+    - index_patterns:
+        - "sec*"
+      masked_fields:
+        - 'ip::/\.[0-9]+$/::.0'
+      allowed_actions:
+        - "read"
+        - "indices:admin/mappings/get"

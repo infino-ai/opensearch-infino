@@ -8,12 +8,20 @@ cluster state, and every document lives in an Infino table on the hosted
 service or on storage of your own (`file://`, `s3://`, `gs://`, `az://`).
 Nothing is written to Lucene.
 
-The plugin answers at the **action layer**: bulk, search (so also `_count`
-and each request of an `_msearch`) and get for an Infino-backed index are
-served from the table before they are routed to any shard. The index's one
-shard stays empty. Nodes are stateless: a node with an empty data directory
-boots, reads a registry kept beside the tables and brings every index back
-with its mapping and aliases; the rows are where they were.
+In **default mode** (`index.infino.mode: default`, every index's default) an
+index keeps OpenSearch's own write path through its shards: each primary's
+engine writes the documents to its shard's table and keeps a Lucene index of
+document ids only, and each shard's query phase is answered from the table.
+A node started with `infino.default_mode.enabled: false` (for a search
+plugin that needs the query phase itself) creates its indices in proxy mode.
+
+In **proxy mode** (`index.infino.mode: proxy`) the plugin answers at the
+**action layer**: bulk, search (so also `_count` and each request of an
+`_msearch`) and get for an Infino-backed index are served from the table
+before they are routed to any shard. The index's one shard stays empty.
+Nodes are stateless: a node with an empty data directory boots, reads a
+registry kept beside the tables and brings every index back with its mapping
+and aliases; the rows are where they were.
 
 The original spike and its findings are in [HANDOVER.md](HANDOVER.md). Since
 then the plugin has been shaped for log and event streams: the table is
@@ -144,9 +152,15 @@ curl localhost:9200/logs/_search -H 'Content-Type: application/json' -d '{
 Settings: `index.infino.table` names the table explicitly (set it to reattach
 a recreated index to its rows; such a table is kept when the index is
 deleted); `index.infino.optimize_interval` (default 60s) compacts the table on
-a schedule. JVM properties `infino.batch.docs` (50000) and
+a schedule; `index.infino.edges: true` makes the index a graph's edges for
+`graph_walk` and `graph_rank` over the SQL route: each document is an edge
+`{src_table, src_id, dst_table, dst_id}` naming its two rows as the engine
+does, by the `_table` and `_id` a SQL read gives each row, and each compaction
+(and, in default mode, a force merge) builds the index the walks read. JVM properties `infino.batch.docs` (50000) and
 `infino.batch.bytes` (64 MiB) bound the writes a batch may hold while an
-append runs.
+append runs. The node setting `infino.sql.max_result_size` (the node's
+`http.max_content_length` when unset) bounds a SQL route result as JSON: a
+statement whose result passes it is refused with a 400.
 
 ## Hosted account, and stateless nodes
 

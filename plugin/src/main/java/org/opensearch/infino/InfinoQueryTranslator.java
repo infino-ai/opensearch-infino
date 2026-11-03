@@ -75,8 +75,20 @@ final class InfinoQueryTranslator {
     static final String OSID = "osid";
     /** The reserved column holding each document's JSON source. */
     static final String SOURCE = "source";
-    /** The reserved column holding the sequence number each document was written under (see {@link InfinoDocumentVersion}). */
+    /** The reserved column holding the routing value a default-mode document was written with, when it was. */
+    static final String ROUTING = "osrouting";
+    /**
+     * The reserved column holding the sequence number each document was written under: the plugin's in proxy mode
+     * (see {@link InfinoDocumentVersion}), the shard's own in default mode, stamped by its writer.
+     */
     static final String SEQ = "osseq";
+    /** The reserved column holding the sequence number of the operation that wrote each default-mode commit's newest row. */
+    static final String OP = "osop";
+    /**
+     * The reserved column naming the index whose write stamped a row's {@link #SEQ} and {@link #OP}: sequence
+     * numbers compare within one index's history only.
+     */
+    static final String GEN = "osgen";
     /**
      * What the bridge adds to a field's column name for the list column that
      * holds the field's values for a document that gives it several; the

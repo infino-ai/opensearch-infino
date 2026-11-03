@@ -43,26 +43,34 @@ import java.util.function.UnaryOperator;
  * the document rule narrows hits, totals, aggregations and gets alike.
  * {@code onRead} is told of every document the request is handed, by id
  * and as shown, where the security plugin's audit log watches the index
- * for reads (null when it does not). {@code aliasFilter} is what the
- * filtering aliases the request reached the index through keep (null when
- * it reads the index whole, see {@link InfinoAliasFilter}): not a security
- * rule, but a part of the search the user is held to as to their own query.
+ * for reads (null when it does not). {@code maskRuleOf} gives the masked-field
+ * expression a masked field is masked by, as the role writes it
+ * ({@code ip}, {@code ip::SHA-256}, {@code ip::/regex/::replacement}), and
+ * {@code maskAlgorithm} the node's default hash algorithm for one that names
+ * none (null when unset): what SQL needs to mask a value as {@code maskOf}
+ * does (see {@link InfinoSql}); both null when nothing is masked.
+ * {@code aliasFilter} is what the filtering aliases the request reached the
+ * index through keep (null when it reads the index whole, see
+ * {@link InfinoAliasFilter}): not a security rule, but a part of the search
+ * the user is held to as to their own query.
  */
 record InfinoAccess(
     List<QueryBuilder> documents,
     Predicate<String> fieldVisible,
     Function<String, UnaryOperator<String>> maskOf,
     BiConsumer<String, String> onRead,
+    Function<String, String> maskRuleOf,
+    String maskAlgorithm,
     QueryBuilder aliasFilter
 ) {
 
     private static final Logger log = LogManager.getLogger(InfinoAccess.class);
 
     /** No restriction: the request sees the index whole. */
-    static final InfinoAccess NONE = new InfinoAccess(null, null, null, null, null);
+    static final InfinoAccess NONE = new InfinoAccess(null, null, null, null);
 
     InfinoAccess(List<QueryBuilder> documents, Predicate<String> fieldVisible, Function<String, UnaryOperator<String>> maskOf) {
-        this(documents, fieldVisible, maskOf, null, null);
+        this(documents, fieldVisible, maskOf, null);
     }
 
     InfinoAccess(
@@ -71,7 +79,19 @@ record InfinoAccess(
         Function<String, UnaryOperator<String>> maskOf,
         BiConsumer<String, String> onRead
     ) {
-        this(documents, fieldVisible, maskOf, onRead, null);
+        this(documents, fieldVisible, maskOf, onRead, null, null);
+    }
+
+    /** A security plugin's rules, read through no filtering alias. */
+    InfinoAccess(
+        List<QueryBuilder> documents,
+        Predicate<String> fieldVisible,
+        Function<String, UnaryOperator<String>> maskOf,
+        BiConsumer<String, String> onRead,
+        Function<String, String> maskRuleOf,
+        String maskAlgorithm
+    ) {
+        this(documents, fieldVisible, maskOf, onRead, maskRuleOf, maskAlgorithm, null);
     }
 
     /** Whether the request reads only some of the index's rows: under a document rule, or through a filtering alias. */
@@ -101,7 +121,7 @@ record InfinoAccess(
             return this;
         }
         QueryBuilder narrowed = aliasFilter == null ? filter : QueryBuilders.boolQuery().filter(aliasFilter).filter(filter);
-        return new InfinoAccess(documents, fieldVisible, maskOf, onRead, narrowed);
+        return new InfinoAccess(documents, fieldVisible, maskOf, onRead, maskRuleOf, maskAlgorithm, narrowed);
     }
 
     /**

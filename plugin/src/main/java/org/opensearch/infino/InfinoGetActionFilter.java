@@ -17,11 +17,13 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.document.DocumentField;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.index.get.GetResult;
+import org.opensearch.index.mapper.RoutingFieldMapper;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.tasks.Task;
@@ -81,12 +83,14 @@ public class InfinoGetActionFilter implements ActionFilter {
             // document rule it is looked up through the rule, and its source is
             // cut to the fields the user may read.
             InfinoAccess access = InfinoSecurity.access(index.getIndex().getName(), "get");
-            String table = tables.ensure(index);
+            String table = tables.ensureForDocument(index, get.id(), get.routing());
             InfinoNative.Doc doc = access.restrictsDocuments()
                 ? restrictedDocs(table, List.of(get.id()), access).get(get.id())
-                : InfinoNative.getDoc(table, get.id());
+                : docOf(index, table, get.id());
             @SuppressWarnings("unchecked")
-            Response response = (Response) new GetResponse(result(index.getIndex().getName(), get.id(), doc, access, get.fetchSourceContext()));
+            Response response = (Response) new GetResponse(
+                result(index.getIndex().getName(), get.id(), doc, access, get.fetchSourceContext(), routingOf(index, table, get.id(), doc))
+            );
             listener.onResponse(response);
         } catch (Exception e) {
             log.warn("[infino] get of {} from {} failed", get.id(), get.index(), e);
@@ -101,6 +105,17 @@ public class InfinoGetActionFilter implements ActionFilter {
      */
     static Map<String, InfinoNative.Doc> restrictedDocs(String table, List<String> ids, InfinoAccess access) {
         return InfinoNative.docs(table, ids, access.documentsWhere(InfinoNative.columns(table), table, System.currentTimeMillis()));
+    }
+
+    /**
+     * A document as a read sees it now, with the sequence number it was
+     * written under: in default mode a write its shard has acknowledged and
+     * not yet committed counts, as a stock get reads the translog; in proxy
+     * mode an acknowledged write is in the table already. Null when it is
+     * missing or deleted.
+     */
+    static InfinoNative.Doc docOf(IndexMetadata index, String table, String id) {
+        return InfinoPlugin.inDefaultMode(index.getSettings()) ? InfinoEngine.currentDoc(table, id) : InfinoNative.getDoc(table, id);
     }
 
     /** The Infino-backed index a request names, directly or through an alias; null when it names something else. */
@@ -121,12 +136,25 @@ public class InfinoGetActionFilter implements ActionFilter {
     }
 
     /**
+     * The routing value a found default-mode document was written with, which
+     * a stock get reports as {@code _routing}; null when it was written with
+     * none, when it was not found, or in proxy mode, which routes nothing.
+     */
+    static String routingOf(IndexMetadata index, String table, String id, InfinoNative.Doc doc) {
+        if (doc == null || !InfinoPlugin.inDefaultMode(index.getSettings())) {
+            return null;
+        }
+        return InfinoEngine.currentRouting(table, id);
+    }
+
+    /**
      * A get result from the table's document (null when it is missing): its
      * source as the user may see it (the read reported to the audit log when
-     * it watches the index), with the request's source filter applied, and
-     * the sequence number it was written under.
+     * it watches the index), with the request's source filter applied, the
+     * sequence number it was written under, and {@code routing} (null for
+     * none) as its {@code _routing}.
      */
-    static GetResult result(String index, String id, InfinoNative.Doc doc, InfinoAccess access, FetchSourceContext fetch) {
+    static GetResult result(String index, String id, InfinoNative.Doc doc, InfinoAccess access, FetchSourceContext fetch, String routing) {
         String source = doc == null ? null : access.read(id, doc.source());
         boolean exists = source != null && !source.isEmpty();
         BytesReference bytes = null;
@@ -145,7 +173,7 @@ public class InfinoGetActionFilter implements ActionFilter {
             exists,
             bytes,
             Map.of(),
-            Map.of()
+            exists && routing != null ? Map.of(RoutingFieldMapper.NAME, new DocumentField(RoutingFieldMapper.NAME, List.of(routing))) : Map.of()
         );
     }
 }

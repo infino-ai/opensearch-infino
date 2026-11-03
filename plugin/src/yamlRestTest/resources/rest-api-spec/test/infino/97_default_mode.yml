@@ -1,0 +1,727 @@
+---
+"Default mode: writes through the shard's engine, reads from the table":
+  - do:
+      indices.create:
+        index: em
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+            refresh_interval: -1
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              level: { type: keyword }
+              message: { type: text }
+              status: { type: long }
+              took: { type: float }
+
+  # The mapper refuses what the mapping cannot hold, as on any index.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: em, _id: a }
+          - { "@timestamp": "2026-10-24T10:00:00Z", level: error, message: "disk full on node-3", status: 500, took: 1.5 }
+          - index: { _index: em, _id: b }
+          - { "@timestamp": "2026-10-24T10:01:00Z", level: info, message: "request served", status: 200, took: 3 }
+          - index: { _index: em, _id: c }
+          - { "@timestamp": "2026-10-24T10:02:00Z", level: warn, message: "slow disk", status: "not-a-number" }
+          - index: { _index: em, _id: d }
+          - { "@timestamp": "2026-10-24T10:03:00Z", level: info, message: "cache warm", status: 204, took: 0.5 }
+  - match: { errors: true }
+  - match: { items.0.index.status: 201 }
+  - match: { items.2.index.status: 400 }
+  - match: { items.3.index.status: 201 }
+
+  # A range the shard's own rewrite would turn to match_none over the empty
+  # Lucene skeleton, newest first, with the exact total.
+  - do:
+      search:
+        index: em
+        body:
+          track_total_hits: true
+          query:
+            range: { "@timestamp": { gte: "2026-10-24T10:00:30Z" } }
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d }
+  - match: { hits.hits.0._source.message: "cache warm" }
+  - match: { hits.hits.1._id: b }
+
+  # Text, a source filter, requested fields, a script field and aggregations over the same relation.
+  - do:
+      search:
+        index: em
+        body:
+          query:
+            match: { message: disk }
+          _source: [ level ]
+          docvalue_fields: [ status ]
+          script_fields:
+            doubled: { script: { source: "doc['status'].value * 2" } }
+          aggs:
+            levels: { terms: { field: level } }
+            took: { sum: { field: took } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: a }
+  - match: { hits.hits.0._source: { level: error } }
+  - match: { hits.hits.0.fields.status: [ 500 ] }
+  - match: { hits.hits.0.fields.doubled: [ 1000 ] }
+  - match: { aggregations.levels.buckets.0.key: error }
+  - match: { aggregations.took.value: 1.5 }
+
+  - do:
+      search:
+        index: em
+        body:
+          size: 0
+          aggs:
+            levels: { terms: { field: level } }
+            took: { avg: { field: took } }
+  - match: { hits.total.value: 3 }
+  - match: { aggregations.levels.buckets.0.key: info }
+  - match: { aggregations.levels.buckets.0.doc_count: 2 }
+  - match: { aggregations.took.value: 1.6666666666666667 }
+
+  # One hit per level, the newest of each.
+  - do:
+      search:
+        index: em
+        body:
+          collapse: { field: level }
+          sort: [ { "@timestamp": desc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: d }
+  - match: { hits.hits.0.fields.level: [ info ] }
+  - match: { hits.hits.1._id: a }
+
+  - do:
+      get:
+        index: em
+        id: b
+  - match: { _source.message: "request served" }
+
+  # A partial update merges into the document, a scripted one is refused as in
+  # proxy mode, and a write that replaces a document replaces its row.
+  - do:
+      update:
+        index: em
+        id: a
+        body: { doc: { level: fatal } }
+  - match: { result: updated }
+  # The merged document is read back before a refresh, as a stock get reads the translog.
+  - do:
+      get:
+        index: em
+        id: a
+  - match: { _source.level: fatal }
+  - match: { _source.message: "disk full on node-3" }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - update: { _index: em, _id: b }
+          - { doc: { took: 4 } }
+          - update: { _index: em, _id: zz }
+          - { doc: { took: 1 } }
+          - update: { _index: em, _id: b }
+          - { script: { source: "ctx._source.took += 1" } }
+  - match: { items.0.update.result: updated }
+  - match: { items.1.update.status: 404 }
+  - match: { items.2.update.status: 400 }
+  - do:
+      search:
+        index: em
+        body:
+          query: { term: { level: fatal } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: a }
+  - do:
+      search:
+        index: em
+        body:
+          size: 0
+          aggs:
+            took: { sum: { field: took } }
+  # a 1.5, b now 4, d 0.5 (c was refused)
+  - match: { aggregations.took.value: 6.0 }
+
+  - do:
+      delete:
+        index: em
+        id: d
+        refresh: true
+  - do:
+      count:
+        index: em
+  - match: { count: 2 }
+
+---
+"Default mode: a scroll, and the requests built on it":
+  - do:
+      indices.create:
+        index: ems
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 2
+            number_of_replicas: 0
+          mappings:
+            properties:
+              n: { type: long }
+              kind: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ems, _id: "1" }
+          - { n: 1, kind: odd }
+          - index: { _index: ems, _id: "2" }
+          - { n: 2, kind: even }
+          - index: { _index: ems, _id: "3" }
+          - { n: 3, kind: odd }
+          - index: { _index: ems, _id: "4" }
+          - { n: 4, kind: even }
+          - index: { _index: ems, _id: "5" }
+          - { n: 5, kind: odd }
+  - match: { errors: false }
+
+  # Two shards, two tables: a sort, a total and aggregations merge across them.
+  - do:
+      search:
+        index: ems
+        body:
+          sort: [ { n: desc } ]
+          size: 3
+          aggs:
+            kinds: { terms: { field: kind } }
+            total: { sum: { field: n } }
+  - match: { hits.total.value: 5 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { aggregations.kinds.buckets.0.key: odd }
+  - match: { aggregations.kinds.buckets.0.doc_count: 3 }
+  - match: { aggregations.total.value: 15.0 }
+  - do:
+      get:
+        index: ems
+        id: "4"
+  - match: { _source.n: 4 }
+  - do:
+      mget:
+        body: { docs: [ { _index: ems, _id: "1" }, { _index: ems, _id: "2" } ] }
+  - match: { docs.0._source.n: 1 }
+  - match: { docs.1._source.n: 2 }
+
+  - do:
+      search:
+        index: ems
+        scroll: 1m
+        body:
+          size: 2
+          sort: [ { n: asc } ]
+  - match: { hits.total.value: 5 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - set: { _scroll_id: scroll }
+  - do:
+      scroll:
+        scroll_id: $scroll
+        scroll: 1m
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+  - do:
+      scroll:
+        scroll_id: $scroll
+        scroll: 1m
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "5" }
+  - do:
+      scroll:
+        scroll_id: $scroll
+        scroll: 1m
+  - length: { hits.hits: 0 }
+  - do:
+      clear_scroll:
+        scroll_id: $scroll
+
+---
+"Default mode: terms over two shards ranks from more than each shard's top":
+  # Routed so the overall top term is neither shard's top: shard 0 holds
+  # a x3 and b x2, shard 1 holds c x3 and b x2, so b leads with 4. A shard
+  # that returned only its own top for size 1 would leave b out.
+  - do:
+      indices.create:
+        index: emt
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 2
+            number_of_replicas: 0
+          mappings:
+            properties:
+              kind: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emt, _id: "1", routing: r0 }
+          - { kind: a }
+          - index: { _index: emt, _id: "2", routing: r0 }
+          - { kind: a }
+          - index: { _index: emt, _id: "3", routing: r0 }
+          - { kind: a }
+          - index: { _index: emt, _id: "4", routing: r0 }
+          - { kind: b }
+          - index: { _index: emt, _id: "5", routing: r0 }
+          - { kind: b }
+          - index: { _index: emt, _id: "6", routing: r1 }
+          - { kind: c }
+          - index: { _index: emt, _id: "7", routing: r1 }
+          - { kind: c }
+          - index: { _index: emt, _id: "8", routing: r1 }
+          - { kind: c }
+          - index: { _index: emt, _id: "9", routing: r1 }
+          - { kind: b }
+          - index: { _index: emt, _id: "10", routing: r1 }
+          - { kind: b }
+  - match: { errors: false }
+  # A routed document reports its routing value, from a get as from a search hit.
+  - do:
+      get:
+        index: emt
+        id: "6"
+        routing: r1
+  - match: { _routing: r1 }
+  - match: { _source.kind: c }
+  - do:
+      mget:
+        body: { docs: [ { _index: emt, _id: "1", routing: r0 }, { _index: emt, _id: "9", routing: r1 } ] }
+  - match: { docs.0._routing: r0 }
+  - match: { docs.1._routing: r1 }
+  - do:
+      search:
+        index: emt
+        body: { query: { ids: { values: [ "6" ] } } }
+  - match: { hits.hits.0._routing: r1 }
+  # r0 routes to shard 0, r1 to shard 1; searched alone, shard 0's top is a.
+  - do:
+      search:
+        index: emt
+        preference: _shards:0
+        body: { size: 0, aggs: { kinds: { terms: { field: kind, size: 1 } } } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.kinds.buckets.0.key: a }
+  - do:
+      search:
+        index: emt
+        body: { size: 0, aggs: { kinds: { terms: { field: kind, size: 1 } } } }
+  - match: { hits.total.value: 10 }
+  - length: { aggregations.kinds.buckets: 1 }
+  - match: { aggregations.kinds.buckets.0.key: b }
+  - match: { aggregations.kinds.buckets.0.doc_count: 4 }
+  # Each shard returned every group it has, so the count is exact.
+  - match: { aggregations.kinds.doc_count_error_upper_bound: 0 }
+  - match: { aggregations.kinds.sum_other_doc_count: 6 }
+
+---
+"Default mode: a search sees what the skeleton's reader sees, a get every acknowledged write":
+  # With refresh off, each write is in the table once acknowledged, which a
+  # get reads; a search sees it after the refresh that follows, as on a stock
+  # index, and its hits, total and aggregations agree before and after.
+  - do:
+      indices.create:
+        index: emw
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            index.refresh_interval: -1
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      index:
+        index: emw
+        id: "1"
+        body: { n: 1 }
+  - do:
+      index:
+        index: emw
+        id: "2"
+        body: { n: 2 }
+  - do:
+      get:
+        index: emw
+        id: "2"
+  - match: { _source.n: 2 }
+  - do:
+      count:
+        index: emw
+  - match: { count: 0 }
+  - do:
+      search:
+        index: emw
+        body: { size: 10, sort: [ { n: asc } ], aggs: { total: { sum: { field: n } } } }
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - match: { aggregations.total.value: 0.0 }
+  - do:
+      indices.refresh:
+        index: emw
+  - do:
+      search:
+        index: emw
+        body: { size: 10, sort: [ { n: asc } ], aggs: { total: { sum: { field: n } } } }
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { aggregations.total.value: 3.0 }
+  # A write after the refresh: the table holds three rows, the reader two.
+  - do:
+      index:
+        index: emw
+        id: "3"
+        body: { n: 3 }
+  - do:
+      search:
+        index: emw
+        body: { size: 10, aggs: { total: { sum: { field: n } } } }
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { aggregations.total.value: 3.0 }
+  - do:
+      count:
+        index: emw
+  - match: { count: 2 }
+
+---
+"Default mode: cardinality and percentiles over two shards are the whole index's":
+  # Each shard's table holds five users, two of them in both: the index holds
+  # eight. A shard that answered from its own table alone would report five,
+  # and the coordinating node could not merge two exact counts into eight.
+  - do:
+      indices.create:
+        index: emc
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 2
+            number_of_replicas: 0
+          mappings:
+            properties:
+              user: { type: keyword }
+              kind: { type: keyword }
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emc, _id: "1", routing: r0 }
+          - { user: u1, kind: a, n: 1 }
+          - index: { _index: emc, _id: "2", routing: r0 }
+          - { user: u2, kind: a, n: 2 }
+          - index: { _index: emc, _id: "3", routing: r0 }
+          - { user: u3, kind: a, n: 3 }
+          - index: { _index: emc, _id: "4", routing: r0 }
+          - { user: u4, kind: a, n: 4 }
+          - index: { _index: emc, _id: "5", routing: r0 }
+          - { user: u5, kind: a, n: 5 }
+          - index: { _index: emc, _id: "6", routing: r1 }
+          - { user: u4, kind: a, n: 6 }
+          - index: { _index: emc, _id: "7", routing: r1 }
+          - { user: u5, kind: a, n: 7 }
+          - index: { _index: emc, _id: "8", routing: r1 }
+          - { user: u6, kind: a, n: 8 }
+          - index: { _index: emc, _id: "9", routing: r1 }
+          - { user: u7, kind: b, n: 9 }
+          - index: { _index: emc, _id: "10", routing: r1 }
+          - { user: u8, kind: b, n: 10 }
+  - match: { errors: false }
+  - do:
+      search:
+        index: emc
+        body:
+          size: 0
+          aggs:
+            users: { cardinality: { field: user } }
+            n_pct: { percentiles: { field: n, percents: [ 50 ] } }
+            n_rank: { percentile_ranks: { field: n, values: [ 5 ] } }
+            kinds:
+              terms: { field: kind }
+              aggs:
+                users: { cardinality: { field: user } }
+  - match: { hits.total.value: 10 }
+  - match: { aggregations.users.value: 8 }
+  - match: { aggregations.kinds.buckets.0.key: a }
+  - match: { aggregations.kinds.buckets.0.doc_count: 8 }
+  - match: { aggregations.kinds.buckets.0.users.value: 6 }
+  - match: { aggregations.kinds.buckets.1.key: b }
+  - match: { aggregations.kinds.buckets.1.doc_count: 2 }
+  - match: { aggregations.kinds.buckets.1.users.value: 2 }
+  - match: { aggregations.kinds.doc_count_error_upper_bound: 0 }
+  - set: { aggregations.n_pct.values.50\.0: median }
+  - set: { aggregations.n_rank.values.5\.0: rank }
+  # The same rows in one shard's table give the same answers.
+  - do:
+      indices.create:
+        index: emc1
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emc1, _id: "1" }
+          - { n: 1 }
+          - index: { _index: emc1, _id: "2" }
+          - { n: 2 }
+          - index: { _index: emc1, _id: "3" }
+          - { n: 3 }
+          - index: { _index: emc1, _id: "4" }
+          - { n: 4 }
+          - index: { _index: emc1, _id: "5" }
+          - { n: 5 }
+          - index: { _index: emc1, _id: "6" }
+          - { n: 6 }
+          - index: { _index: emc1, _id: "7" }
+          - { n: 7 }
+          - index: { _index: emc1, _id: "8" }
+          - { n: 8 }
+          - index: { _index: emc1, _id: "9" }
+          - { n: 9 }
+          - index: { _index: emc1, _id: "10" }
+          - { n: 10 }
+  - do:
+      search:
+        index: emc1
+        body:
+          size: 0
+          aggs:
+            n_pct: { percentiles: { field: n, percents: [ 50 ] } }
+            n_rank: { percentile_ranks: { field: n, values: [ 5 ] } }
+  - match: { aggregations.n_pct.values.50\.0: $median }
+  - match: { aggregations.n_rank.values.5\.0: $rank }
+  # A search routed to one shard answers over that shard's table alone.
+  - do:
+      search:
+        index: emc
+        routing: r0
+        body: { size: 0, aggs: { users: { cardinality: { field: user } } } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.users.value: 5 }
+
+---
+"Default mode: cardinality and percentiles over two indices are both indices' together":
+  # Each index holds four users, one of them in both: the two hold seven. Two
+  # exact counts of four cannot be merged into seven, so the coordinating node
+  # answers over both indices' tables at once.
+  - do:
+      indices.create:
+        index: emx1
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { user: { type: keyword }, n: { type: long } } }
+  - do:
+      indices.create:
+        index: emx2
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { user: { type: keyword }, n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emx1, _id: "1" }
+          - { user: u1, n: 1 }
+          - index: { _index: emx1, _id: "2" }
+          - { user: u2, n: 2 }
+          - index: { _index: emx1, _id: "3" }
+          - { user: u3, n: 3 }
+          - index: { _index: emx1, _id: "4" }
+          - { user: u4, n: 4 }
+          - index: { _index: emx2, _id: "5" }
+          - { user: u4, n: 5 }
+          - index: { _index: emx2, _id: "6" }
+          - { user: u5, n: 6 }
+          - index: { _index: emx2, _id: "7" }
+          - { user: u6, n: 7 }
+          - index: { _index: emx2, _id: "8" }
+          - { user: u7, n: 8 }
+  - match: { errors: false }
+  - do:
+      search:
+        index: emx1,emx2
+        body:
+          size: 0
+          aggs:
+            users: { cardinality: { field: user } }
+            n_pct: { percentiles: { field: n, percents: [ 50 ] } }
+            n_sum: { sum: { field: n } }
+  - match: { hits.total.value: 8 }
+  - match: { aggregations.users.value: 7 }
+  - match: { aggregations.n_sum.value: 36.0 }
+  - set: { aggregations.n_pct.values.50\.0: median_both }
+  # The same rows in one index give the same median.
+  - do:
+      indices.create:
+        index: emx3
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emx3, _id: "1" }
+          - { n: 1 }
+          - index: { _index: emx3, _id: "2" }
+          - { n: 2 }
+          - index: { _index: emx3, _id: "3" }
+          - { n: 3 }
+          - index: { _index: emx3, _id: "4" }
+          - { n: 4 }
+          - index: { _index: emx3, _id: "5" }
+          - { n: 5 }
+          - index: { _index: emx3, _id: "6" }
+          - { n: 6 }
+          - index: { _index: emx3, _id: "7" }
+          - { n: 7 }
+          - index: { _index: emx3, _id: "8" }
+          - { n: 8 }
+  - do:
+      search:
+        index: emx3
+        body: { size: 0, aggs: { n_pct: { percentiles: { field: n, percents: [ 50 ] } } } }
+  - match: { aggregations.n_pct.values.50\.0: $median_both }
+  # Under a query too: n of 4 or more keeps u4 in both indices, counted once, and u5 to u7.
+  - do:
+      search:
+        index: emx1,emx2
+        body:
+          size: 0
+          query: { range: { n: { gte: 4 } } }
+          aggs: { users: { cardinality: { field: user } } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.users.value: 4 }
+
+---
+"Default mode: delete by query scrolls the tables and deletes through the shards":
+  # The reindex module is in the test distributions from 3.6.
+  - skip:
+      version: " - 3.5.99"
+      reason: the test distribution has no reindex module before 3.6
+  - do:
+      indices.create:
+        index: emd
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 2
+            number_of_replicas: 0
+          mappings:
+            properties:
+              n: { type: long }
+              kind: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emd, _id: "1" }
+          - { n: 1, kind: odd }
+          - index: { _index: emd, _id: "2" }
+          - { n: 2, kind: even }
+          - index: { _index: emd, _id: "3" }
+          - { n: 3, kind: odd }
+          - index: { _index: emd, _id: "4" }
+          - { n: 4, kind: even }
+  - do:
+      delete_by_query:
+        index: emd
+        refresh: true
+        body:
+          query: { term: { kind: even } }
+  - match: { deleted: 2 }
+  - do:
+      count:
+        index: emd
+  - match: { count: 2 }
+
+---
+"Default mode under the security plugin's document and masking rules":
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: sec_em
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              tag: { type: keyword }
+              ip: { type: keyword }
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec_em, _id: "e1" }
+          - { tag: x, ip: "10.0.0.1", n: 1 }
+          - index: { _index: sec_em, _id: "e2" }
+          - { tag: y, ip: "10.0.0.2", n: 2 }
+          - index: { _index: sec_em, _id: "e3" }
+          - { tag: y, ip: "10.0.0.1", n: 3 }
+  - match: { errors: false }
+  # The background of significant_terms is the documents the user may see:
+  # e1 alone, not the two documents the rule hides (one of them shares e1's ip).
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec_em
+        body:
+          size: 0
+          aggs:
+            ips: { significant_terms: { field: ip, min_doc_count: 1 } }
+  - match: { aggregations.ips.doc_count: 1 }
+  - match: { aggregations.ips.bg_count: 1 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec_em
+        body:
+          aggs:
+            total_n: { sum: { field: n } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "e1" }
+  - match: { aggregations.total_n.value: 1 }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      search:
+        index: sec_em
+        body:
+          sort: [ { n: asc } ]
+  - match: { hits.hits.0._source.tag: x }
+  - match:
+      hits.hits.0._source.ip: /^[0-9a-f]{64}$/
