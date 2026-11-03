@@ -108,6 +108,8 @@ final class InfinoSecurity {
     private static final int THE_SHARD = 0;
     /** The user's own word on whether an API token authenticated the request (3.9 and later). */
     private static final String API_TOKEN_REQUEST = "isApiTokenRequest";
+    /** The node setting naming the default hash algorithm for masked fields; unset means the security plugin's own default. */
+    private static final String MASKING_ALGORITHM_SETTING = "plugins.security.masked_fields.algorithm.default";
 
     /** The security plugin's evaluator and its processed rules, wherever this release keeps them. */
     private interface Evaluation {
@@ -431,10 +433,25 @@ final class InfinoSecurity {
                     throw refused(what, index, "its masking rule could not be evaluated: " + reason(e));
                 }
             };
-            return new InfinoAccess(documents, visible, maskOf, onRead);
+            // The masked field's own expression, as its role writes it, for SQL to mask by.
+            Function<String, String> maskRuleOf = maskOf == null ? null : field -> {
+                try {
+                    Object f = call(masking, "get", field);
+                    return f == null ? null : f.toString();
+                } catch (ReflectiveOperationException e) {
+                    throw refused(what, index, "its masking rule could not be evaluated: " + reason(e));
+                }
+            };
+            return new InfinoAccess(documents, visible, maskOf, onRead, maskRuleOf, maskOf == null ? null : maskAlgorithm());
         } catch (ReflectiveOperationException e) {
             throw refused(what, index, "its document- and field-level rules could not be evaluated: " + reason(e));
         }
+    }
+
+    /** The node's default hash algorithm for a masked field that names none, as the security plugin reads it; null when unset. */
+    private static String maskAlgorithm() {
+        Injector injector = InfinoSecurity.injector;
+        return injector == null ? null : injector.getInstance(Settings.class).get(MASKING_ALGORITHM_SETTING);
     }
 
     /**

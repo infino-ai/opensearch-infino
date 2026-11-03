@@ -32,3 +32,13 @@ sec_mask:
   reserved: false
   users:
     - "mask_user"
+
+sec_mask_hash:
+  reserved: false
+  users:
+    - "hash_user"
+
+sec_mask_regex:
+  reserved: false
+  users:
+    - "regex_user"
