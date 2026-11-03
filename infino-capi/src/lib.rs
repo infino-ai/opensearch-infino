@@ -60,10 +60,24 @@ use rayon::prelude::*;
 const OSID: &str = "osid";
 /// The raw `_source` JSON of a row, served back by the fetch phase.
 const SOURCE: &str = "source";
-/// The sequence number of the write that put the row there, which the
-/// plugin hands out and a conditional write is checked against; null for a
-/// row written without one (it reads as 0).
+/// The routing value a row was written with, when it was written with one:
+/// what rebuilding a shard's documents from its table routes them by. The
+/// column appears with the first routed write.
+const ROUTING: &str = "osrouting";
+/// The sequence number of the write that put the row there: in proxy mode
+/// the one the plugin hands out, which a conditional write is checked
+/// against; in default mode the shard's own, stamped by its writer, and a
+/// search over a reader that does not hold that write yet leaves the row
+/// out. Null for a row written without one (it reads as 0).
 const SEQ: &str = "osseq";
+/// The sequence number of the operation that wrote a row, when the writer
+/// records one: the highest in a table says how far into the writer's
+/// history the table holds every write.
+const OP: &str = "osop";
+/// Which writer stamped a row's [`SEQ`] and [`OP`]: sequence numbers
+/// compare only between rows of one writer's history, so a cut leaves
+/// another's alone.
+const GEN: &str = "osgen";
 /// Separator used when a multi-valued string field lands in a scalar string
 /// column: the values are joined so a text index sees every token. The
 /// original array is still in `source`.
@@ -820,13 +834,15 @@ fn mapped_fields(mapping: &Value) -> Vec<MappedField> {
 }
 
 /// Create the table from the mapping, or bring an existing table's schema up
-/// to it: a mapped field the table lacks is added with its mapped type. A
-/// mapped field whose type disagrees with the column it already has, or a
-/// `text` field mapped after creation (a text index can only be declared
-/// at creation; the engine's index description is not constructible from
-/// outside the crate), is a conflict the mapping cannot express over this
-/// table: the call fails naming it, so the index answers with the reason
-/// instead of serving the column as something it is not.
+/// to it: a mapped field the table lacks is added with its mapped type, a
+/// `text` one with the text index it would have had at creation (the
+/// mapping grows as documents arrive, a dynamic field included). A mapped
+/// field whose type disagrees with the column it already has, or a `text`
+/// field the table already holds without a text index (an index is part of
+/// a column's definition, fixed when the column is added), is a conflict the
+/// mapping cannot express over this table: the call fails naming it, so the
+/// index answers with the reason instead of serving the column as something
+/// it is not.
 fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, String> {
     let mapped = mapped_fields(mapping);
     bridge.keep_precisions(name, &mapped);
@@ -837,17 +853,47 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
         Ok(table) => {
             let schema = table.schema();
             let table_schema = conn.schema(name).map_err(|e| e.to_string())?;
+            // The text index a field added now gets: the one creation gives a
+            // text field, the engine's defaults (as the id column's index
+            // carries them) with positions.
+            let text_index = table_schema
+                .fields()
+                .iter()
+                .find(|c| c.name == OSID)
+                .and_then(|c| match &c.index {
+                    Some(ColumnIndex::Fts {
+                        stopwords,
+                        stemmer,
+                        stored,
+                        bm25,
+                        ..
+                    }) => Some(ColumnIndex::Fts {
+                        stopwords: *stopwords,
+                        stemmer: *stemmer,
+                        positions: true,
+                        stored: *stored,
+                        bm25: *bm25,
+                    }),
+                    _ => None,
+                });
             let mut conflicts: Vec<String> = Vec::new();
             for f in &mapped {
+                let present = schema.field_with_name(&f.path).is_ok();
                 let indexed = table_schema
                     .fields()
                     .iter()
                     .any(|c| c.name == f.path && matches!(c.index, Some(ColumnIndex::Fts { .. })));
-                // A text index can only be declared at creation, so a text field the
-                // table lacks, or holds without one, cannot be served as text.
-                if f.fts && !indexed {
+                // A column's index is fixed when the column is added, so a text field
+                // the table holds without one cannot be served as text.
+                if f.fts && present && !indexed {
                     conflicts.push(format!(
-                        "[{}] is mapped as text but the table has no text index on it; a text index can only be declared when the index is created",
+                        "[{}] is mapped as text but the table holds it without a text index",
+                        f.path
+                    ));
+                }
+                if f.fts && !present && text_index.is_none() {
+                    conflicts.push(format!(
+                        "[{}] is mapped as text but the table has no text index to model one on",
                         f.path
                     ));
                 }
@@ -873,9 +919,13 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                 .iter()
                 .filter(|f| f.path != SEQ && schema.field_with_name(&f.path).is_err())
                 .map(|f| {
-                    FieldPatch::named(f.path.clone())
+                    let patch = FieldPatch::named(f.path.clone())
                         .with_type(f.data_type.clone())
-                        .with_nullable(true)
+                        .with_nullable(true);
+                    match (&text_index, f.fts) {
+                        (Some(index), true) => patch.with_index(index.clone()),
+                        _ => patch,
+                    }
                 })
                 .collect();
             // A table made before the plugin kept sequence numbers gains the
@@ -1563,11 +1613,21 @@ pub unsafe extern "C" fn infino_index_batch_buf(
         if buf.is_null() || id_ends.is_null() || src_ends.is_null() || count <= 0 {
             return err_json("empty batch");
         }
-        let prepared =
-            match unsafe { prepare(conn, name, buf, buf_len, id_ends, src_ends, count as usize) } {
-                Ok(p) => p,
-                Err(why) => return err_json(&why),
-            };
+        let prepared = match unsafe {
+            prepare(
+                conn,
+                name,
+                buf,
+                buf_len,
+                id_ends,
+                src_ends,
+                None,
+                count as usize,
+            )
+        } {
+            Ok(p) => p,
+            Err(why) => return err_json(&why),
+        };
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
@@ -1596,7 +1656,24 @@ pub struct Prepared {
     failed: Vec<(usize, String)>,
 }
 
-/// Parse the buffer's documents in parallel and convert them to one Arrow batch.
+/// Each row's routing value and sequence numbers, beside the buffer of ids
+/// and sources: `rt_ends[i]` is where row i's routing value ends (it follows
+/// the row's source in the buffer; an empty one is none), `seqs[i]` its
+/// stamp and `ops[i]` the operation that wrote it (each negative for none),
+/// by writer `gen`.
+#[derive(Clone, Copy)]
+struct RowMeta {
+    rt_ends: *const u32,
+    seqs: *const i64,
+    ops: *const i64,
+    gen: i64,
+}
+
+/// Parse the buffer's documents in parallel and convert them to one Arrow
+/// batch. With `meta`, each row also keeps its routing value in
+/// [`ROUTING`], its stamp in [`SEQ`] and its operation in [`OP`] (see
+/// [`RowMeta`]).
+#[allow(clippy::too_many_arguments)]
 unsafe fn prepare(
     conn: &Bridge,
     name: &str,
@@ -1604,36 +1681,62 @@ unsafe fn prepare(
     buf_len: usize,
     id_ends: *const u32,
     src_ends: *const u32,
+    meta: Option<RowMeta>,
     n: usize,
 ) -> Result<Prepared, String> {
     let bytes = unsafe { std::slice::from_raw_parts(buf, buf_len) };
     let id_ends = unsafe { std::slice::from_raw_parts(id_ends, n) };
     let src_ends = unsafe { std::slice::from_raw_parts(src_ends, n) };
+    let rt_ends = meta.map(|m| unsafe { std::slice::from_raw_parts(m.rt_ends, n) });
+    let seqs = meta.map(|m| unsafe { std::slice::from_raw_parts(m.seqs, n) });
+    let ops = meta.map(|m| unsafe { std::slice::from_raw_parts(m.ops, n) });
+    let gen = meta.map_or(0, |m| m.gen);
     let table = conn.table(name).map_err(|e| e.to_string())?;
     let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
     let schema = table.schema();
     let precisions = conn.precisions(name);
 
-    // Each row's id and source as borrowed slices of the buffer.
-    let mut rows_in: Vec<(&str, &str)> = Vec::with_capacity(n);
+    // Each row's id, source and routing value as borrowed slices of the
+    // buffer, with its stamp and operation.
+    let mut rows_in: Vec<(&str, &str, &str, i64, i64)> = Vec::with_capacity(n);
     let mut start = 0usize;
     for i in 0..n {
         let (id_end, src_end) = (id_ends[i] as usize, src_ends[i] as usize);
-        if id_end < start || src_end < id_end || src_end > buf_len {
+        let rt_end = rt_ends.map_or(src_end, |ends| ends[i] as usize);
+        if id_end < start || src_end < id_end || rt_end < src_end || rt_end > buf_len {
             return Err("offsets out of range".into());
         }
         let id = std::str::from_utf8(&bytes[start..id_end]).unwrap_or("");
         let src = std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}");
-        rows_in.push((id, src));
-        start = src_end;
+        let routing = std::str::from_utf8(&bytes[src_end..rt_end]).unwrap_or("");
+        rows_in.push((
+            id,
+            src,
+            routing,
+            seqs.map_or(-1, |s| s[i]),
+            ops.map_or(-1, |o| o[i]),
+        ));
+        start = rt_end;
     }
 
     let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
         .par_iter()
-        .map(|(id, src)| {
+        .map(|(id, src, routing, seq, op)| {
             conform_doc(src, &schema, &precisions).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 flat.insert(SOURCE.into(), Value::String((*src).to_string()));
+                if !routing.is_empty() {
+                    flat.insert(ROUTING.into(), Value::String((*routing).to_string()));
+                }
+                if *seq >= 0 {
+                    flat.insert(SEQ.into(), json!(*seq));
+                }
+                if *op >= 0 {
+                    flat.insert(OP.into(), json!(*op));
+                }
+                if *seq >= 0 || *op >= 0 {
+                    flat.insert(GEN.into(), json!(gen));
+                }
                 flat
             })
         })
@@ -1937,7 +2040,80 @@ pub unsafe extern "C" fn infino_prepare_batch(
         if buf.is_null() || id_ends.is_null() || src_ends.is_null() || count <= 0 {
             return ptr::null_mut();
         }
-        match unsafe { prepare(conn, name, buf, buf_len, id_ends, src_ends, count as usize) } {
+        match unsafe {
+            prepare(
+                conn,
+                name,
+                buf,
+                buf_len,
+                id_ends,
+                src_ends,
+                None,
+                count as usize,
+            )
+        } {
+            Ok(p) => Box::into_raw(Box::new(p)),
+            Err(why) => {
+                eprintln!("[capi] prepare: {why}");
+                ptr::null_mut()
+            }
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// [`infino_prepare_batch`] for documents with a routing value and two
+/// sequence numbers each: the buffer holds `id0 source0 routing0 id1 ...`,
+/// `rt_ends[i]` is where row i's routing value ends (an empty one is none),
+/// `seqs[i]` is its stamp and `ops[i]` the operation that wrote it (each
+/// negative for none), by writer `gen`. A row keeps them in the
+/// `osrouting`, `osseq`, `osop` and `osgen` columns.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn infino_prepare_batch_meta(
+    h: *mut Bridge,
+    name: *const c_char,
+    buf: *const u8,
+    buf_len: usize,
+    id_ends: *const u32,
+    src_ends: *const u32,
+    rt_ends: *const u32,
+    seqs: *const i64,
+    ops: *const i64,
+    gen: i64,
+    count: c_int,
+) -> *mut Prepared {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
+            return ptr::null_mut();
+        };
+        if buf.is_null()
+            || id_ends.is_null()
+            || src_ends.is_null()
+            || rt_ends.is_null()
+            || seqs.is_null()
+            || ops.is_null()
+            || count <= 0
+        {
+            return ptr::null_mut();
+        }
+        match unsafe {
+            prepare(
+                conn,
+                name,
+                buf,
+                buf_len,
+                id_ends,
+                src_ends,
+                Some(RowMeta {
+                    rt_ends,
+                    seqs,
+                    ops,
+                    gen,
+                }),
+                count as usize,
+            )
+        } {
             Ok(p) => Box::into_raw(Box::new(p)),
             Err(why) => {
                 eprintln!("[capi] prepare: {why}");
@@ -2312,7 +2488,9 @@ pub unsafe extern "C" fn infino_value_counts(
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name), Some(column)) =
-            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(column) })
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(column)
+            })
         else {
             return ptr::null_mut();
         };
@@ -2610,6 +2788,7 @@ mod tests {
                 c("logs").as_ptr(),
                 c(column).as_ptr(),
                 c(query).as_ptr(),
+                c("or").as_ptr(),
                 10,
             )
         })
@@ -2813,6 +2992,23 @@ mod tests {
         // Fetch returns the document as sent.
         let src = get(h, "a");
         assert!(src.contains("\"tags\":[\"x\",\"y\"]"), "{src}");
+        close(h);
+    }
+
+    /// A text field the mapping adds after the table exists, as a dynamic
+    /// field is, gets the text index creation would have given it; a text
+    /// field the table already holds without one is still refused.
+    #[test]
+    fn a_text_field_mapped_late_gets_its_text_index() {
+        let h = open_logs();
+        let out = ensure(h, r#"{"properties":{"note":{"type":"text"}}}"#);
+        assert!(out.contains("\"added\":1"), "{out}");
+        index(h, &[("n1", r#"{"note":"a field mapped late"}"#)]);
+        let hits = bm25(h, "note", "late");
+        assert!(hits.contains("\"n1\""), "{hits}");
+        // `level` is a keyword column: mapping it as text cannot add the index.
+        let out = ensure(h, r#"{"properties":{"level":{"type":"text"}}}"#);
+        assert!(out.contains("without a text index"), "{out}");
         close(h);
     }
 
@@ -3667,7 +3863,10 @@ mod tests {
             sql(h, "SELECT osid FROM logs WHERE level = 'error'"),
             written
         );
-        assert!(bytes_under(&cache) > 0, "the reopened read went through the cache");
+        assert!(
+            bytes_under(&cache) > 0,
+            "the reopened read went through the cache"
+        );
         close(h);
         let _ = std::fs::remove_dir_all(&root);
     }

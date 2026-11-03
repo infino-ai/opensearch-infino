@@ -50,6 +50,25 @@ public interface InfinoLib extends Library {
     Pointer infino_prepare_batch(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
 
     /**
+     * {@link #infino_prepare_batch} with each row's routing value after its source (empty for none), ending
+     * at {@code rtEnds}, its stamp in {@code seqs} and the operation that wrote it in {@code ops} (each
+     * negative for none), by writer {@code gen}.
+     */
+    Pointer infino_prepare_batch_meta(
+        Pointer h,
+        String name,
+        byte[] buf,
+        long bufLen,
+        int[] idEnds,
+        int[] srcEnds,
+        int[] rtEnds,
+        long[] seqs,
+        long[] ops,
+        long gen,
+        int count
+    );
+
+    /**
      * Append prepared batches in one commit and release them; the rows whose ids
      * are in {@code replaced} replace the table's rows under those ids in the
      * same mutation (null or zero for a plain append). {@code seqs} holds the

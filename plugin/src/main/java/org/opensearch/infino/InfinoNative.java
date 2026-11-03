@@ -595,22 +595,38 @@ public final class InfinoNative {
         return why == null || why.isEmpty() ? null : why;
     }
 
-    /** The ids and sources of a batch as one UTF-8 buffer with the end offset of each id and each source. */
-    private record Packed(byte[] buf, int[] idEnds, int[] srcEnds) {
+    /**
+     * The ids and sources of a batch as one UTF-8 buffer with the end offset
+     * of each id and each source; with routing values, each row's follows its
+     * source (empty for none) and {@code rtEnds} holds where it ends.
+     */
+    private record Packed(byte[] buf, int[] idEnds, int[] srcEnds, int[] rtEnds) {
         static Packed of(List<String> osids, List<String> sources) {
+            return of(osids, sources, null);
+        }
+
+        static Packed of(List<String> osids, List<String> sources, List<String> routings) {
             int n = osids.size();
             int[] idEnds = new int[n];
             int[] srcEnds = new int[n];
+            int[] rtEnds = routings == null ? null : new int[n];
             byte[][] idBytes = new byte[n][];
             byte[][] srcBytes = new byte[n][];
+            byte[][] rtBytes = new byte[n][];
             int total = 0;
             for (int i = 0; i < n; i++) {
                 idBytes[i] = osids.get(i).getBytes(StandardCharsets.UTF_8);
                 srcBytes[i] = sources.get(i).getBytes(StandardCharsets.UTF_8);
+                String routing = routings == null ? null : routings.get(i);
+                rtBytes[i] = routing == null ? new byte[0] : routing.getBytes(StandardCharsets.UTF_8);
                 total += idBytes[i].length;
                 idEnds[i] = total;
                 total += srcBytes[i].length;
                 srcEnds[i] = total;
+                if (rtEnds != null) {
+                    total += rtBytes[i].length;
+                    rtEnds[i] = total;
+                }
             }
             byte[] buf = new byte[total];
             int at = 0;
@@ -619,8 +635,12 @@ public final class InfinoNative {
                 at += idBytes[i].length;
                 System.arraycopy(srcBytes[i], 0, buf, at, srcBytes[i].length);
                 at += srcBytes[i].length;
+                if (rtEnds != null) {
+                    System.arraycopy(rtBytes[i], 0, buf, at, rtBytes[i].length);
+                    at += rtBytes[i].length;
+                }
             }
-            return new Packed(buf, idEnds, srcEnds);
+            return new Packed(buf, idEnds, srcEnds, rtEnds);
         }
     }
 
@@ -639,6 +659,59 @@ public final class InfinoNative {
         init();
         Packed p = Packed.of(osids, sources);
         return lib.infino_prepare_batch(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), osids.size());
+    }
+
+    /**
+     * {@link #prepare} with each row's routing value (null for none), stamp
+     * and the operation that wrote it (each negative for none), by writer
+     * {@code gen}, kept in the {@link InfinoQueryTranslator#ROUTING},
+     * {@link InfinoQueryTranslator#SEQ}, {@link InfinoQueryTranslator#OP} and
+     * {@link InfinoQueryTranslator#GEN} columns.
+     */
+    public static Pointer prepare(
+        String name,
+        List<String> osids,
+        List<String> sources,
+        List<String> routings,
+        long[] seqs,
+        long[] ops,
+        long gen
+    ) {
+        init();
+        Packed p = Packed.of(osids, sources, routings);
+        return lib.infino_prepare_batch_meta(
+            conn,
+            name,
+            p.buf(),
+            p.buf().length,
+            p.idEnds(),
+            p.srcEnds(),
+            p.rtEnds(),
+            seqs,
+            ops,
+            gen,
+            osids.size()
+        );
+    }
+
+    /**
+     * The highest operation writer {@code gen} recorded on a row of table
+     * {@code name}, or null when no row carries one of its operations.
+     */
+    public static Long highestOp(String name, long gen) {
+        if (!columns(name).containsKey(InfinoQueryTranslator.OP)) {
+            return null;
+        }
+        String op = InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.OP);
+        String sql = "SELECT max(" + op + ") AS highest FROM " + InfinoQueryTranslator.quoteIdent(name) + " WHERE "
+            + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.GEN) + " = " + gen;
+        for (Map<String, Object> row : sqlRows(sql)) {
+            Object highest = row.get("highest");
+            if (highest instanceof Number n) {
+                return n.longValue();
+            }
+        }
+        return null;
     }
 
     /**
@@ -902,6 +975,28 @@ public final class InfinoNative {
                 found.put(id.toString(), seq(row.get(InfinoQueryTranslator.SEQ)));
             }
         }
+    }
+
+    /**
+     * The routing value the table's row for {@code id} was written with,
+     * through the id column's term index; null when the row was written with
+     * none, when there is no row, or when the table never took a routed write.
+     */
+    public static String routingOf(String name, String id) {
+        if (!columns(name).containsKey(InfinoQueryTranslator.ROUTING)) {
+            return null;
+        }
+        String sql = "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING)
+            + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
+            + InfinoQueryTranslator.literal(id) + ", 'and')";
+        for (Map<String, Object> row : sqlRows(sql)) {
+            Object rowId = row.get(InfinoQueryTranslator.OSID);
+            Object routing = row.get(InfinoQueryTranslator.ROUTING);
+            if (rowId != null && id.equals(rowId.toString())) {
+                return routing == null ? null : routing.toString();
+            }
+        }
+        return null;
     }
 
     /** Keep the sources of rows a hit statement returned (id and source columns), for the fetch phase. */

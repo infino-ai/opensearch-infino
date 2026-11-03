@@ -1,9 +1,11 @@
 ---
+# A proxy-mode index's shards hold no documents, so its stats are the table's; a
+# default-mode index's shards count their own, as a stock index's do.
 "Index stats and _cat/indices count the documents in the table":
   - do:
       indices.create:
         index: st1
-        body: { settings: { number_of_shards: 1, number_of_replicas: 0 } }
+        body: { settings: { index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 } }
   - do:
       bulk:
         refresh: true

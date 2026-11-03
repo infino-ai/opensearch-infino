@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -41,6 +42,12 @@ import java.util.function.Supplier;
 public class InfinoSearchActionFilter implements ActionFilter {
 
     private static final Logger log = LogManager.getLogger(InfinoSearchActionFilter.class);
+    /**
+     * The shard whose table a default-mode index's alias filters are checked
+     * against: every shard's table holds the index's mapped columns, and a
+     * filter the engine cannot serve is refused whatever the shard.
+     */
+    private static final int ALIAS_CHECK_SHARD = 0;
 
     private final Supplier<ClusterService> clusterService;
     private final Supplier<IndexNameExpressionResolver> resolver;
@@ -86,12 +93,70 @@ public class InfinoSearchActionFilter implements ActionFilter {
         }
         List<Index> infino = new ArrayList<>();
         List<IndexMetadata> metadata = new ArrayList<>();
+        int engine = 0;
         for (String name : concrete) {
             IndexMetadata md = state.metadata().index(name);
-            if (md != null && md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
+            if (md == null) {
+                continue;
+            }
+            if (InfinoPlugin.inProxyMode(md.getSettings())) {
                 infino.add(md.getIndex());
                 metadata.add(md);
+            } else if (InfinoPlugin.inDefaultMode(md.getSettings())) {
+                engine++;
             }
+        }
+        if (engine > 0) {
+            if (engine != concrete.length) {
+                listener.onFailure(new IllegalArgumentException("[infino] a search mixing default-mode indices with others is not served"));
+                return;
+            }
+            // Served by the shards, which plan from the source as written (see
+            // InfinoQueryExt): the cluster routes it as it routes any search,
+            // a scroll included, and merges the shards' results.
+            SearchSourceBuilder written = search.source() == null ? new SearchSourceBuilder() : search.source();
+            String id = InfinoQueryExt.newRequestId();
+            long now = System.currentTimeMillis();
+            // A filtering alias the search reaches an index through is checked
+            // here, before any shard reads, as proxy mode checks it: one the
+            // table cannot answer is refused naming the alias. Each shard reads
+            // through the filter the cluster resolves for it.
+            Map<String, QueryBuilder> filters = new HashMap<>();
+            try {
+                for (String name : concrete) {
+                    IndexMetadata md = state.metadata().index(name);
+                    if (md.getAliases().isEmpty()) {
+                        continue; // no alias, so none that filters
+                    }
+                    String table = InfinoPlugin.tables().ensure(md, ALIAS_CHECK_SHARD);
+                    filters.put(name, InfinoAliasFilter.of(state, names, md, search.indices(), table, now));
+                }
+            } catch (Exception e) {
+                listener.onFailure(e);
+                return;
+            }
+            // A cardinality or percentiles aggregation over more than one shard is
+            // answered here, once, over every reached shard's table (see
+            // InfinoExactAggregation): the search is recorded for it, with what the
+            // user may see of each index, read now under the user's own identity,
+            // and what an alias filter keeps of it.
+            boolean exactAtCoordinator = reachedShardCount(clusters, names, state, search, concrete) > 1
+                && written.aggregations() != null
+                && InfinoAggregationProcessor.needsExactValues(written.aggregations().getAggregatorFactories());
+            ActionListener<Response> answered = listener;
+            if (exactAtCoordinator) {
+                Map<String, InfinoAccess> access = new HashMap<>();
+                for (String name : concrete) {
+                    access.put(name, InfinoSecurity.access(name, InfinoSecurityCalls.SEARCH).filteredBy(filters.get(name)));
+                }
+                InfinoExactAggregation.record(id, written, now, access);
+                // Its final reduce runs before the search answers, so the record
+                // goes once it has: the records held are the searches in flight.
+                answered = ActionListener.runAfter(listener, () -> InfinoExactAggregation.forget(id));
+            }
+            search.source(InfinoQueryExt.route(written, id, exactAtCoordinator, now));
+            chain.proceed(task, action, request, answered);
+            return;
         }
         if (infino.isEmpty()) {
             chain.proceed(task, action, request, listener);
@@ -151,5 +216,14 @@ public class InfinoSearchActionFilter implements ActionFilter {
             log.debug("[infino] search over {} failed: {}", infino, e.getMessage());
             listener.onFailure(e);
         }
+    }
+
+    /**
+     * How many shards the search reaches, over every index it names, as the
+     * cluster will route it (its routing values and shard preference applied).
+     */
+    private static int reachedShardCount(ClusterService clusters, IndexNameExpressionResolver names, ClusterState state, SearchRequest search, String[] concrete) {
+        Map<String, Set<String>> routing = names.resolveSearchRouting(state, search.routing(), search.indices());
+        return clusters.operationRouting().searchShards(state, concrete, routing, search.preference()).size();
     }
 }

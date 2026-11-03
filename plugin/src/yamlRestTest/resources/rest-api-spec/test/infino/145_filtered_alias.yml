@@ -100,6 +100,45 @@
   - match: { aggregations.total_n.value: 1 }
 
 ---
+"An exact aggregation over several shards reads through the alias's filter":
+  - do:
+      indices.create:
+        index: fa4
+        body:
+          settings: { number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long }, tag: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: fa4, _id: "1" }
+          - { n: 1, tag: a }
+          - index: { _index: fa4, _id: "2" }
+          - { n: 2, tag: a }
+          - index: { _index: fa4, _id: "3" }
+          - { n: 3, tag: b }
+          - index: { _index: fa4, _id: "4" }
+          - { n: 4, tag: b }
+  - match: { errors: false }
+  - do:
+      indices.update_aliases:
+        body:
+          actions:
+            - add: { index: fa4, alias: fa4_a, filter: { term: { tag: a } } }
+  # A cardinality over two shards is answered once, not merged from the shards' parts.
+  - do:
+      search:
+        index: fa4_a
+        body: { size: 0, aggs: { ns: { cardinality: { field: n } } } }
+  - match: { hits.total.value: 2 }
+  - match: { aggregations.ns.value: 2 }
+  - do:
+      search:
+        index: fa4
+        body: { size: 0, aggs: { ns: { cardinality: { field: n } } } }
+  - match: { aggregations.ns.value: 4 }
+
+---
 "A filtered alias whose filter the table cannot answer is refused as a limit of the alias":
   - do:
       indices.create:

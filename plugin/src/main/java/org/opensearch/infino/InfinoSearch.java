@@ -78,7 +78,7 @@ import java.util.function.Function;
 
 /**
  * Answers one {@code _search} for one Infino-backed index from its table,
- * at the action layer: no shard, no Lucene, no fetch phase.
+ * in proxy mode at the action layer: no shard, no Lucene, no fetch phase.
  *
  * <p>Hits come one of three ways: an {@code infino_knn} / {@code infino_hybrid}
  * query, or the k-NN plugin's own {@code knn} query (see {@link InfinoStockKnn}),
@@ -108,7 +108,7 @@ public final class InfinoSearch {
      */
     private static final int RANK_WINDOW = 10_000;
     /** OpenSearch's page size when the request names none. */
-    private static final int DEFAULT_SIZE = 10;
+    static final int DEFAULT_SIZE = 10;
     /** The node name a hit's shard target carries; it only names the index in the response. */
     private static final String NODE = "infino";
     /** How a date in a hit's source is read back and printed when its mapping names no format: OpenSearch's default. */
@@ -131,7 +131,7 @@ public final class InfinoSearch {
      * the aggregations. {@code collapse} is the column hits are collapsed on
      * (null when none), {@code searchAfter} the sort values the page starts
      * after (null when none), {@code access} what the request may see of
-     * each document.
+     * each document, {@code nowMillis} the time {@code now} means in it.
      */
     record Plan(
         String table,
@@ -143,7 +143,8 @@ public final class InfinoSearch {
         Column collapse,
         Object[] searchAfter,
         List<ScriptedField> scriptFields,
-        InfinoAccess access
+        InfinoAccess access,
+        long nowMillis
     ) {
         List<String> orderBy() {
             return InfinoSearch.orderBy(sorts);
@@ -152,6 +153,13 @@ public final class InfinoSearch {
         /** The predicate the hits satisfy: the query's and the post_filter's. */
         String hitWhere() {
             return postWhere == null ? query.where() : "(" + query.where() + ") AND (" + postWhere + ")";
+        }
+
+        /** This plan with {@code predicate} required of every row, the hits', the total's and the aggregations' alike. */
+        Plan requiring(String predicate) {
+            String where = InfinoQueryTranslator.ALL.equals(query.where()) ? predicate : "(" + query.where() + ") AND " + predicate;
+            Translation narrowed = new Translation(query.table(), where, query.principal());
+            return new Plan(table, cols, narrowed, sorts, vector, postWhere, collapse, searchAfter, scriptFields, access, nowMillis);
         }
     }
 
@@ -266,7 +274,7 @@ public final class InfinoSearch {
             query = new Translation(query.table(), where, query.principal());
         }
         log.debug("[infino] query {} -> FROM {} WHERE {}", qb, query.from(), query.where());
-        List<SortSpec> sorts = sorts(source.sorts(), cols);
+        List<SortSpec> sorts = sorts(source.sorts(), cols, nowMillis);
         String postWhere = null;
         if (source.postFilter() != null) {
             if (vector != null) {
@@ -330,7 +338,7 @@ public final class InfinoSearch {
                 throw new IllegalArgumentException("[infino] search_after is not served with a vector query");
             }
         }
-        Plan plan = new Plan(table, cols, query, sorts, vector, postWhere, collapse, searchAfter, scriptFields, access);
+        Plan plan = new Plan(table, cols, query, sorts, vector, postWhere, collapse, searchAfter, scriptFields, access, nowMillis);
         InfinoAggregationProcessor.check(builders(source), plan);
         return plan;
     }
@@ -388,9 +396,9 @@ public final class InfinoSearch {
      * The field sorts over columns, in request order; {@code _score} and
      * {@code _doc} add nothing, and {@code _seq_no} orders by the sequence
      * numbers the table keeps. Throws when a sort names something the table
-     * has no column for.
+     * has no column for. {@code nowMillis} is what a script's clock reads.
      */
-    static List<SortSpec> sorts(List<SortBuilder<?>> sorts, Map<String, Column> cols) {
+    static List<SortSpec> sorts(List<SortBuilder<?>> sorts, Map<String, Column> cols, long nowMillis) {
         List<SortSpec> out = new ArrayList<>();
         if (sorts == null) {
             return out;
@@ -401,7 +409,7 @@ public final class InfinoSearch {
             }
             if (sort instanceof ScriptSortBuilder ss) {
                 // A script sort orders by the script as a column expression; a script sees no masked column.
-                Sql sql = InfinoScriptTranslator.translate(ss.script(), InfinoAccess.scriptColumns(cols), null, System.currentTimeMillis());
+                Sql sql = InfinoScriptTranslator.translate(ss.script(), InfinoAccess.scriptColumns(cols), null, nowMillis);
                 out.add(new SortSpec(sql.expr(), "sort" + out.size(), sql.type(), ss.order() == SortOrder.DESC));
                 continue;
             }
@@ -723,7 +731,7 @@ public final class InfinoSearch {
     private static String keysetPredicate(Plan plan) {
         List<String> alternatives = new ArrayList<>();
         List<String> equal = new ArrayList<>();
-        long now = System.currentTimeMillis();
+        long now = plan.nowMillis();
         for (int i = 0; i < plan.searchAfter().length; i++) {
             SortSpec s = plan.sorts().get(i);
             String col = s.expr();
@@ -1103,6 +1111,20 @@ public final class InfinoSearch {
     }
 
     /**
+     * Whether a scroll of {@code source} pages by the id alone: its request
+     * names no sort but {@code _doc} or the score, which a scroll reads in
+     * the id's order (see {@link #scrollSource}).
+     */
+    static boolean scrollsById(SearchSourceBuilder source) {
+        return source.sorts() == null || source.sorts().stream().allMatch(InfinoSearch::ordersNothing);
+    }
+
+    /** A sort a scroll pages past in the id's order: {@code _doc}, or the score. */
+    private static boolean ordersNothing(SortBuilder<?> sort) {
+        return sort instanceof ScoreSortBuilder || sort instanceof FieldSortBuilder fs && FieldSortBuilder.DOC_FIELD_NAME.equals(fs.getFieldName());
+    }
+
+    /**
      * The request a scroll's later pages run: the first page's query, sorts,
      * window and fields, without its aggregations (a scroll computes them
      * once) and without a count (the first page's total is repeated). A
@@ -1117,20 +1139,14 @@ public final class InfinoSearch {
             out.postFilter(source.postFilter());
         }
         out.size(source.size() < 0 ? DEFAULT_SIZE : source.size());
-        boolean sorted = false;
         if (source.sorts() != null) {
             for (SortBuilder<?> sort : source.sorts()) {
-                if (sort instanceof FieldSortBuilder fs && FieldSortBuilder.DOC_FIELD_NAME.equals(fs.getFieldName())) {
-                    continue;
+                if (!ordersNothing(sort)) {
+                    out.sort(sort);
                 }
-                if (sort instanceof ScoreSortBuilder) {
-                    continue;
-                }
-                out.sort(sort);
-                sorted = true;
             }
         }
-        if (!sorted) {
+        if (scrollsById(source)) {
             out.sort(ID_SORT_FIELD);
         }
         if (source.fetchSource() != null) {
