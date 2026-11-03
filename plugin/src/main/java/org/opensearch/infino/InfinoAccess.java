@@ -15,6 +15,7 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.infino.InfinoNative.Column;
 
 import java.io.IOException;
@@ -42,26 +43,40 @@ import java.util.function.UnaryOperator;
  * the document rule narrows hits, totals, aggregations and gets alike.
  * {@code onRead} is told of every document the request is handed, by id
  * and as shown, where the security plugin's audit log watches the index
- * for reads (null when it does not).
+ * for reads (null when it does not). {@code aliasFilter} is what the
+ * filtering aliases the request reached the index through keep (null when
+ * it reads the index whole, see {@link InfinoAliasFilter}): not a security
+ * rule, but a part of the search the user is held to as to their own query.
  */
 record InfinoAccess(
     List<QueryBuilder> documents,
     Predicate<String> fieldVisible,
     Function<String, UnaryOperator<String>> maskOf,
-    BiConsumer<String, String> onRead
+    BiConsumer<String, String> onRead,
+    QueryBuilder aliasFilter
 ) {
 
     private static final Logger log = LogManager.getLogger(InfinoAccess.class);
 
     /** No restriction: the request sees the index whole. */
-    static final InfinoAccess NONE = new InfinoAccess(null, null, null, null);
+    static final InfinoAccess NONE = new InfinoAccess(null, null, null, null, null);
 
     InfinoAccess(List<QueryBuilder> documents, Predicate<String> fieldVisible, Function<String, UnaryOperator<String>> maskOf) {
-        this(documents, fieldVisible, maskOf, null);
+        this(documents, fieldVisible, maskOf, null, null);
     }
 
+    InfinoAccess(
+        List<QueryBuilder> documents,
+        Predicate<String> fieldVisible,
+        Function<String, UnaryOperator<String>> maskOf,
+        BiConsumer<String, String> onRead
+    ) {
+        this(documents, fieldVisible, maskOf, onRead, null);
+    }
+
+    /** Whether the request reads only some of the index's rows: under a document rule, or through a filtering alias. */
     boolean restrictsDocuments() {
-        return documents != null;
+        return documents != null || aliasFilter != null;
     }
 
     boolean restrictsFields() {
@@ -74,6 +89,19 @@ record InfinoAccess(
 
     boolean unrestricted() {
         return !restrictsDocuments() && !restrictsFields() && !masks();
+    }
+
+    /**
+     * This access with its rows narrowed to what {@code filter} keeps too, as
+     * a filtering alias narrows a search: a row is kept when the document
+     * rule keeps it and so does the filter. Null keeps this access as it is.
+     */
+    InfinoAccess filteredBy(QueryBuilder filter) {
+        if (filter == null) {
+            return this;
+        }
+        QueryBuilder narrowed = aliasFilter == null ? filter : QueryBuilders.boolQuery().filter(aliasFilter).filter(filter);
+        return new InfinoAccess(documents, fieldVisible, maskOf, onRead, narrowed);
     }
 
     /**
@@ -123,20 +151,25 @@ record InfinoAccess(
      * The columns a plan may name: a hidden column is gone (the id and the
      * source stay, as metadata), a masked one carries its hash. A query,
      * sort, aggregation or script naming a hidden field then finds no
-     * column, as it would for an unmapped field.
+     * column, as it would for an unmapped field. A field alias goes with
+     * the field it names: hidden, masked or visible as that field is, and so
+     * does the list column holding a field's several values.
      */
     Map<String, Column> columns(Map<String, Column> cols) {
         if (!restrictsFields() && !masks()) {
             return cols;
         }
         Map<String, Column> out = new LinkedHashMap<>();
-        for (Column c : cols.values()) {
-            boolean reserved = c.name().equals(InfinoQueryTranslator.OSID) || c.name().equals(InfinoQueryTranslator.SOURCE);
-            if (!reserved && restrictsFields() && !fieldVisible.test(c.name())) {
+        for (Map.Entry<String, Column> entry : cols.entrySet()) {
+            Column c = entry.getValue();
+            String name = c.name();
+            boolean reserved = name.equals(InfinoQueryTranslator.OSID) || name.equals(InfinoQueryTranslator.SOURCE) || name.equals(InfinoQueryTranslator.SEQ);
+            String field = InfinoQueryTranslator.fieldOf(name);
+            if (!reserved && restrictsFields() && !fieldVisible.test(field)) {
                 continue;
             }
-            UnaryOperator<String> mask = reserved || !masks() ? null : maskOf.apply(c.name());
-            out.put(c.name(), mask == null ? c : c.masked(mask));
+            UnaryOperator<String> mask = reserved || !masks() ? null : maskOf.apply(field);
+            out.put(entry.getKey(), mask == null ? c : c.masked(mask));
         }
         return Collections.unmodifiableMap(out);
     }
@@ -144,21 +177,41 @@ record InfinoAccess(
     /** The columns a script may read: the visible ones that are not masked, since a script would read the value itself. */
     static Map<String, Column> scriptColumns(Map<String, Column> cols) {
         Map<String, Column> out = new LinkedHashMap<>();
-        for (Column c : cols.values()) {
-            if (!c.masked()) {
-                out.put(c.name(), c);
+        for (Map.Entry<String, Column> entry : cols.entrySet()) {
+            if (!entry.getValue().masked()) {
+                out.put(entry.getKey(), entry.getValue());
             }
         }
         return out.size() == cols.size() ? cols : Collections.unmodifiableMap(out);
     }
 
     /**
-     * The predicate the document rule adds to a plan, over the table's full
-     * columns (the rule may name fields the request may not); null when
-     * there is no rule. A rule the table cannot answer refuses the request.
+     * The predicate the document rule and the alias filter add to a plan;
+     * null when there is neither. The rule is read over the table's full
+     * columns (it may name fields the request may not), and a rule the table
+     * cannot answer refuses the request. The alias filter is read as the
+     * user's own query is, over the columns the user may name: a field
+     * hidden from the user is as if unmapped there and matches nothing, as
+     * on a stock index, where the filter runs over the user's reader.
      */
     String documentsWhere(Map<String, Column> fullCols, String table, long nowMillis) {
-        if (!restrictsDocuments()) {
+        String rules = rulesWhere(fullCols, table, nowMillis);
+        if (aliasFilter == null) {
+            return rules;
+        }
+        String alias = InfinoQueryTranslator.rulePredicate(aliasFilter, columns(fullCols), table, nowMillis);
+        if (alias == null) {
+            throw new IllegalArgumentException(
+                "[infino] a filtering alias the search reads through uses a query an Infino-backed index does not serve in an alias filter: "
+                    + aliasFilter
+            );
+        }
+        return rules == null ? alias : "(" + rules + ") AND (" + alias + ")";
+    }
+
+    /** The predicate the document rule adds to a plan (see {@link #documentsWhere}); null when there is no rule. */
+    private String rulesWhere(Map<String, Column> fullCols, String table, long nowMillis) {
+        if (documents == null) {
             return null;
         }
         List<String> any = new ArrayList<>();

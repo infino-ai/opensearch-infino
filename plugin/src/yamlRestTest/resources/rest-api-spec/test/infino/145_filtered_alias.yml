@@ -1,0 +1,133 @@
+---
+"A search through a filtered alias reads only what the alias's filter keeps, as on stock":
+  - do:
+      indices.create:
+        index: fa1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long }, tag: { type: keyword } } }
+  - do:
+      indices.create:
+        index: fa2
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long }, tag: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: fa1, _id: "a" }
+          - { n: 1, tag: a }
+          - index: { _index: fa1, _id: "b" }
+          - { n: 2, tag: b }
+          - index: { _index: fa2, _id: "c" }
+          - { n: 3, tag: a }
+          - index: { _index: fa2, _id: "d" }
+          - { n: 4, tag: c }
+  - match: { errors: false }
+  - do:
+      indices.update_aliases:
+        body:
+          actions:
+            - add: { index: fa1, alias: fa_a, filter: { term: { tag: a } } }
+            - add: { indices: [ fa1, fa2 ], alias: fa_all_a, filter: { term: { tag: a } } }
+            - add: { index: fa2, alias: fa_big, filter: { range: { n: { gte: 4 } } } }
+            - add: { index: fa1, alias: fa_plain }
+
+  # Hits, totals and aggregations all read through the filter.
+  - do:
+      search:
+        index: fa_a
+        body:
+          aggs: { total_n: { sum: { field: n } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: a }
+  - match: { aggregations.total_n.value: 1 }
+  - do:
+      count:
+        index: fa_a
+  - match: { count: 1 }
+
+  # An alias over two indices filters each; the query is narrowed, not replaced.
+  - do:
+      search:
+        index: fa_all_a
+        body:
+          sort: [ { n: asc } ]
+          query: { range: { n: { gte: 2 } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: c }
+
+  # Two filtering aliases over one index keep what either keeps, as stock does.
+  - do:
+      search:
+        index: fa_all_a,fa_big
+        body: { sort: [ { n: asc } ] }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: a }
+  - match: { hits.hits.1._id: c }
+  - match: { hits.hits.2._id: d }
+
+  # An alias without a filter, or the index named itself, reads it whole.
+  - do:
+      count:
+        index: fa_plain
+  - match: { count: 2 }
+  - do:
+      count:
+        index: fa_a,fa1
+  - match: { count: 2 }
+
+  # A repeated count-only search is kept, under the alias's filter: the same body
+  # through the alias and on the index itself answer each their own.
+  - do:
+      search:
+        index: fa_a
+        request_cache: true
+        body: { size: 0, aggs: { total_n: { sum: { field: n } } } }
+  - match: { aggregations.total_n.value: 1 }
+  - do:
+      search:
+        index: fa1
+        request_cache: true
+        body: { size: 0, aggs: { total_n: { sum: { field: n } } } }
+  - match: { aggregations.total_n.value: 3 }
+  - do:
+      search:
+        index: fa_a
+        request_cache: true
+        body: { size: 0, aggs: { total_n: { sum: { field: n } } } }
+  - match: { aggregations.total_n.value: 1 }
+
+---
+"A filtered alias whose filter the table cannot answer is refused as a limit of the alias":
+  - do:
+      indices.create:
+        index: fa3
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long }, tag: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: fa3, _id: "e" }
+          - { n: 5, tag: a }
+  - match: { errors: false }
+  - do:
+      indices.update_aliases:
+        body:
+          actions:
+            - add: { index: fa3, alias: fa_fuzzy, filter: { fuzzy: { tag: { value: b } } } }
+  # Refused as a request the index does not serve (400), naming the alias, not as a
+  # security rule the user does not have.
+  - do:
+      catch: /the filter of alias \[fa_fuzzy\]/
+      search:
+        index: fa_fuzzy
+  - match: { status: 400 }
+  # The index itself still reads whole.
+  - do:
+      count:
+        index: fa3
+  - match: { count: 1 }

@@ -48,6 +48,16 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("osid IN ('a', 'b')", translate(QueryBuilders.idsQuery().addIds("a", "b")).where());
     }
 
+    /** An object exists where any field under it does, and a pattern names the fields it matches; no field means no row. */
+    public void testExistsOnAnObjectOrAPattern() {
+        assertEquals("(\"host.name\" IS NOT NULL)", translate(QueryBuilders.existsQuery("host")).where());
+        assertEquals(
+            "(\"@timestamp\" IS NOT NULL OR \"status\" IS NOT NULL OR \"host.name\" IS NOT NULL)",
+            translate(QueryBuilders.existsQuery("*t*")).where()
+        );
+        assertEquals("1=0", translate(QueryBuilders.existsQuery("missing")).where());
+    }
+
     public void testDateRangeUsesDateMath() {
         Translation t = translate(QueryBuilders.rangeQuery("@timestamp").gte("now-15m").lte("now"));
         assertEquals("(\"@timestamp\" >= '2026-10-24T11:45:00Z' AND \"@timestamp\" <= '2026-10-24T12:00:00Z')", t.where());
@@ -99,7 +109,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             java.util.List.of(),
             InfinoAccess.NONE
         );
-        return InfinoSearch.hitStatement(plan, fetch);
+        return InfinoSearch.hitStatement(plan, fetch, false);
     }
 
     public void testRankedSearchUnderAFilterAsksForThePage() {

@@ -13,14 +13,11 @@ import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.update.UpdateAction;
 import org.opensearch.action.update.UpdateRequest;
-import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.tasks.Task;
 
-import java.util.List;
-import java.util.Map;
 import java.util.function.Supplier;
 
 /**
@@ -30,7 +27,8 @@ import java.util.function.Supplier;
  * first; the shard holds nothing, so the update is turned into a one-item
  * bulk here and served the same way as an update inside a bulk, its item's
  * response handed back as the update's. An index the update names before
- * it exists is created first, as for a bulk.
+ * it exists is created first, and its upsert goes through its ingest
+ * pipelines, as for a bulk.
  */
 public class InfinoUpdateActionFilter implements ActionFilter {
 
@@ -71,32 +69,18 @@ public class InfinoUpdateActionFilter implements ActionFilter {
             return;
         }
         BulkRequest bulk = new BulkRequest().add(update).setRefreshPolicy(update.getRefreshPolicy());
-        InfinoBulkActionFilter.createMissing(InfinoBulkActionFilter.missingIndices(clusters, bulk), ActionListener.wrap(created -> {
-            Map<String, IndexMetadata> infino;
-            List<String> concrete = InfinoBulkActionFilter.concreteIndices(clusters.state(), bulk);
-            try {
-                infino = InfinoBulkActionFilter.infinoIndices(clusters, concrete);
-            } catch (Exception e) {
-                listener.onFailure(e);
+        InfinoBulkActionFilter.route(bulk, clusters, writes, tables, ActionListener.wrap(response -> {
+            BulkItemResponse item = response.getItems()[0];
+            if (item.isFailed()) {
+                listener.onFailure(item.getFailure().getCause());
                 return;
             }
-            if (infino.isEmpty()) {
-                chain.proceed(task, action, request, listener);
-                return;
-            }
-            InfinoBulkActionFilter.serve(bulk, concrete, infino, writes, tables, ActionListener.wrap(response -> {
-                BulkItemResponse item = response.getItems()[0];
-                if (item.isFailed()) {
-                    listener.onFailure(item.getFailure().getCause());
-                    return;
-                }
-                @SuppressWarnings("unchecked")
-                Response cast = (Response) item.getResponse();
-                listener.onResponse(cast);
-            }, e -> {
-                log.debug("[infino] update of {} in {} failed: {}", update.id(), update.index(), e.getMessage());
-                listener.onFailure(e);
-            }));
-        }, listener::onFailure));
+            @SuppressWarnings("unchecked")
+            Response cast = (Response) item.getResponse();
+            listener.onResponse(cast);
+        }, e -> {
+            log.debug("[infino] update of {} in {} failed: {}", update.id(), update.index(), e.getMessage());
+            listener.onFailure(e);
+        }), () -> chain.proceed(task, action, request, listener));
     }
 }

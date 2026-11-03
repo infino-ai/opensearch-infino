@@ -88,6 +88,23 @@ public class InfinoAccessTests extends OpenSearchTestCase {
         assertEquals(InfinoQueryTranslator.NONE, none.documentsWhere(cols, "t", 0));
     }
 
+    public void testAnAliasFilterNarrowsEveryDocumentRule() {
+        Map<String, Column> cols = cols();
+        assertSame(InfinoAccess.NONE, InfinoAccess.NONE.filteredBy(null));
+        // No rule: the filter is the rule.
+        assertEquals("\"n\" = 3", InfinoAccess.NONE.filteredBy(QueryBuilders.termQuery("n", 3)).documentsWhere(cols, "t", 0));
+        // A rule: a row is kept when the rule and the filter both keep it.
+        InfinoAccess either = new InfinoAccess(List.of(QueryBuilders.termQuery("tag", "x"), QueryBuilders.termQuery("tag", "y")), null, null);
+        String where = either.filteredBy(QueryBuilders.termQuery("n", 3)).documentsWhere(cols, "t", 0);
+        assertTrue(where, where.contains("\"tag\" = 'x'") && where.contains("\"tag\" = 'y'") && where.contains("\"n\" = 3"));
+        assertTrue(where, where.startsWith("(") && where.contains(" OR "));
+        // The filter is read as the user's own query: a field the user may not see
+        // is as if unmapped, and keeps nothing.
+        InfinoAccess hidden = new InfinoAccess(null, field -> !field.equals("n"), null).filteredBy(QueryBuilders.termQuery("n", 3));
+        assertEquals(InfinoQueryTranslator.NONE, hidden.documentsWhere(cols, "t", 0));
+        assertTrue(hidden.restrictsDocuments());
+    }
+
     public void testDocumentRuleTheTableCannotAnswerRefuses() {
         InfinoAccess access = new InfinoAccess(List.of(QueryBuilders.nestedQuery("p", QueryBuilders.matchAllQuery(), ScoreMode.None)), null, null);
         OpenSearchSecurityException e = expectThrows(OpenSearchSecurityException.class, () -> access.documentsWhere(cols(), "t", 0));
