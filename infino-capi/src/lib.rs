@@ -1672,7 +1672,9 @@ pub unsafe extern "C" fn infino_count_where(
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name), Some(predicates)) =
-            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(predicates) })
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(predicates)
+            })
         else {
             return ptr::null_mut();
         };
