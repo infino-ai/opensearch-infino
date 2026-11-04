@@ -83,6 +83,37 @@
   - match: { aggregations.status_hist.buckets.3.key: 500.0 }
   - match: { aggregations.status_hist.buckets.3.doc_count: 3 }
 
+  # Range buckets that only count are asked in one statement: overlapping buckets each count
+  # every document in them, an open bucket counts all, and only the query's documents count.
+  # A metric under the buckets keeps each bucket's own statement, as filters buckets do (they
+  # may hold any query; 50_dashboard_requests has a text one).
+  - do:
+      search:
+        index: events
+        body:
+          size: 0
+          query: { range: { status: { gte: 201 } } }
+          aggs:
+            overlap:
+              range:
+                field: status
+                keyed: true
+                ranges: [ { key: low, to: 500 }, { key: wide, from: 200, to: 600 }, { key: all } ]
+            with_avg:
+              range:
+                field: status
+                ranges: [ { to: 450 }, { from: 450 } ]
+              aggs:
+                avg_took: { avg: { field: took } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.overlap.buckets.low.doc_count: 2 }
+  - match: { aggregations.overlap.buckets.wide.doc_count: 5 }
+  - match: { aggregations.overlap.buckets.all.doc_count: 5 }
+  - match: { aggregations.with_avg.buckets.0.doc_count: 2 }
+  - match: { aggregations.with_avg.buckets.0.avg_took.value: 5.5 }
+  - match: { aggregations.with_avg.buckets.1.doc_count: 3 }
+  - match: { aggregations.with_avg.buckets.1.avg_took.value: 4.666666666666667 }
+
   # Split chart by region, split series by host, a time axis under both, a metric at the leaf.
   - do:
       search:
