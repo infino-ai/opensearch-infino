@@ -546,6 +546,13 @@ public final class InfinoSearch {
                 }
                 vectorSeqs = InfinoNative.storedSeqs(plan.table(), ids);
             }
+        } else if (bareSorted(plan) && !seqNoAndPrimaryTerm) {
+            // Every row in one field's order, ties by the row id: the engine
+            // reads the page from the field's range index, with its sources,
+            // so no statement is planned for it. It returns no sequence
+            // numbers, so a request for them takes the hit statement.
+            SortSpec sort = plan.sorts().get(0);
+            rows = InfinoNative.sortedHits(plan.table(), sort.name(), sort.desc(), fetch, wantsSource(source));
         } else if (bareRanked(plan) && !seqNoAndPrimaryTerm) {
             // A text query and nothing else: the engine's BM25 call returns
             // the page with its sources, so no statement is planned for it. It
@@ -670,6 +677,30 @@ public final class InfinoSearch {
             && plan.searchAfter() == null
             && plan.collapse() == null
             && plan.scriptFields().isEmpty();
+    }
+
+    /**
+     * Whether the page's hits are every row in one field's order and nothing
+     * more: no text query, no predicate (a filter, a post_filter, a security
+     * rule, a read cut), no search_after, collapse or scripted field, and one
+     * sort, on a range-indexed column the request sees unmasked, broken by
+     * the row id. The engine's sorted call then returns exactly what
+     * {@link #hitStatement} would select.
+     */
+    static boolean bareSorted(Plan plan) {
+        if (plan.vector() != null
+            || plan.query().principal() != null
+            || !InfinoQueryTranslator.ALL.equals(plan.hitWhere())
+            || plan.searchAfter() != null
+            || plan.collapse() != null
+            || !plan.scriptFields().isEmpty()
+            || plan.sorts().size() != 2
+            || !plan.sorts().get(1).name().equals(InfinoSql.ROW_ID)) {
+            return false;
+        }
+        SortSpec sort = plan.sorts().get(0);
+        Column c = plan.cols().get(sort.name());
+        return c != null && c.range() && !c.masked() && sort.expr().equals(InfinoQueryTranslator.quoteIdent(c.name()));
     }
 
     /**

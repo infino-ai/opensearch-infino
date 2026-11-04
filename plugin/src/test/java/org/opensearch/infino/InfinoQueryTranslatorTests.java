@@ -142,6 +142,46 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertTrue(collapsed, collapsed.startsWith("SELECT osid, source, "));
     }
 
+    public void testAMatchAllSortedByARangeIndexedFieldTakesTheSortedCall() {
+        // One sort on a range-indexed column over every row: the engine's
+        // sorted call serves it. Anything more is a statement.
+        Map<String, Column> cols = new java.util.HashMap<>(columns());
+        cols.put("status", cols.get("status").ranged());
+        java.util.function.BiFunction<Translation, Object[], InfinoSearch.Plan> plan = (t, after) -> new InfinoSearch.Plan(
+            TABLE,
+            cols,
+            t,
+            java.util.List.of(InfinoSearch.SortSpec.of(cols.get("status"), true), InfinoSearch.SortSpec.rowId()),
+            null,
+            null,
+            null,
+            after,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        Translation all = translate(QueryBuilders.matchAllQuery());
+        assertTrue(InfinoSearch.bareSorted(plan.apply(all, null)));
+        assertFalse(InfinoSearch.bareSorted(plan.apply(all, new Object[] { 404 })));
+        assertFalse(InfinoSearch.bareSorted(plan.apply(translate(QueryBuilders.termQuery("level", "error")), null)));
+        assertFalse(InfinoSearch.bareSorted(plan.apply(all, null).requiring("\"status\" > 1")));
+        // A column without a range index is sorted by a statement.
+        InfinoSearch.Plan unranged = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            all,
+            java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true), InfinoSearch.SortSpec.rowId()),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertFalse(InfinoSearch.bareSorted(unranged));
+    }
+
     public void testTiesBreakByTheEngineRowId() {
         // Rows sharing the sort value are ordered by the engine's row id, which
         // the engine answers from its range index; a page continuing from a row

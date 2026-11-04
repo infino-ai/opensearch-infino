@@ -131,26 +131,41 @@ public final class InfinoNative {
      * masked for the user: how a value of the column is hashed before it
      * leaves the node (null when it is not). {@code dateFormat} is the format
      * a date column's mapping declares (null for the default one). {@code elem}
-     * is a list column's element type (null for any other column).
+     * is a list column's element type (null for any other column). {@code
+     * range} is whether the column has a range index, which serves a sort on it.
      */
-    public record Column(String name, String type, boolean fts, boolean vector, UnaryOperator<String> mask, String dateFormat, String elem) {
+    public record Column(
+        String name,
+        String type,
+        boolean fts,
+        boolean vector,
+        UnaryOperator<String> mask,
+        String dateFormat,
+        String elem,
+        boolean range
+    ) {
         public Column(String name, String type, boolean fts, boolean vector) {
-            this(name, type, fts, vector, null, null, null);
+            this(name, type, fts, vector, null, null, null, false);
         }
 
         /** A list column of {@code elem} values. */
         static Column list(String name, String elem) {
-            return new Column(name, "list", false, false, null, null, elem);
+            return new Column(name, "list", false, false, null, null, elem, false);
         }
 
         /** This column as the request sees it, its values masked by {@code mask}. */
         Column masked(UnaryOperator<String> mask) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, range);
         }
 
         /** This column with the date format its mapping declares. */
         Column dated(String dateFormat) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, range);
+        }
+
+        /** This column with a range index. */
+        Column ranged() {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, true);
         }
 
         /**
@@ -159,12 +174,12 @@ public final class InfinoNative {
          * words.
          */
         Column exact() {
-            return new Column(name, type, false, vector, mask, dateFormat, elem);
+            return new Column(name, type, false, vector, mask, dateFormat, elem, range);
         }
 
         /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */
         Column element() {
-            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null) : this;
+            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null, false) : this;
         }
 
         public boolean isList() {
@@ -561,7 +576,8 @@ public final class InfinoNative {
                 Boolean.TRUE.equals(c.get("vector")),
                 null,
                 null,
-                (String) c.get("elem")
+                (String) c.get("elem"),
+                Boolean.TRUE.equals(c.get("range"))
             );
             // A list column of a mapped field reads its dates as the field's do.
             String format = mapping == null ? null : mapping.dateFormats().get(InfinoQueryTranslator.fieldOf(column));
@@ -956,6 +972,20 @@ public final class InfinoNative {
         init();
         String out = takeOrThrow(lib.infino_bm25(conn, n, c, q, mode, k));
         log.debug("[infino] bm25: {} {} {} k={} -> {} chars", n, c, q, k, out.length());
+        return rows(out);
+    }
+
+    /**
+     * The first {@code k} rows of table {@code n} by range-indexed column
+     * {@code c}, highest first when {@code descending}, rows sharing a value
+     * in the engine's row id order: each with its id, the column's value, the
+     * row id and, when {@code withSource}, its source. A sorted page in one
+     * engine call, read from the range index, with no statement to plan.
+     */
+    public static List<Map<String, Object>> sortedHits(String n, String c, boolean descending, int k, boolean withSource) {
+        init();
+        String out = takeOrThrow(lib.infino_sorted(conn, n, c, descending ? 1 : 0, k, withSource ? 1 : 0));
+        log.debug("[infino] sorted: {} {} desc={} k={} -> {} chars", n, c, descending, k, out.length());
         return rows(out);
     }
 

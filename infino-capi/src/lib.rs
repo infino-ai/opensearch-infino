@@ -65,6 +65,9 @@ use rayon::prelude::*;
 const OSID: &str = "osid";
 /// The raw `_source` JSON of a row, served back by the fetch phase.
 const SOURCE: &str = "source";
+/// The engine's id of a row: the order rows were written in, which breaks
+/// the ties of a sorted page.
+const ROW_ID: &str = "_id";
 /// The routing value a row was written with, when it was written with one:
 /// what rebuilding a shard's documents from its table routes them by. The
 /// column appears with the first routed write.
@@ -1232,9 +1235,10 @@ fn type_name(dt: &DataType) -> &'static str {
     }
 }
 
-/// Columns of a table as JSON `[{"name","type","elem","fts","vector"}]`,
+/// Columns of a table as JSON `[{"name","type","elem","fts","vector","range"}]`,
 /// type in {i64,f64,bool,str,ts,vec,list,other}, `elem` a list column's
-/// element type (null for any other). `""` if the table is absent.
+/// element type (null for any other), `range` whether the column has a range
+/// index. `""` if the table is absent.
 #[no_mangle]
 pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
@@ -1260,6 +1264,7 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                             "elem": elem,
                             "fts": matches!(f.index, Some(ColumnIndex::Fts { .. })),
                             "vector": matches!(f.index, Some(ColumnIndex::Vector { .. })),
+                            "range": matches!(f.index, Some(ColumnIndex::Range)),
                         })
                     })
                     .collect();
@@ -2884,6 +2889,49 @@ pub unsafe extern "C" fn infino_bm25(
     .unwrap_or(ptr::null_mut())
 }
 
+/// The first `k` rows by one range-indexed column (`descending` non-zero for
+/// highest first), rows sharing a value in `_id` order and rows without one
+/// last, each carrying `osid`, the column, `_id` and, with `with_source`
+/// non-zero, `source`: a sorted page in one call, read from the range index,
+/// where the same page in SQL would plan a statement first.
+#[no_mangle]
+pub unsafe extern "C" fn infino_sorted(
+    h: *mut Bridge,
+    name: *const c_char,
+    column: *const c_char,
+    descending: c_int,
+    k: c_int,
+    with_source: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(column)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(column)
+            })
+        else {
+            return ptr::null_mut();
+        };
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let mut projection = vec![OSID, column, ROW_ID];
+        if with_source != 0 {
+            projection.push(SOURCE);
+        }
+        match table.sorted_search(
+            column,
+            descending != 0,
+            k.max(0) as usize,
+            Some(&projection),
+        ) {
+            Ok(b) => out_string(batches_to_json(&b)),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// Number of rows matching a token query on one text column (`mode` is
 /// `"and"` or `"or"`), without materializing them: the exact `hits.total`
 /// of a `match`.
@@ -3355,6 +3403,72 @@ mod tests {
                 10,
             )
         })
+    }
+
+    fn sorted(h: *mut Bridge, column: &str, descending: bool, k: c_int) -> Value {
+        let out = take(unsafe {
+            infino_sorted(
+                h,
+                c("logs").as_ptr(),
+                c(column).as_ptr(),
+                c_int::from(descending),
+                k,
+                1,
+            )
+        });
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
+    /// A sorted page comes back in the column's order, ties in the order the
+    /// rows were written, each row with its id, value, engine id and source,
+    /// as the same sort in SQL orders them; the column metadata says the
+    /// column is range indexed.
+    #[test]
+    fn a_sorted_page_is_the_sql_sort_in_one_call() {
+        let h = open_logs();
+        let cols = columns(h);
+        let status = cols
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|cc| cc["name"] == "status")
+            .unwrap_or_else(|| panic!("{cols}"));
+        assert_eq!(status["range"], true, "{cols}");
+        let docs: Vec<(String, String)> = (0..40)
+            .map(|i| {
+                (
+                    format!("d{i}"),
+                    format!(r#"{{"status":{},"level":"x"}}"#, (i * 7) % 5),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let out = index(h, &refs);
+        assert_eq!(out["ok"], 40, "{out}");
+        for descending in [false, true] {
+            let page = sorted(h, "status", descending, 12);
+            let direction = if descending { "DESC" } else { "ASC" };
+            let want = sql(
+                h,
+                &format!("SELECT osid FROM logs ORDER BY status {direction}, _id ASC LIMIT 12"),
+            );
+            let ids = |rows: &Value| -> Vec<String> {
+                rows.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r[OSID].as_str().unwrap().to_string())
+                    .collect()
+            };
+            assert_eq!(ids(&page), ids(&want), "descending {descending}");
+            let first = &page[0];
+            assert!(
+                first[SOURCE].as_str().unwrap().contains("\"level\":\"x\""),
+                "{page}"
+            );
+            assert!(first[ROW_ID].is_string(), "{page}");
+            assert!(first["status"].is_number(), "{page}");
+        }
+        close(h);
     }
 
     fn count(h: *mut Bridge, column: &str, query: &str) -> String {
