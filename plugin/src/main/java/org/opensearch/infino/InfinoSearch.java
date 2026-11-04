@@ -978,6 +978,10 @@ public final class InfinoSearch {
             // A bare text query: the engine counts its matches without materializing them.
             return InfinoNative.count(table, q.principal().column(), q.principal().query(), q.principal().mode());
         }
+        if (q.principal() == null) {
+            // A condition on the table's columns: the engine counts a range from its range index, with no statement.
+            return InfinoNative.countWhere(table, List.of(q.where()))[0];
+        }
         List<Map<String, Object>> rows = InfinoNative.sqlRows("SELECT COUNT(*) AS c FROM " + q.from() + " WHERE " + q.where());
         if (rows.isEmpty()) {
             return 0;
