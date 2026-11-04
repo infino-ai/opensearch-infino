@@ -171,7 +171,7 @@ const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
 /// when there is none; failing that, a whole number of milliseconds. `None`
 /// for any other string, which the engine's own parser then reads.
 fn default_format_millis(s: &str) -> Option<i64> {
-    date_optional_time_millis(s).or_else(|| {
+    optional_time_millis(s, true).or_else(|| {
         let digits = s.strip_prefix('-').unwrap_or(s);
         (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
             .then(|| s.parse::<i64>().ok())
@@ -179,25 +179,32 @@ fn default_format_millis(s: &str) -> Option<i64> {
     })
 }
 
-/// `strict_date_optional_time` (see [`default_format_millis`]).
-fn date_optional_time_millis(s: &str) -> Option<i64> {
+/// `strict_date_optional_time` (see [`default_format_millis`]), or with
+/// `strict` false `date_optional_time`, which also takes a month, day, hour,
+/// minute or second of one digit (`2026-4-30T9:05`), as OpenSearch's lenient
+/// form does.
+fn optional_time_millis(s: &str, strict: bool) -> Option<i64> {
     let b = s.as_bytes();
     let mut at = 0;
+    let part = |at: &mut usize| match strict {
+        true => fixed_digits(b, at, PART_DIGITS),
+        false => leading_digits(b, at, PART_DIGITS),
+    };
     let year = fixed_digits(b, &mut at, YEAR_DIGITS)?;
     let (mut month, mut day) = (1, 1);
     if skip_byte(b, &mut at, b'-') {
-        month = fixed_digits(b, &mut at, PART_DIGITS)?;
+        month = part(&mut at)?;
         if skip_byte(b, &mut at, b'-') {
-            day = fixed_digits(b, &mut at, PART_DIGITS)?;
+            day = part(&mut at)?;
         }
     }
     let (mut hour, mut minute, mut second, mut nanos) = (0, 0, 0, 0);
     if skip_byte(b, &mut at, b'T') && b.get(at).is_some_and(u8::is_ascii_digit) {
-        hour = fixed_digits(b, &mut at, PART_DIGITS)?;
+        hour = part(&mut at)?;
         if skip_byte(b, &mut at, b':') {
-            minute = fixed_digits(b, &mut at, PART_DIGITS)?;
+            minute = part(&mut at)?;
             if skip_byte(b, &mut at, b':') {
-                second = fixed_digits(b, &mut at, PART_DIGITS)?;
+                second = part(&mut at)?;
                 if skip_byte(b, &mut at, b'.') || skip_byte(b, &mut at, b',') {
                     let start = at;
                     while at < b.len() && b[at].is_ascii_digit() && at - start < FRACTION_DIGITS {
@@ -259,8 +266,13 @@ fn date_optional_time_millis(s: &str) -> Option<i64> {
 /// Epoch milliseconds of `s` as a whole or fractional number of
 /// `unit_millis` (1 for `epoch_millis`, [`MILLIS_PER_SECOND`] for
 /// `epoch_second`), signed, as OpenSearch's epoch formats read it; `None`
-/// for anything else. A fraction finer than the column's milliseconds is
-/// dropped.
+/// for anything else, and for what OpenSearch refuses: a fraction finer than
+/// a nanosecond, and a negative number of seconds under one (`-0`, `-0.5`).
+/// The instant is read to nanoseconds and then to milliseconds toward the
+/// past, as OpenSearch reads it, and a negative number of seconds keeps its
+/// fraction positive, as OpenSearch's `epoch_second` does: `-1.5` is half a
+/// second before the epoch, `-500`, and `-1.9995` is `-1`. A negative number
+/// of milliseconds is negative throughout: `-123.5` is `-124`.
 fn epoch_millis(s: &str, unit_millis: i64) -> Option<i64> {
     let (negative, digits) = match s.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -271,38 +283,42 @@ fn epoch_millis(s: &str, unit_millis: i64) -> Option<i64> {
         Some((whole, fraction)) => (whole, fraction),
         None => (digits, ""),
     };
+    let seconds = unit_millis == MILLIS_PER_SECOND;
+    let unit_nanos = i128::from(unit_millis) * i128::from(NANOS_PER_MILLI);
+    // The unit's fraction to the nanosecond: nine digits of a second, six of
+    // a millisecond.
+    let fraction_digits = FRACTION_DIGITS - if seconds { 0 } else { MILLI_DIGITS };
     if whole.is_empty()
-        || fraction.len() > FRACTION_DIGITS
+        || fraction.len() > fraction_digits
         || !whole.bytes().all(|b| b.is_ascii_digit())
         || !fraction.bytes().all(|b| b.is_ascii_digit())
     {
         return None;
     }
-    // A second's fraction, in the milliseconds it holds.
-    let fraction_millis = if unit_millis == MILLIS_PER_SECOND {
-        let mut millis: String = fraction.chars().take(MILLI_DIGITS).collect();
-        while millis.len() < MILLI_DIGITS {
-            millis.push('0');
-        }
-        millis.parse::<i64>().ok()?
-    } else {
-        0
+    let whole_nanos = i128::from(whole.parse::<i64>().ok()?) * unit_nanos;
+    if negative && seconds && whole_nanos == 0 {
+        return None;
+    }
+    let mut padded = fraction.to_string();
+    while padded.len() < fraction_digits {
+        padded.push('0');
+    }
+    let fraction_nanos: i128 = padded.parse().ok()?;
+    let nanos = match (negative, seconds) {
+        (false, _) => whole_nanos + fraction_nanos,
+        (true, true) => fraction_nanos - whole_nanos,
+        (true, false) => -(whole_nanos + fraction_nanos),
     };
-    let millis = whole
-        .parse::<i64>()
-        .ok()?
-        .checked_mul(unit_millis)?
-        .checked_add(fraction_millis)?;
-    Some(if negative { -millis } else { millis })
+    i64::try_from(nanos.div_euclid(i128::from(NANOS_PER_MILLI))).ok()
 }
 
 /// `value` as a date field of `formats` holds it: the first form that reads
 /// it gives its epoch milliseconds, as OpenSearch tries a field's formats in
 /// order (a number by its digits, so an `epoch_second` field's `893966296`
 /// is a day of 1998, not of 1970). A form this bridge does not read (a
-/// custom pattern) leaves the value to [`conform`], as a field of the
-/// default format. A value no form reads fails its document, as OpenSearch
-/// fails it.
+/// custom pattern) does not stop the others: only when none of them reads
+/// the value is it left to [`conform`], as a field of the default format.
+/// A value no form reads fails its document, as OpenSearch fails it.
 fn conform_date(value: Value, formats: &[DateFormat]) -> Result<Value, String> {
     let text = match &value {
         Value::Null => return Ok(value),
@@ -310,16 +326,23 @@ fn conform_date(value: Value, formats: &[DateFormat]) -> Result<Value, String> {
         Value::Number(n) => n.to_string(),
         _ => return Err("not a date".into()),
     };
+    let mut custom = false;
     for format in formats {
         let millis = match format {
-            DateFormat::OptionalTime => date_optional_time_millis(&text),
+            DateFormat::OptionalTime { strict } => optional_time_millis(&text, *strict),
             DateFormat::EpochMillis => epoch_millis(&text, 1),
             DateFormat::EpochSecond => epoch_millis(&text, MILLIS_PER_SECOND),
-            DateFormat::Other(_) => return conform(value, &date_type()),
+            DateFormat::Other(_) => {
+                custom = true;
+                None
+            }
         };
         if let Some(millis) = millis {
             return Ok(json!(millis));
         }
+    }
+    if custom {
+        return conform(value, &date_type());
     }
     let names: Vec<&str> = formats.iter().map(DateFormat::name).collect();
     Err(format!(
@@ -340,6 +363,21 @@ fn fixed_digits(b: &[u8], at: &mut usize, n: usize) -> Option<i64> {
             .iter()
             .fold(0, |value, d| value * 10 + i64::from(d - b'0')),
     )
+}
+
+/// One to `max` ASCII digits of `b` from `at`, as many as there are, as a
+/// number, moving `at` past them.
+fn leading_digits(b: &[u8], at: &mut usize, max: usize) -> Option<i64> {
+    let n = b
+        .get(*at..)?
+        .iter()
+        .take(max)
+        .take_while(|d| d.is_ascii_digit())
+        .count();
+    if n == 0 {
+        return None;
+    }
+    fixed_digits(b, at, n)
 }
 
 /// Whether `b` holds `byte` at `at`, moving `at` past it when it does.
@@ -701,9 +739,9 @@ impl Kept {
 /// joined by `||`).
 #[derive(Clone, Debug, PartialEq)]
 enum DateFormat {
-    /// `strict_date_optional_time` or `date_optional_time`, as
-    /// [`date_optional_time_millis`] reads it.
-    OptionalTime,
+    /// `strict_date_optional_time`, or with `strict` false the lenient
+    /// `date_optional_time`, as [`optional_time_millis`] reads them.
+    OptionalTime { strict: bool },
     /// `epoch_millis`: milliseconds since the epoch, a fraction allowed.
     EpochMillis,
     /// `epoch_second`: seconds since the epoch, a fraction allowed.
@@ -721,7 +759,8 @@ impl DateFormat {
             .map(str::trim)
             .filter(|f| !f.is_empty())
             .map(|f| match f {
-                "strict_date_optional_time" | "date_optional_time" => Self::OptionalTime,
+                "strict_date_optional_time" => Self::OptionalTime { strict: true },
+                "date_optional_time" => Self::OptionalTime { strict: false },
                 "epoch_millis" => Self::EpochMillis,
                 "epoch_second" => Self::EpochSecond,
                 other => Self::Other(other.to_string()),
@@ -732,7 +771,8 @@ impl DateFormat {
     /// The form's name, as the mapping gives it.
     fn name(&self) -> &str {
         match self {
-            Self::OptionalTime => "strict_date_optional_time",
+            Self::OptionalTime { strict: true } => "strict_date_optional_time",
+            Self::OptionalTime { strict: false } => "date_optional_time",
             Self::EpochMillis => "epoch_millis",
             Self::EpochSecond => "epoch_second",
             Self::Other(f) => f,
@@ -4634,6 +4674,75 @@ mod tests {
         assert_eq!(
             conform_date(json!("2026-11-23 10:30:15"), &custom),
             Ok(json!("2026-11-23 10:30:15"))
+        );
+        // A custom pattern does not stop the forms after it: an
+        // `epoch_second` listed after one still reads a number as seconds,
+        // a day of 1998 rather than of 1970.
+        // Negative and fractional epochs read as stock OpenSearch 3.9.0's
+        // `DateFormatter` reads them, to the millisecond toward the past: a
+        // negative number of seconds keeps its fraction positive, a negative
+        // number of milliseconds is negative throughout, and stock refuses a
+        // negative number of seconds under one and a fraction past the
+        // nanosecond.
+        for (value, want) in [
+            ("1.0005", Some(1_000i64)),
+            ("1.123456789", Some(1_123)),
+            ("-1.0005", Some(-1_000)),
+            ("-1.5", Some(-500)),
+            ("-2.25", Some(-1_750)),
+            ("-1.999", Some(-1)),
+            ("-1.9995", Some(-1)),
+            ("-1.0000001", Some(-1_000)),
+            ("-893966296.25", Some(-893_966_295_750)),
+            ("-0", None),
+            ("-0.5", None),
+            ("1.1234567891", None),
+        ] {
+            assert_eq!(
+                epoch_millis(value, MILLIS_PER_SECOND),
+                want,
+                "epoch_second {value}"
+            );
+        }
+        for (value, want) in [
+            ("123.5", Some(123i64)),
+            ("123.999", Some(123)),
+            ("-123", Some(-123)),
+            ("-123.5", Some(-124)),
+            ("-123.999", Some(-124)),
+            ("-0.5", Some(-1)),
+            ("-0", Some(0)),
+            ("-0.000001", Some(-1)),
+            ("1.1234567", None),
+        ] {
+            assert_eq!(epoch_millis(value, 1), want, "epoch_millis {value}");
+        }
+        let custom_then_seconds = DateFormat::parse_all("yyyy-MM-dd||epoch_second");
+        assert_eq!(
+            conform_date(json!(893966296), &custom_then_seconds),
+            Ok(json!(893_966_296_000i64))
+        );
+        // `date_optional_time` is lenient: a month, day, hour or minute of
+        // one digit reads as the two-digit one; the strict form refuses it,
+        // and each refusal names the form the mapping declared.
+        let lenient = DateFormat::parse_all("date_optional_time");
+        assert_eq!(
+            conform_date(json!("2026-4-30T9:05"), &lenient),
+            Ok(json!(
+                optional_time_millis("2026-04-30T09:05", true).expect("strict")
+            ))
+        );
+        let strict = DateFormat::parse_all("strict_date_optional_time");
+        assert_eq!(
+            conform_date(json!("2026-4-30"), &strict),
+            Err(
+                "failed to parse date field [2026-4-30] with format [strict_date_optional_time]"
+                    .into()
+            )
+        );
+        assert_eq!(
+            conform_date(json!("noon"), &lenient),
+            Err("failed to parse date field [noon] with format [date_optional_time]".into())
         );
     }
 
