@@ -345,7 +345,7 @@ public class InfinoAggregationProcessor {
             }
             if (total == null && spec instanceof Explicit e && countsOnly(e)) {
                 // The buckets' statement counts the request's matches too.
-                Map<String, Object> counted = explicitCounts(e, q.from(), q.where(), true);
+                Map<String, Object> counted = explicitCounts(e, from, where, true);
                 total = asLong(counted.get(TOTAL_ALIAS));
                 byName.put(spec.name(), buildExplicitCounts(e, counted));
                 continue;
