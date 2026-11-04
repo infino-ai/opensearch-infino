@@ -31,6 +31,7 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataIndexTemplateService;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.OperationRouting;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.UUIDs;
@@ -164,7 +165,41 @@ public class InfinoBulkActionFilter implements ActionFilter {
         }
         @SuppressWarnings("unchecked")
         ActionListener<BulkResponse> cast = (ActionListener<BulkResponse>) listener;
-        route(bulk, clusters, writes, tables, cast, () -> chain.proceed(task, action, request, listener));
+        route(bulk, clusters, writes, tables, cast, () -> toShards(task, action, request, listener, chain, bulk, clusters, cast));
+    }
+
+    /**
+     * A bulk no item of which this node serves from a table, on to the shards:
+     * as it came, unless it carries updates to default-mode indices, which are
+     * turned into writes of the whole document first ({@link #engineUpdates})
+     * and their responses back into the ones the client's bulk expects.
+     */
+    private <Request extends ActionRequest, Response extends ActionResponse> void toShards(
+        Task task,
+        String action,
+        Request request,
+        ActionListener<Response> listener,
+        ActionFilterChain<Request, Response> chain,
+        BulkRequest bulk,
+        ClusterService clusters,
+        ActionListener<BulkResponse> cast
+    ) {
+        EngineBulk routed;
+        try {
+            routed = engineUpdates(clusters.state(), bulk, concreteIndices(clusters.state(), bulk), tables);
+        } catch (Exception e) {
+            listener.onFailure(e);
+            return;
+        }
+        if (routed == null) {
+            chain.proceed(task, action, request, listener);
+            return;
+        }
+        @SuppressWarnings("unchecked")
+        Request next = (Request) routed.bulk();
+        @SuppressWarnings("unchecked")
+        ActionListener<Response> answer = (ActionListener<Response>) routed.answer(cast);
+        chain.proceed(task, action, next, answer);
     }
 
     /**
@@ -241,6 +276,31 @@ public class InfinoBulkActionFilter implements ActionFilter {
             }
             dispatch(bulk, concrete, infino, answered, writes, tables, clusters, listener);
         }, listener::onFailure));
+    }
+
+    /**
+     * A bulk over default-mode indices with its updates turned into writes of
+     * the whole document: {@code bulk} goes to the shards, and
+     * {@code answer} turns its response back into the one the client's bulk
+     * expects. {@code slots} is each item's slot in the client's bulk,
+     * {@code updates} the slots that were updates, {@code answered} the items
+     * answered before the shards (in slot order).
+     */
+    record EngineBulk(BulkRequest bulk, int[] slots, Set<Integer> updates, Map<Integer, BulkItemResponse> answered, int size) {
+        ActionListener<BulkResponse> answer(ActionListener<BulkResponse> listener) {
+            return ActionListener.wrap(response -> {
+                BulkItemResponse[] items = new BulkItemResponse[size];
+                for (Map.Entry<Integer, BulkItemResponse> e : answered.entrySet()) {
+                    items[e.getKey()] = e.getValue();
+                }
+                BulkItemResponse[] routed = response.getItems();
+                for (int i = 0; i < routed.length; i++) {
+                    int slot = slots[i];
+                    items[slot] = updates.contains(slot) ? asUpdate(routed[i], slot) : reslot(routed[i], slot);
+                }
+                listener.onResponse(new BulkResponse(items, response.getTook().millis(), response.getIngestTookInMillis()));
+            }, listener::onFailure);
+        }
     }
 
     /**
@@ -372,6 +432,70 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 }));
             }
         }
+    }
+
+    /**
+     * The bulk to send to the shards of default-mode indices when it carries
+     * updates, or null when it carries none (it goes on as it is). The stock
+     * update reads the current document from Lucene, which keeps no source
+     * in default mode, so each update is merged here into the document as a
+     * read sees it now (the shard's write not yet committed, else the
+     * table), by proxy mode's rule ({@link #merge}), and goes on as a
+     * write of the whole document, carrying any sequence-number condition
+     * for the shard to check. An update the table cannot serve (a script) or
+     * whose document is missing is answered here.
+     */
+    static EngineBulk engineUpdates(ClusterState state, BulkRequest bulk, List<String> concrete, InfinoTables tables) {
+        List<DocWriteRequest<?>> items = bulk.requests();
+        Set<Integer> updates = new HashSet<>();
+        Map<Integer, BulkItemResponse> answered = new LinkedHashMap<>();
+        Map<Integer, DocWriteRequest<?>> writes = new HashMap<>();
+        for (int slot = 0; slot < items.size(); slot++) {
+            IndexMetadata md = concrete.get(slot) == null ? null : state.metadata().index(concrete.get(slot));
+            if (!(items.get(slot) instanceof UpdateRequest update) || md == null || !InfinoPlugin.inDefaultMode(md.getSettings())) {
+                continue;
+            }
+            updates.add(slot);
+            String index = md.getIndex().getName();
+            if (update.script() != null) {
+                answered.put(slot, failure(slot, update, index, new IllegalArgumentException("[infino] scripted updates are not served"), RestStatus.BAD_REQUEST));
+                continue;
+            }
+            String table = tables.ensureForDocument(md, update.id(), update.routing());
+            String merged = merge(InfinoEngine.currentSource(table, update.id()), update);
+            if (merged == null) {
+                ShardId shardId = new ShardId(md.getIndex(), OperationRouting.generateShardId(md, update.id(), update.routing()));
+                answered.put(slot, failure(slot, update, index, new DocumentMissingException(shardId, update.id()), RestStatus.NOT_FOUND));
+                continue;
+            }
+            IndexRequest write = new IndexRequest(index).id(update.id()).routing(update.routing()).source(merged, MediaTypeRegistry.JSON);
+            write.setIfSeqNo(update.ifSeqNo()).setIfPrimaryTerm(update.ifPrimaryTerm());
+            writes.put(slot, write);
+        }
+        if (updates.isEmpty()) {
+            return null;
+        }
+        BulkRequest routed = new BulkRequest().setRefreshPolicy(bulk.getRefreshPolicy()).timeout(bulk.timeout()).waitForActiveShards(bulk.waitForActiveShards());
+        int[] slots = new int[items.size() - answered.size()];
+        int at = 0;
+        for (int slot = 0; slot < items.size(); slot++) {
+            if (answered.containsKey(slot)) {
+                continue;
+            }
+            routed.add(writes.getOrDefault(slot, items.get(slot)));
+            slots[at++] = slot;
+        }
+        return new EngineBulk(routed, slots, updates, answered, items.size());
+    }
+
+    /** A routed write's response as the update it was in the client's bulk. */
+    private static BulkItemResponse asUpdate(BulkItemResponse r, int slot) {
+        if (r.isFailed()) {
+            return new BulkItemResponse(slot, DocWriteRequest.OpType.UPDATE, r.getFailure());
+        }
+        DocWriteResponse w = r.getResponse();
+        UpdateResponse update = new UpdateResponse(w.getShardInfo(), w.getShardId(), w.getId(), w.getSeqNo(), w.getPrimaryTerm(), w.getVersion(), w.getResult());
+        return new BulkItemResponse(slot, DocWriteRequest.OpType.UPDATE, update);
     }
 
     /**
@@ -522,17 +646,18 @@ public class InfinoBulkActionFilter implements ActionFilter {
     }
 
     /**
-     * Whether any item writes to an Infino-backed index as the bulk stands:
-     * one that exists with the setting, or one that does not exist yet and
-     * that the cluster would create Infino-backed.
+     * Whether any item writes to an index served here, from its table, as
+     * the bulk stands: one in proxy mode, or one that does not exist yet and
+     * that the cluster would create in proxy mode. An index in default mode
+     * is written by its shards, and its bulk goes on as it came.
      */
     static boolean infinoBound(ClusterService clusters, BulkRequest bulk) {
         ClusterState state = clusters.state();
         Set<String> missing = new HashSet<>(missingIndices(clusters, bulk));
         for (String name : concreteIndices(state, bulk)) {
             IndexMetadata md = name == null ? null : state.metadata().index(name);
-            boolean backed = md != null ? InfinoPlugin.INFINO_ENABLED.get(md.getSettings()) : missing.contains(name) && createdInfinoBacked(clusters, name);
-            if (backed) {
+            boolean served = md != null ? InfinoPlugin.inProxyMode(md.getSettings()) : missing.contains(name) && createdInProxyMode(clusters, name);
+            if (served) {
                 return true;
             }
         }
@@ -540,20 +665,27 @@ public class InfinoBulkActionFilter implements ActionFilter {
     }
 
     /**
-     * Whether an index the cluster created under {@code name} now would be
-     * Infino-backed: the plugin stamps every new index unless the node turns
-     * that off, and a template's own setting wins (see
+     * Whether an index the cluster created under {@code name} now would be in
+     * proxy mode: Infino-backed (the plugin stamps every new index unless the
+     * node turns that off) and given proxy mode, by a template or, when none
+     * names a mode, by the node, whose new indices are in default mode unless
+     * it turns that off; a template's own setting wins (see
      * {@link InfinoPlugin#getAdditionalIndexSettingProviders}), the template
      * found as index creation finds it: a composable one when one matches,
      * else the legacy ones.
      */
-    static boolean createdInfinoBacked(ClusterService clusters, String name) {
+    static boolean createdInProxyMode(ClusterService clusters, String name) {
         Metadata metadata = clusters.state().metadata();
         String composable = MetadataIndexTemplateService.findV2Template(metadata, name, false);
         Settings fromTemplates = composable != null
             ? MetadataIndexTemplateService.resolveSettings(metadata, composable)
             : MetadataIndexTemplateService.resolveSettings(MetadataIndexTemplateService.findV1Templates(metadata, name, null));
-        return fromTemplates.getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), InfinoPlugin.INFINO_DEFAULT_ENABLED.get(clusters.getSettings()));
+        Settings node = clusters.getSettings();
+        if (!fromTemplates.getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), InfinoPlugin.INFINO_DEFAULT_ENABLED.get(node))) {
+            return false;
+        }
+        String nodeMode = InfinoPlugin.DEFAULT_MODE_ENABLED.get(node) ? InfinoPlugin.MODE_DEFAULT : InfinoPlugin.MODE_PROXY;
+        return InfinoPlugin.MODE_PROXY.equals(fromTemplates.get(InfinoPlugin.INFINO_MODE.getKey(), nodeMode));
     }
 
     /**
@@ -715,7 +847,8 @@ public class InfinoBulkActionFilter implements ActionFilter {
         Map<String, IndexMetadata> infino = new LinkedHashMap<>();
         for (String name : concrete) {
             IndexMetadata md = name == null ? null : clusters.state().metadata().index(name);
-            if (md != null && md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
+            // An index in default mode takes its writes through its shard's engine, as any index does.
+            if (md != null && InfinoPlugin.inProxyMode(md.getSettings())) {
                 infino.put(name, md);
             }
         }

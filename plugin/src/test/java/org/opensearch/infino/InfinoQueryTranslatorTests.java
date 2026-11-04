@@ -107,7 +107,8 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             collapse,
             null,
             java.util.List.of(),
-            InfinoAccess.NONE
+            InfinoAccess.NONE,
+            NOW
         );
         return InfinoSearch.hitStatement(plan, fetch, false);
     }

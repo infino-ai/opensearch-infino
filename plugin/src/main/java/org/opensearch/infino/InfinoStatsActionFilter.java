@@ -28,7 +28,7 @@ import java.util.Map;
 import java.util.function.Supplier;
 
 /**
- * Reports the documents of Infino-backed indices in {@code _stats} (and so
+ * Reports the documents of proxy-mode indices in {@code _stats} (and so
  * in {@code _cat/indices} and the index pages of Dashboards), which read
  * them from the shards. The shards of such an index hold no documents, so
  * the request goes on to them as it came, and before the response is handed
@@ -88,7 +88,9 @@ public class InfinoStatsActionFilter implements ActionFilter {
             }
             String name = shard.getShardRouting().getIndexName();
             IndexMetadata md = state.metadata().index(name);
-            if (md == null || !md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
+            // A default-mode index's shards keep each document's id, and count
+            // them as a stock index's do.
+            if (md == null || !InfinoPlugin.inProxyMode(md.getSettings())) {
                 continue;
             }
             Long count = counts.computeIfAbsent(name, n -> rows(md));

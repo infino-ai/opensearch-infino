@@ -30,3 +30,13 @@ mask_user:
   hash: "$2a$12$VcCDgh2NDk07JGN0rjGbM.Ad41qVR/YFJcgHp0UGns5JDymv..TOG"
   reserved: false
   description: "Reads sec* with the ip field masked"
+
+hash_user:
+  hash: "$2a$12$VcCDgh2NDk07JGN0rjGbM.Ad41qVR/YFJcgHp0UGns5JDymv..TOG"
+  reserved: false
+  description: "Reads sec* with the ip field masked by SHA-256"
+
+regex_user:
+  hash: "$2a$12$VcCDgh2NDk07JGN0rjGbM.Ad41qVR/YFJcgHp0UGns5JDymv..TOG"
+  reserved: false
+  description: "Reads sec* with the ip field's last part replaced"

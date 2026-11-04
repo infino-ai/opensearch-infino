@@ -5,14 +5,9 @@
 package org.opensearch.infino;
 
 import org.opensearch.client.Request;
-import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.concurrent.ThreadContext;
-import org.opensearch.test.rest.OpenSearchRestTestCase;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 
@@ -21,10 +16,8 @@ import java.util.Map;
  * type's scores against the k-NN plugin's own (YAML has no tolerance
  * assertion), and a filter over a corpus too large for a YAML suite.
  */
-public class InfinoStockKnnIT extends OpenSearchRestTestCase {
+public class InfinoStockKnnIT extends InfinoRestTestCase {
 
-    /** The admin user of the test cluster's internal user database. */
-    private static final String ADMIN_BASIC = "admin:admin";
     /** The engine's smallest vector. */
     private static final int DIMENSION = 16;
     /** The query vector's leading components; the rest are zero. */
@@ -65,18 +58,6 @@ public class InfinoStockKnnIT extends OpenSearchRestTestCase {
     private static final int K = 10;
     /** A k larger than the far set. */
     private static final int WIDE_K = 20;
-
-    @Override
-    protected Settings restClientSettings() {
-        String token = Base64.getEncoder().encodeToString(ADMIN_BASIC.getBytes(StandardCharsets.UTF_8));
-        return Settings.builder().put(super.restClientSettings()).put(ThreadContext.PREFIX + ".Authorization", "Basic " + token).build();
-    }
-
-    @Override
-    protected boolean preserveIndicesUponCompletion() {
-        // A wildcard delete would reach the security plugin's own index.
-        return true;
-    }
 
     /**
      * For each space type, the same documents in an Infino-backed index and a
