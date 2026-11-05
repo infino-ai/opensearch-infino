@@ -777,16 +777,16 @@ public class InfinoBulkActionFilter implements ActionFilter {
 
     /**
      * The concrete index each item writes to, by slot: the name it gives, or
-     * for an alias the alias's write index, as the stock path resolves it.
-     * An alias that resolves to no single write index keeps its name, so the
-     * stock path reports it.
+     * for an alias or a data stream its write index, as the stock path
+     * resolves it. A name that resolves to no single write index keeps its
+     * name, so the stock path reports it.
      */
     static List<String> concreteIndices(ClusterState state, BulkRequest bulk) {
         IndexNameExpressionResolver resolver = InfinoServices.indexNameExpressionResolver();
         List<String> out = new ArrayList<>(bulk.requests().size());
         for (DocWriteRequest<?> item : bulk.requests()) {
             String name = item.index();
-            if (resolver != null && name != null && state.metadata().hasAlias(name)) {
+            if (resolver != null && name != null && (state.metadata().hasAlias(name) || state.metadata().dataStreams().containsKey(name))) {
                 try {
                     name = resolver.concreteWriteIndex(state, item).getName();
                 } catch (Exception e) {

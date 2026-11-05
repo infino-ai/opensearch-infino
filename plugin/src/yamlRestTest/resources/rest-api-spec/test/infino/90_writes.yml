@@ -206,3 +206,31 @@
       count:
         index: up1
   - match: { count: 2 }
+
+---
+"A write to a data stream in proxy mode lands in its write index's table":
+  - do:
+      indices.put_index_template:
+        name: ds-template
+        body:
+          index_patterns: [ "ds-*" ]
+          data_stream: {}
+          template:
+            settings: { number_of_shards: 1, number_of_replicas: 0, index.infino.mode: proxy }
+  - do:
+      indices.create_data_stream:
+        name: ds-logs
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: ds-logs }
+          - { "@timestamp": "2023-01-01T00:00:01Z", message: one }
+          - create: { _index: ds-logs }
+          - { "@timestamp": "2023-01-01T00:00:02Z", message: two }
+  - match: { errors: false }
+  - match: { items.0.create._index: "/^\\.ds-ds-logs-/" }
+  - do:
+      count:
+        index: ds-logs
+  - match: { count: 2 }
