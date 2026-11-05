@@ -894,7 +894,10 @@ fn mapped_fields(mapping: &Value) -> Vec<MappedField> {
 /// index answers with the reason instead of serving the column as something
 /// it is not.
 fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, String> {
-    let mapped = mapped_fields(mapping);
+    let mut mapped = mapped_fields(mapping);
+    // A field named like a reserved column is served from the document's
+    // source, not given a column of its own.
+    mapped.retain(|f| !matches!(f.path.as_str(), OSID | SOURCE | SEQ));
     bridge.keep_precisions(name, &mapped);
     let conn = &bridge.conn;
     // The cached handle, if any, predates whatever this changes.
@@ -967,7 +970,7 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
             }
             let mut patches: Vec<FieldPatch> = mapped
                 .iter()
-                .filter(|f| f.path != SEQ && schema.field_with_name(&f.path).is_err())
+                .filter(|f| schema.field_with_name(&f.path).is_err())
                 .map(|f| {
                     let patch = FieldPatch::named(f.path.clone())
                         .with_type(f.data_type.clone())
@@ -1011,9 +1014,6 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
             // hold the id. Scalar columns have only min/max per superfile.
             let mut spec = IndexSpec::new().fts(FtsField::new(OSID.to_string()));
             for f in &mapped {
-                if f.path == OSID || f.path == SOURCE || f.path == SEQ {
-                    continue;
-                }
                 fields.push(Field::new(&f.path, f.data_type.clone(), true));
                 if f.fts {
                     // Positions let a quoted phrase match adjacent terms in
@@ -3633,6 +3633,21 @@ mod tests {
         // `level` is a keyword column: mapping it as text cannot add the index.
         let out = ensure(h, r#"{"properties":{"level":{"type":"text"}}}"#);
         assert!(out.contains("without a text index"), "{out}");
+        close(h);
+    }
+
+    /// A field named like a reserved column, added after the table exists,
+    /// leaves the column alone, as it does at creation (#23).
+    #[test]
+    fn a_late_field_named_like_a_reserved_column_leaves_it_alone() {
+        let h = open_logs();
+        let out = ensure(
+            h,
+            r#"{"properties":{"source":{"type":"text"},"osseq":{"type":"text"}}}"#,
+        );
+        assert!(out.contains("\"created\":false"), "{out}");
+        index(h, &[("s1", r#"{"source":"hello"}"#)]);
+        assert!(get(h, "s1").contains("hello"));
         close(h);
     }
 
