@@ -30,8 +30,12 @@ public class InfinoRequestCacheTests extends OpenSearchTestCase {
 
     /** A table name no other test moves. */
     private static final String TABLE = "request_cache_tests";
-    /** Time the kept response's took was measured as, which a hit replaces. */
-    private static final long KEPT_TOOK_MILLIS = 5;
+    /**
+     * Time the kept response's took was measured as, which a hit replaces: a
+     * minute, so the hit's own took (the time the lookup itself took, a few
+     * milliseconds on a cold test JVM) is told from it whatever the machine.
+     */
+    private static final long KEPT_TOOK_MILLIS = 60_000;
 
     private static IndexMetadata index(Settings extra) {
         return IndexMetadata.builder("i")

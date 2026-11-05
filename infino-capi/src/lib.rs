@@ -1918,11 +1918,30 @@ fn join_over_union(batches: &[&RecordBatch]) -> Result<Option<RecordBatch>, Stri
         .map_err(|e| e.to_string())
 }
 
-/// The documents of `prepared` whose id is among `replaced`, as (batch
-/// index, document index).
+/// The `osid` of every row of `batch`, in order; empty when it has no
+/// readable id column.
+fn osids_of(batch: &RecordBatch) -> Vec<String> {
+    let Some(column) = batch.column_by_name(OSID) else {
+        return Vec::new();
+    };
+    if let Some(a) = column.as_any().downcast_ref::<LargeStringArray>() {
+        a.iter().flatten().map(str::to_owned).collect()
+    } else if let Some(a) = column.as_any().downcast_ref::<StringArray>() {
+        a.iter().flatten().map(str::to_owned).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The documents of the converted batches of `prepared` whose id is among
+/// `replaced`, as (batch index, document index). A batch that could not be
+/// converted reports its own documents on the row path.
 fn replaced_rows(prepared: &[Prepared], replaced: &[String]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for (b, p) in prepared.iter().enumerate() {
+        if p.batch.is_none() {
+            continue;
+        }
         for (j, v) in p.values.iter().enumerate() {
             let id = v.get(OSID).and_then(Value::as_str).unwrap_or("");
             if replaced.iter().any(|r| r == id) {
@@ -2002,8 +2021,6 @@ fn append_prepared(
             }
         }
     }
-    let replace_pred =
-        || col(OSID).in_list(replaced.iter().map(|s| lit(s.clone())).collect(), false);
     let batches: Vec<&RecordBatch> = prepared.iter().filter_map(|p| p.batch.as_ref()).collect();
     let joined = match join_over_union(&batches) {
         Ok(joined) => joined,
@@ -2028,9 +2045,16 @@ fn append_prepared(
             match split_by_osid(batch, replaced) {
                 Some((replacing, fresh)) => {
                     if replacing.num_rows() > 0 {
-                        if let Err(e) = table.update(replace_pred(), &replacing) {
+                        // The replace names the ids this commit carries a row for. An
+                        // id in `replaced` whose document was refused keeps its old
+                        // row, and naming it would make the replace match more rows
+                        // than it brings, which the engine refuses whole.
+                        let carried = osids_of(&replacing);
+                        let pred = col(OSID)
+                            .in_list(carried.iter().map(|s| lit(s.clone())).collect(), false);
+                        if let Err(e) = table.update(pred, &replacing) {
                             let why = format!("replace: {e}");
-                            for (b, i) in replaced_rows(&prepared, replaced) {
+                            for (b, i) in replaced_rows(&prepared, &carried) {
                                 failed.push((b, i, why.clone()));
                             }
                         }
@@ -2263,7 +2287,7 @@ pub unsafe extern "C" fn infino_append_prepared(
                 .collect()
         };
         let failed = append_prepared(&table, owned, &replaced, &per_batch);
-        let ok = n - failed.len();
+        let ok = n.saturating_sub(failed.len());
         let failed: Vec<Value> = failed
             .into_iter()
             .map(|(b, i, reason)| json!({ "b": b, "i": i, "reason": reason }))
@@ -4009,6 +4033,47 @@ mod tests {
         assert!(get(h, "a1").contains("\"status\":111"), "{}", get(h, "a1"));
         let rows = sql(h, "SELECT osid FROM logs WHERE osid = 'a1'");
         assert_eq!(rows.as_array().map(|r| r.len()), Some(1), "{rows}");
+        close(h);
+    }
+
+    /// A document the columns refuse, in a batch that replaces rows, leaves
+    /// its id's row as it was, and the batch's other rows are still replaced:
+    /// the replace names only the ids it brings a row for. Naming the refused
+    /// id too made the replace match one row more than it carried, which the
+    /// engine refuses whole, so every replace beside it failed.
+    #[test]
+    fn a_refused_document_keeps_its_row_and_the_rest_of_the_batch_replaces() {
+        let h = open_logs();
+        let out = index(
+            h,
+            &[
+                ("r1", r#"{"level":"info","status":1}"#),
+                ("r2", r#"{"level":"info","status":2}"#),
+            ],
+        );
+        assert_eq!(out["ok"], 2, "{out}");
+        let p = prepared(
+            h,
+            &[
+                ("r1", r#"{"level":"warn","status":"not a number"}"#),
+                ("r2", r#"{"level":"warn","status":22}"#),
+            ],
+        );
+        let out = append_replacing(h, p, &["r1", "r2"]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let failed = out["failed"].as_array().cloned().unwrap_or_default();
+        assert_eq!(failed.len(), 1, "{out}");
+        assert_eq!(failed[0]["i"], 0, "{out}");
+        assert!(
+            get(h, "r1").contains("\"level\":\"info\""),
+            "{}",
+            get(h, "r1")
+        );
+        assert!(get(h, "r2").contains("\"status\":22"), "{}", get(h, "r2"));
+        for id in ["r1", "r2"] {
+            let rows = sql(h, &format!("SELECT osid FROM logs WHERE osid = '{id}'"));
+            assert_eq!(rows.as_array().map(|r| r.len()), Some(1), "{rows}");
+        }
         close(h);
     }
 

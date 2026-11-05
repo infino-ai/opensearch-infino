@@ -1,0 +1,115 @@
+---
+"A page past the index's result window is refused, as a shard refuses it":
+  - do:
+      indices.create:
+        index: win1
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0, index.max_result_window: 5 }
+  - do:
+      index:
+        index: win1
+        id: "1"
+        refresh: true
+        body: { v: 1 }
+  - do:
+      search:
+        index: win1
+        body: { from: 2, size: 3 }
+  - match: { hits.total.value: 1 }
+  - do:
+      catch: /Result\swindow\sis\stoo\slarge/
+      search:
+        index: win1
+        body: { from: 3, size: 3 }
+  - do:
+      indices.delete:
+        index: win1
+
+---
+"A sliced search is refused: the table answers a search whole, and each slice would get every document":
+  - do:
+      indices.create:
+        index: slc1
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      catch: /a\ssliced\ssearch\sis\snot\sserved/
+      search:
+        index: slc1
+        scroll: 1m
+        body: { slice: { id: 0, max: 2 } }
+  - do:
+      indices.delete:
+        index: slc1
+
+---
+"Two indices sorted descending give missing values last, as each index orders them":
+  - do:
+      indices.create:
+        index: srt1
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { prio: { type: long }, tag: { type: keyword } } }
+  - do:
+      indices.create:
+        index: srt2
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { prio: { type: long }, tag: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: srt1, _id: "a1" }
+          - { prio: 1, tag: x }
+          - index: { _index: srt1, _id: "a2" }
+          - { tag: y }
+          - index: { _index: srt2, _id: "b1" }
+          - { prio: 2, tag: x }
+          - index: { _index: srt2, _id: "b2" }
+          - { tag: y }
+  - match: { errors: false }
+  - do:
+      search:
+        index: srt1,srt2
+        body: { sort: [ { prio: desc } ] }
+  - match: { hits.hits.0._id: "b1" }
+  - match: { hits.hits.1._id: "a1" }
+  - is_false: hits.hits.2._source.prio
+  - is_false: hits.hits.3._source.prio
+  # A filters aggregation's other bucket holds the documents no filter keeps, those without the field among them.
+  - do:
+      search:
+        index: srt1
+        body:
+          size: 0
+          aggs:
+            by_prio:
+              filters:
+                other_bucket: true
+                filters: { one: { term: { prio: 1 } } }
+  - match: { aggregations.by_prio.buckets.one.doc_count: 1 }
+  - match: { aggregations.by_prio.buckets._other_.doc_count: 1 }
+  # A terms aggregation's missing value is a bucket of its own; include/exclude is refused, never ignored.
+  - do:
+      search:
+        index: srt1
+        body:
+          size: 0
+          aggs:
+            prios: { terms: { field: prio, missing: 0, order: { _key: asc } } }
+  - length: { aggregations.prios.buckets: 2 }
+  - match: { aggregations.prios.buckets.0.key: 0 }
+  - match: { aggregations.prios.buckets.0.doc_count: 1 }
+  - match: { aggregations.prios.buckets.1.key: 1 }
+  - do:
+      catch: /has\sinclude\/exclude/
+      search:
+        index: srt1
+        body:
+          size: 0
+          aggs:
+            tags: { terms: { field: tag, include: [ x ] } }
+  - do:
+      indices.delete:
+        index: srt1,srt2

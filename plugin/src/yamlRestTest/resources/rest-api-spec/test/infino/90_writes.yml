@@ -206,3 +206,106 @@
       count:
         index: up1
   - match: { count: 2 }
+
+---
+"Proxy-mode writes: an update merges into the write before it, and an id written again replaces its row whatever it holds":
+  - do:
+      indices.create:
+        index: px1
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              a: { type: long }
+              b: { type: long }
+              c: { type: long }
+  # An index and an update of one new id in one bulk: the update merges into the index, as stock applies them.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: px1, _id: "x1" }
+          - { a: 1, b: 1 }
+          - update: { _index: px1, _id: "x1" }
+          - { doc: { c: 3 } }
+  - match: { errors: false }
+  - match: { items.0.index.status: 201 }
+  - match: { items.1.update.status: 200 }
+  - do:
+      get:
+        index: px1
+        id: x1
+  - match: { _source.a: 1 }
+  - match: { _source.b: 1 }
+  - match: { _source.c: 3 }
+  # Two updates of one document in one bulk apply one after the other: neither change is lost.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - update: { _index: px1, _id: "x1" }
+          - { doc: { a: 10 } }
+          - update: { _index: px1, _id: "x1" }
+          - { doc: { b: 20 } }
+  - match: { errors: false }
+  - do:
+      get:
+        index: px1
+        id: x1
+  - match: { _source.a: 10 }
+  - match: { _source.b: 20 }
+  - match: { _source.c: 3 }
+  # An update of a missing document with nothing to upsert is a 404, as stock.
+  - do:
+      bulk:
+        body:
+          - update: { _index: px1, _id: "none" }
+          - { doc: { a: 1 } }
+  - match: { items.0.update.status: 404 }
+  # Ids holding what the engine's text syntax reads as clauses (a leading + or -) or no term at all:
+  # written again, each replaces its row, and a create over one is a conflict.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: px1, _id: "+15551234" }
+          - { a: 1 }
+          - index: { _index: px1, _id: "+15559876" }
+          - { a: 2 }
+          - index: { _index: px1, _id: "-7" }
+          - { a: 3 }
+          - index: { _index: px1, _id: "---" }
+          - { a: 4 }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: px1, _id: "+15551234" }
+          - { a: 11 }
+          - index: { _index: px1, _id: "+15559876" }
+          - { a: 12 }
+          - index: { _index: px1, _id: "-7" }
+          - { a: 13 }
+          - index: { _index: px1, _id: "---" }
+          - { a: 14 }
+  - match: { errors: false }
+  - match: { items.0.index.result: updated }
+  - match: { items.1.index.result: updated }
+  - match: { items.2.index.result: updated }
+  - match: { items.3.index.result: updated }
+  - do:
+      count:
+        index: px1
+  - match: { count: 5 }
+  - do:
+      bulk:
+        body:
+          - create: { _index: px1, _id: "+15551234" }
+          - { a: 99 }
+  - match: { items.0.create.status: 409 }
+  - do:
+      get:
+        index: px1
+        id: "+15551234"
+  - match: { _source.a: 11 }

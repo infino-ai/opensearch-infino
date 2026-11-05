@@ -71,6 +71,12 @@
       headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
       infino.account: {}
   - match: { configured: false }
+  # What the registry would bring back names every index and the users and
+  # roles a loader registered: reading it is the cluster's management.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      catch: forbidden
+      infino.account_indices: {}
 
 ---
 "Forgetting with no account in use changes nothing":

@@ -72,9 +72,10 @@ import java.util.function.Supplier;
  * its one shard stays empty.
  *
  * <p>The table is {@code index.infino.table} when set, else named after the
- * index and its UUID. It is dropped when the index is deleted unless it was
- * named explicitly, so an index recreated on a fresh cluster with the same
- * setting reattaches to the rows its predecessor wrote.
+ * index. A table backs one live index (see {@link InfinoTables}). It is
+ * dropped when the index is deleted unless it was named explicitly, so an
+ * index recreated on a fresh cluster with the same setting reattaches to the
+ * rows its predecessor wrote.
  */
 public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, EnginePlugin {
 
@@ -332,7 +333,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             new InfinoScrollActionFilter(InfinoServices::clusterService, InfinoServices::scriptService),
             new InfinoGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES),
             new InfinoMultiGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES),
-            new InfinoStatsActionFilter(InfinoServices::clusterService, TABLES)
+            new InfinoStatsActionFilter(InfinoServices::clusterService, TABLES),
+            new InfinoExplicitTableActionFilter()
         );
     }
 
@@ -396,8 +398,14 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             @Override
             public void afterIndexShardDeleted(ShardId shardId, Settings indexSettings) {
                 String table = InfinoTables.shardTable(InfinoNative.tableFor(shardId.getIndex(), indexSettings), shardId.id(), indexSettings);
-                TABLES.forget(table);
                 InfinoRegistry.forget(shardId.getIndexName());
+                if (TABLES.keptAfterDelete(table, shardId.getIndex())) {
+                    // Another live index is served from the table (or it is the
+                    // registry's): the rows are not this index's to drop.
+                    log.info("[infino] index {} deleted; its table {} backs another index and is kept", shardId.getIndexName(), table);
+                    return;
+                }
+                TABLES.forget(table);
                 if (InfinoNative.tableIsExplicit(indexSettings)) {
                     log.info("[infino] index {} deleted; its table {} was named explicitly and is kept", shardId.getIndexName(), table);
                     return;

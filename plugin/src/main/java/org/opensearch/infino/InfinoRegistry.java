@@ -126,6 +126,11 @@ final class InfinoRegistry {
             if (!md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
                 continue;
             }
+            if (!InfinoPlugin.tables().owns(md, state.metadata())) {
+                // Named onto a table another index backs (or the registry's own): it is
+                // refused, and a fresh cluster must not bring it back over that table.
+                continue;
+            }
             Long last = recorded.get(md.getIndex().getName());
             if (last == null || last != md.getVersion()) {
                 pending.put(md.getIndex().getName(), md);

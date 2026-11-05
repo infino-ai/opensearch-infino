@@ -10,6 +10,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.inject.Injector;
 import org.opensearch.common.settings.IndexScopedSettings;
+import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
@@ -20,6 +21,7 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
+import java.util.function.Consumer;
 
 /**
  * The node services the plugin's filters need, taken by injection rather
@@ -76,6 +78,9 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         // The indices come back from the tables on a fresh cluster, and every
         // index's shape is recorded as it moves (see InfinoRegistry).
         clusterService.addListener(InfinoRegistry::onClusterChanged);
+        // Which index each table backs, for the tables declared on the applier
+        // thread too, where the state may not be read (see InfinoTables).
+        clusterService.addListener(event -> InfinoPlugin.tables().observe(event.state().metadata()));
     }
 
     /** Whether the cluster would create an index a write names before it exists, as it decides for a stock bulk. */
@@ -104,6 +109,35 @@ public final class InfinoServices extends AbstractLifecycleComponent {
 
     static ThreadPool threadPool() {
         return threadPool;
+    }
+
+    /**
+     * Run {@code work} on the node's {@code pool} ({@code search}, {@code get},
+     * {@code write}) rather than on the thread that delivered the request.
+     * An action filter runs on that thread, an HTTP or transport worker, and
+     * an engine call can take seconds; a worker held that long stops reading
+     * its other channels, the cluster's health checks among them. The pool
+     * runs it under the request's own thread context, and a pool that turns
+     * it away (its queue full) hands {@code onFailure} the rejection, which
+     * answers 429. Inline when no thread pool is bound, as in a unit test.
+     */
+    static void fork(String pool, Consumer<Exception> onFailure, Runnable work) {
+        ThreadPool pools = threadPool;
+        if (pools == null) {
+            work.run();
+            return;
+        }
+        pools.executor(pool).execute(new AbstractRunnable() {
+            @Override
+            protected void doRun() {
+                work.run();
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                onFailure.accept(e);
+            }
+        });
     }
 
     /** The current request's thread context, or null before the services are injected. */

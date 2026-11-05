@@ -153,6 +153,54 @@
       search:
         index: sec1
         body: { size: 0, aggs: { ips: { cardinality: { field: ip } } } }
+  # A query comparing the masked field's values is refused: the table holds its clear ones.
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      search:
+        index: sec1
+        body: { size: 0, query: { term: { ip: "10.0.0.1" } } }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      search:
+        index: sec1
+        body: { size: 0, query: { prefix: { ip: "10.0.0" } } }
+  # A script reads values themselves, so it sees the masked field as unmapped, as a script field does.
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      search:
+        index: sec1
+        body: { size: 0, query: { script: { script: { source: "doc['ip'].value == '10.0.0.1'" } } } }
+  - match: { hits.total.value: 0 }
+  # Whether the masked field has a value is no secret: its hash is shown.
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      search:
+        index: sec1
+        body: { size: 0, query: { exists: { field: ip } } }
+  - match: { hits.total.value: 3 }
+
+  # The column of raw sources holds the hidden and masked fields: under a field
+  # or masking rule it is no field of the index, so nothing reads them through it.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec1
+        body: { size: 0, query: { wildcard: { source: "*alpha*" } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec1
+        body: { size: 0, aggs: { raw: { terms: { field: source } } } }
+  - length: { aggregations.raw.buckets: 0 }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      search:
+        index: sec1
+        body: { size: 0, query: { wildcard: { source: "*10.0.0.1*" } } }
+  - match: { hits.total.value: 0 }
 
   # The admin is unrestricted.
   - do:

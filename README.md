@@ -152,7 +152,12 @@ curl localhost:9200/logs/_search -H 'Content-Type: application/json' -d '{
 
 Settings: `index.infino.table` names the table explicitly (set it to reattach
 a recreated index to its rows; such a table is kept when the index is
-deleted); `index.infino.optimize_interval` (default 60s) compacts the table on
+deleted). Naming a table is cluster management: with the security plugin, a
+create or template request that sets it needs the right to manage the
+cluster. A table backs one live index: of two indices naming the same table
+(explicitly, or by names that map to one table, such as `logs.app` and
+`logs_app`), the older is served from it and the other is refused, and no
+index is served from the registry's table. `index.infino.optimize_interval` (default 60s) compacts the table on
 a schedule; `index.infino.edges: true` makes the index a graph's edges for
 `graph_walk` and `graph_rank` over the SQL route: each document is an edge
 `{src_table, src_id, dst_table, dst_id}` naming its two rows as the engine
@@ -236,11 +241,14 @@ one at once; bulks that arrive during an append go to the table as the next
 append the moment it finishes. A client sending one bulk at a time waits only
 for its own append; clients sending in parallel share appends. An index of an
 existing id replaces it, a delete removes it and an update merges into it
-(partial `doc`, `doc_as_upsert`, `upsert`; scripts are refused); which ids
-exist is answered by the id column's term index in one statement, so a
+(partial `doc`, `doc_as_upsert`, `upsert`; scripts are refused). An update is
+merged when its batch is written, on the one thread that writes the table,
+into the write before it in the batch or else the table, so two updates of a
+document, or an index and an update of it in one bulk, apply in order. Which
+ids exist is answered by the id column's term index in one statement, so a
 stream of new documents pays no lookup. A document the declared columns
-cannot hold is refused as its own item with the reason. A bulk must address
-one Infino-backed index.
+cannot hold is refused as its own item with the reason. A bulk over several
+indices is served index by index, and its items are answered in its order.
 
 A batch's writes and its deletes are two mutations, the deletes after the
 append (the engine replaces rows one for one, so a delete with no row in its
@@ -255,15 +263,18 @@ written.
 
 Query DSL: `match_all`, `term`, `terms`, `range` (numbers and dates, with date
 math and time zones), `exists`, `prefix`, `wildcard`, `regexp`, `ids`, `match`,
-`match_phrase` (as all-terms), `multi_match`, `query_string` /
-`simple_query_string` (as the terms they hold; Lucene syntax inside the string
-is not interpreted), `bool` (must / filter / must_not / should with
-minimum_should_match as "at least one"), `infino_knn`, `infino_hybrid`, and
-the k-NN plugin's own `knn` query. A field
+`match_phrase` (the terms adjacent and in order), `multi_match`,
+`query_string` / `simple_query_string` (Lucene's classic syntax: terms,
+phrases, `field:` clauses, wildcards, regular expressions and ranges; fuzzy
+and proximity are refused), `bool` (must / filter / must_not / should, with
+minimum_should_match), `script` (an expression subset of Painless),
+`infino_knn`, `infino_hybrid`, and the k-NN plugin's own `knn` query. A field
 named `x.keyword` resolves to the string column `x`. Sorting by fields;
-`from` / `size` paging; `_source` includes and excludes; exact `hits.total`.
-A search over several Infino-backed indices merges their pages by sort values
-or score and reduces their aggregations once.
+`from` / `size` paging up to the index's `index.max_result_window`;
+`search_after`, `post_filter`, `collapse` and scroll; `_source` includes and
+excludes; exact `hits.total`. A search over several Infino-backed indices
+merges their pages by sort values or score and reduces their aggregations
+once, under `search.max_buckets`.
 
 Vector search: `knn_vector` is the k-NN plugin's mapping type, so an index
 with vectors runs beside the k-NN plugin, and its stock query is served from
@@ -298,16 +309,17 @@ columns with size, min_doc_count and order by count, key or a sibling metric;
 `date_histogram` with fixed or calendar intervals, time zone, offset (fixed),
 min_doc_count and numeric extended_bounds; `histogram` with interval and
 offset; `filters` (keyed and anonymous, with `other_bucket`), `range`,
-`date_range`; bucket aggregations nested to any depth, each level a `GROUP BY`
-over the parent's kept buckets; pipeline aggregations, computed in the final
-reduction from the buckets returned.
+`date_range`; `composite`, `top_hits`, `percentile_ranks` and
+`significant_terms`; bucket aggregations nested to any depth, each level a
+`GROUP BY` over the parent's kept buckets; pipeline aggregations, computed in
+the final reduction from the buckets returned. `get` and `mget` are served
+from the table too.
 
 A request outside this surface fails with `400` and a reason naming the
 clause (`[infino] query not served by the table: ...`), never a silently
-empty answer. Not served: `composite`, `top_hits`, `percentile_ranks`, HDR
-percentiles, `significant_terms`; `fuzzy`, `nested`, `function_score`,
-`script` and geo queries; `scroll`, `search_after`, `post_filter`,
-`collapse`, `suggest`; `mget`; a search or bulk mixing Infino-backed indices
+empty answer. Not served: HDR percentiles; `fuzzy`, `nested`,
+`function_score` and geo queries; `suggest`; a sliced search (a sliced
+scroll, reindex or update by query); a search mixing Infino-backed indices
 with others.
 
 ## License

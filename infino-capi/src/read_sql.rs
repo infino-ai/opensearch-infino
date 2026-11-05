@@ -787,7 +787,18 @@ impl<'a> Walk<'a> {
             if let Some(closed) = unsearchable.get(&index) {
                 let at: &[usize] = engine.map_or(&[], |engine| engine.columns);
                 for arg in at.iter().filter_map(|&i| args.args.get(i)) {
-                    if let Some(column) = string_arg(arg).filter(|c| closed.contains(*c)) {
+                    // A column named any other way (a dollar-quoted string, a
+                    // concatenation the planner folds) is a column this check
+                    // cannot read, so it is refused rather than let through.
+                    let Some(column) = string_arg(arg) else {
+                        return ControlFlow::Break(refuse(
+                            format!(
+                                "{function} over [{index}] names its column other than as a quoted string, which is not served under a field or masking rule"
+                            ),
+                            FORBIDDEN,
+                        ));
+                    };
+                    if closed.contains(column) {
                         return ControlFlow::Break(refuse(
                             format!(
                                 "[{column}] is hidden or masked for you in [{index}]; {function} over it would match its values"
@@ -1132,6 +1143,14 @@ mod tests {
             &[],
         ));
         assert_eq!(r.status, FORBIDDEN);
+        // A column named other than as a quoted string is one the check cannot
+        // read: the planner folds this one into the hidden column's name.
+        let r = refusal(rewritten(
+            "SELECT osid FROM bm25_search('logs', 'sec' || 'ret', 'alpha', 10)",
+            &reads,
+            &[],
+        ));
+        assert_eq!(r.status, FORBIDDEN, "{}", r.message);
     }
 
     #[test]

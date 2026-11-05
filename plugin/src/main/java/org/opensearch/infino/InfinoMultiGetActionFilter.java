@@ -21,6 +21,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -84,6 +85,12 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                 return;
             }
         }
+        // The tables are read on the get pool, never on the thread that took the request.
+        InfinoServices.fork(ThreadPool.Names.GET, listener::onFailure, () -> serve(mget, indices, listener));
+    }
+
+    /** Answer a multi-get whose every item is on an Infino-backed index from the tables. */
+    private <Response extends ActionResponse> void serve(MultiGetRequest mget, Map<String, IndexMetadata> indices, ActionListener<Response> listener) {
         try {
             // One fetch per table, over all of its ids: through the document
             // rule when the security plugin has one for this user. An index in
