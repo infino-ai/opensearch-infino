@@ -19,6 +19,7 @@ import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.action.update.UpdateResponse;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.engine.VersionConflictEngineException;
@@ -36,9 +37,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.Condition;
+import java.util.concurrent.Executor;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 
 /**
  * Writes to one table, batched across bulk requests.
@@ -82,7 +84,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class InfinoWriter {
 
     private static final Logger log = LogManager.getLogger(InfinoWriter.class);
-    /** Documents a batch may hold while an append runs; past this, arriving bulks wait for the next append to be taken. */
+    /** Documents a batch may hold while an append runs; past this, arriving bulks are refused with 429 until the append takes them. */
     private static final int MAX_BATCH_DOCS = Integer.getInteger("infino.batch.docs", 50_000);
     /** Source bytes a batch may hold while an append runs. */
     private static final long MAX_BATCH_BYTES = Long.getLong("infino.batch.bytes", 64L << 20);
@@ -136,8 +138,6 @@ public final class InfinoWriter {
     /** The pending batch of one table, and whether an append is running for it. */
     private static final class Batch {
         final Lock lock = new ReentrantLock();
-        /** Signalled whenever the pending writes are taken by an append, for bulks held back by the bound. */
-        final Condition taken = lock.newCondition();
         final List<Staged> staged = new ArrayList<>();
         /** The latest source pending for each id, for an update in the same batch to merge into. */
         final Map<String, String> pendingSources = new HashMap<>();
@@ -155,11 +155,20 @@ public final class InfinoWriter {
         String seqAllocation;
     }
 
-    private final ThreadPool threadPool;
+    /** Where a table's appends run: the {@code write} pool. */
+    private final Supplier<Executor> flushes;
+    private final int maxBatchDocs;
+    private final long maxBatchBytes;
     private final Map<String, Batch> batches = new ConcurrentHashMap<>();
 
     public InfinoWriter(ThreadPool threadPool) {
-        this.threadPool = threadPool;
+        this(() -> threadPool.executor(ThreadPool.Names.WRITE), MAX_BATCH_DOCS, MAX_BATCH_BYTES);
+    }
+
+    InfinoWriter(Supplier<Executor> flushes, int maxBatchDocs, long maxBatchBytes) {
+        this.flushes = flushes;
+        this.maxBatchDocs = maxBatchDocs;
+        this.maxBatchBytes = maxBatchBytes;
     }
 
     /** The source a pending write holds for an id, so an update in the same batch merges into it. */
@@ -201,37 +210,56 @@ public final class InfinoWriter {
         Staged staged = new Staged(waiter, prepared, ids, bytes);
 
         Batch batch = batches.computeIfAbsent(table, t -> new Batch());
-        boolean start;
+        boolean admitted;
+        boolean start = false;
+        int pending;
         batch.lock.lock();
         try {
-            // A batch past its bound waits for the running append to take it
-            // before more is staged behind it.
-            while (batch.flushing && (batch.docs >= MAX_BATCH_DOCS || batch.bytes >= MAX_BATCH_BYTES)) {
-                try {
-                    batch.taken.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    InfinoNative.freePrepared(prepared);
-                    waiter.listener().onFailure(e);
-                    return;
+            // A batch past its bound refuses more until the running append
+            // takes it. It never waits here: this is the thread that delivered
+            // the bulk, a transport worker, and a node whose workers all wait
+            // on a stalled append reads no more requests, health checks included.
+            pending = batch.docs;
+            admitted = !refuse(batch.flushing, batch.docs, batch.bytes);
+            if (admitted) {
+                batch.staged.add(staged);
+                batch.docs += ids.size();
+                batch.bytes += bytes;
+                for (int i = 0; i < ids.size(); i++) {
+                    batch.pendingSources.put(ids.get(i), sources.get(i));
                 }
-            }
-            batch.staged.add(staged);
-            batch.docs += ids.size();
-            batch.bytes += bytes;
-            for (int i = 0; i < ids.size(); i++) {
-                batch.pendingSources.put(ids.get(i), sources.get(i));
-            }
-            start = !batch.flushing;
-            if (start) {
-                batch.flushing = true;
+                start = !batch.flushing;
+                if (start) {
+                    batch.flushing = true;
+                }
             }
         } finally {
             batch.lock.unlock();
         }
-        if (start) {
-            threadPool.executor(ThreadPool.Names.WRITE).execute(() -> flush(table, batch));
+        if (!admitted) {
+            if (prepared != null) {
+                InfinoNative.freePrepared(prepared);
+            }
+            waiter.listener()
+                .onFailure(
+                    new OpenSearchRejectedExecutionException(
+                        "[infino] "
+                            + pending
+                            + " writes to table "
+                            + table
+                            + " are waiting for the running append; the bulk is refused until the append takes them"
+                    )
+                );
+            return;
         }
+        if (start) {
+            flushes.get().execute(() -> flush(table, batch));
+        }
+    }
+
+    /** Whether a bulk arriving now is refused: an append is running and the batch behind it is past its bound. */
+    private boolean refuse(boolean flushing, int docs, long bytes) {
+        return flushing && (docs >= maxBatchDocs || bytes >= maxBatchBytes);
     }
 
     /** Append what is pending and answer the bulks it carries; repeat while more arrived meanwhile. */
@@ -242,7 +270,6 @@ public final class InfinoWriter {
             try {
                 if (batch.staged.isEmpty()) {
                     batch.flushing = false;
-                    batch.taken.signalAll();
                     return;
                 }
                 staged = new ArrayList<>(batch.staged);
@@ -250,7 +277,6 @@ public final class InfinoWriter {
                 batch.pendingSources.clear();
                 batch.docs = 0;
                 batch.bytes = 0;
-                batch.taken.signalAll();
             } finally {
                 batch.lock.unlock();
             }
