@@ -25,12 +25,15 @@ import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.support.XContentMapValues;
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
@@ -46,6 +49,7 @@ import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.aggregations.MultiBucketConsumerService;
 import org.opensearch.search.aggregations.metrics.InternalTopHits;
 import org.opensearch.search.aggregations.metrics.TopHitsAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -254,9 +258,12 @@ public final class InfinoSearch {
         VectorRequest vector = null;
         Translation query;
         if (qb instanceof InfinoKnnQueryBuilder knn) {
+            searched(cols, knn.field(), true, InfinoKnnQueryBuilder.NAME);
             vector = VectorRequest.of(false, null, null, knn.field(), knn.vector(), knn.k());
             query = new Translation(table, InfinoQueryTranslator.ALL, null);
         } else if (qb instanceof InfinoHybridQueryBuilder hybrid) {
+            searched(cols, hybrid.textColumn(), false, InfinoHybridQueryBuilder.NAME);
+            searched(cols, hybrid.vectorColumn(), true, InfinoHybridQueryBuilder.NAME);
             vector = VectorRequest.of(true, hybrid.textColumn(), hybrid.textQuery(), hybrid.vectorColumn(), hybrid.vector(), hybrid.k());
             query = new Translation(table, InfinoQueryTranslator.ALL, null);
         } else if (InfinoStockKnn.is(qb)) {
@@ -358,6 +365,25 @@ public final class InfinoSearch {
     }
 
     /**
+     * Check the column a vector or hybrid query searches against the columns
+     * the request may see: the engine's search reads the column itself, so a
+     * field hidden from the user is as if unmapped, and one masked for the
+     * user is refused, as a sort on it is. {@code vector} says which kind of
+     * column the query needs: a vector one, else a text one.
+     */
+    private static void searched(Map<String, Column> cols, String field, boolean vector, String query) {
+        Column c = field == null ? null : cols.get(field);
+        if (c == null || (vector ? !c.vector() : !c.fts())) {
+            throw new IllegalArgumentException(
+                "[infino] [" + query + "] names field [" + field + "], which the table has no " + (vector ? "vector" : "text") + " column for"
+            );
+        }
+        if (c.masked()) {
+            throw InfinoAccess.refused("[" + query + "] on [" + field + "], a field masked for this user, is not served");
+        }
+    }
+
+    /**
      * The vector request of the k-NN plugin's {@code knn} query. Its filter
      * becomes the predicate the engine narrows the search with, so the k
      * nearest come from the rows the filter keeps, as the k-NN plugin's
@@ -365,10 +391,8 @@ public final class InfinoSearch {
      * is refused with the clause named.
      */
     private static VectorRequest stockKnn(InfinoStockKnn.Query knn, Map<String, Column> cols, String table, long nowMillis) {
+        searched(cols, knn.field(), true, InfinoStockKnn.NAME);
         Column c = cols.get(knn.field());
-        if (c == null || !c.vector()) {
-            throw new IllegalArgumentException("[infino] knn names field [" + knn.field() + "], which the table has no vector column for");
-        }
         String filter = null;
         if (knn.filter() != null) {
             filter = InfinoQueryTranslator.vectorFilter(knn.filter(), cols, table, nowMillis);
@@ -1058,6 +1082,10 @@ public final class InfinoSearch {
             // A bare text query: the engine counts its matches without materializing them.
             return InfinoNative.count(table, q.principal().column(), q.principal().query(), q.principal().mode());
         }
+        if (q.principal() == null) {
+            // A condition on the table's columns: the engine counts a range from its range index, with no statement.
+            return InfinoNative.countWhere(table, List.of(q.where()))[0];
+        }
         List<Map<String, Object>> rows = InfinoNative.sqlRows("SELECT COUNT(*) AS c FROM " + q.from() + " WHERE " + q.where());
         if (rows.isEmpty()) {
             return 0;
@@ -1100,6 +1128,49 @@ public final class InfinoSearch {
     record Searched(SearchResponse response, Map<Index, Object[]> after) {}
 
     /**
+     * Refuse a page past an index's {@code index.max_result_window}, as a
+     * shard refuses it: every row up to the window is read with its source,
+     * once per index, so an unbounded one fills the heap. A scroll's pages
+     * are bounded by their size, as a stock scroll's batches are.
+     */
+    static void checkResultWindow(List<Index> indices, SearchSourceBuilder source, boolean scrolling) {
+        ClusterService clusters = InfinoServices.clusterService();
+        if (clusters == null) {
+            return;
+        }
+        long size = source.size() < 0 ? DEFAULT_SIZE : source.size();
+        long window = scrolling ? size : Math.max(0, source.from()) + size;
+        for (Index index : indices) {
+            IndexMetadata md = clusters.state().metadata().index(index);
+            if (md == null) {
+                continue;
+            }
+            int max = IndexSettings.MAX_RESULT_WINDOW_SETTING.get(md.getSettings());
+            if (window <= max) {
+                continue;
+            }
+            String setting = IndexSettings.MAX_RESULT_WINDOW_SETTING.getKey();
+            throw new IllegalArgumentException(
+                scrolling
+                    ? "Batch size is too large, size must be less than or equal to: [" + max + "] but was [" + window
+                        + "]. Scroll batch sizes cost as much memory as result windows so they are controlled by the [" + setting
+                        + "] index level setting."
+                    : "Result window is too large, from + size must be less than or equal to: [" + max + "] but was [" + window
+                        + "]. See the scroll api for a more efficient way to request large data sets. This limit can be set by changing the ["
+                        + setting + "] index level setting."
+            );
+        }
+    }
+
+    /** The buckets one request may build, as the cluster sets {@code search.max_buckets}. */
+    private static int maxBuckets() {
+        ClusterService clusters = InfinoServices.clusterService();
+        return clusters == null
+            ? MultiBucketConsumerService.DEFAULT_MAX_BUCKETS
+            : clusters.getClusterSettings().get(MultiBucketConsumerService.MAX_BUCKET_SETTING);
+    }
+
+    /**
      * As {@link #search(List, Function, Function, SearchSourceBuilder, ScriptService, long)},
      * and for a scroll: {@code after} is the cursor each index resumes from
      * (an index absent from it starts at the top; null when not scrolling),
@@ -1117,6 +1188,7 @@ public final class InfinoSearch {
         ScriptService scripts,
         long startNanos
     ) {
+        checkResultWindow(indices, source, after != null);
         long now = System.currentTimeMillis();
         List<Page> pages = new ArrayList<>();
         List<InternalAggregations> aggs = new ArrayList<>();
@@ -1162,10 +1234,12 @@ public final class InfinoSearch {
         }
         InternalAggregations reduced = null;
         if (!aggs.isEmpty()) {
+            // The buckets are counted against search.max_buckets as a stock reduce
+            // counts them, so one request cannot build more than the cluster allows.
             InternalAggregation.ReduceContext ctx = InternalAggregation.ReduceContext.forFinalReduction(
                 BigArrays.NON_RECYCLING_INSTANCE,
                 scripts,
-                bucketCount -> {},
+                new MultiBucketConsumerService.MultiBucketConsumer(maxBuckets(), new NoopCircuitBreaker(CircuitBreaker.REQUEST)),
                 source.aggregations().buildPipelineTree()
             );
             reduced = InternalAggregations.topLevelReduce(aggs, ctx);
@@ -1341,10 +1415,17 @@ public final class InfinoSearch {
             Object[] va = a.getSortValues();
             Object[] vb = b.getSortValues();
             for (int i = 0; i < Math.min(va.length, vb.length); i++) {
-                int c;
                 if (va[i] == null || vb[i] == null) {
-                    c = va[i] == null ? (vb[i] == null ? 0 : 1) : -1; // nulls last, both directions
-                } else if (va[i] instanceof Comparable ca && vb[i].getClass() == va[i].getClass()) {
+                    // Missing values last in both directions, as each index's own
+                    // statement orders them (NULLS LAST): never turned by a descending sort.
+                    int nulls = va[i] == null ? (vb[i] == null ? 0 : 1) : -1;
+                    if (nulls != 0) {
+                        return nulls;
+                    }
+                    continue;
+                }
+                int c;
+                if (va[i] instanceof Comparable ca && vb[i].getClass() == va[i].getClass()) {
                     c = ca.compareTo(vb[i]);
                 } else if (va[i] instanceof Number na && vb[i] instanceof Number nb) {
                     c = Double.compare(na.doubleValue(), nb.doubleValue());

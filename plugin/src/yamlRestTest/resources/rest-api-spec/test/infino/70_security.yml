@@ -153,6 +153,78 @@
       search:
         index: sec1
         body: { size: 0, aggs: { ips: { cardinality: { field: ip } } } }
+  # A query comparing the masked field's values is refused: the table holds its clear ones.
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      search:
+        index: sec1
+        body: { size: 0, query: { term: { ip: "10.0.0.1" } } }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      search:
+        index: sec1
+        body: { size: 0, query: { prefix: { ip: "10.0.0" } } }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      search:
+        index: sec1
+        body: { size: 0, query: { range: { ip: { gte: "10.0.0.0" } } } }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      search:
+        index: sec1
+        body: { size: 0, query: { wildcard: { ip: "10.*" } } }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      search:
+        index: sec1
+        body: { size: 0, query: { regexp: { ip: "10[.].*" } } }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      search:
+        index: sec1
+        body: { size: 0, query: { match: { ip: "10.0.0.1" } } }
+  # A script reads values themselves, so it sees the masked field as unmapped, as a script field does.
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      search:
+        index: sec1
+        body: { size: 0, query: { script: { script: { source: "doc['ip'].value == '10.0.0.1'" } } } }
+  - match: { hits.total.value: 0 }
+  # Whether the masked field has a value is no secret: its hash is shown.
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      search:
+        index: sec1
+        body: { size: 0, query: { exists: { field: ip } } }
+  - match: { hits.total.value: 3 }
+
+  # The column of raw sources holds the hidden and masked fields: under a field
+  # or masking rule it is no field of the index, so nothing reads them through it.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec1
+        body: { size: 0, query: { wildcard: { source: "*alpha*" } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec1
+        body: { size: 0, aggs: { raw: { terms: { field: source } } } }
+  - length: { aggregations.raw.buckets: 0 }
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      search:
+        index: sec1
+        body: { size: 0, query: { wildcard: { source: "*10.0.0.1*" } } }
+  - match: { hits.total.value: 0 }
 
   # The admin is unrestricted.
   - do:
@@ -523,3 +595,32 @@
         index: sec4
         id: k1
   - match: { _source.tag: $lucene_tag }
+
+---
+"Security: naming an index's table takes the right to manage the cluster":
+  - skip:
+      features: headers
+  # A user who may create sec* indices creates one served from the table its name maps to...
+  - do:
+      headers: { Authorization: "Basic Y3JlYXRlX3VzZXI6YWRtaW4=" }
+      indices.create:
+        index: sec7a
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+  # ...but naming the table, which chooses the rows the index reads, is refused.
+  - do:
+      headers: { Authorization: "Basic Y3JlYXRlX3VzZXI6YWRtaW4=" }
+      catch: forbidden
+      indices.create:
+        index: sec7b
+        body:
+          settings: { index.infino.table: os_sec7_rows, number_of_shards: 1, number_of_replicas: 0 }
+  # The admin may name it.
+  - do:
+      indices.create:
+        index: sec7c
+        body:
+          settings: { index.infino.table: os_sec7_rows, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      indices.delete:
+        index: sec7a,sec7c

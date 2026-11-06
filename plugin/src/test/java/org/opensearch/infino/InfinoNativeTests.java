@@ -7,6 +7,7 @@ package org.opensearch.infino;
 import org.opensearch.infino.InfinoNative.Mapping;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -60,5 +61,23 @@ public class InfinoNativeTests extends OpenSearchTestCase {
         assertTrue(m.aliases().isEmpty());
         assertTrue(m.keywordFields().isEmpty());
         assertTrue(m.dateFormats().isEmpty());
+    }
+
+    /**
+     * The id probe asks for plain terms: a leading + or - (a phone number, a
+     * negative number) and a double quote are clause syntax to the engine,
+     * and with a required clause the union found only one id's rows.
+     */
+    public void testIdsAreAskedForAsPlainTerms() {
+        assertEquals("15551234 15559876", InfinoNative.idTerms(List.of("+15551234", "+15559876")));
+        assertEquals("7 a b x y z", InfinoNative.idTerms(List.of("-7", "a\"b", "x y", "--z")));
+        assertEquals("", InfinoNative.idTerms(List.of("---", "+")));
+    }
+
+    public void testAnIdWithNoLetterOrDigitHasNoTerm() {
+        assertFalse(InfinoNative.hasTerm("---"));
+        assertFalse(InfinoNative.hasTerm("+/-"));
+        assertTrue(InfinoNative.hasTerm("+1"));
+        assertTrue(InfinoNative.hasTerm("é"));
     }
 }

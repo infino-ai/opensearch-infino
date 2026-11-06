@@ -87,3 +87,16 @@ sec_mask_regex:
       allowed_actions:
         - "read"
         - "indices:admin/mappings/get"
+
+# Creates and reads sec* indices, and may not manage the cluster.
+sec_create:
+  reserved: false
+  cluster_permissions:
+    - "cluster_composite_ops_ro"
+  index_permissions:
+    - index_patterns:
+        - "sec*"
+      allowed_actions:
+        - "create_index"
+        - "read"
+        - "indices:admin/mappings/get"

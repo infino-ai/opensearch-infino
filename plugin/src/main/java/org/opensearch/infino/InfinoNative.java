@@ -14,11 +14,14 @@ import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.json.JsonXContent;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 
 import java.io.IOException;
@@ -156,7 +159,7 @@ public final class InfinoNative {
          * words.
          */
         Column exact() {
-            return new Column(name, type, false, vector, mask, dateFormat, elem);
+            return fts ? new Column(name, type, false, vector, mask, dateFormat, elem) : this;
         }
 
         /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */
@@ -363,11 +366,16 @@ public final class InfinoNative {
      * its table, so a recreated one starts empty.
      */
     public static String tableFor(Index index, Settings indexSettings) {
+        return tableFor(index.getName(), indexSettings);
+    }
+
+    /** The Infino table of an index of this name and these settings, as {@link #tableFor(Index, Settings)} names it. */
+    public static String tableFor(String indexName, Settings indexSettings) {
         String explicit = InfinoPlugin.INFINO_TABLE.get(indexSettings);
         if (!explicit.isEmpty()) {
             return explicit;
         }
-        return tableFor(index.getName());
+        return tableFor(indexName);
     }
 
     /** The table an index of this name is served from when none is named explicitly. */
@@ -963,6 +971,41 @@ public final class InfinoNative {
     }
 
     /**
+     * The rows each of {@code predicates} (SQL conditions over the table's
+     * columns) holds, in order, as {@code COUNT(*) FILTER (WHERE p)} counts
+     * each. The engine counts a range on a range-indexed column, or every row,
+     * from its range index with no statement, and runs one aggregate otherwise.
+     */
+    public static long[] countWhere(String n, List<String> predicates) {
+        init();
+        String out = takeOrThrow(lib.infino_count_where(conn, n, jsonArray(predicates)));
+        try (XContentParser parser = parser(out)) {
+            List<Object> list = parser.list();
+            long[] counts = new long[list.size()];
+            for (int i = 0; i < counts.length; i++) {
+                counts[i] = ((Number) list.get(i)).longValue();
+            }
+            return counts;
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** {@code values} as a JSON array of strings. */
+    private static String jsonArray(List<String> values) {
+        try (XContentBuilder b = XContentFactory.jsonBuilder()) {
+            b.startArray();
+            for (String v : values) {
+                b.value(v);
+            }
+            b.endArray();
+            return BytesReference.bytes(b).utf8ToString();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
      * A column's rows counted per value, without a statement: one row per
      * value (under the column's name, null for the rows without one) with its
      * count under {@link #VALUE_COUNT}. The engine reads them from the table's
@@ -1004,9 +1047,10 @@ public final class InfinoNative {
 
     /**
      * Which of these ids the table already holds, through the id column's
-     * term index: one statement per thousand ids, a union of their postings,
-     * then an exact comparison, since an id with punctuation indexes as
-     * several terms and the union may name ids that only share one.
+     * term index: one statement per thousand ids, a union of their postings
+     * (asked as plain terms, see {@link #idTerms}), then an exact comparison,
+     * since an id with punctuation indexes as several terms and the union may
+     * name ids that only share one. An id with no term is compared by value.
      */
     public static Set<String> existingOsids(String name, Collection<String> osids) {
         return probe(name, osids, false).keySet();
@@ -1039,16 +1083,59 @@ public final class InfinoNative {
     }
 
     private static void probe(String name, List<String> ids, boolean withSeqs, Set<String> wanted, Map<String, Long> found) {
-        String terms = InfinoQueryTranslator.literal(String.join(" ", ids));
         String columns = withSeqs ? InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SEQ : InfinoQueryTranslator.OSID;
-        String sql = "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', " + terms
-            + ", 'or')";
-        for (Map<String, Object> row : sqlRows(sql)) {
-            Object id = row.get(InfinoQueryTranslator.OSID);
-            if (id != null && wanted.contains(id.toString())) {
-                found.put(id.toString(), seq(row.get(InfinoQueryTranslator.SEQ)));
+        // An id with no letter or digit indexes as no term, so the term index
+        // cannot find it: those are compared by value over the id column.
+        List<String> termed = new ArrayList<>(ids.size());
+        List<String> bare = new ArrayList<>();
+        for (String id : ids) {
+            (hasTerm(id) ? termed : bare).add(id);
+        }
+        List<String> statements = new ArrayList<>(2);
+        if (!termed.isEmpty()) {
+            statements.add(
+                "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
+                    + InfinoQueryTranslator.literal(idTerms(termed)) + ", 'or')"
+            );
+        }
+        if (!bare.isEmpty()) {
+            statements.add(byIds(name, columns, bare, null));
+        }
+        for (String sql : statements) {
+            for (Map<String, Object> row : sqlRows(sql)) {
+                Object id = row.get(InfinoQueryTranslator.OSID);
+                if (id != null && wanted.contains(id.toString())) {
+                    found.put(id.toString(), seq(row.get(InfinoQueryTranslator.SEQ)));
+                }
             }
         }
+    }
+
+    /**
+     * Ids as an engine text query of plain terms
+     * ({@link InfinoQueryTranslator#plainTerms}): an id holding a leading
+     * {@code +} or {@code -} (a phone number such as {@code +15551234}, a
+     * negative number) would otherwise be a required or excluded clause, and
+     * with a required clause in it the union finds only the rows holding
+     * that one id.
+     */
+    static String idTerms(Collection<String> ids) {
+        StringBuilder out = new StringBuilder();
+        for (String id : ids) {
+            String terms = InfinoQueryTranslator.plainTerms(id);
+            if (!terms.isEmpty()) {
+                if (out.length() > 0) {
+                    out.append(' ');
+                }
+                out.append(terms);
+            }
+        }
+        return out.toString();
+    }
+
+    /** Whether an id holds a letter or a digit, and so indexes as at least one term of the id column's term index. */
+    static boolean hasTerm(String id) {
+        return id.codePoints().anyMatch(Character::isLetterOrDigit);
     }
 
     /**
@@ -1060,9 +1147,11 @@ public final class InfinoNative {
         if (!columns(name).containsKey(InfinoQueryTranslator.ROUTING)) {
             return null;
         }
-        String sql = "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING)
-            + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
-            + InfinoQueryTranslator.literal(id) + ", 'and')";
+        String columns = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING);
+        String sql = hasTerm(id)
+            ? "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
+                + InfinoQueryTranslator.literal(idTerms(List.of(id))) + ", 'and')"
+            : byIds(name, columns, List.of(id), null);
         for (Map<String, Object> row : sqlRows(sql)) {
             Object rowId = row.get(InfinoQueryTranslator.OSID);
             Object routing = row.get(InfinoQueryTranslator.ROUTING);

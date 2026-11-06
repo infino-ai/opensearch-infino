@@ -33,6 +33,7 @@ import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.PipelineAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -81,7 +82,8 @@ public class InfinoScrollActionFilter implements ActionFilter {
         if (SearchScrollAction.NAME.equals(action) && request instanceof SearchScrollRequest scroll && InfinoScrolls.owns(scroll.scrollId())) {
             @SuppressWarnings("unchecked")
             ActionListener<SearchResponse> cast = (ActionListener<SearchResponse>) listener;
-            page(scroll, cast);
+            // The table is read on the search pool, never on the thread that took the request.
+            InfinoServices.fork(ThreadPool.Names.SEARCH, cast::onFailure, () -> page(scroll, cast));
             return;
         }
         if (SearchScrollAction.NAME.equals(action) && request instanceof SearchScrollRequest scroll) {

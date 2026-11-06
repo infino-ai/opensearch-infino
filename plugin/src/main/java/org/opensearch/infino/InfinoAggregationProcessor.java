@@ -225,6 +225,8 @@ public class InfinoAggregationProcessor {
      * with more groups than are picked here (see {@link #totalFromTopTerms}).
      */
     private final Map<String, List<Map<String, Object>>> readAhead = new HashMap<>();
+    /** The table {@link #evaluate} reads, whose plain relation {@link #explicitCounts} counts directly. */
+    private String table;
 
     /** A processor whose top hits name {@code index}; null for planning only. */
     InfinoAggregationProcessor(Index index) {
@@ -273,8 +275,8 @@ public class InfinoAggregationProcessor {
      * The requested aggregations over the plan's relation, in request order,
      * as the stock response objects, with the request's exact match count.
      * {@code total} is that count when the hit path already has it; when
-     * null it is counted here, beside the root metrics when there are any,
-     * so it costs no statement of its own.
+     * null it is counted here, beside the root metrics or a counting range's
+     * buckets when there are any, so it costs no statement of its own.
      */
     Counted evaluate(Collection<AggregationBuilder> builders, Plan plan, Long total) {
         Translation q = plan.query();
@@ -323,6 +325,7 @@ public class InfinoAggregationProcessor {
     ) {
         this.plan = plan;
         this.tables = tables;
+        this.table = tables.size() == 1 ? tables.get(0) : null;
         List<Spec> specs = new ArrayList<>();
         int position = 0;
         for (AggregationBuilder b : builders) {
@@ -338,6 +341,13 @@ public class InfinoAggregationProcessor {
         for (Spec spec : specs) {
             if (spec instanceof Metric m) {
                 rootMetrics.add(m);
+                continue;
+            }
+            if (total == null && spec instanceof Explicit e && countsOnly(e)) {
+                // The buckets' statement counts the request's matches too.
+                Map<String, Object> counted = explicitCounts(e, from, where, true);
+                total = asLong(counted.get(TOTAL_ALIAS));
+                byName.put(spec.name(), buildExplicitCounts(e, counted));
                 continue;
             }
             if (total == null) {
@@ -685,7 +695,7 @@ public class InfinoAggregationProcessor {
                 c = InfinoSearch.columnFor(cols, b.field());
                 if (c == null) {
                     if (!InfinoNative.maps(table, b.field())) {
-                        return Source.unmapped(b.field(), unmappedType(b));
+                        return withMissing(b, Source.unmapped(b.field(), unmappedType(b)), now);
                     }
                     throw new Unsupported("aggregation [" + b.getName() + "] names field [" + b.field() + "], which the table has no column for");
                 }
@@ -694,12 +704,36 @@ public class InfinoAggregationProcessor {
                 // A script reads values themselves, so it sees no masked column, the value script's included.
                 Column valueColumn = c != null && c.masked() ? null : c;
                 Sql sql = InfinoScriptTranslator.translate(b.script(), InfinoAccess.scriptColumns(cols), valueColumn, now);
-                return new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]", null);
+                return withMissing(b, new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]", null), now);
             }
             if (c == null) {
                 throw new Unsupported("aggregation [" + b.getName() + "] needs a field or a script");
             }
-            return Source.of(c, cols, table);
+            return withMissing(b, Source.of(c, cols, table), now);
+        }
+
+        /**
+         * {@code source} with the aggregation's {@code missing} value standing
+         * in for a document that gives none, as OpenSearch reads it: a terms
+         * bucket of its own, a value a metric counts. A field some document
+         * gives several values, or one masked for the user, is refused with it.
+         */
+        static Source withMissing(ValuesSourceAggregationBuilder<?> b, Source source, long now) {
+            if (b.missing() == null) {
+                return source;
+            }
+            if (source.multi()) {
+                throw new Unsupported("aggregation [" + b.getName() + "] has [missing] over " + source.label() + ", which documents give several values");
+            }
+            if (source.masked()) {
+                throw new Unsupported("aggregation [" + b.getName() + "] has [missing] over " + source.label() + ", a field masked for this user");
+            }
+            String literal = InfinoQueryTranslator.literalForType(source.type(), b.missing(), now);
+            if (literal == null) {
+                throw new Unsupported("aggregation [" + b.getName() + "] has [missing: " + b.missing() + "], which " + source.label() + " cannot hold");
+            }
+            // No column: the fast paths that read a column's own values would skip the stand-in.
+            return new Source("COALESCE(" + source.expr() + ", " + literal + ")", source.type(), source.label(), null, null, source.dateFormat(), null, source.onlyWhere());
         }
 
         /** The type an aggregation reads an unmapped field as: what its values would have been. */
@@ -1506,6 +1540,10 @@ public class InfinoAggregationProcessor {
             long now
         ) {
             Source c = sourceOf(t, cols, table, now);
+            if (t.includeExclude() != null) {
+                // Read as Lucene reads them (its regular expressions, its partitions), which the table does not.
+                throw new Unsupported("aggregation [" + t.getName() + "] has include/exclude, which is not served");
+            }
             if (t.size() > MAX_TERMS_SIZE) {
                 throw new Unsupported("aggregation [" + t.getName() + "] asks for " + t.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
             }
@@ -1899,7 +1937,9 @@ public class InfinoAggregationProcessor {
                 all.add("(" + p + ")");
             }
             if (f.otherBucket()) {
-                String other = all.isEmpty() ? InfinoQueryTranslator.ALL : "NOT (" + String.join(" OR ", all) + ")";
+                // A document a filter cannot judge (its field missing) is in no named
+                // bucket, so it is in the other one: unknown counts as false here.
+                String other = all.isEmpty() ? InfinoQueryTranslator.ALL : "NOT COALESCE((" + String.join(" OR ", all) + "), FALSE)";
                 buckets.add(new ExplicitBucket(f.otherBucketKey(), other, Double.NaN, Double.NaN));
             }
             return new Explicit(f, leaves, child, ExplicitKind.FILTERS, buckets, f.isKeyed(), DocValueFormat.RAW);
@@ -2473,6 +2513,9 @@ public class InfinoAggregationProcessor {
     }
 
     private InternalAggregation evalExplicit(Explicit e, String from, String where) {
+        if (countsOnly(e)) {
+            return buildExplicitCounts(e, explicitCounts(e, from, where, false));
+        }
         List<Map<String, Object>> rows = new ArrayList<>();
         List<List<InternalAggregation>> topHits = new ArrayList<>();
         List<List<InternalAggregation>> nested = new ArrayList<>();
@@ -2486,6 +2529,72 @@ public class InfinoAggregationProcessor {
             nested.add(evalChildren(e.child, from, w, docCount));
         }
         return e.build(rows, topHits, nested);
+    }
+
+    /**
+     * Whether {@code e} is range or date_range buckets that only count. A filters bucket may
+     * hold a query the table answers through a subquery, which an aggregate's FILTER clause
+     * cannot carry; range buckets are plain comparisons.
+     */
+    private static boolean countsOnly(Explicit e) {
+        return e.kind != ExplicitKind.FILTERS && e.metrics.isEmpty() && e.hits.isEmpty() && e.child == null && !e.buckets.isEmpty();
+    }
+
+    /**
+     * The counts of {@link #countsOnly} buckets, all in one call: each bucket's, and the
+     * relation's own as {@link #TOTAL_ALIAS} when {@code withTotal}. Over the plain table
+     * the engine counts a range-indexed field's buckets from its range index, with no
+     * statement; over any other relation they are one statement of a
+     * {@code COUNT(*) FILTER (WHERE ...)} per bucket, which reads the relation once.
+     */
+    private Map<String, Object> explicitCounts(Explicit e, String from, String where, boolean withTotal) {
+        if (table != null && from.equals(InfinoQueryTranslator.quoteIdent(table))) {
+            List<String> predicates = new ArrayList<>();
+            if (withTotal) {
+                predicates.add(where);
+            }
+            for (ExplicitBucket b : e.buckets) {
+                predicates.add("(" + where + ") AND (" + b.predicate() + ")");
+            }
+            long[] counted = InfinoNative.countWhere(table, predicates);
+            Map<String, Object> row = new HashMap<>();
+            int next = 0;
+            if (withTotal) {
+                row.put(TOTAL_ALIAS, counted[next++]);
+            }
+            for (int i = 0; i < e.buckets.size(); i++) {
+                row.put(bucketCount(i), counted[next++]);
+            }
+            return row;
+        }
+        List<String> counts = new ArrayList<>();
+        if (withTotal) {
+            counts.add("COUNT(*) AS " + TOTAL_ALIAS);
+        }
+        for (int i = 0; i < e.buckets.size(); i++) {
+            counts.add("COUNT(*) FILTER (WHERE " + e.buckets.get(i).predicate() + ") AS " + bucketCount(i));
+        }
+        return oneRow("SELECT " + String.join(", ", counts) + " FROM " + from + " WHERE " + where);
+    }
+
+    /** The response of {@link #countsOnly} buckets from their {@link #explicitCounts} row. */
+    private InternalAggregation buildExplicitCounts(Explicit e, Map<String, Object> counted) {
+        List<Map<String, Object>> rows = new ArrayList<>();
+        List<List<InternalAggregation>> topHits = new ArrayList<>();
+        List<List<InternalAggregation>> nested = new ArrayList<>();
+        for (int i = 0; i < e.buckets.size(); i++) {
+            Map<String, Object> row = new HashMap<>();
+            row.put("doc_count", counted.get(bucketCount(i)));
+            rows.add(row);
+            topHits.add(List.of());
+            nested.add(List.of());
+        }
+        return e.build(rows, topHits, nested);
+    }
+
+    /** The column a bucket's count comes back in from {@link #explicitCounts}. */
+    private static String bucketCount(int bucket) {
+        return "bucket_" + bucket;
     }
 
     /** The nested aggregations of one bucket, {@code child} (or each of its {@link Siblings}) over the bucket's rows. */

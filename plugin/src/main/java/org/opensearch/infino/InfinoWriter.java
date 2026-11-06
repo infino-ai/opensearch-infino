@@ -8,6 +8,7 @@ import com.sun.jna.Pointer;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.ExceptionsHelper;
 import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.DocWriteResponse;
 import org.opensearch.action.bulk.BulkItemResponse;
@@ -19,8 +20,10 @@ import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.action.update.UpdateResponse;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.index.engine.DocumentMissingException;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.threadpool.ThreadPool;
@@ -36,9 +39,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.Condition;
+import java.util.concurrent.Executor;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 
 /**
  * Writes to one table, batched across bulk requests.
@@ -54,12 +58,17 @@ import java.util.concurrent.locks.ReentrantLock;
  * document and a byte threshold. The append runs on the write pool, never
  * on the thread that took the request.
  *
- * <p>A bulk's documents are parsed, conformed and converted to Arrow on the
- * thread that took the request, before they join the batch, so that work
- * overlaps the append that is running; the append itself then only
+ * <p>A bulk's documents are parsed, conformed and converted to Arrow on a
+ * write-pool thread before they join the batch, so that work overlaps the
+ * append that is running; the append itself then only
  * commits the prepared batches. When an id is written by more than one
  * bulk of a batch, or a delete targets an id a bulk of the batch writes,
- * the batch takes the slower path that folds the writes by id first.
+ * the batch takes the slower path that folds the writes by id first. So
+ * does a batch carrying an update: an update's document is made when its
+ * batch is written, merged into the write before it in the batch or into
+ * the table, on the one thread that writes the table, so two updates of
+ * one document, or an index and an update of it in one bulk, apply one
+ * after the other as stock applies them.
  *
  * <p>Before the append, one statement over the id column's term index
  * names the ids the table already holds; those are tombstoned in one
@@ -82,7 +91,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class InfinoWriter {
 
     private static final Logger log = LogManager.getLogger(InfinoWriter.class);
-    /** Documents a batch may hold while an append runs; past this, arriving bulks wait for the next append to be taken. */
+    /** Documents a batch may hold while an append runs; past this, arriving bulks are refused with 429 until the append takes them. */
     private static final int MAX_BATCH_DOCS = Integer.getInteger("infino.batch.docs", 50_000);
     /** Source bytes a batch may hold while an append runs. */
     private static final long MAX_BATCH_BYTES = Long.getLong("infino.batch.bytes", 64L << 20);
@@ -95,13 +104,33 @@ public final class InfinoWriter {
 
     /**
      * One write a bulk item asks for: the source to append (null for a
-     * delete), whether the id may already exist (looked up at flush), and
-     * whether it must not ({@code op_type: create}, answered with a conflict
-     * when it does).
+     * delete or an update), whether the id may already exist (looked up at
+     * flush), whether it must not ({@code op_type: create}, answered with a
+     * conflict when it does), and for an update the request whose document
+     * is merged when its batch is written.
      */
-    record Write(String id, String source, boolean lookup, boolean create) {
+    record Write(String id, String source, boolean lookup, boolean create, UpdateRequest update) {
+        Write(String id, String source, boolean lookup, boolean create) {
+            this(id, source, lookup, create, null);
+        }
+
         Write(String id, String source, boolean lookup) {
-            this(id, source, lookup, false);
+            this(id, source, lookup, false, null);
+        }
+
+        /**
+         * An update. Its document is merged into the one it replaces when its
+         * batch is written, on the one thread that writes the table, so it
+         * merges into every write taken before it: earlier in its own bulk,
+         * earlier in its batch, or in an append that has committed since.
+         */
+        static Write update(UpdateRequest update) {
+            return new Write(update.id(), null, true, false, update);
+        }
+
+        /** Whether this write removes its id's document. */
+        boolean deletes() {
+            return source == null && update == null;
         }
     }
 
@@ -117,9 +146,10 @@ public final class InfinoWriter {
     /**
      * What one write became when its batch was written: the sequence number
      * it was given, whether a document stood under its id just before it, and
-     * the conflict that kept it out of the write (null when it was written).
+     * what kept it out of the write (null when it was written): a conflict,
+     * or for an update a missing document or a merged one the columns refuse.
      */
-    private record Written(long seq, boolean existed, Exception conflict) {}
+    private record Written(long seq, boolean existed, Exception rejection) {}
 
     /**
      * What a flush did: the ids the engine refused with the reason, what each
@@ -136,11 +166,7 @@ public final class InfinoWriter {
     /** The pending batch of one table, and whether an append is running for it. */
     private static final class Batch {
         final Lock lock = new ReentrantLock();
-        /** Signalled whenever the pending writes are taken by an append, for bulks held back by the bound. */
-        final Condition taken = lock.newCondition();
         final List<Staged> staged = new ArrayList<>();
-        /** The latest source pending for each id, for an update in the same batch to merge into. */
-        final Map<String, String> pendingSources = new HashMap<>();
         int docs = 0;
         long bytes = 0;
         boolean flushing = false;
@@ -155,25 +181,20 @@ public final class InfinoWriter {
         String seqAllocation;
     }
 
-    private final ThreadPool threadPool;
+    /** Where a table's appends run: the {@code write} pool. */
+    private final Supplier<Executor> flushes;
+    private final int maxBatchDocs;
+    private final long maxBatchBytes;
     private final Map<String, Batch> batches = new ConcurrentHashMap<>();
 
     public InfinoWriter(ThreadPool threadPool) {
-        this.threadPool = threadPool;
+        this(() -> threadPool.executor(ThreadPool.Names.WRITE), MAX_BATCH_DOCS, MAX_BATCH_BYTES);
     }
 
-    /** The source a pending write holds for an id, so an update in the same batch merges into it. */
-    String pendingSource(String table, String id) {
-        Batch batch = batches.get(table);
-        if (batch == null) {
-            return null;
-        }
-        batch.lock.lock();
-        try {
-            return batch.pendingSources.get(id);
-        } finally {
-            batch.lock.unlock();
-        }
+    InfinoWriter(Supplier<Executor> flushes, int maxBatchDocs, long maxBatchBytes) {
+        this.flushes = flushes;
+        this.maxBatchDocs = maxBatchDocs;
+        this.maxBatchBytes = maxBatchBytes;
     }
 
     /**
@@ -186,11 +207,15 @@ public final class InfinoWriter {
         List<String> ids = new ArrayList<>();
         List<String> sources = new ArrayList<>();
         long bytes = 0;
+        // An update's document is made when its batch is written; it counts toward the bound as a document.
+        int updates = 0;
         for (Outcome o : waiter.outcomes()) {
             if (carriesRow(o)) {
                 ids.add(o.write().id());
                 sources.add(o.write().source());
                 bytes += o.write().source().length();
+            } else if (o.write() != null && o.write().update() != null) {
+                updates++;
             }
         }
         Pointer prepared = ids.isEmpty() ? null : InfinoNative.prepare(table, ids, sources);
@@ -201,37 +226,53 @@ public final class InfinoWriter {
         Staged staged = new Staged(waiter, prepared, ids, bytes);
 
         Batch batch = batches.computeIfAbsent(table, t -> new Batch());
-        boolean start;
+        boolean admitted;
+        boolean start = false;
+        int pending;
         batch.lock.lock();
         try {
-            // A batch past its bound waits for the running append to take it
-            // before more is staged behind it.
-            while (batch.flushing && (batch.docs >= MAX_BATCH_DOCS || batch.bytes >= MAX_BATCH_BYTES)) {
-                try {
-                    batch.taken.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    InfinoNative.freePrepared(prepared);
-                    waiter.listener().onFailure(e);
-                    return;
+            // A batch past its bound refuses more until the running append
+            // takes it. It never waits here: this is a write-pool thread, the
+            // pool the appends themselves run on, and threads waiting on a
+            // stalled append would leave none to run it.
+            pending = batch.docs;
+            admitted = !refuse(batch.flushing, batch.docs, batch.bytes);
+            if (admitted) {
+                batch.staged.add(staged);
+                batch.docs += ids.size() + updates;
+                batch.bytes += bytes;
+                start = !batch.flushing;
+                if (start) {
+                    batch.flushing = true;
                 }
-            }
-            batch.staged.add(staged);
-            batch.docs += ids.size();
-            batch.bytes += bytes;
-            for (int i = 0; i < ids.size(); i++) {
-                batch.pendingSources.put(ids.get(i), sources.get(i));
-            }
-            start = !batch.flushing;
-            if (start) {
-                batch.flushing = true;
             }
         } finally {
             batch.lock.unlock();
         }
-        if (start) {
-            threadPool.executor(ThreadPool.Names.WRITE).execute(() -> flush(table, batch));
+        if (!admitted) {
+            if (prepared != null) {
+                InfinoNative.freePrepared(prepared);
+            }
+            waiter.listener()
+                .onFailure(
+                    new OpenSearchRejectedExecutionException(
+                        "[infino] "
+                            + pending
+                            + " writes to table "
+                            + table
+                            + " are waiting for the running append; the bulk is refused until the append takes them"
+                    )
+                );
+            return;
         }
+        if (start) {
+            flushes.get().execute(() -> flush(table, batch));
+        }
+    }
+
+    /** Whether a bulk arriving now is refused: an append is running and the batch behind it is past its bound. */
+    private boolean refuse(boolean flushing, int docs, long bytes) {
+        return flushing && (docs >= maxBatchDocs || bytes >= maxBatchBytes);
     }
 
     /** Append what is pending and answer the bulks it carries; repeat while more arrived meanwhile. */
@@ -242,15 +283,12 @@ public final class InfinoWriter {
             try {
                 if (batch.staged.isEmpty()) {
                     batch.flushing = false;
-                    batch.taken.signalAll();
                     return;
                 }
                 staged = new ArrayList<>(batch.staged);
                 batch.staged.clear();
-                batch.pendingSources.clear();
                 batch.docs = 0;
                 batch.bytes = 0;
-                batch.taken.signalAll();
             } finally {
                 batch.lock.unlock();
             }
@@ -334,34 +372,63 @@ public final class InfinoWriter {
         Map<Outcome, Written> written = new IdentityHashMap<>();
         // The sequence number each id's document stands at after the writes so far; null once deleted.
         Map<String, Long> standing = new HashMap<>();
+        // The document each id stands at after the writes so far, for an update to merge into; null once deleted.
+        Map<String, String> documents = new HashMap<>();
+        // The document each update became.
+        Map<Outcome, String> merged = new IdentityHashMap<>();
         // The last write of each id that goes to the table.
         Map<String, Outcome> last = new LinkedHashMap<>();
         boolean folded = false;
-        for (Staged s : staged) {
-            ShardId shardId = s.waiter().shardId();
-            for (Outcome o : s.waiter().outcomes()) {
-                Write w = o.write();
-                if (w == null) {
-                    continue;
-                }
-                Long current = standing.containsKey(w.id())
-                    ? standing.get(w.id())
-                    : existed.contains(w.id()) ? stored.getOrDefault(w.id(), InfinoDocumentVersion.UNTRACKED_SEQ_NO) : null;
-                Exception conflict = w.create() && current != null
-                    ? new VersionConflictEngineException(shardId, w.id(), "document already exists")
-                    : InfinoDocumentVersion.conflict(shardId, o.item(), current);
-                if (conflict != null) {
-                    written.put(o, new Written(SequenceNumbers.UNASSIGNED_SEQ_NO, current != null, conflict));
-                    folded = true; // the prepared batches carry its row; only the folded path leaves it out
-                    continue;
-                }
-                long seq = batch.nextSeq++;
-                written.put(o, new Written(seq, current != null, null));
-                standing.put(w.id(), w.source() == null ? null : seq);
-                if (last.put(w.id(), o) != null) {
-                    folded = true; // the same id twice in one batch: written twice, or written and deleted
+        try {
+            for (Staged s : staged) {
+                ShardId shardId = s.waiter().shardId();
+                for (Outcome o : s.waiter().outcomes()) {
+                    Write w = o.write();
+                    if (w == null) {
+                        continue;
+                    }
+                    Long current = standing.containsKey(w.id())
+                        ? standing.get(w.id())
+                        : existed.contains(w.id()) ? stored.getOrDefault(w.id(), InfinoDocumentVersion.UNTRACKED_SEQ_NO) : null;
+                    Exception rejection = w.create() && current != null
+                        ? new VersionConflictEngineException(shardId, w.id(), "document already exists")
+                        : InfinoDocumentVersion.conflict(shardId, o.item(), current);
+                    if (rejection == null && w.update() != null) {
+                        // The base is the write before it in this batch, else the table,
+                        // which holds every append before this one: flushes take turns.
+                        String base = documents.containsKey(w.id()) ? documents.get(w.id()) : current == null ? null : InfinoNative.getSourceFresh(table, w.id());
+                        String document = InfinoBulkActionFilter.merge(base, w.update());
+                        String why = document == null ? null : InfinoNative.checkDoc(table, document);
+                        if (document == null) {
+                            rejection = new DocumentMissingException(shardId, w.id());
+                        } else if (why != null) {
+                            rejection = new IllegalArgumentException("[infino] " + why);
+                        } else {
+                            merged.put(o, document);
+                        }
+                    }
+                    if (rejection != null) {
+                        written.put(o, new Written(SequenceNumbers.UNASSIGNED_SEQ_NO, current != null, rejection));
+                        folded |= carriesRow(o); // the prepared batches carry its row; only the folded path leaves it out
+                        continue;
+                    }
+                    String document = merged.containsKey(o) ? merged.get(o) : w.source();
+                    long seq = batch.nextSeq++;
+                    written.put(o, new Written(seq, current != null, null));
+                    standing.put(w.id(), document == null ? null : seq);
+                    documents.put(w.id(), document);
+                    if (last.put(w.id(), o) != null) {
+                        folded = true; // the same id twice in one batch: written twice, or written and deleted
+                    }
+                    folded |= w.update() != null; // its document was made here: only the folded path prepares it
                 }
             }
+        } catch (RuntimeException e) {
+            // An update's read of the table failed: the handles never reached the engine.
+            for (Staged s : staged) {
+                InfinoNative.freePrepared(s.prepared());
+            }
+            throw e;
         }
         List<String> replaced = new ArrayList<>();
         List<String> tombstones = new ArrayList<>();
@@ -370,7 +437,7 @@ public final class InfinoWriter {
             if (!existed.contains(w.id())) {
                 continue; // a new id: its row is appended, and there is nothing to replace
             }
-            if (w.source() == null) {
+            if (w.deletes()) {
                 tombstones.add(w.id());
             } else {
                 replaced.add(w.id());
@@ -380,7 +447,7 @@ public final class InfinoWriter {
         try {
             // Both paths release every handle: the engine does on the prepared
             // path, the folded path up front. Nothing after this may release one.
-            refused = folded ? appendFolded(table, staged, last.values(), written, replaced) : appendPrepared(table, staged, written, replaced);
+            refused = folded ? appendFolded(table, staged, last.values(), merged, written, replaced) : appendPrepared(table, staged, written, replaced);
         } finally {
             // A read after the write must see the table, not a prefetched copy.
             InfinoNative.forgetSources(table, last.keySet());
@@ -447,10 +514,18 @@ public final class InfinoWriter {
     /**
      * The batch's last write of each id, prepared afresh and written as one
      * mutation under the sequence number it was given (a delete writes no
-     * row): the path for a batch in which one id appears twice, or a write
-     * meets a conflict and is left out.
+     * row; an update writes the document {@code merged} holds for it): the
+     * path for a batch in which one id appears twice, a write meets a
+     * conflict and is left out, or an update was merged.
      */
-    private static Map<String, String> appendFolded(String table, List<Staged> staged, Collection<Outcome> last, Map<Outcome, Written> written, List<String> replaced) {
+    private static Map<String, String> appendFolded(
+        String table,
+        List<Staged> staged,
+        Collection<Outcome> last,
+        Map<Outcome, String> merged,
+        Map<Outcome, Written> written,
+        List<String> replaced
+    ) {
         for (Staged s : staged) {
             InfinoNative.freePrepared(s.prepared());
         }
@@ -458,9 +533,10 @@ public final class InfinoWriter {
         List<String> sources = new ArrayList<>();
         List<Long> seqs = new ArrayList<>();
         for (Outcome o : last) {
-            if (carriesRow(o)) {
+            String document = merged.containsKey(o) ? merged.get(o) : o.write().source();
+            if (document != null) {
                 ids.add(o.write().id());
-                sources.add(o.write().source());
+                sources.add(document);
                 seqs.add(written.get(o).seq());
             }
         }
@@ -490,16 +566,18 @@ public final class InfinoWriter {
             }
             Write write = o.write();
             Written done = applied.written().get(o);
-            if (done.conflict() != null) {
-                // A create over a document, or a condition the document does not meet: the conflict stock reports, and no row written.
+            if (done.rejection() != null) {
+                // A create over a document, a condition the document does not meet, or an
+                // update of a missing document or into one the columns refuse: the failure
+                // stock reports (409, 404 or 400), and no row written.
                 w.items()[o.slot()] = new BulkItemResponse(
                     o.slot(),
                     o.item().opType(),
-                    new BulkItemResponse.Failure(w.indexName(), write.id(), done.conflict(), RestStatus.CONFLICT)
+                    new BulkItemResponse.Failure(w.indexName(), write.id(), done.rejection(), ExceptionsHelper.status(done.rejection()))
                 );
                 continue;
             }
-            if (write.source() == null && applied.undeleted().contains(write.id())) {
+            if (write.deletes() && applied.undeleted().contains(write.id())) {
                 w.items()[o.slot()] = new BulkItemResponse(
                     o.slot(),
                     o.item().opType(),
@@ -517,7 +595,7 @@ public final class InfinoWriter {
                 continue;
             }
             DocWriteResponse r;
-            if (write.source() == null) {
+            if (write.deletes()) {
                 r = new DeleteResponse(w.shardId(), write.id(), done.seq(), PRIMARY_TERM, VERSION, done.existed());
             } else if (o.item() instanceof UpdateRequest) {
                 r = new UpdateResponse(

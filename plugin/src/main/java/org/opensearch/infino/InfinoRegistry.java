@@ -74,14 +74,19 @@ final class InfinoRegistry {
     /** The registry table, in the same database as the indices' tables. */
     static final String TABLE = "os_index";
 
-    /** Index settings the cluster assigns at creation and refuses on a create request. */
+    /**
+     * Index settings the cluster assigns at creation and refuses on a create
+     * request. Whether an index was free to take its table is among them: an
+     * index brought back is stamped afresh against the indices then live.
+     */
     private static final Set<String> CLUSTER_OWNED_SETTINGS = Set.of(
         IndexMetadata.SETTING_INDEX_UUID,
         IndexMetadata.SETTING_CREATION_DATE,
         IndexMetadata.SETTING_VERSION_CREATED,
         IndexMetadata.SETTING_VERSION_UPGRADED,
         IndexMetadata.SETTING_INDEX_PROVIDED_NAME,
-        IndexMetadata.SETTING_HISTORY_UUID
+        IndexMetadata.SETTING_HISTORY_UUID,
+        InfinoPlugin.INFINO_TABLE_CLAIMED.getKey()
     );
 
     /** The key of a row that records the metadata version of its index as the cluster held it. */
@@ -124,6 +129,11 @@ final class InfinoRegistry {
         boolean any = false;
         for (IndexMetadata md : state.metadata().indices().values()) {
             if (!md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
+                continue;
+            }
+            if (!InfinoPlugin.tables().owns(md, state.metadata())) {
+                // Named onto a table another index backs (or the registry's own): it is
+                // refused, and a fresh cluster must not bring it back over that table.
                 continue;
             }
             Long last = recorded.get(md.getIndex().getName());

@@ -44,6 +44,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.regex.Pattern;
 
 /**
  * Translates an OpenSearch query-DSL builder tree into the SQL the Infino
@@ -241,13 +242,30 @@ final class InfinoQueryTranslator {
     // ---- columns ----
 
     /**
-     * The column a query names, resolving {@code name.keyword} to the string
-     * column {@code name} read by its whole value (as a keyword multi-field
-     * the mapping declares is, see {@link InfinoNative#columns}). A field's
-     * list column ({@link #LIST_SUFFIX}) is no field of its own: a query
-     * naming one names an unmapped field.
+     * The column a query compares the values of, as {@link #resolve} finds
+     * it. A masked field's column holds its clear values, so a user's query
+     * comparing them (a term, a range, a pattern, a text match) would tell
+     * the user what the mask hides: refused, as a sort on it is. A security
+     * rule or an alias filter, which the user did not write, compares them.
      */
     Column column(String field) {
+        Column c = resolve(field);
+        if (c != null && c.masked() && !trusted) {
+            throw InfinoAccess.refused("a query on [" + field + "], a field masked for this user, is not served");
+        }
+        return c;
+    }
+
+    /**
+     * The column a query names, resolving {@code name.keyword} to the string
+     * column {@code name}. A field's list column ({@link #LIST_SUFFIX}) is no
+     * field of its own: a query naming one names an unmapped field. A
+     * {@code name.keyword} over a text field is that field's whole value, as
+     * a keyword subfield holds it: compared exactly, never through the text
+     * field's terms ({@code term dept.keyword: Sales} matches "Sales", not
+     * "Pre-Sales Ops").
+     */
+    Column resolve(String field) {
         if (field == null || field.endsWith(LIST_SUFFIX)) {
             return null;
         }
@@ -316,7 +334,8 @@ final class InfinoQueryTranslator {
      * reserved columns are never a document's field.
      */
     private String exists(String field) {
-        Column c = column(field);
+        // Whether a field has a value tells nothing of a masked one's: its hash is shown.
+        Column c = resolve(field);
         if (c != null) {
             Column values = listOf(cols, c);
             String own = quoteIdent(c.name()) + " IS NOT NULL";
@@ -376,7 +395,8 @@ final class InfinoQueryTranslator {
             // A term on a text column is one indexed term, as in Lucene; on an exact column the value.
             Column c = column(t.fieldName());
             if (c != null && c.fts()) {
-                return textClause(c.name(), String.valueOf(t.value()), "and", false);
+                String terms = plainTerms(String.valueOf(t.value()));
+                return terms.isEmpty() ? NONE : textClause(c.name(), terms, "and", false);
             }
             return equality(t.fieldName(), t.value());
         }
@@ -454,7 +474,8 @@ final class InfinoQueryTranslator {
         }
         if (qb instanceof ScriptQueryBuilder sq) {
             // The script as a column expression; it must yield a boolean to filter.
-            Sql s = InfinoScriptTranslator.translate(sq.script(), cols, null, nowMillis);
+            // A script reads values themselves, so a user's sees no masked column.
+            Sql s = InfinoScriptTranslator.translate(sq.script(), trusted ? cols : InfinoAccess.scriptColumns(cols), null, nowMillis);
             if (s.type() != SqlType.BOOL && s.type() != SqlType.UNKNOWN) {
                 throw new InfinoScriptTranslator.Unsupported("[" + sq.script().getIdOrCode() + "] yields a " + s.type().name().toLowerCase(Locale.ROOT) + ", not the boolean a script query needs");
             }
@@ -574,7 +595,8 @@ final class InfinoQueryTranslator {
             // A match on an exact column is an equality, whatever the column's type.
             return equality(field, value);
         }
-        return textClause(c.name(), asPhrase ? phrase(value) : value, op == Operator.AND ? "and" : "or", positive);
+        String query = asPhrase ? phrase(value) : plainTerms(value);
+        return query.isEmpty() ? NONE : textClause(c.name(), query, op == Operator.AND ? "and" : "or", positive);
     }
 
     private String textClause(String column, String query, String mode, boolean positive) {
@@ -614,6 +636,15 @@ final class InfinoQueryTranslator {
      * has no column for matches nothing.
      */
     private String textOnFields(List<String> fields, String value, Operator op, boolean positive, boolean asPhrase, boolean exactToo) {
+        return textOnFields(fields, value, op, positive, asPhrase, exactToo, false);
+    }
+
+    /**
+     * As {@link #textOnFields(List, String, Operator, boolean, boolean, boolean)};
+     * with {@code composed}, {@code value} is an engine query the translator
+     * built itself (a query string's clauses with their sigils), sent as it is.
+     */
+    private String textOnFields(List<String> fields, String value, Operator op, boolean positive, boolean asPhrase, boolean exactToo, boolean composed) {
         List<String> indexed = new ArrayList<>();
         List<String> exact = new ArrayList<>();
         for (String f : fields) {
@@ -631,7 +662,14 @@ final class InfinoQueryTranslator {
             return NONE;
         }
         String mode = op == Operator.AND ? "and" : "or";
-        String query = asPhrase ? phrase(value) : value;
+        String query = composed ? value : asPhrase ? phrase(value) : plainTerms(value);
+        if (query.isEmpty()) {
+            // No term to match on a text column: only an exact column's equality can.
+            indexed.clear();
+            if (exact.isEmpty()) {
+                return NONE;
+            }
+        }
         if (indexed.size() == 1 && exact.isEmpty()) {
             return textClause(indexed.get(0), query, mode, positive);
         }
@@ -645,6 +683,35 @@ final class InfinoQueryTranslator {
     /** The query that matches {@code value} as a phrase: the engine reads a quoted run as adjacent terms in order. */
     static String phrase(String value) {
         return "\"" + value.replace("\"", " ") + "\"";
+    }
+
+    /** What separates the runs of an engine text query: Unicode white space, as the engine splits it. */
+    private static final Pattern QUERY_WHITESPACE = Pattern.compile("(?U)\\s+");
+
+    /**
+     * {@code text} as an engine text query of plain terms. The engine reads a
+     * run's leading {@code +} or {@code -} as a required or an excluded clause
+     * and a double quote as the bound of a phrase; a match's text means none
+     * of that ({@code -error timeout} is the two words, not "timeout and not
+     * error"), and an id holding one ({@code +15551234}) is just the id.
+     * Neither character is part of a term, so the terms are those of the
+     * text. Empty when the text holds no term at all.
+     */
+    static String plainTerms(String text) {
+        StringBuilder out = new StringBuilder();
+        for (String run : QUERY_WHITESPACE.split(text.replace('"', ' '))) {
+            int start = 0;
+            while (start < run.length() && (run.charAt(start) == '+' || run.charAt(start) == '-')) {
+                start++;
+            }
+            if (start < run.length()) {
+                if (out.length() > 0) {
+                    out.append(' ');
+                }
+                out.append(run, start, run.length());
+            }
+        }
+        return out.toString();
     }
 
     /** One atom of a query string: its polarity, the field it names (null for the default fields) and its text. */
@@ -676,10 +743,13 @@ final class InfinoQueryTranslator {
         }
         if (targets.isEmpty() || targets.contains("*")) {
             targets.clear();
-            // Every text column once: an alias names a column already here.
+            // Every text field once: an alias names a column already here. The id
+            // column carries a term index but is no field of the documents, and a
+            // field masked for the user is left out rather than matched by its
+            // clear values.
             for (Map.Entry<String, Column> entry : cols.entrySet()) {
                 Column c = entry.getValue();
-                if (c.fts() && !InfinoNative.isAlias(entry.getKey(), c)) {
+                if (c.fts() && !InfinoNative.isAlias(entry.getKey(), c) && !c.name().equals(OSID) && (trusted || !c.masked())) {
                     targets.add(c.name());
                 }
             }
@@ -695,7 +765,7 @@ final class InfinoQueryTranslator {
         if (n instanceof Bool b) {
             String engine = engineQuery(b);
             if (engine != null) {
-                return textOnFields(targets, engine, Operator.OR, positive, false, false);
+                return textOnFields(targets, engine, Operator.OR, positive, false, false, true);
             }
             // Lucene's clause list: the required clauses match on their own, the
             // optional ones only when nothing is required, the prohibited never.
@@ -806,13 +876,19 @@ final class InfinoQueryTranslator {
         for (List<Node> group : List.of(b.must(), b.should(), b.mustNot())) {
             String sigil = group == b.must() ? "+" : group == b.mustNot() ? "-" : "";
             for (Node n : group) {
-                if (!(n instanceof Term t) || t.field() != null || t.fuzzy() > 0 || t.slop() > 0 || t.text().isBlank()) {
+                if (!(n instanceof Term t) || t.field() != null || t.fuzzy() > 0 || t.slop() > 0) {
+                    return null;
+                }
+                // The parser has read the clause's own sigil; its text is the words alone.
+                String words = t.quoted() ? phrase(t.text()) : plainTerms(t.text());
+                if (words.isBlank() || (!t.quoted() && words.indexOf(' ') >= 0)) {
+                    // Several words under one sigil are no single engine clause.
                     return null;
                 }
                 if (out.length() > 0) {
                     out.append(' ');
                 }
-                out.append(sigil).append(t.quoted() ? phrase(t.text()) : t.text());
+                out.append(sigil).append(words);
             }
         }
         return out.toString();
@@ -880,7 +956,8 @@ final class InfinoQueryTranslator {
             return NONE;
         }
         if (c.fts()) {
-            return textClause(c.name(), a.quoted() ? phrase(a.text()) : a.text(), "and", false);
+            String query = a.quoted() ? phrase(a.text()) : plainTerms(a.text());
+            return query.isEmpty() ? NONE : textClause(c.name(), query, "and", false);
         }
         if (!a.quoted() && (a.text().indexOf('*') >= 0 || a.text().indexOf('?') >= 0)) {
             return like(c, wildcardToLike(a.text()));

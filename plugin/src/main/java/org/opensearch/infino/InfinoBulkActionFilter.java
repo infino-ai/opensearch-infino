@@ -867,7 +867,10 @@ public class InfinoBulkActionFilter implements ActionFilter {
      * has, each item in the bulk's own slot; an index whose write fails
      * answers its own items with the failure, and the others keep their
      * results. An item {@code answered} holds an answer for (one its ingest
-     * pipeline failed or dropped) is given that answer and not written.
+     * pipeline failed or dropped) is given that answer and not written. The
+     * items are parsed, conformed and converted on the write pool, never on
+     * the thread that delivered the bulk; a write pool whose queue is full
+     * refuses the bulk with 429, as a stock bulk's is.
      */
     static void serve(
         BulkRequest bulk,
@@ -879,13 +882,26 @@ public class InfinoBulkActionFilter implements ActionFilter {
         ActionListener<BulkResponse> listener
     ) {
         long start = System.nanoTime();
+        InfinoServices.fork(ThreadPool.Names.WRITE, listener::onFailure, () -> stageAndSubmit(bulk, concrete, infino, answered, writes, tables, listener, start));
+    }
+
+    private static void stageAndSubmit(
+        BulkRequest bulk,
+        List<String> concrete,
+        Map<String, IndexMetadata> infino,
+        BulkItemResponse[] answered,
+        InfinoWriter writes,
+        InfinoTables tables,
+        ActionListener<BulkResponse> listener,
+        long start
+    ) {
         try {
             BulkItemResponse[] items = new BulkItemResponse[bulk.requests().size()];
             if (infino.size() == 1) {
                 IndexMetadata md = infino.values().iterator().next();
                 String table = tables.ensure(md);
                 ShardId shardId = new ShardId(md.getIndex(), 0);
-                Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, bulk.requests(), answered, writes), items, start, listener);
+                Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(shardId, bulk.requests(), answered), items, start, listener);
                 writes.submit(table, waiter);
                 return;
             }
@@ -908,7 +924,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 try {
                     String table = tables.ensure(md);
                     ShardId shardId = new ShardId(md.getIndex(), 0);
-                    Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(table, shardId, requests, partAnswered, writes), part, start, partListener);
+                    Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(shardId, requests, partAnswered), part, start, partListener);
                     writes.submit(table, waiter);
                 } catch (Exception e) {
                     log.warn("[infino] bulk items for {} failed", group.getKey(), e);
@@ -931,11 +947,11 @@ public class InfinoBulkActionFilter implements ActionFilter {
     }
 
     /**
-     * Check every item against the table and turn it into a write, or answer
-     * it now when it cannot be written or {@code answered} already holds its
-     * answer (by slot, as {@code requests}).
+     * Turn every item into a write, or answer it now when it cannot be
+     * written or {@code answered} already holds its answer (by slot, as
+     * {@code requests}).
      */
-    private static List<Outcome> stage(String table, ShardId shardId, List<DocWriteRequest<?>> requests, BulkItemResponse[] answered, InfinoWriter writes) {
+    private static List<Outcome> stage(ShardId shardId, List<DocWriteRequest<?>> requests, BulkItemResponse[] answered) {
         String indexName = shardId.getIndexName();
         List<Outcome> outcomes = new ArrayList<>(requests.size());
         for (int slot = 0; slot < requests.size(); slot++) {
@@ -971,23 +987,10 @@ public class InfinoBulkActionFilter implements ActionFilter {
                     outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, new IllegalArgumentException("[infino] scripted updates are not served"), RestStatus.BAD_REQUEST)));
                     continue;
                 }
-                // The merge base is the pending write for the id, else the table itself;
-                // never a prefetched copy, which may predate an acknowledged write.
-                String current = writes.pendingSource(table, update.id());
-                if (current == null) {
-                    current = InfinoNative.getSourceFresh(table, update.id());
-                }
-                String merged = merge(current, update);
-                if (merged == null) {
-                    outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, new DocumentMissingException(shardId, update.id()), RestStatus.NOT_FOUND)));
-                    continue;
-                }
-                String why = InfinoNative.checkDoc(table, merged);
-                if (why != null) {
-                    outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, new IllegalArgumentException("[infino] " + why), RestStatus.BAD_REQUEST)));
-                    continue;
-                }
-                outcomes.add(new Outcome(slot, item, new Write(update.id(), merged, true), null));
+                // Merged when its batch is written, in the order the batch takes the
+                // writes: into the write before it in the batch, else the table as
+                // the appends before it left it (see InfinoWriter#apply).
+                outcomes.add(new Outcome(slot, item, Write.update(update), null));
             } else {
                 outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, new IllegalArgumentException("[infino] unsupported write " + item.getClass().getSimpleName()), RestStatus.BAD_REQUEST)));
             }
