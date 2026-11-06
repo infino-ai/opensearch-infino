@@ -542,3 +542,47 @@
       infino.sql:
         body: { query: "SELECT count(*) AS c FROM other_sql1" }
   - match: { rows.0.c: 1 }
+
+---
+"SQL reads a data stream across a rollover, as a search does":
+  - do:
+      indices.put_index_template:
+        name: sql-ds-template
+        body:
+          index_patterns: [ "sql-ds-*" ]
+          data_stream: {}
+          template:
+            settings: { number_of_shards: 1, number_of_replicas: 0, index.infino.enabled: true, index.infino.mode: default }
+  - do:
+      indices.create_data_stream:
+        name: sql-ds-logs
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: sql-ds-logs }
+          - { "@timestamp": "2023-01-01T00:00:01Z", n: 1 }
+          - create: { _index: sql-ds-logs }
+          - { "@timestamp": "2023-01-01T00:00:02Z", n: 2 }
+  - do:
+      indices.rollover:
+        alias: sql-ds-logs
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: sql-ds-logs }
+          - { "@timestamp": "2023-01-01T00:00:03Z", n: 3 }
+  - do:
+      count:
+        index: sql-ds-logs
+  - match: { count: 3 }
+  - do:
+      infino.sql:
+        body: { query: "SELECT count(*) AS c, sum(n) AS total FROM \"sql-ds-logs\"" }
+  - match: { rows.0.c: 3 }
+  - match: { rows.0.total: 6 }
+  - do:
+      infino.sql:
+        body: { query: "SELECT count(*) AS c FROM \"sql-ds-*\"" }
+  - match: { rows.0.c: 3 }
