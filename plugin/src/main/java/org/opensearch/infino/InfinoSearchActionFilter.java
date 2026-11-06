@@ -23,6 +23,7 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -106,6 +107,12 @@ public class InfinoSearchActionFilter implements ActionFilter {
                 engine++;
             }
         }
+        if ((engine > 0 || !infino.isEmpty()) && search.source() != null && search.source().slice() != null) {
+            // The table answers a search whole, never a slice of it: each slice of a
+            // sliced scroll (a sliced reindex or update by query) would get every document.
+            listener.onFailure(new IllegalArgumentException("[infino] a sliced search is not served by the table; send it as one slice"));
+            return;
+        }
         if (engine > 0) {
             if (engine != concrete.length) {
                 listener.onFailure(new IllegalArgumentException("[infino] a search mixing default-mode indices with others is not served"));
@@ -167,6 +174,20 @@ public class InfinoSearchActionFilter implements ActionFilter {
             return;
         }
         long start = System.nanoTime();
+        // The table is read on the search pool, never on the thread that took the request.
+        InfinoServices.fork(ThreadPool.Names.SEARCH, listener::onFailure, () -> serve(search, state, names, infino, metadata, start, listener));
+    }
+
+    /** Answer a search over proxy-mode indices from their tables. */
+    private <Response extends ActionResponse> void serve(
+        SearchRequest search,
+        ClusterState state,
+        IndexNameExpressionResolver names,
+        List<Index> infino,
+        List<IndexMetadata> metadata,
+        long start,
+        ActionListener<Response> listener
+    ) {
         try {
             SearchSourceBuilder source = search.source() == null ? new SearchSourceBuilder() : search.source();
             InfinoTables tables = InfinoPlugin.tables();

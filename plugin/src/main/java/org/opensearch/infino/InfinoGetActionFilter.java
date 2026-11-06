@@ -27,6 +27,7 @@ import org.opensearch.index.mapper.RoutingFieldMapper;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
 
 import java.util.List;
 import java.util.Map;
@@ -78,24 +79,27 @@ public class InfinoGetActionFilter implements ActionFilter {
             chain.proceed(task, action, request, listener);
             return;
         }
-        try {
-            // The document as the security plugin lets this user see it: under a
-            // document rule it is looked up through the rule, and its source is
-            // cut to the fields the user may read.
-            InfinoAccess access = InfinoSecurity.access(index.getIndex().getName(), "get");
-            String table = tables.ensureForDocument(index, get.id(), get.routing());
-            InfinoNative.Doc doc = access.restrictsDocuments()
-                ? restrictedDocs(table, List.of(get.id()), access).get(get.id())
-                : docOf(index, table, get.id());
-            @SuppressWarnings("unchecked")
-            Response response = (Response) new GetResponse(
-                result(index.getIndex().getName(), get.id(), doc, access, get.fetchSourceContext(), routingOf(index, table, get.id(), doc))
-            );
-            listener.onResponse(response);
-        } catch (Exception e) {
-            log.warn("[infino] get of {} from {} failed", get.id(), get.index(), e);
-            listener.onFailure(e);
-        }
+        // The table is read on the get pool, never on the thread that took the request.
+        InfinoServices.fork(ThreadPool.Names.GET, listener::onFailure, () -> {
+            try {
+                // The document as the security plugin lets this user see it: under a
+                // document rule it is looked up through the rule, and its source is
+                // cut to the fields the user may read.
+                InfinoAccess access = InfinoSecurity.access(index.getIndex().getName(), "get");
+                String table = tables.ensureForDocument(index, get.id(), get.routing());
+                InfinoNative.Doc doc = access.restrictsDocuments()
+                    ? restrictedDocs(table, List.of(get.id()), access).get(get.id())
+                    : docOf(index, table, get.id());
+                @SuppressWarnings("unchecked")
+                Response response = (Response) new GetResponse(
+                    result(index.getIndex().getName(), get.id(), doc, access, get.fetchSourceContext(), routingOf(index, table, get.id(), doc))
+                );
+                listener.onResponse(response);
+            } catch (Exception e) {
+                log.warn("[infino] get of {} from {} failed", get.id(), get.index(), e);
+                listener.onFailure(e);
+            }
+        });
     }
 
     /**

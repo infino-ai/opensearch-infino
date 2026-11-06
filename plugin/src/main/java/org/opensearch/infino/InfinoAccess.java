@@ -169,11 +169,15 @@ record InfinoAccess(
 
     /**
      * The columns a plan may name: a hidden column is gone (the id and the
-     * source stay, as metadata), a masked one carries its hash. A query,
-     * sort, aggregation or script naming a hidden field then finds no
+     * sequence number stay, as metadata), a masked one carries its hash. A
+     * query, sort, aggregation or script naming a hidden field then finds no
      * column, as it would for an unmapped field. A field alias goes with
      * the field it names: hidden, masked or visible as that field is, and so
-     * does the list column holding a field's several values.
+     * does the list column holding a field's several values. The column of
+     * raw sources goes too: it holds every field, the hidden and masked ones
+     * among them, so a query, aggregation or script over it would read them.
+     * A hit's source is read by the planner itself and cut by
+     * {@link #source}, never through a column the request names.
      */
     Map<String, Column> columns(Map<String, Column> cols) {
         if (!restrictsFields() && !masks()) {
@@ -183,7 +187,10 @@ record InfinoAccess(
         for (Map.Entry<String, Column> entry : cols.entrySet()) {
             Column c = entry.getValue();
             String name = c.name();
-            boolean reserved = name.equals(InfinoQueryTranslator.OSID) || name.equals(InfinoQueryTranslator.SOURCE) || name.equals(InfinoQueryTranslator.SEQ);
+            if (name.equals(InfinoQueryTranslator.SOURCE)) {
+                continue;
+            }
+            boolean reserved = name.equals(InfinoQueryTranslator.OSID) || name.equals(InfinoQueryTranslator.SEQ);
             String field = InfinoQueryTranslator.fieldOf(name);
             if (!reserved && restrictsFields() && !fieldVisible.test(field)) {
                 continue;

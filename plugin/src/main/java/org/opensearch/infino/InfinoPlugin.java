@@ -72,9 +72,10 @@ import java.util.function.Supplier;
  * its one shard stays empty.
  *
  * <p>The table is {@code index.infino.table} when set, else named after the
- * index and its UUID. It is dropped when the index is deleted unless it was
- * named explicitly, so an index recreated on a fresh cluster with the same
- * setting reattaches to the rows its predecessor wrote.
+ * index. A table backs one live index (see {@link InfinoTables}). It is
+ * dropped when the index is deleted unless it was named explicitly, so an
+ * index recreated on a fresh cluster with the same setting reattaches to the
+ * rows its predecessor wrote.
  */
 public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, EnginePlugin {
 
@@ -149,6 +150,26 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         "index.infino.table",
         Setting.Property.IndexScope,
         Setting.Property.Final
+    );
+
+    /**
+     * Whether the index was free to take its table when it was created: set
+     * by the cluster at creation ({@link #getAdditionalIndexSettingProviders}),
+     * false when a live index the table could back already named it. An
+     * index created false is never served from the table, not even after
+     * that index is deleted, so a younger index named onto a table never
+     * inherits the rows of the one it was refused beside (see
+     * {@link InfinoTables}). Private, so no request or template sets it; not
+     * copied to a resized index, which is a new index. An index created
+     * before the setting carries none and counts as free, as it always has.
+     */
+    public static final Setting<Boolean> INFINO_TABLE_CLAIMED = Setting.boolSetting(
+        "index.infino.table_claimed",
+        true,
+        Setting.Property.IndexScope,
+        Setting.Property.PrivateIndex,
+        Setting.Property.Final,
+        Setting.Property.NotCopyableOnResize
     );
 
     /**
@@ -332,7 +353,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             new InfinoScrollActionFilter(InfinoServices::clusterService, InfinoServices::scriptService),
             new InfinoGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES),
             new InfinoMultiGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES),
-            new InfinoStatsActionFilter(InfinoServices::clusterService, TABLES)
+            new InfinoStatsActionFilter(InfinoServices::clusterService, TABLES),
+            new InfinoExplicitTableActionFilter()
         );
     }
 
@@ -396,8 +418,14 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             @Override
             public void afterIndexShardDeleted(ShardId shardId, Settings indexSettings) {
                 String table = InfinoTables.shardTable(InfinoNative.tableFor(shardId.getIndex(), indexSettings), shardId.id(), indexSettings);
-                TABLES.forget(table);
                 InfinoRegistry.forget(shardId.getIndexName());
+                if (TABLES.keptAfterDelete(table, shardId.getIndex())) {
+                    // Another live index is served from the table (or it is the
+                    // registry's): the rows are not this index's to drop.
+                    log.info("[infino] index {} deleted; its table {} backs another index and is kept", shardId.getIndexName(), table);
+                    return;
+                }
+                TABLES.forget(table);
                 if (InfinoNative.tableIsExplicit(indexSettings)) {
                     log.info("[infino] index {} deleted; its table {} was named explicitly and is kept", shardId.getIndexName(), table);
                     return;
@@ -469,6 +497,12 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      * one the creating node serves: default mode, or proxy mode where
      * {@link #DEFAULT_MODE_ENABLED} is off. The mode is final, so the index
      * keeps it on every node.
+     *
+     * <p>Every Infino-backed index is also stamped with whether it was free
+     * to take its table ({@link #INFINO_TABLE_CLAIMED}), from the indices the
+     * cluster manager last applied. The provider runs on the cluster manager
+     * as it creates the index; a resized index is created without providers
+     * and so carries none.
      */
     @Override
     public Collection<IndexSettingProvider> getAdditionalIndexSettingProviders() {
@@ -488,6 +522,11 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
                 if (enabled && !templateAndRequestSettings.hasValue(INFINO_MODE.getKey())) {
                     out.put(INFINO_MODE.getKey(), defaultModeEnabled ? MODE_DEFAULT : MODE_PROXY);
                 }
+                if (enabled) {
+                    // The index's tables as it will hold them: the request and its templates over the defaults above.
+                    Settings index = Settings.builder().put(out.build()).put(templateAndRequestSettings).build();
+                    out.put(INFINO_TABLE_CLAIMED.getKey(), TABLES.claimable(indexName, index));
+                }
                 return out.build();
             }
         });
@@ -503,6 +542,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             INFINO_REBUILT,
             INFINO_EDGES,
             INFINO_TABLE,
+            INFINO_TABLE_CLAIMED,
             OPTIMIZE_INTERVAL,
             PLATFORM_URL,
             PLATFORM_DATABASE,

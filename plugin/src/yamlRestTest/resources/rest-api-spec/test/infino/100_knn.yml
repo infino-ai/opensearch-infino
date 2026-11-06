@@ -274,3 +274,62 @@
         body: { size: 3, query: { infino_hybrid: { text_column: title, query: wool, vector_column: emb, vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 3 } } }
   - gte: { hits.total.value: 1 }
   - match: { hits.hits.0._index: knn_inf }
+
+---
+"Security: infino_knn and infino_hybrid search only the fields the user may see":
+  - skip:
+      features: headers
+  # Here secret is a vector, which the field rule hides, and ip is text, which the masking rule masks.
+  - do:
+      indices.create:
+        index: sec6
+        body:
+          settings: { index.infino.enabled: true, index.knn: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              secret: { type: knn_vector, dimension: 16, method: { name: hnsw, engine: lucene, space_type: l2 } }
+              ip: { type: text }
+              tag: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: sec6
+        body:
+          - index: { _id: "e1" }
+          - { secret: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], ip: "wool coat", tag: x }
+          - index: { _id: "e2" }
+          - { secret: [ 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], ip: "silk scarf", tag: y }
+  - match: { errors: false }
+  # A user who may see both fields searches them.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      search:
+        index: sec6
+        body: { size: 2, query: { infino_knn: { field: secret, vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2 } } }
+  - match: { hits.hits.0._id: e1 }
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      search:
+        index: sec6
+        body: { size: 2, query: { infino_hybrid: { text_column: ip, query: wool, vector_column: secret, vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2 } } }
+  - match: { hits.hits.0._id: e1 }
+  # The hidden vector field is as if unmapped, for either query.
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      catch: bad_request
+      search:
+        index: sec6
+        body: { size: 2, query: { infino_knn: { field: secret, vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2 } } }
+  - do:
+      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
+      catch: bad_request
+      search:
+        index: sec6
+        body: { size: 2, query: { infino_hybrid: { text_column: ip, query: wool, vector_column: secret, vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2 } } }
+  # The masked text field is refused: the engine's search reads its clear values.
+  - do:
+      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
+      catch: forbidden
+      search:
+        index: sec6
+        body: { size: 2, query: { infino_hybrid: { text_column: ip, query: wool, vector_column: secret, vector: [ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ], k: 2 } } }

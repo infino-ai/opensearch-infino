@@ -95,6 +95,28 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * A match's text is its words: a leading + or - or a quote in it is no
+     * clause syntax to the engine, as it is none to OpenSearch's analyzer.
+     * Before, "-error timeout" asked the engine for "timeout and not error".
+     */
+    public void testAMatchsTextIsAskedForAsPlainWords() {
+        assertEquals("token_match('os_logs_0', 'message', 'error timeout', 'or')", translate(QueryBuilders.matchQuery("message", "-error timeout")).from());
+        assertEquals("token_match('os_logs_0', 'message', 'a b c', 'or')", translate(QueryBuilders.matchQuery("message", "+a \"b c")).from());
+        String where = translate(QueryBuilders.boolQuery().should(QueryBuilders.termQuery("message", "-error"))).where();
+        assertTrue(where, where.contains("token_match('os_logs_0', 'message', 'error', 'and')"));
+        assertFalse(where, where.contains("-error"));
+        // Text with no term matches nothing rather than reaching the engine empty.
+        String none = translate(QueryBuilders.boolQuery().filter(QueryBuilders.matchQuery("message", "--"))).where();
+        assertTrue(none, none.contains("1=0"));
+    }
+
+    /** name.keyword over a text field is the field's whole value, compared exactly, as a keyword subfield holds it. */
+    public void testAKeywordViewOfATextFieldComparesTheWholeValue() {
+        assertEquals("\"message\" = 'disk full'", translate(QueryBuilders.termQuery("message.keyword", "disk full")).where());
+        assertEquals("\"message\" LIKE 'disk%'", translate(QueryBuilders.prefixQuery("message.keyword", "disk")).where());
+    }
+
     /** The hit statement for a translated query, with no sort, collapse, post_filter or search_after. */
     private static String hits(Translation t, Column collapse, int fetch) {
         InfinoSearch.Plan plan = new InfinoSearch.Plan(

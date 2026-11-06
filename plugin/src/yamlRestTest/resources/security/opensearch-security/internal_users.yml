@@ -40,3 +40,8 @@ regex_user:
   hash: "$2a$12$VcCDgh2NDk07JGN0rjGbM.Ad41qVR/YFJcgHp0UGns5JDymv..TOG"
   reserved: false
   description: "Reads sec* with the ip field's last part replaced"
+
+create_user:
+  hash: "$2a$12$VcCDgh2NDk07JGN0rjGbM.Ad41qVR/YFJcgHp0UGns5JDymv..TOG"
+  reserved: false
+  description: "Creates and reads sec*, without the right to manage the cluster"

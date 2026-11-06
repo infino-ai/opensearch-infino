@@ -42,3 +42,8 @@ sec_mask_regex:
   reserved: false
   users:
     - "regex_user"
+
+sec_create:
+  reserved: false
+  users:
+    - "create_user"
