@@ -45,6 +45,13 @@ import java.util.concurrent.ConcurrentHashMap;
  * and every other one is refused, so an index never reads or writes rows
  * that belong to another, whatever the security plugin lets its user do
  * with the index itself. No index is served from the registry's table.
+ *
+ * <p>An index created while a live index the table could back already named
+ * it is refused for its whole life ({@link InfinoPlugin#INFINO_TABLE_CLAIMED}),
+ * and counts for nothing when the table's index is chosen. So deleting the
+ * index a table backs hands its rows to none of the indices refused beside
+ * it: the table is dropped as if no other index named it (or kept, when it
+ * was named explicitly), and an index created after the delete may take it.
  */
 public final class InfinoTables {
 
@@ -100,15 +107,26 @@ public final class InfinoTables {
 
     /** Every table holding an index's rows: one per shard in default mode, else the one. */
     static List<String> tablesOf(IndexMetadata md) {
-        String table = InfinoNative.tableFor(md.getIndex(), md.getSettings());
-        if (!InfinoPlugin.inDefaultMode(md.getSettings()) || md.getNumberOfShards() == 1) {
+        return tablesOf(md.getIndex().getName(), md.getSettings());
+    }
+
+    /** Every table that would hold the rows of an index of this name and these settings, as {@link #tablesOf(IndexMetadata)} names them. */
+    static List<String> tablesOf(String name, Settings settings) {
+        String table = InfinoNative.tableFor(name, settings);
+        int shards = IndexMetadata.INDEX_NUMBER_OF_SHARDS_SETTING.get(settings);
+        if (!InfinoPlugin.inDefaultMode(settings) || shards == 1) {
             return List.of(table);
         }
-        List<String> out = new ArrayList<>(md.getNumberOfShards());
-        for (int shard = 0; shard < md.getNumberOfShards(); shard++) {
-            out.add(shardTable(table, shard, md.getSettings()));
+        List<String> out = new ArrayList<>(shards);
+        for (int shard = 0; shard < shards; shard++) {
+            out.add(shardTable(table, shard, settings));
         }
         return out;
+    }
+
+    /** Whether the index may be served from its tables at all: it was not created beside a live index they could back. */
+    static boolean free(IndexMetadata md) {
+        return InfinoPlugin.INFINO_TABLE_CLAIMED.get(md.getSettings());
     }
 
     /** The Infino-backed indices of those given that name each table, by table. */
@@ -127,12 +145,15 @@ public final class InfinoTables {
 
     /**
      * The index a table backs, of the live indices naming it: the oldest (by
-     * creation, then by UUID, so every node picks the same one); null when
-     * none does.
+     * creation, then by UUID, so every node picks the same one) of those not
+     * created refused (see {@link #free}); null when none is.
      */
     static Index owner(List<IndexMetadata> naming) {
         IndexMetadata oldest = null;
         for (IndexMetadata md : naming) {
+            if (!free(md)) {
+                continue;
+            }
             if (oldest == null) {
                 oldest = md;
                 continue;
@@ -147,8 +168,9 @@ public final class InfinoTables {
 
     /**
      * Refuse to serve {@code md} from {@code table} when the table is not
-     * its own: the registry's, or one an older live index of {@code naming}
-     * (see {@link #naming}) is served from.
+     * its own: the registry's, one an older live index of {@code naming}
+     * (see {@link #naming}) is served from, or one {@code md} was created
+     * refused from (see {@link #free}).
      */
     static void claim(String table, IndexMetadata md, Map<String, List<IndexMetadata>> naming) {
         String name = md.getIndex().getName();
@@ -163,6 +185,33 @@ public final class InfinoTables {
                 "[infino] index [" + name + "] would be served from table [" + table + "], which backs index [" + owner.getName() + "]"
             );
         }
+        if (!free(md)) {
+            throw new IllegalArgumentException(
+                "[infino] index [" + name + "] was created while table [" + table + "] backed another index, and is never served from it"
+            );
+        }
+    }
+
+    /**
+     * Whether an index created now under {@code name} with {@code settings}
+     * would be free to take its tables: no live index they could back names
+     * any of them, as the metadata last applied holds them. The cluster
+     * manager stamps the answer on the index as it creates it
+     * ({@link InfinoPlugin#INFINO_TABLE_CLAIMED}).
+     */
+    boolean claimable(String name, Settings settings) {
+        Naming known = naming;
+        return claimable(tablesOf(name, settings), known == null ? Map.of() : known.byTable());
+    }
+
+    /** Whether no live index of {@code naming} that {@code tables} could back names any of them. */
+    static boolean claimable(List<String> tables, Map<String, List<IndexMetadata>> naming) {
+        for (String table : tables) {
+            if (owner(naming.getOrDefault(table, List.of())) != null) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Take the metadata the node applied; called from a cluster state listener, after the state is applied. */
@@ -172,6 +221,9 @@ public final class InfinoTables {
 
     /** Whether every table of {@code md} is its own, as {@code metadata} names them (see {@link #claim}). */
     boolean owns(IndexMetadata md, Metadata metadata) {
+        if (!free(md)) {
+            return false;
+        }
         Map<String, List<IndexMetadata>> byTable = namingOf(metadata);
         for (String table : tablesOf(md)) {
             if (InfinoRegistry.TABLE.equals(table) || !md.getIndex().equals(owner(byTable.getOrDefault(table, List.of())))) {
@@ -183,9 +235,11 @@ public final class InfinoTables {
 
     /**
      * Whether deleting {@code gone} must leave {@code table}: it is the
-     * registry's, or a live index other than {@code gone} names it, as the
-     * metadata last applied holds them (the delete runs on the applier,
-     * before the state without {@code gone} is the node's).
+     * registry's, or a live index other than {@code gone} that the table
+     * could back names it, as the metadata last applied holds them (the
+     * delete runs on the applier, before the state without {@code gone} is
+     * the node's). An index created refused beside {@code gone} keeps
+     * nothing: the table's rows were never its own.
      */
     boolean keptAfterDelete(String table, Index gone) {
         if (InfinoRegistry.TABLE.equals(table)) {
@@ -196,7 +250,7 @@ public final class InfinoTables {
             return false;
         }
         for (IndexMetadata md : known.byTable().getOrDefault(table, List.of())) {
-            if (!md.getIndex().equals(gone)) {
+            if (!md.getIndex().equals(gone) && free(md)) {
                 return true;
             }
         }

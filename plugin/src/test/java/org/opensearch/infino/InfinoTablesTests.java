@@ -6,7 +6,10 @@ package org.opensearch.infino;
 
 import org.opensearch.Version;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
+import org.opensearch.action.admin.indices.rollover.RolloverRequest;
+import org.opensearch.action.admin.indices.shrink.ResizeRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -36,6 +39,9 @@ public class InfinoTablesTests extends OpenSearchTestCase {
     private static IndexMetadata index(String name, String uuid, long created) {
         return index(name, uuid, created, Settings.EMPTY);
     }
+
+    /** The settings of an index created while a live index its table could back named that table. */
+    private static final Settings CREATED_REFUSED = Settings.builder().put(InfinoPlugin.INFINO_TABLE_CLAIMED.getKey(), false).build();
 
     public void testOfTwoIndicesWhoseNamesMapToOneTableTheOlderIsServed() {
         IndexMetadata dotted = index("logs.app", "u1", 1);
@@ -122,5 +128,72 @@ public class InfinoTablesTests extends OpenSearchTestCase {
         // The cluster gives an index setting written without its prefix the prefix.
         assertEquals("os_y", InfinoExplicitTableActionFilter.namedTable(new CreateIndexRequest("a").settings(Settings.builder().put("infino.table", "os_y"))));
         assertNull(InfinoExplicitTableActionFilter.namedTable(new CreateIndexRequest("a")));
+    }
+
+    public void testAnExplicitTableIsReadFromTheIndexAResizeOrARolloverCreates() {
+        ResizeRequest resize = new ResizeRequest("target", "source");
+        resize.getTargetIndexRequest().settings(Settings.builder().put(InfinoPlugin.INFINO_TABLE.getKey(), "os_z"));
+        assertEquals("os_z", InfinoExplicitTableActionFilter.namedTable(resize));
+        RolloverRequest rollover = new RolloverRequest("alias", null);
+        rollover.getCreateIndexRequest().settings(Settings.builder().put("infino.table", "os_w"));
+        assertEquals("os_w", InfinoExplicitTableActionFilter.namedTable(rollover));
+        assertNull(InfinoExplicitTableActionFilter.namedTable(new ResizeRequest("target", "source")));
+    }
+
+    public void testWhetherAnIndexWasFreeToTakeItsTableIsReadFromAnyRequestThatSetsIt() {
+        String claimed = InfinoPlugin.INFINO_TABLE_CLAIMED.getKey();
+        Settings set = InfinoExplicitTableActionFilter.requestedSettings(new CreateIndexRequest("a").settings(Settings.builder().put("infino.table_claimed", true)));
+        assertTrue(set.keySet().contains(claimed));
+        ResizeRequest resize = new ResizeRequest("target", "source");
+        resize.getTargetIndexRequest().settings(Settings.builder().put(claimed, true));
+        assertTrue(InfinoExplicitTableActionFilter.requestedSettings(resize).keySet().contains(claimed));
+    }
+
+    public void testAnIndexCreatedBesideTheOneItsTableBacksInheritsNothingWhenThatOneIsDeleted() {
+        IndexMetadata owner = index("logs.app", "u1", 1);
+        IndexMetadata refused = index("logs_app", "u2", 2, CREATED_REFUSED);
+        // While the owner lives, the refused index is told which index the table backs.
+        Map<String, List<IndexMetadata>> both = InfinoTables.naming(List.of(owner, refused));
+        assertEquals(owner.getIndex(), InfinoTables.owner(both.get("os_logs_app")));
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> InfinoTables.claim("os_logs_app", refused, both));
+        assertTrue(e.getMessage(), e.getMessage().contains("backs index [logs.app]"));
+        // Once the owner is gone, the table backs no index: the refused one, now the oldest, takes nothing.
+        Map<String, List<IndexMetadata>> after = InfinoTables.naming(List.of(refused));
+        assertNull(InfinoTables.owner(after.get("os_logs_app")));
+        e = expectThrows(IllegalArgumentException.class, () -> InfinoTables.claim("os_logs_app", refused, after));
+        assertTrue(e.getMessage(), e.getMessage().contains("was created while table [os_logs_app] backed another index"));
+        assertFalse(new InfinoTables().owns(refused, Metadata.builder().put(refused, false).build()));
+    }
+
+    public void testAnIndexIsFreeToTakeATableNoIndexItCouldBackNames() {
+        IndexMetadata owner = index("logs.app", "u1", 1);
+        IndexMetadata refused = index("logs_app", "u2", 2, CREATED_REFUSED);
+        Settings proxy = Settings.builder()
+            .put(InfinoPlugin.INFINO_ENABLED.getKey(), true)
+            .put(InfinoPlugin.INFINO_MODE.getKey(), InfinoPlugin.MODE_PROXY)
+            .build();
+        List<String> tables = InfinoTables.tablesOf("logs-app", proxy);
+        assertEquals(List.of("os_logs-app"), tables);
+        List<String> colliding = InfinoTables.tablesOf("logs_app", proxy);
+        assertFalse(InfinoTables.claimable(colliding, InfinoTables.naming(List.of(owner))));
+        // An index created refused beside a deleted owner holds the table for no later index.
+        assertTrue(InfinoTables.claimable(colliding, InfinoTables.naming(List.of(refused))));
+        assertTrue(InfinoTables.claimable(colliding, Map.of()));
+        // An explicit table is taken against the index it names.
+        Settings explicit = Settings.builder().put(proxy).put(InfinoPlugin.INFINO_TABLE.getKey(), "os_logs_app").build();
+        assertFalse(InfinoTables.claimable(InfinoTables.tablesOf("other", explicit), InfinoTables.naming(List.of(owner))));
+    }
+
+    public void testDeletingTheOwnerKeepsTheTableForNoIndexCreatedRefusedBesideIt() {
+        IndexMetadata owner = index("logs.app", "u1", 1);
+        IndexMetadata refused = index("logs_app", "u2", 2, CREATED_REFUSED);
+        IndexMetadata older = index("logs~app", "u0", 0);
+        InfinoTables tables = new InfinoTables();
+        tables.observe(Metadata.builder().put(owner, false).put(refused, false).build());
+        assertFalse(tables.keptAfterDelete("os_logs_app", owner.getIndex()));
+        assertTrue(tables.keptAfterDelete("os_logs_app", refused.getIndex()));
+        // An index created before the setting carries none and keeps the table as it always did.
+        tables.observe(Metadata.builder().put(owner, false).put(older, false).build());
+        assertTrue(tables.keptAfterDelete("os_logs_app", owner.getIndex()));
     }
 }

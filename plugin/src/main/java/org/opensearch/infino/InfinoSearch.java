@@ -377,10 +377,8 @@ public final class InfinoSearch {
      * is refused with the clause named.
      */
     private static VectorRequest stockKnn(InfinoStockKnn.Query knn, Map<String, Column> cols, String table, long nowMillis) {
+        searched(cols, knn.field(), true, InfinoStockKnn.NAME);
         Column c = cols.get(knn.field());
-        if (c == null || !c.vector()) {
-            throw new IllegalArgumentException("[infino] knn names field [" + knn.field() + "], which the table has no vector column for");
-        }
         String filter = null;
         if (knn.filter() != null) {
             filter = InfinoQueryTranslator.vectorFilter(knn.filter(), cols, table, nowMillis);

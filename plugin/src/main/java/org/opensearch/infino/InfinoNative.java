@@ -360,11 +360,16 @@ public final class InfinoNative {
      * its table, so a recreated one starts empty.
      */
     public static String tableFor(Index index, Settings indexSettings) {
+        return tableFor(index.getName(), indexSettings);
+    }
+
+    /** The Infino table of an index of this name and these settings, as {@link #tableFor(Index, Settings)} names it. */
+    public static String tableFor(String indexName, Settings indexSettings) {
         String explicit = InfinoPlugin.INFINO_TABLE.get(indexSettings);
         if (!explicit.isEmpty()) {
             return explicit;
         }
-        return tableFor(index.getName());
+        return tableFor(indexName);
     }
 
     /** The table an index of this name is served from when none is named explicitly. */

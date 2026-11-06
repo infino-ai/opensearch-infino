@@ -153,11 +153,12 @@ curl localhost:9200/logs/_search -H 'Content-Type: application/json' -d '{
 Settings: `index.infino.table` names the table explicitly (set it to reattach
 a recreated index to its rows; such a table is kept when the index is
 deleted). Naming a table is cluster management: with the security plugin, a
-create or template request that sets it needs the right to manage the
-cluster. A table backs one live index: of two indices naming the same table
-(explicitly, or by names that map to one table, such as `logs.app` and
-`logs_app`), the older is served from it and the other is refused, and no
-index is served from the registry's table. `index.infino.optimize_interval` (default 60s) compacts the table on
+create, resize, rollover or template request that sets it needs the right to
+manage the cluster. A table backs one live index: of two indices naming the
+same table (explicitly, or by names that map to one table, such as
+`logs.app` and `logs_app`), the older is served from it and the other is
+refused, for good: deleting the older one hands its rows to no index refused
+beside it. No index is served from the registry's table. `index.infino.optimize_interval` (default 60s) compacts the table on
 a schedule; `index.infino.edges: true` makes the index a graph's edges for
 `graph_walk` and `graph_rank` over the SQL route: each document is an edge
 `{src_table, src_id, dst_table, dst_id}` naming its two rows as the engine

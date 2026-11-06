@@ -87,3 +87,61 @@
   - do:
       indices.delete:
         index: own.a
+
+---
+"Deleting the index a table backs hands its rows to no index refused beside it":
+  - do:
+      indices.create:
+        index: hand.a
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      index:
+        index: hand.a
+        id: "1"
+        refresh: true
+        body: { v: 1 }
+  # hand_a's name maps to the table hand.a is served from: refused while hand.a lives...
+  - do:
+      indices.create:
+        index: hand_a
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      catch: /which\sbacks\sindex\s\[hand\.a\]/
+      search:
+        index: hand_a
+  # ...and after hand.a is deleted: it was created beside the index the table backed.
+  - do:
+      indices.delete:
+        index: hand.a
+  - do:
+      catch: /was\screated\swhile\stable\s\[os_hand_a\]\sbacked\sanother\sindex/
+      search:
+        index: hand_a
+  - do:
+      catch: /was\screated\swhile\stable\s\[os_hand_a\]/
+      index:
+        index: hand_a
+        id: "2"
+        body: { v: 2 }
+  - do:
+      indices.delete:
+        index: hand_a
+
+---
+"Whether an index was free to take its table is the cluster's to say, never a request's":
+  - do:
+      catch: /is\sset\sby\sthe\scluster/
+      indices.create:
+        index: claim1
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, index.infino.table_claimed: true, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      catch: /is\sset\sby\sthe\scluster/
+      indices.put_index_template:
+        name: claim_template
+        body:
+          index_patterns: [ "claim*" ]
+          template:
+            settings: { index.infino.table_claimed: true }
