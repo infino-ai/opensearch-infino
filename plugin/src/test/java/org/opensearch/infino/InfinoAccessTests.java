@@ -54,7 +54,9 @@ public class InfinoAccessTests extends OpenSearchTestCase {
         assertFalse(cols.containsKey("secret"));
         assertTrue(cols.containsKey("tag"));
         assertTrue(cols.containsKey("osid"));
-        assertTrue(cols.containsKey("source"));
+        // The raw source holds the hidden field: a query, aggregation or script
+        // over that column would read it, so the plan cannot name it.
+        assertFalse(cols.containsKey("source"));
         String shown = access.source("{\"tag\":\"x\",\"secret\":{\"a\":1},\"nested\":{\"secret\":2,\"keep\":3},\"list\":[{\"secret\":1},{\"keep\":2}]}");
         // A visible object stays, with whatever of it is visible, an empty one included.
         assertEquals("{\"tag\":\"x\",\"nested\":{\"keep\":3},\"list\":[{},{\"keep\":2}]}", shown);
@@ -72,6 +74,8 @@ public class InfinoAccessTests extends OpenSearchTestCase {
         Map<String, Column> cols = access.columns(cols());
         assertTrue(cols.get("ip").masked());
         assertFalse(cols.get("tag").masked());
+        // The raw source holds the clear value of the masked field.
+        assertFalse(cols.containsKey("source"));
         assertFalse(InfinoAccess.scriptColumns(cols).containsKey("ip"));
         assertTrue(InfinoAccess.scriptColumns(cols).containsKey("tag"));
         String shown = access.source("{\"ip\":\"10.0.0.1\",\"ips\":[\"a\",\"b\"],\"tag\":\"x\",\"ip2\":5}");

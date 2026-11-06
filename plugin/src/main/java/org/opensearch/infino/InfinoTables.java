@@ -8,15 +8,18 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.OperationRouting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.XContentBuilder;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +36,22 @@ import java.util.concurrent.ConcurrentHashMap;
  * primary's engine, and one table has one writer, so an index of several
  * shards keeps a table per shard; one of a single shard keeps proxy mode's
  * name for its one table.
+ *
+ * <p>A table backs one index. Two live indices can name the same table: an
+ * index's name maps to its table with every character a table name may not
+ * hold turned into {@code _} ({@code logs.app} and {@code logs_app} both
+ * read {@code os_logs_app}), and {@code index.infino.table} names any table
+ * at all. Of the live indices naming a table, the oldest is served from it
+ * and every other one is refused, so an index never reads or writes rows
+ * that belong to another, whatever the security plugin lets its user do
+ * with the index itself. No index is served from the registry's table.
+ *
+ * <p>An index created while a live index the table could back already named
+ * it is refused for its whole life ({@link InfinoPlugin#INFINO_TABLE_CLAIMED}),
+ * and counts for nothing when the table's index is chosen. So deleting the
+ * index a table backs hands its rows to none of the indices refused beside
+ * it: the table is dropped as if no other index named it (or kept, when it
+ * was named explicitly), and an index created after the delete may take it.
  */
 public final class InfinoTables {
 
@@ -57,6 +76,16 @@ public final class InfinoTables {
     /** The mapping version each table was last declared from, by table. */
     private final Map<String, Long> declared = new ConcurrentHashMap<>();
 
+    /** The live Infino-backed indices naming each table, as one cluster metadata holds them. */
+    private record Naming(Metadata metadata, Map<String, List<IndexMetadata>> byTable) {}
+
+    /**
+     * The naming of the metadata the node last applied, taken from a cluster
+     * state listener ({@link #observe}): a table is declared on the applier
+     * thread too (a shard starting), where the cluster state may not be read.
+     */
+    private volatile Naming naming;
+
     /** The index's table, declared from its current mapping if it has not been. */
     public String ensure(IndexMetadata md) {
         return declare(InfinoNative.tableFor(md.getIndex(), md.getSettings()), md);
@@ -69,14 +98,173 @@ public final class InfinoTables {
 
     /** Every table holding the index's rows, each declared as {@link #ensure(IndexMetadata, int)} declares it: one per shard in default mode, else the one. */
     public List<String> ensureAll(IndexMetadata md) {
-        if (!InfinoPlugin.inDefaultMode(md.getSettings()) || md.getNumberOfShards() == 1) {
-            return List.of(ensure(md));
-        }
-        List<String> out = new ArrayList<>(md.getNumberOfShards());
-        for (int shard = 0; shard < md.getNumberOfShards(); shard++) {
-            out.add(ensure(md, shard));
+        List<String> out = new ArrayList<>();
+        for (String table : tablesOf(md)) {
+            out.add(declare(table, md));
         }
         return out;
+    }
+
+    /** Every table holding an index's rows: one per shard in default mode, else the one. */
+    static List<String> tablesOf(IndexMetadata md) {
+        return tablesOf(md.getIndex().getName(), md.getSettings());
+    }
+
+    /** Every table that would hold the rows of an index of this name and these settings, as {@link #tablesOf(IndexMetadata)} names them. */
+    static List<String> tablesOf(String name, Settings settings) {
+        String table = InfinoNative.tableFor(name, settings);
+        int shards = IndexMetadata.INDEX_NUMBER_OF_SHARDS_SETTING.get(settings);
+        if (!InfinoPlugin.inDefaultMode(settings) || shards == 1) {
+            return List.of(table);
+        }
+        List<String> out = new ArrayList<>(shards);
+        for (int shard = 0; shard < shards; shard++) {
+            out.add(shardTable(table, shard, settings));
+        }
+        return out;
+    }
+
+    /** Whether the index may be served from its tables at all: it was not created beside a live index they could back. */
+    static boolean free(IndexMetadata md) {
+        return InfinoPlugin.INFINO_TABLE_CLAIMED.get(md.getSettings());
+    }
+
+    /** The Infino-backed indices of those given that name each table, by table. */
+    static Map<String, List<IndexMetadata>> naming(Iterable<IndexMetadata> indices) {
+        Map<String, List<IndexMetadata>> out = new HashMap<>();
+        for (IndexMetadata md : indices) {
+            if (!md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
+                continue;
+            }
+            for (String table : tablesOf(md)) {
+                out.computeIfAbsent(table, t -> new ArrayList<>(1)).add(md);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * The index a table backs, of the live indices naming it: the oldest (by
+     * creation, then by UUID, so every node picks the same one) of those not
+     * created refused (see {@link #free}); null when none is.
+     */
+    static Index owner(List<IndexMetadata> naming) {
+        IndexMetadata oldest = null;
+        for (IndexMetadata md : naming) {
+            if (!free(md)) {
+                continue;
+            }
+            if (oldest == null) {
+                oldest = md;
+                continue;
+            }
+            int c = Long.compare(md.getCreationDate(), oldest.getCreationDate());
+            if (c < 0 || (c == 0 && md.getIndexUUID().compareTo(oldest.getIndexUUID()) < 0)) {
+                oldest = md;
+            }
+        }
+        return oldest == null ? null : oldest.getIndex();
+    }
+
+    /**
+     * Refuse to serve {@code md} from {@code table} when the table is not
+     * its own: the registry's, one an older live index of {@code naming}
+     * (see {@link #naming}) is served from, or one {@code md} was created
+     * refused from (see {@link #free}).
+     */
+    static void claim(String table, IndexMetadata md, Map<String, List<IndexMetadata>> naming) {
+        String name = md.getIndex().getName();
+        if (InfinoRegistry.TABLE.equals(table)) {
+            throw new IllegalArgumentException(
+                "[infino] index [" + name + "] would be served from table [" + table + "], which holds the registry of the cluster's indices"
+            );
+        }
+        Index owner = owner(naming.getOrDefault(table, List.of()));
+        if (owner != null && !owner.equals(md.getIndex())) {
+            throw new IllegalArgumentException(
+                "[infino] index [" + name + "] would be served from table [" + table + "], which backs index [" + owner.getName() + "]"
+            );
+        }
+        if (!free(md)) {
+            throw new IllegalArgumentException(
+                "[infino] index [" + name + "] was created while table [" + table + "] backed another index, and is never served from it"
+            );
+        }
+    }
+
+    /**
+     * Whether an index created now under {@code name} with {@code settings}
+     * would be free to take its tables: no live index they could back names
+     * any of them, as the metadata last applied holds them. The cluster
+     * manager stamps the answer on the index as it creates it
+     * ({@link InfinoPlugin#INFINO_TABLE_CLAIMED}).
+     */
+    boolean claimable(String name, Settings settings) {
+        Naming known = naming;
+        return claimable(tablesOf(name, settings), known == null ? Map.of() : known.byTable());
+    }
+
+    /** Whether no live index of {@code naming} that {@code tables} could back names any of them. */
+    static boolean claimable(List<String> tables, Map<String, List<IndexMetadata>> naming) {
+        for (String table : tables) {
+            if (owner(naming.getOrDefault(table, List.of())) != null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Take the metadata the node applied; called from a cluster state listener, after the state is applied. */
+    void observe(Metadata metadata) {
+        namingOf(metadata);
+    }
+
+    /** Whether every table of {@code md} is its own, as {@code metadata} names them (see {@link #claim}). */
+    boolean owns(IndexMetadata md, Metadata metadata) {
+        if (!free(md)) {
+            return false;
+        }
+        Map<String, List<IndexMetadata>> byTable = namingOf(metadata);
+        for (String table : tablesOf(md)) {
+            if (InfinoRegistry.TABLE.equals(table) || !md.getIndex().equals(owner(byTable.getOrDefault(table, List.of())))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether deleting {@code gone} must leave {@code table}: it is the
+     * registry's, or a live index other than {@code gone} that the table
+     * could back names it, as the metadata last applied holds them (the
+     * delete runs on the applier, before the state without {@code gone} is
+     * the node's). An index created refused beside {@code gone} keeps
+     * nothing: the table's rows were never its own.
+     */
+    boolean keptAfterDelete(String table, Index gone) {
+        if (InfinoRegistry.TABLE.equals(table)) {
+            return true;
+        }
+        Naming known = naming;
+        if (known == null) {
+            return false;
+        }
+        for (IndexMetadata md : known.byTable().getOrDefault(table, List.of())) {
+            if (!md.getIndex().equals(gone) && free(md)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Map<String, List<IndexMetadata>> namingOf(Metadata metadata) {
+        Naming known = naming;
+        if (known != null && known.metadata() == metadata) {
+            return known.byTable();
+        }
+        Map<String, List<IndexMetadata>> byTable = naming(metadata.indices().values());
+        naming = new Naming(metadata, byTable);
+        return byTable;
     }
 
     /** The table holding the document {@code id} (routed by {@code routing} when given), as its shard is chosen for a write. */
@@ -94,6 +282,8 @@ public final class InfinoTables {
     }
 
     private String declare(String table, IndexMetadata md) {
+        Naming known = naming;
+        claim(table, md, known == null ? Map.of() : known.byTable());
         long version = md.getMappingVersion();
         Long last = declared.get(table);
         if (last != null && last == version) {

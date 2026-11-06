@@ -1,0 +1,147 @@
+---
+"A table backs one index: an index named onto another's table, or the registry's, is refused":
+  - do:
+      indices.create:
+        index: own.a
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      index:
+        index: own.a
+        id: "1"
+        refresh: true
+        body: { v: 1 }
+  # own_a's name maps to the table own.a is served from: the older index keeps it, and own_a is refused.
+  - do:
+      indices.create:
+        index: own_a
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      catch: /which\sbacks\sindex\s\[own\.a\]/
+      search:
+        index: own_a
+  - do:
+      catch: /which\sbacks\sindex\s\[own\.a\]/
+      index:
+        index: own_a
+        id: "2"
+        body: { v: 2 }
+  # Deleting the refused index leaves the table the other index is served from.
+  - do:
+      indices.delete:
+        index: own_a
+  - do:
+      count:
+        index: own.a
+  - match: { count: 1 }
+
+  # A table named explicitly is refused the same way when another index is served from it.
+  - do:
+      indices.create:
+        index: own-b
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, index.infino.table: os_own_a, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      catch: /which\sbacks\sindex\s\[own\.a\]/
+      search:
+        index: own-b
+  - do:
+      indices.delete:
+        index: own-b
+
+  # The registry's table backs no index, named explicitly or by the index's own name.
+  - do:
+      catch: /holds\sthe\sregistry/
+      indices.create:
+        index: reg1
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, index.infino.table: os_index, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      indices.create:
+        index: index
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      catch: /holds\sthe\sregistry/
+      search:
+        index: index
+  - do:
+      catch: /holds\sthe\sregistry/
+      index:
+        index: index
+        id: "_cluster/state"
+        body: { items: [] }
+  - do:
+      indices.delete:
+        index: index
+  # The registry still answers: deleting that index left its table.
+  - do:
+      infino.account_indices:
+        name: own.a
+  - match: { registered: true }
+  - do:
+      count:
+        index: own.a
+  - match: { count: 1 }
+  - do:
+      indices.delete:
+        index: own.a
+
+---
+"Deleting the index a table backs hands its rows to no index refused beside it":
+  - do:
+      indices.create:
+        index: hand.a
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      index:
+        index: hand.a
+        id: "1"
+        refresh: true
+        body: { v: 1 }
+  # hand_a's name maps to the table hand.a is served from: refused while hand.a lives...
+  - do:
+      indices.create:
+        index: hand_a
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      catch: /which\sbacks\sindex\s\[hand\.a\]/
+      search:
+        index: hand_a
+  # ...and after hand.a is deleted: it was created beside the index the table backed.
+  - do:
+      indices.delete:
+        index: hand.a
+  - do:
+      catch: /was\screated\swhile\stable\s\[os_hand_a\]\sbacked\sanother\sindex/
+      search:
+        index: hand_a
+  - do:
+      catch: /was\screated\swhile\stable\s\[os_hand_a\]/
+      index:
+        index: hand_a
+        id: "2"
+        body: { v: 2 }
+  - do:
+      indices.delete:
+        index: hand_a
+
+---
+"Whether an index was free to take its table is the cluster's to say, never a request's":
+  - do:
+      catch: /is\sset\sby\sthe\scluster/
+      indices.create:
+        index: claim1
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, index.infino.table_claimed: true, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      catch: /is\sset\sby\sthe\scluster/
+      indices.put_index_template:
+        name: claim_template
+        body:
+          index_patterns: [ "claim*" ]
+          template:
+            settings: { index.infino.table_claimed: true }

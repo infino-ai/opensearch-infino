@@ -104,6 +104,8 @@ public final class InfinoNative {
     private static final String FORMAT = "format";
     /** The mapping types whose values are dates. */
     private static final Set<String> DATE_TYPES = Set.of("date", "date_nanos");
+    /** The type of a multi-field that holds its field's value whole, the exact form of a text field. */
+    private static final String KEYWORD_TYPE = "keyword";
     /** The count's key in {@link #valueCounts}'s rows, as the engine names it. */
     static final String VALUE_COUNT = "count(*)";
     /** How long a prefetched source waits for its fetch phase. */
@@ -149,6 +151,15 @@ public final class InfinoNative {
         /** This column with the date format its mapping declares. */
         Column dated(String dateFormat) {
             return new Column(name, type, fts, vector, mask, dateFormat, elem);
+        }
+
+        /**
+         * This column read by its whole value, as a keyword multi-field of its
+         * field reads it: no text index, so a term is the value, not one of its
+         * words.
+         */
+        Column exact() {
+            return fts ? new Column(name, type, false, vector, mask, dateFormat, elem) : this;
         }
 
         /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */
@@ -355,11 +366,16 @@ public final class InfinoNative {
      * its table, so a recreated one starts empty.
      */
     public static String tableFor(Index index, Settings indexSettings) {
+        return tableFor(index.getName(), indexSettings);
+    }
+
+    /** The Infino table of an index of this name and these settings, as {@link #tableFor(Index, Settings)} names it. */
+    public static String tableFor(String indexName, Settings indexSettings) {
         String explicit = InfinoPlugin.INFINO_TABLE.get(indexSettings);
         if (!explicit.isEmpty()) {
             return explicit;
         }
-        return tableFor(index.getName());
+        return tableFor(indexName);
     }
 
     /** The table an index of this name is served from when none is named explicitly. */
@@ -460,13 +476,16 @@ public final class InfinoNative {
      * What a mapping declares beyond the columns: every field path, of any
      * type, a multi-field and an alias included ({@link #maps}); each field
      * alias's dotted path to the path it points at, since an alias has no
-     * column of its own and OpenSearch reads it as the field it names; and
-     * each date field's declared format.
+     * column of its own and OpenSearch reads it as the field it names; each
+     * keyword multi-field's dotted path to its field's, since the field's
+     * column holds the value the multi-field indexes whole (a log mapping's
+     * {@code request.raw} under the text field {@code request}, as a dynamic
+     * mapping's {@code name.keyword}); and each date field's declared format.
      */
-    record Mapping(Set<String> paths, Map<String, String> aliases, Map<String, String> dateFormats) {
+    record Mapping(Set<String> paths, Map<String, String> aliases, Map<String, String> keywordFields, Map<String, String> dateFormats) {
         @SuppressWarnings("unchecked")
         static Mapping of(String mappingJson) {
-            Mapping out = new Mapping(new HashSet<>(), new LinkedHashMap<>(), new LinkedHashMap<>());
+            Mapping out = new Mapping(new HashSet<>(), new LinkedHashMap<>(), new LinkedHashMap<>(), new LinkedHashMap<>());
             Object root = object(mappingJson);
             // The mapping as the cluster keeps it sits under its type name.
             while (root instanceof Map<?, ?> m && !m.containsKey(PROPERTIES) && m.size() == 1) {
@@ -494,8 +513,12 @@ public final class InfinoNative {
                     dateFormats.put(path, format);
                 }
                 if (field.get(MULTI_FIELDS) instanceof Map<?, ?> multi) {
-                    for (Object sub : multi.keySet()) {
-                        paths.add(path + "." + sub);
+                    for (Map.Entry<?, ?> sub : multi.entrySet()) {
+                        String subPath = path + "." + sub.getKey();
+                        paths.add(subPath);
+                        if (sub.getValue() instanceof Map<?, ?> subField && KEYWORD_TYPE.equals(subField.get(TYPE))) {
+                            keywordFields.put(subPath, path);
+                        }
                     }
                 }
                 if (field.get(PROPERTIES) instanceof Map<?, ?> inner) {
@@ -518,8 +541,9 @@ public final class InfinoNative {
 
     /**
      * Column name → description; empty if the table does not exist yet. A
-     * field alias is a name of its target's column, and a date column
-     * carries the format its mapping declares.
+     * field alias is a name of its target's column, as a keyword multi-field
+     * is of its string field's, and a date column carries the format its
+     * mapping declares.
      */
     public static Map<String, Column> columns(String name) {
         init();
@@ -552,6 +576,12 @@ public final class InfinoNative {
             Column target = out.get(alias.getValue());
             if (target != null) {
                 out.putIfAbsent(alias.getKey(), target);
+            }
+        }
+        for (Map.Entry<String, String> sub : (mapping == null ? Map.<String, String>of() : mapping.keywordFields()).entrySet()) {
+            Column field = out.get(sub.getValue());
+            if (field != null && field.isString()) {
+                out.putIfAbsent(sub.getKey(), field.exact());
             }
         }
         Map<String, Column> view = Collections.unmodifiableMap(out);
@@ -846,6 +876,23 @@ public final class InfinoNative {
         return out;
     }
 
+    /**
+     * The sources of these ids, by id, each looked up through the id
+     * column's index: a page's worth costs what its ids do, whatever the
+     * table holds, where one statement over the ids would read the whole id
+     * column. An id the table does not hold is absent.
+     */
+    public static Map<String, String> sources(String name, Collection<String> osids) {
+        Map<String, String> out = new HashMap<>();
+        for (String id : osids) {
+            String source = getSourceFresh(name, id);
+            if (source != null && !source.isEmpty()) {
+                out.put(id, source);
+            }
+        }
+        return out;
+    }
+
     /** A sequence number as a row holds it: a row written without one reads as {@link InfinoDocumentVersion#UNTRACKED_SEQ_NO}. */
     static long seq(Object value) {
         return value instanceof Number n ? n.longValue() : InfinoDocumentVersion.UNTRACKED_SEQ_NO;
@@ -1000,9 +1047,10 @@ public final class InfinoNative {
 
     /**
      * Which of these ids the table already holds, through the id column's
-     * term index: one statement per thousand ids, a union of their postings,
-     * then an exact comparison, since an id with punctuation indexes as
-     * several terms and the union may name ids that only share one.
+     * term index: one statement per thousand ids, a union of their postings
+     * (asked as plain terms, see {@link #idTerms}), then an exact comparison,
+     * since an id with punctuation indexes as several terms and the union may
+     * name ids that only share one. An id with no term is compared by value.
      */
     public static Set<String> existingOsids(String name, Collection<String> osids) {
         return probe(name, osids, false).keySet();
@@ -1035,16 +1083,59 @@ public final class InfinoNative {
     }
 
     private static void probe(String name, List<String> ids, boolean withSeqs, Set<String> wanted, Map<String, Long> found) {
-        String terms = InfinoQueryTranslator.literal(String.join(" ", ids));
         String columns = withSeqs ? InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SEQ : InfinoQueryTranslator.OSID;
-        String sql = "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', " + terms
-            + ", 'or')";
-        for (Map<String, Object> row : sqlRows(sql)) {
-            Object id = row.get(InfinoQueryTranslator.OSID);
-            if (id != null && wanted.contains(id.toString())) {
-                found.put(id.toString(), seq(row.get(InfinoQueryTranslator.SEQ)));
+        // An id with no letter or digit indexes as no term, so the term index
+        // cannot find it: those are compared by value over the id column.
+        List<String> termed = new ArrayList<>(ids.size());
+        List<String> bare = new ArrayList<>();
+        for (String id : ids) {
+            (hasTerm(id) ? termed : bare).add(id);
+        }
+        List<String> statements = new ArrayList<>(2);
+        if (!termed.isEmpty()) {
+            statements.add(
+                "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
+                    + InfinoQueryTranslator.literal(idTerms(termed)) + ", 'or')"
+            );
+        }
+        if (!bare.isEmpty()) {
+            statements.add(byIds(name, columns, bare, null));
+        }
+        for (String sql : statements) {
+            for (Map<String, Object> row : sqlRows(sql)) {
+                Object id = row.get(InfinoQueryTranslator.OSID);
+                if (id != null && wanted.contains(id.toString())) {
+                    found.put(id.toString(), seq(row.get(InfinoQueryTranslator.SEQ)));
+                }
             }
         }
+    }
+
+    /**
+     * Ids as an engine text query of plain terms
+     * ({@link InfinoQueryTranslator#plainTerms}): an id holding a leading
+     * {@code +} or {@code -} (a phone number such as {@code +15551234}, a
+     * negative number) would otherwise be a required or excluded clause, and
+     * with a required clause in it the union finds only the rows holding
+     * that one id.
+     */
+    static String idTerms(Collection<String> ids) {
+        StringBuilder out = new StringBuilder();
+        for (String id : ids) {
+            String terms = InfinoQueryTranslator.plainTerms(id);
+            if (!terms.isEmpty()) {
+                if (out.length() > 0) {
+                    out.append(' ');
+                }
+                out.append(terms);
+            }
+        }
+        return out.toString();
+    }
+
+    /** Whether an id holds a letter or a digit, and so indexes as at least one term of the id column's term index. */
+    static boolean hasTerm(String id) {
+        return id.codePoints().anyMatch(Character::isLetterOrDigit);
     }
 
     /**
@@ -1056,9 +1147,11 @@ public final class InfinoNative {
         if (!columns(name).containsKey(InfinoQueryTranslator.ROUTING)) {
             return null;
         }
-        String sql = "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING)
-            + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
-            + InfinoQueryTranslator.literal(id) + ", 'and')";
+        String columns = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING);
+        String sql = hasTerm(id)
+            ? "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
+                + InfinoQueryTranslator.literal(idTerms(List.of(id))) + ", 'and')"
+            : byIds(name, columns, List.of(id), null);
         for (Map<String, Object> row : sqlRows(sql)) {
             Object rowId = row.get(InfinoQueryTranslator.OSID);
             Object routing = row.get(InfinoQueryTranslator.ROUTING);

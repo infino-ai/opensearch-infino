@@ -204,6 +204,9 @@
   - match: { hits.hits.0._id: "5" }
   - match: { hits.hits.1._id: "4" }
   - match: { hits.hits.2._id: "3" }
+  # Each hit hands back the request's own sort values, as stock does: the id the tables break
+  # ties on stays the plugin's.
+  - match: { hits.hits.0.sort: [ 5 ] }
   - match: { aggregations.kinds.buckets.0.key: odd }
   - match: { aggregations.kinds.buckets.0.doc_count: 3 }
   - match: { aggregations.total.value: 15.0 }
@@ -235,6 +238,7 @@
         scroll: 1m
   - match: { hits.hits.0._id: "3" }
   - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.1.sort: [ 4 ] }
   - do:
       scroll:
         scroll_id: $scroll

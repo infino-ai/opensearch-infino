@@ -1,147 +1,36 @@
-# opensearch-infino
+# Infino for OpenSearch
 
-Back **OpenSearch** with the **Infino** engine for storage, full-text (BM25),
-vector (kNN / hybrid) and analytics (SQL aggregations), delivered as an
-**OpenSearch plugin**, not a fork. The OpenSearch REST API and cluster
-framework stay intact; an index keeps its name, mapping and settings in
-cluster state, and every document lives in an Infino table on the hosted
-service or on storage of your own (`file://`, `s3://`, `gs://`, `az://`).
-Nothing is written to Lucene.
+An OpenSearch plugin that stores your indices in Infino tables instead of Lucene. The documents live on storage you choose (a local disk, an S3, GCS or Azure bucket, or a hosted Infino account), and OpenSearch's REST API, Dashboards, security plugin and cluster management work unchanged.
 
-In **default mode** (`index.infino.mode: default`, every index's default) an
-index keeps OpenSearch's own write path through its shards: each primary's
-engine writes the documents to its shard's table and keeps a Lucene index of
-document ids only, and each shard's query phase is answered from the table.
-A node started with `infino.default_mode.enabled: false` (for a search
-plugin that needs the query phase itself) creates its indices in proxy mode.
+- **The same APIs.** Index, bulk, get, search, aggregations, scroll and Dashboards work unchanged. An index keeps its name, mapping, settings and aliases.
+- **One engine for every query.** Full-text search (BM25), vector search (kNN and hybrid) and SQL run on the same tables.
+- **Stateless nodes.** A node with an empty data directory brings every index back from storage, with its mapping and aliases.
+- **Not a fork.** The plugin installs into a released OpenSearch: 2.19.6, 3.0.0, 3.3.2, 3.6.0 or 3.9.0.
 
-In **proxy mode** (`index.infino.mode: proxy`) the plugin answers at the
-**action layer**: bulk, search (so also `_count` and each request of an
-`_msearch`) and get for an Infino-backed index are served from the table
-before they are routed to any shard. The index's one shard stays empty.
-Nodes are stateless: a node with an empty data directory boots, reads a
-registry kept beside the tables and brings every index back with its mapping
-and aliases; the rows are where they were.
+**Contents:** [Quick start](#quick-start) · [How it works](#how-it-works) · [Install on a cluster](#install-on-a-cluster) · [Hosted account and stateless nodes](#hosted-account-and-stateless-nodes) · [Settings](#settings) · [SQL](#sql) · [What is supported](#what-is-supported) · [Writes](#writes) · [Build and test](#build-and-test)
 
-The original spike and its findings are in [HANDOVER.md](HANDOVER.md). Since
-then the plugin has been shaped for log and event streams: the table is
-declared from the index **mapping** (dates are timestamp columns, text fields
-carry their own BM25 index, keywords are exact columns, numeric and date
-fields carry a range index unless the mapping says `"index": false`, the id
-column carries a term index), search serves date ranges with date math, field sorts,
-field-scoped text search with filters, and the aggregations dashboards ask
-for (`date_histogram`, `terms`, `histogram`, `filters`, `range`, metrics
-including `cardinality` and `percentiles`, nested to any depth), writes group
-commit across bulk requests and the table is compacted on a schedule, and a
-document the mapping cannot hold fails as its own bulk item.
+## Quick start
 
-## What's here
-
-| path | what |
-|---|---|
-| `infino-capi/` | Rust **C-ABI bridge** (`cdylib`) over the published `infino` crate. JSON in, JSON out; per-document checks against the declared columns. |
-| `plugin/` | The **OpenSearch Java plugin** (`org.opensearch.infino`): bulk, search and get action filters, the query translator, the aggregation processor, the batching writer, custom kNN/hybrid queries, SQL passthrough. Talks to the bridge via JNA. Builds out of tree against a released OpenSearch. |
-| `bench/` | `bench.py`: indexing + query-latency comparison vs stock Lucene. |
-| `scripts/` | `build.sh` (bridge + plugin zip), `run.sh` (install into a distribution + start a node), `check-all.sh` (the full check on every supported release). |
-
-## Build
-
-Needs a Rust toolchain, a JDK 21 and Gradle. No OpenSearch checkout: the
-plugin builds against the release named by `OPENSEARCH_VERSION` (default
-3.9.0), pulled from Maven, and the zip installs only into that exact version.
-One source tree builds for 2.19 through 3.9; the full check passes on
-2.19.6, 3.0.0, 3.3.2, 3.6.0 and 3.9.0 (the build tools of 2.19 want Gradle
-8.12.1, those of 3.0 want 8.14, 3.3 and later take 9.x).
+You need a Rust toolchain, a JDK 21, Gradle, and an OpenSearch 3.9.0 distribution to run it in.
 
 ```bash
-./scripts/build.sh                      # infino-capi/target/release/libinfino_capi.{so,dylib} + plugin/build/distributions/infino-engine-<ver>.zip
-cd plugin && gradle check               # precommit gates, unit tests, YAML REST suites on a test cluster with the bridge
-./scripts/check-all.sh                  # the same check on every supported release
+./scripts/build.sh                                      # the native bridge and the plugin zip
+DISTRO=/path/to/opensearch-3.9.0 ./scripts/run.sh       # install the plugin and start the node
 ```
 
-`gradle check` builds against one release. The security integration takes a
-different path on 2.x, on 3.0 through 3.5 and from 3.6 on, and only a check
-built against a release exercises its path, so run `scripts/check-all.sh`
-before relying on any release but the default. It takes the Gradle launcher
-for each release's build tools from `GRADLE_8_12`, `GRADLE_8_14` and `GRADLE`.
+`run.sh` keeps the tables in `data/` at the repository's root. Set `INFINO_URI=s3://bucket/prefix` (or `gs://`, `az://`) to keep them in a bucket instead.
 
-## Install and use
-
-There is no published release yet, so the two artifacts come from the build
-above: the native bridge (`infino-capi/target/release/libinfino_capi.so`, or
-`.dylib` on macOS) and the plugin zip for one OpenSearch version
-(`plugin/build/distributions/infino-engine-<version>.zip`).
-
-**1. Install the plugin on every node**, into the exact OpenSearch version
-the zip was built for:
-
-```bash
-bin/opensearch-plugin install -b file:///path/infino-engine-3.9.0.zip
-```
-
-**2. Point the JVM at the bridge**, in `config/jvm.options` or
-`OPENSEARCH_JAVA_OPTS`:
-
-```
--Dinfino.lib=/path/libinfino_capi.so
-```
-
-**3. Choose where the tables live.** Four choices; the same OpenSearch
-APIs on top of each, and nothing in Lucene with any of them:
-
-- *In memory*: the default when nothing is set. Fast and gone on restart;
-  for trying things out.
-- *On disk*: `-Dinfino.uri=file:///abs/path` beside the bridge option. One
-  node's own disk; the node that owns the path serves the tables.
-- *In a bucket*: `-Dinfino.uri=s3://bucket/prefix` (`gs://`, `az://` too).
-  Your storage, your credentials, the way any client reaches the bucket;
-  any node pointed at it serves the same tables.
-- *On an Infino account*: the hosted service runs the engine and manages
-  the tables, with the enterprise features on top (compaction, the usage
-  and billing console, the agent and search APIs over the same data). The
-  account stores either in an Infino bucket or in your own bucket, and
-  customer-managed encryption keys (CMEK) are supported. In
-  `config/opensearch.yml`
-
-  ```yaml
-  infino.platform.url: https://host
-  infino.platform.database: logs        # optional: the cluster's name when unset
-  ```
-  and the key in the node's keystore, `bin/opensearch-keystore add
-  infino.platform.api_key` (or `INFINO_API_KEY` in the node's environment).
-  With no account yet, start the node without these and ask for one:
-  `POST /_plugins/_infino/account/trial {"accept": true}` answers with the
-  key, exactly once, and these lines; the node uses the account from then
-  on, and the lines make it the node's own after a restart. See "Hosted
-  account, and stateless nodes" below. When both a URI and an account are
-  set, the account wins.
-
-**4. Start the node and use OpenSearch as usual.** Every index the cluster
-creates is Infino-backed (`index.infino.enabled: false` on an index keeps
-that one off; `infino.index.default_enabled: false` on the node turns the
-default off). Index, bulk, get, search, aggregations, scroll and Dashboards
-work through the same APIs; nothing reaches Lucene. Give an index one shard
-and no replicas, since the shard holds nothing and the engine scales reads
-itself. A fresh node on the same storage brings the indices back by itself.
-
-For a development node, `scripts/run.sh` does steps 1 to 4 on a
-distribution:
-
-```bash
-DISTRO=/path/to/opensearch-3.9.0 INFINO_URI=s3://bucket/prefix ./scripts/run.sh
-```
-
-Two things would make this a one-step install and are not done: a published
-zip per OpenSearch version, and the bridge inside the zip (loaded from the
-plugin's own directory, per platform) so `-Dinfino.lib` goes away.
+Create an index, write a document and search it:
 
 ```bash
 curl -XPUT localhost:9200/logs -H 'Content-Type: application/json' -d '{
-  "settings": {"index.infino.enabled": true, "number_of_shards": 1, "number_of_replicas": 0},
+  "settings": {"number_of_shards": 1, "number_of_replicas": 0},
   "mappings": {"properties": {
     "@timestamp": {"type": "date"}, "level": {"type": "keyword"},
     "message": {"type": "text"}, "status": {"type": "long"}}}}'
+
 curl -XPOST localhost:9200/_bulk -H 'Content-Type: application/x-ndjson' --data-binary $'{"index":{"_index":"logs","_id":"1"}}\n{"@timestamp":"2026-10-24T10:00:00Z","level":"error","message":"disk full on node-3","status":500}\n'
+
 curl localhost:9200/logs/_search -H 'Content-Type: application/json' -d '{
   "query": {"bool": {"must": [{"match": {"message": "disk"}}],
                      "filter": [{"range": {"@timestamp": {"gte": "now-1d"}}}]}},
@@ -150,166 +39,238 @@ curl localhost:9200/logs/_search -H 'Content-Type: application/json' -d '{
                          "aggs": {"by_level": {"terms": {"field": "level"}}}}}}'
 ```
 
-Settings: `index.infino.table` names the table explicitly (set it to reattach
-a recreated index to its rows; such a table is kept when the index is
-deleted); `index.infino.optimize_interval` (default 60s) compacts the table on
-a schedule; `index.infino.edges: true` makes the index a graph's edges for
-`graph_walk` and `graph_rank` over the SQL route: each document is an edge
-`{src_table, src_id, dst_table, dst_id}` naming its two rows as the engine
-does, by the `_table` and `_id` a SQL read gives each row, and each compaction
-(and, in default mode, a force merge) builds the index the walks read. JVM properties `infino.batch.docs` (50000) and
-`infino.batch.bytes` (64 MiB) bound the writes a batch may hold while an
-append runs. The node setting `infino.sql.max_result_size` (the node's
-`http.max_content_length` when unset) bounds a SQL route result as JSON: a
-statement whose result passes it is refused with a 400.
+Every index the cluster creates is backed by Infino, so the index above needs no setting of its own.
 
-## Hosted account, and stateless nodes
+## How it works
 
-Instead of its own storage, a node's tables can live on the hosted service:
-every table operation then goes there through the engine's own hosted
-client, and the node holds no table data. The account is node configuration,
-read at boot:
+The plugin has two parts: a Java plugin (`plugin/`) and a native bridge (`infino-capi/`) over the [`infino`](https://crates.io/crates/infino) crate, which it calls through JNA. Each index is backed by a table, which the bridge declares from the index's mapping:
+
+| Mapping | Column |
+|---|---|
+| `date` | a timestamp column, with a range index unless the mapping says `"index": false` |
+| numeric types | a numeric column, with a range index unless the mapping says `"index": false` |
+| `text` | a string column with its own BM25 index |
+| `keyword` | a string column compared by exact value |
+| `knn_vector` | a vector column, searched by the space type the mapping names |
+
+The document id is a column too, with a term index.
+
+A document that the declared columns cannot hold is refused as its own bulk item, with the reason.
+
+An index is served in one of two modes, fixed when it is created:
+
+| | **Default mode** (`index.infino.mode: default`, the default) | **Proxy mode** (`index.infino.mode: proxy`) |
+|---|---|---|
+| Writes | OpenSearch's own write path: each primary shard writes its documents to its shard's table | Bulk requests are answered before they are routed to a shard |
+| Searches | Each shard's query phase is answered from its table | Search, `_count`, each request of an `_msearch`, and get are answered from the table before any shard |
+| Lucene | Holds each document's id only | Holds nothing; the index's one shard stays empty |
+
+A node with `infino.default_mode.enabled: false` creates its indices in proxy mode. A search plugin that needs the node's query phase for itself, such as neural search, needs this (see [below](#neural-search)).
+
+Writes are group-committed, and each table is compacted every 60 seconds (`index.infino.optimize_interval`), so a steady stream of events doesn't leave it as thousands of small files.
+
+## Install on a cluster
+
+Build the two artifacts first (`./scripts/build.sh`):
+
+- the native bridge: `infino-capi/target/release/libinfino_capi.so` (`.dylib` on macOS);
+- the plugin zip for one OpenSearch release: `plugin/build/distributions/infino-engine.zip`. It installs only into the release it was built for (`OPENSEARCH_VERSION`, default 3.9.0).
+
+Then, on every node:
+
+**1. Install the plugin.**
+
+```bash
+bin/opensearch-plugin install -b file:///path/infino-engine.zip
+```
+
+**2. Point the JVM at the bridge**, in `config/jvm.options` or `OPENSEARCH_JAVA_OPTS`:
+
+```
+-Dinfino.lib=/path/libinfino_capi.so
+```
+
+**3. Choose where the tables live.** Every option serves the same OpenSearch APIs, and none writes anything to Lucene.
+
+| Where | How | |
+|---|---|---|
+| In memory | nothing to set | Lost on restart; for trying things out. |
+| On local disk | `-Dinfino.uri=file:///abs/path` | The node that owns the path serves the tables. |
+| In your bucket | `-Dinfino.uri=s3://bucket/prefix` (or `gs://`, `az://`) | Your bucket and credentials, reached the way any client reaches them. Every node pointed at it serves the same tables. |
+| On an Infino account | `infino.platform.url` in `opensearch.yml`, the key in the keystore | The hosted service runs the engine and manages the tables. See [Hosted account](#hosted-account-and-stateless-nodes). |
+
+When both a URI and an account are set, the account is used.
+
+**4. Start the node.** Every index is Infino-backed unless its settings say `index.infino.enabled: false`. To make the default off, set `infino.index.default_enabled: false` on the node. Give an index one shard and no replicas: the engine scales reads itself.
+
+### Neural search
+
+The standard OpenSearch bundle includes the neural search plugin, which takes the node's one query-phase searcher for its hybrid query; default mode needs that searcher too. With neural search installed, the node creates its indices in proxy mode and says so in its log. To use default mode, remove it:
+
+```bash
+bin/opensearch-plugin remove opensearch-neural-search
+```
+
+Setting `infino.default_mode.enabled: true` while neural search is installed stops the node, naming both ways out.
+
+Neural search's queries run on Lucene's vectors, which an Infino-backed index does not keep. Use `infino_knn`, `infino_hybrid` or the k-NN plugin's `knn` query instead. To embed documents as they are indexed, use ml-commons' `ml_inference` ingest processor in place of neural search's `text_embedding`. The model is the same; you map its input and output to your fields:
+
+```json
+PUT _ingest/pipeline/embed
+{"processors": [{"ml_inference": {
+  "model_id": "<model id>",
+  "input_map": [{"<model input>": "message"}],
+  "output_map": [{"message_embedding": "<model output>"}]
+}}]}
+```
+
+## Hosted account and stateless nodes
+
+With an Infino account, the tables live on the hosted service. It runs the engine, compacts the tables, and serves the agent and search APIs over the same data. The account stores the tables in an Infino bucket or in your own bucket, with customer-managed encryption keys (CMEK) supported. The node holds no table data.
+
+The account is node configuration, read at startup:
 
 ```yaml
 # opensearch.yml
-infino.platform.url: https://host          # the service
-infino.platform.database: logs             # the cluster's name, mapped, when unset
-```
-```bash
-opensearch-keystore add infino.platform.api_key   # or INFINO_API_KEY in the node's environment
+infino.platform.url: https://host
+infino.platform.database: logs        # optional: the cluster's name when unset
 ```
 
-Nothing about the account lives in the cluster, and nothing a node needs
-survives in it: the indices come back from a registry kept beside the tables
-(one row per index with its settings, mapping and aliases, written by the
-elected cluster manager as each index moves, deleted with the index). A node
-with an empty data directory boots, reads the registry and creates every
-index it names; the tables are named by the index, so the rows are there
-before the first request. Cluster state is a cache of this, rebuilt at boot,
-never the source. The security plugin's configuration index and Dashboards'
-saved objects come back the same way. The same holds for a `file://` or
-`s3://` catalog of the node's own.
+```bash
+bin/opensearch-keystore add infino.platform.api_key    # or INFINO_API_KEY in the node's environment
+```
 
-The security plugin's index is Infino-backed like every other, so roles,
-users and password hashes live in a table under the same credentials as the
-data (the account's key, or the bucket's), and a fresh node reads them from
-there rather than from a `securityadmin` run. The table is the only copy,
-written on every change, so it cannot be staler than the cluster was. An
-operator who wants that index in Lucene instead puts an index template on
-`.opendistro_security` with `index.infino.enabled: false`; templates sit
-above the plugin's default, and such a node then needs `securityadmin` (or
-the demo initialization) after a restart with an empty data directory. In the cloud: every document, the account,
-its credit and its limits. Nothing is kept in any shard either way.
+**Getting an account.** Start the node without these settings and ask for a free account:
 
 ```bash
-curl localhost:9200/_plugins/_infino/account           # what the tables are served from; the notice when no account is in use
-curl localhost:9200/_plugins/_infino/account/indices   # what the registry would bring back on a fresh cluster (?name=<index> for one)
-curl -XPOST localhost:9200/_plugins/_infino/account/indices  # bring them back now: apply the cluster state a loader registered (templates, pipelines, scripts, settings, users and roles), then create every index the cluster lacks (?name=<index> for one)
 curl -XPOST localhost:9200/_plugins/_infino/account/trial -H 'Content-Type: application/json' -d '{"accept": true}'
-curl -XPUT  localhost:9200/_plugins/_infino/account -H 'Content-Type: application/json' -d '{"platform": "https://host", "api_key": "..."}'
-curl -XDELETE localhost:9200/_plugins/_infino/account  # stop using the account on this node; the tables stay on the service
 ```
 
-An account is created only when a person accepts: the trial request must
-carry `"accept": true`. The trial creates a free account with credit, no
-email, no password and no card, registers one database named after the
-cluster (`database` in the body names another), answers with the key exactly
-once and the configuration lines above, and this node uses the account from
-then on, for its life; after a restart the node reads it from its
-configuration. `PUT` does the same for an account you already have, after
-using the key once so a refused key fails there. The service answers 501 when
-it offers no trial and 409 when the cluster's address has had one; the route
-passes each on with the next step. `infino.platform.default_url` (node
-setting) is the service a trial is asked from when the body names none.
+An account is created only when the request says `"accept": true`. The trial creates a free account with credit, with no email, password or card. It registers one database, named after the cluster (or `database` in the body), and answers with the key, exactly once, along with the configuration lines above. The node uses the account from then on, and those lines keep it after a restart. If the service gives out no free accounts, it answers 501; if the cluster's address has already had one, it answers 409. Either way the response names the next step. `infino.platform.default_url` names the service a trial is asked from.
 
-The service enforces the account's limits: at a ceiling or out of credit it
-refuses a write with a message naming the console where billing is added,
-and the bulk or request fails with that status and message. The node's own
-optimize schedule is off for hosted tables; the service compacts them.
+| Request | |
+|---|---|
+| `GET /_plugins/_infino/account` | What the tables are served from |
+| `POST /_plugins/_infino/account/trial` | Create a free account (`{"accept": true}`) |
+| `PUT /_plugins/_infino/account` | Use an account you have: `{"platform": "https://host", "api_key": "..."}`. The key is tried once first, so a wrong key fails here. |
+| `DELETE /_plugins/_infino/account` | Stop using the account on this node; the tables stay on the service |
+| `GET /_plugins/_infino/account/indices` | What would come back on a fresh cluster (`?name=<index>` for one) |
+| `POST /_plugins/_infino/account/indices` | Bring it back now: the cluster state a loader registered (templates, pipelines, scripts, settings, users and roles), then every index the cluster lacks |
+
+**Limits.** The service enforces the account's limits. At a ceiling or out of credit, it refuses a write with a message naming the console where billing is added, and the bulk fails with that status and message.
+
+**Stateless nodes.** Nothing a node needs lives only in the cluster. A registry kept beside the tables holds one row per index: its settings, mapping and aliases, written by the elected cluster manager as the index changes and deleted with it. A node with an empty data directory boots, reads the registry, and creates every index it names. The tables are named by the index, so the rows are there before the first request. Cluster state is a cache of the registry, rebuilt at boot. The same holds for a `file://` or bucket URI of the node's own.
+
+The security plugin's index is Infino-backed too, so its roles, users and password hashes live in a table under the same credentials as the data, and a fresh node reads them from there without a `securityadmin` run. To keep that index in Lucene instead, put an index template on `.opendistro_security` with `index.infino.enabled: false`; such a node then needs `securityadmin` (or the demo initialization) after a restart with an empty data directory. Dashboards' saved objects come back the same way.
+
+## Settings
+
+**Index settings**
+
+| Setting | Default | |
+|---|---|---|
+| `index.infino.enabled` | on (`infino.index.default_enabled`) | Whether the index is Infino-backed. |
+| `index.infino.mode` | `default` | `default` or `proxy`; fixed at creation. See [How it works](#how-it-works). |
+| `index.infino.table` | derived from the index's name | The table behind the index, named explicitly, to reattach a recreated index to its rows. A named table is kept when its index is deleted. |
+| `index.infino.optimize_interval` | `60s` | How often the table is compacted (5 seconds at least; off for a hosted account, which compacts its own tables). |
+| `index.infino.edges` | `false` | The index holds a graph's edges, for `graph_walk` and `graph_rank` in [SQL](#sql). |
+
+A table backs one live index. If two indices name the same table (explicitly, or by names that map to one table, such as `logs.app` and `logs_app`), the older one is served from it and the other is refused, even after the older one is deleted. With the security plugin, setting `index.infino.table` in a create, resize, rollover or template request needs the right to manage the cluster.
+
+**Node settings** (`opensearch.yml`)
+
+| Setting | Default | |
+|---|---|---|
+| `infino.index.default_enabled` | `true` | Whether new indices are Infino-backed unless their settings say otherwise. |
+| `infino.default_mode.enabled` | `true` (`false` when neural search is installed) | Whether this node serves default-mode indices. Off: its indices are created in proxy mode. |
+| `infino.platform.url` | none | The hosted service the tables live on. |
+| `infino.platform.database` | the cluster's name | The account's database. |
+| `infino.platform.api_key` | none | The account's key, in the keystore. `INFINO_API_KEY` in the environment is read when it is unset. |
+| `infino.platform.default_url` | `https://api.platform.infino.ws` | The service a trial is asked from when the request names none. |
+| `infino.cache.dir` | `infino-cache` under the node's first data path | Where the engine keeps a local copy of what it reads from the node's storage. Not used with a hosted account. |
+| `infino.sql.max_result_size` | `http.max_content_length` | The largest SQL result, as JSON; a statement whose result is larger is refused with a 400. |
+
+**JVM properties** (`config/jvm.options` or `OPENSEARCH_JAVA_OPTS`)
+
+| Property | Default | |
+|---|---|---|
+| `infino.lib` | `libinfino_capi.so` on the library path | The native bridge. |
+| `infino.uri` | `memory://` | Where the tables live without an account: `file://`, `s3://`, `gs://` or `az://`. |
+| `infino.batch.docs` | `50000` | The most documents one write batch holds. |
+| `infino.batch.bytes` | 64 MiB | The most bytes one write batch holds. |
+
+## SQL
+
+`POST /_plugins/_infino/sql` runs one read-only SQL statement over Infino-backed indices:
+
+```bash
+curl -XPOST localhost:9200/_plugins/_infino/sql -H 'Content-Type: application/json' -d '{
+  "query": "SELECT level, count(*) AS n FROM logs GROUP BY level ORDER BY n DESC"}'
+```
+
+The answer is `{"schema": [{"name", "type"}], "rows": [...]}`. A statement names indices (an index, an alias, or a pattern in quotes), never tables. The security plugin authorizes the caller for each index as it would for a search, and the statement sees each index as the caller does: hidden fields left out, masked fields masked, and only the rows the caller's document rules and filtering aliases allow. System indices are refused.
+
+An index with `index.infino.edges: true` holds a graph's edges: each document is one edge, `{src_table, src_id, dst_table, dst_id}`, naming two rows by the `_table` and `_id` a SQL read gives each row. `graph_walk` and `graph_rank` walk the edges; each compaction (and, in default mode, a force merge) builds the index they read.
+
+## What is supported
+
+**Queries:** `match_all`, `term`, `terms`, `range` (numbers and dates, with date math and time zones), `exists`, `prefix`, `wildcard`, `regexp`, `ids`, `match`, `match_phrase`, `multi_match`, `query_string` and `simple_query_string` (Lucene's classic syntax; fuzzy and proximity are refused), `bool` (with `minimum_should_match`), `script` (an expression subset of Painless), `infino_knn`, `infino_hybrid`, and the k-NN plugin's `knn`. A field named `x.keyword` reads the string column `x` by its whole value.
+
+**Search:** sorting by fields; `from` and `size` up to `index.max_result_window`; `search_after`, `post_filter`, `collapse` and scroll; `_source` includes and excludes; exact `hits.total`. A search over several Infino-backed indices merges their pages by sort values or score and reduces their aggregations together, under `search.max_buckets`. `get` and `mget` read the table too.
+
+**Aggregations:** `value_count`, `sum`, `avg`, `min`, `max`, `cardinality` (exact), `percentiles` (t-digest), `percentile_ranks`; `terms` over string, boolean, numeric and date columns, with `size` and `min_doc_count`, ordered by count, key or a sibling metric; `date_histogram` (fixed or calendar intervals, time zone, a fixed offset, `min_doc_count`, numeric `extended_bounds`); `histogram` (interval and offset); `filters` (with `other_bucket`); `range`; `date_range`; `composite`; `top_hits`; `significant_terms`; bucket aggregations nested to any depth; pipeline aggregations.
+
+**Vector search.** `knn_vector` is the k-NN plugin's own mapping type, so an index with vectors runs beside the k-NN plugin, and its `knn` query is answered from the table just as it would be on a Lucene index:
+
+```json
+{"query": {"knn": {"<field>": {"vector": [...], "k": 10, "filter": {...}}}}}
+```
+
+- **Results.** The engine returns the k nearest documents, and the page is a window over them.
+- **Filters.** A `filter` is applied before the k nearest are picked, as the k-NN plugin's filtered search does. When too few of the nearest documents match, the engine searches within exactly the documents the filter keeps. A filter takes the term-level queries above; a full-text query inside one is refused.
+- **Scoring.** Hits are scored as the k-NN plugin scores them for the field's `space_type`: `l2`, `innerproduct` or `cosinesimil`. Any other space type is refused. Name the `space_type` in the mapping: a vector field mapped without one is treated as cosine.
+- **Where `knn` goes.** `knn` is the whole query, not a clause inside `bool`.
+- **Refused, with the parameter named:** radial search (`max_distance`, `min_score`), `method_parameters`, `rescore`, `expand_nested_docs`, `ignore_unmapped`, a boost or query name. With a `knn` query, aggregations, field sorts, `post_filter`, `collapse`, `search_after` and scroll are refused too.
+
+**Not supported:** HDR percentiles; `fuzzy`, `nested`, `function_score` and geo queries; `suggest`; sliced search (sliced scroll, reindex or update by query); and a search across Infino-backed and other indices together. A request using any of these fails with a 400 that names the clause (`[infino] query not served by the table: ...`); it never returns an empty answer instead.
 
 ## Writes
 
-Each engine append is a commit, and a bulk is acknowledged after the append
-that carries its writes, so an acknowledged item is durable in the table.
-Writes group commit: a bulk that arrives while no append is running starts
-one at once; bulks that arrive during an append go to the table as the next
-append the moment it finishes. A client sending one bulk at a time waits only
-for its own append; clients sending in parallel share appends. An index of an
-existing id replaces it, a delete removes it and an update merges into it
-(partial `doc`, `doc_as_upsert`, `upsert`; scripts are refused); which ids
-exist is answered by the id column's term index in one statement, so a
-stream of new documents pays no lookup. A document the declared columns
-cannot hold is refused as its own item with the reason. A bulk must address
-one Infino-backed index.
+Each engine append is a commit, and a bulk is acknowledged only after the append carrying its writes, so an acknowledged write is durable.
 
-A batch's writes and its deletes are two mutations, the deletes after the
-append (the engine replaces rows one for one, so a delete with no row in its
-place cannot join the append). A node that stops between the two leaves the
-batch unacknowledged, its writes durable and its deletes not; the client's
-retry applies both again, and both are idempotent (a write replaces by id,
-and an id deleted twice stays deleted). A delete that fails after its append
-committed fails only the delete items (500); the writes are answered as
-written.
+- **Grouped commits.** A bulk that arrives while no append is running starts one at once. Bulks that arrive during an append go into the next one.
+- **Replace, delete, update.** Indexing an existing id replaces it, and a delete removes it. An update merges into the document (partial `doc`, `doc_as_upsert`, `upsert`); update scripts are refused. Updates apply in order, including two updates of one document in the same bulk.
+- **No lookup for new ids.** Which ids exist is answered by the id column's term index, so a stream of new documents pays no lookup.
+- **Several indices.** A bulk over several indices is applied index by index, and its items are answered in order.
 
-## What the table answers
+A batch's writes and deletes are two mutations, with the deletes after the append. If a node stops between them, the batch is not acknowledged; the client's retry applies both again, and both are idempotent. If a delete fails after its append committed, only the delete items fail (500).
 
-Query DSL: `match_all`, `term`, `terms`, `range` (numbers and dates, with date
-math and time zones), `exists`, `prefix`, `wildcard`, `regexp`, `ids`, `match`,
-`match_phrase` (as all-terms), `multi_match`, `query_string` /
-`simple_query_string` (as the terms they hold; Lucene syntax inside the string
-is not interpreted), `bool` (must / filter / must_not / should with
-minimum_should_match as "at least one"), `infino_knn`, `infino_hybrid`, and
-the k-NN plugin's own `knn` query. A field
-named `x.keyword` resolves to the string column `x`. Sorting by fields;
-`from` / `size` paging; `_source` includes and excludes; exact `hits.total`.
-A search over several Infino-backed indices merges their pages by sort values
-or score and reduces their aggregations once.
+## Build and test
 
-Vector search: `knn_vector` is the k-NN plugin's mapping type, so an index
-with vectors runs beside the k-NN plugin, and its stock query is served from
-the table as it is sent to a Lucene index:
-`{"query": {"knn": {"<field>": {"vector": [...], "k": 10, "filter": {...}}}}}`.
-The engine returns the k nearest and the page is a window over them, so the
-total is how many came back. A `filter` goes to the engine's `vector_search`
-as a predicate, and the k nearest come from the documents it keeps, as the
-k-NN plugin's filtered search returns them, however many nearer documents
-the filter rejects: when the engine's nearest hits leave fewer than k that
-match, it evaluates the predicate over the table's rows and searches within
-exactly the rows it keeps.
-The filter takes the term-level clauses above (term, terms, range, exists,
-prefix, wildcard, regexp, ids, bool); a full-text clause inside it is refused,
-since a text match is a search of its own rather than a predicate the vector
-search takes. `knn` is served as the whole query, like `infino_knn`, not as a
-clause inside `bool`. Refused with the parameter named: radial search
-(`max_distance`, `min_score`), `method_parameters`, `rescore`,
-`expand_nested_docs`, `ignore_unmapped`, a boost or query name, and
-aggregations, a field sort, `post_filter`, `collapse`, `search_after` or a
-scroll with a `knn` query. Hits score as the k-NN plugin scores them under
-the field's `space_type` (`l2`, `innerproduct`, `cosinesimil`); a `knn` on
-a field mapped with any other space type (`l1`, `linf`, `hamming`) is
-refused, since the engine computes none of those distances. Name the
-`space_type` in the mapping: the bridge declares a vector field mapped
-without one as cosine.
+```bash
+./scripts/build.sh          # the bridge and the plugin zip, for OPENSEARCH_VERSION (default 3.9.0)
+cd plugin && gradle check   # precommit, unit tests, and the REST suites on a test cluster with the bridge
+./scripts/check-all.sh      # the same check on every supported release
+```
 
-Aggregations: `value_count`, `sum`, `avg`, `min`, `max`, `cardinality`
-(exact, `COUNT(DISTINCT)`), `percentiles` (t-digest, from the engine's
-`approx_percentile_cont`); `terms` over string, boolean, integer, float or date
-columns with size, min_doc_count and order by count, key or a sibling metric;
-`date_histogram` with fixed or calendar intervals, time zone, offset (fixed),
-min_doc_count and numeric extended_bounds; `histogram` with interval and
-offset; `filters` (keyed and anonymous, with `other_bucket`), `range`,
-`date_range`; bucket aggregations nested to any depth, each level a `GROUP BY`
-over the parent's kept buckets; pipeline aggregations, computed in the final
-reduction from the buckets returned.
+No OpenSearch checkout is needed: the plugin builds against the release named by `OPENSEARCH_VERSION`, pulled from Maven. `gradle check` builds against one release. The security integration takes a different path on 2.x, on 3.0 to 3.5, and on 3.6 and later, so run `check-all.sh` before relying on any release but the default. Each release's build tools want their own Gradle:
 
-A request outside this surface fails with `400` and a reason naming the
-clause (`[infino] query not served by the table: ...`), never a silently
-empty answer. Not served: `composite`, `top_hits`, `percentile_ranks`, HDR
-percentiles, `significant_terms`; `fuzzy`, `nested`, `function_score`,
-`script` and geo queries; `scroll`, `search_after`, `post_filter`,
-`collapse`, `suggest`; `mget`; a search or bulk mixing Infino-backed indices
-with others.
+| Releases | Gradle | `check-all.sh` reads it from |
+|---|---|---|
+| 2.19.x | 8.12.1 | `GRADLE_8_12` |
+| 3.0.x | 8.14 | `GRADLE_8_14` |
+| 3.3 and later | 9.x | `GRADLE` |
+
+## Repository layout
+
+| Path | |
+|---|---|
+| `plugin/` | The OpenSearch plugin (`org.opensearch.infino`): the engine and query phase of default mode, the bulk, search and get filters of proxy mode, the query translator, aggregations, the batching writer, kNN and hybrid queries, and the SQL route. |
+| `infino-capi/` | The native bridge, a Rust `cdylib` over the `infino` crate: JSON in, JSON out, with every document checked against the declared columns. |
+| `scripts/` | `build.sh`, `run.sh` (install into a distribution and start a node) and `check-all.sh`. |
+| `bench/` | `bench.py`: indexing and query latency against stock Lucene. |
+| `HANDOVER.md` | Design notes from the first prototype. |
 
 ## License
 
-Apache-2.0. The bridge and plugin bind only the published `infino` crate.
+Apache-2.0. The bridge and the plugin use only the published `infino` crate.

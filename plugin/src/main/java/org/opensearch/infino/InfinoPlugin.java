@@ -45,6 +45,7 @@ import org.opensearch.search.query.QueryPhaseSearcher;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.nio.file.Files;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -72,9 +73,10 @@ import java.util.function.Supplier;
  * its one shard stays empty.
  *
  * <p>The table is {@code index.infino.table} when set, else named after the
- * index and its UUID. It is dropped when the index is deleted unless it was
- * named explicitly, so an index recreated on a fresh cluster with the same
- * setting reattaches to the rows its predecessor wrote.
+ * index. A table backs one live index (see {@link InfinoTables}). It is
+ * dropped when the index is deleted unless it was named explicitly, so an
+ * index recreated on a fresh cluster with the same setting reattaches to the
+ * rows its predecessor wrote.
  */
 public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, EnginePlugin {
 
@@ -109,9 +111,17 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      * default mode is every index's default. A node turns it off where
      * another search plugin needs the node's one query-phase searcher
      * (neural search's hybrid query, for one); its indices are then created
-     * in proxy mode.
+     * in proxy mode. Unset on a node with neural search installed, it is off
+     * (see {@link #servesDefaultMode}).
      */
     public static final Setting<Boolean> DEFAULT_MODE_ENABLED = Setting.boolSetting("infino.default_mode.enabled", true, Setting.Property.NodeScope);
+
+    /**
+     * The OpenSearch bundle's neural search plugin, which registers a
+     * query-phase searcher of its own (for its hybrid query). OpenSearch
+     * starts a node with one at most.
+     */
+    static final String NEURAL_SEARCH_PLUGIN = "opensearch-neural-search";
 
     /**
      * Set by the registry on an index it recreates on a fresh cluster (see
@@ -149,6 +159,26 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         "index.infino.table",
         Setting.Property.IndexScope,
         Setting.Property.Final
+    );
+
+    /**
+     * Whether the index was free to take its table when it was created: set
+     * by the cluster at creation ({@link #getAdditionalIndexSettingProviders}),
+     * false when a live index the table could back already named it. An
+     * index created false is never served from the table, not even after
+     * that index is deleted, so a younger index named onto a table never
+     * inherits the rows of the one it was refused beside (see
+     * {@link InfinoTables}). Private, so no request or template sets it; not
+     * copied to a resized index, which is a new index. An index created
+     * before the setting carries none and counts as free, as it always has.
+     */
+    public static final Setting<Boolean> INFINO_TABLE_CLAIMED = Setting.boolSetting(
+        "index.infino.table_claimed",
+        true,
+        Setting.Property.IndexScope,
+        Setting.Property.PrivateIndex,
+        Setting.Property.Final,
+        Setting.Property.NotCopyableOnResize
     );
 
     /**
@@ -225,7 +255,15 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
 
     public InfinoPlugin(Settings settings) {
         this.defaultEnabled = INFINO_DEFAULT_ENABLED.get(settings);
-        this.defaultModeEnabled = DEFAULT_MODE_ENABLED.get(settings);
+        this.defaultModeEnabled = servesDefaultMode(settings);
+        if (!defaultModeEnabled && !DEFAULT_MODE_ENABLED.exists(settings)) {
+            log.warn(
+                "[infino] [{}] is installed and takes the node's query-phase searcher, so this node serves its Infino-backed indices in "
+                    + "proxy mode; remove it ({}) to serve them in default mode",
+                NEURAL_SEARCH_PLUGIN,
+                "bin/opensearch-plugin remove " + NEURAL_SEARCH_PLUGIN
+            );
+        }
         this.account = new InfinoAccount(PLATFORM_DEFAULT_URL.get(settings));
         InfinoNative.cacheDir(cacheDir(settings));
         InfinoRequestCache.configure(settings);
@@ -265,6 +303,47 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         return new Environment(settings, null).dataFiles()[0].resolve(DEFAULT_CACHE_SUBDIR).toString();
     }
 
+    /**
+     * Whether a node with these settings serves default-mode indices:
+     * {@link #DEFAULT_MODE_ENABLED} where the node sets it, else on unless
+     * neural search is installed, which takes the node's one query-phase
+     * searcher (the node then serves its indices in proxy mode, over the
+     * same storage). Set on beside neural search, the node cannot start:
+     * the two searchers would refuse each other.
+     */
+    static boolean servesDefaultMode(Settings settings) {
+        boolean neural = neuralSearchInstalled(settings);
+        if (!DEFAULT_MODE_ENABLED.exists(settings)) {
+            return !neural;
+        }
+        boolean on = DEFAULT_MODE_ENABLED.get(settings);
+        if (on && neural) {
+            throw new IllegalArgumentException(
+                "[infino] ["
+                    + DEFAULT_MODE_ENABLED.getKey()
+                    + ": true] needs the node's query-phase searcher, which ["
+                    + NEURAL_SEARCH_PLUGIN
+                    + "] also registers: remove it (bin/opensearch-plugin remove "
+                    + NEURAL_SEARCH_PLUGIN
+                    + "), or set ["
+                    + DEFAULT_MODE_ENABLED.getKey()
+                    + ": false] to serve this node's indices in proxy mode"
+            );
+        }
+        return on;
+    }
+
+    /**
+     * Whether neural search is installed on the node: its directory among the
+     * node's plugins. False without a home, as on a node built for a unit test.
+     */
+    static boolean neuralSearchInstalled(Settings settings) {
+        if (Environment.PATH_HOME_SETTING.get(settings).isEmpty()) {
+            return false;
+        }
+        return Files.isDirectory(InfinoNodePaths.plugins(new Environment(settings, null)).resolve(NEURAL_SEARCH_PLUGIN));
+    }
+
     /** The tables behind the node's Infino-backed indices. */
     static InfinoTables tables() {
         return TABLES;
@@ -288,7 +367,13 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         if (!defaultModeEnabled) {
             // Without the engine the index would fall to the stock one and keep its data in Lucene.
             throw new IllegalArgumentException(
-                "[infino] index " + indexSettings.getIndex().getName() + " is in default mode, which needs [" + DEFAULT_MODE_ENABLED.getKey() + ": true] on the node"
+                "[infino] index "
+                    + indexSettings.getIndex().getName()
+                    + " is in default mode, which needs ["
+                    + DEFAULT_MODE_ENABLED.getKey()
+                    + ": true] on the node and ["
+                    + NEURAL_SEARCH_PLUGIN
+                    + "] not installed"
             );
         }
         // The release's own subclass hooks the translog sync (see InfinoEngine#commitBeforeSync).
@@ -332,7 +417,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             new InfinoScrollActionFilter(InfinoServices::clusterService, InfinoServices::scriptService),
             new InfinoGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES),
             new InfinoMultiGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES),
-            new InfinoStatsActionFilter(InfinoServices::clusterService, TABLES)
+            new InfinoStatsActionFilter(InfinoServices::clusterService, TABLES),
+            new InfinoExplicitTableActionFilter()
         );
     }
 
@@ -396,8 +482,14 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             @Override
             public void afterIndexShardDeleted(ShardId shardId, Settings indexSettings) {
                 String table = InfinoTables.shardTable(InfinoNative.tableFor(shardId.getIndex(), indexSettings), shardId.id(), indexSettings);
-                TABLES.forget(table);
                 InfinoRegistry.forget(shardId.getIndexName());
+                if (TABLES.keptAfterDelete(table, shardId.getIndex())) {
+                    // Another live index is served from the table (or it is the
+                    // registry's): the rows are not this index's to drop.
+                    log.info("[infino] index {} deleted; its table {} backs another index and is kept", shardId.getIndexName(), table);
+                    return;
+                }
+                TABLES.forget(table);
                 if (InfinoNative.tableIsExplicit(indexSettings)) {
                     log.info("[infino] index {} deleted; its table {} was named explicitly and is kept", shardId.getIndexName(), table);
                     return;
@@ -469,6 +561,12 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      * one the creating node serves: default mode, or proxy mode where
      * {@link #DEFAULT_MODE_ENABLED} is off. The mode is final, so the index
      * keeps it on every node.
+     *
+     * <p>Every Infino-backed index is also stamped with whether it was free
+     * to take its table ({@link #INFINO_TABLE_CLAIMED}), from the indices the
+     * cluster manager last applied. The provider runs on the cluster manager
+     * as it creates the index; a resized index is created without providers
+     * and so carries none.
      */
     @Override
     public Collection<IndexSettingProvider> getAdditionalIndexSettingProviders() {
@@ -488,6 +586,11 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
                 if (enabled && !templateAndRequestSettings.hasValue(INFINO_MODE.getKey())) {
                     out.put(INFINO_MODE.getKey(), defaultModeEnabled ? MODE_DEFAULT : MODE_PROXY);
                 }
+                if (enabled) {
+                    // The index's tables as it will hold them: the request and its templates over the defaults above.
+                    Settings index = Settings.builder().put(out.build()).put(templateAndRequestSettings).build();
+                    out.put(INFINO_TABLE_CLAIMED.getKey(), TABLES.claimable(indexName, index));
+                }
                 return out.build();
             }
         });
@@ -503,6 +606,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             INFINO_REBUILT,
             INFINO_EDGES,
             INFINO_TABLE,
+            INFINO_TABLE_CLAIMED,
             OPTIMIZE_INTERVAL,
             PLATFORM_URL,
             PLATFORM_DATABASE,

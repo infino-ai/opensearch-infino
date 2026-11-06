@@ -695,7 +695,7 @@ public class InfinoAggregationProcessor {
                 c = InfinoSearch.columnFor(cols, b.field());
                 if (c == null) {
                     if (!InfinoNative.maps(table, b.field())) {
-                        return Source.unmapped(b.field(), unmappedType(b));
+                        return withMissing(b, Source.unmapped(b.field(), unmappedType(b)), now);
                     }
                     throw new Unsupported("aggregation [" + b.getName() + "] names field [" + b.field() + "], which the table has no column for");
                 }
@@ -704,12 +704,36 @@ public class InfinoAggregationProcessor {
                 // A script reads values themselves, so it sees no masked column, the value script's included.
                 Column valueColumn = c != null && c.masked() ? null : c;
                 Sql sql = InfinoScriptTranslator.translate(b.script(), InfinoAccess.scriptColumns(cols), valueColumn, now);
-                return new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]", null);
+                return withMissing(b, new Source(sql.expr(), sql.type(), "script [" + b.script().getIdOrCode() + "]", null), now);
             }
             if (c == null) {
                 throw new Unsupported("aggregation [" + b.getName() + "] needs a field or a script");
             }
-            return Source.of(c, cols, table);
+            return withMissing(b, Source.of(c, cols, table), now);
+        }
+
+        /**
+         * {@code source} with the aggregation's {@code missing} value standing
+         * in for a document that gives none, as OpenSearch reads it: a terms
+         * bucket of its own, a value a metric counts. A field some document
+         * gives several values, or one masked for the user, is refused with it.
+         */
+        static Source withMissing(ValuesSourceAggregationBuilder<?> b, Source source, long now) {
+            if (b.missing() == null) {
+                return source;
+            }
+            if (source.multi()) {
+                throw new Unsupported("aggregation [" + b.getName() + "] has [missing] over " + source.label() + ", which documents give several values");
+            }
+            if (source.masked()) {
+                throw new Unsupported("aggregation [" + b.getName() + "] has [missing] over " + source.label() + ", a field masked for this user");
+            }
+            String literal = InfinoQueryTranslator.literalForType(source.type(), b.missing(), now);
+            if (literal == null) {
+                throw new Unsupported("aggregation [" + b.getName() + "] has [missing: " + b.missing() + "], which " + source.label() + " cannot hold");
+            }
+            // No column: the fast paths that read a column's own values would skip the stand-in.
+            return new Source("COALESCE(" + source.expr() + ", " + literal + ")", source.type(), source.label(), null, null, source.dateFormat(), null, source.onlyWhere());
         }
 
         /** The type an aggregation reads an unmapped field as: what its values would have been. */
@@ -1516,6 +1540,10 @@ public class InfinoAggregationProcessor {
             long now
         ) {
             Source c = sourceOf(t, cols, table, now);
+            if (t.includeExclude() != null) {
+                // Read as Lucene reads them (its regular expressions, its partitions), which the table does not.
+                throw new Unsupported("aggregation [" + t.getName() + "] has include/exclude, which is not served");
+            }
             if (t.size() > MAX_TERMS_SIZE) {
                 throw new Unsupported("aggregation [" + t.getName() + "] asks for " + t.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
             }
@@ -1909,7 +1937,9 @@ public class InfinoAggregationProcessor {
                 all.add("(" + p + ")");
             }
             if (f.otherBucket()) {
-                String other = all.isEmpty() ? InfinoQueryTranslator.ALL : "NOT (" + String.join(" OR ", all) + ")";
+                // A document a filter cannot judge (its field missing) is in no named
+                // bucket, so it is in the other one: unknown counts as false here.
+                String other = all.isEmpty() ? InfinoQueryTranslator.ALL : "NOT COALESCE((" + String.join(" OR ", all) + "), FALSE)";
                 buckets.add(new ExplicitBucket(f.otherBucketKey(), other, Double.NaN, Double.NaN));
             }
             return new Explicit(f, leaves, child, ExplicitKind.FILTERS, buckets, f.isKeyed(), DocValueFormat.RAW);

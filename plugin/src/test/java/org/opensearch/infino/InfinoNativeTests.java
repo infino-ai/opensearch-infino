@@ -7,6 +7,7 @@ package org.opensearch.infino;
 import org.opensearch.infino.InfinoNative.Mapping;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -30,7 +31,22 @@ public class InfinoNativeTests extends OpenSearchTestCase {
             m.paths()
         );
         assertEquals(Map.of("@timestamp", "timestamp", "geo.origin", "geo.src"), m.aliases());
+        assertEquals(Map.of("agent.keyword", "agent"), m.keywordFields());
         assertEquals(Map.of("when", "yyyy-MM-dd HH:mm:ss||strict_date_optional_time"), m.dateFormats());
+    }
+
+    /**
+     * A keyword multi-field is read by its own name, whatever the mapping calls it (the logs
+     * track's {@code request.raw}); one of another type indexes the value differently and is
+     * not read as its field.
+     */
+    public void testAKeywordMultiFieldOfAnyNameReadsItsField() {
+        Mapping m = Mapping.of("""
+            {"properties":{"request":{"type":"match_only_text","fields":{
+              "raw":{"type":"keyword","ignore_above":256},
+              "english":{"type":"text","analyzer":"english"}}}}}""");
+        assertEquals(Set.of("request", "request.raw", "request.english"), m.paths());
+        assertEquals(Map.of("request.raw", "request"), m.keywordFields());
     }
 
     public void testAMappingWithoutTheTypeNameIsReadTheSame() {
@@ -43,6 +59,25 @@ public class InfinoNativeTests extends OpenSearchTestCase {
         Mapping m = Mapping.of("{}");
         assertTrue(m.paths().isEmpty());
         assertTrue(m.aliases().isEmpty());
+        assertTrue(m.keywordFields().isEmpty());
         assertTrue(m.dateFormats().isEmpty());
+    }
+
+    /**
+     * The id probe asks for plain terms: a leading + or - (a phone number, a
+     * negative number) and a double quote are clause syntax to the engine,
+     * and with a required clause the union found only one id's rows.
+     */
+    public void testIdsAreAskedForAsPlainTerms() {
+        assertEquals("15551234 15559876", InfinoNative.idTerms(List.of("+15551234", "+15559876")));
+        assertEquals("7 a b x y z", InfinoNative.idTerms(List.of("-7", "a\"b", "x y", "--z")));
+        assertEquals("", InfinoNative.idTerms(List.of("---", "+")));
+    }
+
+    public void testAnIdWithNoLetterOrDigitHasNoTerm() {
+        assertFalse(InfinoNative.hasTerm("---"));
+        assertFalse(InfinoNative.hasTerm("+/-"));
+        assertTrue(InfinoNative.hasTerm("+1"));
+        assertTrue(InfinoNative.hasTerm("é"));
     }
 }

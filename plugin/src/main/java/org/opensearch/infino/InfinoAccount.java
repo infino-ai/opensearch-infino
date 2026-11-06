@@ -159,7 +159,12 @@ public final class InfinoAccount {
         switch (request.method()) {
             case GET -> {
                 if (indices) {
-                    indices(request.param("name"), channel);
+                    // What the registry would bring back names every index, its
+                    // aliases and their filters, and the users, roles and role
+                    // mappings a loader registered: the cluster's management,
+                    // as bringing them back is.
+                    String name = request.param("name");
+                    asClusterAdmin(channel, () -> indices(name, channel));
                 } else {
                     status(channel);
                 }
