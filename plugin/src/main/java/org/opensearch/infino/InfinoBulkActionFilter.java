@@ -684,7 +684,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
         if (!fromTemplates.getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), InfinoPlugin.INFINO_DEFAULT_ENABLED.get(node))) {
             return false;
         }
-        String nodeMode = InfinoPlugin.DEFAULT_MODE_ENABLED.get(node) ? InfinoPlugin.MODE_DEFAULT : InfinoPlugin.MODE_PROXY;
+        String nodeMode = InfinoPlugin.servesDefaultMode(node) ? InfinoPlugin.MODE_DEFAULT : InfinoPlugin.MODE_PROXY;
         return InfinoPlugin.MODE_PROXY.equals(fromTemplates.get(InfinoPlugin.INFINO_MODE.getKey(), nodeMode));
     }
 

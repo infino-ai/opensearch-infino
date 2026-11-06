@@ -45,6 +45,7 @@ import org.opensearch.search.query.QueryPhaseSearcher;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.nio.file.Files;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -110,9 +111,17 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      * default mode is every index's default. A node turns it off where
      * another search plugin needs the node's one query-phase searcher
      * (neural search's hybrid query, for one); its indices are then created
-     * in proxy mode.
+     * in proxy mode. Unset on a node with neural search installed, it is off
+     * (see {@link #servesDefaultMode}).
      */
     public static final Setting<Boolean> DEFAULT_MODE_ENABLED = Setting.boolSetting("infino.default_mode.enabled", true, Setting.Property.NodeScope);
+
+    /**
+     * The OpenSearch bundle's neural search plugin, which registers a
+     * query-phase searcher of its own (for its hybrid query). OpenSearch
+     * starts a node with one at most.
+     */
+    static final String NEURAL_SEARCH_PLUGIN = "opensearch-neural-search";
 
     /**
      * Set by the registry on an index it recreates on a fresh cluster (see
@@ -246,7 +255,15 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
 
     public InfinoPlugin(Settings settings) {
         this.defaultEnabled = INFINO_DEFAULT_ENABLED.get(settings);
-        this.defaultModeEnabled = DEFAULT_MODE_ENABLED.get(settings);
+        this.defaultModeEnabled = servesDefaultMode(settings);
+        if (!defaultModeEnabled && !DEFAULT_MODE_ENABLED.exists(settings)) {
+            log.warn(
+                "[infino] [{}] is installed and takes the node's query-phase searcher, so this node serves its Infino-backed indices in "
+                    + "proxy mode; remove it ({}) to serve them in default mode",
+                NEURAL_SEARCH_PLUGIN,
+                "bin/opensearch-plugin remove " + NEURAL_SEARCH_PLUGIN
+            );
+        }
         this.account = new InfinoAccount(PLATFORM_DEFAULT_URL.get(settings));
         InfinoNative.cacheDir(cacheDir(settings));
         InfinoRequestCache.configure(settings);
@@ -286,6 +303,47 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         return new Environment(settings, null).dataFiles()[0].resolve(DEFAULT_CACHE_SUBDIR).toString();
     }
 
+    /**
+     * Whether a node with these settings serves default-mode indices:
+     * {@link #DEFAULT_MODE_ENABLED} where the node sets it, else on unless
+     * neural search is installed, which takes the node's one query-phase
+     * searcher (the node then serves its indices in proxy mode, over the
+     * same storage). Set on beside neural search, the node cannot start:
+     * the two searchers would refuse each other.
+     */
+    static boolean servesDefaultMode(Settings settings) {
+        boolean neural = neuralSearchInstalled(settings);
+        if (!DEFAULT_MODE_ENABLED.exists(settings)) {
+            return !neural;
+        }
+        boolean on = DEFAULT_MODE_ENABLED.get(settings);
+        if (on && neural) {
+            throw new IllegalArgumentException(
+                "[infino] ["
+                    + DEFAULT_MODE_ENABLED.getKey()
+                    + ": true] needs the node's query-phase searcher, which ["
+                    + NEURAL_SEARCH_PLUGIN
+                    + "] also registers: remove it (bin/opensearch-plugin remove "
+                    + NEURAL_SEARCH_PLUGIN
+                    + "), or set ["
+                    + DEFAULT_MODE_ENABLED.getKey()
+                    + ": false] to serve this node's indices in proxy mode"
+            );
+        }
+        return on;
+    }
+
+    /**
+     * Whether neural search is installed on the node: its directory among the
+     * node's plugins. False without a home, as on a node built for a unit test.
+     */
+    static boolean neuralSearchInstalled(Settings settings) {
+        if (Environment.PATH_HOME_SETTING.get(settings).isEmpty()) {
+            return false;
+        }
+        return Files.isDirectory(InfinoNodePaths.plugins(new Environment(settings, null)).resolve(NEURAL_SEARCH_PLUGIN));
+    }
+
     /** The tables behind the node's Infino-backed indices. */
     static InfinoTables tables() {
         return TABLES;
@@ -309,7 +367,13 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         if (!defaultModeEnabled) {
             // Without the engine the index would fall to the stock one and keep its data in Lucene.
             throw new IllegalArgumentException(
-                "[infino] index " + indexSettings.getIndex().getName() + " is in default mode, which needs [" + DEFAULT_MODE_ENABLED.getKey() + ": true] on the node"
+                "[infino] index "
+                    + indexSettings.getIndex().getName()
+                    + " is in default mode, which needs ["
+                    + DEFAULT_MODE_ENABLED.getKey()
+                    + ": true] on the node and ["
+                    + NEURAL_SEARCH_PLUGIN
+                    + "] not installed"
             );
         }
         // The release's own subclass hooks the translog sync (see InfinoEngine#commitBeforeSync).

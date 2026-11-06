@@ -24,4 +24,4 @@ echo "    bridge: $LIB"
 
 echo "==> building the plugin zip for OpenSearch $OPENSEARCH_VERSION"
 ( cd "$HERE/plugin" && "$GRADLE" -Dopensearch.version="$OPENSEARCH_VERSION" bundlePlugin )
-echo "    zip: $HERE/plugin/build/distributions/infino-engine-$OPENSEARCH_VERSION.zip"
+echo "    zip: $HERE/plugin/build/distributions/infino-engine.zip (for OpenSearch $OPENSEARCH_VERSION)"

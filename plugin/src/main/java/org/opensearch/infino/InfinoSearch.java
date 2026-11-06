@@ -69,6 +69,7 @@ import java.io.UncheckedIOException;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -121,6 +122,8 @@ public final class InfinoSearch {
     private static final String MAPPING_FORMAT = "use_field_mapping";
     /** The format that prints a date as its epoch milliseconds. */
     private static final String EPOCH_MILLIS_FORMAT = "epoch_millis";
+    /** Digits of the engine's row id: its type is {@code DECIMAL(38, 0)}. */
+    private static final int ROW_ID_DIGITS = 38;
     /** The sort a scroll without one pages by: the document id, which {@link #columnFor} resolves to the id column. */
     private static final String ID_SORT_FIELD = "_id";
 
@@ -191,6 +194,18 @@ public final class InfinoSearch {
                 : "CASE WHEN " + InfinoQueryTranslator.quoteIdent(values.name()) + " IS NULL THEN " + InfinoQueryTranslator.quoteIdent(c.name())
                     + " ELSE " + pick + " END";
             return new SortSpec(expr, c.name(), InfinoScriptTranslator.typeOf(c.element()), desc);
+        }
+
+        /**
+         * The engine's row id, which orders the rows sharing every sort value
+         * of a request: the order they were written in, as stock orders them
+         * by their place in the index. The engine answers a sort broken this
+         * way from the first rows of each superfile's range index rather than
+         * every row tied with the page's last value. Its value is the id's
+         * digits ({@link #rowIdLiteral} reads it back).
+         */
+        static SortSpec rowId() {
+            return new SortSpec(InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID), InfinoSql.ROW_ID, SqlType.UNKNOWN, false);
         }
 
         /** The sort on {@code _seq_no}: the sequence column, a row written without a number at the one it reports. */
@@ -321,13 +336,12 @@ public final class InfinoSearch {
                 scriptFields.add(new ScriptedField(sf.fieldName(), sql.expr(), "sf" + scriptFields.size()));
             }
         }
-        // A sorted request orders by the id last, so rows sharing a sort value
-        // have one order and a page boundary falls between rows, never through
-        // a value: the id is the tiebreak search_after needs, and the hit's sort
-        // values carry it for the next page.
-        Column idColumn = cols.get(InfinoQueryTranslator.OSID);
-        if (!sorts.isEmpty() && idColumn != null && sorts.stream().noneMatch(s -> s.name().equals(InfinoQueryTranslator.OSID))) {
-            sorts.add(SortSpec.of(idColumn, false));
+        // A sorted request orders by the engine's row id last, so rows sharing
+        // a sort value have one order and a page boundary falls between rows,
+        // never through a value; a scroll's next page continues from it. A
+        // request sorted by the document id already has one order.
+        if (!sorts.isEmpty() && sorts.stream().noneMatch(s -> s.name().equals(InfinoQueryTranslator.OSID))) {
+            sorts.add(SortSpec.rowId());
         }
         Object[] searchAfter = source.searchAfter();
         if (searchAfter != null) {
@@ -564,6 +578,9 @@ public final class InfinoSearch {
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
         } else {
             rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+            if (sourcesById(plan) && wantsSource(source)) {
+                rows = withSources(plan.table(), rows, fetch);
+            }
         }
 
         boolean exact = trackTotal(source);
@@ -581,7 +598,7 @@ public final class InfinoSearch {
         }
 
         FetchSourceContext sourceFilter = sourceFilter(source.fetchSource());
-        boolean withSource = source.fetchSource() == null || source.fetchSource().fetchSource();
+        boolean withSource = returnsSource(source);
         List<FieldAndFormat> fields = requestedFields(source.docValueFields(), source.fetchFields());
         boolean version = Boolean.TRUE.equals(source.version());
         SearchShardTarget target = target(index);
@@ -680,10 +697,53 @@ public final class InfinoSearch {
     }
 
     /**
-     * The statement that fetches the page's hits: each hit's id, source,
-     * sort values, its sequence number when {@code withSeq} (the request
-     * asks for {@code seq_no_primary_term}) and, under a collapse, its
-     * collapse value. A sorted request
+     * Whether the page's sources are read by id once its rows are chosen,
+     * rather than in the hit statement: a sorted page without a collapse.
+     * The sort weighs every row the predicate keeps, and every row that ties
+     * on the first key competes on the next, so a source in the statement
+     * would be read for each of those rows to keep a page's worth.
+     */
+    static boolean sourcesById(Plan plan) {
+        return !plan.sorts().isEmpty() && plan.collapse() == null;
+    }
+
+    /** Whether a hit's response carries its source. */
+    private static boolean returnsSource(SearchSourceBuilder source) {
+        return source.fetchSource() == null || source.fetchSource().fetchSource();
+    }
+
+    /** Whether a hit needs its source: to return it, or to read requested fields from it. */
+    private static boolean wantsSource(SearchSourceBuilder source) {
+        return returnsSource(source) || !requestedFields(source.docValueFields(), source.fetchFields()).isEmpty();
+    }
+
+    /** {@code rows} up to {@code fetch}, each with its source from the table, looked up by its id. */
+    private static List<Map<String, Object>> withSources(String table, List<Map<String, Object>> rows, int fetch) {
+        List<Map<String, Object>> page = rows.subList(0, Math.min(rows.size(), fetch));
+        List<String> ids = new ArrayList<>(page.size());
+        for (Map<String, Object> row : page) {
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            if (id != null) {
+                ids.add(id.toString());
+            }
+        }
+        Map<String, String> sources = InfinoNative.sources(table, ids);
+        List<Map<String, Object>> out = new ArrayList<>(page.size());
+        for (Map<String, Object> row : page) {
+            Map<String, Object> withSource = new HashMap<>(row);
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            withSource.put(InfinoQueryTranslator.SOURCE, id == null ? null : sources.get(id.toString()));
+            out.add(withSource);
+        }
+        return out;
+    }
+
+    /**
+     * The statement that fetches the page's hits: each hit's id, its source
+     * unless {@link #sourcesById} reads it afterwards, sort values, its
+     * sequence number when {@code withSeq} (the request asks for
+     * {@code seq_no_primary_term}) and, under a collapse, its collapse value.
+     * A sorted request
      * orders the filtered relation; a text-ranked one orders the engine's
      * ranked candidates by score; anything else is a filtered scan. A
      * search_after narrows the relation to the rows past the given sort values
@@ -692,7 +752,10 @@ public final class InfinoSearch {
      */
     static String hitStatement(Plan plan, int fetch, boolean withSeq) {
         Translation q = plan.query();
-        StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE);
+        StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID);
+        if (!sourcesById(plan)) {
+            hit.append(", ").append(InfinoQueryTranslator.SOURCE);
+        }
         if (withSeq) {
             hit.append(", ").append(InfinoQueryTranslator.SEQ);
         }
@@ -766,7 +829,11 @@ public final class InfinoSearch {
                 strict = InfinoQueryTranslator.NONE;
                 same = col + " IS NULL";
             } else {
-                String lit = InfinoQueryTranslator.literalForType(s.type(), value, now);
+                // A date sort's value as text is read by its field's own format, as stock reads it.
+                Column sorted = plan.cols().get(s.name());
+                String lit = s.name().equals(InfinoSql.ROW_ID)
+                    ? rowIdLiteral(value)
+                    : InfinoQueryTranslator.literalForType(s.type(), value, now, sorted == null ? null : sorted.dateFormat());
                 if (lit == null) {
                     throw new IllegalArgumentException("[infino] search_after value [" + value + "] is not a " + s.type().name().toLowerCase(Locale.ROOT));
                 }
@@ -779,6 +846,19 @@ public final class InfinoSearch {
             equal.add(same);
         }
         return "(" + String.join(" OR ", alternatives) + ")";
+    }
+
+    /**
+     * The engine row id {@code value} (its digits, as a hit's sort values carry
+     * it) as a literal of the id's type, or null when it is not one: the
+     * digits as text cast, since an id is past what a SQL integer literal holds.
+     */
+    static String rowIdLiteral(Object value) {
+        String digits = value.toString();
+        if (digits.isEmpty() || digits.length() > ROW_ID_DIGITS || !digits.chars().allMatch(Character::isDigit)) {
+            return null;
+        }
+        return "CAST('" + digits + "' AS DECIMAL(" + ROW_ID_DIGITS + ", 0))";
     }
 
     /** Whether the request asks for the exact total (the default, and what dashboards send). */
@@ -1177,6 +1257,46 @@ public final class InfinoSearch {
             SearchResponse.Clusters.EMPTY
         );
         return new Searched(response, cursor);
+    }
+
+    /**
+     * How many sort values each hit hands the client: one per field or script
+     * sort its request names ({@code _score} and {@code _doc} give none here),
+     * as stock gives one per sort it names. What the plugin adds past them,
+     * the id it breaks ties on and a scroll's own order by the id, orders and
+     * resumes its pages and is not handed out.
+     */
+    static int requestedSortValues(SearchSourceBuilder source) {
+        if (source == null || source.sorts() == null) {
+            return 0;
+        }
+        int count = 0;
+        for (SortBuilder<?> sort : source.sorts()) {
+            if (!ordersNothing(sort)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * {@code response} with each hit's sort values cut to the {@code count}
+     * its request names ({@link #requestedSortValues}), as the client reads
+     * them: the values kept as formatted, the plugin's own after them gone.
+     */
+    static SearchResponse handOut(SearchResponse response, int count) {
+        if (response == null || response.getHits() == null) {
+            return response;
+        }
+        for (SearchHit h : response.getHits().getHits()) {
+            Object[] values = h.getSortValues();
+            if (values.length > count) {
+                DocValueFormat[] asFormatted = new DocValueFormat[count];
+                Arrays.fill(asFormatted, DocValueFormat.RAW);
+                h.sortValues(Arrays.copyOf(values, count), asFormatted);
+            }
+        }
+        return response;
     }
 
     /** The request with its page starting after {@code values}, the rest as it is. */

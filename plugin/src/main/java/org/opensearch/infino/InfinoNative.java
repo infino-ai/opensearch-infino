@@ -104,6 +104,8 @@ public final class InfinoNative {
     private static final String FORMAT = "format";
     /** The mapping types whose values are dates. */
     private static final Set<String> DATE_TYPES = Set.of("date", "date_nanos");
+    /** The type of a multi-field that holds its field's value whole, the exact form of a text field. */
+    private static final String KEYWORD_TYPE = "keyword";
     /** The count's key in {@link #valueCounts}'s rows, as the engine names it. */
     static final String VALUE_COUNT = "count(*)";
     /** How long a prefetched source waits for its fetch phase. */
@@ -151,7 +153,11 @@ public final class InfinoNative {
             return new Column(name, type, fts, vector, mask, dateFormat, elem);
         }
 
-        /** This column compared by its whole values, never through a text index: a keyword view of a text field. */
+        /**
+         * This column read by its whole value, as a keyword multi-field of its
+         * field reads it: no text index, so a term is the value, not one of its
+         * words.
+         */
         Column exact() {
             return fts ? new Column(name, type, false, vector, mask, dateFormat, elem) : this;
         }
@@ -470,13 +476,16 @@ public final class InfinoNative {
      * What a mapping declares beyond the columns: every field path, of any
      * type, a multi-field and an alias included ({@link #maps}); each field
      * alias's dotted path to the path it points at, since an alias has no
-     * column of its own and OpenSearch reads it as the field it names; and
-     * each date field's declared format.
+     * column of its own and OpenSearch reads it as the field it names; each
+     * keyword multi-field's dotted path to its field's, since the field's
+     * column holds the value the multi-field indexes whole (a log mapping's
+     * {@code request.raw} under the text field {@code request}, as a dynamic
+     * mapping's {@code name.keyword}); and each date field's declared format.
      */
-    record Mapping(Set<String> paths, Map<String, String> aliases, Map<String, String> dateFormats) {
+    record Mapping(Set<String> paths, Map<String, String> aliases, Map<String, String> keywordFields, Map<String, String> dateFormats) {
         @SuppressWarnings("unchecked")
         static Mapping of(String mappingJson) {
-            Mapping out = new Mapping(new HashSet<>(), new LinkedHashMap<>(), new LinkedHashMap<>());
+            Mapping out = new Mapping(new HashSet<>(), new LinkedHashMap<>(), new LinkedHashMap<>(), new LinkedHashMap<>());
             Object root = object(mappingJson);
             // The mapping as the cluster keeps it sits under its type name.
             while (root instanceof Map<?, ?> m && !m.containsKey(PROPERTIES) && m.size() == 1) {
@@ -504,8 +513,12 @@ public final class InfinoNative {
                     dateFormats.put(path, format);
                 }
                 if (field.get(MULTI_FIELDS) instanceof Map<?, ?> multi) {
-                    for (Object sub : multi.keySet()) {
-                        paths.add(path + "." + sub);
+                    for (Map.Entry<?, ?> sub : multi.entrySet()) {
+                        String subPath = path + "." + sub.getKey();
+                        paths.add(subPath);
+                        if (sub.getValue() instanceof Map<?, ?> subField && KEYWORD_TYPE.equals(subField.get(TYPE))) {
+                            keywordFields.put(subPath, path);
+                        }
                     }
                 }
                 if (field.get(PROPERTIES) instanceof Map<?, ?> inner) {
@@ -528,8 +541,9 @@ public final class InfinoNative {
 
     /**
      * Column name → description; empty if the table does not exist yet. A
-     * field alias is a name of its target's column, and a date column
-     * carries the format its mapping declares.
+     * field alias is a name of its target's column, as a keyword multi-field
+     * is of its string field's, and a date column carries the format its
+     * mapping declares.
      */
     public static Map<String, Column> columns(String name) {
         init();
@@ -562,6 +576,12 @@ public final class InfinoNative {
             Column target = out.get(alias.getValue());
             if (target != null) {
                 out.putIfAbsent(alias.getKey(), target);
+            }
+        }
+        for (Map.Entry<String, String> sub : (mapping == null ? Map.<String, String>of() : mapping.keywordFields()).entrySet()) {
+            Column field = out.get(sub.getValue());
+            if (field != null && field.isString()) {
+                out.putIfAbsent(sub.getKey(), field.exact());
             }
         }
         Map<String, Column> view = Collections.unmodifiableMap(out);
@@ -851,6 +871,23 @@ public final class InfinoNative {
             Object source = row.get(InfinoQueryTranslator.SOURCE);
             if (id != null && source != null) {
                 out.put(id.toString(), new Doc(source.toString(), seq(row.get(InfinoQueryTranslator.SEQ))));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * The sources of these ids, by id, each looked up through the id
+     * column's index: a page's worth costs what its ids do, whatever the
+     * table holds, where one statement over the ids would read the whole id
+     * column. An id the table does not hold is absent.
+     */
+    public static Map<String, String> sources(String name, Collection<String> osids) {
+        Map<String, String> out = new HashMap<>();
+        for (String id : osids) {
+            String source = getSourceFresh(name, id);
+            if (source != null && !source.isEmpty()) {
+                out.put(id, source);
             }
         }
         return out;
