@@ -868,6 +868,23 @@ public final class InfinoNative {
         return out;
     }
 
+    /**
+     * The sources of these ids, by id, each looked up through the id
+     * column's index: a page's worth costs what its ids do, whatever the
+     * table holds, where one statement over the ids would read the whole id
+     * column. An id the table does not hold is absent.
+     */
+    public static Map<String, String> sources(String name, Collection<String> osids) {
+        Map<String, String> out = new HashMap<>();
+        for (String id : osids) {
+            String source = getSourceFresh(name, id);
+            if (source != null && !source.isEmpty()) {
+                out.put(id, source);
+            }
+        }
+        return out;
+    }
+
     /** A sequence number as a row holds it: a row written without one reads as {@link InfinoDocumentVersion#UNTRACKED_SEQ_NO}. */
     static long seq(Object value) {
         return value instanceof Number n ? n.longValue() : InfinoDocumentVersion.UNTRACKED_SEQ_NO;
