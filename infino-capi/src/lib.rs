@@ -40,11 +40,13 @@ use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
-use datafusion::prelude::{col, lit};
+use datafusion::common::tree_node::TreeNode;
+use datafusion::common::DFSchema;
+use datafusion::prelude::{col, lit, Expr, SessionContext};
 use infino::arrow_array::{
     new_null_array, Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int64Array,
     LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
@@ -63,6 +65,9 @@ use rayon::prelude::*;
 const OSID: &str = "osid";
 /// The raw `_source` JSON of a row, served back by the fetch phase.
 const SOURCE: &str = "source";
+/// The engine's id of a row: the order rows were written in, which breaks
+/// the ties of a sorted page.
+const ROW_ID: &str = "_id";
 /// The routing value a row was written with, when it was written with one:
 /// what rebuilding a shard's documents from its table routes them by. The
 /// column appears with the first routed write.
@@ -661,6 +666,10 @@ struct MappedField {
     data_type: DataType,
     fts: bool,
     vector: Option<(usize, Metric)>,
+    /// A numeric or date field the mapping indexes, as OpenSearch indexes
+    /// every such field for ranges unless it says `"index": false`: the
+    /// table gives it a range index.
+    range: bool,
     /// How OpenSearch keeps the field's values, when at less than a
     /// double's precision.
     precision: Option<Precision>,
@@ -952,6 +961,21 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             format!("{prefix}.{name}")
         };
         let ty = def.get("type").and_then(|t| t.as_str());
+        let indexed = def.get("index").and_then(|i| i.as_bool()) != Some(false);
+        let ranged = matches!(
+            ty,
+            Some("date")
+                | Some("date_nanos")
+                | Some("long")
+                | Some("integer")
+                | Some("short")
+                | Some("byte")
+                | Some("unsigned_long")
+                | Some("double")
+                | Some("float")
+                | Some("half_float")
+                | Some("scaled_float")
+        );
         let (data_type, fts, vector) = match ty {
             Some("date") | Some("date_nanos") => (date_type(), false, None),
             Some("keyword")
@@ -1001,6 +1025,7 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             data_type,
             fts,
             vector,
+            range: ranged && indexed,
             precision: ty.and_then(|ty| Precision::of(ty, def)),
             date_formats,
         });
@@ -1104,9 +1129,13 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                     let patch = FieldPatch::named(f.path.clone())
                         .with_type(f.data_type.clone())
                         .with_nullable(true);
-                    match (&text_index, f.fts) {
-                        (Some(index), true) => patch.with_index(index.clone()),
-                        _ => patch,
+                    if f.range {
+                        patch.with_index(ColumnIndex::Range)
+                    } else {
+                        match (&text_index, f.fts) {
+                            (Some(index), true) => patch.with_index(index.clone()),
+                            _ => patch,
+                        }
                     }
                 })
                 .collect();
@@ -1150,6 +1179,9 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                 }
                 if let Some((dim, metric)) = f.vector {
                     spec = spec.vector(f.path.clone(), dim, metric);
+                }
+                if f.range {
+                    spec = spec.range(f.path.clone());
                 }
             }
             conn.create_table(name, Arc::new(Schema::new(fields)), spec)
@@ -1203,9 +1235,10 @@ fn type_name(dt: &DataType) -> &'static str {
     }
 }
 
-/// Columns of a table as JSON `[{"name","type","elem","fts","vector"}]`,
+/// Columns of a table as JSON `[{"name","type","elem","fts","vector","range"}]`,
 /// type in {i64,f64,bool,str,ts,vec,list,other}, `elem` a list column's
-/// element type (null for any other). `""` if the table is absent.
+/// element type (null for any other), `range` whether the column has a range
+/// index. `""` if the table is absent.
 #[no_mangle]
 pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
@@ -1231,6 +1264,7 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                             "elem": elem,
                             "fts": matches!(f.index, Some(ColumnIndex::Fts { .. })),
                             "vector": matches!(f.index, Some(ColumnIndex::Vector { .. })),
+                            "range": matches!(f.index, Some(ColumnIndex::Range)),
                         })
                     })
                     .collect();
@@ -2855,6 +2889,49 @@ pub unsafe extern "C" fn infino_bm25(
     .unwrap_or(ptr::null_mut())
 }
 
+/// The first `k` rows by one range-indexed column (`descending` non-zero for
+/// highest first), rows sharing a value in `_id` order and rows without one
+/// last, each carrying `osid`, the column, `_id` and, with `with_source`
+/// non-zero, `source`: a sorted page in one call, read from the range index,
+/// where the same page in SQL would plan a statement first.
+#[no_mangle]
+pub unsafe extern "C" fn infino_sorted(
+    h: *mut Bridge,
+    name: *const c_char,
+    column: *const c_char,
+    descending: c_int,
+    k: c_int,
+    with_source: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(column)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(column)
+            })
+        else {
+            return ptr::null_mut();
+        };
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let mut projection = vec![OSID, column, ROW_ID];
+        if with_source != 0 {
+            projection.push(SOURCE);
+        }
+        match table.sorted_search(
+            column,
+            descending != 0,
+            k.max(0) as usize,
+            Some(&projection),
+        ) {
+            Ok(b) => out_string(batches_to_json(&b)),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// Number of rows matching a token query on one text column (`mode` is
 /// `"and"` or `"or"`), without materializing them: the exact `hits.total`
 /// of a `match`.
@@ -2889,6 +2966,103 @@ pub unsafe extern "C" fn infino_count(
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// The rows each of `predicates` holds: a JSON array of SQL boolean
+/// expressions over the table's columns in, a JSON array of their counts out,
+/// in order, as `COUNT(*) FILTER (WHERE p)` gives each. The engine counts a
+/// range on a range-indexed column (or `1=1`, every row) from the range index
+/// with no statement, and runs one aggregate otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn infino_count_where(
+    h: *mut Bridge,
+    name: *const c_char,
+    predicates: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(predicates)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(predicates)
+            })
+        else {
+            return ptr::null_mut();
+        };
+        let predicates: Vec<String> = match serde_json::from_str(predicates) {
+            Ok(p) => p,
+            Err(e) => return err_json(&format!("predicates: {e}")),
+        };
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let schema = match DFSchema::try_from(table.schema().as_ref().clone()) {
+            Ok(s) => s,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        // A predicate over another relation (a subquery) is no expression of
+        // this table's columns alone, and the parser plans its subquery
+        // against its own context, not the table's: such counts run as one
+        // statement.
+        let Ok(exprs) = predicates
+            .iter()
+            .map(|p| predicate_parser().parse_sql_expr(p, &schema))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return count_where_by_sql(&conn.conn, name, &predicates);
+        };
+        if exprs.iter().any(holds_subquery) {
+            return count_where_by_sql(&conn.conn, name, &predicates);
+        }
+        match table.count_where(&exprs) {
+            Ok(counts) => out_string(json!(counts).to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Whether `expr` reads another relation: an `IN`, `EXISTS` or scalar
+/// subquery anywhere in it.
+fn holds_subquery(expr: &Expr) -> bool {
+    expr.exists(|e| {
+        Ok(matches!(
+            e,
+            Expr::InSubquery(_) | Expr::Exists(_) | Expr::ScalarSubquery(_)
+        ))
+    })
+    .unwrap_or(true)
+}
+
+/// [`infino_count_where`]'s counts as statements over table `name`, one
+/// `COUNT(*) ... WHERE p` per predicate: a FILTER clause cannot hold the
+/// subquery these predicates read.
+fn count_where_by_sql(conn: &Connection, name: &str, predicates: &[String]) -> *mut c_char {
+    let table = name.replace('"', "\"\"");
+    let mut counts = Vec::with_capacity(predicates.len());
+    for p in predicates {
+        let sql = format!("SELECT COUNT(*) AS c FROM \"{table}\" WHERE {p}");
+        let batches = match conn.query_sql(&sql) {
+            Ok(b) => b,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let count = batches
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .and_then(|row| row.column(0).as_any().downcast_ref::<Int64Array>())
+            .map(|c| c.value(0));
+        match count {
+            Some(count) => counts.push(count),
+            None => return err_json("count_where: a count came back as no Int64"),
+        }
+    }
+    out_string(json!(counts).to_string())
+}
+
+/// The context [`infino_count_where`] parses predicates with: one for the
+/// process, as building a context registers every function anew.
+fn predicate_parser() -> &'static SessionContext {
+    static PARSER: OnceLock<SessionContext> = OnceLock::new();
+    PARSER.get_or_init(SessionContext::new)
 }
 
 /// A column's rows counted per value: rows of the value (under the column's
@@ -3231,6 +3405,72 @@ mod tests {
         })
     }
 
+    fn sorted(h: *mut Bridge, column: &str, descending: bool, k: c_int) -> Value {
+        let out = take(unsafe {
+            infino_sorted(
+                h,
+                c("logs").as_ptr(),
+                c(column).as_ptr(),
+                c_int::from(descending),
+                k,
+                1,
+            )
+        });
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
+    /// A sorted page comes back in the column's order, ties in the order the
+    /// rows were written, each row with its id, value, engine id and source,
+    /// as the same sort in SQL orders them; the column metadata says the
+    /// column is range indexed.
+    #[test]
+    fn a_sorted_page_is_the_sql_sort_in_one_call() {
+        let h = open_logs();
+        let cols = columns(h);
+        let status = cols
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|cc| cc["name"] == "status")
+            .unwrap_or_else(|| panic!("{cols}"));
+        assert_eq!(status["range"], true, "{cols}");
+        let docs: Vec<(String, String)> = (0..40)
+            .map(|i| {
+                (
+                    format!("d{i}"),
+                    format!(r#"{{"status":{},"level":"x"}}"#, (i * 7) % 5),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let out = index(h, &refs);
+        assert_eq!(out["ok"], 40, "{out}");
+        for descending in [false, true] {
+            let page = sorted(h, "status", descending, 12);
+            let direction = if descending { "DESC" } else { "ASC" };
+            let want = sql(
+                h,
+                &format!("SELECT osid FROM logs ORDER BY status {direction}, _id ASC LIMIT 12"),
+            );
+            let ids = |rows: &Value| -> Vec<String> {
+                rows.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r[OSID].as_str().unwrap().to_string())
+                    .collect()
+            };
+            assert_eq!(ids(&page), ids(&want), "descending {descending}");
+            let first = &page[0];
+            assert!(
+                first[SOURCE].as_str().unwrap().contains("\"level\":\"x\""),
+                "{page}"
+            );
+            assert!(first[ROW_ID].is_string(), "{page}");
+            assert!(first["status"].is_number(), "{page}");
+        }
+        close(h);
+    }
+
     fn count(h: *mut Bridge, column: &str, query: &str) -> String {
         take(unsafe {
             infino_count(
@@ -3449,6 +3689,64 @@ mod tests {
     }
 
     #[test]
+    fn count_where_counts_each_predicate_as_a_filtered_count() {
+        let h = open_logs();
+        index(
+            h,
+            &[
+                ("a", r#"{"status":200,"took":1.5,"level":"info"}"#),
+                ("b", r#"{"status":404,"took":30.0,"level":"warn"}"#),
+                ("c", r#"{"status":500,"took":2.5,"level":"error"}"#),
+                ("d", r#"{"message":"no status"}"#),
+            ],
+        );
+        // Every row, ranges the index counts, and two shapes it leaves to the
+        // aggregate: a keyword column and an OR.
+        let predicates = [
+            "1=1",
+            r#"(1=1 AND ("status" >= 400))"#,
+            r#"("took") < 10"#,
+            r#""level" = 'info'"#,
+            r#""status" < 300 OR "took" > 20"#,
+        ];
+        let filtered: Vec<String> = predicates
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("COUNT(*) FILTER (WHERE {p}) AS c{i}"))
+            .collect();
+        let expected = sql(h, &format!("SELECT {} FROM logs", filtered.join(", ")));
+        let expected: Vec<u64> = (0..predicates.len())
+            .map(|i| expected[0][format!("c{i}")].as_u64().expect("a count"))
+            .collect();
+        let out = take(unsafe {
+            infino_count_where(
+                h,
+                c("logs").as_ptr(),
+                c(&json!(predicates).to_string()).as_ptr(),
+            )
+        });
+        let counts: Vec<u64> = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert_eq!(counts, expected);
+        assert_eq!(counts, [4, 2, 2, 1, 2]);
+        // A text clause joined by id, which reads the token index through a
+        // subquery, beside the whole table.
+        let joined = [
+            r#""osid" IN (SELECT "osid" FROM token_match('logs', 'message', 'status', 'or'))"#,
+            "1=1",
+        ];
+        let out = take(unsafe {
+            infino_count_where(
+                h,
+                c("logs").as_ptr(),
+                c(&json!(joined).to_string()).as_ptr(),
+            )
+        });
+        let counts: Vec<u64> = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert_eq!(counts, [1, 4]);
+        close(h);
+    }
+
+    #[test]
     fn mapping_declares_the_columns() {
         let h = open_logs();
         let cols = columns(h);
@@ -3479,6 +3777,27 @@ mod tests {
             .iter()
             .all(|cc| cc["vector"] == false));
         close(h);
+    }
+
+    #[test]
+    fn numeric_and_date_fields_get_a_range_index_unless_unindexed() {
+        let mapping = json!({"properties": {
+            "@timestamp": {"type": "date"},
+            "status": {"type": "integer"},
+            "took": {"type": "float"},
+            "bytes": {"type": "long", "index": false},
+            "level": {"type": "keyword"},
+            "message": {"type": "text"},
+            "ok": {"type": "boolean"},
+            "http": {"properties": {"code": {"type": "short"}}}
+        }});
+        let mut ranged: Vec<String> = mapped_fields(&mapping)
+            .into_iter()
+            .filter(|f| f.range)
+            .map(|f| f.path)
+            .collect();
+        ranged.sort();
+        assert_eq!(ranged, ["@timestamp", "http.code", "status", "took"]);
     }
 
     #[test]

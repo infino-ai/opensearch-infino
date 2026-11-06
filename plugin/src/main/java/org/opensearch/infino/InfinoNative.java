@@ -14,11 +14,14 @@ import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.json.JsonXContent;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 
 import java.io.IOException;
@@ -128,26 +131,41 @@ public final class InfinoNative {
      * masked for the user: how a value of the column is hashed before it
      * leaves the node (null when it is not). {@code dateFormat} is the format
      * a date column's mapping declares (null for the default one). {@code elem}
-     * is a list column's element type (null for any other column).
+     * is a list column's element type (null for any other column). {@code
+     * range} is whether the column has a range index, which serves a sort on it.
      */
-    public record Column(String name, String type, boolean fts, boolean vector, UnaryOperator<String> mask, String dateFormat, String elem) {
+    public record Column(
+        String name,
+        String type,
+        boolean fts,
+        boolean vector,
+        UnaryOperator<String> mask,
+        String dateFormat,
+        String elem,
+        boolean range
+    ) {
         public Column(String name, String type, boolean fts, boolean vector) {
-            this(name, type, fts, vector, null, null, null);
+            this(name, type, fts, vector, null, null, null, false);
         }
 
         /** A list column of {@code elem} values. */
         static Column list(String name, String elem) {
-            return new Column(name, "list", false, false, null, null, elem);
+            return new Column(name, "list", false, false, null, null, elem, false);
         }
 
         /** This column as the request sees it, its values masked by {@code mask}. */
         Column masked(UnaryOperator<String> mask) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, range);
         }
 
         /** This column with the date format its mapping declares. */
         Column dated(String dateFormat) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, range);
+        }
+
+        /** This column with a range index. */
+        Column ranged() {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, true);
         }
 
         /**
@@ -156,12 +174,12 @@ public final class InfinoNative {
          * words.
          */
         Column exact() {
-            return new Column(name, type, false, vector, mask, dateFormat, elem);
+            return new Column(name, type, false, vector, mask, dateFormat, elem, range);
         }
 
         /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */
         Column element() {
-            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null) : this;
+            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null, false) : this;
         }
 
         public boolean isList() {
@@ -558,7 +576,8 @@ public final class InfinoNative {
                 Boolean.TRUE.equals(c.get("vector")),
                 null,
                 null,
-                (String) c.get("elem")
+                (String) c.get("elem"),
+                Boolean.TRUE.equals(c.get("range"))
             );
             // A list column of a mapped field reads its dates as the field's do.
             String format = mapping == null ? null : mapping.dateFormats().get(InfinoQueryTranslator.fieldOf(column));
@@ -956,10 +975,59 @@ public final class InfinoNative {
         return rows(out);
     }
 
+    /**
+     * The first {@code k} rows of table {@code n} by range-indexed column
+     * {@code c}, highest first when {@code descending}, rows sharing a value
+     * in the engine's row id order: each with its id, the column's value, the
+     * row id and, when {@code withSource}, its source. A sorted page in one
+     * engine call, read from the range index, with no statement to plan.
+     */
+    public static List<Map<String, Object>> sortedHits(String n, String c, boolean descending, int k, boolean withSource) {
+        init();
+        String out = takeOrThrow(lib.infino_sorted(conn, n, c, descending ? 1 : 0, k, withSource ? 1 : 0));
+        log.debug("[infino] sorted: {} {} desc={} k={} -> {} chars", n, c, descending, k, out.length());
+        return rows(out);
+    }
+
     /** Count of rows matching a full-text query ({@code mode} "and" / "or"), without materializing them. */
     public static long count(String n, String c, String q, String mode) {
         init();
         return Long.parseLong(takeOrThrow(lib.infino_count(conn, n, c, q, mode)).trim());
+    }
+
+    /**
+     * The rows each of {@code predicates} (SQL conditions over the table's
+     * columns) holds, in order, as {@code COUNT(*) FILTER (WHERE p)} counts
+     * each. The engine counts a range on a range-indexed column, or every row,
+     * from its range index with no statement, and runs one aggregate otherwise.
+     */
+    public static long[] countWhere(String n, List<String> predicates) {
+        init();
+        String out = takeOrThrow(lib.infino_count_where(conn, n, jsonArray(predicates)));
+        try (XContentParser parser = parser(out)) {
+            List<Object> list = parser.list();
+            long[] counts = new long[list.size()];
+            for (int i = 0; i < counts.length; i++) {
+                counts[i] = ((Number) list.get(i)).longValue();
+            }
+            return counts;
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** {@code values} as a JSON array of strings. */
+    private static String jsonArray(List<String> values) {
+        try (XContentBuilder b = XContentFactory.jsonBuilder()) {
+            b.startArray();
+            for (String v : values) {
+                b.value(v);
+            }
+            b.endArray();
+            return BytesReference.bytes(b).utf8ToString();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /**
