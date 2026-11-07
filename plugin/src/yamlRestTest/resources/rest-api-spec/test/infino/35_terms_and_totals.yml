@@ -118,6 +118,46 @@
   - match: { aggregations.tags.buckets.1.key: z }
   - match: { aggregations.tags.buckets.4.key: b }
 
+  # An order by an average (sum over count): z 7.0, é 6.0, Z 5.0, then a 3.5
+  # and b 2.0 past the size, as a dashboard's "top hosts by average CPU" asks.
+  - do:
+      search:
+        index: tt
+        body:
+          size: 0
+          aggs:
+            tags:
+              terms: { field: tag, size: 3, order: { avg_price: desc } }
+              aggs:
+                avg_price: { avg: { field: price } }
+  - length: { aggregations.tags.buckets: 3 }
+  - match: { aggregations.tags.buckets.0.key: z }
+  - match: { aggregations.tags.buckets.0.avg_price.value: 7.0 }
+  - match: { aggregations.tags.buckets.1.key: "é" }
+  - match: { aggregations.tags.buckets.2.key: Z }
+  - match: { aggregations.tags.sum_other_doc_count: 4 }
+
+  # ... ascending, and nested under a parent bucket: within n = 3, Z (5.0)
+  # before é (6.0).
+  - do:
+      search:
+        index: tt
+        body:
+          size: 0
+          aggs:
+            ns:
+              terms: { field: n, order: { _key: asc } }
+              aggs:
+                tags:
+                  terms: { field: tag, order: { avg_price: asc } }
+                  aggs:
+                    avg_price: { avg: { field: price } }
+  - match: { aggregations.ns.buckets.2.key: 3 }
+  - match: { aggregations.ns.buckets.2.tags.buckets.0.key: Z }
+  - match: { aggregations.ns.buckets.2.tags.buckets.1.key: "é" }
+  - match: { aggregations.ns.buckets.0.tags.buckets.0.key: b }
+  - match: { aggregations.ns.buckets.0.tags.buckets.0.avg_price.value: 2.0 }
+
   # The exact total of a request with no hits to fetch comes beside the metrics.
   - do:
       search:
