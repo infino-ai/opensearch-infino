@@ -442,6 +442,10 @@ pub struct Bridge {
     /// (`infino_ensure_table`, which the plugin calls before a node first
     /// writes to an index and whenever its mapping moves).
     kept: RwLock<HashMap<String, Arc<HashMap<String, Kept>>>>,
+    /// The field each document of a table backing a data stream must hold
+    /// one value at, from the mapping's `_data_stream_timestamp` (set with
+    /// [`Bridge::kept`]).
+    stamps: RwLock<HashMap<String, Arc<str>>>,
 }
 
 impl Bridge {
@@ -464,6 +468,24 @@ impl Bridge {
             .collect();
         if let Ok(mut all) = self.kept.write() {
             all.insert(name.to_string(), Arc::new(kept));
+        }
+    }
+
+    /// The timestamp field of the data stream `name` backs, if it backs one.
+    fn stamp(&self, name: &str) -> Option<Arc<str>> {
+        self.stamps
+            .read()
+            .ok()
+            .and_then(|all| all.get(name).cloned())
+    }
+
+    /// Record the timestamp field `mapping` requires for `name`, or none.
+    fn stamp_rule(&self, name: &str, mapping: &Value) {
+        if let Ok(mut all) = self.stamps.write() {
+            match stream_timestamp(mapping) {
+                Some(field) => all.insert(name.to_string(), field.into()),
+                None => all.remove(name),
+            };
         }
     }
 
@@ -565,6 +587,7 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
         tables: RwLock::new(HashMap::new()),
         hosted,
         kept: RwLock::new(HashMap::new()),
+        stamps: RwLock::new(HashMap::new()),
     })
 }
 
@@ -957,6 +980,37 @@ fn keep(value: Value, precision: Option<Precision>) -> Result<Value, String> {
 
 /// The `properties` object of a mapping, whether the caller passed the
 /// mapping source itself, a `{"_doc": {...}}` wrapper, or `{"properties": ...}`.
+/// The mapping meta-field that makes an index back a data stream.
+const STREAM_TIMESTAMP: &str = "_data_stream_timestamp";
+/// The timestamp field a data stream names when its mapping names none.
+const DEFAULT_STREAM_TIMESTAMP: &str = "@timestamp";
+
+/// The field a data stream's documents must hold one value at, when
+/// `mapping` enables [`STREAM_TIMESTAMP`]; read wherever [`properties_of`]
+/// reads the properties.
+fn stream_timestamp(mapping: &Value) -> Option<String> {
+    let m = mapping.as_object()?;
+    if let Some(meta) = m.get(STREAM_TIMESTAMP) {
+        if meta.get("enabled") != Some(&Value::Bool(true)) {
+            return None;
+        }
+        let field = meta
+            .pointer("/timestamp_field/name")
+            .and_then(Value::as_str);
+        return Some(field.unwrap_or(DEFAULT_STREAM_TIMESTAMP).to_string());
+    }
+    ["_doc", "mappings"]
+        .iter()
+        .find_map(|k| m.get(*k))
+        .and_then(stream_timestamp)
+}
+
+/// Stock's refusal of a data-stream document without one timestamp; the
+/// plugin answers a reason that starts so as stock's parse failure.
+fn no_timestamp(field: &str) -> String {
+    format!("documents must contain a single-valued timestamp field '{field}' of date type")
+}
+
 fn properties_of(mapping: &Value) -> Option<&Map<String, Value>> {
     let m = mapping.as_object()?;
     if let Some(p) = m.get("properties").and_then(|p| p.as_object()) {
@@ -1093,6 +1147,7 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
     // source, not given a column of its own.
     mapped.retain(|f| !matches!(f.path.as_str(), OSID | SOURCE | SEQ));
     bridge.keep_rules(name, &mapped);
+    bridge.stamp_rule(name, mapping);
     let conn = &bridge.conn;
     // The cached handle, if any, predates whatever this changes.
     bridge.forget(name);
@@ -1640,10 +1695,13 @@ pub unsafe extern "C" fn infino_check_doc(
             Err(e) => return out_string(e.to_string()),
         };
         let schema = table.schema();
-        out_string(match conform_doc(source, &schema, &conn.kept(name)) {
-            Ok(_) => String::new(),
-            Err(why) => why,
-        })
+        let stamp = conn.stamp(name);
+        out_string(
+            match conform_doc(source, &schema, &conn.kept(name), stamp.as_deref()) {
+                Ok(_) => String::new(),
+                Err(why) => why,
+            },
+        )
     }))
     .unwrap_or(ptr::null_mut())
 }
@@ -1654,11 +1712,13 @@ pub unsafe extern "C" fn infino_check_doc(
 /// value conformed as the field's own would be; one value in an array is
 /// that value, as OpenSearch reads it. A field `kept` names holds each value
 /// as OpenSearch keeps it ([`Kept`]): a float at its precision, a date read
-/// by its own format.
+/// by its own format. With `stamp`, the document must hold exactly one
+/// non-null value at that field, as a data stream's documents must.
 fn conform_doc(
     source: &str,
     schema: &Schema,
     kept: &HashMap<String, Kept>,
+    stamp: Option<&str>,
 ) -> Result<Map<String, Value>, String> {
     let doc: Value = serde_json::from_str(source).map_err(|e| format!("malformed JSON: {e}"))?;
     let obj = doc
@@ -1666,6 +1726,16 @@ fn conform_doc(
         .ok_or_else(|| "the document is not an object".to_string())?;
     let mut flat = Map::new();
     flatten(obj, "", &mut flat);
+    if let Some(field) = stamp {
+        let values = match flat.get(field) {
+            None | Some(Value::Null) => 0,
+            Some(Value::Array(items)) => items.iter().filter(|v| !v.is_null()).count(),
+            Some(_) => 1,
+        };
+        if values != 1 {
+            return Err(no_timestamp(field));
+        }
+    }
     let mut lists: Vec<(String, Value)> = Vec::new();
     for (path, value) in flat.iter_mut() {
         let Ok(field) = schema.field_with_name(path) else {
@@ -1820,13 +1890,14 @@ pub unsafe extern "C" fn infino_index_batch(
         };
         let schema = table.schema();
         let kept = conn.kept(name);
+        let stamp = conn.stamp(name);
 
         let mut failed: Vec<Value> = Vec::new();
         let mut rows: Vec<(usize, Map<String, Value>)> = Vec::with_capacity(n);
         for i in 0..n {
             let osid = unsafe { cstr(os_p[i]) }.unwrap_or("");
             let source = unsafe { cstr(sr_p[i]) }.unwrap_or("{}");
-            let mut flat = match conform_doc(source, &schema, &kept) {
+            let mut flat = match conform_doc(source, &schema, &kept, stamp.as_deref()) {
                 Ok(flat) => flat,
                 Err(why) => {
                     failed.push(json!({ "i": i, "reason": why }));
@@ -1970,6 +2041,7 @@ unsafe fn prepare(
     let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
     let schema = table.schema();
     let kept = conn.kept(name);
+    let stamp = conn.stamp(name);
 
     // Each row's id, source and routing value as borrowed slices of the
     // buffer, with its stamp and operation.
@@ -1997,7 +2069,7 @@ unsafe fn prepare(
     let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
         .par_iter()
         .map(|(id, src, routing, seq, op)| {
-            conform_doc(src, &schema, &kept).map(|mut flat| {
+            conform_doc(src, &schema, &kept, stamp.as_deref()).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 flat.insert(SOURCE.into(), Value::String((*src).to_string()));
                 if !routing.is_empty() {
@@ -4138,7 +4210,8 @@ mod tests {
                 let mut rows: Vec<Map<String, Value>> = docs
                     .iter()
                     .map(|(id, src)| {
-                        let mut flat = conform_doc(src, &schema, &conn.kept("bench")).unwrap();
+                        let mut flat =
+                            conform_doc(src, &schema, &conn.kept("bench"), None).unwrap();
                         flat.insert(OSID.into(), Value::String(id.clone()));
                         flat.insert(SOURCE.into(), Value::String(src.clone()));
                         flat
@@ -5045,5 +5118,34 @@ mod tests {
             json!("a b c 7")
         );
         assert!(conform(json!(["a", [{"b": 1}]]), &DataType::LargeUtf8).is_err());
+    }
+
+    /// A data stream's documents hold exactly one value at its timestamp
+    /// field, named by the mapping however it is wrapped.
+    #[test]
+    fn a_stream_document_without_one_timestamp_is_refused() {
+        let enabled = json!({"_data_stream_timestamp": {"enabled": true}});
+        assert_eq!(stream_timestamp(&enabled).as_deref(), Some("@timestamp"));
+        let named = json!({"_doc": {"_data_stream_timestamp": {"enabled": true, "timestamp_field": {"name": "at"}}}});
+        assert_eq!(stream_timestamp(&named).as_deref(), Some("at"));
+        assert_eq!(
+            stream_timestamp(&json!({"_data_stream_timestamp": {"enabled": false}})),
+            None
+        );
+        assert_eq!(stream_timestamp(&json!({"properties": {}})), None);
+
+        let schema = Schema::new(vec![Field::new("message", DataType::LargeUtf8, true)]);
+        let kept = HashMap::new();
+        let check = |doc: &str| conform_doc(doc, &schema, &kept, Some("@timestamp"));
+        assert!(check(r#"{"@timestamp": "2023-01-01T00:00:01Z"}"#).is_ok());
+        assert!(check(r#"{"@timestamp": ["2023-01-01T00:00:01Z", null]}"#).is_ok());
+        for doc in [
+            r#"{"message": "m"}"#,
+            r#"{"@timestamp": null}"#,
+            r#"{"@timestamp": ["2023-01-01T00:00:01Z", "2023-01-01T00:00:02Z"]}"#,
+        ] {
+            assert_eq!(check(doc), Err(no_timestamp("@timestamp")), "{doc}");
+        }
+        assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, None).is_ok());
     }
 }
