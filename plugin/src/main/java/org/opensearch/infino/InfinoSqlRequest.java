@@ -67,6 +67,12 @@ public final class InfinoSqlRequest extends ActionRequest implements IndicesRequ
         return OPTIONS;
     }
 
+    /** A data stream resolves to its backing indices, as for a search. */
+    @Override
+    public boolean includeDataStreams() {
+        return true;
+    }
+
     @Override
     public ActionRequestValidationException validate() {
         ActionRequestValidationException e = null;

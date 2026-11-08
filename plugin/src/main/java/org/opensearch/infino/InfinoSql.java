@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexAbstraction;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.common.settings.Settings;
@@ -95,8 +96,8 @@ final class InfinoSql {
     /**
      * How a name in a statement resolves, as a search resolves its indices:
      * a pattern to the open indices it matches (not the hidden ones), an
-     * alias to every index it points at, a name that is none of these
-     * refused.
+     * alias to every index it points at, a data stream to its backing
+     * indices, a name that is none of these refused.
      */
     static final IndicesOptions OPTIONS = IndicesOptions.strictExpandOpenAndForbidClosed();
     /** What a refusal calls the request. */
@@ -180,7 +181,7 @@ final class InfinoSql {
         // statement reads no other, whatever a caller put in the request.
         Set<String> authorized = new LinkedHashSet<>();
         for (String expression : request.indices()) {
-            authorized.addAll(Arrays.asList(resolver.concreteIndexNames(state, OPTIONS, expression)));
+            authorized.addAll(Arrays.asList(resolver.concreteIndexNames(state, OPTIONS, true, expression)));
         }
         long now = System.currentTimeMillis();
         Map<String, String> views = new LinkedHashMap<>();
@@ -198,7 +199,7 @@ final class InfinoSql {
         for (String name : named) {
             List<Part> parts = new ArrayList<>();
             boolean readWhole = true;
-            String[] concrete = resolver.concreteIndexNames(state, OPTIONS, name);
+            String[] concrete = resolver.concreteIndexNames(state, OPTIONS, true, name);
             for (String index : concrete) {
                 if (!authorized.contains(index)) {
                     continue; // as a search over a pattern reads only the indices it may
@@ -298,13 +299,19 @@ final class InfinoSql {
         }
     }
 
-    /** {@code index}, which {@code name} resolved to, when SQL reads it: Infino-backed, and not a system index. */
+    /**
+     * {@code index}, which {@code name} resolved to, when SQL reads it:
+     * Infino-backed, and not a system index. A name starting with {@code .}
+     * counts as one, except a data stream's backing index.
+     */
     private static IndexMetadata infinoIndex(ClusterState state, String name, String index) {
         IndexMetadata md = state.metadata().index(index);
         if (md == null) {
             throw new IndexNotFoundException(index);
         }
-        if (md.isSystem() || index.startsWith(".")) {
+        IndexAbstraction found = state.metadata().getIndicesLookup().get(index);
+        boolean backing = found != null && found.getParentDataStream() != null;
+        if (md.isSystem() || (index.startsWith(".") && !backing)) {
             throw InfinoAccess.refused("[" + index + "] is a system index, which SQL does not read");
         }
         if (!md.getSettings().getAsBoolean(InfinoPlugin.INFINO_ENABLED.getKey(), false)) {
