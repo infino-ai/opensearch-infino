@@ -41,6 +41,18 @@ curl localhost:9200/logs/_search -H 'Content-Type: application/json' -d '{
 
 Every index the cluster creates is backed by Infino, so the index above needs no setting of its own.
 
+### In Docker
+
+Docker builds the bridge and the plugin inside the image, so you need neither Rust nor a JDK. Copy `env.example` to `.env` and fill it in before the first start:
+
+```bash
+cp env.example .env           # set OPENSEARCH_ADMIN_PASSWORD, and INFINO_API_KEY for an Infino Cloud account
+docker compose up --build
+curl -sk -u "admin:<password>" https://localhost:9200/_plugins/_infino/account
+```
+
+`INFINO_STORAGE` in `.env` picks where the tables live: `cloud` (the default, an [Infino account](#hosted-account-and-stateless-nodes)), `local` (a Docker volume, or a bucket named by `INFINO_URI`) or `memory`. `OPENSEARCH_VERSION` picks the release; `env.example` lists every option. The node serves HTTPS with the security plugin's demo certificates, hence `-k`. `docker compose --profile dashboards up` adds Dashboards on port 5601.
+
 ## How it works
 
 The plugin has two parts: a Java plugin (`plugin/`) and a native bridge (`infino-capi/`) over the [`infino`](https://crates.io/crates/infino) crate, which it calls through JNA. Each index is backed by a table, which the bridge declares from the index's mapping:

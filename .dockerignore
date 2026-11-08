@@ -1,0 +1,7 @@
+.git
+data/
+infino-capi/target/
+plugin/build/
+plugin/.gradle/
+bench/*.out
+.env
