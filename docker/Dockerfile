@@ -3,7 +3,7 @@
 # OpenSearch with the Infino engine plugin, built from this checkout.
 #
 #   docker compose build                                   # see docker-compose.yml
-#   docker build --build-arg OPENSEARCH_VERSION=3.6.0 .    # any supported release
+#   docker build -f docker/Dockerfile --build-arg OPENSEARCH_VERSION=3.6.0 .   # any supported release
 #
 # The plugin zip installs only into the release it was built for, so one
 # OPENSEARCH_VERSION drives the base image, the Gradle build and the install.

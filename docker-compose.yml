@@ -13,6 +13,7 @@ services:
   opensearch:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       args:
         OPENSEARCH_VERSION: ${OPENSEARCH_VERSION:-3.9.0}
         GRADLE_IMAGE: ${GRADLE_IMAGE:-gradle:9-jdk21}
