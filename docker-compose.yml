@@ -5,7 +5,8 @@
 #   curl -sk -u "admin:$OPENSEARCH_ADMIN_PASSWORD" https://localhost:9200/_plugins/_infino/account
 #
 # Storage: INFINO_STORAGE=cloud (default, Infino Cloud account) or local
-# (tables on the infino-data volume). Dashboards: docker compose --profile dashboards up
+# (tables on the infino-data volume). To change storage, run
+# `docker compose down -v` first. Dashboards: docker compose --profile dashboards up
 
 name: opensearch-infino
 
@@ -18,6 +19,7 @@ services:
         OPENSEARCH_VERSION: ${OPENSEARCH_VERSION:-3.9.0}
         GRADLE_IMAGE: ${GRADLE_IMAGE:-gradle:9-jdk21}
         REMOVE_NEURAL_SEARCH: ${REMOVE_NEURAL_SEARCH:-true}
+        RUST_TOOLCHAIN: ${RUST_TOOLCHAIN:-1.95.0}
     image: opensearch-infino:${OPENSEARCH_VERSION:-3.9.0}
     container_name: opensearch-infino
     environment:
@@ -65,7 +67,7 @@ services:
 
   dashboards:
     profiles: [dashboards]
-    image: opensearchproject/opensearch-dashboards:${OPENSEARCH_VERSION:-3.9.0}
+    image: opensearchproject/opensearch-dashboards:${DASHBOARDS_VERSION:-${OPENSEARCH_VERSION:-3.9.0}}
     container_name: opensearch-infino-dashboards
     environment:
       OPENSEARCH_HOSTS: '["https://opensearch:9200"]'

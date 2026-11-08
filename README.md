@@ -28,6 +28,8 @@ curl -sk -u "admin:<password>" https://localhost:9200/_plugins/_infino/account
 
 `INFINO_STORAGE` in `.env` picks where the tables live: `cloud` (the default, an [Infino account](#hosted-account-and-stateless-nodes)), `local` (a Docker volume, or a bucket named by `INFINO_URI`) or `memory`. `OPENSEARCH_VERSION` picks the release; `env.example` lists every option. The node serves HTTPS with the security plugin's demo certificates, hence `-k`. `docker compose --profile dashboards up` adds Dashboards on port 5601.
 
+The node's data volume belongs to the storage it was first started with, so to change `INFINO_STORAGE` (or the account, database or URI), run `docker compose down -v` first. This deletes the local volumes, including tables kept on `infino-data`. Use it between `memory` runs too.
+
 ### b) Local build
 
 You need a Rust toolchain, a JDK 21, Gradle, and an OpenSearch 3.9.0 distribution to run it in.

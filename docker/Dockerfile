@@ -7,22 +7,27 @@
 #
 # The plugin zip installs only into the release it was built for, so one
 # OPENSEARCH_VERSION drives the base image, the Gradle build and the install.
-# Supported releases: 2.19.6, 3.0.0, 3.3.2, 3.6.0, 3.9.0. Each wants its own
-# Gradle (README "Build and test"): set GRADLE_IMAGE to match.
+# The plugin supports 2.19.6, 3.0.0, 3.3.2, 3.6.0 and 3.9.0; env.example says
+# which of them this image has been tested on. Each wants its own Gradle
+# (README "Build and test"): set GRADLE_IMAGE to match.
 #   2.19.x -> gradle:8.12.1-jdk21    3.0.x -> gradle:8.14-jdk21    3.3+ -> gradle:9-jdk21
 
 ARG OPENSEARCH_VERSION=3.9.0
 ARG GRADLE_IMAGE=gradle:9-jdk21
+# The engine's toolchain (the infino crate's rust-version), pinned so the
+# native build is reproducible.
+ARG RUST_TOOLCHAIN=1.95.0
 
 # --- Native bridge (Rust cdylib) -------------------------------------------
 # Built on the OpenSearch image itself so the .so links against exactly the
 # glibc it will run on.
 FROM opensearchproject/opensearch:${OPENSEARCH_VERSION} AS native
+ARG RUST_TOOLCHAIN
 USER root
 RUN yum install -y gcc gcc-c++ make tar gzip && yum clean all
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+      | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN} --no-modify-path
 WORKDIR /src/infino-capi
 COPY infino-capi/ ./
 RUN --mount=type=cache,target=/opt/cargo/registry \
