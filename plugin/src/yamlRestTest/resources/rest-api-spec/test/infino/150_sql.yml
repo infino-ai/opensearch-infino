@@ -564,6 +564,7 @@
           - { "@timestamp": "2023-01-01T00:00:01Z", n: 1 }
           - create: { _index: sql-ds-logs }
           - { "@timestamp": "2023-01-01T00:00:02Z", n: 2 }
+  - match: { items.0.create._index: .ds-sql-ds-logs-000001 }
   - do:
       indices.rollover:
         alias: sql-ds-logs
@@ -586,3 +587,9 @@
       infino.sql:
         body: { query: "SELECT count(*) AS c FROM \"sql-ds-*\"" }
   - match: { rows.0.c: 3 }
+  # A backing index named directly reads its own rows, as a search does.
+  - do:
+      infino.sql:
+        body: { query: "SELECT count(*) AS c, sum(n) AS total FROM \".ds-sql-ds-logs-000001\"" }
+  - match: { rows.0.c: 2 }
+  - match: { rows.0.total: 3 }
