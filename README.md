@@ -11,6 +11,25 @@ An OpenSearch plugin that stores your indices in Infino tables instead of Lucene
 
 ## Quick start
 
+There are two ways to run a node with the plugin:
+
+- **a) Docker Compose:** builds the plugin and runs OpenSearch in a container. You need only Docker.
+- **b) Local build:** builds the plugin on your machine and installs it into an OpenSearch distribution you've downloaded.
+
+### a) Docker Compose
+
+Docker builds the bridge and the plugin inside the image, so you need neither Rust nor a JDK. Copy `env.example` to `.env` and fill it in before the first start:
+
+```bash
+cp env.example .env           # set OPENSEARCH_ADMIN_PASSWORD, and INFINO_API_KEY for an Infino Cloud account
+docker compose up --build
+curl -sk -u "admin:<password>" https://localhost:9200/_plugins/_infino/account
+```
+
+`INFINO_STORAGE` in `.env` picks where the tables live: `cloud` (the default, an [Infino account](#hosted-account-and-stateless-nodes)), `local` (a Docker volume, or a bucket named by `INFINO_URI`) or `memory`. `OPENSEARCH_VERSION` picks the release; `env.example` lists every option. The node serves HTTPS with the security plugin's demo certificates, hence `-k`. `docker compose --profile dashboards up` adds Dashboards on port 5601.
+
+### b) Local build
+
 You need a Rust toolchain, a JDK 21, Gradle, and an OpenSearch 3.9.0 distribution to run it in.
 
 ```bash
@@ -20,7 +39,9 @@ DISTRO=/path/to/opensearch-3.9.0 ./scripts/run.sh       # install the plugin and
 
 `run.sh` keeps the tables in `data/` at the repository's root. Set `INFINO_URI=s3://bucket/prefix` (or `gs://`, `az://`) to keep them in a bucket instead.
 
-Create an index, write a document and search it:
+### Try it
+
+Create an index, write a document and search it. On the Docker node, use `https://` and add `-k -u "admin:<password>"` to each command.
 
 ```bash
 curl -XPUT localhost:9200/logs -H 'Content-Type: application/json' -d '{
@@ -40,18 +61,6 @@ curl localhost:9200/logs/_search -H 'Content-Type: application/json' -d '{
 ```
 
 Every index the cluster creates is backed by Infino, so the index above needs no setting of its own.
-
-### In Docker
-
-Docker builds the bridge and the plugin inside the image, so you need neither Rust nor a JDK. Copy `env.example` to `.env` and fill it in before the first start:
-
-```bash
-cp env.example .env           # set OPENSEARCH_ADMIN_PASSWORD, and INFINO_API_KEY for an Infino Cloud account
-docker compose up --build
-curl -sk -u "admin:<password>" https://localhost:9200/_plugins/_infino/account
-```
-
-`INFINO_STORAGE` in `.env` picks where the tables live: `cloud` (the default, an [Infino account](#hosted-account-and-stateless-nodes)), `local` (a Docker volume, or a bucket named by `INFINO_URI`) or `memory`. `OPENSEARCH_VERSION` picks the release; `env.example` lists every option. The node serves HTTPS with the security plugin's demo certificates, hence `-k`. `docker compose --profile dashboards up` adds Dashboards on port 5601.
 
 ## How it works
 
