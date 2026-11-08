@@ -27,6 +27,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateObserver;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataIndexTemplateService;
 import org.opensearch.cluster.node.DiscoveryNode;
@@ -40,6 +41,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.bytes.BytesArray;
@@ -52,6 +54,8 @@ import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.engine.DocumentMissingException;
+import org.opensearch.index.mapper.DataStreamFieldMapper;
+import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.infino.InfinoWriter.Outcome;
 import org.opensearch.infino.InfinoWriter.Waiter;
@@ -71,6 +75,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
@@ -777,16 +782,20 @@ public class InfinoBulkActionFilter implements ActionFilter {
 
     /**
      * The concrete index each item writes to, by slot: the name it gives, or
-     * for an alias the alias's write index, as the stock path resolves it.
-     * An alias that resolves to no single write index keeps its name, so the
-     * stock path reports it.
+     * for an alias or a data stream its write index, as the stock path
+     * resolves it. A name that resolves to no single write index keeps its
+     * name, so the stock path reports it; so does a write stock refuses on
+     * a data stream (any op but {@code create}, or a custom routing).
      */
     static List<String> concreteIndices(ClusterState state, BulkRequest bulk) {
         IndexNameExpressionResolver resolver = InfinoServices.indexNameExpressionResolver();
         List<String> out = new ArrayList<>(bulk.requests().size());
         for (DocWriteRequest<?> item : bulk.requests()) {
             String name = item.index();
-            if (resolver != null && name != null && state.metadata().hasAlias(name)) {
+            boolean appendToStream = item.opType() == DocWriteRequest.OpType.CREATE
+                && item.routing() == null
+                && state.metadata().dataStreams().containsKey(name);
+            if (resolver != null && name != null && (state.metadata().hasAlias(name) || appendToStream)) {
                 try {
                     name = resolver.concreteWriteIndex(state, item).getName();
                 } catch (Exception e) {
@@ -901,7 +910,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 IndexMetadata md = infino.values().iterator().next();
                 String table = tables.ensure(md);
                 ShardId shardId = new ShardId(md.getIndex(), 0);
-                Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(shardId, bulk.requests(), answered), items, start, listener);
+                Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(shardId, streamTimestamp(md), bulk.requests(), answered), items, start, listener);
                 writes.submit(table, waiter);
                 return;
             }
@@ -924,7 +933,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 try {
                     String table = tables.ensure(md);
                     ShardId shardId = new ShardId(md.getIndex(), 0);
-                    Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(shardId, requests, partAnswered), part, start, partListener);
+                    Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(shardId, streamTimestamp(md), requests, partAnswered), part, start, partListener);
                     writes.submit(table, waiter);
                 } catch (Exception e) {
                     log.warn("[infino] bulk items for {} failed", group.getKey(), e);
@@ -949,9 +958,11 @@ public class InfinoBulkActionFilter implements ActionFilter {
     /**
      * Turn every item into a write, or answer it now when it cannot be
      * written or {@code answered} already holds its answer (by slot, as
-     * {@code requests}).
+     * {@code requests}). {@code timestamp} is the field each document must
+     * hold once when the index backs a data stream, else null (see
+     * {@link #streamTimestamp}).
      */
-    private static List<Outcome> stage(ShardId shardId, List<DocWriteRequest<?>> requests, BulkItemResponse[] answered) {
+    private static List<Outcome> stage(ShardId shardId, String timestamp, List<DocWriteRequest<?>> requests, BulkItemResponse[] answered) {
         String indexName = shardId.getIndexName();
         List<Outcome> outcomes = new ArrayList<>(requests.size());
         for (int slot = 0; slot < requests.size(); slot++) {
@@ -971,6 +982,10 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 boolean generated = index.id() == null;
                 if (generated) {
                     index.id(UUIDs.base64UUID());
+                }
+                if (timestamp != null && !singleValued(index.source(), index.getContentType(), timestamp)) {
+                    outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, noTimestamp(timestamp), RestStatus.BAD_REQUEST)));
+                    continue;
                 }
                 // The document is checked against the declared columns when its batch is
                 // appended, and a refused one comes back as its own item then; checking it
@@ -1001,6 +1016,35 @@ public class InfinoBulkActionFilter implements ActionFilter {
     /** Why a write's version condition cannot be served, or null when it has none (see {@link InfinoDocumentVersion}). */
     static String conditioned(DocWriteRequest<?> item) {
         return InfinoDocumentVersion.conditioned(item);
+    }
+
+    /**
+     * The timestamp field of the data stream {@code md} backs, or null when it
+     * backs none: its mapping enables {@code _data_stream_timestamp}, which is
+     * what makes the stock parse require that field.
+     */
+    static String streamTimestamp(IndexMetadata md) {
+        MappingMetadata mapping = md.mapping();
+        Object meta = mapping == null ? null : mapping.sourceAsMap().get(DataStreamFieldMapper.NAME);
+        if (!(meta instanceof Map<?, ?> m) || !Boolean.TRUE.equals(m.get("enabled"))) {
+            return null;
+        }
+        Object name = m.get("timestamp_field") instanceof Map<?, ?> field ? field.get("name") : null;
+        return name instanceof String s ? s : DataStreamFieldMapper.Defaults.TIMESTAMP_FIELD.getName();
+    }
+
+    /** Whether {@code source} holds exactly one non-null value at {@code field}. */
+    static boolean singleValued(BytesReference source, MediaType type, String field) {
+        Map<String, Object> doc = XContentHelper.convertToMap(source, false, type).v2();
+        return XContentMapValues.extractRawValues(field, doc).stream().filter(Objects::nonNull).count() == 1;
+    }
+
+    /** Stock's refusal of a data-stream document without a single timestamp. */
+    private static MapperParsingException noTimestamp(String field) {
+        return new MapperParsingException(
+            "failed to parse",
+            new IllegalArgumentException("documents must contain a single-valued timestamp field '" + field + "' of date type")
+        );
     }
 
     private static BulkItemResponse failure(int slot, DocWriteRequest<?> item, String index, Exception cause, RestStatus status) {

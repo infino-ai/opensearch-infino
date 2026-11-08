@@ -309,3 +309,76 @@
         index: px1
         id: "+15551234"
   - match: { _source.a: 11 }
+
+---
+"A write to a data stream in proxy mode lands in its write index's table":
+  - do:
+      indices.put_index_template:
+        name: ds-template
+        body:
+          index_patterns: [ "ds-*" ]
+          data_stream: {}
+          template:
+            settings: { number_of_shards: 1, number_of_replicas: 0, index.infino.mode: proxy }
+  - do:
+      indices.create_data_stream:
+        name: ds-logs
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: ds-logs }
+          - { "@timestamp": "2023-01-01T00:00:01Z", message: one }
+          - create: { _index: ds-logs }
+          - { "@timestamp": "2023-01-01T00:00:02Z", message: two }
+  - match: { errors: false }
+  - match: { items.0.create._index: "/^\\.ds-ds-logs-/" }
+  - do:
+      count:
+        index: ds-logs
+  - match: { count: 2 }
+
+  # Writes stock refuses on a data stream are refused the same way, and none is written.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ds-logs }
+          - { "@timestamp": "2023-01-01T00:00:03Z", message: three }
+          - create: { _index: ds-logs, routing: r1 }
+          - { "@timestamp": "2023-01-01T00:00:03Z", message: three }
+          - create: { _index: ds-logs }
+          - { message: three }
+          - create: { _index: ds-logs }
+          - { "@timestamp": [ "2023-01-01T00:00:03Z", "2023-01-01T00:00:04Z" ], message: three }
+  - match: { errors: true }
+  - match: { items.0.index.status: 400 }
+  - match: { items.0.index.error.reason: '/.*op_type\sof\screate\sare\sallowed\sin\sdata\sstreams.*/' }
+  - match: { items.1.create.status: 400 }
+  - match: { items.1.create.error.reason: '/.*specifies\sa\scustom\srouting.*/' }
+  - match: { items.2.create.status: 400 }
+  - match: { items.2.create.error.type: mapper_parsing_exception }
+  - match: { items.2.create.error.caused_by.reason: '/.*single-valued\stimestamp\sfield.*@timestamp.*/' }
+  - match: { items.3.create.status: 400 }
+  - match: { items.3.create.error.caused_by.reason: '/.*single-valued\stimestamp\sfield.*@timestamp.*/' }
+  - do:
+      count:
+        index: ds-logs
+  - match: { count: 2 }
+
+  # After a rollover, a write lands in the new write index and reads span both.
+  - do:
+      indices.rollover:
+        alias: ds-logs
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: ds-logs }
+          - { "@timestamp": "2023-01-01T00:00:05Z", message: five }
+  - match: { errors: false }
+  - match: { items.0.create._index: "/^\\.ds-ds-logs-0*2$/" }
+  - do:
+      count:
+        index: ds-logs
+  - match: { count: 3 }
