@@ -1,0 +1,275 @@
+---
+"A nested query matches within one entry, as Dashboards' has_reference asks, with the same hits as a Lucene twin":
+  # Saved objects as Dashboards keeps them in .kibana: each one's references
+  # are a nested field, so has_reference (a nested query on references with
+  # a term on its id and one on its type) matches a document only when one
+  # entry holds both. The same mapping and documents go to an Infino-backed
+  # index and to a Lucene twin, and every query must give both the same hits.
+  # s2 holds the id and the type the query asks for in different entries:
+  # read over the flattened values it would match, read entry by entry it
+  # must not.
+  - do:
+      indices.create:
+        index: so_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            dynamic: strict
+            properties:
+              type: { type: keyword }
+              namespace: { type: keyword }
+              namespaces: { type: keyword }
+              title: { type: text }
+              rank: { type: long }
+              references:
+                type: nested
+                properties:
+                  name: { type: keyword }
+                  type: { type: keyword }
+                  id: { type: keyword }
+                  weight: { type: long }
+  - do:
+      indices.create:
+        index: so_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            dynamic: strict
+            properties:
+              type: { type: keyword }
+              namespace: { type: keyword }
+              namespaces: { type: keyword }
+              title: { type: text }
+              rank: { type: long }
+              references:
+                type: nested
+                properties:
+                  name: { type: keyword }
+                  type: { type: keyword }
+                  id: { type: keyword }
+                  weight: { type: long }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: so_inf
+        body:
+          - index: { _id: "s1" }
+          - { type: dashboard, title: "two panels", rank: 1, references: [ { name: panel_0, type: visualization, id: mig-header, weight: 1 }, { name: panel_1, type: visualization, id: other, weight: 5 } ] }
+          - index: { _id: "s2" }
+          - { type: dashboard, title: "split pair", rank: 2, references: [ { name: panel_0, type: index-pattern, id: mig-header, weight: 2 }, { name: panel_1, type: visualization, id: x, weight: 2 } ] }
+          - index: { _id: "s3" }
+          - { type: dashboard, title: "one panel", rank: 3, references: [ { name: panel_0, type: visualization, id: mig-header, weight: 9 } ] }
+          - index: { _id: "s4" }
+          - { type: visualization, title: "a visualization", rank: 4, references: [ { name: panel_0, type: visualization, id: mig-header, weight: 3 } ] }
+          - index: { _id: "s5" }
+          - { type: dashboard, namespace: elsewhere, title: "another namespace", rank: 5, references: [ { name: panel_0, type: visualization, id: mig-header, weight: 1 } ] }
+          - index: { _id: "s6" }
+          - { type: dashboard, title: "no panels", rank: 6, references: [] }
+          - index: { _id: "s7" }
+          - { type: dashboard, title: "second", rank: 7, references: [ { name: panel_0, type: visualization, id: second, weight: 4 }, { name: panel_1, type: visualization, id: other, weight: 6 } ] }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: so_luc
+        body:
+          - index: { _id: "s1" }
+          - { type: dashboard, title: "two panels", rank: 1, references: [ { name: panel_0, type: visualization, id: mig-header, weight: 1 }, { name: panel_1, type: visualization, id: other, weight: 5 } ] }
+          - index: { _id: "s2" }
+          - { type: dashboard, title: "split pair", rank: 2, references: [ { name: panel_0, type: index-pattern, id: mig-header, weight: 2 }, { name: panel_1, type: visualization, id: x, weight: 2 } ] }
+          - index: { _id: "s3" }
+          - { type: dashboard, title: "one panel", rank: 3, references: [ { name: panel_0, type: visualization, id: mig-header, weight: 9 } ] }
+          - index: { _id: "s4" }
+          - { type: visualization, title: "a visualization", rank: 4, references: [ { name: panel_0, type: visualization, id: mig-header, weight: 3 } ] }
+          - index: { _id: "s5" }
+          - { type: dashboard, namespace: elsewhere, title: "another namespace", rank: 5, references: [ { name: panel_0, type: visualization, id: mig-header, weight: 1 } ] }
+          - index: { _id: "s6" }
+          - { type: dashboard, title: "no panels", rank: 6, references: [] }
+          - index: { _id: "s7" }
+          - { type: dashboard, title: "second", rank: 7, references: [ { name: panel_0, type: visualization, id: second, weight: 4 }, { name: panel_1, type: visualization, id: other, weight: 6 } ] }
+  - match: { errors: false }
+
+  # The query Dashboards 3.9 sends for GET /api/saved_objects/_find?type=dashboard&has_reference={"type":"visualization","id":"mig-header"},
+  # as the live node received it: the nested clause beside the type and namespace filters.
+  - do:
+      search:
+        index: so_luc
+        body:
+          sort: [ { rank: asc } ]
+          query:
+            bool:
+              filter:
+                - bool:
+                    must:
+                      - nested:
+                          path: references
+                          query:
+                            bool:
+                              must:
+                                - term: { references.id: mig-header }
+                                - term: { references.type: visualization }
+                    should:
+                      - bool:
+                          must: [ { term: { type: dashboard } } ]
+                          must_not: [ { exists: { field: namespaces } } ]
+                          should: [ { bool: { must_not: [ { exists: { field: namespace } } ] } } ]
+                          minimum_should_match: 1
+                    minimum_should_match: 1
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: s1 }
+  - match: { hits.hits.1._id: s3 }
+  - do:
+      search:
+        index: so_inf
+        body:
+          sort: [ { rank: asc } ]
+          query:
+            bool:
+              filter:
+                - bool:
+                    must:
+                      - nested:
+                          path: references
+                          query:
+                            bool:
+                              must:
+                                - term: { references.id: mig-header }
+                                - term: { references.type: visualization }
+                    should:
+                      - bool:
+                          must: [ { term: { type: dashboard } } ]
+                          must_not: [ { exists: { field: namespaces } } ]
+                          should: [ { bool: { must_not: [ { exists: { field: namespace } } ] } } ]
+                          minimum_should_match: 1
+                    minimum_should_match: 1
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: s1 }
+  - match: { hits.hits.1._id: s3 }
+
+  # Several references, any of them (has_reference_operator OR): a should of nested clauses.
+  - do:
+      search:
+        index: so_luc
+        body:
+          sort: [ { rank: asc } ]
+          query:
+            bool:
+              should:
+                - nested: { path: references, query: { bool: { must: [ { term: { references.id: mig-header } }, { term: { references.type: visualization } } ] } } }
+                - nested: { path: references, query: { bool: { must: [ { term: { references.id: second } }, { term: { references.type: visualization } } ] } } }
+              minimum_should_match: 1
+  - match: { hits.total.value: 5 }
+  - match: { hits.hits.0._id: s1 }
+  - match: { hits.hits.1._id: s3 }
+  - match: { hits.hits.2._id: s4 }
+  - match: { hits.hits.3._id: s5 }
+  - match: { hits.hits.4._id: s7 }
+  - do:
+      search:
+        index: so_inf
+        body:
+          sort: [ { rank: asc } ]
+          query:
+            bool:
+              should:
+                - nested: { path: references, query: { bool: { must: [ { term: { references.id: mig-header } }, { term: { references.type: visualization } } ] } } }
+                - nested: { path: references, query: { bool: { must: [ { term: { references.id: second } }, { term: { references.type: visualization } } ] } } }
+              minimum_should_match: 1
+  - match: { hits.total.value: 5 }
+  - match: { hits.hits.0._id: s1 }
+  - match: { hits.hits.1._id: s3 }
+  - match: { hits.hits.2._id: s4 }
+  - match: { hits.hits.3._id: s5 }
+  - match: { hits.hits.4._id: s7 }
+
+  # Several references, all of them (has_reference_operator AND): each nested clause may match a different entry.
+  - do:
+      search:
+        index: so_luc
+        body:
+          sort: [ { rank: asc } ]
+          query:
+            bool:
+              must:
+                - nested: { path: references, query: { bool: { must: [ { term: { references.id: mig-header } }, { term: { references.type: visualization } } ] } } }
+                - nested: { path: references, query: { bool: { must: [ { term: { references.id: other } }, { term: { references.type: visualization } } ] } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: s1 }
+  - do:
+      search:
+        index: so_inf
+        body:
+          sort: [ { rank: asc } ]
+          query:
+            bool:
+              must:
+                - nested: { path: references, query: { bool: { must: [ { term: { references.id: mig-header } }, { term: { references.type: visualization } } ] } } }
+                - nested: { path: references, query: { bool: { must: [ { term: { references.id: other } }, { term: { references.type: visualization } } ] } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: s1 }
+
+  # Negation and a range inside one entry: an entry of type visualization other than mig-header, weighing at least 2.
+  - do:
+      search:
+        index: so_luc
+        body:
+          sort: [ { rank: asc } ]
+          query:
+            nested:
+              path: references
+              query:
+                bool:
+                  filter: [ { term: { references.type: visualization } }, { range: { references.weight: { gte: 2 } } } ]
+                  must_not: [ { term: { references.id: mig-header } } ]
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: s1 }
+  - match: { hits.hits.1._id: s2 }
+  - match: { hits.hits.2._id: s7 }
+  - do:
+      search:
+        index: so_inf
+        body:
+          sort: [ { rank: asc } ]
+          query:
+            nested:
+              path: references
+              query:
+                bool:
+                  filter: [ { term: { references.type: visualization } }, { range: { references.weight: { gte: 2 } } } ]
+                  must_not: [ { term: { references.id: mig-header } } ]
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: s1 }
+  - match: { hits.hits.1._id: s2 }
+  - match: { hits.hits.2._id: s7 }
+
+  # The nested clause scopes an aggregation and a count as it does the hits.
+  - do:
+      search:
+        index: so_inf
+        body:
+          size: 0
+          query: { nested: { path: references, query: { bool: { must: [ { term: { references.id: mig-header } }, { term: { references.type: visualization } } ] } } } }
+          aggs: { by_type: { terms: { field: type } } }
+  - match: { hits.total.value: 4 }
+  - match: { aggregations.by_type.buckets.0.key: dashboard }
+  - match: { aggregations.by_type.buckets.0.doc_count: 3 }
+  - match: { aggregations.by_type.buckets.1.key: visualization }
+  - match: { aggregations.by_type.buckets.1.doc_count: 1 }
+  - do:
+      count:
+        index: so_inf
+        body: { query: { nested: { path: references, query: { term: { references.id: other } } } } }
+  - match: { count: 2 }
+
+  # A clause the table cannot check entry by entry is refused with the clause named, never answered over the flattened values.
+  - do:
+      catch: /\[wildcard\] inside the nested query on \[references\] is not served/
+      search:
+        index: so_inf
+        body: { query: { nested: { path: references, query: { wildcard: { references.id: "mig-*" } } } } }
+  - do:
+      catch: /inner_hits on the nested query on \[references\] is not served/
+      search:
+        index: so_inf
+        body: { query: { nested: { path: references, query: { term: { references.id: mig-header } }, inner_hits: {} } } }

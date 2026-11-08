@@ -355,4 +355,220 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("1=0", translate(QueryBuilders.termQuery("nope", 1)).where());
         assertNull(translate(QueryBuilders.fuzzyQuery("message", "dsk")));
     }
+
+    // ---- nested ----
+
+    private static final String KIBANA = "os_kibana_0";
+
+    /** A saved-objects table: references are a nested field, flattened to a column (and a list column) per member. */
+    private static Map<String, Column> savedObjectColumns() {
+        Map<String, Column> cols = new LinkedHashMap<>();
+        cols.put("osid", new Column("osid", "str", false, false));
+        cols.put("source", new Column("source", "str", false, false));
+        cols.put("type", new Column("type", "str", false, false));
+        cols.put("namespace", new Column("namespace", "str", false, false));
+        cols.put("namespaces", new Column("namespaces", "str", false, false));
+        cols.put("title", new Column("title", "str", true, false));
+        cols.put("references.name", new Column("references.name", "str", false, false));
+        cols.put("references.type", new Column("references.type", "str", false, false));
+        cols.put("references.id", new Column("references.id", "str", false, false));
+        cols.put("references.weight", new Column("references.weight", "i64", false, false));
+        cols.put("references.note", new Column("references.note", "str", true, false));
+        cols.put("references.name[]", Column.list("references.name[]", "str"));
+        cols.put("references.type[]", Column.list("references.type[]", "str"));
+        cols.put("references.id[]", Column.list("references.id[]", "str"));
+        cols.put("references.weight[]", Column.list("references.weight[]", "i64"));
+        return cols;
+    }
+
+    /** Saved objects by id; s2 holds the id and the type has_reference asks for, but in different entries. */
+    private static final Map<String, String> SAVED_OBJECTS = savedObjects();
+
+    private static Map<String, String> savedObjects() {
+        Map<String, String> docs = new LinkedHashMap<>();
+        docs.put("s1", "{\"type\":\"dashboard\",\"references\":[{\"name\":\"panel_0\",\"type\":\"visualization\",\"id\":\"mig-header\",\"weight\":1},{\"name\":\"panel_1\",\"type\":\"visualization\",\"id\":\"other\",\"weight\":5}]}");
+        docs.put("s2", "{\"type\":\"dashboard\",\"references\":[{\"name\":\"panel_0\",\"type\":\"index-pattern\",\"id\":\"mig-header\",\"weight\":2},{\"name\":\"panel_1\",\"type\":\"visualization\",\"id\":\"x\",\"weight\":2}]}");
+        docs.put("s3", "{\"type\":\"dashboard\",\"references\":[{\"name\":\"panel_0\",\"type\":\"visualization\",\"id\":\"mig-header\",\"weight\":9}]}");
+        docs.put("s4", "{\"type\":\"visualization\",\"references\":{\"name\":\"panel_0\",\"type\":\"visualization\",\"id\":\"mig-header\",\"weight\":\"3.7\"}}");
+        docs.put("s6", "{\"type\":\"dashboard\",\"references\":[]}");
+        docs.put("s7", "{\"type\":\"dashboard\",\"references\":[{\"name\":\"panel_0\",\"type\":\"visualization\",\"id\":\"second\",\"weight\":4},{\"name\":\"panel_1\",\"type\":\"visualization\",\"id\":\"other\",\"weight\":6}]}");
+        return docs;
+    }
+
+    /**
+     * Reads the candidates a nested query asks for: every saved object with a reference, whatever
+     * else the narrowing asks, so the entry check alone decides; {@code whole}, every one given.
+     */
+    private static final class Rows implements java.util.function.Function<String, java.util.List<Map<String, Object>>> {
+        final java.util.List<String> statements = new java.util.ArrayList<>();
+        final Map<String, String> docs;
+        final boolean whole;
+
+        Rows(Map<String, String> docs) {
+            this(docs, false);
+        }
+
+        Rows(Map<String, String> docs, boolean whole) {
+            this.docs = docs;
+            this.whole = whole;
+        }
+
+        @Override
+        public java.util.List<Map<String, Object>> apply(String sql) {
+            statements.add(sql);
+            java.util.List<Map<String, Object>> out = new java.util.ArrayList<>();
+            for (Map.Entry<String, String> doc : docs.entrySet()) {
+                if (!whole && (doc.getValue().contains("\"references\":[]") || !doc.getValue().contains("\"references\""))) {
+                    continue;
+                }
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("osid", doc.getKey());
+                row.put("source", doc.getValue());
+                out.add(row);
+            }
+            return out;
+        }
+    }
+
+    private static Translation translateSaved(org.opensearch.index.query.QueryBuilder qb, Rows rows) {
+        return InfinoQueryTranslator.translate(qb, savedObjectColumns(), KIBANA, NOW, rows);
+    }
+
+    /** Dashboards' has_reference clause: a nested query on references, the id and the type on one entry. */
+    private static org.opensearch.index.query.NestedQueryBuilder hasReference(String type, String id) {
+        return QueryBuilders.nestedQuery(
+            "references",
+            QueryBuilders.boolQuery().must(QueryBuilders.termQuery("references.id", id)).must(QueryBuilders.termQuery("references.type", type)),
+            org.apache.lucene.search.join.ScoreMode.Avg
+        );
+    }
+
+    /**
+     * The query Dashboards 3.9 sends for a saved-objects find with has_reference (the
+     * relationships of a visualization, or a dashboard's panels): the nested clause beside
+     * the type and namespace filters, as the node received it.
+     */
+    public void testHasReferenceMatchesWithinOneEntry() {
+        BoolQueryBuilder typeAndNamespace = QueryBuilders.boolQuery()
+            .must(QueryBuilders.termQuery("type", "dashboard"))
+            .mustNot(QueryBuilders.existsQuery("namespaces"))
+            .should(QueryBuilders.boolQuery().mustNot(QueryBuilders.existsQuery("namespace")))
+            .minimumShouldMatch(1);
+        BoolQueryBuilder find = QueryBuilders.boolQuery()
+            .filter(QueryBuilders.boolQuery().must(hasReference("visualization", "mig-header")).should(typeAndNamespace).minimumShouldMatch(1));
+        Rows rows = new Rows(SAVED_OBJECTS);
+        Translation t = translateSaved(find, rows);
+        assertNotNull("the has_reference query is served", t);
+        assertEquals("\"os_kibana_0\"", t.from());
+        // s2 has mig-header and a visualization, in different entries: not a match. s4's one reference is an object, not an array.
+        assertEquals(
+            "((osid IN ('s1', 's3', 's4') AND ((\"type\" = 'dashboard' AND ((NOT COALESCE((\"namespace\" IS NOT NULL), FALSE)))"
+                + " AND NOT COALESCE((\"namespaces\" IS NOT NULL), FALSE)))))",
+            t.where()
+        );
+        // The columns narrow the candidates to documents holding both values anywhere under references.
+        assertEquals(1, rows.statements.size());
+        assertEquals(
+            "SELECT osid, source FROM \"os_kibana_0\" WHERE ((\"references.name\" IS NOT NULL OR \"references.type\" IS NOT NULL OR \"references.id\" IS NOT NULL"
+                + " OR \"references.weight\" IS NOT NULL OR \"references.note\" IS NOT NULL OR \"references.name[]\" IS NOT NULL OR \"references.type[]\" IS NOT NULL"
+                + " OR \"references.id[]\" IS NOT NULL OR \"references.weight[]\" IS NOT NULL) AND (((\"references.id[]\" IS NULL AND \"references.id\" = 'mig-header')"
+                + " OR osid IN (SELECT list_rows.list_id FROM (SELECT list_source.osid AS list_id, unnest(list_source.\"references.id[]\") AS list_value"
+                + " FROM \"os_kibana_0\" list_source WHERE list_source.\"references.id[]\" IS NOT NULL) list_rows WHERE list_rows.list_value = 'mig-header'))"
+                + " AND ((\"references.type[]\" IS NULL AND \"references.type\" = 'visualization') OR osid IN (SELECT list_rows.list_id FROM (SELECT list_source.osid"
+                + " AS list_id, unnest(list_source.\"references.type[]\") AS list_value FROM \"os_kibana_0\" list_source WHERE list_source.\"references.type[]\""
+                + " IS NOT NULL) list_rows WHERE list_rows.list_value = 'visualization')))) LIMIT "
+                + (InfinoQueryTranslator.NESTED_CANDIDATES_MAX + 1),
+            rows.statements.get(0)
+        );
+    }
+
+    /** has_reference_operator OR and AND over several references: a should or a must of nested clauses, each on an entry of its own. */
+    public void testSeveralReferencesAnyOrAll() {
+        BoolQueryBuilder any = QueryBuilders.boolQuery()
+            .should(hasReference("visualization", "mig-header"))
+            .should(hasReference("visualization", "second"))
+            .minimumShouldMatch(1);
+        assertEquals("((osid IN ('s1', 's3', 's4') OR osid IN ('s7')))", translateSaved(any, new Rows(SAVED_OBJECTS)).where());
+        BoolQueryBuilder all = QueryBuilders.boolQuery().must(hasReference("visualization", "mig-header")).must(hasReference("visualization", "other"));
+        assertEquals("(osid IN ('s1', 's3', 's4') AND osid IN ('s1', 's7'))", translateSaved(all, new Rows(SAVED_OBJECTS)).where());
+        // No entry is a dashboard: nothing, with no rows read past the narrowing.
+        assertEquals("1=0", translateSaved(hasReference("dashboard", "mig-header"), new Rows(SAVED_OBJECTS)).where());
+    }
+
+    /** Negation, ranges, terms, exists and match within one entry, a long read as the field indexes it. */
+    public void testEntryClauses() {
+        // A visualization other than mig-header weighing at least 2: s1's "other" (5), s2's "x" (2), s7's two.
+        org.opensearch.index.query.QueryBuilder q = QueryBuilders.nestedQuery(
+            "references",
+            QueryBuilders.boolQuery()
+                .filter(QueryBuilders.termQuery("references.type", "visualization"))
+                .filter(QueryBuilders.rangeQuery("references.weight").gte(2))
+                .mustNot(QueryBuilders.termQuery("references.id", "mig-header")),
+            org.apache.lucene.search.join.ScoreMode.None
+        );
+        Rows rows = new Rows(SAVED_OBJECTS);
+        assertEquals("osid IN ('s1', 's2', 's7')", translateSaved(q, rows).where());
+        // The negation narrows nothing: the candidates are those with a visualization and a weight past 2 anywhere.
+        assertFalse(rows.statements.get(0), rows.statements.get(0).contains("COALESCE"));
+        // s4's weight "3.7" is a long field's 3.
+        q = QueryBuilders.nestedQuery("references", QueryBuilders.termQuery("references.weight", 3), org.apache.lucene.search.join.ScoreMode.None);
+        assertEquals("osid IN ('s4')", translateSaved(q, new Rows(SAVED_OBJECTS)).where());
+        q = QueryBuilders.nestedQuery(
+            "references",
+            QueryBuilders.boolQuery().must(QueryBuilders.termsQuery("references.id", "x", "second")).must(QueryBuilders.matchQuery("references.name", "panel_0")),
+            org.apache.lucene.search.join.ScoreMode.None
+        );
+        assertEquals("osid IN ('s7')", translateSaved(q, new Rows(SAVED_OBJECTS)).where());
+        q = QueryBuilders.nestedQuery("references", QueryBuilders.existsQuery("references.weight"), org.apache.lucene.search.join.ScoreMode.None);
+        assertEquals("osid IN ('s1', 's2', 's3', 's4', 's7')", translateSaved(q, new Rows(SAVED_OBJECTS)).where());
+        // A field outside the path is no field of an entry, as in stock's nested documents.
+        q = QueryBuilders.nestedQuery("references", QueryBuilders.termQuery("type", "dashboard"), org.apache.lucene.search.join.ScoreMode.None);
+        assertEquals("1=0", translateSaved(q, new Rows(SAVED_OBJECTS)).where());
+        // A path with no field under it is unmapped: nothing.
+        q = QueryBuilders.nestedQuery("missing", QueryBuilders.termQuery("missing.id", "a"), org.apache.lucene.search.join.ScoreMode.None);
+        Rows none = new Rows(SAVED_OBJECTS);
+        assertEquals("1=0", translateSaved(q, none).where());
+        assertTrue(none.statements.isEmpty());
+    }
+
+    /** What the entry check cannot read is refused with the clause named, never answered over the flattened values. */
+    public void testUnservableNestedShapesAreRefused() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> translateSaved(
+                QueryBuilders.nestedQuery("references", QueryBuilders.wildcardQuery("references.id", "mig-*"), org.apache.lucene.search.join.ScoreMode.None),
+                new Rows(SAVED_OBJECTS)
+            )
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("[wildcard] inside the nested query on [references] is not served"));
+        e = expectThrows(
+            IllegalArgumentException.class,
+            () -> translateSaved(
+                QueryBuilders.nestedQuery("references", QueryBuilders.matchQuery("references.note", "disk"), org.apache.lucene.search.join.ScoreMode.None),
+                new Rows(SAVED_OBJECTS)
+            )
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("[match] on the text field [references.note] inside the nested query on [references]"));
+        e = expectThrows(
+            IllegalArgumentException.class,
+            () -> translateSaved(
+                hasReference("visualization", "mig-header").innerHit(new org.opensearch.index.query.InnerHitBuilder()),
+                new Rows(SAVED_OBJECTS)
+            )
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("inner_hits on the nested query on [references] is not served"));
+        // Past the candidate cap: refused rather than read whole.
+        Map<String, String> many = new LinkedHashMap<>();
+        for (int i = 0; i <= InfinoQueryTranslator.NESTED_CANDIDATES_MAX; i++) {
+            many.put("d" + i, SAVED_OBJECTS.get("s3"));
+        }
+        e = expectThrows(IllegalArgumentException.class, () -> translateSaved(hasReference("visualization", "mig-header"), new Rows(many)));
+        assertTrue(e.getMessage(), e.getMessage().contains("documents to check entry by entry"));
+        // A candidate whose source holds no entries cannot be checked.
+        e = expectThrows(
+            IllegalArgumentException.class,
+            () -> translateSaved(hasReference("visualization", "mig-header"), new Rows(Map.of("s9", "{\"type\":\"dashboard\"}"), true))
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("document [s9] has values under [references] its source does not hold"));
+    }
 }

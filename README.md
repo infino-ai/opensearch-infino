@@ -214,7 +214,9 @@ An index with `index.infino.edges: true` holds a graph's edges: each document is
 
 ## What is supported
 
-**Queries:** `match_all`, `term`, `terms`, `range` (numbers and dates, with date math and time zones), `exists`, `prefix`, `wildcard`, `regexp`, `ids`, `match`, `match_phrase`, `multi_match`, `query_string` and `simple_query_string` (Lucene's classic syntax; fuzzy and proximity are refused), `bool` (with `minimum_should_match`), `script` (an expression subset of Painless), `infino_knn`, `infino_hybrid`, and the k-NN plugin's `knn`. A field named `x.keyword` reads the string column `x` by its whole value.
+**Queries:** `match_all`, `term`, `terms`, `range` (numbers and dates, with date math and time zones), `exists`, `prefix`, `wildcard`, `regexp`, `ids`, `match`, `match_phrase`, `multi_match`, `query_string` and `simple_query_string` (Lucene's classic syntax; fuzzy and proximity are refused), `bool` (with `minimum_should_match`), `nested` (see below), `script` (an expression subset of Painless), `infino_knn`, `infino_hybrid`, and the k-NN plugin's `knn`. A field named `x.keyword` reads the string column `x` by its whole value.
+
+A `nested` query (Dashboards' `has_reference` on saved objects' `references` is one) matches a document only when one entry of the array holds every clause, as stock does. The table flattens an array of objects into a column per member field, which loses which values share an entry, so the columns only narrow the documents to those that may match; each of those is then checked entry by entry from its source. Inside a nested query, `term`, `terms`, `match`, `range` and `exists` on keyword, numeric and boolean fields are served, combined by `bool` or a deeper `nested` query. A text or date field, any other clause, `inner_hits`, or a query that leaves more than 10,000 documents to check (`-Dinfino.nested.candidates.max`) is refused with a 400 that names it.
 
 **Search:** sorting by fields; `from` and `size` up to `index.max_result_window`; `search_after`, `post_filter`, `collapse` and scroll; `_source` includes and excludes; exact `hits.total`. A search over several Infino-backed indices merges their pages by sort values or score and reduces their aggregations together, under `search.max_buckets`. `get` and `mget` read the table too.
 
@@ -232,7 +234,7 @@ An index with `index.infino.edges: true` holds a graph's edges: each document is
 - **Where `knn` goes.** `knn` is the whole query, not a clause inside `bool`.
 - **Refused, with the parameter named:** radial search (`max_distance`, `min_score`), `method_parameters`, `rescore`, `expand_nested_docs`, `ignore_unmapped`, a boost or query name. With a `knn` query, aggregations, field sorts, `post_filter`, `collapse`, `search_after` and scroll are refused too.
 
-**Not supported:** HDR percentiles; `fuzzy`, `nested`, `function_score` and geo queries; `suggest`; sliced search (sliced scroll, reindex or update by query); and a search across Infino-backed and other indices together. A request using any of these fails with a 400 that names the clause (`[infino] query not served by the table: ...`); it never returns an empty answer instead.
+**Not supported:** HDR percentiles; `fuzzy`, `function_score` and geo queries; `suggest`; sliced search (sliced scroll, reindex or update by query); and a search across Infino-backed and other indices together. A request using any of these fails with a 400 that names the clause (`[infino] query not served by the table: ...`); it never returns an empty answer instead.
 
 ## Writes
 
