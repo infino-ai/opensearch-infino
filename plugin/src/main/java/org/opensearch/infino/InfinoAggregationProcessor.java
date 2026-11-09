@@ -1104,7 +1104,8 @@ public class InfinoAggregationProcessor {
                 return switch (kind) {
                     case VALUE_COUNT -> "SUM(" + figure(FIGURE_COUNT) + ") AS " + alias + "_c";
                     case SUM -> "SUM(" + figure(FIGURE_SUM) + ") AS " + alias + "_s";
-                    case AVG -> "SUM(" + figure(FIGURE_SUM) + ") AS " + alias + "_s, SUM(" + figure(FIGURE_COUNT) + ") AS " + alias + "_c";
+                    case AVG -> "SUM(" + figure(FIGURE_SUM) + ") AS " + alias + "_s, SUM(" + figure(FIGURE_COUNT) + ") AS " + alias + "_c, "
+                        + "CAST(SUM(" + figure(FIGURE_SUM) + ") AS DOUBLE) / NULLIF(SUM(" + figure(FIGURE_COUNT) + "), 0) AS " + alias + "_a";
                     case MIN -> "MIN(" + figure(FIGURE_MIN) + ") AS " + alias + "_v";
                     case MAX -> "MAX(" + figure(FIGURE_MAX) + ") AS " + alias + "_v";
                     default -> throw new IllegalStateException("a " + kind + " metric is not read from figures");
@@ -1115,7 +1116,7 @@ public class InfinoAggregationProcessor {
                 case FILTER -> throw new IllegalStateException("a filter's columns are its count's and its metrics'");
                 case VALUE_COUNT -> "COUNT(" + f + ") AS " + alias + "_c";
                 case SUM -> "SUM(" + f + ") AS " + alias + "_s";
-                case AVG -> "SUM(" + f + ") AS " + alias + "_s, COUNT(" + f + ") AS " + alias + "_c";
+                case AVG -> "SUM(" + f + ") AS " + alias + "_s, COUNT(" + f + ") AS " + alias + "_c, AVG(" + f + ") AS " + alias + "_a";
                 case MIN -> "MIN(" + f + ") AS " + alias + "_v";
                 case MAX -> "MAX(" + f + ") AS " + alias + "_v";
                 case CARDINALITY -> "COUNT(DISTINCT " + f + ") AS " + alias + "_d";
@@ -1163,14 +1164,17 @@ public class InfinoAggregationProcessor {
             }
         }
 
-        /** The alias a terms order by this metric sorts on, or null when it has no single column. */
+        /** The alias a terms order by this metric sorts on, or null when it has no single column. An
+         *  average is built from its sum and count, and also selected whole (`_a`) for an order by it:
+         *  OpenSearch Dashboards orders a split by its metric, an average among them. */
         String orderAlias() {
             return switch (kind) {
                 case VALUE_COUNT -> alias + "_c";
                 case SUM -> alias + "_s";
+                case AVG -> alias + "_a";
                 case MIN, MAX -> alias + "_v";
                 case CARDINALITY -> alias + "_d";
-                case AVG, PERCENTILES, PERCENTILE_RANKS, FILTER -> null;
+                case PERCENTILES, PERCENTILE_RANKS, FILTER -> null;
             };
         }
 
