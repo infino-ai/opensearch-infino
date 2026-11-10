@@ -20,6 +20,16 @@ DISTRO=/path/to/opensearch-3.9.0 ./scripts/run.sh       # install the plugin and
 
 `run.sh` keeps the tables in `data/` at the repository's root. Set `INFINO_URI=s3://bucket/prefix` (or `gs://`, `az://`) to keep them in a bucket instead.
 
+**Using the full OpenSearch bundle.** The standard 3.9.0 download includes the security plugin. With an empty `opensearch.yml`, the security plugin stops the node at startup with `No SSL configuration found`. For a local node that answers the plain-HTTP requests below, turn security off in `$DISTRO/config/opensearch.yml`:
+
+```yaml
+plugins.security.disabled: true
+```
+
+To keep security on, run `$DISTRO/opensearch-tar-install.sh` once with `OPENSEARCH_INITIAL_ADMIN_PASSWORD` set. It installs demo certificates, and the requests below then need `-k -u admin:<password> https://localhost:9200/...`.
+
+The bundle also includes neural search, so the node creates its indices in proxy mode (see [Neural search](#neural-search)). The example below works in either mode.
+
 Create an index, write a document and search it:
 
 ```bash
@@ -38,6 +48,8 @@ curl localhost:9200/logs/_search -H 'Content-Type: application/json' -d '{
   "aggs": {"over_time": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1h"},
                          "aggs": {"by_level": {"terms": {"field": "level"}}}}}}'
 ```
+
+The search keeps only documents from the last day (`"gte": "now-1d"`). Give the document a recent `@timestamp`, or widen the range, or the search finds no hits.
 
 Every index the cluster creates is backed by Infino, so the index above needs no setting of its own.
 
