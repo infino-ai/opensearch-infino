@@ -25,6 +25,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.engine.DocumentMissingException;
 import org.opensearch.index.engine.VersionConflictEngineException;
+import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -402,7 +403,7 @@ public final class InfinoWriter {
                         if (document == null) {
                             rejection = new DocumentMissingException(shardId, w.id());
                         } else if (why != null) {
-                            rejection = new IllegalArgumentException("[infino] " + why);
+                            rejection = refused(why);
                         } else {
                             merged.put(o, document);
                         }
@@ -474,6 +475,17 @@ public final class InfinoWriter {
             return null;
         }
         return InfinoBulkActionFilter.writerAllocation(clusters.state(), staged.get(0).waiter().shardId().getIndex());
+    }
+
+    /** How the bridge's reason starts when a data stream's document lacks one timestamp. */
+    static final String NO_TIMESTAMP = "documents must contain a single-valued timestamp field";
+
+    /** A document the bridge refused, answered as stock answers it: a data stream's document without one timestamp fails the parse. */
+    static Exception refused(String why) {
+        if (why.startsWith(NO_TIMESTAMP)) {
+            return new MapperParsingException("failed to parse", new IllegalArgumentException(why));
+        }
+        return new IllegalArgumentException("[infino] " + why);
     }
 
     /** The prepared batches as one commit, each row under the sequence number its write was given; a refused document is reported under its id. */
@@ -590,7 +602,7 @@ public final class InfinoWriter {
                 w.items()[o.slot()] = new BulkItemResponse(
                     o.slot(),
                     o.item().opType(),
-                    new BulkItemResponse.Failure(w.indexName(), write.id(), new IllegalArgumentException("[infino] " + why), RestStatus.BAD_REQUEST)
+                    new BulkItemResponse.Failure(w.indexName(), write.id(), refused(why), RestStatus.BAD_REQUEST)
                 );
                 continue;
             }
