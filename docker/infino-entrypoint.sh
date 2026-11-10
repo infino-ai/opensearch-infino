@@ -4,7 +4,7 @@
 # handles OPENSEARCH_INITIAL_ADMIN_PASSWORD, the demo security config and
 # dotted env vars such as cluster.name).
 #
-#   INFINO_STORAGE       cloud (default) | local | memory
+#   INFINO_STORAGE       local (default) | cloud | memory
 #   INFINO_API_KEY       cloud: the account key (read by the plugin from the env)
 #   INFINO_PLATFORM_URL  the hosted service (default https://api.platform.infino.ws);
 #                        in local/memory, where a trial account is asked from
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 INFINO_HOME=/usr/share/opensearch/infino
-INFINO_STORAGE="${INFINO_STORAGE:-cloud}"
+INFINO_STORAGE="${INFINO_STORAGE:-local}"
 INFINO_DATA="$INFINO_HOME/data"
 PLATFORM_URL="${INFINO_PLATFORM_URL:-https://api.platform.infino.ws}"
 # Records which storage this node's data volume belongs to (see below).
@@ -62,7 +62,7 @@ case "$INFINO_STORAGE" in
     echo "infino: storage=memory (tables are lost on restart; use 'docker compose down -v' between runs)"
     ;;
   *)
-    echo "infino: INFINO_STORAGE must be cloud, local or memory (got '$INFINO_STORAGE')" >&2
+    echo "infino: INFINO_STORAGE must be local, cloud or memory (got '$INFINO_STORAGE')" >&2
     exit 1
     ;;
 esac
