@@ -978,8 +978,6 @@ fn keep(value: Value, precision: Option<Precision>) -> Result<Value, String> {
     }
 }
 
-/// The `properties` object of a mapping, whether the caller passed the
-/// mapping source itself, a `{"_doc": {...}}` wrapper, or `{"properties": ...}`.
 /// The mapping meta-field that makes an index back a data stream.
 const STREAM_TIMESTAMP: &str = "_data_stream_timestamp";
 /// The timestamp field a data stream names when its mapping names none.
@@ -1011,6 +1009,8 @@ fn no_timestamp(field: &str) -> String {
     format!("documents must contain a single-valued timestamp field '{field}' of date type")
 }
 
+/// The `properties` object of a mapping, whether the caller passed the
+/// mapping source itself, a `{"_doc": {...}}` wrapper, or `{"properties": ...}`.
 fn properties_of(mapping: &Value) -> Option<&Map<String, Value>> {
     let m = mapping.as_object()?;
     if let Some(p) = m.get("properties").and_then(|p| p.as_object()) {
