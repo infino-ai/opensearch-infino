@@ -273,3 +273,138 @@
       search:
         index: so_inf
         body: { query: { nested: { path: references, query: { term: { references.id: mig-header } }, inner_hits: {} } } }
+
+---
+"A nested query inside a nested one, and a nested path several levels deep, match one entry at each level, with the same hits as a Lucene twin":
+  # o1's item a has a tag named size that is red. o2's item a has a size tag
+  # and a red tag, but no one tag that is both. o3 has the red size tag, but
+  # on item b. p2 has the rel and the href asked for in two links, and p3
+  # writes its parent as a dotted key. Read over the flattened values each
+  # of those would match; read an entry at a time, at each level, they must
+  # not, and stock agrees.
+  - do:
+      indices.create:
+        index: deep_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"dynamic": "strict", "properties": {"rank": {"type": "long"}, "items": {"type": "nested", "properties": {"sku": {"type": "keyword"}, "tags": {"type": "nested", "properties": {"name": {"type": "keyword"}, "color": {"type": "keyword"}}}}}, "site": {"properties": {"meta": {"properties": {"links": {"type": "nested", "properties": {"rel": {"type": "keyword"}, "href": {"type": "keyword"}}}}}}}}}
+  - do:
+      indices.create:
+        index: deep_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"dynamic": "strict", "properties": {"rank": {"type": "long"}, "items": {"type": "nested", "properties": {"sku": {"type": "keyword"}, "tags": {"type": "nested", "properties": {"name": {"type": "keyword"}, "color": {"type": "keyword"}}}}}, "site": {"properties": {"meta": {"properties": {"links": {"type": "nested", "properties": {"rel": {"type": "keyword"}, "href": {"type": "keyword"}}}}}}}}}
+  - do:
+      bulk:
+        refresh: true
+        index: deep_inf
+        body:
+          - { index: { _id: "o1" } }
+          - {"rank": 1, "items": [{"sku": "a", "tags": [{"name": "size", "color": "red"}, {"name": "fit", "color": "blue"}]}]}
+          - { index: { _id: "o2" } }
+          - {"rank": 2, "items": [{"sku": "a", "tags": [{"name": "size", "color": "blue"}, {"name": "fit", "color": "red"}]}]}
+          - { index: { _id: "o3" } }
+          - {"rank": 3, "items": [{"sku": "a", "tags": [{"name": "fit", "color": "blue"}]}, {"sku": "b", "tags": [{"name": "size", "color": "red"}]}]}
+          - { index: { _id: "p1" } }
+          - {"rank": 4, "site": {"meta": {"links": [{"rel": "next", "href": "a"}, {"rel": "prev", "href": "b"}]}}}
+          - { index: { _id: "p2" } }
+          - {"rank": 5, "site": {"meta": {"links": [{"rel": "next", "href": "b"}, {"rel": "prev", "href": "a"}]}}}
+          - { index: { _id: "p3" } }
+          - {"rank": 6, "site.meta": {"links": [{"rel": "next", "href": "a"}]}}
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: deep_luc
+        body:
+          - { index: { _id: "o1" } }
+          - {"rank": 1, "items": [{"sku": "a", "tags": [{"name": "size", "color": "red"}, {"name": "fit", "color": "blue"}]}]}
+          - { index: { _id: "o2" } }
+          - {"rank": 2, "items": [{"sku": "a", "tags": [{"name": "size", "color": "blue"}, {"name": "fit", "color": "red"}]}]}
+          - { index: { _id: "o3" } }
+          - {"rank": 3, "items": [{"sku": "a", "tags": [{"name": "fit", "color": "blue"}]}, {"sku": "b", "tags": [{"name": "size", "color": "red"}]}]}
+          - { index: { _id: "p1" } }
+          - {"rank": 4, "site": {"meta": {"links": [{"rel": "next", "href": "a"}, {"rel": "prev", "href": "b"}]}}}
+          - { index: { _id: "p2" } }
+          - {"rank": 5, "site": {"meta": {"links": [{"rel": "next", "href": "b"}, {"rel": "prev", "href": "a"}]}}}
+          - { index: { _id: "p3" } }
+          - {"rank": 6, "site.meta": {"links": [{"rel": "next", "href": "a"}]}}
+  - match: { errors: false }
+
+  # A red size tag on any item: o1, and o3 (item b), not o2, whose size tag is blue.
+  - do:
+      search:
+        index: deep_luc
+        body:
+          sort: [ { rank: asc } ]
+          query: {"nested": {"path": "items", "query": {"nested": {"path": "items.tags", "query": {"bool": {"must": [{"term": {"items.tags.name": "size"}}, {"term": {"items.tags.color": "red"}}]}}}}}}
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: o1 }
+  - match: { hits.hits.1._id: o3 }
+  - do:
+      search:
+        index: deep_inf
+        body:
+          sort: [ { rank: asc } ]
+          query: {"nested": {"path": "items", "query": {"nested": {"path": "items.tags", "query": {"bool": {"must": [{"term": {"items.tags.name": "size"}}, {"term": {"items.tags.color": "red"}}]}}}}}}
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: o1 }
+  - match: { hits.hits.1._id: o3 }
+
+  # Item a holding a red size tag: o1 alone; o3's red size tag is on item b.
+  - do:
+      search:
+        index: deep_luc
+        body:
+          sort: [ { rank: asc } ]
+          query: {"nested": {"path": "items", "query": {"bool": {"must": [{"term": {"items.sku": "a"}}, {"nested": {"path": "items.tags", "query": {"bool": {"must": [{"term": {"items.tags.name": "size"}}, {"term": {"items.tags.color": "red"}}]}}}}]}}}}
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: o1 }
+  - do:
+      search:
+        index: deep_inf
+        body:
+          sort: [ { rank: asc } ]
+          query: {"nested": {"path": "items", "query": {"bool": {"must": [{"term": {"items.sku": "a"}}, {"nested": {"path": "items.tags", "query": {"bool": {"must": [{"term": {"items.tags.name": "size"}}, {"term": {"items.tags.color": "red"}}]}}}}]}}}}
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: o1 }
+
+  # Item a without a red size tag: o2 and o3.
+  - do:
+      search:
+        index: deep_luc
+        body:
+          sort: [ { rank: asc } ]
+          query: {"nested": {"path": "items", "query": {"bool": {"must": [{"term": {"items.sku": "a"}}], "must_not": [{"nested": {"path": "items.tags", "query": {"bool": {"must": [{"term": {"items.tags.name": "size"}}, {"term": {"items.tags.color": "red"}}]}}}}]}}}}
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: o2 }
+  - match: { hits.hits.1._id: o3 }
+  - do:
+      search:
+        index: deep_inf
+        body:
+          sort: [ { rank: asc } ]
+          query: {"nested": {"path": "items", "query": {"bool": {"must": [{"term": {"items.sku": "a"}}], "must_not": [{"nested": {"path": "items.tags", "query": {"bool": {"must": [{"term": {"items.tags.name": "size"}}, {"term": {"items.tags.color": "red"}}]}}}}]}}}}
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: o2 }
+  - match: { hits.hits.1._id: o3 }
+
+  # A next link to a, three levels down: p1 and p3, not p2, whose next link goes to b.
+  - do:
+      search:
+        index: deep_luc
+        body:
+          sort: [ { rank: asc } ]
+          query: {"nested": {"path": "site.meta.links", "query": {"bool": {"must": [{"term": {"site.meta.links.rel": "next"}}, {"term": {"site.meta.links.href": "a"}}]}}}}
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: p1 }
+  - match: { hits.hits.1._id: p3 }
+  - do:
+      search:
+        index: deep_inf
+        body:
+          sort: [ { rank: asc } ]
+          query: {"nested": {"path": "site.meta.links", "query": {"bool": {"must": [{"term": {"site.meta.links.rel": "next"}}, {"term": {"site.meta.links.href": "a"}}]}}}}
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: p1 }
+  - match: { hits.hits.1._id: p3 }
