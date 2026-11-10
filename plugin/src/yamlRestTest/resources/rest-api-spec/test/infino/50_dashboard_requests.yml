@@ -115,6 +115,40 @@
   - match: { aggregations.2.buckets.1.key: n1 }
   - match: { aggregations.2.buckets.1.1.value: 640.0 }
 
+  # The same split ordered by an average, with the key as the tiebreak, as Dashboards sends a
+  # visualization whose split is ordered by an Average metric.
+  - do:
+      search:
+        index: web
+        body:
+          size: 0
+          aggs:
+            "2":
+              terms: { field: host, order: [ { "1": desc }, { _key: asc } ], size: 5 }
+              aggs:
+                "1": { avg: { field: bytes } }
+  - match: { aggregations.2.buckets.0.key: n2 }
+  - match: { aggregations.2.buckets.0.1.value: 2048.0 }
+  - match: { aggregations.2.buckets.1.key: n1 }
+  - match: { aggregations.2.buckets.1.1.value: 320.0 }
+  - match: { aggregations.2.buckets.2.key: n3 }
+  - match: { aggregations.2.buckets.2.1.value: 0.0 }
+
+  # Ascending by the average.
+  - do:
+      search:
+        index: web
+        body:
+          size: 0
+          aggs:
+            "2":
+              terms: { field: host, order: { "1": asc }, size: 5 }
+              aggs:
+                "1": { avg: { field: bytes } }
+  - match: { aggregations.2.buckets.0.key: n3 }
+  - match: { aggregations.2.buckets.1.key: n1 }
+  - match: { aggregations.2.buckets.2.key: n2 }
+
   # A filters panel: each filter a query_string, as the editor sends it.
   - do:
       search:
