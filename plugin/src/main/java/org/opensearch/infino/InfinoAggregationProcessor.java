@@ -2317,7 +2317,9 @@ public class InfinoAggregationProcessor {
             }
             if (s instanceof DateHistogramValuesSourceBuilder dh) {
                 ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
-                Grouped.DateExpr expr = Grouped.dateExpr(agg, c, tz, dh.getIntervalAsFixed(), dh.getIntervalAsCalendar(), dh.offset());
+                DateHistogramInterval calendar = calendarOf(dh);
+                DateHistogramInterval fixed = calendar == null ? dh.getIntervalAsFixed() : null;
+                Grouped.DateExpr expr = Grouped.dateExpr(agg, c, tz, fixed, calendar, dh.offset());
                 // As stock: the key is epoch milliseconds unless the source names a format.
                 DocValueFormat format = s.format() == null ? DocValueFormat.RAW : Grouped.dateFormat(s.format(), c, tz);
                 return new CompositeSource(s.name(), c, expr.keyExpr(), KeyKind.DATE, format, desc, s.missingBucket(), missing);
@@ -2327,6 +2329,20 @@ public class InfinoAggregationProcessor {
                 return new CompositeSource(s.name(), c, keyExpr, KeyKind.DOUBLE, DocValueFormat.RAW, desc, s.missingBucket(), missing);
             }
             throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] of type [" + s.getClass().getSimpleName() + "] is not served");
+        }
+
+        /**
+         * The calendar interval of a composite date source, or null when its interval is fixed.
+         * The source does not say which kind the request wrote, and each getter throws for the
+         * other kind; the calendar getter answers only for a calendar interval, so trying it first
+         * picks the kind in the order stock's rounding does.
+         */
+        private static DateHistogramInterval calendarOf(DateHistogramValuesSourceBuilder dh) {
+            try {
+                return dh.getIntervalAsCalendar();
+            } catch (IllegalStateException fixed) {
+                return null;
+            }
         }
 
         /** The after value of a source as an SQL literal, read as the source's key kind. */

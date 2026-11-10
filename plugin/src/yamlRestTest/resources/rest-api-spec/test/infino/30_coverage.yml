@@ -312,3 +312,36 @@
   - match: { aggregations.days.buckets.0.doc_count: 2 }
   - match: { aggregations.days.buckets.1.doc_count: 3 }
   - match: { aggregations.days.buckets.2.doc_count: 3 }
+
+  # composite over calendar and fixed intervals, whatever unit they are written in.
+  - do:
+      search:
+        index: shop
+        body:
+          size: 0
+          aggs:
+            days:
+              composite:
+                sources:
+                  - day: { date_histogram: { field: "@timestamp", calendar_interval: day } }
+            weeks:
+              composite:
+                sources:
+                  - week: { date_histogram: { field: "@timestamp", calendar_interval: week } }
+            halves:
+              composite:
+                sources:
+                  - half: { date_histogram: { field: "@timestamp", fixed_interval: 12h } }
+  - length: { aggregations.days.buckets: 3 }
+  - match: { aggregations.days.buckets.0: { key: { day: 1792800000000 }, doc_count: 3 } }
+  - match: { aggregations.days.buckets.1: { key: { day: 1792886400000 }, doc_count: 3 } }
+  - match: { aggregations.days.buckets.2: { key: { day: 1792972800000 }, doc_count: 2 } }
+  - length: { aggregations.weeks.buckets: 2 }
+  - match: { aggregations.weeks.buckets.0: { key: { week: 1792368000000 }, doc_count: 6 } }
+  - match: { aggregations.weeks.buckets.1: { key: { week: 1792972800000 }, doc_count: 2 } }
+  - length: { aggregations.halves.buckets: 5 }
+  - match: { aggregations.halves.buckets.0: { key: { half: 1792800000000 }, doc_count: 2 } }
+  - match: { aggregations.halves.buckets.1: { key: { half: 1792843200000 }, doc_count: 1 } }
+  - match: { aggregations.halves.buckets.2: { key: { half: 1792886400000 }, doc_count: 2 } }
+  - match: { aggregations.halves.buckets.3: { key: { half: 1792929600000 }, doc_count: 1 } }
+  - match: { aggregations.halves.buckets.4: { key: { half: 1792972800000 }, doc_count: 2 } }
