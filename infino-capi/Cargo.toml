@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 # node whose account is set up holds no table data of its own.
 # `graph-index` serves the graph walks (`graph_walk`, `graph_rank`) to SQL and
 # builds an edge table's adjacency index on optimize.
-infino = { version = "0.11.21", features = ["remote", "graph-index"] }
+infino = { version = "0.11.27", features = ["remote", "graph-index"] }
 # serde_json comes re-exported from infino, so the two never disagree.
 # Same major as infino so the delete-predicate Expr is the same type infino expects.
 datafusion = "54"
