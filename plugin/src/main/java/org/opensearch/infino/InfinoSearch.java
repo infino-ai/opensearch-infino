@@ -1398,10 +1398,26 @@ public final class InfinoSearch {
         int from = Math.max(0, source.from());
         int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
         all = all.subList(Math.min(from, all.size()), Math.min(all.size(), from + size));
-        TotalHits totalHits = fixedTotal != null
-            ? fixedTotal
-            : new TotalHits(total, exact ? TotalHits.Relation.EQUAL_TO : TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+        TotalHits totalHits = fixedTotal != null ? fixedTotal : reported(total, exact, source);
         return new SearchHits(all.toArray(new SearchHit[0]), totalHits, maxScore);
+    }
+
+    /**
+     * The total as a coordinator reports it under the request's {@code track_total_hits}: none when
+     * disabled, else the count up to the limit (the stock default when the request names none), and
+     * the limit itself, as a lower bound, past it. The pages count exactly whenever tracking is on,
+     * so a default-mode shard's coordinator can apply the same rule.
+     */
+    private static TotalHits reported(long total, boolean exact, SearchSourceBuilder source) {
+        Integer upTo = source.trackTotalHitsUpTo();
+        int limit = upTo == null ? SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO : upTo;
+        if (limit == SearchContext.TRACK_TOTAL_HITS_DISABLED) {
+            return null;
+        }
+        if (exact && total > limit) {
+            return new TotalHits(limit, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
+        }
+        return new TotalHits(total, exact ? TotalHits.Relation.EQUAL_TO : TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
     }
 
     /** Hits by their sort values in the plan's order: field and script sorts alike, each in its direction. */
