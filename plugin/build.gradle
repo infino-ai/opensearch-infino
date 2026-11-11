@@ -158,6 +158,28 @@ def multiNodeData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-c
 // Infino-backed like every other, which is part of what the suites verify.
 def securityResources = file("${projectDir}/src/yamlRestTest/resources/security")
 
+// OpenSearch's own YAML REST suites, copied from the release's rest-api-spec
+// artifact, over the APIs the plugin answers in place of Lucene. They run in
+// tasks of their own (one per mode), outside check: the denylist that lets
+// them pass is chosen test by test, in core-denylist.txt.
+def coreSuites = [
+    'index', 'create', 'get', 'get_source', 'exists', 'mget', 'bulk', 'update', 'delete',
+    'count', 'search', 'search.aggregation', 'scroll', 'msearch', 'field_caps',
+    'indices.get_mapping', 'indices.get_settings', 'indices.update_aliases',
+]
+restResources {
+    restTests {
+        includeCore(*coreSuites)
+    }
+}
+def coreTask = 'coreYamlRestTest'
+def coreProxyTask = 'coreYamlRestTestProxy'
+def coreLuceneTask = 'coreYamlRestTestLucene'
+def coreTests = 'org.opensearch.infino.InfinoCoreYamlTestSuiteIT'
+def coreDenylist = file("${projectDir}/src/yamlRestTest/core-denylist.txt").readLines()
+    .collect { it.trim() }
+    .findAll { it && !it.startsWith('#') }
+
 // The rule-framework module as the distribution lays it out: its jars and a
 // descriptor, zipped the way the test cluster installs a module.
 def ruleFrameworkDescriptor = tasks.register('ruleFrameworkDescriptor', WriteProperties) {
@@ -258,10 +280,53 @@ testClusters.matching { it.name == multiNodeTask }.all {
     systemProperty 'infino.data', System.getProperty('infino.data', multiNodeData)
 }
 
+// The stock suites' clusters, one per mode, each over its own catalog. The
+// lucene one is the same cluster without the plugin: a test failing there
+// fails for the cluster (the security plugin, the single node), not for Infino.
+[(coreTask): 'default', (coreProxyTask): 'proxy', (coreLuceneTask): 'lucene'].each { name, mode ->
+    def data = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-core-${mode}"
+    testClusters.maybeCreate(name)
+    testClusters.matching { it.name == name }.all {
+        if (mode != 'lucene') {
+            plugin(tasks.named('bundlePlugin').flatMap { it.archiveFile })
+        }
+        systemProperty 'infino.uri', System.getProperty('infino.uri', "file://${data}")
+        systemProperty 'infino.data', System.getProperty('infino.data', data)
+        // A refresh behind a write the table keeps refusing waits this long, not a
+        // minute: the stock suites send such writes, and a stalled refresh should
+        // fail its test rather than spend the suite's timeout.
+        systemProperty 'infino.engine.copies.wait.ms', '3000'
+        if (mode == 'proxy') {
+            setting 'infino.default_mode.enabled', 'false'
+        }
+    }
+    tasks.register(name, RestIntegTestTask) {
+        description = mode == 'lucene'
+            ? "Runs OpenSearch's own YAML REST suites on the same cluster without the plugin, as a baseline."
+            : "Runs OpenSearch's own YAML REST suites with every index in ${mode} mode."
+        group = 'verification'
+        testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
+        classpath = sourceSets.yamlRestTest.runtimeClasspath
+        systemProperty 'tests.rest.suite', coreSuites.join(',')
+        if (coreDenylist) {
+            systemProperty 'tests.rest.denylist', coreDenylist.join(',')
+        }
+        filter {
+            includeTestsMatching coreTests
+        }
+        doFirst {
+            delete data
+        }
+    }
+}
+
 // A run that dies before its shards are deleted leaves their tables; each run starts clean.
 tasks.named('yamlRestTest').configure {
+    // Only the plugin's own suites: the stock ones copied beside them run in the core tasks.
+    systemProperty 'tests.rest.suite', 'infino'
     systemProperty 'tests.rest.denylist', "${knnSuite}/*"
     filter {
+        excludeTestsMatching coreTests
         excludeTestsMatching knnTests
         excludeTestsMatching replicaTests
         excludeTestsMatching multiNodeTests

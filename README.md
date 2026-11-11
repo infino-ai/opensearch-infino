@@ -267,6 +267,17 @@ cd plugin && gradle check   # precommit, unit tests, and the REST suites on a te
 ./scripts/check-all.sh      # the same check on every supported release
 ```
 
+OpenSearch's own YAML REST suites (index, get, bulk, update, delete, search, aggregations, scroll and the rest of the document and search APIs, from the release's `rest-api-spec` artifact) run in tasks of their own, outside `check`:
+
+```bash
+cd plugin
+gradle coreYamlRestTest         # every index in default mode
+gradle coreYamlRestTestProxy    # every index in proxy mode
+gradle coreYamlRestTestLucene   # the same cluster without the plugin: the baseline
+```
+
+A test that fails on the baseline fails because of the test cluster (the security plugin, the single node), not because of Infino. Tests to skip go in `plugin/src/yamlRestTest/core-denylist.txt`, one per line, each with the reason.
+
 No OpenSearch checkout is needed: the plugin builds against the release named by `OPENSEARCH_VERSION`, pulled from Maven. `gradle check` builds against one release. The security integration takes a different path on 2.x, on 3.0 to 3.5, and on 3.6 and later, so run `check-all.sh` before relying on any release but the default. Each release's build tools want their own Gradle:
 
 | Releases | Gradle | `check-all.sh` reads it from |

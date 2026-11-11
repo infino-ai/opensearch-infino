@@ -1,0 +1,9 @@
+# Stock YAML REST tests that coreYamlRestTest and coreYamlRestTestProxy skip.
+#
+# One pattern per line, relative to rest-api-spec/test, as the YAML runner's
+# tests.rest.denylist takes it:
+#   search/10_source_filtering/*                   every test in a file
+#   search/10_source_filtering/Source filtering    one test, by its name
+# Blank lines and lines starting with # are ignored. Give each entry a comment
+# saying why it is skipped: a bug to fix, unsupported by design, or a test of
+# Lucene internals.
