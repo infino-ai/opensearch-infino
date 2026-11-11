@@ -15,6 +15,7 @@ import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.mapper.DataStreamFieldMapper;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -334,8 +335,15 @@ public final class InfinoTables {
             EDGE_TABLES.forEach(column -> properties.put(column, Map.of(TYPE, KEYWORD)));
             EDGE_IDS.forEach(column -> properties.put(column, Map.of(TYPE, ENGINE_ID)));
         }
+        Map<String, Object> table = new LinkedHashMap<>();
+        table.put(PROPERTIES, properties);
+        // A data stream's timestamp field, which the bridge requires of each document.
+        Object stream = mapping == null ? null : mapping.sourceAsMap().get(DataStreamFieldMapper.NAME);
+        if (stream != null) {
+            table.put(DataStreamFieldMapper.NAME, stream);
+        }
         try (XContentBuilder b = XContentFactory.jsonBuilder()) {
-            b.map(Map.of(PROPERTIES, properties));
+            b.map(table);
             return BytesReference.bytes(b).utf8ToString();
         } catch (IOException e) {
             throw new UncheckedIOException(e);

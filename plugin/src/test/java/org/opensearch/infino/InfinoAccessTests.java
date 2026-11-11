@@ -4,7 +4,6 @@
 
 package org.opensearch.infino;
 
-import org.apache.lucene.search.join.ScoreMode;
 import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
@@ -110,7 +109,8 @@ public class InfinoAccessTests extends OpenSearchTestCase {
     }
 
     public void testDocumentRuleTheTableCannotAnswerRefuses() {
-        InfinoAccess access = new InfinoAccess(List.of(QueryBuilders.nestedQuery("p", QueryBuilders.matchAllQuery(), ScoreMode.None)), null, null);
+        // A fuzzy query has no counterpart over the table's columns.
+        InfinoAccess access = new InfinoAccess(List.of(QueryBuilders.fuzzyQuery("tag", "x")), null, null);
         OpenSearchSecurityException e = expectThrows(OpenSearchSecurityException.class, () -> access.documentsWhere(cols(), "t", 0));
         assertEquals(RestStatus.FORBIDDEN, e.status());
     }

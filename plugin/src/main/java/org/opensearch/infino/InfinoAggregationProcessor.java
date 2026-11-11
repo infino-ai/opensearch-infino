@@ -1163,14 +1163,20 @@ public class InfinoAggregationProcessor {
             }
         }
 
-        /** The alias a terms order by this metric sorts on, or null when it has no single column. */
-        String orderAlias() {
+        /**
+         * What a terms order by this metric sorts on, over the grouped row's
+         * columns, or null when the metric is no single value of them. An
+         * average is its sum over its count, null for a bucket with no values,
+         * which sorts as stock's NaN does: last ascending, first descending.
+         */
+        String orderExpr() {
             return switch (kind) {
                 case VALUE_COUNT -> alias + "_c";
                 case SUM -> alias + "_s";
                 case MIN, MAX -> alias + "_v";
                 case CARDINALITY -> alias + "_d";
-                case AVG, PERCENTILES, PERCENTILE_RANKS, FILTER -> null;
+                case AVG -> "(CAST(" + alias + "_s AS DOUBLE) / NULLIF(" + alias + "_c, 0))";
+                case PERCENTILES, PERCENTILE_RANKS, FILTER -> null;
             };
         }
 
@@ -2469,15 +2475,16 @@ public class InfinoAggregationProcessor {
             return "{key} DESC";
         }
         for (Metric m : metrics) {
-            if (m.orderAlias() == null) {
+            String expr = m.orderExpr();
+            if (expr == null) {
                 continue;
             }
             String name = m.builder.getName();
             if (order.equals(BucketOrder.aggregation(name, true))) {
-                return m.orderAlias() + " ASC";
+                return expr + " ASC";
             }
             if (order.equals(BucketOrder.aggregation(name, false))) {
-                return m.orderAlias() + " DESC";
+                return expr + " DESC";
             }
         }
         return null;

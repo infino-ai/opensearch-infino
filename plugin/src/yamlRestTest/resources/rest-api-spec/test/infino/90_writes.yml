@@ -333,6 +333,7 @@
           - { "@timestamp": "2023-01-01T00:00:02Z", message: two }
   - match: { errors: false }
   - match: { items.0.create._index: "/^\\.ds-ds-logs-/" }
+  - set: { items.0.create._index: backing, items.0.create._id: first }
   - do:
       count:
         index: ds-logs
@@ -365,6 +366,27 @@
       count:
         index: ds-logs
   - match: { count: 2 }
+
+  # An update sent straight to a backing index is checked once merged:
+  # one that clears the timestamp is refused, one that keeps it is served.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - update: { _index: $backing, _id: $first }
+          - { doc: { "@timestamp": null } }
+  - match: { errors: true }
+  - match: { items.0.update.status: 400 }
+  - match: { items.0.update.error.type: mapper_parsing_exception }
+  - match: { items.0.update.error.caused_by.reason: '/.*single-valued\stimestamp\sfield.*@timestamp.*/' }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - update: { _index: $backing, _id: $first }
+          - { doc: { message: uno } }
+  - match: { errors: false }
+  - match: { items.0.update.result: updated }
 
   # After a rollover, a write lands in the new write index and reads span both.
   - do:

@@ -7,6 +7,9 @@ package org.opensearch.infino;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateMathParser;
+import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
@@ -15,6 +18,7 @@ import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.MatchPhraseQueryBuilder;
 import org.opensearch.index.query.MatchQueryBuilder;
 import org.opensearch.index.query.MultiMatchQueryBuilder;
+import org.opensearch.index.query.NestedQueryBuilder;
 import org.opensearch.index.query.Operator;
 import org.opensearch.index.query.PrefixQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
@@ -37,13 +41,20 @@ import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoScriptTranslator.Sql;
 import org.opensearch.infino.InfinoScriptTranslator.SqlType;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.function.BiPredicate;
 import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.ToIntFunction;
 import java.util.regex.Pattern;
 
 /**
@@ -68,6 +79,13 @@ import java.util.regex.Pattern;
  * clause occurrences as {@code +} / {@code -} sigils, and its field
  * clauses, ranges, wildcards and regular expressions become predicates on
  * those columns. Nothing materializes a match set in Java.
+ *
+ * <p>A nested query (an entry of an array of objects matching, every
+ * clause on that one entry) is checked entry by entry: the table's columns
+ * hold each member field's values flattened across the entries, so they
+ * narrow the documents to those that may match, and each of those
+ * document's source is read to find an entry that does. See
+ * {@link #nested}.
  *
  * <p>A query the table cannot answer translates to {@code null}; the
  * caller then falls back to the stock query phase.
@@ -123,6 +141,12 @@ final class InfinoQueryTranslator {
     static final String ALL = "1=1";
     /** Predicate that keeps no row. */
     static final String NONE = "1=0";
+    /**
+     * How many documents a nested query's columns may leave to be checked
+     * entry by entry, each by its source; past this the query is refused
+     * rather than read whole. {@code -Dinfino.nested.candidates.max}.
+     */
+    static final int NESTED_CANDIDATES_MAX = Integer.getInteger("infino.nested.candidates.max", 10_000);
 
     /** One full-text clause on a text-indexed column. */
     record TextClause(String column, String query, String mode) {}
@@ -176,6 +200,8 @@ final class InfinoQueryTranslator {
      * a text clause's subquery over the token index cannot go.
      */
     private final boolean columnValuesOnly;
+    /** How the translator reads rows of the table: a nested query's candidates, with their sources. */
+    private final Function<String, List<Map<String, Object>>> rows;
     private TextClause principal;
 
     private InfinoQueryTranslator(Map<String, Column> cols, String table, long nowMillis, boolean trusted) {
@@ -183,16 +209,33 @@ final class InfinoQueryTranslator {
     }
 
     private InfinoQueryTranslator(Map<String, Column> cols, String table, long nowMillis, boolean trusted, boolean columnValuesOnly) {
+        this(cols, table, nowMillis, trusted, columnValuesOnly, InfinoNative::sqlRows);
+    }
+
+    private InfinoQueryTranslator(
+        Map<String, Column> cols,
+        String table,
+        long nowMillis,
+        boolean trusted,
+        boolean columnValuesOnly,
+        Function<String, List<Map<String, Object>>> rows
+    ) {
         this.cols = cols;
         this.table = table;
         this.nowMillis = nowMillis;
         this.trusted = trusted;
         this.columnValuesOnly = columnValuesOnly;
+        this.rows = rows;
     }
 
     /** Translate, or {@code null} when the query is not answerable over the table's columns. */
     static Translation translate(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis) {
-        InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, false);
+        return translate(qb, cols, table, nowMillis, InfinoNative::sqlRows);
+    }
+
+    /** {@link #translate(QueryBuilder, Map, String, long)}, reading the table's rows through {@code rows}. */
+    static Translation translate(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis, Function<String, List<Map<String, Object>>> rows) {
+        InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, false, false, rows);
         String where = t.predicate(qb, true);
         if (where == null) {
             return null;
@@ -472,6 +515,9 @@ final class InfinoQueryTranslator {
         if (qb instanceof BoolQueryBuilder b) {
             return bool(b, positive);
         }
+        if (qb instanceof NestedQueryBuilder n) {
+            return nested(n);
+        }
         if (qb instanceof ScriptQueryBuilder sq) {
             // The script as a column expression; it must yield a boolean to filter.
             // A script reads values themselves, so a user's sees no masked column.
@@ -572,6 +618,468 @@ final class InfinoQueryTranslator {
         } catch (NumberFormatException e) {
             return 1;
         }
+    }
+
+    // ---- nested ----
+
+    /**
+     * A nested query: the documents with an entry of the array of objects at
+     * its path on which the inner query holds, every clause of it on that
+     * one entry. Dashboards' {@code has_reference} is one: a saved object
+     * whose references hold an entry with both the id and the type asked
+     * for, not the id in one entry and the type in another.
+     *
+     * <p>The table flattens an array of objects into one column per member
+     * field, holding the values of every entry ({@code references.id},
+     * {@code references.type}), which loses which values share an entry. So
+     * the columns only narrow the documents to those that may match: the
+     * inner query read over the flattened values, its negations left out
+     * ({@link #mayMatch}). Each of those is then checked by its source, entry
+     * by entry ({@link #entryTest}), and the clause becomes the ids of the
+     * documents that hold a matching entry. A clause the check cannot read
+     * refuses the query with the clause named, as does a narrowing that
+     * leaves more than {@link #NESTED_CANDIDATES_MAX} documents: never an
+     * answer read over the flattened values.
+     */
+    private String nested(NestedQueryBuilder n) {
+        String path = n.path();
+        if (n.innerHit() != null) {
+            throw new IllegalArgumentException("[infino] inner_hits on the nested query on [" + path + "] is not served by the table");
+        }
+        Predicate<Map<String, Object>> test = entryTest(n.query(), path, path);
+        // An entry with no value at all matches only a query that needs none
+        // (match_all, a must_not); then no column narrows the documents, and
+        // each one's entries are read from its source alone.
+        boolean emptyEntryMatches = test.test(Map.of());
+        String present = exists(path);
+        if (NONE.equals(present) && !emptyEntryMatches) {
+            return NONE;
+        }
+        // The narrowing reads every column's values, as a predicate the engine runs here, not in a vector search.
+        InfinoQueryTranslator wide = columnValuesOnly ? new InfinoQueryTranslator(cols, table, nowMillis, trusted, false, rows) : this;
+        String narrowed = emptyEntryMatches ? ALL : and(List.of(present, wide.mayMatch(n.query())));
+        List<Map<String, Object>> candidates = rows.apply(
+            "SELECT " + OSID + ", " + SOURCE + " FROM " + quoteIdent(table) + " WHERE " + narrowed + " LIMIT " + (NESTED_CANDIDATES_MAX + 1)
+        );
+        if (candidates.size() > NESTED_CANDIDATES_MAX) {
+            throw new IllegalArgumentException(
+                "[infino] the nested query on ["
+                    + path
+                    + "] leaves more than "
+                    + NESTED_CANDIDATES_MAX
+                    + " documents to check entry by entry, which the table does not serve: "
+                    + n.query()
+            );
+        }
+        List<String> ids = new ArrayList<>();
+        for (Map<String, Object> row : candidates) {
+            Object id = row.get(OSID);
+            Object source = row.get(SOURCE);
+            List<Map<String, Object>> entries = source == null
+                ? List.of()
+                : entries(XContentHelper.convertToMap(new BytesArray(source.toString()), false, MediaTypeRegistry.JSON).v2(), path);
+            if (entries.isEmpty() && !emptyEntryMatches) {
+                // Its columns hold values under the path its source does not: its entries cannot be read, so neither can the answer.
+                throw new IllegalArgumentException(
+                    "[infino] the nested query on [" + path + "] is not served: document [" + id + "] has values under [" + path + "] its source does not hold"
+                );
+            }
+            for (Map<String, Object> entry : entries) {
+                if (test.test(entry)) {
+                    ids.add(literal(String.valueOf(id)));
+                    break;
+                }
+            }
+        }
+        return ids.isEmpty() ? NONE : OSID + " IN (" + String.join(", ", ids) + ")";
+    }
+
+    /** The predicates all holding: the one there is, or their conjunction; every row for none. */
+    private static String and(List<String> predicates) {
+        List<String> kept = new ArrayList<>();
+        for (String p : predicates) {
+            if (!ALL.equals(p)) {
+                kept.add(p);
+            }
+        }
+        if (kept.isEmpty()) {
+            return ALL;
+        }
+        return kept.size() == 1 ? kept.get(0) : "(" + String.join(" AND ", kept) + ")";
+    }
+
+    /**
+     * A predicate over the flattened columns that holds wherever a nested
+     * query's inner query may hold on an entry: each clause on the values of
+     * every entry together. A negation, or a clause the columns cannot read,
+     * narrows nothing, so every row it would decide stays a candidate.
+     */
+    private String mayMatch(QueryBuilder qb) {
+        if (qb instanceof BoolQueryBuilder b) {
+            List<String> and = new ArrayList<>();
+            for (QueryBuilder c : b.must()) {
+                and.add(mayMatch(c));
+            }
+            for (QueryBuilder c : b.filter()) {
+                and.add(mayMatch(c));
+            }
+            boolean nothingRequired = b.must().isEmpty() && b.filter().isEmpty();
+            if (!b.should().isEmpty() && minimumShouldMatch(b.minimumShouldMatch(), b.should().size(), nothingRequired) > 0) {
+                List<String> or = new ArrayList<>();
+                for (QueryBuilder c : b.should()) {
+                    or.add(mayMatch(c));
+                }
+                if (!or.contains(ALL)) {
+                    and.add("(" + String.join(" OR ", or) + ")");
+                }
+            }
+            return and(and);
+        }
+        if (qb instanceof NestedQueryBuilder inner) {
+            return mayMatch(inner.query());
+        }
+        if (qb instanceof TermQueryBuilder
+            || qb instanceof TermsQueryBuilder
+            || qb instanceof RangeQueryBuilder
+            || qb instanceof ExistsQueryBuilder
+            || qb instanceof MatchQueryBuilder
+            || qb instanceof MatchNoneQueryBuilder) {
+            String p = predicate(qb, false);
+            return p == null ? ALL : p;
+        }
+        return ALL;
+    }
+
+    /**
+     * Whether an entry of the nested query on {@code path} matches {@code qb},
+     * its fields read from the entry, which sits at {@code scope} (the path
+     * itself, or a deeper nested query's). A clause on a field outside the
+     * scope matches nothing, as in stock, whose nested documents hold only
+     * their own fields; a field the table has no column for (unmapped, or
+     * not visible to the request) matches nothing either. Throws naming the
+     * clause the check cannot read.
+     */
+    private Predicate<Map<String, Object>> entryTest(QueryBuilder qb, String path, String scope) {
+        if (qb == null || qb instanceof MatchAllQueryBuilder) {
+            return e -> true;
+        }
+        if (qb instanceof MatchNoneQueryBuilder) {
+            return e -> false;
+        }
+        if (qb instanceof TermQueryBuilder t) {
+            Object q = t.value();
+            return entryValue(t.fieldName(), qb, path, scope, (c, v) -> sameValue(c, v, q));
+        }
+        if (qb instanceof TermsQueryBuilder ts) {
+            if (ts.termsLookup() != null) {
+                throw notInNested(qb, path, "a terms lookup");
+            }
+            List<Object> qs = ts.values() == null ? List.of() : ts.values();
+            return entryValue(ts.fieldName(), qb, path, scope, (c, v) -> {
+                for (Object q : qs) {
+                    if (sameValue(c, v, q)) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+        }
+        if (qb instanceof MatchQueryBuilder m) {
+            // A match on an exact field is an equality, as the translator reads it elsewhere.
+            Object q = m.value();
+            return entryValue(m.fieldName(), qb, path, scope, (c, v) -> sameValue(c, v, q));
+        }
+        if (qb instanceof RangeQueryBuilder r) {
+            return entryValue(r.fieldName(), qb, path, scope, (c, v) -> inRange(c, v, r));
+        }
+        if (qb instanceof ExistsQueryBuilder e) {
+            return entryExists(e, path, scope);
+        }
+        if (qb instanceof BoolQueryBuilder b) {
+            List<Predicate<Map<String, Object>>> required = new ArrayList<>();
+            for (QueryBuilder c : b.must()) {
+                required.add(entryTest(c, path, scope));
+            }
+            for (QueryBuilder c : b.filter()) {
+                required.add(entryTest(c, path, scope));
+            }
+            List<Predicate<Map<String, Object>>> optional = new ArrayList<>();
+            for (QueryBuilder c : b.should()) {
+                optional.add(entryTest(c, path, scope));
+            }
+            List<Predicate<Map<String, Object>>> prohibited = new ArrayList<>();
+            for (QueryBuilder c : b.mustNot()) {
+                prohibited.add(entryTest(c, path, scope));
+            }
+            boolean nothingRequired = required.isEmpty();
+            int atLeast = optional.isEmpty() ? 0 : Math.min(minimumShouldMatch(b.minimumShouldMatch(), optional.size(), nothingRequired), optional.size());
+            return e -> {
+                for (Predicate<Map<String, Object>> p : required) {
+                    if (!p.test(e)) {
+                        return false;
+                    }
+                }
+                for (Predicate<Map<String, Object>> p : prohibited) {
+                    if (p.test(e)) {
+                        return false;
+                    }
+                }
+                int matched = 0;
+                for (Predicate<Map<String, Object>> p : optional) {
+                    if (matched >= atLeast) {
+                        break;
+                    }
+                    if (p.test(e)) {
+                        matched++;
+                    }
+                }
+                return matched >= atLeast;
+            };
+        }
+        if (qb instanceof NestedQueryBuilder inner) {
+            if (inner.innerHit() != null) {
+                throw new IllegalArgumentException("[infino] inner_hits on the nested query on [" + inner.path() + "] is not served by the table");
+            }
+            String sub = relative(inner.path(), scope);
+            if (sub == null) {
+                throw notInNested(qb, path, "a nested query on [" + inner.path() + "], which is not under [" + scope + "]");
+            }
+            Predicate<Map<String, Object>> test = entryTest(inner.query(), path, inner.path());
+            return e -> {
+                for (Map<String, Object> entry : entries(e, sub)) {
+                    if (test.test(entry)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+        }
+        throw notInNested(qb, path, null);
+    }
+
+    /** The refusal of a clause inside a nested query the entry check does not read. */
+    private static IllegalArgumentException notInNested(QueryBuilder qb, String path, String what) {
+        return new IllegalArgumentException(
+            "[infino] ["
+                + qb.getWriteableName()
+                + "]"
+                + (what == null ? "" : " on " + what)
+                + " inside the nested query on ["
+                + path
+                + "] is not served by the table; inside one it serves term, terms, match, range and exists on keyword,"
+                + " numeric and boolean fields, combined by bool or a deeper nested query"
+        );
+    }
+
+    /**
+     * An entry holding a value of {@code field} that passes {@code test}, the
+     * field read through its column (so a field masked for the user is
+     * refused, and one the user may not see matches nothing). A text field
+     * would be matched by its analyzed terms and a date by its parsed
+     * instant, which the check does not reproduce: refused.
+     */
+    private Predicate<Map<String, Object>> entryValue(
+        String field,
+        QueryBuilder clause,
+        String path,
+        String scope,
+        BiPredicate<Column, Object> test
+    ) {
+        Column c = column(field);
+        if (c == null) {
+            return e -> false;
+        }
+        if (c.fts()) {
+            throw notInNested(clause, path, "the text field [" + field + "]");
+        }
+        if (!(c.isString() || c.isNumeric() || c.isBoolean())) {
+            throw notInNested(clause, path, "the " + (c.isTimestamp() ? "date" : c.type()) + " field [" + field + "]");
+        }
+        String rel = relative(c.name(), scope);
+        if (rel == null) {
+            return e -> false;
+        }
+        return e -> {
+            for (Object v : valuesAt(e, rel)) {
+                if (test.test(c, v)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+    }
+
+    /** An entry with a value of the field, or of any field under it when it is an object. */
+    private Predicate<Map<String, Object>> entryExists(ExistsQueryBuilder e, String path, String scope) {
+        String field = e.fieldName();
+        if (org.opensearch.common.regex.Regex.isSimpleMatchPattern(field)) {
+            throw notInNested(e, path, "the pattern [" + field + "]");
+        }
+        List<String> rels = new ArrayList<>();
+        Column c = resolve(field);
+        if (c != null) {
+            String rel = relative(c.name(), scope);
+            if (rel != null) {
+                rels.add(rel);
+            }
+        } else {
+            for (Column sub : cols.values()) {
+                String rel = relative(sub.name(), scope);
+                if (rel != null && !sub.isList() && sub.name().startsWith(field + ".") && !rels.contains(rel)) {
+                    rels.add(rel);
+                }
+            }
+        }
+        return entry -> {
+            for (String rel : rels) {
+                if (!valuesAt(entry, rel).isEmpty()) {
+                    return true;
+                }
+            }
+            return false;
+        };
+    }
+
+    /** {@code name} relative to {@code scope}, or null when it is not under it. */
+    private static String relative(String name, String scope) {
+        return name.startsWith(scope + ".") ? name.substring(scope.length() + 1) : null;
+    }
+
+    /** The entries of the array of objects at {@code path} in a document or entry: one object is one entry. */
+    @SuppressWarnings("unchecked")
+    static List<Map<String, Object>> entries(Map<String, Object> doc, String path) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Object o : valuesAt(doc, path)) {
+            if (o instanceof Map<?, ?> m) {
+                out.add((Map<String, Object>) m);
+            }
+        }
+        return out;
+    }
+
+    /** Every non-null value at {@code path} under {@code node}, arrays read through, a key holding dots read as its path. */
+    static List<Object> valuesAt(Object node, String path) {
+        List<Object> out = new ArrayList<>();
+        collect(node, path.split("\\."), 0, out);
+        return out;
+    }
+
+    private static void collect(Object node, String[] parts, int at, List<Object> out) {
+        if (node instanceof List<?> list) {
+            for (Object o : list) {
+                collect(o, parts, at, out);
+            }
+            return;
+        }
+        if (at == parts.length) {
+            if (node != null) {
+                out.add(node);
+            }
+            return;
+        }
+        if (node instanceof Map<?, ?> map) {
+            StringBuilder key = new StringBuilder();
+            for (int j = at; j < parts.length; j++) {
+                if (j > at) {
+                    key.append('.');
+                }
+                key.append(parts[j]);
+                if (map.containsKey(key.toString())) {
+                    collect(map.get(key.toString()), parts, j + 1, out);
+                }
+            }
+        }
+    }
+
+    /**
+     * Whether a source value equals a query value as the field indexes both:
+     * a keyword its text, a long its integer part (a long field indexes 5.7
+     * as 5), a double its number, a boolean its truth.
+     */
+    private static boolean sameValue(Column c, Object v, Object q) {
+        if (v == null || q == null) {
+            return false;
+        }
+        if (c.isString()) {
+            return v.toString().equals(q.toString());
+        }
+        if (c.isNumeric()) {
+            BigDecimal a = indexed(c, v);
+            BigDecimal b = decimal(q);
+            return a != null && b != null && a.compareTo(b) == 0;
+        }
+        if (c.isBoolean()) {
+            Boolean a = truth(v);
+            return a != null && a.equals(truth(q));
+        }
+        return false;
+    }
+
+    /** Whether a source value lies within a range, compared as the field indexes it (a keyword by its UTF-8 bytes). */
+    private static boolean inRange(Column c, Object v, RangeQueryBuilder r) {
+        if (v == null) {
+            return false;
+        }
+        if (c.isString()) {
+            byte[] x = v.toString().getBytes(StandardCharsets.UTF_8);
+            return within(r, b -> Arrays.compareUnsigned(x, b.toString().getBytes(StandardCharsets.UTF_8)));
+        }
+        if (c.isNumeric()) {
+            BigDecimal x = indexed(c, v);
+            if (x == null) {
+                return false;
+            }
+            return within(r, b -> {
+                BigDecimal bound = decimal(b);
+                if (bound == null) {
+                    throw new IllegalArgumentException("[infino] the range on [" + r.fieldName() + "] has the bound [" + b + "], which is not a number");
+                }
+                return x.compareTo(bound);
+            });
+        }
+        return false;
+    }
+
+    /** Whether a value, compared to each bound by {@code compareTo} (the value's order against the bound), lies within the range. */
+    private static boolean within(RangeQueryBuilder r, ToIntFunction<Object> compareTo) {
+        if (r.from() != null) {
+            int cmp = compareTo.applyAsInt(r.from());
+            if (r.includeLower() ? cmp < 0 : cmp <= 0) {
+                return false;
+            }
+        }
+        if (r.to() != null) {
+            int cmp = compareTo.applyAsInt(r.to());
+            if (r.includeUpper() ? cmp > 0 : cmp >= 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** A source value of a numeric field as the field indexes it: a long's integer part, a double whole. */
+    private static BigDecimal indexed(Column c, Object v) {
+        BigDecimal d = decimal(v);
+        return d != null && "i64".equals(c.type()) ? d.setScale(0, RoundingMode.DOWN) : d;
+    }
+
+    private static BigDecimal decimal(Object v) {
+        if (v instanceof Map<?, ?> || v instanceof List<?> || v instanceof Boolean) {
+            return null;
+        }
+        try {
+            return new BigDecimal(v.toString().trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static Boolean truth(Object v) {
+        if (v instanceof Boolean b) {
+            return b;
+        }
+        String s = v.toString();
+        return "true".equals(s) ? Boolean.TRUE : "false".equals(s) ? Boolean.FALSE : null;
     }
 
     // ---- full text ----
