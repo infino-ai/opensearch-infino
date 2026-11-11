@@ -1,0 +1,82 @@
+# OpenSearch + the Infino engine plugin, single node.
+#
+#   cp env.example .env      # set OPENSEARCH_ADMIN_PASSWORD (and INFINO_API_KEY for cloud)
+#   docker compose up --build
+#   curl -sk -u "admin:$OPENSEARCH_ADMIN_PASSWORD" https://localhost:9200/_plugins/_infino/account
+#
+# Storage: INFINO_STORAGE=local (default, tables on the infino-data volume) or cloud
+# (an Infino Cloud account). To change storage, run
+# `docker compose down -v` first. Dashboards: docker compose --profile dashboards up
+
+name: opensearch-infino
+
+services:
+  opensearch:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        OPENSEARCH_VERSION: ${OPENSEARCH_VERSION:-3.9.0}
+        GRADLE_IMAGE: ${GRADLE_IMAGE:-gradle:9-jdk21}
+        REMOVE_NEURAL_SEARCH: ${REMOVE_NEURAL_SEARCH:-true}
+        RUST_TOOLCHAIN: ${RUST_TOOLCHAIN:-1.95.0}
+    image: opensearch-infino:${OPENSEARCH_VERSION:-3.9.0}
+    container_name: opensearch-infino
+    environment:
+      # --- OpenSearch ---
+      cluster.name: ${CLUSTER_NAME:-opensearch-infino}
+      node.name: opensearch-infino
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: ${OPENSEARCH_JAVA_OPTS:--Xms1g -Xmx1g}
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_ADMIN_PASSWORD:?set OPENSEARCH_ADMIN_PASSWORD in .env}
+      DISABLE_PERFORMANCE_ANALYZER_AGENT_CLI: "true"
+
+      # --- Infino plugin (see docker/infino-entrypoint.sh) ---
+      INFINO_STORAGE: ${INFINO_STORAGE:-local}            # local | cloud | memory
+      INFINO_API_KEY: ${INFINO_API_KEY:-}                 # cloud
+      INFINO_PLATFORM_URL: ${INFINO_PLATFORM_URL:-https://api.platform.infino.ws}
+      INFINO_DATABASE: ${INFINO_DATABASE:-}               # cloud; defaults to cluster.name
+      INFINO_URI: ${INFINO_URI:-}                         # local; defaults to the infino-data volume
+      INFINO_LOG_LEVEL: ${INFINO_LOG_LEVEL:-}             # e.g. DEBUG logs the SQL each request runs
+
+      # Plain node settings pass straight through (empty values are ignored).
+      infino.index.default_enabled: ${INFINO_INDEX_DEFAULT_ENABLED:-}
+      infino.default_mode.enabled: ${INFINO_DEFAULT_MODE_ENABLED:-}
+      infino.sql.max_result_size: ${INFINO_SQL_MAX_RESULT_SIZE:-}
+
+      # Bucket credentials for INFINO_URI=s3://... (unused otherwise).
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_REGION: ${AWS_REGION:-}
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+      - infino-data:/usr/share/opensearch/infino/data
+    ports:
+      - "${OPENSEARCH_PORT:-9200}:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk -u \"admin:$$OPENSEARCH_INITIAL_ADMIN_PASSWORD\" https://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  dashboards:
+    profiles: [dashboards]
+    image: opensearchproject/opensearch-dashboards:${DASHBOARDS_VERSION:-${OPENSEARCH_VERSION:-3.9.0}}
+    container_name: opensearch-infino-dashboards
+    environment:
+      OPENSEARCH_HOSTS: '["https://opensearch:9200"]'
+    ports:
+      - "${DASHBOARDS_PORT:-5601}:5601"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+volumes:
+  opensearch-data:
+  infino-data:

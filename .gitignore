@@ -13,3 +13,6 @@ bench/*.out
 
 # OS / editor
 .DS_Store
+
+# Docker compose secrets
+.env
