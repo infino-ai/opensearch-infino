@@ -163,7 +163,7 @@ PUT _ingest/pipeline/embed
 
 ## Hosted account and stateless nodes
 
-With an Infino account, the tables live on the hosted service. It runs the engine, compacts the tables, and serves Infino's own APIs (SQL, search, and tools for AI agents) over the same data. The account stores the tables in an Infino bucket or in your own bucket, with customer-managed encryption keys (CMEK) supported. The node holds no table data.
+With an Infino account, the tables live on the hosted service. It runs the engine, compacts the tables, and serves Infino's own SQL and search APIs over the same data. The account stores the tables in an Infino bucket or in your own bucket, with customer-managed encryption keys (CMEK) supported. The node holds no table data.
 
 The account is node configuration, read at startup:
 
