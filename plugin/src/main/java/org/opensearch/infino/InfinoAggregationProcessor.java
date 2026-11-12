@@ -1663,14 +1663,17 @@ public class InfinoAggregationProcessor {
                 }
                 wrapper.fixedInterval(fixed);
             } else if (calendar != null) {
-                if (offset != 0) {
-                    throw new Unsupported("aggregation [" + agg + "] combines a calendar interval with an offset");
-                }
                 String unit = calendarUnit(calendar);
                 if (unit == null) {
                     throw new Unsupported("aggregation [" + agg + "] has calendar interval [" + calendar + "]; one unit at a time is served");
                 }
-                keyExpr = "date_trunc('" + unit + "', " + source + ")";
+                if (offset == 0) {
+                    keyExpr = "date_trunc('" + unit + "', " + source + ")";
+                } else {
+                    // As stock's offset rounding: the unit's start, shifted by the offset, holds the date.
+                    String shift = "INTERVAL '" + offset + " milliseconds'";
+                    keyExpr = "(date_trunc('" + unit + "', " + source + " - " + shift + ") + " + shift + ")";
+                }
                 wrapper.calendarInterval(calendar);
             } else {
                 throw new Unsupported("aggregation [" + agg + "] names no interval");
@@ -1872,7 +1875,8 @@ public class InfinoAggregationProcessor {
                 buckets,
                 minDocCount,
                 date.offset(),
-                date.rounding(),
+                // The reduce adds the offset to each empty bucket itself, as stock's aggregator expects.
+                date.rounding().withoutOffset(),
                 empty,
                 date.bounds(),
                 date.format(),
@@ -2317,7 +2321,9 @@ public class InfinoAggregationProcessor {
             }
             if (s instanceof DateHistogramValuesSourceBuilder dh) {
                 ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
-                Grouped.DateExpr expr = Grouped.dateExpr(agg, c, tz, dh.getIntervalAsFixed(), dh.getIntervalAsCalendar(), dh.offset());
+                DateHistogramInterval calendar = calendarOf(dh);
+                DateHistogramInterval fixed = calendar == null ? dh.getIntervalAsFixed() : null;
+                Grouped.DateExpr expr = Grouped.dateExpr(agg, c, tz, fixed, calendar, dh.offset());
                 // As stock: the key is epoch milliseconds unless the source names a format.
                 DocValueFormat format = s.format() == null ? DocValueFormat.RAW : Grouped.dateFormat(s.format(), c, tz);
                 return new CompositeSource(s.name(), c, expr.keyExpr(), KeyKind.DATE, format, desc, s.missingBucket(), missing);
@@ -2327,6 +2333,20 @@ public class InfinoAggregationProcessor {
                 return new CompositeSource(s.name(), c, keyExpr, KeyKind.DOUBLE, DocValueFormat.RAW, desc, s.missingBucket(), missing);
             }
             throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] of type [" + s.getClass().getSimpleName() + "] is not served");
+        }
+
+        /**
+         * The calendar interval of a composite date source, or null when its interval is fixed.
+         * The source does not say which kind the request wrote, and each getter throws for the
+         * other kind; the calendar getter answers only for a calendar interval, so trying it first
+         * picks the kind in the order stock's rounding does.
+         */
+        private static DateHistogramInterval calendarOf(DateHistogramValuesSourceBuilder dh) {
+            try {
+                return dh.getIntervalAsCalendar();
+            } catch (IllegalStateException fixed) {
+                return null;
+            }
         }
 
         /** The after value of a source as an SQL literal, read as the source's key kind. */

@@ -312,3 +312,75 @@
   - match: { aggregations.days.buckets.0.doc_count: 2 }
   - match: { aggregations.days.buckets.1.doc_count: 3 }
   - match: { aggregations.days.buckets.2.doc_count: 3 }
+
+  # composite over calendar and fixed intervals, whatever unit they are written in.
+  - do:
+      search:
+        index: shop
+        body:
+          size: 0
+          aggs:
+            days:
+              composite:
+                sources:
+                  - day: { date_histogram: { field: "@timestamp", calendar_interval: day } }
+            weeks:
+              composite:
+                sources:
+                  - week: { date_histogram: { field: "@timestamp", calendar_interval: week } }
+            halves:
+              composite:
+                sources:
+                  - half: { date_histogram: { field: "@timestamp", fixed_interval: 12h } }
+  - length: { aggregations.days.buckets: 3 }
+  - match: { aggregations.days.buckets.0: { key: { day: 1792800000000 }, doc_count: 3 } }
+  - match: { aggregations.days.buckets.1: { key: { day: 1792886400000 }, doc_count: 3 } }
+  - match: { aggregations.days.buckets.2: { key: { day: 1792972800000 }, doc_count: 2 } }
+  - length: { aggregations.weeks.buckets: 2 }
+  - match: { aggregations.weeks.buckets.0: { key: { week: 1792368000000 }, doc_count: 6 } }
+  - match: { aggregations.weeks.buckets.1: { key: { week: 1792972800000 }, doc_count: 2 } }
+  - length: { aggregations.halves.buckets: 5 }
+  - match: { aggregations.halves.buckets.0: { key: { half: 1792800000000 }, doc_count: 2 } }
+  - match: { aggregations.halves.buckets.1: { key: { half: 1792843200000 }, doc_count: 1 } }
+  - match: { aggregations.halves.buckets.2: { key: { half: 1792886400000 }, doc_count: 2 } }
+  - match: { aggregations.halves.buckets.3: { key: { half: 1792929600000 }, doc_count: 1 } }
+  - match: { aggregations.halves.buckets.4: { key: { half: 1792972800000 }, doc_count: 2 } }
+
+  # Intervals with an offset: calendar days start at 11:00, in UTC and then in +01:00; 12h buckets
+  # start at 05:00 and 17:00, the empty ones between days filled in.
+  - do:
+      search:
+        index: shop
+        body:
+          size: 0
+          aggs:
+            days:
+              composite:
+                sources:
+                  - day: { date_histogram: { field: "@timestamp", calendar_interval: day, offset: "+11h" } }
+            hist:
+              date_histogram: { field: "@timestamp", calendar_interval: day, offset: "+11h" }
+            zoned:
+              date_histogram: { field: "@timestamp", calendar_interval: day, offset: "+11h", time_zone: "+01:00" }
+            fixed:
+              date_histogram: { field: "@timestamp", fixed_interval: 12h, offset: "+5h" }
+  - length: { aggregations.days.buckets: 4 }
+  - match: { aggregations.days.buckets.0: { key: { day: 1792753200000 }, doc_count: 1 } }
+  - match: { aggregations.days.buckets.1: { key: { day: 1792839600000 }, doc_count: 3 } }
+  - match: { aggregations.days.buckets.2: { key: { day: 1792926000000 }, doc_count: 3 } }
+  - match: { aggregations.days.buckets.3: { key: { day: 1793012400000 }, doc_count: 1 } }
+  - length: { aggregations.hist.buckets: 4 }
+  - match: { aggregations.hist.buckets.0.key: 1792753200000 }
+  - match: { aggregations.hist.buckets.1.doc_count: 3 }
+  - match: { aggregations.hist.buckets.3.key: 1793012400000 }
+  - match: { aggregations.hist.buckets.3.doc_count: 1 }
+  - length: { aggregations.zoned.buckets: 3 }
+  - match: { aggregations.zoned.buckets.0: { key_as_string: "2026-10-24T11:00:00.000+01:00", key: 1792836000000, doc_count: 3 } }
+  - match: { aggregations.zoned.buckets.1: { key_as_string: "2026-10-25T11:00:00.000+01:00", key: 1792922400000, doc_count: 3 } }
+  - match: { aggregations.zoned.buckets.2: { key_as_string: "2026-10-26T11:00:00.000+01:00", key: 1793008800000, doc_count: 2 } }
+  - length: { aggregations.fixed.buckets: 5 }
+  - match: { aggregations.fixed.buckets.0: { key_as_string: "2026-10-24T05:00:00.000Z", key: 1792818000000, doc_count: 3 } }
+  - match: { aggregations.fixed.buckets.1: { key_as_string: "2026-10-24T17:00:00.000Z", key: 1792861200000, doc_count: 0 } }
+  - match: { aggregations.fixed.buckets.2: { key_as_string: "2026-10-25T05:00:00.000Z", key: 1792904400000, doc_count: 3 } }
+  - match: { aggregations.fixed.buckets.3: { key_as_string: "2026-10-25T17:00:00.000Z", key: 1792947600000, doc_count: 0 } }
+  - match: { aggregations.fixed.buckets.4: { key_as_string: "2026-10-26T05:00:00.000Z", key: 1792990800000, doc_count: 2 } }
