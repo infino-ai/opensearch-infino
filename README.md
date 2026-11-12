@@ -163,7 +163,7 @@ PUT _ingest/pipeline/embed
 
 ## Hosted account and stateless nodes
 
-With an Infino account, the tables live on the hosted service. It runs the engine, compacts the tables, and serves the agent and search APIs over the same data. The account stores the tables in an Infino bucket or in your own bucket, with customer-managed encryption keys (CMEK) supported. The node holds no table data.
+With an Infino account, the tables live on the hosted service. It runs the engine, compacts the tables, and serves Infino's own APIs (SQL, search, and tools for AI agents) over the same data. The account stores the tables in an Infino bucket or in your own bucket, with customer-managed encryption keys (CMEK) supported. The node holds no table data.
 
 The account is node configuration, read at startup:
 
@@ -319,7 +319,6 @@ No OpenSearch checkout is needed: the plugin builds against the release named by
 | `infino-capi/` | The native bridge, a Rust `cdylib` over the `infino` crate: JSON in, JSON out, with every document checked against the declared columns. |
 | `scripts/` | `build.sh`, `run.sh` (install into a distribution and start a node) and `check-all.sh`. |
 | `bench/` | `bench.py`: indexing and query latency against stock Lucene. |
-| `HANDOVER.md` | Design notes from the first prototype; historical, and out of date where it differs from this README. |
 
 ## License
 
