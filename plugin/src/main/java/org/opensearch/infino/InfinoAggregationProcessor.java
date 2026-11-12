@@ -1663,14 +1663,17 @@ public class InfinoAggregationProcessor {
                 }
                 wrapper.fixedInterval(fixed);
             } else if (calendar != null) {
-                if (offset != 0) {
-                    throw new Unsupported("aggregation [" + agg + "] combines a calendar interval with an offset");
-                }
                 String unit = calendarUnit(calendar);
                 if (unit == null) {
                     throw new Unsupported("aggregation [" + agg + "] has calendar interval [" + calendar + "]; one unit at a time is served");
                 }
-                keyExpr = "date_trunc('" + unit + "', " + source + ")";
+                if (offset == 0) {
+                    keyExpr = "date_trunc('" + unit + "', " + source + ")";
+                } else {
+                    // As stock's offset rounding: the unit's start, shifted by the offset, holds the date.
+                    String shift = "INTERVAL '" + offset + " milliseconds'";
+                    keyExpr = "(date_trunc('" + unit + "', " + source + " - " + shift + ") + " + shift + ")";
+                }
                 wrapper.calendarInterval(calendar);
             } else {
                 throw new Unsupported("aggregation [" + agg + "] names no interval");
@@ -1872,7 +1875,8 @@ public class InfinoAggregationProcessor {
                 buckets,
                 minDocCount,
                 date.offset(),
-                date.rounding(),
+                // The reduce adds the offset to each empty bucket itself, as stock's aggregator expects.
+                date.rounding().withoutOffset(),
                 empty,
                 date.bounds(),
                 date.format(),
