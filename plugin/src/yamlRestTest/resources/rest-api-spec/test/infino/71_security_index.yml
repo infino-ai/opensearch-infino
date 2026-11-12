@@ -1,0 +1,59 @@
+---
+"A search reads the security plugin's own index as empty, for an admin and for a role that reads every index":
+  # The security index is Infino-backed, so its users, password hashes and
+  # roles come back to a node from the table; a search must not hand them out.
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: secidx1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: secidx1, _id: "1" } }
+          - { v: 1 }
+          - { index: { _index: secidx1, _id: "2" } }
+          - { v: 2 }
+
+  - do:
+      search:
+        index: .opendistro_security
+        body: { query: { match_all: {} } }
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+
+  - do:
+      search:
+        index: "secidx1,.opendistro_security"
+        body: { size: 10, query: { match_all: {} }, aggs: { kinds: { cardinality: { field: v } } } }
+  - match: { hits.total.value: 2 }
+  - match: { aggregations.kinds.value: 2 }
+
+  - do:
+      headers: { Authorization: "Basic c3Rhcl91c2VyOmFkbWlu" }
+      search:
+        index: "secidx1,.opendistro_security"
+        rest_total_hits_as_int: true
+        body: { query: { ids: { values: [ config, internalusers, roles, rolesmapping ] } } }
+  - match: { hits.total: 0 }
+
+  - do:
+      headers: { Authorization: "Basic c3Rhcl91c2VyOmFkbWlu" }
+      count:
+        index: .opendistro_security
+  - match: { count: 0 }
+
+  # The security plugin still reads its configuration from the table: a user it knows logs in.
+  - do:
+      headers: { Authorization: "Basic c3Rhcl91c2VyOmFkbWlu" }
+      search:
+        index: secidx1
+        body: { query: { match_all: {} } }
+  - match: { hits.total.value: 2 }
+
+  - do:
+      indices.delete:
+        index: secidx1

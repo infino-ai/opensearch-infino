@@ -14,6 +14,7 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.infino.InfinoNative.Column;
@@ -68,6 +69,38 @@ record InfinoAccess(
 
     /** No restriction: the request sees the index whole. */
     static final InfinoAccess NONE = new InfinoAccess(null, null, null, null);
+
+    /** The security plugin's index when its {@code plugins.security.config_index_name} is unset. */
+    static final String DEFAULT_SECURITY_INDEX = ".opendistro_security";
+
+    /** A document rule that keeps no row. */
+    private static final List<QueryBuilder> NO_ROW = List.of(new MatchNoneQueryBuilder());
+
+    /** A search's access to the security plugin's own index: no row of it (see {@link #searching}). */
+    static final InfinoAccess NO_ROWS = new InfinoAccess(NO_ROW, null, null);
+
+    private static volatile String securityIndex = DEFAULT_SECURITY_INDEX;
+
+    /** The security plugin's own index on this node, from its {@code plugins.security.config_index_name}. */
+    static void securityIndex(String name) {
+        securityIndex = name == null || name.isEmpty() ? DEFAULT_SECURITY_INDEX : name;
+    }
+
+    /**
+     * What a search may read of {@code index}. The security plugin's own index
+     * (its users, password hashes and roles) reads as holding no row, as that
+     * plugin shows it to a search on a Lucene index: the table would otherwise
+     * hand it to anyone whose role reads {@code *}. Gets are not searches: the
+     * security plugin loads its configuration by id, from the table.
+     */
+    static InfinoAccess searching(String index) {
+        return index.equals(securityIndex) ? NO_ROWS : InfinoSecurity.access(index, InfinoSecurityCalls.SEARCH);
+    }
+
+    /** Whether the request reads no row of the index (see {@link #searching}). */
+    boolean readsNothing() {
+        return documents == NO_ROW;
+    }
 
     InfinoAccess(List<QueryBuilder> documents, Predicate<String> fieldVisible, Function<String, UnaryOperator<String>> maskOf) {
         this(documents, fieldVisible, maskOf, null);
