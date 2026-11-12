@@ -1408,7 +1408,7 @@ public final class InfinoSearch {
      * the limit itself, as a lower bound, past it. The pages count exactly whenever tracking is on,
      * so a default-mode shard's coordinator can apply the same rule.
      */
-    private static TotalHits reported(long total, boolean exact, SearchSourceBuilder source) {
+    static TotalHits reported(long total, boolean exact, SearchSourceBuilder source) {
         Integer upTo = source.trackTotalHitsUpTo();
         int limit = upTo == null ? SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO : upTo;
         if (limit == SearchContext.TRACK_TOTAL_HITS_DISABLED) {
