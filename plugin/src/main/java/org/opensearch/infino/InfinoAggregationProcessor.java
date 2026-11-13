@@ -225,6 +225,30 @@ public class InfinoAggregationProcessor {
      * with more groups than are picked here (see {@link #totalFromTopTerms}).
      */
     private final Map<String, List<Map<String, Object>>> readAhead = new HashMap<>();
+    /**
+     * The background of each significant_terms level read so far in this
+     * request, by its relation ({@link #backgroundRows}): its size and the
+     * counts of the terms looked up in it.
+     */
+    private final Map<String, Background> backgrounds = new HashMap<>();
+    /**
+     * The foreground rows of a significant_terms level under a chain of
+     * terms levels, read for every parent bucket in one statement (see
+     * {@link #prefetchSignificant}), by the level and then by the predicate
+     * {@link #fold} hands that bucket.
+     */
+    private final Map<Significant, Map<String, List<Map<String, Object>>>> foregrounds = new HashMap<>();
+
+    /** A significant_terms background: its row count, and each term's count once read. */
+    private static final class Background {
+        final long size;
+        final Map<String, Long> counts = new HashMap<>();
+
+        Background(long size) {
+            this.size = size;
+        }
+    }
+
     /** The table {@link #evaluate} reads, whose plain relation {@link #explicitCounts} counts directly. */
     private String table;
 
@@ -2665,22 +2689,42 @@ public class InfinoAggregationProcessor {
         String key = s.keyExpr();
         String select = key + " AS k0, COUNT(*) AS doc_count" + (s.metrics.isEmpty() ? "" : ", " + metricColumns(s.metrics));
         String having = s.minDocCount > 1 ? " HAVING COUNT(*) >= " + s.minDocCount : "";
-        List<Map<String, Object>> foreground = InfinoNative.sqlRows(
-            "SELECT * FROM (SELECT " + select + " FROM " + from + " WHERE (" + where + ") AND " + key + " IS NOT NULL GROUP BY 1" + having
-                + ") t ORDER BY doc_count DESC, k0 ASC LIMIT " + s.candidates
-        );
+        Map<String, List<Map<String, Object>>> prefetched = foregrounds.get(s);
+        List<Map<String, Object>> foreground = prefetched == null ? null : prefetched.get(where);
+        if (foreground == null) {
+            foreground = InfinoNative.sqlRows(
+                "SELECT * FROM (SELECT " + select + " FROM " + from + " WHERE (" + where + ") AND " + key + " IS NOT NULL GROUP BY 1" + having
+                    + ") t ORDER BY doc_count DESC, k0 ASC LIMIT " + s.candidates
+            );
+        }
+        // The background does not depend on the bucket this level sits under:
+        // under a parent terms level every bucket would count the same rows
+        // again, so its size and each term's count are read once per request.
         String backgroundRows = backgroundRows(s);
-        long supersetSize = asLong(oneRow("SELECT COUNT(*) AS c FROM " + backgroundRows).get("c"));
-        Map<String, Long> background = new HashMap<>();
-        if (!foreground.isEmpty()) {
-            List<String> literals = new ArrayList<>();
-            for (Map<String, Object> row : foreground) {
+        Background bg = backgrounds.computeIfAbsent(
+            backgroundRows,
+            rows -> new Background(asLong(oneRow("SELECT COUNT(*) AS c FROM " + rows).get("c")))
+        );
+        long supersetSize = bg.size;
+        Map<String, Long> background = bg.counts;
+        List<String> literals = new ArrayList<>();
+        List<String> unread = new ArrayList<>();
+        for (Map<String, Object> row : foreground) {
+            String term = keyString(row.get("k0"));
+            if (!background.containsKey(term) && !unread.contains(term)) {
+                unread.add(term);
                 literals.add(Grouped.keyLiteral(s.keyKind, row.get("k0")));
             }
+        }
+        if (!literals.isEmpty()) {
             for (Map<String, Object> row : InfinoNative.sqlRows(
                 "SELECT k0, COUNT(*) AS bg FROM " + backgroundRows + " WHERE k0 IN (" + String.join(", ", literals) + ") GROUP BY 1"
             )) {
                 background.put(keyString(row.get("k0")), asLong(row.get("bg")));
+            }
+            // A term no background row holds counts 0; remember that too.
+            for (String term : unread) {
+                background.putIfAbsent(term, 0L);
             }
         }
         List<Significant.Candidate> candidates = new ArrayList<>();
@@ -2843,7 +2887,72 @@ public class InfinoAggregationProcessor {
             rowsByLevel.add(List.of());
             hitsByLevel.add(Map.of());
         }
+        if (rowsByLevel.get(chain.size() - 1).size() > 1) {
+            prefetchSignificant(chain, kept, leafChild, from, where);
+        }
         return fold(chain, 0, List.of(), rowsByLevel, hitsByLevel, total, leafChild, from, where);
+    }
+
+    /**
+     * Read the foreground of each significant_terms level directly under the
+     * chain's leaf for every leaf bucket in {@code kept} in one statement,
+     * rather than one per bucket: the same GROUP BY, also grouped by the
+     * chain's keys, ranked within each bucket as {@link #evalSignificant}
+     * orders and cuts it. Only when that is the same rows: every chain level
+     * a terms level on a field each document gives one value (so a
+     * document's keys are its buckets), and the significant level carries
+     * no metric. Otherwise, or past {@link #MAX_PARENT_TUPLES} buckets, the
+     * level reads each bucket on its own as before.
+     */
+    private void prefetchSignificant(List<Grouped> chain, List<List<Object>> kept, BucketSpec leafChild, String from, String where) {
+        if (kept == null || kept.size() > MAX_PARENT_TUPLES) {
+            return;
+        }
+        for (Grouped g : chain) {
+            if (!g.terms || g.source.multi() || g.date != null || g.hist != null) {
+                return;
+            }
+        }
+        List<BucketSpec> leaves = leafChild instanceof Siblings sib ? sib.children : leafChild == null ? List.of() : List.of(leafChild);
+        int n = chain.size();
+        List<String> parents = new ArrayList<>();
+        List<String> parentCols = new ArrayList<>();
+        for (int j = 0; j < n; j++) {
+            parents.add(chain.get(j).keyExpr + " AS p" + j);
+            parentCols.add("p" + j);
+        }
+        String partition = String.join(", ", parentCols);
+        for (BucketSpec leaf : leaves) {
+            if (!(leaf instanceof Significant s) || !s.metrics.isEmpty()) {
+                continue;
+            }
+            String key = s.keyExpr();
+            String having = s.minDocCount > 1 ? " HAVING COUNT(*) >= " + s.minDocCount : "";
+            String inner = "SELECT " + String.join(", ", parents) + ", " + key + " AS k0, COUNT(*) AS doc_count FROM " + from
+                + " WHERE (" + where + ") AND " + tupleRestriction(chain, kept, n, false) + " AND " + key + " IS NOT NULL GROUP BY "
+                + String.join(", ", parentCols) + ", k0" + having;
+            List<Map<String, Object>> rows = InfinoNative.sqlRows(
+                "SELECT * FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY doc_count DESC, k0 ASC) AS rn FROM ("
+                    + inner + ") t) WHERE rn <= " + s.candidates + " ORDER BY " + partition + ", rn"
+            );
+            Map<String, List<Map<String, Object>>> byTuple = new HashMap<>();
+            for (Map<String, Object> row : rows) {
+                List<Object> tuple = new ArrayList<>();
+                for (int j = 0; j < n; j++) {
+                    tuple.add(row.get("p" + j));
+                }
+                Map<String, Object> fg = new HashMap<>();
+                fg.put("k0", row.get("k0"));
+                fg.put("doc_count", row.get("doc_count"));
+                byTuple.computeIfAbsent(keyString(tuple), k -> new ArrayList<>()).add(fg);
+            }
+            Map<String, List<Map<String, Object>>> byWhere = new HashMap<>();
+            for (List<Object> tuple : kept) {
+                String bucketWhere = "(" + where + ") AND " + tupleRestriction(chain, List.of(tuple), n, false);
+                byWhere.put(bucketWhere, byTuple.getOrDefault(keyString(tuple), List.of()));
+            }
+            foregrounds.put(s, byWhere);
+        }
     }
 
     /**
