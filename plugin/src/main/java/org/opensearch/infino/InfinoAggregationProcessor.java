@@ -105,9 +105,11 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
@@ -2715,19 +2717,41 @@ public class InfinoAggregationProcessor {
         // The background does not depend on the bucket this level sits under:
         // under a parent terms level every bucket would count the same rows
         // again, so its size and each term's count are read once per request.
+        Background bg = background(s, foreground);
+        long supersetSize = bg.size;
+        Map<String, Long> background = bg.counts;
+        List<Significant.Candidate> candidates = new ArrayList<>();
+        List<List<InternalAggregation>> topHits = new ArrayList<>();
+        List<List<InternalAggregation>> nested = new ArrayList<>();
+        for (Map<String, Object> row : foreground) {
+            Object k = row.get("k0");
+            long subsetDf = asLong(row.get("doc_count"));
+            long supersetDf = background.getOrDefault(keyString(k), 0L);
+            candidates.add(new Significant.Candidate(k, subsetDf, Math.max(subsetDf, supersetDf), row));
+            String w = "(" + where + ") AND " + key + " = " + Grouped.keyLiteral(s.keyKind, k);
+            topHits.add(bucketHits(s, from, w, subsetDf));
+            nested.add(evalChildren(s.child, from, w, subsetDf));
+        }
+        return s.build(candidates, topHits, nested, subsetSize, supersetSize);
+    }
+
+    /**
+     * The background of {@code s} for this request ({@link #backgrounds}),
+     * holding the count of every term among {@code foreground}'s keys: its
+     * size read once, and the terms not yet read in one statement.
+     */
+    private Background background(Significant s, Collection<Map<String, Object>> foreground) {
         String backgroundRows = backgroundRows(s);
         Background bg = backgrounds.computeIfAbsent(
             backgroundRows,
             rows -> new Background(asLong(oneRow("SELECT COUNT(*) AS c FROM " + rows).get("c")))
         );
-        long supersetSize = bg.size;
         Map<String, Long> background = bg.counts;
         List<String> literals = new ArrayList<>();
-        List<String> unread = new ArrayList<>();
+        Set<String> unread = new LinkedHashSet<>();
         for (Map<String, Object> row : foreground) {
             String term = keyString(row.get("k0"));
-            if (!background.containsKey(term) && !unread.contains(term)) {
-                unread.add(term);
+            if (!background.containsKey(term) && unread.add(term)) {
                 literals.add(Grouped.keyLiteral(s.keyKind, row.get("k0")));
             }
         }
@@ -2742,19 +2766,7 @@ public class InfinoAggregationProcessor {
                 background.putIfAbsent(term, 0L);
             }
         }
-        List<Significant.Candidate> candidates = new ArrayList<>();
-        List<List<InternalAggregation>> topHits = new ArrayList<>();
-        List<List<InternalAggregation>> nested = new ArrayList<>();
-        for (Map<String, Object> row : foreground) {
-            Object k = row.get("k0");
-            long subsetDf = asLong(row.get("doc_count"));
-            long supersetDf = background.getOrDefault(keyString(k), 0L);
-            candidates.add(new Significant.Candidate(k, subsetDf, Math.max(subsetDf, supersetDf), row));
-            String w = "(" + where + ") AND " + key + " = " + Grouped.keyLiteral(s.keyKind, k);
-            topHits.add(bucketHits(s, from, w, subsetDf));
-            nested.add(evalChildren(s.child, from, w, subsetDf));
-        }
-        return s.build(candidates, topHits, nested, subsetSize, supersetSize);
+        return bg;
     }
 
     /**
@@ -2980,6 +2992,9 @@ public class InfinoAggregationProcessor {
                 byWhere.put(bucketWhere, byTuple.getOrDefault(keyString(tuple), List.of()));
             }
             foregrounds.put(s, byWhere);
+            // Every bucket's candidates are known now: their background
+            // counts are one statement, not one per bucket.
+            background(s, rows);
         }
     }
 
