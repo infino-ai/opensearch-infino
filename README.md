@@ -22,9 +22,12 @@ Docker builds the bridge and the plugin inside the image, so you need neither Ru
 
 ```bash
 cp env.example .env           # set OPENSEARCH_ADMIN_PASSWORD, and INFINO_API_KEY for an Infino Cloud account
-docker compose up --build
+docker compose up --build -d  # the first build compiles the bridge: about 15 minutes
+until curl -sk -o /dev/null -w '%{http_code}' -u "admin:<password>" https://localhost:9200/_cluster/health | grep -q 200; do sleep 5; done
 curl -sk -u "admin:<password>" https://localhost:9200/_plugins/_infino/account
 ```
+
+The node answers `OpenSearch Security not initialized` for its first seconds, while the security plugin reads its configuration from the table; the loop waits that out.
 
 `INFINO_STORAGE` in `.env` picks where the tables live: `local` (the default, a Docker volume, or a bucket named by `INFINO_URI`), `cloud` (an [Infino account](#hosted-account-and-stateless-nodes), with `INFINO_API_KEY`) or `memory`. `OPENSEARCH_VERSION` picks the release; `env.example` lists every option. The node serves HTTPS with the security plugin's demo certificates, hence `-k`. `docker compose --profile dashboards up` adds Dashboards on port 5601.
 
@@ -39,7 +42,9 @@ You need a Rust toolchain, a JDK 21, Gradle, and an OpenSearch 3.9.0 distributio
 DISTRO=/path/to/opensearch-3.9.0 ./scripts/run.sh       # install the plugin and start the node
 ```
 
-`run.sh` keeps the tables in `data/` at the repository's root. Set `INFINO_URI=s3://bucket/prefix` (or `gs://`, `az://`) to keep them in a bucket instead.
+OpenSearch 3.3 and later need Gradle 9.4.1 or later: an older Gradle stops with `Gradle 9.4.1+ is required`. [Build and test](#build-and-test) lists the Gradle for older releases.
+
+`run.sh` keeps the tables in `data/` at the repository's root. Set `INFINO_URI=s3://bucket/prefix` or `gs://bucket/prefix` to keep them in a bucket instead; see [where the tables live](#install-on-a-cluster) for the credentials it uses.
 
 **Using the full OpenSearch bundle.** The standard 3.9.0 download includes the security plugin. With an empty `opensearch.yml`, the security plugin stops the node at startup with `No SSL configuration found`. For a local node that answers the plain-HTTP requests below, turn security off in `$DISTRO/config/opensearch.yml`:
 
@@ -62,7 +67,8 @@ curl -XPUT localhost:9200/logs -H 'Content-Type: application/json' -d '{
     "@timestamp": {"type": "date"}, "level": {"type": "keyword"},
     "message": {"type": "text"}, "status": {"type": "long"}}}}'
 
-curl -XPOST localhost:9200/_bulk -H 'Content-Type: application/x-ndjson' --data-binary $'{"index":{"_index":"logs","_id":"1"}}\n{"@timestamp":"2026-10-24T10:00:00Z","level":"error","message":"disk full on node-3","status":500}\n'
+printf '{"index":{"_index":"logs","_id":"1"}}\n{"@timestamp":"%s","level":"error","message":"disk full on node-3","status":500}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" |
+  curl -XPOST 'localhost:9200/_bulk?refresh=true' -H 'Content-Type: application/x-ndjson' --data-binary @-
 
 curl localhost:9200/logs/_search -H 'Content-Type: application/json' -d '{
   "query": {"bool": {"must": [{"match": {"message": "disk"}}],
@@ -72,7 +78,7 @@ curl localhost:9200/logs/_search -H 'Content-Type: application/json' -d '{
                          "aggs": {"by_level": {"terms": {"field": "level"}}}}}}'
 ```
 
-The search keeps only documents from the last day (`"gte": "now-1d"`). Give the document a recent `@timestamp`, or widen the range, or the search finds no hits.
+The document is stamped with the current time, so the search's last-day range (`"gte": "now-1d"`) keeps it.
 
 Every index the cluster creates is backed by Infino, so the index above needs no setting of its own.
 
@@ -131,10 +137,12 @@ bin/opensearch-plugin install -b file:///path/infino-engine.zip
 |---|---|---|
 | In memory | nothing to set | Lost on restart; for trying things out. |
 | On local disk | `-Dinfino.uri=file:///abs/path` | The node that owns the path serves the tables. |
-| In your bucket | `-Dinfino.uri=s3://bucket/prefix` (or `gs://`, `az://`) | Your bucket and credentials, reached the way any client reaches them. Every node pointed at it serves the same tables. |
+| In your bucket | `-Dinfino.uri=s3://bucket/prefix` or `gs://bucket/prefix` | Every node pointed at it serves the same tables. The node uses the machine's own identity: an EC2 instance role for S3, with the bucket in `us-east-1`, or the GCE service account (or the node user's gcloud application-default credentials) for GCS. Keys in environment variables are not read, and `az://` is not supported yet. |
 | On an Infino account | `infino.platform.url` in `opensearch.yml`, the key in the keystore | The hosted service runs the engine and manages the tables. See [Hosted account](#hosted-account-and-stateless-nodes). |
 
-When both a URI and an account are set, the account is used.
+When both a URI and an account are set, the account is used. A key belongs to one platform: set `infino.platform.url` to the one that issued it.
+
+In Docker on EC2, the container reaches the instance role only when the instance's metadata hop limit is 2 (`aws ec2 modify-instance-metadata-options --http-put-response-hop-limit 2`). With the default of 1 the node finds no credentials and does not become ready.
 
 **4. Start the node.** Every index is Infino-backed unless its settings say `index.infino.enabled: false`. To make the default off, set `infino.index.default_enabled: false` on the node. Give an index one shard and no replicas: the engine scales reads itself.
 
@@ -307,7 +315,7 @@ No OpenSearch checkout is needed: the plugin builds against the release named by
 |---|---|---|
 | 2.19.x | 8.12.1 | `GRADLE_8_12` |
 | 3.0.x | 8.14 | `GRADLE_8_14` |
-| 3.3 and later | 9.x | `GRADLE` |
+| 3.3 and later | 9.4.1 or later | `GRADLE` |
 
 ## Repository layout
 
