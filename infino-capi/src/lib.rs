@@ -723,6 +723,11 @@ struct MappedField {
     path: String,
     data_type: DataType,
     fts: bool,
+    /// A `keyword` field the mapping indexes: the table gives it a full-text
+    /// index without positions, so `=` and `IN` are answered from its
+    /// dictionary instead of a scan. Reported to the plugin as no text index
+    /// ([`infino_columns`]), so it is still read as a keyword.
+    exact: bool,
     vector: Option<(usize, Metric)>,
     /// A numeric or date field the mapping indexes, as OpenSearch indexes
     /// every such field for ranges unless it says `"index": false`: the
@@ -1115,6 +1120,7 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             path,
             data_type,
             fts,
+            exact: ty == Some("keyword") && indexed,
             vector,
             range: ranged && indexed,
             precision: ty.and_then(|ty| Precision::of(ty, def)),
@@ -1178,13 +1184,24 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                     }),
                     _ => None,
                 });
+            // The index a keyword field added now gets: the same, without positions.
+            let exact_index = text_index.clone().map(|index| match index {
+                ColumnIndex::Fts { stopwords, stemmer, stored, bm25, .. } => ColumnIndex::Fts {
+                    stopwords,
+                    stemmer,
+                    positions: false,
+                    stored,
+                    bm25,
+                },
+                other => other,
+            });
             let mut conflicts: Vec<String> = Vec::new();
             for f in &mapped {
                 let present = schema.field_with_name(&f.path).is_ok();
                 let indexed = table_schema
                     .fields()
                     .iter()
-                    .any(|c| c.name == f.path && matches!(c.index, Some(ColumnIndex::Fts { .. })));
+                    .any(|c| c.name == f.path && is_text_index(&c.name, &c.index));
                 // A column's index is fixed when the column is added, so a text field
                 // the table holds without one cannot be served as text.
                 if f.fts && present && !indexed {
@@ -1227,8 +1244,9 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                     if f.range {
                         patch.with_index(ColumnIndex::Range)
                     } else {
-                        match (&text_index, f.fts) {
-                            (Some(index), true) => patch.with_index(index.clone()),
+                        match (&text_index, &exact_index, f.fts, f.exact) {
+                            (Some(index), _, true, _) => patch.with_index(index.clone()),
+                            (_, Some(index), false, true) => patch.with_index(index.clone()),
                             _ => patch,
                         }
                     }
@@ -1268,6 +1286,8 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                     // Positions let a quoted phrase match adjacent terms in
                     // order (match_phrase, quoted atoms of a query_string).
                     spec = spec.fts(FtsField::new(f.path.clone()).positions(true));
+                } else if f.exact {
+                    spec = spec.fts(FtsField::new(f.path.clone()));
                 }
                 if let Some((dim, metric)) = f.vector {
                     spec = spec.vector(f.path.clone(), dim, metric);
@@ -1327,6 +1347,17 @@ fn type_name(dt: &DataType) -> &'static str {
     }
 }
 
+/// Whether a column's index serves it as text: a full-text index with
+/// positions, as a mapped `text` field gets, or the id column's. A `keyword`
+/// field's index has no positions: the column is still a keyword, answered
+/// exactly, whose dictionary only spares `=` and `IN` a scan.
+fn is_text_index(column: &str, index: &Option<ColumnIndex>) -> bool {
+    match index {
+        Some(ColumnIndex::Fts { positions, .. }) => *positions || column == OSID,
+        _ => false,
+    }
+}
+
 /// Columns of a table as JSON `[{"name","type","elem","fts","vector"}]`,
 /// type in {i64,f64,bool,str,ts,vec,list,other}, `elem` a list column's
 /// element type (null for any other). `""` if the table is absent.
@@ -1353,7 +1384,7 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                             "name": f.name,
                             "type": type_name(&f.data_type),
                             "elem": elem,
-                            "fts": matches!(f.index, Some(ColumnIndex::Fts { .. })),
+                            "fts": is_text_index(&f.name, &f.index),
                             "vector": matches!(f.index, Some(ColumnIndex::Vector { .. })),
                         })
                     })
@@ -3929,6 +3960,64 @@ mod tests {
         // `level` is a keyword column: mapping it as text cannot add the index.
         let out = ensure(h, r#"{"properties":{"level":{"type":"text"}}}"#);
         assert!(out.contains("without a text index"), "{out}");
+        close(h);
+    }
+
+    /// A keyword field gets an index without positions, at creation and when
+    /// mapped later: still a keyword to the plugin, and `=` and `IN` still
+    /// match whole values exactly, case and all.
+    #[test]
+    fn a_keyword_field_gets_an_exact_index_and_stays_a_keyword() {
+        let h = open_logs();
+        let out = ensure(
+            h,
+            r#"{"properties":{"host":{"type":"keyword"},"tag":{"type":"keyword","index":false}}}"#,
+        );
+        assert!(out.contains("\"added\":2"), "{out}");
+        let index_of = |name: &str| {
+            let bridge = unsafe { &*h };
+            let schema = bridge.conn.schema("logs").unwrap();
+            schema.fields().iter().find(|f| f.name == name).map(|f| f.index.clone()).unwrap()
+        };
+        for name in ["level", "host"] {
+            assert!(
+                matches!(index_of(name), Some(ColumnIndex::Fts { positions: false, .. })),
+                "{name}: {:?}",
+                index_of(name)
+            );
+        }
+        assert!(index_of("tag").is_none(), "{:?}", index_of("tag"));
+        assert!(matches!(index_of("message"), Some(ColumnIndex::Fts { positions: true, .. })));
+        let cols = columns(h);
+        let fts_of = |n: &str| cols.as_array().unwrap().iter().find(|c| c["name"] == n).unwrap()["fts"].clone();
+        assert_eq!(
+            (fts_of("level"), fts_of("host"), fts_of("message"), fts_of("osid")),
+            (json!(false), json!(false), json!(true), json!(true))
+        );
+
+        index(
+            h,
+            &[
+                ("k1", r#"{"level":"Disk Full","host":"a"}"#),
+                ("k2", r#"{"level":"disk","host":"b"}"#),
+                ("k3", r#"{"level":"DISK","host":"a"}"#),
+            ],
+        );
+        let ids = |q: &str| -> Vec<String> {
+            let mut v: Vec<String> = sql(h, q)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["osid"].as_str().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids("SELECT osid FROM logs WHERE level = 'disk'"), ["k2"]);
+        assert_eq!(ids("SELECT osid FROM logs WHERE level = 'full'"), Vec::<String>::new());
+        assert_eq!(ids("SELECT osid FROM logs WHERE level = 'Disk Full'"), ["k1"]);
+        assert_eq!(ids("SELECT osid FROM logs WHERE level IN ('DISK', 'disk')"), ["k2", "k3"]);
+        assert_eq!(ids("SELECT osid FROM logs WHERE host = 'a' AND level <> 'disk'"), ["k1", "k3"]);
         close(h);
     }
 
