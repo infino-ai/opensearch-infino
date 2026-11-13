@@ -12,6 +12,8 @@
 #   NODES      where the nodes live (default ./nodes); wiped per node
 #   BASE_PORT  http port of the default-mode node (default 9250)
 #   HEAP       JVM heap of each node (default 2g)
+#   COLUMN_CACHE  the engine's decoded-column cache per Infino node, bytes
+#              (default 4294967296, as the big5 races on GCP set it)
 #   ONLY       space-separated subset of "stock default proxy" to start
 #   KEEP       1: keep each node's data and tables, only stop it, reinstall
 #              the plugin from ZIP and LIB, and start it again (to compare
@@ -26,6 +28,10 @@ HEAP=${HEAP:-2g}
 ONLY=${ONLY:-stock default proxy}
 V=$(basename "$TARBALL" | sed -E 's/^opensearch-([0-9.]+)-.*/\1/')
 
+column_cache() {  # home: the engine reads infino.yaml from the node's home
+  printf 'memory:\n  decoded_column_cache_bytes: %s\n' "${COLUMN_CACHE:-4294967296}" > "$1/infino.yaml"
+}
+
 restart() {  # name: reinstall the plugin into a node that keeps its data
   local name=$1 home=$NODES/$1/opensearch-$V
   if [ -f "$NODES/$name/pid" ]; then
@@ -37,6 +43,7 @@ restart() {  # name: reinstall the plugin into a node that keeps its data
     "$home/bin/opensearch-plugin" remove infino-engine >/dev/null
     "$home/bin/opensearch-plugin" install --batch "file://$(realpath "$ZIP")" >/dev/null
     sed -i "s#^-Dinfino.lib=.*#-Dinfino.lib=$(realpath "$LIB")#" "$home/config/jvm.options"
+    column_cache "$home"
   fi
   (cd "$home" && nohup bin/opensearch -d -p "$NODES/$name/pid" > "$NODES/$name/start.log" 2>&1)
 }
@@ -64,6 +71,7 @@ YML
     printf -- '-Dinfino.lib=%s\n-Dinfino.uri=file://%s\n' "$(realpath "$LIB")" "$NODES/$name/catalog" >> "$home/config/jvm.options"
     [ "$name" = proxy ] && echo "infino.default_mode.enabled: false" >> "$home/config/opensearch.yml"
   fi
+  column_cache "$home"
   (cd "$home" && nohup bin/opensearch -d -p "$NODES/$name/pid" > "$NODES/$name/start.log" 2>&1)
 }
 

@@ -1691,7 +1691,12 @@ public class InfinoAggregationProcessor {
                 if (unit == null) {
                     throw new Unsupported("aggregation [" + agg + "] has calendar interval [" + calendar + "]; one unit at a time is served");
                 }
-                if (offset == 0) {
+                long unitMillis = fixedUnitMillis(unit);
+                if (offset == 0 && !zoned && unitMillis > 0) {
+                    // In UTC a minute, hour or day is a fixed length from the epoch, so
+                    // date_bin gives the same start as date_trunc, at about half its cost.
+                    keyExpr = "date_bin(INTERVAL '" + unitMillis + " milliseconds', " + source + ")";
+                } else if (offset == 0) {
                     keyExpr = "date_trunc('" + unit + "', " + source + ")";
                 } else {
                     // As stock's offset rounding: the unit's start, shifted by the offset, holds the date.
@@ -1735,6 +1740,16 @@ public class InfinoAggregationProcessor {
                 case INT -> KeyKind.LONG;
                 case FLOAT -> KeyKind.DOUBLE;
                 default -> throw new Unsupported(c.label() + " of type " + c.typeName() + " cannot key buckets");
+            };
+        }
+
+        /** The length of a calendar {@code unit} that is the same everywhere in UTC (minute, hour, day), or 0 for one that varies. */
+        private static long fixedUnitMillis(String unit) {
+            return switch (unit) {
+                case "minute" -> 60_000L;
+                case "hour" -> 3_600_000L;
+                case "day" -> 86_400_000L;
+                default -> 0L;
             };
         }
 
@@ -2765,6 +2780,19 @@ public class InfinoAggregationProcessor {
         return "(" + String.join(" UNION ALL ", branches) + ") AS " + quoteIdent(BACKGROUND_ALIAS);
     }
 
+    /**
+     * That a bucket key {@code keyExpr} over {@code source} has a value. A
+     * terms key is the value itself, and a date or numeric histogram's key is
+     * a rounding that is never null for a value that is not, so for a field
+     * each document gives one value this is a null check on the value: the
+     * engine then evaluates the rounding once per row, in the GROUP BY,
+     * rather than again in the filter. A field some documents give several
+     * values keys its buckets by another expression and keeps the key's own check.
+     */
+    private static String presence(String keyExpr, Source source) {
+        return source.multi() ? keyExpr + " IS NOT NULL" : "(" + source.expr() + ") IS NOT NULL";
+    }
+
     /** The composite page: the GROUP BY over every key, past the after key, in key order, cut to size. */
     private InternalAggregation evalComposite(Composite c, String from, String where) {
         List<String> keyCols = new ArrayList<>();
@@ -2775,7 +2803,7 @@ public class InfinoAggregationProcessor {
             CompositeSource s = c.sources.get(i);
             keyCols.add(s.keyExpr() + " AS k" + i);
             if (!s.missingBucket()) {
-                present.add(s.keyExpr() + " IS NOT NULL");
+                present.add(presence(s.keyExpr(), s.source()));
             }
             if (s.source().multi()) {
                 multi.add(s.source());
@@ -2975,7 +3003,7 @@ public class InfinoAggregationProcessor {
             }
         }
         String metrics = level.metrics.isEmpty() ? "" : metricColumns(level.metrics);
-        String keep = present ? " AND " + level.keyExpr + " IS NOT NULL" : "";
+        String keep = present ? " AND " + presence(level.keyExpr, level.source) : "";
         String having = level.minDocCount > 1 ? " HAVING COUNT(*) >= " + level.minDocCount : "";
         return groupStatement(keyCols, metrics, from, where + restriction + keep, multi, having);
     }
