@@ -134,6 +134,14 @@ public final class InfinoQueryExt extends SearchExtBuilder {
         return routed;
     }
 
+    /**
+     * The id a search the shard request cache may keep is routed with: it
+     * has no hits to fetch and no aggregation answered at the coordinating
+     * node, so nothing is looked up by it, and a repeat of the search keys
+     * the same (see {@link InfinoSearchActionFilter}).
+     */
+    static final String CACHED_REQUEST = "cached";
+
     /** A fresh id for a search. */
     static String newRequestId() {
         return UUIDs.randomBase64UUID();
