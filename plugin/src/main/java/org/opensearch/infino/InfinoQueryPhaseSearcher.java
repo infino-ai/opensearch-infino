@@ -201,7 +201,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         boolean exact = trackTotal(source);
         boolean sharedTotal = !here.isEmpty() && !deferred && plan.vector() == null && plan.postWhere() == null && exact;
         boolean countWithAggs = sharedTotal && source.size() == 0;
-        InfinoSearch.Page page = InfinoSearch.page(index, plan, source, !countWithAggs);
+        InfinoSearch.Page page = InfinoSearch.page(index, plan, source, !countWithAggs, scroll == null);
         long total = page.total();
         if (!builders.isEmpty()) {
             // A search over several shards (this index's, or other indices')

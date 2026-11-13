@@ -525,6 +525,16 @@ public final class InfinoSearch {
      * is then 0 until replaced).
      */
     static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count) {
+        return page(index, plan, source, count, false);
+    }
+
+    /**
+     * As {@link #page(Index, Plan, SearchSourceBuilder, boolean)}; with
+     * {@code capTotal} the total is counted only as far as the request's
+     * {@code track_total_hits} limit needs (see {@link #countCap}), which a
+     * scroll, whose later rounds carry the first round's total, does not ask for.
+     */
+    static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count, boolean capTotal) {
         final int from = Math.max(0, source.from());
         final int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
         final int fetch = from + size;
@@ -592,7 +602,10 @@ public final class InfinoSearch {
         } else if (exact) {
             // The total counts what the query and post_filter keep, before
             // any collapse and regardless of where the page starts.
-            total = plan.postWhere() == null ? count(plan.table(), q) : count(plan.table(), new Translation(q.table(), plan.hitWhere(), q.principal()));
+            long cap = capTotal ? countCap(source) : Long.MAX_VALUE;
+            total = plan.postWhere() == null
+                ? count(plan.table(), q, cap)
+                : count(plan.table(), new Translation(q.table(), plan.hitWhere(), q.principal()), cap);
         } else {
             total = rows.size();
         }
@@ -1078,6 +1091,40 @@ public final class InfinoSearch {
 
     /** The exact number of rows the request matches. */
     static long count(String table, Translation q) {
+        return count(table, q, Long.MAX_VALUE);
+    }
+
+    /**
+     * How far a total needs counting for the request's {@code track_total_hits}:
+     * one past its limit (the stock default when it names none), since
+     * {@link #reported} turns any count past the limit into the limit, as a
+     * lower bound. A default-mode shard's total reaches its coordinator the
+     * same way: one past the limit stays past it when shards' totals add up.
+     * Unlimited when the request tracks every hit or none.
+     */
+    static long countCap(SearchSourceBuilder source) {
+        Integer upTo = source.trackTotalHitsUpTo();
+        int limit = upTo == null ? SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO : upTo;
+        if (limit == SearchContext.TRACK_TOTAL_HITS_DISABLED || limit == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
+            return Long.MAX_VALUE;
+        }
+        return (long) limit + 1;
+    }
+
+    /**
+     * The number of rows the request matches, or {@code cap} when it matches at
+     * least that many. A predicate that reads the token index is counted under
+     * a LIMIT, so the scan stops at the cap instead of matching every row; any
+     * other keeps the engine's count, which a range answers from its index.
+     */
+    static long count(String table, Translation q, long cap) {
+        if (cap != Long.MAX_VALUE && q.principal() == null && InfinoQueryTranslator.readsTextIndex(q.where())) {
+            List<Map<String, Object>> rows = InfinoNative.sqlRows(
+                "SELECT COUNT(*) AS c FROM (SELECT 1 AS one FROM " + q.from() + " WHERE " + q.where() + " LIMIT " + cap + ") capped"
+            );
+            Object c = rows.isEmpty() ? null : rows.get(0).get("c");
+            return c instanceof Number n ? n.longValue() : 0;
+        }
         if (q.principal() != null && InfinoQueryTranslator.ALL.equals(q.where())) {
             // A bare text query: the engine counts its matches without materializing them.
             return InfinoNative.count(table, q.principal().column(), q.principal().query(), q.principal().mode());
@@ -1203,7 +1250,7 @@ public final class InfinoSearch {
             // reads its total beside the aggregations rather than in a count of its own.
             boolean sharedTotal = !builders.isEmpty() && plan.vector() == null && plan.postWhere() == null && trackTotal(perIndex);
             boolean countWithAggs = sharedTotal && perIndex.size() == 0;
-            Page page = page(index, plan, perIndex, !countWithAggs);
+            Page page = page(index, plan, perIndex, !countWithAggs, scrollId == null);
             if (!builders.isEmpty()) {
                 InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(index).evaluate(
                     builders,

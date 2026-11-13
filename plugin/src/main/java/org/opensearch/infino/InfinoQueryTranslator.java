@@ -137,6 +137,14 @@ final class InfinoQueryTranslator {
     private static final String ID_SUBQUERY = " IN (SELECT ";
     /** How a text clause that is not the FROM source reads the token index: a subquery over its ids. */
     private static final String TEXT_SUBQUERY = OSID + ID_SUBQUERY + OSID + " FROM token_match(";
+    /**
+     * How a text clause of plain terms that is not the FROM source reads the
+     * token index: the engine's row predicate, which the scan answers from
+     * the term dictionary and the postings of a {@code standard} column (as
+     * the bridge declares every text column), so the clause neither collects
+     * every matching id before the outer query starts nor joins on them.
+     */
+    private static final String TEXT_PREDICATE = "text_match(";
     /** Predicate that keeps every row. */
     static final String ALL = "1=1";
     /** Predicate that keeps no row. */
@@ -402,13 +410,13 @@ final class InfinoQueryTranslator {
 
     /**
      * Whether a predicate holds a subquery by id (a text clause on a column
-     * other than the ranked one, or a field's list values): one the engine
-     * joins above a ranked search, so the rows it removes go after the
-     * ranking. A string literal that happens to hold the same text only
-     * costs that search a wider candidate window.
+     * other than the ranked one, or a field's list values) or a text_match
+     * on such a column: one the engine applies above a ranked search, so the
+     * rows it removes go after the ranking. A string literal that happens to
+     * hold the same text only costs that search a wider candidate window.
      */
     static boolean joinsAfterRanking(String predicate) {
-        return predicate.contains(ID_SUBQUERY);
+        return predicate.contains(ID_SUBQUERY) || predicate.contains(TEXT_PREDICATE);
     }
 
     static String quoteIdent(String name) {
@@ -1123,7 +1131,28 @@ final class InfinoQueryTranslator {
             principal = new TextClause(column, principal.query() + " " + query, mode);
             return ALL;
         }
+        if (plainQuery(query)) {
+            return TEXT_PREDICATE + quoteIdent(column) + ", " + literal(query) + ", " + literal(mode) + ")";
+        }
         return TEXT_SUBQUERY + literal(table) + ", " + literal(column) + ", " + literal(query) + ", " + literal(mode) + "))";
+    }
+
+    /**
+     * Whether {@code query} is plain words, which {@code text_match} takes: no
+     * phrase (a double quote) and no run the engine reads as a required or an
+     * excluded clause (a leading {@code +} or {@code -}). Those keep the
+     * {@code token_match} subquery, which reads them.
+     */
+    static boolean plainQuery(String query) {
+        if (query.indexOf('"') >= 0) {
+            return false;
+        }
+        for (String run : QUERY_WHITESPACE.split(query)) {
+            if (!run.isEmpty() && (run.charAt(0) == '+' || run.charAt(0) == '-')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -1132,7 +1161,9 @@ final class InfinoQueryTranslator {
      * expression.
      */
     static boolean readsTextIndex(String predicate) {
-        return predicate.contains(TEXT_SUBQUERY);
+        // text_match is a predicate the scan answers from the index; inside an
+        // aggregate's expression it would be evaluated row by row instead.
+        return predicate.contains(TEXT_SUBQUERY) || predicate.contains(TEXT_PREDICATE);
     }
 
     /**

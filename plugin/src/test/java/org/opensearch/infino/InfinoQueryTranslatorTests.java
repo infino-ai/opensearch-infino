@@ -104,7 +104,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("token_match('os_logs_0', 'message', 'error timeout', 'or')", translate(QueryBuilders.matchQuery("message", "-error timeout")).from());
         assertEquals("token_match('os_logs_0', 'message', 'a b c', 'or')", translate(QueryBuilders.matchQuery("message", "+a \"b c")).from());
         String where = translate(QueryBuilders.boolQuery().should(QueryBuilders.termQuery("message", "-error"))).where();
-        assertTrue(where, where.contains("token_match('os_logs_0', 'message', 'error', 'and')"));
+        assertTrue(where, where.contains("text_match(\"message\", 'error', 'and')"));
         assertFalse(where, where.contains("-error"));
         // Text with no term matches nothing rather than reaching the engine empty.
         String none = translate(QueryBuilders.boolQuery().filter(QueryBuilders.matchQuery("message", "--"))).where();
@@ -252,14 +252,32 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(InfinoQueryTranslator.joinsAfterRanking("\"level\" = 'error'"));
     }
 
-    public void testTextUnderShouldIsASubquery() {
+    public void testTextUnderShouldIsARowPredicate() {
         BoolQueryBuilder b = QueryBuilders.boolQuery()
             .should(QueryBuilders.matchQuery("message", "disk"))
             .should(QueryBuilders.termQuery("level", "error"));
         Translation t = translate(b);
         assertNull(t.principal());
         assertEquals("\"os_logs_0\"", t.from());
-        assertEquals("((osid IN (SELECT osid FROM token_match('os_logs_0', 'message', 'disk', 'or')) OR \"level\" = 'error'))", t.where());
+        assertEquals("((text_match(\"message\", 'disk', 'or') OR \"level\" = 'error'))", t.where());
+        assertTrue(InfinoQueryTranslator.readsTextIndex(t.where()));
+    }
+
+    /**
+     * Only plain words become text_match: a phrase or a clause the engine
+     * reads with a + or - sigil keeps the token_match subquery, which reads them.
+     */
+    public void testAPhraseOrASigilKeepsTheSubquery() {
+        assertTrue(InfinoQueryTranslator.plainQuery("disk full"));
+        assertFalse(InfinoQueryTranslator.plainQuery("\"disk full\""));
+        assertFalse(InfinoQueryTranslator.plainQuery("disk -full"));
+        assertFalse(InfinoQueryTranslator.plainQuery("+disk cache"));
+        String where = translate(
+            QueryBuilders.boolQuery()
+                .should(QueryBuilders.matchPhraseQuery("message", "disk full"))
+                .should(QueryBuilders.termQuery("level", "error"))
+        ).where();
+        assertTrue(where, where.contains("osid IN (SELECT osid FROM token_match('os_logs_0', 'message', '\"disk full\"', 'and'))"));
     }
 
     public void testShouldIsOptionalBesideMust() {
