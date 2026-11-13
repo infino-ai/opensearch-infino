@@ -408,3 +408,84 @@
   - match: { hits.total.value: 2 }
   - match: { hits.hits.0._id: p1 }
   - match: { hits.hits.1._id: p3 }
+
+---
+"A nested query reads the entries as indexed, with _source disabled or the path excluded, with the same hits as a Lucene twin":
+  # The table keeps each document as it was indexed, whatever the mapping's
+  # _source says, so the entries a nested query checks are there either way.
+  # d1 has one entry, a red size; d2 has a blue size and a red fit.
+  - do:
+      indices.create:
+        index: src_off_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { _source: { enabled: false }, properties: { rank: { type: long }, items: { type: nested, properties: { name: { type: keyword }, color: { type: keyword } } } } }
+  - do:
+      indices.create:
+        index: src_off_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { _source: { enabled: false }, properties: { rank: { type: long }, items: { type: nested, properties: { name: { type: keyword }, color: { type: keyword } } } } }
+  - do:
+      indices.create:
+        index: src_ex_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { _source: { excludes: [ items ] }, properties: { rank: { type: long }, items: { type: nested, properties: { name: { type: keyword }, color: { type: keyword } } } } }
+  - do:
+      indices.create:
+        index: src_ex_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { _source: { excludes: [ items ] }, properties: { rank: { type: long }, items: { type: nested, properties: { name: { type: keyword }, color: { type: keyword } } } } }
+  - do: { bulk: { refresh: true, index: src_off_inf, body: [ { index: { _id: d1 } }, { rank: 1, items: [ { name: size, color: red } ] }, { index: { _id: d2 } }, { rank: 2, items: [ { name: size, color: blue }, { name: fit, color: red } ] } ] } }
+  - match: { errors: false }
+  - do: { bulk: { refresh: true, index: src_off_luc, body: [ { index: { _id: d1 } }, { rank: 1, items: [ { name: size, color: red } ] }, { index: { _id: d2 } }, { rank: 2, items: [ { name: size, color: blue }, { name: fit, color: red } ] } ] } }
+  - match: { errors: false }
+  - do: { bulk: { refresh: true, index: src_ex_inf, body: [ { index: { _id: d1 } }, { rank: 1, items: [ { name: size, color: red } ] }, { index: { _id: d2 } }, { rank: 2, items: [ { name: size, color: blue }, { name: fit, color: red } ] } ] } }
+  - match: { errors: false }
+  - do: { bulk: { refresh: true, index: src_ex_luc, body: [ { index: { _id: d1 } }, { rank: 1, items: [ { name: size, color: red } ] }, { index: { _id: d2 } }, { rank: 2, items: [ { name: size, color: blue }, { name: fit, color: red } ] } ] } }
+  - match: { errors: false }
+  # A red size: d1.
+  - do: { search: { index: src_off_luc, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { bool: { must: [ { term: { items.name: size } }, { term: { items.color: red } } ] } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - do: { search: { index: src_off_inf, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { bool: { must: [ { term: { items.name: size } }, { term: { items.color: red } } ] } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - do: { search: { index: src_ex_luc, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { bool: { must: [ { term: { items.name: size } }, { term: { items.color: red } } ] } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - do: { search: { index: src_ex_inf, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { bool: { must: [ { term: { items.name: size } }, { term: { items.color: red } } ] } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  # An entry that is not red: d2's blue size.
+  - do: { search: { index: src_off_luc, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { bool: { must_not: [ { term: { items.color: red } } ] } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d2 }
+  - do: { search: { index: src_off_inf, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { bool: { must_not: [ { term: { items.color: red } } ] } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d2 }
+  - do: { search: { index: src_ex_luc, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { bool: { must_not: [ { term: { items.color: red } } ] } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d2 }
+  - do: { search: { index: src_ex_inf, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { bool: { must_not: [ { term: { items.color: red } } ] } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d2 }
+  # Any entry: both.
+  - do: { search: { index: src_off_luc, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { match_all: {} } } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.1._id: d2 }
+  - do: { search: { index: src_off_inf, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { match_all: {} } } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.1._id: d2 }
+  - do: { search: { index: src_ex_luc, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { match_all: {} } } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.1._id: d2 }
+  - do: { search: { index: src_ex_inf, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { match_all: {} } } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.1._id: d2 }
