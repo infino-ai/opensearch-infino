@@ -707,13 +707,6 @@ public final class InfinoSearch {
     }
 
     /**
-     * Whether the page's sources are read by id once its rows are chosen,
-     * rather than in the hit statement: a sorted page without a collapse.
-     * The sort weighs every row the predicate keeps, and every row that ties
-     * on the first key competes on the next, so a source in the statement
-     * would be read for each of those rows to keep a page's worth.
-     */
-    /**
      * Whether the page is every row sorted on one field's own column, ties
      * broken by the row id: the engine's sorted search, which reads it from
      * the column's range index (and plans the statement itself for a column
@@ -741,6 +734,13 @@ public final class InfinoSearch {
             && first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()));
     }
 
+    /**
+     * Whether the page's sources are read by id once its rows are chosen,
+     * rather than in the hit statement: a sorted page without a collapse.
+     * The sort weighs every row the predicate keeps, and every row that ties
+     * on the first key competes on the next, so a source in the statement
+     * would be read for each of those rows to keep a page's worth.
+     */
     static boolean sourcesById(Plan plan) {
         return !plan.sorts().isEmpty() && plan.collapse() == null;
     }
