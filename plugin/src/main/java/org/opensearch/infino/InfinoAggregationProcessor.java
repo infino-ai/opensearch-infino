@@ -3283,14 +3283,19 @@ public class InfinoAggregationProcessor {
             keys.add(row.get(keyAlias));
             long docCount = asLong(row.get("doc_count"));
             List<InternalAggregation> topHits = new ArrayList<>();
-            List<List<Map<String, Object>>> hitRows = hitsByLevel.get(depth).get(keyString(keys));
+            // Only a level with top hits looks its bucket's up, and only a
+            // child aggregation reads the bucket's predicate: a histogram's
+            // thousands of buckets otherwise build both for nothing.
+            List<List<Map<String, Object>>> hitRows = level.hits.isEmpty() ? null : hitsByLevel.get(depth).get(keyString(keys));
             for (int h = 0; h < level.hits.size(); h++) {
                 List<Map<String, Object>> hits = hitRows == null || h >= hitRows.size() ? List.of() : hitRows.get(h);
                 topHits.add(level.hits.get(h).build(hits, docCount, index));
             }
             List<InternalAggregation> nested = depth + 1 < chain.size()
                 ? List.of(fold(chain, depth + 1, keys, rowsByLevel, hitsByLevel, docCount, leafChild, from, where))
-                : evalChildren(leafChild, from, "(" + where + ") AND " + tupleRestriction(chain, List.of(keys), keys.size(), false), docCount);
+                : leafChild == null
+                    ? List.of()
+                    : evalChildren(leafChild, from, "(" + where + ") AND " + tupleRestriction(chain, List.of(keys), keys.size(), false), docCount);
             return level.subs(row, topHits, nested);
         }, parentTotal);
     }
