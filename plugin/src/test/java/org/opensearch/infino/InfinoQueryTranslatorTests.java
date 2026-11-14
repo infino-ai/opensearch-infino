@@ -293,6 +293,23 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("(\"level\" = 'error' AND (\"status\" = 500))", translate(b).where());
     }
 
+    public void testQueryStringReadsMinimumShouldMatch() {
+        // Two of three optional words: the engine query still ranks, and a count narrows it.
+        String two = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("2")).where();
+        assertTrue(two, two.contains(">= 2)"));
+        assertEquals(3, two.split("THEN 1 ELSE 0 END", -1).length - 1);
+        // Stock's reading of the forms: 100% of three is three, -1 of three is two.
+        assertTrue(translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("100%")).where().contains(">= 3)"));
+        assertTrue(translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("-1")).where().contains(">= 2)"));
+        // One is a plain OR over the optional words, ANDed with the required one.
+        String required = translate(QueryBuilders.queryStringQuery("+alpha beta gamma").defaultField("message").minimumShouldMatch("1")).where();
+        assertTrue(required, required.contains(" AND ("));
+        // Without it, nothing changes; and simple_query_string reads it too.
+        String none = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message")).where();
+        assertFalse(none, none.contains("THEN 1 ELSE 0 END"));
+        assertTrue(translate(QueryBuilders.simpleQueryStringQuery("alpha beta gamma").field("message").minimumShouldMatch("2")).where().contains(">= 2)"));
+    }
+
     public void testQueryStringOverEveryTextColumn() {
         assertEquals("1=1", translate(QueryBuilders.queryStringQuery("*")).where());
         Translation t = translate(QueryBuilders.queryStringQuery("disk"));

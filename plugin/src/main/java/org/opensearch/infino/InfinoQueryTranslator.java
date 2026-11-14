@@ -5,6 +5,7 @@
 package org.opensearch.infino;
 
 import org.opensearch.OpenSearchParseException;
+import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateMathParser;
 import org.opensearch.common.xcontent.XContentHelper;
@@ -526,10 +527,10 @@ final class InfinoQueryTranslator {
             return textOnFields(new ArrayList<>(mm.fields().keySet()), String.valueOf(mm.value()), mm.operator(), positive, asPhrase, true);
         }
         if (qb instanceof QueryStringQueryBuilder qs) {
-            return queryString(qs.queryString(), qs.defaultField(), new ArrayList<>(qs.fields().keySet()), qs.defaultOperator(), positive);
+            return queryString(qs.queryString(), qs.defaultField(), new ArrayList<>(qs.fields().keySet()), qs.defaultOperator(), qs.minimumShouldMatch(), positive);
         }
         if (qb instanceof SimpleQueryStringBuilder sqs) {
-            return queryString(sqs.value(), null, new ArrayList<>(sqs.fields().keySet()), sqs.defaultOperator(), positive);
+            return queryString(sqs.value(), null, new ArrayList<>(sqs.fields().keySet()), sqs.defaultOperator(), sqs.minimumShouldMatch(), positive);
         }
         if (qb instanceof BoolQueryBuilder b) {
             return bool(b, positive);
@@ -1257,9 +1258,11 @@ final class InfinoQueryTranslator {
      * comparison on a date column takes date math. Boosts change nothing
      * here and are dropped. Fuzziness and proximity have no counterpart in
      * the token index and are refused with the clause named, as is a range
-     * without a field.
+     * without a field. {@code minimumShouldMatch} applies to the optional
+     * clauses of the top level only, as stock applies it to the query the
+     * string parses to when that query is a clause list.
      */
-    private String queryString(String query, String defaultField, List<String> fields, Operator op, boolean positive) {
+    private String queryString(String query, String defaultField, List<String> fields, Operator op, String minimumShouldMatch, boolean positive) {
         String q = query == null ? "" : query.trim();
         if (q.isEmpty() || "*".equals(q) || "*:*".equals(q)) {
             return ALL;
@@ -1281,7 +1284,55 @@ final class InfinoQueryTranslator {
                 }
             }
         }
-        return node(InfinoLuceneQuery.parse(q, op), targets, positive, q, op);
+        Node parsed = InfinoLuceneQuery.parse(q, op);
+        if (minimumShouldMatch != null && parsed instanceof Bool b && !b.should().isEmpty()) {
+            int required = Queries.calculateMinShouldMatch(b.should().size(), minimumShouldMatch);
+            if (required > 0) {
+                return atLeastOptional(b, required, targets, positive, q, op);
+            }
+        }
+        return node(parsed, targets, positive, q, op);
+    }
+
+    /**
+     * A query string's top clause list with at least {@code required} of its
+     * optional clauses matching: its required clauses, the count over its
+     * optional ones, and none of its prohibited ones. When the list is one
+     * engine query, that query still ranks the rows (BM25 over every clause,
+     * as stock scores the clauses that match), and the count narrows them.
+     */
+    private String atLeastOptional(Bool b, int required, List<String> targets, boolean positive, String query, Operator op) {
+        List<String> optional = new ArrayList<>();
+        for (Node s : b.should()) {
+            String p = node(s, targets, false, query, op);
+            if (p == null) {
+                return null;
+            }
+            optional.add(p);
+        }
+        String count = atLeast(optional, required);
+        String engine = engineQuery(b);
+        if (engine != null) {
+            String ranked = textOnFields(targets, engine, Operator.OR, positive, false, false, true);
+            return ranked == null ? null : "(" + ranked + " AND " + count + ")";
+        }
+        List<String> and = new ArrayList<>();
+        for (Node m : b.must()) {
+            String p = node(m, targets, positive, query, op);
+            if (p == null) {
+                return null;
+            }
+            and.add(p);
+        }
+        and.add(count);
+        for (Node x : b.mustNot()) {
+            String p = node(x, targets, false, query, op);
+            if (p == null) {
+                return null;
+            }
+            and.add(not(p));
+        }
+        return "(" + String.join(" AND ", and) + ")";
     }
 
     /** The predicate of one node of a query string's tree, or null when the table cannot take it; {@code op} reads a bare term's words. */
