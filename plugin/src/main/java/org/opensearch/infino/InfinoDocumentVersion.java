@@ -70,7 +70,7 @@ final class InfinoDocumentVersion {
         }
         boolean staleSeqNo = current != item.ifSeqNo();
         boolean staleTerm = item.ifPrimaryTerm() != PRIMARY_TERM;
-        if (staleSeqNo && staleTerm) {
+        if (staleSeqNo || staleTerm) {
             return new VersionConflictEngineException(shardId, item.id(), item.ifSeqNo(), item.ifPrimaryTerm(), current, PRIMARY_TERM);
         }
         return null;
