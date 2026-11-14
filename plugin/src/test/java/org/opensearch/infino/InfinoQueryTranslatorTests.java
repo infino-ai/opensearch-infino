@@ -260,6 +260,24 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(InfinoSearch.onlyRanges(QueryBuilders.boolQuery().should(QueryBuilders.rangeQuery("status").gte(500))));
         assertFalse(InfinoSearch.onlyRanges(QueryBuilders.termQuery("level", "error")));
         assertFalse(InfinoSearch.onlyRanges(null));
+        // A page after one present value of a column sort may come from its range index.
+        InfinoSearch.Plan afterOne = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchAllQuery()),
+            all.sorts(),
+            null,
+            null,
+            null,
+            new Object[] { 404 },
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertTrue(InfinoSearch.afterInterval(afterOne));
+        // Two values (the tiebreak's too) make the rows past them an OR, and no search_after is no page after one.
+        assertFalse(InfinoSearch.afterInterval(after));
+        assertFalse(InfinoSearch.afterInterval(all));
     }
 
     public void testTiesBreakByTheEngineRowId() {

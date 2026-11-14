@@ -592,6 +592,17 @@ public final class InfinoSearch {
                 // column keeps: its first rows in the column's order, from the
                 // column's range index, when the predicate is one such interval.
                 rows = InfinoNative.sortedRowsWhere(plan.table(), null, plan.hitWhere(), false, fetch, wantsSource(source));
+            } else if (afterInterval(plan) && !seqNoAndPrimaryTerm) {
+                // A page after one present value of a range-indexed sort column:
+                // the rows past it are one interval of the column, read from its
+                // range index. They are the page when they fill it; otherwise the
+                // rows missing the value follow them, and the statement reads both.
+                SortSpec first = plan.sorts().get(0);
+                String past = "(" + plan.hitWhere() + ") AND " + first.expr() + (first.desc() ? " < " : " > ") + afterLiteral(plan, first, plan.searchAfter()[0]);
+                rows = InfinoNative.sortedRowsWhere(plan.table(), first.name(), past, first.desc(), fetch, wantsSource(source));
+                if (rows != null && rows.size() < fetch) {
+                    rows = null;
+                }
             }
             if (rows == null) {
                 rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
@@ -786,6 +797,44 @@ public final class InfinoSearch {
             return b.should().isEmpty() && b.mustNot().isEmpty() && !required.isEmpty() && required.stream().allMatch(InfinoSearch::onlyRanges);
         }
         return false;
+    }
+
+    /**
+     * Whether the page continues after one present value of a sort on one
+     * field's own column, ties broken by the row id, with no text query,
+     * vector, collapse or scripted field: the rows past the value are one
+     * interval of that column when the predicate allows it.
+     */
+    static boolean afterInterval(Plan plan) {
+        List<SortSpec> sorts = plan.sorts();
+        Object[] after = plan.searchAfter();
+        if (plan.vector() != null
+            || plan.query().principal() != null
+            || plan.collapse() != null
+            || !plan.scriptFields().isEmpty()
+            || after == null
+            || after.length != 1
+            || after[0] == null
+            || sorts.size() != 2) {
+            return false;
+        }
+        SortSpec first = sorts.get(0);
+        SortSpec tie = sorts.get(1);
+        return tie.name().equals(InfinoSql.ROW_ID)
+            && !tie.desc()
+            && !first.name().equals(InfinoSql.ROW_ID)
+            && !first.name().equals(InfinoQueryTranslator.OSID)
+            && first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()));
+    }
+
+    /** A search_after value of sort {@code s} as a literal of its column's type, read as the keyset reads it. */
+    private static String afterLiteral(Plan plan, SortSpec s, Object value) {
+        Column sorted = plan.cols().get(s.name());
+        String lit = InfinoQueryTranslator.literalForType(s.type(), value, plan.nowMillis(), sorted == null ? null : sorted.dateFormat());
+        if (lit == null) {
+            throw new IllegalArgumentException("[infino] search_after value [" + value + "] is not a " + s.type().name().toLowerCase(Locale.ROOT));
+        }
+        return lit;
     }
 
     static boolean sourcesById(Plan plan) {
