@@ -164,6 +164,45 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertTrue(collapsed, collapsed.startsWith("SELECT osid, source, "));
     }
 
+    /** A match_all sorted by {@code status} descending, then by the row id, continuing after {@code after}, under {@code collapse}. */
+    private static InfinoSearch.Plan afterPlan(Object[] after, Column collapse) {
+        return new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchAllQuery()),
+            java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true), InfinoSearch.SortSpec.rowId()),
+            null,
+            null,
+            collapse,
+            after,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+    }
+
+    public void testASearchAfterPageReadsThePresentRowsBeforeTheMissingOnes() {
+        // After a present first value, the rows past it are a plain range on
+        // the sort column; the rows missing it sort after them all and are
+        // their own statement, read only for a short page.
+        InfinoSearch.Plan plan = afterPlan(new Object[] { 404, "7" }, null);
+        assertTrue(InfinoSearch.splitsMissingTail(plan));
+        String whole = InfinoSearch.hitStatement(plan, 10, false);
+        assertTrue(whole, whole.contains("(\"status\" < 404 OR \"status\" IS NULL)"));
+        String present = InfinoSearch.hitStatement(plan, 10, false, InfinoSearch.Keyset.PRESENT);
+        assertTrue(present, present.contains("AND ((\"status\" < 404) OR (\"status\" = 404 AND (\"_id\" > CAST('7' AS DECIMAL(38, 0)) OR \"_id\" IS NULL)))"));
+        assertFalse(present, present.contains("\"status\" IS NULL"));
+        assertTrue(present, present.endsWith("ORDER BY \"status\" DESC NULLS LAST, \"_id\" ASC NULLS LAST LIMIT 10"));
+        String missing = InfinoSearch.hitStatement(plan, 3, false, InfinoSearch.Keyset.MISSING);
+        assertTrue(missing, missing.contains("WHERE (1=1) AND \"status\" IS NULL ORDER BY "));
+        assertTrue(missing, missing.endsWith(" LIMIT 3"));
+        // After a missing first value only the deeper sorts decide, and a
+        // collapse ranks a value's rows across both parts: one statement each.
+        assertFalse(InfinoSearch.splitsMissingTail(afterPlan(new Object[] { null, "7" }, null)));
+        assertFalse(InfinoSearch.splitsMissingTail(afterPlan(new Object[] { 404, "7" }, columns().get("level"))));
+        assertFalse(InfinoSearch.splitsMissingTail(afterPlan(null, null)));
+    }
+
     public void testTiesBreakByTheEngineRowId() {
         // Rows sharing the sort value are ordered by the engine's row id, which
         // the engine answers from its range index; a page continuing from a row
