@@ -1,0 +1,109 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package org.opensearch.infino;
+
+import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.common.xcontent.support.XContentMapValues;
+import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.mapper.SourceFieldMapper;
+import org.opensearch.search.fetch.subphase.FetchSourceContext;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * What a document's {@code _source} keeps under its index's mapping, as
+ * stock stores it: nothing when the mapping disables {@code _source}, else
+ * what its {@code includes} and {@code excludes} keep. The table keeps each
+ * document as it was indexed, which nested queries read their entries from,
+ * so the mapping is applied where a hit, a get or an mget hands the source
+ * out, and the request's own source filter then applies to what it keeps.
+ */
+record InfinoMappingSource(boolean enabled, String[] includes, String[] excludes) {
+
+    /** A mapping that keeps the source whole, as one that says nothing of it does. */
+    static final InfinoMappingSource WHOLE = new InfinoMappingSource(true, new String[0], new String[0]);
+
+    /** The {@code _source} of {@code mapping}; {@link #WHOLE} when there is none or it says nothing. */
+    static InfinoMappingSource of(MappingMetadata mapping) {
+        if (mapping == null) {
+            return WHOLE;
+        }
+        if (!(mapping.sourceAsMap().get(SourceFieldMapper.NAME) instanceof Map<?, ?> source)) {
+            return WHOLE;
+        }
+        boolean enabled = XContentMapValues.nodeBooleanValue(source.get("enabled"), "_source.enabled", true);
+        String[] includes = strings(source.get("includes"));
+        String[] excludes = strings(source.get("excludes"));
+        return enabled && includes.length == 0 && excludes.length == 0 ? WHOLE : new InfinoMappingSource(enabled, includes, excludes);
+    }
+
+    private static String[] strings(Object node) {
+        if (node instanceof List<?> list) {
+            return list.stream().map(String::valueOf).toArray(String[]::new);
+        }
+        return node == null ? new String[0] : new String[] { String.valueOf(node) };
+    }
+
+    /** Whether the mapping keeps every field of the source. */
+    boolean whole() {
+        return enabled && includes.length == 0 && excludes.length == 0;
+    }
+
+    /**
+     * Refuses {@code request} when it filters the source of a hit of
+     * {@code index} and the mapping disables {@code _source}, as stock's
+     * fetch phase does.
+     */
+    void refuseFilters(String index, FetchSourceContext request) {
+        if (!enabled && filters(request)) {
+            throw new IllegalArgumentException(
+                "unable to fetch fields from _source field: _source is disabled in the mappings for index [" + index + "]"
+            );
+        }
+    }
+
+    /** Whether {@code request} names includes or excludes. */
+    private static boolean filters(FetchSourceContext request) {
+        return request != null
+            && ((request.includes() != null && request.includes().length > 0)
+                || (request.excludes() != null && request.excludes().length > 0));
+    }
+
+    /**
+     * The source {@code src} as a response carries it: null when the mapping
+     * disables {@code _source}, else what the mapping keeps of it, filtered
+     * by {@code request}'s includes and excludes when it names any.
+     */
+    BytesReference shown(String src, FetchSourceContext request) {
+        if (!enabled) {
+            return null;
+        }
+        boolean requestFilters = filters(request);
+        if (whole() && !requestFilters) {
+            return new BytesArray(src);
+        }
+        Map<String, Object> map = XContentHelper.convertToMap(new BytesArray(src), true, MediaTypeRegistry.JSON).v2();
+        if (!whole()) {
+            map = XContentMapValues.filter(map, includes, excludes);
+        }
+        if (requestFilters) {
+            map = XContentMapValues.filter(map, request.includes(), request.excludes());
+        }
+        try (XContentBuilder b = XContentFactory.jsonBuilder()) {
+            b.map(map);
+            return BytesReference.bytes(b);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+}

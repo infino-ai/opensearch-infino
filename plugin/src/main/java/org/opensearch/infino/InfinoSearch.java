@@ -22,9 +22,7 @@ import org.opensearch.common.regex.Regex;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateFormatters;
 import org.opensearch.common.util.BigArrays;
-import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
-import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.common.bytes.BytesArray;
@@ -32,7 +30,6 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
-import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
@@ -64,8 +61,6 @@ import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.search.sort.SortMode;
 import org.opensearch.search.sort.SortOrder;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -597,8 +592,9 @@ public final class InfinoSearch {
             total = rows.size();
         }
 
-        FetchSourceContext sourceFilter = sourceFilter(source.fetchSource());
         boolean withSource = returnsSource(source);
+        // What the mapping's _source keeps of each document: the table keeps it whole.
+        InfinoMappingSource stored = withSource ? InfinoMappingSource.of(mapping(index)) : InfinoMappingSource.WHOLE;
         List<FieldAndFormat> fields = requestedFields(source.docValueFields(), source.fetchFields());
         boolean version = Boolean.TRUE.equals(source.version());
         SearchShardTarget target = target(index);
@@ -650,7 +646,11 @@ public final class InfinoSearch {
                 src = plan.access().read(id.toString(), src);
                 if (src != null && !src.isEmpty()) {
                     if (withSource) {
-                        h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
+                        stored.refuseFilters(index.getName(), source.fetchSource());
+                        BytesReference shown = stored.shown(src, source.fetchSource());
+                        if (shown != null) {
+                            h.sourceRef(shown);
+                        }
                     }
                     fillFields(h, src, fields, plan.cols());
                 }
@@ -867,16 +867,6 @@ public final class InfinoSearch {
         return upTo == null || upTo != SearchContext.TRACK_TOTAL_HITS_DISABLED;
     }
 
-    /** The source includes/excludes of {@code ctx}, or null when the source is returned whole (or not at all). */
-    private static FetchSourceContext sourceFilter(FetchSourceContext ctx) {
-        if (ctx == null || !ctx.fetchSource()) {
-            return null;
-        }
-        boolean includes = ctx.includes() != null && ctx.includes().length > 0;
-        boolean excludes = ctx.excludes() != null && ctx.excludes().length > 0;
-        return includes || excludes ? ctx : null;
-    }
-
     /** The index's mapping from the cluster state, or null when it cannot be read there. */
     private static MappingMetadata mapping(Index index) {
         ClusterService clusters = InfinoServices.clusterService();
@@ -909,8 +899,8 @@ public final class InfinoSearch {
         long bucketCount,
         Index index
     ) {
-        FetchSourceContext sourceFilter = sourceFilter(fetchSource);
         boolean withSource = fetchSource == null || fetchSource.fetchSource();
+        InfinoMappingSource stored = withSource && index != null ? InfinoMappingSource.of(mapping(index)) : InfinoMappingSource.WHOLE;
         float score = sorts.isEmpty() ? 1.0f : Float.NaN;
         SearchShardTarget target = index == null ? null : target(index);
         List<SearchHit> hits = new ArrayList<>();
@@ -928,7 +918,11 @@ public final class InfinoSearch {
                 String src = access.read(id.toString(), String.valueOf(row.get(InfinoQueryTranslator.SOURCE)));
                 if (!src.isEmpty()) {
                     if (withSource) {
-                        h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
+                        stored.refuseFilters(index == null ? null : index.getName(), fetchSource);
+                        BytesReference shown = stored.shown(src, fetchSource);
+                        if (shown != null) {
+                            h.sourceRef(shown);
+                        }
                     }
                     fillFields(h, src, fields, cols);
                 }
@@ -1063,16 +1057,6 @@ public final class InfinoSearch {
             return printer.format(at.atZone(ZoneOffset.UTC));
         } catch (RuntimeException e) {
             return v;
-        }
-    }
-
-    static BytesReference filtered(String src, FetchSourceContext filter) {
-        Map<String, Object> map = XContentHelper.convertToMap(new BytesArray(src), true, MediaTypeRegistry.JSON).v2();
-        try (XContentBuilder b = XContentFactory.jsonBuilder()) {
-            b.map(XContentMapValues.filter(map, filter.includes(), filter.excludes()));
-            return BytesReference.bytes(b);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
         }
     }
 
