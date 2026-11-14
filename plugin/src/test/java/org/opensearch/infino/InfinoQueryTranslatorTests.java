@@ -164,6 +164,67 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertTrue(collapsed, collapsed.startsWith("SELECT osid, source, "));
     }
 
+    public void testEveryRowSortedOnAColumnIsTheEnginesSortedSearch() {
+        InfinoSearch.Plan all = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchAllQuery()),
+            java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true), InfinoSearch.SortSpec.rowId()),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertTrue(InfinoSearch.indexSorted(all));
+        // A predicate narrows the rows: the hit statement.
+        InfinoSearch.Plan filtered = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.termQuery("level", "error")),
+            all.sorts(),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertFalse(InfinoSearch.indexSorted(filtered));
+        // So does a page after given sort values, and a sort on the row id alone.
+        InfinoSearch.Plan after = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchAllQuery()),
+            all.sorts(),
+            null,
+            null,
+            null,
+            new Object[] { 404, "7" },
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertFalse(InfinoSearch.indexSorted(after));
+        InfinoSearch.Plan byRowId = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchAllQuery()),
+            java.util.List.of(InfinoSearch.SortSpec.rowId()),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertFalse(InfinoSearch.indexSorted(byRowId));
+    }
+
     public void testTiesBreakByTheEngineRowId() {
         // Rows sharing the sort value are ordered by the engine's row id, which
         // the engine answers from its range index; a page continuing from a row

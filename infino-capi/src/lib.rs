@@ -75,6 +75,8 @@ const ROUTING: &str = "osrouting";
 /// search over a reader that does not hold that write yet leaves the row
 /// out. Null for a row written without one (it reads as 0).
 const SEQ: &str = "osseq";
+/// The engine's row id column, which orders rows sharing every sort value.
+const ROW_ID: &str = "_id";
 /// The sequence number of the operation that wrote a row, when the writer
 /// records one: the highest in a table says how far into the writer's
 /// history the table holds every write.
@@ -3018,6 +3020,58 @@ pub unsafe extern "C" fn infino_bm25(
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// The table's first `k` rows by `column`, ascending or (`descending`
+/// non-zero) descending, rows sharing a value in row id order and rows
+/// without one last, each carrying `osid`, `_id` and the column: the page a
+/// search that keeps every row asks for when it sorts on one field, in one
+/// call. The engine reads it from the column's range index with no
+/// statement planned, and plans the statement itself for a column without
+/// one.
+#[no_mangle]
+pub unsafe extern "C" fn infino_sorted(
+    h: *mut Bridge,
+    name: *const c_char,
+    column: *const c_char,
+    descending: c_int,
+    k: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(column)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(column) })
+        else {
+            return ptr::null_mut();
+        };
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        match table.sorted_search(
+            column,
+            descending != 0,
+            k.max(0) as usize,
+            Some(&[OSID, ROW_ID, column]),
+        ) {
+            // The engine fixes every row's `score` at zero; a sorted hit has none.
+            Ok(b) => out_string(batches_to_json(&without_column(&b, "score"))),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// `batches` without their column `name`, when they have one.
+fn without_column(batches: &[RecordBatch], name: &str) -> Vec<RecordBatch> {
+    batches
+        .iter()
+        .map(|b| {
+            let keep: Vec<usize> = (0..b.num_columns())
+                .filter(|&i| b.schema().field(i).name() != name)
+                .collect();
+            b.project(&keep).unwrap_or_else(|_| b.clone())
+        })
+        .collect()
 }
 
 /// Number of rows matching a token query on one text column (`mode` is

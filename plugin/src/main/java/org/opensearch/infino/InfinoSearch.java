@@ -576,6 +576,14 @@ public final class InfinoSearch {
             // returns no sequence numbers, so a request for them takes the hit statement.
             TextClause text = q.principal();
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
+        } else if (indexSorted(plan) && !seqNoAndPrimaryTerm) {
+            // Every row, sorted on one field: the engine reads the page from
+            // the field's range index, so no statement is planned for it.
+            SortSpec first = plan.sorts().get(0);
+            rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch);
+            if (wantsSource(source)) {
+                rows = withSources(plan.table(), rows, fetch);
+            }
         } else {
             rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
             if (sourcesById(plan) && wantsSource(source)) {
@@ -703,6 +711,34 @@ public final class InfinoSearch {
      * on the first key competes on the next, so a source in the statement
      * would be read for each of those rows to keep a page's worth.
      */
+    /**
+     * Whether the page is every row sorted on one field's own column, ties
+     * broken by the row id: the engine's sorted search, which reads it from
+     * the column's range index (and plans the statement itself for a column
+     * without one). A predicate, a text query, a vector, a search_after, a
+     * collapse, a scripted field, or a sort on an expression rather than a
+     * column takes the hit statement.
+     */
+    static boolean indexSorted(Plan plan) {
+        List<SortSpec> sorts = plan.sorts();
+        if (plan.vector() != null
+            || plan.query().principal() != null
+            || !InfinoQueryTranslator.ALL.equals(plan.hitWhere())
+            || plan.searchAfter() != null
+            || plan.collapse() != null
+            || !plan.scriptFields().isEmpty()
+            || sorts.size() != 2) {
+            return false;
+        }
+        SortSpec first = sorts.get(0);
+        SortSpec tie = sorts.get(1);
+        return tie.name().equals(InfinoSql.ROW_ID)
+            && !tie.desc()
+            && !first.name().equals(InfinoSql.ROW_ID)
+            && !first.name().equals(InfinoQueryTranslator.OSID)
+            && first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()));
+    }
+
     static boolean sourcesById(Plan plan) {
         return !plan.sorts().isEmpty() && plan.collapse() == null;
     }
