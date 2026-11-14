@@ -68,7 +68,9 @@ final class InfinoDocumentVersion {
         if (current == null) {
             return new VersionConflictEngineException(shardId, item.id(), item.ifSeqNo(), item.ifPrimaryTerm(), SequenceNumbers.UNASSIGNED_SEQ_NO, NO_DOCUMENT_TERM);
         }
-        if (current != item.ifSeqNo() || item.ifPrimaryTerm() != PRIMARY_TERM) {
+        boolean staleSeqNo = current != item.ifSeqNo();
+        boolean staleTerm = item.ifPrimaryTerm() != PRIMARY_TERM;
+        if (staleSeqNo && staleTerm) {
             return new VersionConflictEngineException(shardId, item.id(), item.ifSeqNo(), item.ifPrimaryTerm(), current, PRIMARY_TERM);
         }
         return null;
