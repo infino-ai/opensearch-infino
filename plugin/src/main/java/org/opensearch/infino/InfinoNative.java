@@ -980,6 +980,22 @@ public final class InfinoNative {
         return out.equals("null") ? null : rows(out);
     }
 
+    /**
+     * The first {@code k} rows of table {@code n} that {@code predicate}
+     * keeps, by {@code column} (by the one column the predicate names when
+     * null), descending when {@code desc}, each with its id, row id, the
+     * column's value when one is named and, when {@code withSource}, its
+     * source: a page in one engine call, read from the column's range index
+     * with no statement to plan. Null when the predicate is not one interval
+     * on a range-indexed column, for the caller to plan the statement.
+     */
+    public static List<Map<String, Object>> sortedRowsWhere(String n, String column, String predicate, boolean desc, int k, boolean withSource) {
+        init();
+        String out = takeOrThrow(lib.infino_sorted_where(conn, n, column, predicate, desc ? 1 : 0, k, withSource ? 1 : 0)).trim();
+        log.debug("[infino] sorted where: {} {} {} {} k={} -> {} chars", n, column, predicate, desc ? "desc" : "asc", k, out.length());
+        return out.equals("null") ? null : rows(out);
+    }
+
     /** Count of rows matching a full-text query ({@code mode} "and" / "or"), without materializing them. */
     public static long count(String n, String c, String q, String mode) {
         init();

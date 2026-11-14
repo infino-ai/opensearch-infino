@@ -35,7 +35,10 @@ import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
+import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.ConstantScoreQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.TextClause;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
@@ -584,6 +587,11 @@ public final class InfinoSearch {
             if (indexSorted(plan) && !seqNoAndPrimaryTerm) {
                 SortSpec first = plan.sorts().get(0);
                 rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, wantsSource(source));
+            } else if (intervalPage(plan) && onlyRanges(source.query()) && !seqNoAndPrimaryTerm) {
+                // A page in no order of the rows one interval of a range-indexed
+                // column keeps: its first rows in the column's order, from the
+                // column's range index, when the predicate is one such interval.
+                rows = InfinoNative.sortedRowsWhere(plan.table(), null, plan.hitWhere(), false, fetch, wantsSource(source));
             }
             if (rows == null) {
                 rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
@@ -739,6 +747,45 @@ public final class InfinoSearch {
             && !first.name().equals(InfinoSql.ROW_ID)
             && !first.name().equals(InfinoQueryTranslator.OSID)
             && first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()));
+    }
+
+    /**
+     * Whether the page is the rows a predicate keeps, in no order: no text
+     * query, vector, sort, search_after, collapse or scripted field. The
+     * engine reads it from a range index when the predicate is one interval
+     * on a range-indexed column ({@link InfinoNative#sortedRowsWhere}),
+     * stock returning the matches in no order either.
+     */
+    static boolean intervalPage(Plan plan) {
+        return plan.vector() == null
+            && plan.query().principal() == null
+            && !InfinoQueryTranslator.ALL.equals(plan.hitWhere())
+            && plan.sorts().isEmpty()
+            && plan.searchAfter() == null
+            && plan.collapse() == null
+            && plan.scriptFields().isEmpty();
+    }
+
+    /**
+     * Whether {@code query} is ranges and nothing else: a range, or a bool
+     * of ranges that must (or filter) hold, with no should or must_not. Only
+     * such a query can be one interval of a range-indexed column, so only
+     * its page asks the engine for one ({@link #intervalPage}); the engine
+     * checks that the ranges are one interval on one such column.
+     */
+    static boolean onlyRanges(QueryBuilder query) {
+        if (query instanceof RangeQueryBuilder) {
+            return true;
+        }
+        if (query instanceof ConstantScoreQueryBuilder c) {
+            return onlyRanges(c.innerQuery());
+        }
+        if (query instanceof BoolQueryBuilder b) {
+            List<QueryBuilder> required = new ArrayList<>(b.must());
+            required.addAll(b.filter());
+            return b.should().isEmpty() && b.mustNot().isEmpty() && !required.isEmpty() && required.stream().allMatch(InfinoSearch::onlyRanges);
+        }
+        return false;
     }
 
     static boolean sourcesById(Plan plan) {
