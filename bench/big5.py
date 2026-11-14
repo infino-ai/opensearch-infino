@@ -13,6 +13,8 @@ runs. A node that dies mid-search is reported as such and left out of the
 searches after it. Each answer is compared with stock's: hits.total, the
 set of top hit ids (scored searches may order ties differently), and the
 aggregations as JSON.
+
+Linux only: a node's resident memory is read from /proc.
 """
 
 import argparse

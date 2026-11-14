@@ -13,11 +13,14 @@
 #   BASE_PORT  http port of the default-mode node (default 9250)
 #   HEAP       JVM heap of each node (default 2g)
 #   COLUMN_CACHE  the engine's decoded-column cache per Infino node, bytes
-#              (default 4294967296, as the big5 races on GCP set it)
+#              (default 4294967296, 4 GiB)
 #   ONLY       space-separated subset of "stock default proxy" to start
 #   KEEP       1: keep each node's data and tables, only stop it, reinstall
 #              the plugin from ZIP and LIB, and start it again (to compare
 #              two builds over the same loaded index)
+#
+# Linux only: it uses GNU sed -i and realpath -m, and the opensearch-<V>-linux-x64
+# tarball.
 #
 # Stop them with: for p in $NODES/*/pid; do kill "$(cat "$p")"; done
 set -euo pipefail

@@ -324,7 +324,7 @@ No OpenSearch checkout is needed: the plugin builds against the release named by
 | `plugin/` | The OpenSearch plugin (`org.opensearch.infino`): the engine and query phase of default mode, the bulk, search and get filters of proxy mode, the query translator, aggregations, the batching writer, kNN and hybrid queries, and the SQL route. |
 | `infino-capi/` | The native bridge, a Rust `cdylib` over the `infino` crate: JSON in, JSON out, with every document checked against the declared columns. |
 | `scripts/` | `build.sh`, `run.sh` (install into a distribution and start a node) and `check-all.sh`. |
-| `bench/` | `bench.py`: indexing and query latency against stock Lucene. |
+| `bench/` | `bench.py`: indexing and query latency against stock Lucene. `local-nodes.sh` starts a stock, a default-mode and a proxy-mode node side by side, and `big5.py` loads big5 documents into them and times big5's searches against stock's answers (both Linux only). |
 | `HANDOVER.md` | Design notes from the first prototype. |
 
 ## License
