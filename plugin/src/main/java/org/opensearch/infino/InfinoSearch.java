@@ -578,20 +578,25 @@ public final class InfinoSearch {
             TextClause text = q.principal();
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
         } else {
-            if (splitsMissingTail(plan)) {
-                // The rows past a present first sort value come first; the
-                // rows missing it follow them all, so they are read only
-                // when the first part leaves the page short.
-                rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
-                if (rows.size() < fetch) {
-                    rows = new ArrayList<>(rows);
-                    rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
+            // Every row in no order: the engine's first rows in storage order,
+            // read with no statement planned.
+            rows = everyRowPage(plan) && !seqNoAndPrimaryTerm ? InfinoNative.headRows(plan.table(), fetch, wantsSource(source)) : null;
+            if (rows == null) {
+                if (splitsMissingTail(plan)) {
+                    // The rows past a present first sort value come first; the
+                    // rows missing it follow them all, so they are read only
+                    // when the first part leaves the page short.
+                    rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
+                    if (rows.size() < fetch) {
+                        rows = new ArrayList<>(rows);
+                        rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
+                    }
+                } else {
+                    rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
                 }
-            } else {
-                rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
-            }
-            if (sourcesById(plan) && wantsSource(source)) {
-                rows = withSources(plan.table(), rows, fetch);
+                if (sourcesById(plan) && wantsSource(source)) {
+                    rows = withSources(plan.table(), rows, fetch);
+                }
             }
             // A page the hit statement could not fill holds every row its
             // predicate keeps, and that predicate is the total's (no keyset,
@@ -707,6 +712,23 @@ public final class InfinoSearch {
      */
     static boolean bareRanked(Plan plan) {
         return plan.query().principal() != null
+            && InfinoQueryTranslator.ALL.equals(plan.hitWhere())
+            && plan.sorts().isEmpty()
+            && plan.searchAfter() == null
+            && plan.collapse() == null
+            && plan.scriptFields().isEmpty();
+    }
+
+    /**
+     * Whether the page is every row in no order: no predicate, text query,
+     * vector, sort, search_after, collapse or scripted field. The engine reads
+     * it as the table's first rows in storage order ({@link
+     * InfinoNative#headRows}), stock returning a match_all's hits in no
+     * order either.
+     */
+    static boolean everyRowPage(Plan plan) {
+        return plan.vector() == null
+            && plan.query().principal() == null
             && InfinoQueryTranslator.ALL.equals(plan.hitWhere())
             && plan.sorts().isEmpty()
             && plan.searchAfter() == null

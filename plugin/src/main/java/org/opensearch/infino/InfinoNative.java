@@ -1023,6 +1023,20 @@ public final class InfinoNative {
     }
 
     /**
+     * The first {@code k} live rows of table {@code n} in storage order, each
+     * with its id and, when {@code withSource}, its source: the page of a
+     * search that keeps every row in no order, in one engine call with no
+     * statement to plan. Null when the table answers no such call, for the
+     * caller to plan the statement.
+     */
+    public static List<Map<String, Object>> headRows(String n, int k, boolean withSource) {
+        init();
+        String out = takeOrThrow(lib.infino_head(conn, n, k, withSource ? 1 : 0)).trim();
+        log.debug("[infino] head: {} k={} -> {} chars", n, k, out.length());
+        return out.equals("null") ? null : rows(out);
+    }
+
+    /**
      * A column's rows counted per value, without a statement: one row per
      * value (under the column's name, null for the rows without one) with its
      * count under {@link #VALUE_COUNT}. The engine reads them from the table's

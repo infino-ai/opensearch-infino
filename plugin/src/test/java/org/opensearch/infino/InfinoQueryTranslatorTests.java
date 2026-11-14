@@ -175,6 +175,23 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         return InfinoSearch.hitStatement(plan, 10, false);
     }
 
+    private static InfinoSearch.Plan pagePlan(org.opensearch.index.query.QueryBuilder query, java.util.List<InfinoSearch.SortSpec> sorts) {
+        return new InfinoSearch.Plan(TABLE, columns(), translate(query), sorts, null, null, null, null, java.util.List.of(), InfinoAccess.NONE, NOW);
+    }
+
+    public void testEveryRowInNoOrderIsTheEnginesHead() {
+        // Every row in no order: the engine's first rows, with no statement.
+        assertTrue(InfinoSearch.everyRowPage(pagePlan(QueryBuilders.matchAllQuery(), java.util.List.of())));
+        // A predicate, a text query or a sort reads its rows through the hit statement.
+        assertFalse(InfinoSearch.everyRowPage(pagePlan(QueryBuilders.termQuery("level", "error"), java.util.List.of())));
+        assertFalse(InfinoSearch.everyRowPage(pagePlan(QueryBuilders.matchQuery("message", "fox"), java.util.List.of())));
+        assertFalse(
+            InfinoSearch.everyRowPage(
+                pagePlan(QueryBuilders.matchAllQuery(), java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true)))
+            )
+        );
+    }
+
     public void testASortedPageReadsItsSourcesAfterTheSort() {
         // The sort weighs every row it keeps; its statement selects ids and sort
         // values only, and the page's sources are read by id afterwards.

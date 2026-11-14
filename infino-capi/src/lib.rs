@@ -3251,6 +3251,37 @@ pub unsafe extern "C" fn infino_value_counts(
     .unwrap_or(ptr::null_mut())
 }
 
+/// The table's first `k` live rows in storage order, each carrying `osid`
+/// and, when `with_source` is non-zero, `source`: the page a search that
+/// keeps every row in no order asks for, in one call with no statement
+/// planned. `null` when the table answers no such call (a hosted one), for
+/// the caller to plan the statement.
+#[no_mangle]
+pub unsafe extern "C" fn infino_head(
+    h: *mut Bridge,
+    name: *const c_char,
+    k: c_int,
+    with_source: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
+            return ptr::null_mut();
+        };
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let with = [OSID, SOURCE];
+        let projection = if with_source != 0 { &with[..] } else { &with[..1] };
+        match table.head(k.max(0) as usize, Some(projection)) {
+            Ok(Some(b)) => out_string(batches_to_json(&b)),
+            Ok(None) => out_string("null".to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// Unranked full-text match set: the osids of every row matching `query` on
 /// `column`. Backs query-scoped aggregations over a text query.
 #[no_mangle]
