@@ -986,8 +986,12 @@ public final class InfinoNative {
      * null), descending when {@code desc}, each with its id, row id, the
      * column's value when one is named and, when {@code withSource}, its
      * source: a page in one engine call, read from the column's range index
-     * with no statement to plan. Null when the predicate is not one interval
-     * on a range-indexed column, for the caller to plan the statement.
+     * with no statement to plan. The predicate's ranges on the column pick
+     * the stretch of the index to read, and the engine checks the rest of it
+     * on the rows it reads, until the page fills. Null, for the caller to plan
+     * the statement, when the column has no range index, when the predicate
+     * needs a statement to evaluate, or when it keeps too few of the rows
+     * read in order to fill the page within a few thousand.
      */
     public static List<Map<String, Object>> sortedRowsWhere(String n, String column, String predicate, boolean desc, int k, boolean withSource) {
         init();

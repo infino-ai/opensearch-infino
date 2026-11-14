@@ -587,11 +587,17 @@ public final class InfinoSearch {
             if (indexSorted(plan) && !seqNoAndPrimaryTerm) {
                 SortSpec first = plan.sorts().get(0);
                 rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, wantsSource(source));
-            } else if (intervalPage(plan) && onlyRanges(source.query()) && !seqNoAndPrimaryTerm) {
-                // A page in no order of the rows one interval of a range-indexed
-                // column keeps: its first rows in the column's order, from the
-                // column's range index, when the predicate is one such interval.
-                rows = InfinoNative.sortedRowsWhere(plan.table(), null, plan.hitWhere(), false, fetch, wantsSource(source));
+            } else if (filterSorted(plan) && !seqNoAndPrimaryTerm) {
+                // A predicate's rows sorted on one range-indexed field: the engine
+                // reads the field's range index in order, a window of rows at a
+                // time, and keeps those the predicate holds until the page fills.
+                SortSpec first = plan.sorts().get(0);
+                rows = InfinoNative.sortedRowsWhere(plan.table(), first.name(), plan.hitWhere(), first.desc(), fetch, wantsSource(source));
+            } else if (intervalPage(plan) && !seqNoAndPrimaryTerm && rangeColumn(plan, source.query()) != null) {
+                // A page in no order of the rows a predicate with a range keeps:
+                // its first rows in the range column's order, from that column's
+                // range index, checked against the rest of the predicate.
+                rows = InfinoNative.sortedRowsWhere(plan.table(), rangeColumn(plan, source.query()), plan.hitWhere(), false, fetch, wantsSource(source));
             } else if (afterInterval(plan) && !seqNoAndPrimaryTerm) {
                 // A page after one present value of a range-indexed sort column:
                 // the rows past it are one interval of the column, read from its
@@ -741,11 +747,29 @@ public final class InfinoSearch {
      * column takes the hit statement.
      */
     static boolean indexSorted(Plan plan) {
+        return columnSorted(plan) && InfinoQueryTranslator.ALL.equals(plan.hitWhere()) && plan.searchAfter() == null;
+    }
+
+    /**
+     * Whether the page is the rows a predicate keeps, sorted on one field's
+     * own column, ties broken by the row id, from its start: the engine reads
+     * the column's range index in order and checks the predicate on the rows
+     * it gives ({@link InfinoNative#sortedRowsWhere}), or answers that the
+     * statement should, when the column has no range index or the predicate
+     * keeps too few of the rows read.
+     */
+    static boolean filterSorted(Plan plan) {
+        return columnSorted(plan) && !InfinoQueryTranslator.ALL.equals(plan.hitWhere()) && plan.searchAfter() == null;
+    }
+
+    /**
+     * Whether the page is sorted on one field's own column, ties broken by
+     * the row id, with no text query, vector, collapse or scripted field.
+     */
+    private static boolean columnSorted(Plan plan) {
         List<SortSpec> sorts = plan.sorts();
         if (plan.vector() != null
             || plan.query().principal() != null
-            || !InfinoQueryTranslator.ALL.equals(plan.hitWhere())
-            || plan.searchAfter() != null
             || plan.collapse() != null
             || !plan.scriptFields().isEmpty()
             || sorts.size() != 2) {
@@ -763,9 +787,8 @@ public final class InfinoSearch {
     /**
      * Whether the page is the rows a predicate keeps, in no order: no text
      * query, vector, sort, search_after, collapse or scripted field. The
-     * engine reads it from a range index when the predicate is one interval
-     * on a range-indexed column ({@link InfinoNative#sortedRowsWhere}),
-     * stock returning the matches in no order either.
+     * engine reads it from a range index when the predicate holds a range
+     * ({@link #rangeColumn}), stock returning the matches in no order either.
      */
     static boolean intervalPage(Plan plan) {
         return plan.vector() == null
@@ -778,25 +801,32 @@ public final class InfinoSearch {
     }
 
     /**
-     * Whether {@code query} is ranges and nothing else: a range, or a bool
-     * of ranges that must (or filter) hold, with no should or must_not. Only
-     * such a query can be one interval of a range-indexed column, so only
-     * its page asks the engine for one ({@link #intervalPage}); the engine
-     * checks that the ranges are one interval on one such column.
+     * The column of the first range {@code query} requires, a range or a
+     * bool's must or filter range (within a constant_score too), when the
+     * table has a column for its field; null otherwise. A page in no order
+     * reads the predicate's rows in that column's order: the engine reads the
+     * range from the column's range index and checks the rest of the
+     * predicate on the rows it gives, or answers that the statement should.
      */
-    static boolean onlyRanges(QueryBuilder query) {
-        if (query instanceof RangeQueryBuilder) {
-            return true;
+    static String rangeColumn(Plan plan, QueryBuilder query) {
+        if (query instanceof RangeQueryBuilder r) {
+            Column c = plan.cols().get(r.fieldName());
+            return c == null ? null : c.name();
         }
         if (query instanceof ConstantScoreQueryBuilder c) {
-            return onlyRanges(c.innerQuery());
+            return rangeColumn(plan, c.innerQuery());
         }
         if (query instanceof BoolQueryBuilder b) {
             List<QueryBuilder> required = new ArrayList<>(b.must());
             required.addAll(b.filter());
-            return b.should().isEmpty() && b.mustNot().isEmpty() && !required.isEmpty() && required.stream().allMatch(InfinoSearch::onlyRanges);
+            for (QueryBuilder clause : required) {
+                String column = rangeColumn(plan, clause);
+                if (column != null) {
+                    return column;
+                }
+            }
         }
-        return false;
+        return null;
     }
 
     /**

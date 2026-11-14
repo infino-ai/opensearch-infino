@@ -194,6 +194,9 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             NOW
         );
         assertFalse(InfinoSearch.indexSorted(filtered));
+        // The engine reads it in the column's order and checks the predicate on the rows.
+        assertTrue(InfinoSearch.filterSorted(filtered));
+        assertFalse(InfinoSearch.filterSorted(all));
         // So does a page after given sort values, and a sort on the row id alone.
         InfinoSearch.Plan after = new InfinoSearch.Plan(
             TABLE,
@@ -209,6 +212,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             NOW
         );
         assertFalse(InfinoSearch.indexSorted(after));
+        assertFalse(InfinoSearch.filterSorted(after));
         InfinoSearch.Plan byRowId = new InfinoSearch.Plan(
             TABLE,
             columns(),
@@ -253,13 +257,17 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             NOW
         );
         assertFalse(InfinoSearch.intervalPage(everyRow));
-        // Only a query of ranges alone can be one interval: a term beside one, or a should, is not asked for.
-        assertTrue(InfinoSearch.onlyRanges(QueryBuilders.rangeQuery("status").gte(500)));
-        assertTrue(InfinoSearch.onlyRanges(QueryBuilders.boolQuery().must(QueryBuilders.rangeQuery("status").gte(500)).filter(QueryBuilders.rangeQuery("status").lt(600))));
-        assertFalse(InfinoSearch.onlyRanges(QueryBuilders.boolQuery().must(QueryBuilders.rangeQuery("status").gte(500)).must(QueryBuilders.termQuery("level", "error"))));
-        assertFalse(InfinoSearch.onlyRanges(QueryBuilders.boolQuery().should(QueryBuilders.rangeQuery("status").gte(500))));
-        assertFalse(InfinoSearch.onlyRanges(QueryBuilders.termQuery("level", "error")));
-        assertFalse(InfinoSearch.onlyRanges(null));
+        // A page in no order is read in the order of the first range the query requires.
+        InfinoSearch.Plan p = ranged;
+        assertEquals("status", InfinoSearch.rangeColumn(p, QueryBuilders.rangeQuery("status").gte(500)));
+        assertEquals("status", InfinoSearch.rangeColumn(p, QueryBuilders.boolQuery().must(QueryBuilders.termQuery("level", "error")).filter(QueryBuilders.rangeQuery("status").lt(600))));
+        assertEquals("@timestamp", InfinoSearch.rangeColumn(p, QueryBuilders.constantScoreQuery(QueryBuilders.boolQuery().must(QueryBuilders.rangeQuery("@timestamp").gte("2024-01-01")))));
+        // A range only a should or must_not holds is no order the predicate requires, and a field with no column has none.
+        assertNull(InfinoSearch.rangeColumn(p, QueryBuilders.boolQuery().should(QueryBuilders.rangeQuery("status").gte(500))));
+        assertNull(InfinoSearch.rangeColumn(p, QueryBuilders.boolQuery().mustNot(QueryBuilders.rangeQuery("status").gte(500))));
+        assertNull(InfinoSearch.rangeColumn(p, QueryBuilders.rangeQuery("nope").gte(1)));
+        assertNull(InfinoSearch.rangeColumn(p, QueryBuilders.termQuery("level", "error")));
+        assertNull(InfinoSearch.rangeColumn(p, null));
         // A page after one present value of a column sort may come from its range index.
         InfinoSearch.Plan afterOne = new InfinoSearch.Plan(
             TABLE,
