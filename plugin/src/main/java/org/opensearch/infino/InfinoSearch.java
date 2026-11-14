@@ -576,16 +576,20 @@ public final class InfinoSearch {
             // returns no sequence numbers, so a request for them takes the hit statement.
             TextClause text = q.principal();
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
-        } else if (indexSorted(plan) && !seqNoAndPrimaryTerm) {
-            // Every row, sorted on one field: the engine reads the page from
-            // the field's range index, so no statement is planned for it, and
-            // the page's sources by row id along with it.
-            SortSpec first = plan.sorts().get(0);
-            rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, wantsSource(source));
         } else {
-            rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
-            if (sourcesById(plan) && wantsSource(source)) {
-                rows = withSources(plan.table(), rows, fetch);
+            // Every row, sorted on one range-indexed field: the engine reads the
+            // page from the field's range index, so no statement is planned for
+            // it, and the page's sources by row id along with it.
+            rows = null;
+            if (indexSorted(plan) && !seqNoAndPrimaryTerm) {
+                SortSpec first = plan.sorts().get(0);
+                rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, wantsSource(source));
+            }
+            if (rows == null) {
+                rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+                if (sourcesById(plan) && wantsSource(source)) {
+                    rows = withSources(plan.table(), rows, fetch);
+                }
             }
         }
 

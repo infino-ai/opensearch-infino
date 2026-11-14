@@ -3027,7 +3027,9 @@ pub unsafe extern "C" fn infino_bm25(
 /// without one last, each carrying `osid`, `_id`, the column and, when
 /// `with_source` is non-zero, `source`: the page a search that keeps every
 /// row asks for when it sorts on one field, in one call. The sources are
-/// read by row id along with the page, not looked up by `osid` afterwards. The engine reads it from the column's range index with no
+/// read by row id along with the page, not looked up by `osid` afterwards.
+/// `null` when the column has no range index: the engine's sorted search
+/// serves only a range-indexed column, and the caller plans the statement. The engine reads it from the column's range index with no
 /// statement planned, and plans the statement itself for a column without
 /// one.
 #[no_mangle]
@@ -3045,6 +3047,16 @@ pub unsafe extern "C" fn infino_sorted(
         else {
             return ptr::null_mut();
         };
+        let range_indexed = match conn.conn.schema(name) {
+            Ok(schema) => schema
+                .fields()
+                .iter()
+                .any(|f| f.name == column && matches!(f.index, Some(ColumnIndex::Range))),
+            Err(e) => return err_json(&e.to_string()),
+        };
+        if !range_indexed {
+            return out_string("null".to_string());
+        }
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),

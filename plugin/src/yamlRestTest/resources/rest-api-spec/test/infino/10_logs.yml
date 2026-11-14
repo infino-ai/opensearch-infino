@@ -71,6 +71,30 @@
   - match: { hits.hits.0._id: d }
   - match: { hits.hits.1._id: b }
 
+  # Every document sorted on one field, with its source: a date from the
+  # field's range index, a keyword (which has none) by statement, ties in the
+  # order the documents were written.
+  - do:
+      search:
+        index: logs
+        body:
+          sort: [ { "@timestamp": asc } ]
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: a }
+  - match: { hits.hits.0._source.message: "disk full on node-3" }
+  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.2._id: d }
+  - do:
+      search:
+        index: logs
+        body:
+          sort: [ { level: asc } ]
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: a }
+  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.2._id: d }
+  - match: { hits.hits.2._source.message: "cache warm" }
+
   # Field-scoped text search, with a filter on the ranked candidates.
   - do:
       search:
