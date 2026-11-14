@@ -2717,7 +2717,9 @@ pub unsafe extern "C" fn infino_get_many(
             let sources: Vec<Option<String>> = std::thread::scope(|scope| {
                 let lookups: Vec<_> = chunk
                     .iter()
-                    .map(|id| scope.spawn(move || get_row(conn, name, id).map(|(source, _)| source)))
+                    .map(|id| {
+                        scope.spawn(move || get_row(conn, name, id).map(|(source, _)| source))
+                    })
                     .collect();
                 lookups
                     .into_iter()
@@ -3787,20 +3789,33 @@ mod tests {
         index(
             h,
             &[
-                ("a", r#"{"status":200,"took":1.5,"level":"info"}"#),
-                ("b", r#"{"status":404,"took":30.0,"level":"warn"}"#),
-                ("c", r#"{"status":500,"took":2.5,"level":"error"}"#),
+                (
+                    "a",
+                    r#"{"@timestamp":"2026-10-24T10:00:00Z","status":200,"took":1.5,"level":"info"}"#,
+                ),
+                (
+                    "b",
+                    r#"{"@timestamp":"2026-10-24T10:01:00Z","status":404,"took":30.0,"level":"warn"}"#,
+                ),
+                (
+                    "c",
+                    r#"{"@timestamp":"2026-10-24T10:02:00Z","status":500,"took":2.5,"level":"error"}"#,
+                ),
                 ("d", r#"{"message":"no status"}"#),
             ],
         );
-        // Every row, ranges the index counts, and two shapes it leaves to the
-        // aggregate: a keyword column and an OR.
+        // Every row, ranges the index counts, two shapes it leaves to the
+        // aggregate (a keyword column and an OR), and a date compared with a
+        // string literal, which the count coerces to a timestamp as a
+        // statement does.
         let predicates = [
             "1=1",
             r#"(1=1 AND ("status" >= 400))"#,
             r#"("took") < 10"#,
             r#""level" = 'info'"#,
             r#""status" < 300 OR "took" > 20"#,
+            r#""@timestamp" >= '2026-10-24T10:01:00Z'"#,
+            r#"("@timestamp" >= '2026-10-24T10:00:00Z' AND "@timestamp" < '2026-10-24T10:02:00Z')"#,
         ];
         let filtered: Vec<String> = predicates
             .iter()
@@ -3820,7 +3835,7 @@ mod tests {
         });
         let counts: Vec<u64> = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
         assert_eq!(counts, expected);
-        assert_eq!(counts, [4, 2, 2, 1, 2]);
+        assert_eq!(counts, [4, 2, 2, 1, 2, 2, 2]);
         // A text clause joined by id, which reads the token index through a
         // subquery, beside the whole table.
         let joined = [
