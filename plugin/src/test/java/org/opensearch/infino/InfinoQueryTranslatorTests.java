@@ -267,6 +267,22 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
      * Only plain words become text_match: a phrase or a clause the engine
      * reads with a + or - sigil keeps the token_match subquery, which reads them.
      */
+    /**
+     * A query string's optional words that all reach one text column are that
+     * column matching any of them: one clause, the ranked source of the page,
+     * not a clause per word. Words that reach another column, a phrase, or a
+     * required clause keep the clauses apart.
+     */
+    public void testOptionalWordsOnOneTextColumnAreOneRankedClause() {
+        Translation t = translate(QueryBuilders.queryStringQuery("message: monkey jackal bear"));
+        assertEquals("token_match('os_logs_0', 'message', 'monkey jackal bear', 'or')", t.from());
+        assertEquals(InfinoQueryTranslator.ALL, t.where());
+        Translation phrase = translate(QueryBuilders.queryStringQuery("message: monkey \"jackal bear\""));
+        assertFalse(phrase.from(), phrase.from().contains("'monkey jackal bear'"));
+        Translation required = translate(QueryBuilders.queryStringQuery("message:monkey AND jackal"));
+        assertFalse(required.from(), required.from().contains("'monkey jackal'"));
+    }
+
     public void testAPhraseOrASigilKeepsTheSubquery() {
         assertTrue(InfinoQueryTranslator.plainQuery("disk full"));
         assertFalse(InfinoQueryTranslator.plainQuery("\"disk full\""));

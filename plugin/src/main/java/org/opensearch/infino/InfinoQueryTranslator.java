@@ -1296,6 +1296,51 @@ final class InfinoQueryTranslator {
         return node(InfinoLuceneQuery.parse(q, op), targets, positive, q, op);
     }
 
+    /**
+     * {@code clauses}, optional clauses of one group, as one text clause
+     * matching any of their words, when each is a single plain word (no
+     * phrase, wildcard, fuzziness or proximity) and all reach the same one
+     * text column: a field clause naming it, or a bare word whose default
+     * fields hold that text column and no other field the word could match.
+     * Null otherwise, and the clauses are read one by one.
+     */
+    private String oneColumnAnyWord(List<Node> clauses, List<String> targets, boolean positive) {
+        String column = null;
+        List<String> words = new ArrayList<>();
+        for (Node n : clauses) {
+            if (!(n instanceof Term t) || t.quoted() || t.fuzzy() > 0 || t.slop() > 0) {
+                return null;
+            }
+            String word = plainTerms(t.text());
+            if (word.isEmpty() || word.indexOf(' ') >= 0 || word.indexOf('*') >= 0 || word.indexOf('?') >= 0) {
+                return null;
+            }
+            String reached = t.field() == null ? onlyTextColumn(targets) : onlyTextColumn(List.of(t.field()));
+            if (reached == null || (column != null && !column.equals(reached))) {
+                return null;
+            }
+            column = reached;
+            words.add(word);
+        }
+        return column == null ? null : textClause(column, String.join(" ", words), "or", positive);
+    }
+
+    /** The one text column {@code fields} name, when they name exactly one field the table has and it is a text column. */
+    private String onlyTextColumn(List<String> fields) {
+        String only = null;
+        for (String f : fields) {
+            Column c = column(f);
+            if (c == null) {
+                continue;
+            }
+            if (!c.fts() || (only != null && !only.equals(c.name()))) {
+                return null;
+            }
+            only = c.name();
+        }
+        return only;
+    }
+
     /** The predicate of one node of a query string's tree, or null when the table cannot take it; {@code op} reads a bare term's words. */
     private String node(Node n, List<String> targets, boolean positive, String query, Operator op) {
         if (n instanceof All) {
@@ -1305,6 +1350,16 @@ final class InfinoQueryTranslator {
             String engine = engineQuery(b);
             if (engine != null) {
                 return textOnFields(targets, engine, Operator.OR, positive, false, false, true);
+            }
+            // Optional clauses alone that are each one plain word on the same
+            // text column (`message:a b c` over a single text column) are that
+            // column matching any of the words: one text clause, which can be
+            // the query's ranked source, rather than one clause per word.
+            if (b.must().isEmpty() && b.mustNot().isEmpty()) {
+                String one = oneColumnAnyWord(b.should(), targets, positive);
+                if (one != null) {
+                    return one;
+                }
             }
             // Lucene's clause list: the required clauses match on their own, the
             // optional ones only when nothing is required, the prohibited never.
