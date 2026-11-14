@@ -3024,9 +3024,10 @@ pub unsafe extern "C" fn infino_bm25(
 
 /// The table's first `k` rows by `column`, ascending or (`descending`
 /// non-zero) descending, rows sharing a value in row id order and rows
-/// without one last, each carrying `osid`, `_id` and the column: the page a
-/// search that keeps every row asks for when it sorts on one field, in one
-/// call. The engine reads it from the column's range index with no
+/// without one last, each carrying `osid`, `_id`, the column and, when
+/// `with_source` is non-zero, `source`: the page a search that keeps every
+/// row asks for when it sorts on one field, in one call. The sources are
+/// read by row id along with the page, not looked up by `osid` afterwards. The engine reads it from the column's range index with no
 /// statement planned, and plans the statement itself for a column without
 /// one.
 #[no_mangle]
@@ -3036,6 +3037,7 @@ pub unsafe extern "C" fn infino_sorted(
     column: *const c_char,
     descending: c_int,
     k: c_int,
+    with_source: c_int,
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name), Some(column)) =
@@ -3047,12 +3049,9 @@ pub unsafe extern "C" fn infino_sorted(
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
-        match table.sorted_search(
-            column,
-            descending != 0,
-            k.max(0) as usize,
-            Some(&[OSID, ROW_ID, column]),
-        ) {
+        let with = [OSID, ROW_ID, column, SOURCE];
+        let projection = if with_source != 0 { &with[..] } else { &with[..3] };
+        match table.sorted_search(column, descending != 0, k.max(0) as usize, Some(projection)) {
             // The engine fixes every row's `score` at zero; a sorted hit has none.
             Ok(b) => out_string(batches_to_json(&without_column(&b, "score"))),
             Err(e) => err_json(&e.to_string()),

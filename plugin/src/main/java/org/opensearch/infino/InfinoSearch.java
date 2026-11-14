@@ -578,12 +578,10 @@ public final class InfinoSearch {
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
         } else if (indexSorted(plan) && !seqNoAndPrimaryTerm) {
             // Every row, sorted on one field: the engine reads the page from
-            // the field's range index, so no statement is planned for it.
+            // the field's range index, so no statement is planned for it, and
+            // the page's sources by row id along with it.
             SortSpec first = plan.sorts().get(0);
-            rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch);
-            if (wantsSource(source)) {
-                rows = withSources(plan.table(), rows, fetch);
-            }
+            rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, wantsSource(source));
         } else {
             rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
             if (sourcesById(plan) && wantsSource(source)) {

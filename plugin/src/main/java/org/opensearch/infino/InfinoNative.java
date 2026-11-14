@@ -967,13 +967,14 @@ public final class InfinoNative {
     /**
      * The first {@code k} rows of table {@code n} by {@code column},
      * descending when {@code desc}, rows sharing a value in row id order and
-     * rows without one last, each with its id, row id and the column's value:
-     * a sorted page in one engine call, read from the column's range index
-     * with no statement to plan when it has one.
+     * rows without one last, each with its id, row id, the column's value
+     * and, when {@code withSource}, its source: a sorted page in one engine
+     * call, read from the column's range index with no statement to plan
+     * when it has one, its sources read by row id along with it.
      */
-    public static List<Map<String, Object>> sortedRows(String n, String column, boolean desc, int k) {
+    public static List<Map<String, Object>> sortedRows(String n, String column, boolean desc, int k, boolean withSource) {
         init();
-        String out = takeOrThrow(lib.infino_sorted(conn, n, column, desc ? 1 : 0, k));
+        String out = takeOrThrow(lib.infino_sorted(conn, n, column, desc ? 1 : 0, k, withSource ? 1 : 0));
         log.debug("[infino] sorted: {} {} {} k={} -> {} chars", n, column, desc ? "desc" : "asc", k, out.length());
         return rows(out);
     }
