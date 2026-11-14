@@ -571,4 +571,91 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
         assertTrue(e.getMessage(), e.getMessage().contains("document [s9] has values under [references] its source does not hold"));
     }
+
+    // ---- nested at depth ----
+
+    /** Orders whose items are nested and whose items' tags are nested inside them, flattened to a column per member. */
+    private static Map<String, Column> orderColumns() {
+        Map<String, Column> cols = new LinkedHashMap<>();
+        cols.put("osid", new Column("osid", "str", false, false));
+        cols.put("source", new Column("source", "str", false, false));
+        cols.put("items.sku", new Column("items.sku", "str", false, false));
+        cols.put("items.tags.name", new Column("items.tags.name", "str", false, false));
+        cols.put("items.tags.color", new Column("items.tags.color", "str", false, false));
+        cols.put("items.sku[]", Column.list("items.sku[]", "str"));
+        cols.put("items.tags.name[]", Column.list("items.tags.name[]", "str"));
+        cols.put("items.tags.color[]", Column.list("items.tags.color[]", "str"));
+        return cols;
+    }
+
+    /**
+     * o1's item a has a tag named size that is red. o2's item a has a size tag and a red tag, but not one
+     * tag that is both. o3 has the red size tag, but on item b, not on item a.
+     */
+    private static Map<String, String> orders() {
+        Map<String, String> docs = new LinkedHashMap<>();
+        docs.put("o1", "{\"items\":[{\"sku\":\"a\",\"tags\":[{\"name\":\"size\",\"color\":\"red\"},{\"name\":\"fit\",\"color\":\"blue\"}]}]}");
+        docs.put("o2", "{\"items\":[{\"sku\":\"a\",\"tags\":[{\"name\":\"size\",\"color\":\"blue\"},{\"name\":\"fit\",\"color\":\"red\"}]}]}");
+        docs.put("o3", "{\"items\":[{\"sku\":\"a\",\"tags\":[{\"name\":\"fit\",\"color\":\"blue\"}]},{\"sku\":\"b\",\"tags\":[{\"name\":\"size\",\"color\":\"red\"}]}]}");
+        return docs;
+    }
+
+    private static org.opensearch.index.query.NestedQueryBuilder redSizeTag() {
+        return QueryBuilders.nestedQuery(
+            "items.tags",
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.termQuery("items.tags.name", "size"))
+                .must(QueryBuilders.termQuery("items.tags.color", "red")),
+            org.apache.lucene.search.join.ScoreMode.None
+        );
+    }
+
+    /**
+     * A nested query inside a nested query holds every clause on one inner entry, and that entry inside the
+     * one outer entry its siblings hold on: not a name and a color from two tags (o2), nor an inner match
+     * on an item the outer clause does not hold on (o3).
+     */
+    public void testNestedUnderNestedMatchesOneEntryAtEachLevel() {
+        org.opensearch.index.query.QueryBuilder q = QueryBuilders.nestedQuery("items", redSizeTag(), org.apache.lucene.search.join.ScoreMode.None);
+        assertEquals("osid IN ('o1', 'o3')", InfinoQueryTranslator.translate(q, orderColumns(), "os_orders_0", NOW, new Rows(orders(), true)).where());
+        q = QueryBuilders.nestedQuery(
+            "items",
+            QueryBuilders.boolQuery().must(QueryBuilders.termQuery("items.sku", "a")).must(redSizeTag()),
+            org.apache.lucene.search.join.ScoreMode.None
+        );
+        assertEquals("osid IN ('o1')", InfinoQueryTranslator.translate(q, orderColumns(), "os_orders_0", NOW, new Rows(orders(), true)).where());
+        // A must_not of the inner nested query holds on every item without a red size tag: o1's has one, o2's does not, o3's item a does not.
+        q = QueryBuilders.nestedQuery(
+            "items",
+            QueryBuilders.boolQuery().must(QueryBuilders.termQuery("items.sku", "a")).mustNot(redSizeTag()),
+            org.apache.lucene.search.join.ScoreMode.None
+        );
+        assertEquals("osid IN ('o2', 'o3')", InfinoQueryTranslator.translate(q, orderColumns(), "os_orders_0", NOW, new Rows(orders(), true)).where());
+    }
+
+    /**
+     * A path three levels deep is read through objects, arrays and dotted keys alike, an entry at a time:
+     * p2 has the rel and the href asked for in two links, and p3 writes its parent as a dotted key.
+     */
+    public void testNestedPathSeveralLevelsDeep() {
+        Map<String, Column> cols = new LinkedHashMap<>();
+        cols.put("osid", new Column("osid", "str", false, false));
+        cols.put("source", new Column("source", "str", false, false));
+        cols.put("site.meta.links.rel", new Column("site.meta.links.rel", "str", false, false));
+        cols.put("site.meta.links.href", new Column("site.meta.links.href", "str", false, false));
+        cols.put("site.meta.links.rel[]", Column.list("site.meta.links.rel[]", "str"));
+        cols.put("site.meta.links.href[]", Column.list("site.meta.links.href[]", "str"));
+        Map<String, String> docs = new LinkedHashMap<>();
+        docs.put("p1", "{\"site\":{\"meta\":{\"links\":[{\"rel\":\"next\",\"href\":\"a\"},{\"rel\":\"prev\",\"href\":\"b\"}]}}}");
+        docs.put("p2", "{\"site\":{\"meta\":{\"links\":[{\"rel\":\"next\",\"href\":\"b\"},{\"rel\":\"prev\",\"href\":\"a\"}]}}}");
+        docs.put("p3", "{\"site.meta\":{\"links\":[{\"rel\":\"next\",\"href\":\"a\"}]}}");
+        org.opensearch.index.query.QueryBuilder q = QueryBuilders.nestedQuery(
+            "site.meta.links",
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.termQuery("site.meta.links.rel", "next"))
+                .must(QueryBuilders.termQuery("site.meta.links.href", "a")),
+            org.apache.lucene.search.join.ScoreMode.None
+        );
+        assertEquals("osid IN ('p1', 'p3')", InfinoQueryTranslator.translate(q, cols, "os_pages_0", NOW, new Rows(docs, true)).where());
+    }
 }

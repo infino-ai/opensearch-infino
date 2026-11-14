@@ -78,7 +78,9 @@ import java.util.regex.Pattern;
  * terms and phrases on the default fields go to the engine with the
  * clause occurrences as {@code +} / {@code -} sigils, and its field
  * clauses, ranges, wildcards and regular expressions become predicates on
- * those columns. Nothing materializes a match set in Java.
+ * those columns. None of these materializes a match set in Java; only a
+ * nested query reads rows into Java, its candidates' sources, up to
+ * {@link #NESTED_CANDIDATES_MAX}.
  *
  * <p>A nested query (an entry of an array of objects matching, every
  * clause on that one entry) is checked entry by entry: the table's columns
