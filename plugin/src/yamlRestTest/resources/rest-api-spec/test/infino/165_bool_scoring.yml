@@ -311,6 +311,47 @@
   - gt: { hits.hits.1._score: 1.999000 }
   - lt: { hits.hits.1._score: 2.001000 }
 
+  # Should clauses that match no document: no hits, whether the total is
+  # counted first (and is 0, so no page is ranked) or not counted at all.
+  - do:
+      search:
+        index: sc_luc
+        body: { query: {"bool": {"should": [{"term": {"k": "z"}}, {"range": {"n": {"gte": 10, "lte": 20}}}]}} }
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: sc_inf
+        body: { query: {"bool": {"should": [{"term": {"k": "z"}}, {"range": {"n": {"gte": 10, "lte": 20}}}]}} }
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: sc_inf
+        body: { track_total_hits: false, query: {"bool": {"should": [{"term": {"k": "z"}}, {"range": {"n": {"gte": 10, "lte": 20}}}]}} }
+  - length: { hits.hits: 0 }
+  # One matches, so the page is ranked after the count: d5 matches both, d4 the range alone.
+  - do:
+      search:
+        index: sc_luc
+        body: { query: {"bool": {"should": [{"term": {"k": "b"}}, {"range": {"n": {"gte": 4}}}]}} }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d5 }
+  - gt: { hits.hits.0._score: 1.999000 }
+  - lt: { hits.hits.0._score: 2.001000 }
+  - match: { hits.hits.1._id: d2 }
+  - match: { hits.hits.2._id: d4 }
+  - do:
+      search:
+        index: sc_inf
+        body: { query: {"bool": {"should": [{"term": {"k": "b"}}, {"range": {"n": {"gte": 4}}}]}} }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d5 }
+  - gt: { hits.hits.0._score: 1.999000 }
+  - lt: { hits.hits.0._score: 2.001000 }
+  - match: { hits.hits.1._id: d2 }
+  - match: { hits.hits.2._id: d4 }
+
 ---
 "A term on a boolean field, or on a keyword field with use_similarity, scores its BM25, as a Lucene twin scores it":
   # Lucene scores a term on such a field with BM25, not at a constant: the

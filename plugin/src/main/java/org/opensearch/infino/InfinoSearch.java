@@ -537,6 +537,15 @@ public final class InfinoSearch {
      * for the caller, which reads it beside the aggregations (the page's total
      * is then 0 until replaced).
      */
+    /**
+     * The total: what the query and post_filter keep, before any collapse
+     * and regardless of where the page starts.
+     */
+    private static long total(Plan plan) {
+        Translation q = plan.query();
+        return plan.postWhere() == null ? count(plan.table(), q) : count(plan.table(), q.withWhere(plan.hitWhere()));
+    }
+
     static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count) {
         final int from = Math.max(0, source.from());
         final int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
@@ -553,6 +562,9 @@ public final class InfinoSearch {
         // A vector hit's sequence number, by id, when the request asks for it: the
         // vector entry points return ids and scores only.
         Map<String, Long> vectorSeqs = Map.of();
+        boolean exact = trackTotal(source);
+        // The exact total, when it is read before the page: see the scored page below.
+        Long counted = null;
         if (size == 0 && !stockKnn) {
             rows = List.of();
         } else if (plan.vector() != null) {
@@ -589,6 +601,11 @@ public final class InfinoSearch {
             // returns no sequence numbers, so a request for them takes the hit statement.
             TextClause text = q.principal();
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
+        } else if (exact && count && scoredPage(plan) && (counted = total(plan)) == 0) {
+            // A scored page is the costliest statement to plan, and the total is
+            // counted anyway: read first, a total of 0 leaves no hit to rank,
+            // and the statement is not planned.
+            rows = List.of();
         } else {
             rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
             if (sourcesById(plan) && wantsSource(source)) {
@@ -596,16 +613,13 @@ public final class InfinoSearch {
             }
         }
 
-        boolean exact = trackTotal(source);
         long total;
         if (plan.vector() != null) {
             total = rows.size(); // kNN is inherently top-k
         } else if (exact && !count) {
             total = 0;
         } else if (exact) {
-            // The total counts what the query and post_filter keep, before
-            // any collapse and regardless of where the page starts.
-            total = plan.postWhere() == null ? count(plan.table(), q) : count(plan.table(), q.withWhere(plan.hitWhere()));
+            total = counted != null ? counted : total(plan);
         } else {
             total = rows.size();
         }
@@ -796,7 +810,7 @@ public final class InfinoSearch {
             where = "(" + where + ") AND " + keysetPredicate(plan);
         }
         boolean sorted = !plan.sorts().isEmpty();
-        if (!sorted && plan.collapse() == null && plan.searchAfter() == null && q.scoring().reorders()) {
+        if (scoredPage(plan)) {
             return scoredStatement(plan, hit.toString(), where, fetch, withSeq);
         }
         boolean ranked = !sorted && q.principal() != null;
@@ -828,6 +842,15 @@ public final class InfinoSearch {
         return "SELECT " + hit + " FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY " + within
             + ") AS collapse_rank FROM " + from + " t WHERE " + where + ") WHERE collapse_rank = 1"
             + (order == null ? "" : " ORDER BY " + order) + " LIMIT " + fetch;
+    }
+
+    /**
+     * Whether the page is ranked by more than the principal's BM25
+     * ({@link Scoring#reorders}), in no other order, and read by
+     * {@link #scoredStatement}.
+     */
+    static boolean scoredPage(Plan plan) {
+        return plan.sorts().isEmpty() && plan.collapse() == null && plan.searchAfter() == null && plan.query().scoring().reorders();
     }
 
     /**
