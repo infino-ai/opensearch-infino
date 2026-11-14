@@ -36,6 +36,28 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         return InfinoQueryTranslator.translate(qb, columns(), TABLE, NOW);
     }
 
+    public void testARangeOnADateColumnCarriesItsSpan() {
+        // Both bounds as written: from the lower, inclusive, to the upper, exclusive.
+        InfinoQueryTranslator.Span span = translate(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00").lt("2023-01-02T10:00:00")).span();
+        assertEquals(new InfinoQueryTranslator.Span("@timestamp", Instant.parse("2023-01-02T00:00:00Z").toEpochMilli(), Instant.parse("2023-01-02T10:00:00Z").toEpochMilli()), span);
+        // gt and lte on a day round up to its last millisecond, so the span starts and ends a millisecond past it.
+        span = translate(QueryBuilders.rangeQuery("@timestamp").gt("2023-01-01").lte("2023-01-02").format("yyyy-MM-dd")).span();
+        assertEquals(Instant.parse("2023-01-02T00:00:00Z").toEpochMilli(), span.fromMillis());
+        assertEquals(Instant.parse("2023-01-03T00:00:00Z").toEpochMilli(), span.untilMillis());
+        // An open range, a range on a number, or anything but a range carries none.
+        assertNull(translate(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00")).span());
+        assertNull(translate(QueryBuilders.rangeQuery("status").gte(500).lt(600)).span());
+        assertNull(
+            translate(QueryBuilders.boolQuery().filter(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00").lt("2023-01-03T00:00:00")).filter(QueryBuilders.termQuery("level", "error")))
+                .span()
+        );
+        assertNull(translate(QueryBuilders.matchAllQuery()).span());
+        assertEquals(
+            "arrow_cast('2023-01-02T00:00:00Z', 'Timestamp(Millisecond, Some(\"UTC\"))')",
+            InfinoAggregationProcessor.timestampLiteral(Instant.parse("2023-01-02T00:00:00Z").toEpochMilli())
+        );
+    }
+
     public void testMatchAllAndFilters() {
         assertEquals("1=1", translate(QueryBuilders.matchAllQuery()).where());
         assertEquals("\"level\" = 'error'", translate(QueryBuilders.termQuery("level", "error")).where());
@@ -162,6 +184,45 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         // A collapse keeps the first row of each value through a window, whose rows carry their sources.
         String collapsed = sortedHits(columns().get("level"));
         assertTrue(collapsed, collapsed.startsWith("SELECT osid, source, "));
+    }
+
+    /** A match_all sorted by {@code status} descending, then by the row id, continuing after {@code after}, under {@code collapse}. */
+    private static InfinoSearch.Plan afterPlan(Object[] after, Column collapse) {
+        return new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchAllQuery()),
+            java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true), InfinoSearch.SortSpec.rowId()),
+            null,
+            null,
+            collapse,
+            after,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+    }
+
+    public void testASearchAfterPageReadsThePresentRowsBeforeTheMissingOnes() {
+        // After a present first value, the rows past it are a plain range on
+        // the sort column; the rows missing it sort after them all and are
+        // their own statement, read only for a short page.
+        InfinoSearch.Plan plan = afterPlan(new Object[] { 404, "7" }, null);
+        assertTrue(InfinoSearch.splitsMissingTail(plan));
+        String whole = InfinoSearch.hitStatement(plan, 10, false);
+        assertTrue(whole, whole.contains("(\"status\" < 404 OR \"status\" IS NULL)"));
+        String present = InfinoSearch.hitStatement(plan, 10, false, InfinoSearch.Keyset.PRESENT);
+        assertTrue(present, present.contains("AND ((\"status\" < 404) OR (\"status\" = 404 AND (\"_id\" > CAST('7' AS DECIMAL(38, 0)) OR \"_id\" IS NULL)))"));
+        assertFalse(present, present.contains("\"status\" IS NULL"));
+        assertTrue(present, present.endsWith("ORDER BY \"status\" DESC NULLS LAST, \"_id\" ASC NULLS LAST LIMIT 10"));
+        String missing = InfinoSearch.hitStatement(plan, 3, false, InfinoSearch.Keyset.MISSING);
+        assertTrue(missing, missing.contains("WHERE (1=1) AND \"status\" IS NULL ORDER BY "));
+        assertTrue(missing, missing.endsWith(" LIMIT 3"));
+        // After a missing first value only the deeper sorts decide, and a
+        // collapse ranks a value's rows across both parts: one statement each.
+        assertFalse(InfinoSearch.splitsMissingTail(afterPlan(new Object[] { null, "7" }, null)));
+        assertFalse(InfinoSearch.splitsMissingTail(afterPlan(new Object[] { 404, "7" }, columns().get("level"))));
+        assertFalse(InfinoSearch.splitsMissingTail(afterPlan(null, null)));
     }
 
     public void testTiesBreakByTheEngineRowId() {

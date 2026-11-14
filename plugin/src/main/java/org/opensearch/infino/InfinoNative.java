@@ -935,6 +935,23 @@ public final class InfinoNative {
      */
     public static Map<String, String> sources(String name, Collection<String> osids) {
         Map<String, String> out = new HashMap<>();
+        if (osids.size() > 1) {
+            // One call for the page: the bridge runs its lookups side by side.
+            init();
+            String json = take(lib.infino_get_many(conn, name, osids.toArray(new String[0]), osids.size()));
+            if (json != null && !json.isEmpty()) {
+                try (XContentParser parser = parser(json)) {
+                    for (Map.Entry<String, Object> entry : parser.map().entrySet()) {
+                        if (entry.getValue() instanceof String source && !source.isEmpty()) {
+                            out.put(entry.getKey(), source);
+                        }
+                    }
+                    return out;
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }
+        }
         for (String id : osids) {
             String source = getSourceFresh(name, id);
             if (source != null && !source.isEmpty()) {
