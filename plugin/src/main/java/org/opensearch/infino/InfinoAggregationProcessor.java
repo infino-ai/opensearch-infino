@@ -245,10 +245,57 @@ public class InfinoAggregationProcessor {
     private static final class Background {
         final long size;
         final Map<String, Long> counts = new HashMap<>();
+        /** Whether {@link #counts} holds every term the background has. */
+        boolean complete;
 
         Background(long size) {
             this.size = size;
         }
+    }
+
+    /** Most distinct values a background is read whole for (see {@link #wholeTableBackground}). */
+    private static final int MAX_BACKGROUND_VALUES = 10_000;
+
+    /**
+     * The background of {@code s} from its table's value counts, when it is
+     * the whole of one table: no background filter, no rule narrowing what
+     * the user may see, a string field each document gives one value. The
+     * engine reads the counts from the table's statistics when they count
+     * every row exactly, and runs one grouped count otherwise, where the
+     * statements read the background's size and its terms' counts apart.
+     * Every row, those without the field among them, counts toward the
+     * size, as the size statement counts them. Null for any other shape, or
+     * past {@link #MAX_BACKGROUND_VALUES} values.
+     */
+    private Background wholeTableBackground(Significant s) {
+        if (tables.size() != 1
+            || !tables.get(0).equals(s.table)
+            || s.keyKind != KeyKind.STR
+            || s.source.column() == null
+            || s.source.multi()
+            || !InfinoQueryTranslator.ALL.equals(s.backgroundWhere)
+            || plan.access().documentsWhere(InfinoNative.columns(s.table), s.table, plan.nowMillis()) != null) {
+            return null;
+        }
+        String column = s.source.column();
+        List<Map<String, Object>> rows = InfinoNative.valueCounts(s.table, column, MAX_BACKGROUND_VALUES);
+        if (rows == null) {
+            return null;
+        }
+        long size = 0;
+        Map<String, Long> counts = new HashMap<>();
+        for (Map<String, Object> row : rows) {
+            long n = asLong(row.get(InfinoNative.VALUE_COUNT));
+            size += n;
+            Object value = row.get(column);
+            if (value != null) {
+                counts.put(keyString(value), n);
+            }
+        }
+        Background bg = new Background(size);
+        bg.counts.putAll(counts);
+        bg.complete = true;
+        return bg;
     }
 
     /** The table {@link #evaluate} reads, whose plain relation {@link #explicitCounts} counts directly. */
@@ -2742,11 +2789,18 @@ public class InfinoAggregationProcessor {
      */
     private Background background(Significant s, Collection<Map<String, Object>> foreground) {
         String backgroundRows = backgroundRows(s);
-        Background bg = backgrounds.computeIfAbsent(
-            backgroundRows,
-            rows -> new Background(asLong(oneRow("SELECT COUNT(*) AS c FROM " + rows).get("c")))
-        );
+        Background bg = backgrounds.computeIfAbsent(backgroundRows, rows -> {
+            Background whole = wholeTableBackground(s);
+            return whole != null ? whole : new Background(asLong(oneRow("SELECT COUNT(*) AS c FROM " + rows).get("c")));
+        });
         Map<String, Long> background = bg.counts;
+        if (bg.complete) {
+            // Every term the background holds is counted; one it lacks counts 0.
+            for (Map<String, Object> row : foreground) {
+                background.putIfAbsent(keyString(row.get("k0")), 0L);
+            }
+            return bg;
+        }
         List<String> literals = new ArrayList<>();
         Set<String> unread = new LinkedHashSet<>();
         for (Map<String, Object> row : foreground) {
