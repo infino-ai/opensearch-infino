@@ -36,6 +36,28 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         return InfinoQueryTranslator.translate(qb, columns(), TABLE, NOW);
     }
 
+    public void testARangeOnADateColumnCarriesItsSpan() {
+        // Both bounds as written: from the lower, inclusive, to the upper, exclusive.
+        InfinoQueryTranslator.Span span = translate(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00").lt("2023-01-02T10:00:00")).span();
+        assertEquals(new InfinoQueryTranslator.Span("@timestamp", Instant.parse("2023-01-02T00:00:00Z").toEpochMilli(), Instant.parse("2023-01-02T10:00:00Z").toEpochMilli()), span);
+        // gt and lte on a day round up to its last millisecond, so the span starts and ends a millisecond past it.
+        span = translate(QueryBuilders.rangeQuery("@timestamp").gt("2023-01-01").lte("2023-01-02").format("yyyy-MM-dd")).span();
+        assertEquals(Instant.parse("2023-01-02T00:00:00Z").toEpochMilli(), span.fromMillis());
+        assertEquals(Instant.parse("2023-01-03T00:00:00Z").toEpochMilli(), span.untilMillis());
+        // An open range, a range on a number, or anything but a range carries none.
+        assertNull(translate(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00")).span());
+        assertNull(translate(QueryBuilders.rangeQuery("status").gte(500).lt(600)).span());
+        assertNull(
+            translate(QueryBuilders.boolQuery().filter(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00").lt("2023-01-03T00:00:00")).filter(QueryBuilders.termQuery("level", "error")))
+                .span()
+        );
+        assertNull(translate(QueryBuilders.matchAllQuery()).span());
+        assertEquals(
+            "arrow_cast('2023-01-02T00:00:00Z', 'Timestamp(Millisecond, Some(\"UTC\"))')",
+            InfinoAggregationProcessor.timestampLiteral(Instant.parse("2023-01-02T00:00:00Z").toEpochMilli())
+        );
+    }
+
     public void testMatchAllAndFilters() {
         assertEquals("1=1", translate(QueryBuilders.matchAllQuery()).where());
         assertEquals("\"level\" = 'error'", translate(QueryBuilders.termQuery("level", "error")).where());

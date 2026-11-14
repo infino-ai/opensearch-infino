@@ -151,8 +151,23 @@ final class InfinoQueryTranslator {
     /** One full-text clause on a text-indexed column. */
     record TextClause(String column, String query, String mode) {}
 
-    /** What a query translates to. */
-    record Translation(String table, String where, TextClause principal) {
+    /**
+     * The rows of a date column from {@code fromMillis}, inclusive, to
+     * {@code untilMillis}, exclusive: what a query that is one range on that
+     * column keeps, read from the range's own bounds.
+     */
+    record Span(String column, long fromMillis, long untilMillis) {}
+
+    /**
+     * What a query translates to. {@code span} is set when the query is one
+     * range on a date column with both bounds, and is then exactly the rows
+     * {@code where} keeps; null otherwise.
+     */
+    record Translation(String table, String where, TextClause principal, Span span) {
+        Translation(String table, String where, TextClause principal) {
+            this(table, where, principal, null);
+        }
+
         /** The relation the predicate applies to: the table, or its token-match set. */
         String from() {
             if (principal == null) {
@@ -188,6 +203,8 @@ final class InfinoQueryTranslator {
     private final Map<String, Column> cols;
     private final String table;
     private final long nowMillis;
+    /** The span of the last range translated over a date column with both bounds ({@link Span}). */
+    private Span span;
     /**
      * Whether a terms lookup may be read from its index's table directly:
      * true for a security rule, which is the security plugin's own; false
@@ -240,7 +257,7 @@ final class InfinoQueryTranslator {
         if (where == null) {
             return null;
         }
-        return new Translation(table, where, t.principal);
+        return new Translation(table, where, t.principal, qb instanceof RangeQueryBuilder ? t.span : null);
     }
 
     /**
@@ -1536,6 +1553,12 @@ final class InfinoQueryTranslator {
         if (bounds.isEmpty()) {
             return ALL;
         }
+        if (typed.isTimestamp() && !c.isList() && r.from() != null && r.to() != null) {
+            // A bound rounded up ends in .999: past it (gt) starts a millisecond later, through it (lte) ends a millisecond later.
+            long from = epochMillis(bounds.get(0)) + (r.includeLower() ? 0 : 1);
+            long until = epochMillis(bounds.get(1)) + (r.includeUpper() ? 1 : 0);
+            span = new Span(c.name(), from, until);
+        }
         return anyValue(c, v -> {
             List<String> parts = new ArrayList<>(bounds.size());
             for (String bound : bounds) {
@@ -1543,6 +1566,12 @@ final class InfinoQueryTranslator {
             }
             return "(" + String.join(" AND ", parts) + ")";
         });
+    }
+
+    /** The epoch milliseconds of a bound {@link #range} wrote: a comparison and a quoted ISO instant. */
+    private static long epochMillis(String bound) {
+        int open = bound.indexOf('\'');
+        return Instant.parse(bound.substring(open + 1, bound.lastIndexOf('\''))).toEpochMilli();
     }
 
     private String like(String field, String pattern) {
