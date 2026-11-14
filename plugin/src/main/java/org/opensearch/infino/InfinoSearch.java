@@ -79,6 +79,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 
 /**
@@ -540,6 +541,13 @@ public final class InfinoSearch {
         // A vector hit's sequence number, by id, when the request asks for it: the
         // vector entry points return ids and scores only.
         Map<String, Long> vectorSeqs = Map.of();
+        // The exact total and the page are separate engine calls, neither
+        // waiting on the other: the total is counted on another thread while
+        // the page is read.
+        boolean exact = trackTotal(source);
+        CompletableFuture<Long> counted = plan.vector() == null && exact && count && size > 0
+            ? InfinoServices.beside(() -> total(plan))
+            : null;
         if (size == 0 && !stockKnn) {
             rows = List.of();
         } else if (plan.vector() != null) {
@@ -583,16 +591,13 @@ public final class InfinoSearch {
             }
         }
 
-        boolean exact = trackTotal(source);
         long total;
         if (plan.vector() != null) {
             total = rows.size(); // kNN is inherently top-k
         } else if (exact && !count) {
             total = 0;
         } else if (exact) {
-            // The total counts what the query and post_filter keep, before
-            // any collapse and regardless of where the page starts.
-            total = plan.postWhere() == null ? count(plan.table(), q) : count(plan.table(), new Translation(q.table(), plan.hitWhere(), q.principal()));
+            total = counted != null ? InfinoServices.await(counted) : total(plan);
         } else {
             total = rows.size();
         }
@@ -1074,6 +1079,15 @@ public final class InfinoSearch {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    /**
+     * The request's exact total: what the query and post_filter keep, before
+     * any collapse and regardless of where the page starts.
+     */
+    private static long total(Plan plan) {
+        Translation q = plan.query();
+        return plan.postWhere() == null ? count(plan.table(), q) : count(plan.table(), new Translation(q.table(), plan.hitWhere(), q.principal()));
     }
 
     /** The exact number of rows the request matches. */
