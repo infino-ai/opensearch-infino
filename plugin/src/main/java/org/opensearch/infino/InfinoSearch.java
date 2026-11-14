@@ -540,6 +540,7 @@ public final class InfinoSearch {
         // A vector hit's sequence number, by id, when the request asks for it: the
         // vector entry points return ids and scores only.
         Map<String, Long> vectorSeqs = Map.of();
+        boolean shortPage = false;
         if (size == 0 && !stockKnn) {
             rows = List.of();
         } else if (plan.vector() != null) {
@@ -581,6 +582,10 @@ public final class InfinoSearch {
             if (sourcesById(plan) && wantsSource(source)) {
                 rows = withSources(plan.table(), rows, fetch);
             }
+            // A page the hit statement could not fill holds every row its
+            // predicate keeps, and that predicate is the total's (no keyset,
+            // collapse or ranked window narrows it), so its length is the total.
+            shortPage = rows.size() < fetch && q.principal() == null && plan.searchAfter() == null && plan.collapse() == null;
         }
 
         boolean exact = trackTotal(source);
@@ -589,6 +594,8 @@ public final class InfinoSearch {
             total = rows.size(); // kNN is inherently top-k
         } else if (exact && !count) {
             total = 0;
+        } else if (exact && shortPage) {
+            total = rows.size();
         } else if (exact) {
             // The total counts what the query and post_filter keep, before
             // any collapse and regardless of where the page starts.
