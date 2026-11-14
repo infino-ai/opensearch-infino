@@ -9,7 +9,9 @@ import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.search.SearchHit;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
+import org.opensearch.search.fetch.subphase.FieldAndFormat;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;
@@ -66,5 +68,50 @@ public class InfinoMappingSourceTests extends OpenSearchTestCase {
 
     public void testASingleStringNamesOneField() {
         assertEquals(json("{\"rank\":1,\"note\":\"a\"}"), shown(of(Map.of("excludes", "items")), null));
+    }
+
+    public void testFieldsAreRefusedWhenTheSourceIsDisabled() {
+        InfinoMappingSource off = of(Map.of("enabled", false));
+        off.refuseFields("i", List.of());
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> off.refuseFields("i", List.of(new FieldAndFormat("rank", null)))
+        );
+        assertEquals("Unable to retrieve the requested [fields] since _source is disabled in the mappings for index [i]", e.getMessage());
+        of(Map.of("excludes", List.of("items"))).refuseFields("i", List.of(new FieldAndFormat("rank", null)));
+    }
+
+    public void testKeptIsWhatTheMappingKeeps() {
+        assertSame(DOC, InfinoMappingSource.WHOLE.kept(DOC));
+        assertEquals(json("{\"rank\":1,\"note\":\"a\"}"), json(of(Map.of("excludes", List.of("items"))).kept(DOC)));
+        assertEquals(json("{\"rank\":1}"), json(of(Map.of("includes", List.of("rank"))).kept(DOC)));
+    }
+
+    public void testDocValueFieldsReadTheDocumentAndFieldsReadTheKeptSource() {
+        InfinoMappingSource ex = of(Map.of("excludes", List.of("note")));
+        List<FieldAndFormat> note = List.of(new FieldAndFormat("note", null));
+
+        SearchHit fields = new SearchHit(0, "d1", Map.of(), Map.of());
+        InfinoSearch.fillRequested(fields, DOC, ex, "i", List.of(), note, Map.of());
+        assertNull(fields.field("note"));
+
+        SearchHit docValues = new SearchHit(0, "d1", Map.of(), Map.of());
+        InfinoSearch.fillRequested(docValues, DOC, ex, "i", note, List.of(), Map.of());
+        assertEquals(List.of("a"), docValues.field("note").getValues());
+
+        // Asked for both ways, the doc value stays when the source leaves the field out.
+        SearchHit both = new SearchHit(0, "d1", Map.of(), Map.of());
+        InfinoSearch.fillRequested(both, DOC, ex, "i", note, note, Map.of());
+        assertEquals(List.of("a"), both.field("note").getValues());
+
+        SearchHit kept = new SearchHit(0, "d1", Map.of(), Map.of());
+        InfinoSearch.fillRequested(kept, DOC, ex, "i", List.of(), List.of(new FieldAndFormat("rank", null)), Map.of());
+        assertEquals(List.of(1), kept.field("rank").getValues());
+
+        InfinoMappingSource off = of(Map.of("enabled", false));
+        expectThrows(IllegalArgumentException.class, () -> InfinoSearch.fillRequested(new SearchHit(0, "d1", Map.of(), Map.of()), DOC, off, "i", List.of(), note, Map.of()));
+        SearchHit offDocValues = new SearchHit(0, "d1", Map.of(), Map.of());
+        InfinoSearch.fillRequested(offDocValues, DOC, off, "i", note, List.of(), Map.of());
+        assertEquals(List.of("a"), offDocValues.field("note").getValues());
     }
 }

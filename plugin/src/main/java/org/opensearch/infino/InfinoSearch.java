@@ -594,8 +594,9 @@ public final class InfinoSearch {
 
         boolean withSource = returnsSource(source);
         // What the mapping's _source keeps of each document: the table keeps it whole.
-        InfinoMappingSource stored = withSource ? InfinoMappingSource.of(mapping(index)) : InfinoMappingSource.WHOLE;
-        List<FieldAndFormat> fields = requestedFields(source.docValueFields(), source.fetchFields());
+        List<FieldAndFormat> docValueFields = requestedFields(source.docValueFields(), null);
+        List<FieldAndFormat> fetchFields = requestedFields(null, source.fetchFields());
+        InfinoMappingSource stored = withSource || !fetchFields.isEmpty() ? InfinoMappingSource.of(mapping(index)) : InfinoMappingSource.WHOLE;
         boolean version = Boolean.TRUE.equals(source.version());
         SearchShardTarget target = target(index);
         List<SearchHit> hits = new ArrayList<>();
@@ -640,7 +641,7 @@ public final class InfinoSearch {
                 );
                 h.setPrimaryTerm(InfinoDocumentVersion.PRIMARY_TERM);
             }
-            if (withSource || !fields.isEmpty()) {
+            if (withSource || !docValueFields.isEmpty() || !fetchFields.isEmpty()) {
                 String src = String.valueOf(row.get(InfinoQueryTranslator.SOURCE));
                 // The source as the user may see it: hidden fields gone, masked values hashed.
                 src = plan.access().read(id.toString(), src);
@@ -652,7 +653,7 @@ public final class InfinoSearch {
                             h.sourceRef(shown);
                         }
                     }
-                    fillFields(h, src, fields, plan.cols());
+                    fillRequested(h, src, stored, index.getName(), docValueFields, fetchFields, plan.cols());
                 }
             }
             if (!plan.sorts().isEmpty()) {
@@ -892,7 +893,8 @@ public final class InfinoSearch {
         int size,
         List<SortSpec> sorts,
         FetchSourceContext fetchSource,
-        List<FieldAndFormat> fields,
+        List<FieldAndFormat> docValueFields,
+        List<FieldAndFormat> fetchFields,
         Map<String, Column> cols,
         InfinoAccess access,
         List<Map<String, Object>> rows,
@@ -900,7 +902,9 @@ public final class InfinoSearch {
         Index index
     ) {
         boolean withSource = fetchSource == null || fetchSource.fetchSource();
-        InfinoMappingSource stored = withSource && index != null ? InfinoMappingSource.of(mapping(index)) : InfinoMappingSource.WHOLE;
+        InfinoMappingSource stored = (withSource || !fetchFields.isEmpty()) && index != null
+            ? InfinoMappingSource.of(mapping(index))
+            : InfinoMappingSource.WHOLE;
         float score = sorts.isEmpty() ? 1.0f : Float.NaN;
         SearchShardTarget target = index == null ? null : target(index);
         List<SearchHit> hits = new ArrayList<>();
@@ -914,7 +918,7 @@ public final class InfinoSearch {
                 h.shard(target);
             }
             h.score(score);
-            if (withSource || !fields.isEmpty()) {
+            if (withSource || !docValueFields.isEmpty() || !fetchFields.isEmpty()) {
                 String src = access.read(id.toString(), String.valueOf(row.get(InfinoQueryTranslator.SOURCE)));
                 if (!src.isEmpty()) {
                     if (withSource) {
@@ -924,7 +928,7 @@ public final class InfinoSearch {
                             h.sourceRef(shown);
                         }
                     }
-                    fillFields(h, src, fields, cols);
+                    fillRequested(h, src, stored, index == null ? null : index.getName(), docValueFields, fetchFields, cols);
                 }
             }
             if (!sorts.isEmpty()) {
@@ -964,6 +968,31 @@ public final class InfinoSearch {
             }
         }
         return new ArrayList<>(byField.values());
+    }
+
+    /**
+     * The requested fields on the hit, as stock's fetch phase reads them:
+     * {@code docvalue_fields} from the document as it was indexed (the doc
+     * values hold every field, whatever the mapping's {@code _source}
+     * keeps), then {@code fields} from the source as the mapping keeps it,
+     * refused when the mapping disables {@code _source}. A field asked for
+     * both ways takes the {@code fields} value when the source holds it, as
+     * stock's fields phase runs after its doc values phase.
+     */
+    static void fillRequested(
+        SearchHit h,
+        String src,
+        InfinoMappingSource stored,
+        String index,
+        List<FieldAndFormat> docValueFields,
+        List<FieldAndFormat> fetchFields,
+        Map<String, Column> cols
+    ) {
+        fillFields(h, src, docValueFields, cols);
+        if (!fetchFields.isEmpty()) {
+            stored.refuseFields(index, fetchFields);
+            fillFields(h, stored.kept(src), fetchFields, cols);
+        }
     }
 
     /**

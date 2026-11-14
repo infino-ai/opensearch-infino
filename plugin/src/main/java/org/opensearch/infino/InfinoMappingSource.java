@@ -80,6 +80,33 @@ record InfinoMappingSource(boolean enabled, String[] includes, String[] excludes
     }
 
     /**
+     * Refuses {@code fields} (the request's {@code fields}, read from the
+     * source) on a hit of {@code index} when the mapping disables
+     * {@code _source}, as stock's fetch fields phase does.
+     */
+    void refuseFields(String index, List<?> fields) {
+        if (!enabled && !fields.isEmpty()) {
+            throw new IllegalArgumentException(
+                "Unable to retrieve the requested [fields] since _source is disabled in the mappings for index [" + index + "]"
+            );
+        }
+    }
+
+    /**
+     * The source {@code src} as the mapping keeps it, which stock's
+     * {@code fields} read: what its includes and excludes keep (the whole
+     * of {@code src} when it names none). Not called when the mapping
+     * disables {@code _source}: {@link #refuseFields} refuses that first.
+     */
+    String kept(String src) {
+        if (whole()) {
+            return src;
+        }
+        Map<String, Object> map = XContentMapValues.filter(XContentHelper.convertToMap(new BytesArray(src), true, MediaTypeRegistry.JSON).v2(), includes, excludes);
+        return json(map).utf8ToString();
+    }
+
+    /**
      * The source {@code src} as a response carries it: null when the mapping
      * disables {@code _source}, else what the mapping keeps of it, filtered
      * by {@code request}'s includes and excludes when it names any.
@@ -99,6 +126,10 @@ record InfinoMappingSource(boolean enabled, String[] includes, String[] excludes
         if (requestFilters) {
             map = XContentMapValues.filter(map, request.includes(), request.excludes());
         }
+        return json(map);
+    }
+
+    private static BytesReference json(Map<String, Object> map) {
         try (XContentBuilder b = XContentFactory.jsonBuilder()) {
             b.map(map);
             return BytesReference.bytes(b);
