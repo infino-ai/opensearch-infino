@@ -514,6 +514,103 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertSame(InfinoQueryTranslator.Scoring.NONE, t.scoring());
     }
 
+    /** The log columns with a boolean field and a keyword field mapped with use_similarity. */
+    private static Map<String, Column> bm25TermColumns() {
+        Map<String, Column> cols = columns();
+        cols.put("flag", new Column("flag", "bool", false, false));
+        cols.put("tag", new Column("tag", "str", false, false).scoredBySimilarity());
+        return cols;
+    }
+
+    /** Answers the count a BM25 term's score reads: {@code docs} holding the field, {@code hits} matching the term. */
+    private static java.util.function.Function<String, java.util.List<Map<String, Object>>> counts(
+        java.util.List<String> statements,
+        long docs,
+        long hits
+    ) {
+        return sql -> {
+            statements.add(sql);
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("infino_docs", docs);
+            row.put("infino_hits", hits);
+            return java.util.List.of(row);
+        };
+    }
+
+    /**
+     * A term on a boolean field, or on a keyword field with use_similarity,
+     * is a plain term query in Lucene, scored by BM25 (the reviewer's point
+     * on #83): the field has no norms, so each hit it matches scores
+     * {@code idf / 2.2}, 0.245 for 3 of 5 documents, not its boost.
+     */
+    public void testATermLuceneScoresByBm25ScoresItsIdf() {
+        for (org.opensearch.index.query.QueryBuilder term : java.util.List.<org.opensearch.index.query.QueryBuilder>of(
+            QueryBuilders.termQuery("flag", true),
+            QueryBuilders.matchQuery("flag", "true"),
+            QueryBuilders.termQuery("tag", "x")
+        )) {
+            java.util.List<String> statements = new java.util.ArrayList<>();
+            BoolQueryBuilder b = QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(term);
+            Translation t = InfinoQueryTranslator.translate(b, bm25TermColumns(), TABLE, NOW, counts(statements, 5, 3));
+            InfinoQueryTranslator.Scoring s = t.scoring();
+            assertEquals(1, s.bonuses().size());
+            assertEquals(1, s.bonuses().get(0).values().size());
+            assertEquals(term.toString(), 0.244998, s.bonuses().get(0).values().get(0), 1e-6);
+            assertEquals(statements.toString(), 1, statements.size());
+            assertTrue(statements.get(0), statements.get(0).startsWith("SELECT COUNT(\"" + (term.toString().contains("tag") ? "tag" : "flag") + "\") AS infino_docs, SUM(CASE WHEN "));
+            assertTrue(statements.get(0), statements.get(0).endsWith(" THEN 1 ELSE 0 END) AS infino_hits FROM \"os_logs_0\""));
+        }
+        // In must it adds the same to every hit; a boost scales it.
+        java.util.List<String> statements = new java.util.ArrayList<>();
+        BoolQueryBuilder b = QueryBuilders.boolQuery().must(QueryBuilders.termQuery("flag", true).boost(2));
+        Translation t = InfinoQueryTranslator.translate(b, bm25TermColumns(), TABLE, NOW, counts(statements, 5, 3));
+        assertEquals(2 * 0.244998, t.scoring().offset(), 1e-5);
+        // A term on a plain keyword or on a number still scores its boost, with nothing counted.
+        statements.clear();
+        b = QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.termQuery("level", "error"));
+        t = InfinoQueryTranslator.translate(b, bm25TermColumns(), TABLE, NOW, counts(statements, 5, 3));
+        assertEquals(java.util.List.of(1.0), t.scoring().bonuses().get(0).values());
+        assertTrue(statements.isEmpty());
+    }
+
+    /**
+     * Where documents give the boolean field several values, a term's
+     * frequency and the field's average length vary by document: the table
+     * cannot score it, and with no ranked clause the hits keep one score.
+     * So does a nested query whose entries a BM25-scored term scores.
+     */
+    public void testABm25TermTheTableCannotScoreKeepsTheHitsAlike() {
+        Map<String, Column> cols = bm25TermColumns();
+        cols.put("flag[]", Column.list("flag[]", "bool"));
+        BoolQueryBuilder b = QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.termQuery("flag", true));
+        assertSame(InfinoQueryTranslator.Scoring.NONE, InfinoQueryTranslator.translate(b, cols, TABLE, NOW, counts(new java.util.ArrayList<>(), 5, 3)).scoring());
+
+        Map<String, Column> orders = orderColumns();
+        orders.put("items.gift", new Column("items.gift", "bool", false, false));
+        b = QueryBuilders.boolQuery()
+            .should(QueryBuilders.termQuery("items.sku", "a"))
+            .should(QueryBuilders.nestedQuery("items", QueryBuilders.termQuery("items.gift", true), org.apache.lucene.search.join.ScoreMode.Avg));
+        assertSame(
+            InfinoQueryTranslator.Scoring.NONE,
+            InfinoQueryTranslator.translate(b, orders, "os_orders_0", NOW, new Rows(orders(), true)).scoring()
+        );
+    }
+
+    /** A request sorted by _doc first is ordered by the index, unscored, as stock orders it; one sorted by _score is not. */
+    public void testASortByDocFirstIsNotScored() {
+        org.opensearch.search.builder.SearchSourceBuilder source = new org.opensearch.search.builder.SearchSourceBuilder();
+        assertFalse(InfinoSearch.sortsByDocFirst(source));
+        source.sort("_doc");
+        assertTrue(InfinoSearch.sortsByDocFirst(source));
+        assertFalse(InfinoSearch.sortsByDocFirst(new org.opensearch.search.builder.SearchSourceBuilder().sort(new org.opensearch.search.sort.ScoreSortBuilder()).sort("_doc")));
+        BoolQueryBuilder b = QueryBuilders.boolQuery().should(QueryBuilders.termQuery("level", "error")).should(QueryBuilders.rangeQuery("status").gte(500));
+        Translation t = translate(b);
+        assertTrue(t.scoring().reorders());
+        assertSame(InfinoQueryTranslator.Scoring.NONE, t.unscored().scoring());
+        assertEquals(t.where(), t.unscored().where());
+        assertFalse(hits(t.unscored(), null, 10).contains("infino_bonus"));
+    }
+
     // ---- nested ----
 
     private static final String KIBANA = "os_kibana_0";

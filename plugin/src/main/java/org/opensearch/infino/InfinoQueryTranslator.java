@@ -191,6 +191,11 @@ final class InfinoQueryTranslator {
             return new Translation(table, where, principal, scoring);
         }
 
+        /** This translation with no clause but the principal's BM25 scoring the hits. */
+        Translation unscored() {
+            return new Translation(table, where, principal, Scoring.NONE);
+        }
+
         /** The relation the predicate applies to: the table, or its token-match set. */
         String from() {
             if (principal == null) {
@@ -258,6 +263,8 @@ final class InfinoQueryTranslator {
     private TextClause principal;
     /** Each nested clause's matching documents with their scores, read once whether it filters, scores or both. */
     private final Map<NestedQueryBuilder, Map<String, Double>> nestedScores = new java.util.IdentityHashMap<>();
+    /** Each BM25-scored term clause's score ({@link #bm25TermScore}), read once per clause. */
+    private final Map<QueryBuilder, Double> termScores = new java.util.IdentityHashMap<>();
 
     private InfinoQueryTranslator(Map<String, Column> cols, String table, long nowMillis, boolean trusted) {
         this(cols, table, nowMillis, trusted, false);
@@ -341,7 +348,7 @@ final class InfinoQueryTranslator {
         Double w = constantScore(qb);
         if (w != null) {
             offset[0] += w;
-        } else if (qb instanceof NestedQueryBuilder n) {
+        } else if (qb instanceof NestedQueryBuilder n && !entriesScoredApart(n.query())) {
             Bonus nb = nestedBonus(n);
             if (nb != null) {
                 bonuses.add(nb);
@@ -386,6 +393,9 @@ final class InfinoQueryTranslator {
             return true;
         }
         if (qb instanceof NestedQueryBuilder n) {
+            if (entriesScoredApart(n.query())) {
+                return false;
+            }
             Bonus nb = nestedBonus(n);
             if (nb != null) {
                 bonuses.add(nb);
@@ -405,7 +415,12 @@ final class InfinoQueryTranslator {
      * scores documents apart: a terms, range, exists, ids or match_all query scores its
      * boost (a constant-score query in Lucene), as do a term, prefix,
      * wildcard or regexp query on a field other than a text one, and a match
-     * or match_phrase on one, which is a term query there.
+     * or match_phrase on one, which is a term query there. A term, match or
+     * match_phrase on a boolean field, or on a keyword field with
+     * {@code use_similarity}, Lucene scores by BM25 instead: the same score
+     * on every document it matches ({@link #bm25TermScore}) while each
+     * document gives the field one value, and apart (null) once some give
+     * several.
      */
     private Double constantScore(QueryBuilder qb) {
         if (qb instanceof TermsQueryBuilder
@@ -433,7 +448,95 @@ final class InfinoQueryTranslator {
             return null;
         }
         Column c = resolve(field);
-        return c != null && c.fts() ? null : (double) qb.boost();
+        if (c != null && c.fts()) {
+            return null;
+        }
+        if (c != null && c.scoresTermsByBm25() && isTermQuery(qb)) {
+            return c.isList() || listOf(cols, c) != null ? null : bm25TermScore(qb, c);
+        }
+        return (double) qb.boost();
+    }
+
+    /** Whether Lucene reads {@code qb} on a field other than a text one as one term query. */
+    private static boolean isTermQuery(QueryBuilder qb) {
+        return qb instanceof TermQueryBuilder || qb instanceof MatchQueryBuilder || qb instanceof MatchPhraseQueryBuilder;
+    }
+
+    /** BM25's {@code k1} and {@code b}, Lucene's defaults, which an index keeps unless its similarity says otherwise. */
+    private static final float BM25_K1 = 1.2f;
+    private static final float BM25_B = 0.75f;
+
+    /**
+     * What Lucene's BM25 gives each document a term on {@code c} matches,
+     * when every document gives the field one value. The field has no
+     * norms, so every document's length is 1, as is the average, and the
+     * score is {@code boost * idf * 1 / (1 + k1)}, with
+     * {@code idf = ln(1 + (N - n + 0.5) / (n + 0.5))}: {@code N} the documents
+     * holding the field, {@code n} those the term matches. Both are counted
+     * over the whole table, as Lucene reads them from the shard's index
+     * whatever a document-level rule hides. Computed in floats, as Lucene does.
+     */
+    private Double bm25TermScore(QueryBuilder qb, Column c) {
+        Double known = termScores.get(qb);
+        if (known != null) {
+            return known;
+        }
+        String p = predicate(qb, false);
+        if (p == null) {
+            return null;
+        }
+        double score = qb.boost();
+        if (!NONE.equals(p)) {
+            List<Map<String, Object>> counted = rows.apply(
+                "SELECT COUNT(" + quoteIdent(c.name()) + ") AS infino_docs, SUM(CASE WHEN " + p + " THEN 1 ELSE 0 END) AS infino_hits FROM "
+                    + quoteIdent(table)
+            );
+            long docs = counted.isEmpty() ? 0 : asLong(counted.get(0).get("infino_docs"));
+            long hits = counted.isEmpty() ? 0 : asLong(counted.get(0).get("infino_hits"));
+            if (hits > 0) {
+                float idf = (float) Math.log(1 + (docs - hits + 0.5D) / (hits + 0.5D));
+                float weight = qb.boost() * idf;
+                float normInverse = 1f / (BM25_K1 * ((1 - BM25_B) + BM25_B));
+                score = weight - weight / (1f + normInverse);
+            }
+        }
+        termScores.put(qb, score);
+        return score;
+    }
+
+    private static long asLong(Object v) {
+        return v instanceof Number n ? n.longValue() : 0;
+    }
+
+    /**
+     * Whether the entries of a nested query score apart, as the table cannot
+     * score them: a term on a boolean field or a keyword field with
+     * {@code use_similarity} in a scoring place (a must or should clause, at
+     * any depth), which Lucene scores by BM25 over the nested documents.
+     */
+    private boolean entriesScoredApart(QueryBuilder qb) {
+        if (qb instanceof BoolQueryBuilder b) {
+            for (QueryBuilder c : b.must()) {
+                if (entriesScoredApart(c)) {
+                    return true;
+                }
+            }
+            for (QueryBuilder c : b.should()) {
+                if (entriesScoredApart(c)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (qb instanceof NestedQueryBuilder n) {
+            return entriesScoredApart(n.query());
+        }
+        String field = qb instanceof TermQueryBuilder t ? t.fieldName()
+            : qb instanceof MatchQueryBuilder m ? m.fieldName()
+            : qb instanceof MatchPhraseQueryBuilder mp ? mp.fieldName()
+            : null;
+        Column c = field == null ? null : resolve(field);
+        return c != null && c.scoresTermsByBm25();
     }
 
     /**

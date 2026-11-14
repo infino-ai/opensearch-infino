@@ -305,6 +305,11 @@ public final class InfinoSearch {
         }
         log.debug("[infino] query {} -> FROM {} WHERE {}", qb, query.from(), query.where());
         List<SortSpec> sorts = sorts(source.sorts(), cols, nowMillis);
+        if (sorts.isEmpty() && sortsByDocFirst(source)) {
+            // Stock orders such a page by the index and scores nothing, so
+            // the clauses' scores never reorder it.
+            query = query.unscored();
+        }
         String postWhere = null;
         if (source.postFilter() != null) {
             if (vector != null) {
@@ -1437,6 +1442,14 @@ public final class InfinoSearch {
      */
     static boolean scrollsById(SearchSourceBuilder source) {
         return source.sorts() == null || source.sorts().stream().allMatch(InfinoSearch::ordersNothing);
+    }
+
+    /** Whether the first sort {@code source} names is {@code _doc}. */
+    static boolean sortsByDocFirst(SearchSourceBuilder source) {
+        return source.sorts() != null
+            && !source.sorts().isEmpty()
+            && source.sorts().get(0) instanceof FieldSortBuilder fs
+            && FieldSortBuilder.DOC_FIELD_NAME.equals(fs.getFieldName());
     }
 
     /** A sort a scroll pages past in the id's order: {@code _doc}, or the score. */
