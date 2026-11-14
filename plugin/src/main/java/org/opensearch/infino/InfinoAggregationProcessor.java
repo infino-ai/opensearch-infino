@@ -12,8 +12,11 @@ import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.Rounding;
+import org.opensearch.common.cache.Cache;
+import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.common.time.DateFormatter;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.bytes.BytesArray;
@@ -167,6 +170,15 @@ public class InfinoAggregationProcessor {
     private static final String TOTAL_ALIAS = "request_total";
     /** Parent buckets a nested grouped level is restricted to; past this the key list is not worth a predicate. */
     private static final int MAX_PARENT_TUPLES = 1_000;
+    /**
+     * Rows the batched significant_terms foreground ({@link #prefetchSignificant})
+     * may return, parent buckets times candidates: the most one bucket's own
+     * statement returns. It also bounds the terms its background reads in one IN list.
+     */
+    private static final int MAX_PREFETCHED_ROWS = MAX_TERMS_SIZE;
+    /** The earliest and latest epoch milliseconds date_bin can take: it works in nanoseconds, in an i64. */
+    private static final long DATE_BIN_MIN_MILLIS = Long.MIN_VALUE / 1_000_000L;
+    private static final long DATE_BIN_MAX_MILLIS = Long.MAX_VALUE / 1_000_000L;
     /** The Arrow type a mapped date's column holds, which a date the index does not map is read as. */
     private static final String UNMAPPED_DATE_TYPE = "Timestamp(ms, \"UTC\")";
     /** How bucket keys are printed when the request names no format. */
@@ -255,6 +267,17 @@ public class InfinoAggregationProcessor {
 
     /** Most distinct values a background is read whole for (see {@link #wholeTableBackground}). */
     private static final int MAX_BACKGROUND_VALUES = 10_000;
+    /**
+     * Columns, by table and column, whose value counts came back past
+     * {@link #MAX_BACKGROUND_VALUES} lately. The engine counts every value
+     * before the bridge sees there are too many, so a background on such a
+     * column is read by the statements alone until the entry expires, rather
+     * than paying that count again on every request.
+     */
+    private static final Cache<String, Boolean> WIDE_COLUMNS = CacheBuilder.<String, Boolean>builder()
+        .setExpireAfterWrite(TimeValue.timeValueMinutes(10))
+        .setMaximumWeight(10_000)
+        .build();
 
     /**
      * The background of {@code s} from its table's value counts, when it is
@@ -278,8 +301,13 @@ public class InfinoAggregationProcessor {
             return null;
         }
         String column = s.source.column();
+        String wide = s.table + "\u0000" + column;
+        if (WIDE_COLUMNS.get(wide) != null) {
+            return null;
+        }
         List<Map<String, Object>> rows = InfinoNative.valueCounts(s.table, column, MAX_BACKGROUND_VALUES);
         if (rows == null) {
+            WIDE_COLUMNS.put(wide, Boolean.TRUE);
             return null;
         }
         long size = 0;
@@ -1732,7 +1760,7 @@ public class InfinoAggregationProcessor {
                     // rounding) puts them.
                     keyExpr = "arrow_cast(date_bin(INTERVAL '" + ms + " milliseconds', to_local_time(" + source + ")" + origin + "), " + zone + ")";
                 } else {
-                    keyExpr = "date_bin(INTERVAL '" + ms + " milliseconds', " + source + origin + ")";
+                    keyExpr = utcBin(source, ms, offset);
                 }
                 wrapper.fixedInterval(fixed);
             } else if (calendar != null) {
@@ -1744,7 +1772,7 @@ public class InfinoAggregationProcessor {
                 if (offset == 0 && !zoned && unitMillis > 0) {
                     // In UTC a minute, hour or day is a fixed length from the epoch, so
                     // date_bin gives the same start as date_trunc, at about half its cost.
-                    keyExpr = "date_bin(INTERVAL '" + unitMillis + " milliseconds', " + source + ")";
+                    keyExpr = utcBin(source, unitMillis, 0);
                 } else if (offset == 0) {
                     keyExpr = "date_trunc('" + unit + "', " + source + ")";
                 } else {
@@ -1757,6 +1785,30 @@ public class InfinoAggregationProcessor {
                 throw new Unsupported("aggregation [" + agg + "] names no interval");
             }
             return new DateExpr(keyExpr, wrapper.createRounding(tz, offset));
+        }
+
+        /**
+         * The UTC bucket of {@code source} at a fixed interval of {@code ms},
+         * counted from the epoch shifted by {@code offset}. date_bin works in
+         * nanoseconds, which an i64 holds only from 1677-09-21 to 2262-04-11,
+         * so a date outside that range (less an interval and the offset at each
+         * end, which the bucket's start may reach) is floored in epoch
+         * milliseconds instead, which hold any date the field can.
+         */
+        static String utcBin(String source, long ms, long offset) {
+            String origin = offset == 0 ? "" : ", TIMESTAMP '1970-01-01T00:00:00Z' + INTERVAL '" + offset + " milliseconds'";
+            String binned = "date_bin(INTERVAL '" + ms + " milliseconds', " + source + origin + ")";
+            long margin = ms + (offset < 0 ? -offset : offset);
+            long lo = DATE_BIN_MIN_MILLIS + margin;
+            long hi = DATE_BIN_MAX_MILLIS - margin;
+            String epoch = "arrow_cast(" + source + ", 'Int64')";
+            String shifted = "(" + epoch + " - (" + offset + "))";
+            String floored = "arrow_cast(" + shifted + " - ((" + shifted + " % " + ms + ") + " + ms + ") % " + ms + " + (" + offset + "), "
+                + "'Timestamp(Millisecond, Some(\"UTC\"))')";
+            if (lo > hi) {
+                return floored;
+            }
+            return "CASE WHEN " + epoch + " BETWEEN " + lo + " AND " + hi + " THEN " + binned + " ELSE " + floored + " END";
         }
 
         /** How a date of {@code c} reads and prints: the request's format, else the one its field's mapping declares, else the default. */
@@ -3020,6 +3072,12 @@ public class InfinoAggregationProcessor {
             if (!(leaf instanceof Significant s) || !s.metrics.isEmpty()) {
                 continue;
             }
+            if ((long) kept.size() * s.candidates > MAX_PREFETCHED_ROWS) {
+                // Past the rows one bucket's own statement may return, and past
+                // that many terms in the background's IN list: read each bucket
+                // on its own.
+                continue;
+            }
             String key = s.keyExpr();
             String having = s.minDocCount > 1 ? " HAVING COUNT(*) >= " + s.minDocCount : "";
             String inner = "SELECT " + String.join(", ", parents) + ", " + key + " AS k0, COUNT(*) AS doc_count FROM " + from
@@ -3042,8 +3100,15 @@ public class InfinoAggregationProcessor {
             }
             Map<String, List<Map<String, Object>>> byWhere = new HashMap<>();
             for (List<Object> tuple : kept) {
+                List<Map<String, Object>> fg = byTuple.get(keyString(tuple));
+                if (fg == null) {
+                    // No candidate came back under this bucket's keys: the bucket
+                    // reads its own foreground, so a key the statement printed
+                    // differently is not taken for an empty bucket.
+                    continue;
+                }
                 String bucketWhere = "(" + where + ") AND " + tupleRestriction(chain, List.of(tuple), n, false);
-                byWhere.put(bucketWhere, byTuple.getOrDefault(keyString(tuple), List.of()));
+                byWhere.put(bucketWhere, fg);
             }
             foregrounds.put(s, byWhere);
             // Every bucket's candidates are known now: their background
