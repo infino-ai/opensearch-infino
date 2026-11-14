@@ -152,3 +152,576 @@
   - match: { hits.hits.0._id: "p1" }
   - match: { hits.hits.1._id: "m1" }
   - match: { hits.hits.2._id: "m2" }
+
+---
+"A page after a row missing the first sort value continues among the missing rows, as a Lucene twin pages it":
+  # A default-mode hit hands back the least long as the sort value of a row
+  # missing it under a descending sort (the greatest ascending), as stock
+  # does. Sent back as search_after, it stands for a missing value: the next
+  # page holds the missing rows past that row only, not every missing row.
+  - do:
+      indices.create:
+        index: sa2_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: sa2_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              k: { type: keyword }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sa2_inf
+        body:
+          - index: { _id: "p1" }
+          - { n: 5, k: "p1" }
+          - index: { _id: "p2" }
+          - { n: 4, k: "p2" }
+          - index: { _id: "p3" }
+          - { n: 3, k: "p3" }
+          - index: { _id: "p4" }
+          - { n: 2, k: "p4" }
+          - index: { _id: "m1" }
+          - { k: "m1" }
+          - index: { _id: "m2" }
+          - { k: "m2" }
+          - index: { _id: "m3" }
+          - { k: "m3" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sa2_luc
+        body:
+          - index: { _id: "p1" }
+          - { n: 5, k: "p1" }
+          - index: { _id: "p2" }
+          - { n: 4, k: "p2" }
+          - index: { _id: "p3" }
+          - { n: 3, k: "p3" }
+          - index: { _id: "p4" }
+          - { n: 2, k: "p4" }
+          - index: { _id: "m1" }
+          - { k: "m1" }
+          - index: { _id: "m2" }
+          - { k: "m2" }
+          - index: { _id: "m3" }
+          - { k: "m3" }
+  - match: { errors: false }
+
+  # Descending: the third page starts after m2.
+  - do:
+      search:
+        index: sa2_luc
+        body:
+          size: 3
+          sort: [ { n: desc }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p1" }
+  - match: { hits.hits.1._id: "p2" }
+  - match: { hits.hits.2._id: "p3" }
+  - set: { hits.hits.2.sort: after_sa2_luc_1 }
+  - do:
+      search:
+        index: sa2_luc
+        body:
+          size: 3
+          sort: [ { n: desc }, { k: asc } ]
+          search_after: $after_sa2_luc_1
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p4" }
+  - match: { hits.hits.1._id: "m1" }
+  - match: { hits.hits.2._id: "m2" }
+  - set: { hits.hits.2.sort: after_sa2_luc_2 }
+  - do:
+      search:
+        index: sa2_luc
+        body:
+          size: 3
+          sort: [ { n: desc }, { k: asc } ]
+          search_after: $after_sa2_luc_2
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "m3" }
+  - do:
+      search:
+        index: sa2_inf
+        body:
+          size: 3
+          sort: [ { n: desc }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p1" }
+  - match: { hits.hits.1._id: "p2" }
+  - match: { hits.hits.2._id: "p3" }
+  - set: { hits.hits.2.sort: after_sa2_inf_1 }
+  - do:
+      search:
+        index: sa2_inf
+        body:
+          size: 3
+          sort: [ { n: desc }, { k: asc } ]
+          search_after: $after_sa2_inf_1
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p4" }
+  - match: { hits.hits.1._id: "m1" }
+  - match: { hits.hits.2._id: "m2" }
+  - set: { hits.hits.2.sort: after_sa2_inf_2 }
+  - do:
+      search:
+        index: sa2_inf
+        body:
+          size: 3
+          sort: [ { n: desc }, { k: asc } ]
+          search_after: $after_sa2_inf_2
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "m3" }
+  # Ascending: the third page starts after m2.
+  - do:
+      search:
+        index: sa2_luc
+        body:
+          size: 3
+          sort: [ { n: asc }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p4" }
+  - match: { hits.hits.1._id: "p3" }
+  - match: { hits.hits.2._id: "p2" }
+  - set: { hits.hits.2.sort: after_sa2_luc_1 }
+  - do:
+      search:
+        index: sa2_luc
+        body:
+          size: 3
+          sort: [ { n: asc }, { k: asc } ]
+          search_after: $after_sa2_luc_1
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p1" }
+  - match: { hits.hits.1._id: "m1" }
+  - match: { hits.hits.2._id: "m2" }
+  - set: { hits.hits.2.sort: after_sa2_luc_2 }
+  - do:
+      search:
+        index: sa2_luc
+        body:
+          size: 3
+          sort: [ { n: asc }, { k: asc } ]
+          search_after: $after_sa2_luc_2
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "m3" }
+  - do:
+      search:
+        index: sa2_inf
+        body:
+          size: 3
+          sort: [ { n: asc }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p4" }
+  - match: { hits.hits.1._id: "p3" }
+  - match: { hits.hits.2._id: "p2" }
+  - set: { hits.hits.2.sort: after_sa2_inf_1 }
+  - do:
+      search:
+        index: sa2_inf
+        body:
+          size: 3
+          sort: [ { n: asc }, { k: asc } ]
+          search_after: $after_sa2_inf_1
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p1" }
+  - match: { hits.hits.1._id: "m1" }
+  - match: { hits.hits.2._id: "m2" }
+  - set: { hits.hits.2.sort: after_sa2_inf_2 }
+  - do:
+      search:
+        index: sa2_inf
+        body:
+          size: 3
+          sort: [ { n: asc }, { k: asc } ]
+          search_after: $after_sa2_inf_2
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "m3" }
+
+---
+"missing: _first puts the rows missing the sort value first, in both directions, as a Lucene twin sorts them":
+  # Pages of 2 cross from the missing rows into the present ones (page 2),
+  # and continue after a present value without reading the missing rows again.
+  - do:
+      indices.create:
+        index: sa3_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: sa3_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              k: { type: keyword }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sa3_inf
+        body:
+          - index: { _id: "p1" }
+          - { n: 5, k: "p1" }
+          - index: { _id: "p2" }
+          - { n: 4, k: "p2" }
+          - index: { _id: "p3" }
+          - { n: 3, k: "p3" }
+          - index: { _id: "p4" }
+          - { n: 2, k: "p4" }
+          - index: { _id: "m1" }
+          - { k: "m1" }
+          - index: { _id: "m2" }
+          - { k: "m2" }
+          - index: { _id: "m3" }
+          - { k: "m3" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sa3_luc
+        body:
+          - index: { _id: "p1" }
+          - { n: 5, k: "p1" }
+          - index: { _id: "p2" }
+          - { n: 4, k: "p2" }
+          - index: { _id: "p3" }
+          - { n: 3, k: "p3" }
+          - index: { _id: "p4" }
+          - { n: 2, k: "p4" }
+          - index: { _id: "m1" }
+          - { k: "m1" }
+          - index: { _id: "m2" }
+          - { k: "m2" }
+          - index: { _id: "m3" }
+          - { k: "m3" }
+  - match: { errors: false }
+
+  # Descending.
+  - do:
+      search:
+        index: sa3_luc
+        body:
+          size: 2
+          sort: [ { n: { order: desc, missing: _first } }, { k: asc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "m1" }
+  - match: { hits.hits.1._id: "m2" }
+  - set: { hits.hits.1.sort: after_sa3_luc_1 }
+  - do:
+      search:
+        index: sa3_luc
+        body:
+          size: 2
+          sort: [ { n: { order: desc, missing: _first } }, { k: asc } ]
+          search_after: $after_sa3_luc_1
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "m3" }
+  - match: { hits.hits.1._id: "p1" }
+  - set: { hits.hits.1.sort: after_sa3_luc_2 }
+  - do:
+      search:
+        index: sa3_luc
+        body:
+          size: 2
+          sort: [ { n: { order: desc, missing: _first } }, { k: asc } ]
+          search_after: $after_sa3_luc_2
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p2" }
+  - match: { hits.hits.1._id: "p3" }
+  - set: { hits.hits.1.sort: after_sa3_luc_3 }
+  - do:
+      search:
+        index: sa3_luc
+        body:
+          size: 2
+          sort: [ { n: { order: desc, missing: _first } }, { k: asc } ]
+          search_after: $after_sa3_luc_3
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "p4" }
+  - do:
+      search:
+        index: sa3_inf
+        body:
+          size: 2
+          sort: [ { n: { order: desc, missing: _first } }, { k: asc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "m1" }
+  - match: { hits.hits.1._id: "m2" }
+  - set: { hits.hits.1.sort: after_sa3_inf_1 }
+  - do:
+      search:
+        index: sa3_inf
+        body:
+          size: 2
+          sort: [ { n: { order: desc, missing: _first } }, { k: asc } ]
+          search_after: $after_sa3_inf_1
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "m3" }
+  - match: { hits.hits.1._id: "p1" }
+  - set: { hits.hits.1.sort: after_sa3_inf_2 }
+  - do:
+      search:
+        index: sa3_inf
+        body:
+          size: 2
+          sort: [ { n: { order: desc, missing: _first } }, { k: asc } ]
+          search_after: $after_sa3_inf_2
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p2" }
+  - match: { hits.hits.1._id: "p3" }
+  - set: { hits.hits.1.sort: after_sa3_inf_3 }
+  - do:
+      search:
+        index: sa3_inf
+        body:
+          size: 2
+          sort: [ { n: { order: desc, missing: _first } }, { k: asc } ]
+          search_after: $after_sa3_inf_3
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "p4" }
+  # Ascending.
+  - do:
+      search:
+        index: sa3_luc
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: _first } }, { k: asc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "m1" }
+  - match: { hits.hits.1._id: "m2" }
+  - set: { hits.hits.1.sort: after_sa3_luc_1 }
+  - do:
+      search:
+        index: sa3_luc
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: _first } }, { k: asc } ]
+          search_after: $after_sa3_luc_1
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "m3" }
+  - match: { hits.hits.1._id: "p4" }
+  - set: { hits.hits.1.sort: after_sa3_luc_2 }
+  - do:
+      search:
+        index: sa3_luc
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: _first } }, { k: asc } ]
+          search_after: $after_sa3_luc_2
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "p2" }
+  - set: { hits.hits.1.sort: after_sa3_luc_3 }
+  - do:
+      search:
+        index: sa3_luc
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: _first } }, { k: asc } ]
+          search_after: $after_sa3_luc_3
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "p1" }
+  - do:
+      search:
+        index: sa3_inf
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: _first } }, { k: asc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "m1" }
+  - match: { hits.hits.1._id: "m2" }
+  - set: { hits.hits.1.sort: after_sa3_inf_1 }
+  - do:
+      search:
+        index: sa3_inf
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: _first } }, { k: asc } ]
+          search_after: $after_sa3_inf_1
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "m3" }
+  - match: { hits.hits.1._id: "p4" }
+  - set: { hits.hits.1.sort: after_sa3_inf_2 }
+  - do:
+      search:
+        index: sa3_inf
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: _first } }, { k: asc } ]
+          search_after: $after_sa3_inf_2
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "p2" }
+  - set: { hits.hits.1.sort: after_sa3_inf_3 }
+  - do:
+      search:
+        index: sa3_inf
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: _first } }, { k: asc } ]
+          search_after: $after_sa3_inf_3
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "p1" }
+
+---
+"A missing value given as a number sorts the rows missing the field as that number, as a Lucene twin sorts them":
+  - do:
+      indices.create:
+        index: sa4_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: sa4_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              k: { type: keyword }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sa4_inf
+        body:
+          - index: { _id: "p1" }
+          - { n: 5, k: "p1" }
+          - index: { _id: "p2" }
+          - { n: 4, k: "p2" }
+          - index: { _id: "p3" }
+          - { n: 3, k: "p3" }
+          - index: { _id: "p4" }
+          - { n: 2, k: "p4" }
+          - index: { _id: "m1" }
+          - { k: "m1" }
+          - index: { _id: "m2" }
+          - { k: "m2" }
+          - index: { _id: "m3" }
+          - { k: "m3" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sa4_luc
+        body:
+          - index: { _id: "p1" }
+          - { n: 5, k: "p1" }
+          - index: { _id: "p2" }
+          - { n: 4, k: "p2" }
+          - index: { _id: "p3" }
+          - { n: 3, k: "p3" }
+          - index: { _id: "p4" }
+          - { n: 2, k: "p4" }
+          - index: { _id: "m1" }
+          - { k: "m1" }
+          - index: { _id: "m2" }
+          - { k: "m2" }
+          - index: { _id: "m3" }
+          - { k: "m3" }
+  - match: { errors: false }
+
+  # Descending, missing rows sorted as 3, tied with p3 and broken by k.
+  - do:
+      search:
+        index: sa4_luc
+        body:
+          size: 3
+          sort: [ { n: { order: desc, missing: 3 } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p1" }
+  - match: { hits.hits.1._id: "p2" }
+  - match: { hits.hits.2._id: "m1" }
+  - set: { hits.hits.2.sort: after_sa4_luc_1 }
+  - do:
+      search:
+        index: sa4_luc
+        body:
+          size: 3
+          sort: [ { n: { order: desc, missing: 3 } }, { k: asc } ]
+          search_after: $after_sa4_luc_1
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "m2" }
+  - match: { hits.hits.1._id: "m3" }
+  - match: { hits.hits.2._id: "p3" }
+  - set: { hits.hits.2.sort: after_sa4_luc_2 }
+  - do:
+      search:
+        index: sa4_luc
+        body:
+          size: 3
+          sort: [ { n: { order: desc, missing: 3 } }, { k: asc } ]
+          search_after: $after_sa4_luc_2
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "p4" }
+  - do:
+      search:
+        index: sa4_inf
+        body:
+          size: 3
+          sort: [ { n: { order: desc, missing: 3 } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p1" }
+  - match: { hits.hits.1._id: "p2" }
+  - match: { hits.hits.2._id: "m1" }
+  - set: { hits.hits.2.sort: after_sa4_inf_1 }
+  - do:
+      search:
+        index: sa4_inf
+        body:
+          size: 3
+          sort: [ { n: { order: desc, missing: 3 } }, { k: asc } ]
+          search_after: $after_sa4_inf_1
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "m2" }
+  - match: { hits.hits.1._id: "m3" }
+  - match: { hits.hits.2._id: "p3" }
+  - set: { hits.hits.2.sort: after_sa4_inf_2 }
+  - do:
+      search:
+        index: sa4_inf
+        body:
+          size: 3
+          sort: [ { n: { order: desc, missing: 3 } }, { k: asc } ]
+          search_after: $after_sa4_inf_2
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "p4" }
+  # The hit carries the stand-in value as its sort value, as stock does.
+  - do:
+      search:
+        index: sa4_luc
+        body:
+          size: 1
+          query: { ids: { values: [ "m1" ] } }
+          sort: [ { n: { order: desc, missing: 3 } } ]
+  - match: { hits.hits.0.sort.0: 3 }
+  - do:
+      search:
+        index: sa4_inf
+        body:
+          size: 1
+          query: { ids: { values: [ "m1" ] } }
+          sort: [ { n: { order: desc, missing: 3 } } ]
+  - match: { hits.hits.0.sort.0: 3 }
