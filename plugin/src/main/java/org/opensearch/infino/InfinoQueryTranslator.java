@@ -4,7 +4,9 @@
 
 package org.opensearch.infino;
 
+import org.apache.lucene.search.join.ScoreMode;
 import org.opensearch.OpenSearchParseException;
+import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateMathParser;
 import org.opensearch.common.xcontent.XContentHelper;
@@ -153,8 +155,42 @@ final class InfinoQueryTranslator {
     /** One full-text clause on a text-indexed column. */
     record TextClause(String column, String query, String mode) {}
 
+    /**
+     * One clause's share of a hit's score beyond a text clause's BM25:
+     * {@code expr} a SQL number per row (0 where the clause does not match),
+     * {@code values} the scores it takes where it does.
+     */
+    record Bonus(String expr, List<Double> values) {}
+
+    /**
+     * How a hit scores, as Lucene sums a bool's scoring clauses: the BM25 of
+     * a text clause, {@code offset} from the clauses every hit matches with
+     * one score (a term, terms, range or exists in must scores its boost),
+     * and each {@code bonuses} entry where its clause matches (such a clause
+     * in should, or a nested clause, whose score is its entries'). The text
+     * clause is the principal when there is one; otherwise {@code text}, a
+     * text clause in should, whose BM25 counts where it matches.
+     */
+    record Scoring(TextClause text, double offset, List<Bonus> bonuses) {
+        static final Scoring NONE = new Scoring(null, 0, List.of());
+
+        /** Whether hits rank by more than the principal's BM25 alone: then {@code offset} only shifts every score alike. */
+        boolean reorders() {
+            return text != null || !bonuses.isEmpty();
+        }
+    }
+
     /** What a query translates to. */
-    record Translation(String table, String where, TextClause principal) {
+    record Translation(String table, String where, TextClause principal, Scoring scoring) {
+        Translation(String table, String where, TextClause principal) {
+            this(table, where, principal, Scoring.NONE);
+        }
+
+        /** This translation with {@code where} as its predicate, scored as before. */
+        Translation withWhere(String where) {
+            return new Translation(table, where, principal, scoring);
+        }
+
         /** The relation the predicate applies to: the table, or its token-match set. */
         String from() {
             if (principal == null) {
@@ -173,18 +209,33 @@ final class InfinoQueryTranslator {
 
         /** The ranked relation for hits: BM25 over the principal clause, {@code k} candidates. */
         String rankedFrom(int k) {
+            return rankedFrom(principal, k);
+        }
+
+        /** The ranked relation for hits: BM25 over {@code text}, {@code k} candidates. */
+        String rankedFrom(TextClause text, int k) {
             return "bm25_search("
                 + literal(table)
                 + ", "
-                + literal(principal.column())
+                + literal(text.column())
                 + ", "
-                + literal(principal.query())
+                + literal(text.query())
                 + ", "
                 + k
                 + ", "
-                + literal(principal.mode())
+                + literal(text.mode())
                 + ")";
         }
+
+        /** The predicate {@code text} is as a clause other than the ranked one: the ids its token match holds. */
+        String textMatch(TextClause text) {
+            return textSubquery(table, text);
+        }
+    }
+
+    /** The ids a text clause matches, as a subquery over the token index of {@code table}. */
+    private static String textSubquery(String table, TextClause text) {
+        return TEXT_SUBQUERY + literal(table) + ", " + literal(text.column()) + ", " + literal(text.query()) + ", " + literal(text.mode()) + "))";
     }
 
     private final Map<String, Column> cols;
@@ -205,6 +256,8 @@ final class InfinoQueryTranslator {
     /** How the translator reads rows of the table: a nested query's candidates, with their sources. */
     private final Function<String, List<Map<String, Object>>> rows;
     private TextClause principal;
+    /** Each nested clause's matching documents with their scores, read once whether it filters, scores or both. */
+    private final Map<NestedQueryBuilder, Map<String, Double>> nestedScores = new java.util.IdentityHashMap<>();
 
     private InfinoQueryTranslator(Map<String, Column> cols, String table, long nowMillis, boolean trusted) {
         this(cols, table, nowMillis, trusted, false);
@@ -242,7 +295,187 @@ final class InfinoQueryTranslator {
         if (where == null) {
             return null;
         }
-        return new Translation(table, where, t.principal);
+        return new Translation(table, where, t.principal, t.scoring(qb));
+    }
+
+    // ---- scoring ----
+
+    /**
+     * How the hits of {@code root} score, as Lucene scores them, beyond the
+     * principal's BM25: what the clauses every hit matches add, and what the
+     * optional ones add where they match. See {@link Scoring}.
+     */
+    private Scoring scoring(QueryBuilder root) {
+        double[] offset = { 0 };
+        List<Bonus> bonuses = new ArrayList<>();
+        List<TextClause> texts = new ArrayList<>();
+        boolean[] unscored = { false };
+        required(root, offset, bonuses, texts, unscored);
+        if (principal == null && (unscored[0] || texts.size() > 1)) {
+            // A should clause the table cannot score (or a second text clause,
+            // which would add its BM25 beside the first) would leave some of the
+            // hits it matches at 0, under hits it outscores in stock: with no
+            // ranked clause, the hits keep the one score they all had.
+            return offset[0] == 0 ? Scoring.NONE : new Scoring(null, offset[0], List.of());
+        }
+        // Beside a ranked clause a should clause the table cannot score adds
+        // nothing, as before; the others add theirs.
+        TextClause text = principal == null && texts.size() == 1 ? texts.get(0) : null;
+        return offset[0] == 0 && bonuses.isEmpty() && text == null ? Scoring.NONE : new Scoring(text, offset[0], List.copyOf(bonuses));
+    }
+
+    /** A clause every hit matches: the root, or a must clause of a bool every hit matches. */
+    private void required(QueryBuilder qb, double[] offset, List<Bonus> bonuses, List<TextClause> texts, boolean[] unscored) {
+        if (qb instanceof BoolQueryBuilder b) {
+            // A filter or must_not clause scores nothing.
+            for (QueryBuilder c : b.must()) {
+                required(c, offset, bonuses, texts, unscored);
+            }
+            for (QueryBuilder c : b.should()) {
+                if (!optional(c, bonuses, texts)) {
+                    unscored[0] = true;
+                }
+            }
+            return;
+        }
+        Double w = constantScore(qb);
+        if (w != null) {
+            offset[0] += w;
+        } else if (qb instanceof NestedQueryBuilder n) {
+            Bonus nb = nestedBonus(n);
+            if (nb != null) {
+                bonuses.add(nb);
+            }
+        } else {
+            // A text clause here ranks the hits when it is the principal; any
+            // other (a text clause on a second column, a query string over
+            // several, a script) scores nothing here, where stock scores it.
+            TextClause t = textOnly(qb);
+            if (t == null || !t.equals(principal)) {
+                unscored[0] = true;
+            }
+        }
+    }
+
+    /**
+     * A should clause of a bool every hit matches: it adds its score to the
+     * hits it matches. Beside a must or filter clause it does not narrow the
+     * hits, so it was never read as a predicate: one the table cannot read
+     * (or that names a field masked for the user, whose values a score would
+     * tell) is left unscored, and the query is served as before.
+     */
+    private boolean optional(QueryBuilder qb, List<Bonus> bonuses, List<TextClause> texts) {
+        try {
+            return scoreOptional(qb, bonuses, texts);
+        } catch (IllegalArgumentException | OpenSearchSecurityException e) {
+            return false;
+        }
+    }
+
+    /** Scores a should clause; false when the table cannot score it as stock does. */
+    private boolean scoreOptional(QueryBuilder qb, List<Bonus> bonuses, List<TextClause> texts) {
+        Double w = constantScore(qb);
+        if (w != null) {
+            String p = predicate(qb, false);
+            if (p == null) {
+                return false;
+            }
+            if (!NONE.equals(p)) {
+                bonuses.add(new Bonus("CASE WHEN " + p + " THEN " + scoreLiteral(w) + " ELSE 0.0 END", List.of(w)));
+            }
+            return true;
+        }
+        if (qb instanceof NestedQueryBuilder n) {
+            Bonus nb = nestedBonus(n);
+            if (nb != null) {
+                bonuses.add(nb);
+            }
+            return true;
+        }
+        TextClause t = textOnly(qb);
+        if (t == null) {
+            return false;
+        }
+        texts.add(t);
+        return true;
+    }
+
+    /**
+     * The score Lucene gives every document a clause matches, or null when it
+     * scores documents apart: a terms, range, exists, ids or match_all query scores its
+     * boost (a constant-score query in Lucene), as do a term, prefix,
+     * wildcard or regexp query on a field other than a text one, and a match
+     * or match_phrase on one, which is a term query there.
+     */
+    private Double constantScore(QueryBuilder qb) {
+        if (qb instanceof TermsQueryBuilder
+            || qb instanceof RangeQueryBuilder
+            || qb instanceof ExistsQueryBuilder
+            || qb instanceof IdsQueryBuilder
+            || qb instanceof MatchAllQueryBuilder) {
+            return (double) qb.boost();
+        }
+        String field = null;
+        if (qb instanceof TermQueryBuilder t) {
+            field = t.fieldName();
+        } else if (qb instanceof MatchQueryBuilder m) {
+            field = m.fieldName();
+        } else if (qb instanceof MatchPhraseQueryBuilder mp) {
+            field = mp.fieldName();
+        } else if (qb instanceof PrefixQueryBuilder px) {
+            field = px.fieldName();
+        } else if (qb instanceof WildcardQueryBuilder w) {
+            field = w.fieldName();
+        } else if (qb instanceof RegexpQueryBuilder re) {
+            field = re.fieldName();
+        }
+        if (field == null) {
+            return null;
+        }
+        Column c = resolve(field);
+        return c != null && c.fts() ? null : (double) qb.boost();
+    }
+
+    /**
+     * The text clause {@code qb} is when it is one alone (a match or a
+     * match_phrase on a text field), as it would rank: null for any other clause.
+     */
+    private TextClause textOnly(QueryBuilder qb) {
+        if (!(qb instanceof MatchQueryBuilder || qb instanceof MatchPhraseQueryBuilder)) {
+            return null;
+        }
+        InfinoQueryTranslator alone = new InfinoQueryTranslator(cols, table, nowMillis, trusted, columnValuesOnly, rows);
+        String p = alone.predicate(qb, true);
+        return ALL.equals(p) ? alone.principal : null;
+    }
+
+    /**
+     * What a nested clause adds to the documents it matches: their entries'
+     * scores read by its score_mode ({@link #nestedScores}), by id. Null when
+     * it matches none, or scores them all 0.
+     */
+    private Bonus nestedBonus(NestedQueryBuilder n) {
+        Map<String, Double> scores = nestedScores(n);
+        Map<Double, List<String>> byScore = new java.util.TreeMap<>();
+        for (Map.Entry<String, Double> e : scores.entrySet()) {
+            if (e.getValue() != 0) {
+                byScore.computeIfAbsent(e.getValue(), k -> new ArrayList<>()).add(literal(e.getKey()));
+            }
+        }
+        if (byScore.isEmpty()) {
+            return null;
+        }
+        StringBuilder expr = new StringBuilder("CASE");
+        for (Map.Entry<Double, List<String>> e : byScore.entrySet()) {
+            expr.append(" WHEN ").append(OSID).append(" IN (").append(String.join(", ", e.getValue())).append(") THEN ").append(scoreLiteral(e.getKey()));
+        }
+        expr.append(" ELSE 0.0 END");
+        return new Bonus(expr.toString(), List.copyOf(byScore.keySet()));
+    }
+
+    /** A score as a SQL number: plain digits, never an exponent. */
+    static String scoreLiteral(double v) {
+        return BigDecimal.valueOf(v).toPlainString();
     }
 
     /**
@@ -637,25 +870,50 @@ final class InfinoQueryTranslator {
      * the columns only narrow the documents to those that may match: the
      * inner query read over the flattened values, its negations left out
      * ({@link #mayMatch}). Each of those is then checked by its source, entry
-     * by entry ({@link #entryTest}), and the clause becomes the ids of the
+     * by entry ({@link #entryScore}), and the clause becomes the ids of the
      * documents that hold a matching entry. A clause the check cannot read
      * refuses the query with the clause named, as does a narrowing that
      * leaves more than {@link #NESTED_CANDIDATES_MAX} documents: never an
      * answer read over the flattened values.
      */
     private String nested(NestedQueryBuilder n) {
+        Map<String, Double> scores = nestedScores(n);
+        if (scores.isEmpty()) {
+            return NONE;
+        }
+        List<String> ids = new ArrayList<>();
+        for (String id : scores.keySet()) {
+            ids.add(literal(id));
+        }
+        return OSID + " IN (" + String.join(", ", ids) + ")";
+    }
+
+    /**
+     * The documents a nested query matches ({@link #nested}), each with its
+     * score as Lucene gives it: the scores of its matching entries
+     * ({@link #entryScore}) read by the query's score_mode (their average by
+     * default, their sum, the greatest, the least, or 0 for none), times the
+     * query's boost. Read once per clause.
+     */
+    private Map<String, Double> nestedScores(NestedQueryBuilder n) {
+        Map<String, Double> known = nestedScores.get(n);
+        if (known != null) {
+            return known;
+        }
         String path = n.path();
         if (n.innerHit() != null) {
             throw new IllegalArgumentException("[infino] inner_hits on the nested query on [" + path + "] is not served by the table");
         }
-        Predicate<Map<String, Object>> test = entryTest(n.query(), path, path);
+        EntryScore score = entryScore(n.query(), path, path);
         // An entry with no value at all matches only a query that needs none
         // (match_all, a must_not); then no column narrows the documents, and
         // each one's entries are read from its source alone.
-        boolean emptyEntryMatches = test.test(Map.of());
+        boolean emptyEntryMatches = !Double.isNaN(score.of(Map.of()));
         String present = exists(path);
+        Map<String, Double> matched = new java.util.LinkedHashMap<>();
         if (NONE.equals(present) && !emptyEntryMatches) {
-            return NONE;
+            nestedScores.put(n, matched);
+            return matched;
         }
         // The narrowing reads every column's values, as a predicate the engine runs here, not in a vector search.
         InfinoQueryTranslator wide = columnValuesOnly ? new InfinoQueryTranslator(cols, table, nowMillis, trusted, false, rows) : this;
@@ -673,7 +931,6 @@ final class InfinoQueryTranslator {
                     + n.query()
             );
         }
-        List<String> ids = new ArrayList<>();
         for (Map<String, Object> row : candidates) {
             Object id = row.get(OSID);
             Object source = row.get(SOURCE);
@@ -686,14 +943,13 @@ final class InfinoQueryTranslator {
                     "[infino] the nested query on [" + path + "] is not served: document [" + id + "] has values under [" + path + "] its source does not hold"
                 );
             }
-            for (Map<String, Object> entry : entries) {
-                if (test.test(entry)) {
-                    ids.add(literal(String.valueOf(id)));
-                    break;
-                }
+            double s = combined(n.scoreMode(), entries, score);
+            if (!Double.isNaN(s)) {
+                matched.put(String.valueOf(id), s * n.boost());
             }
         }
-        return ids.isEmpty() ? NONE : OSID + " IN (" + String.join(", ", ids) + ")";
+        nestedScores.put(n, matched);
+        return matched;
     }
 
     /** The predicates all holding: the one there is, or their conjunction; every row for none. */
@@ -753,89 +1009,152 @@ final class InfinoQueryTranslator {
     }
 
     /**
-     * Whether an entry of the nested query on {@code path} matches {@code qb},
-     * its fields read from the entry, which sits at {@code scope} (the path
-     * itself, or a deeper nested query's). A clause on a field outside the
-     * scope matches nothing, as in stock, whose nested documents hold only
-     * their own fields; a field the table has no column for (unmapped, or
-     * not visible to the request) matches nothing either. Throws naming the
+     * The score of one entry under a nested query, as Lucene scores the
+     * nested document: NaN when the query does not hold on it.
+     */
+    @FunctionalInterface
+    private interface EntryScore {
+        double of(Map<String, Object> entry);
+    }
+
+    /**
+     * The scores of the {@code entries} that match read by {@code mode}, as a
+     * nested query reads them for their document: NaN when none matches.
+     */
+    private static double combined(ScoreMode mode, List<Map<String, Object>> entries, EntryScore score) {
+        int matched = 0;
+        double sum = 0;
+        double max = Double.NEGATIVE_INFINITY;
+        double min = Double.POSITIVE_INFINITY;
+        for (Map<String, Object> entry : entries) {
+            double s = score.of(entry);
+            if (Double.isNaN(s)) {
+                continue;
+            }
+            matched++;
+            sum += s;
+            max = Math.max(max, s);
+            min = Math.min(min, s);
+        }
+        if (matched == 0) {
+            return Double.NaN;
+        }
+        return switch (mode) {
+            case None -> 0;
+            case Total -> sum;
+            case Max -> max;
+            case Min -> min;
+            case Avg -> sum / matched;
+        };
+    }
+
+    /** {@code test} as an entry score: {@code boost} where it holds, NaN where it does not. */
+    private static EntryScore scoring(Predicate<Map<String, Object>> test, float boost) {
+        return e -> test.test(e) ? boost : Double.NaN;
+    }
+
+    /**
+     * How an entry of the nested query on {@code path} scores under
+     * {@code qb}, its fields read from the entry, which sits at {@code scope}
+     * (the path itself, or a deeper nested query's): NaN where {@code qb}
+     * does not hold on it. A term, terms, match, range, exists or match_all
+     * scores its boost, as their queries score on a keyword, numeric or
+     * boolean field in Lucene; a bool the sum of its must clauses' scores and
+     * its matching should clauses', times its boost (a filter or must_not
+     * scores nothing); a deeper nested query its entries' scores by its
+     * score_mode, times its boost. A clause on a field outside the scope
+     * matches nothing, as in stock, whose nested documents hold only their
+     * own fields; a field the table has no column for (unmapped, or not
+     * visible to the request) matches nothing either. Throws naming the
      * clause the check cannot read.
      */
-    private Predicate<Map<String, Object>> entryTest(QueryBuilder qb, String path, String scope) {
-        if (qb == null || qb instanceof MatchAllQueryBuilder) {
-            return e -> true;
+    private EntryScore entryScore(QueryBuilder qb, String path, String scope) {
+        if (qb == null) {
+            return e -> 1.0;
+        }
+        if (qb instanceof MatchAllQueryBuilder) {
+            return scoring(e -> true, qb.boost());
         }
         if (qb instanceof MatchNoneQueryBuilder) {
-            return e -> false;
+            return e -> Double.NaN;
         }
         if (qb instanceof TermQueryBuilder t) {
             Object q = t.value();
-            return entryValue(t.fieldName(), qb, path, scope, (c, v) -> sameValue(c, v, q));
+            return scoring(entryValue(t.fieldName(), qb, path, scope, (c, v) -> sameValue(c, v, q)), qb.boost());
         }
         if (qb instanceof TermsQueryBuilder ts) {
             if (ts.termsLookup() != null) {
                 throw notInNested(qb, path, "a terms lookup");
             }
             List<Object> qs = ts.values() == null ? List.of() : ts.values();
-            return entryValue(ts.fieldName(), qb, path, scope, (c, v) -> {
+            return scoring(entryValue(ts.fieldName(), qb, path, scope, (c, v) -> {
                 for (Object q : qs) {
                     if (sameValue(c, v, q)) {
                         return true;
                     }
                 }
                 return false;
-            });
+            }), qb.boost());
         }
         if (qb instanceof MatchQueryBuilder m) {
             // A match on an exact field is an equality, as the translator reads it elsewhere.
             Object q = m.value();
-            return entryValue(m.fieldName(), qb, path, scope, (c, v) -> sameValue(c, v, q));
+            return scoring(entryValue(m.fieldName(), qb, path, scope, (c, v) -> sameValue(c, v, q)), qb.boost());
         }
         if (qb instanceof RangeQueryBuilder r) {
-            return entryValue(r.fieldName(), qb, path, scope, (c, v) -> inRange(c, v, r));
+            return scoring(entryValue(r.fieldName(), qb, path, scope, (c, v) -> inRange(c, v, r)), qb.boost());
         }
         if (qb instanceof ExistsQueryBuilder e) {
-            return entryExists(e, path, scope);
+            return scoring(entryExists(e, path, scope), qb.boost());
         }
         if (qb instanceof BoolQueryBuilder b) {
-            List<Predicate<Map<String, Object>>> required = new ArrayList<>();
+            List<EntryScore> scored = new ArrayList<>();
             for (QueryBuilder c : b.must()) {
-                required.add(entryTest(c, path, scope));
+                scored.add(entryScore(c, path, scope));
             }
+            List<EntryScore> filters = new ArrayList<>();
             for (QueryBuilder c : b.filter()) {
-                required.add(entryTest(c, path, scope));
+                filters.add(entryScore(c, path, scope));
             }
-            List<Predicate<Map<String, Object>>> optional = new ArrayList<>();
+            List<EntryScore> optional = new ArrayList<>();
             for (QueryBuilder c : b.should()) {
-                optional.add(entryTest(c, path, scope));
+                optional.add(entryScore(c, path, scope));
             }
-            List<Predicate<Map<String, Object>>> prohibited = new ArrayList<>();
+            List<EntryScore> prohibited = new ArrayList<>();
             for (QueryBuilder c : b.mustNot()) {
-                prohibited.add(entryTest(c, path, scope));
+                prohibited.add(entryScore(c, path, scope));
             }
-            boolean nothingRequired = required.isEmpty();
+            boolean nothingRequired = scored.isEmpty() && filters.isEmpty();
             int atLeast = optional.isEmpty() ? 0 : Math.min(minimumShouldMatch(b.minimumShouldMatch(), optional.size(), nothingRequired), optional.size());
+            float boost = b.boost();
             return e -> {
-                for (Predicate<Map<String, Object>> p : required) {
-                    if (!p.test(e)) {
-                        return false;
+                double sum = 0;
+                for (EntryScore s : scored) {
+                    double v = s.of(e);
+                    if (Double.isNaN(v)) {
+                        return Double.NaN;
+                    }
+                    sum += v;
+                }
+                for (EntryScore s : filters) {
+                    if (Double.isNaN(s.of(e))) {
+                        return Double.NaN;
                     }
                 }
-                for (Predicate<Map<String, Object>> p : prohibited) {
-                    if (p.test(e)) {
-                        return false;
+                for (EntryScore s : prohibited) {
+                    if (!Double.isNaN(s.of(e))) {
+                        return Double.NaN;
                     }
                 }
                 int matched = 0;
-                for (Predicate<Map<String, Object>> p : optional) {
-                    if (matched >= atLeast) {
-                        break;
-                    }
-                    if (p.test(e)) {
+                for (EntryScore s : optional) {
+                    double v = s.of(e);
+                    if (!Double.isNaN(v)) {
                         matched++;
+                        sum += v;
                     }
                 }
-                return matched >= atLeast;
+                return matched >= atLeast ? sum * boost : Double.NaN;
             };
         }
         if (qb instanceof NestedQueryBuilder inner) {
@@ -846,15 +1165,10 @@ final class InfinoQueryTranslator {
             if (sub == null) {
                 throw notInNested(qb, path, "a nested query on [" + inner.path() + "], which is not under [" + scope + "]");
             }
-            Predicate<Map<String, Object>> test = entryTest(inner.query(), path, inner.path());
-            return e -> {
-                for (Map<String, Object> entry : entries(e, sub)) {
-                    if (test.test(entry)) {
-                        return true;
-                    }
-                }
-                return false;
-            };
+            EntryScore score = entryScore(inner.query(), path, inner.path());
+            ScoreMode mode = inner.scoreMode();
+            float boost = inner.boost();
+            return e -> combined(mode, entries(e, sub), score) * boost;
         }
         throw notInNested(qb, path, null);
     }
@@ -1125,7 +1439,7 @@ final class InfinoQueryTranslator {
             principal = new TextClause(column, principal.query() + " " + query, mode);
             return ALL;
         }
-        return TEXT_SUBQUERY + literal(table) + ", " + literal(column) + ", " + literal(query) + ", " + literal(mode) + "))";
+        return textSubquery(table, new TextClause(column, query, mode));
     }
 
     /**

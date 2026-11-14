@@ -37,6 +37,8 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
+import org.opensearch.infino.InfinoQueryTranslator.Bonus;
+import org.opensearch.infino.InfinoQueryTranslator.Scoring;
 import org.opensearch.infino.InfinoQueryTranslator.TextClause;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
 import org.opensearch.infino.InfinoScriptTranslator.Sql;
@@ -112,6 +114,12 @@ public final class InfinoSearch {
      * filter while it collects), so such a page asks for the page alone.
      */
     private static final int RANK_WINDOW = 10_000;
+    /**
+     * The most score bands a scored statement ranks apart ({@link #scoredStatement}):
+     * past this the text clause's candidates are ranked once, over
+     * {@link #RANK_WINDOW} of them, and scored after.
+     */
+    private static final int MAX_SCORE_BANDS = 64;
     /** OpenSearch's page size when the request names none. */
     static final int DEFAULT_SIZE = 10;
     /** The node name a hit's shard target carries; it only names the index in the response. */
@@ -165,7 +173,7 @@ public final class InfinoSearch {
         /** This plan with {@code predicate} required of every row, the hits', the total's and the aggregations' alike. */
         Plan requiring(String predicate) {
             String where = InfinoQueryTranslator.ALL.equals(query.where()) ? predicate : "(" + query.where() + ") AND " + predicate;
-            Translation narrowed = new Translation(query.table(), where, query.principal());
+            Translation narrowed = query.withWhere(where);
             return new Plan(table, cols, narrowed, sorts, vector, postWhere, collapse, searchAfter, scriptFields, access, nowMillis);
         }
     }
@@ -293,7 +301,7 @@ public final class InfinoSearch {
                 throw InfinoAccess.refused("a vector query under document-level security is not served; the engine's vector search takes no predicate");
             }
             String where = InfinoQueryTranslator.ALL.equals(query.where()) ? rule : "(" + query.where() + ") AND " + rule;
-            query = new Translation(query.table(), where, query.principal());
+            query = query.withWhere(where);
         }
         log.debug("[infino] query {} -> FROM {} WHERE {}", qb, query.from(), query.where());
         List<SortSpec> sorts = sorts(source.sorts(), cols, nowMillis);
@@ -592,7 +600,7 @@ public final class InfinoSearch {
         } else if (exact) {
             // The total counts what the query and post_filter keep, before
             // any collapse and regardless of where the page starts.
-            total = plan.postWhere() == null ? count(plan.table(), q) : count(plan.table(), new Translation(q.table(), plan.hitWhere(), q.principal()));
+            total = plan.postWhere() == null ? count(plan.table(), q) : count(plan.table(), q.withWhere(plan.hitWhere()));
         } else {
             total = rows.size();
         }
@@ -617,15 +625,21 @@ public final class InfinoSearch {
             h.shard(target);
             float score = Float.NaN;
             Object s = row.get("score");
+            // What the clauses every hit matches add to each hit's score alike.
+            double offset = q.scoring().offset();
             if (s instanceof Number n) {
                 score = n.floatValue();
                 if (stockKnn) {
                     score = InfinoStockKnn.score(space, score);
                 } else if (knnDistance) {
                     score = 1.0f / (1.0f + score);
+                } else if (plan.vector() == null) {
+                    score = (float) (n.doubleValue() + offset);
                 }
             } else if (plan.sorts().isEmpty()) {
-                score = 1.0f; // a filter-only request scores every hit alike, as Lucene does
+                // A filter-only request scores every hit alike, as Lucene does: by
+                // what its scoring clauses add (a must term 1.0), else 1.0.
+                score = offset > 0 ? (float) offset : 1.0f;
             }
             h.score(score);
             if (!Float.isNaN(score)) {
@@ -689,6 +703,7 @@ public final class InfinoSearch {
      */
     static boolean bareRanked(Plan plan) {
         return plan.query().principal() != null
+            && !plan.query().scoring().reorders()
             && InfinoQueryTranslator.ALL.equals(plan.hitWhere())
             && plan.sorts().isEmpty()
             && plan.searchAfter() == null
@@ -776,6 +791,9 @@ public final class InfinoSearch {
             where = "(" + where + ") AND " + keysetPredicate(plan);
         }
         boolean sorted = !plan.sorts().isEmpty();
+        if (!sorted && plan.collapse() == null && plan.searchAfter() == null && q.scoring().reorders()) {
+            return scoredStatement(plan, hit.toString(), where, fetch, withSeq);
+        }
         boolean ranked = !sorted && q.principal() != null;
         String from;
         String order;
@@ -805,6 +823,114 @@ public final class InfinoSearch {
         return "SELECT " + hit + " FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY " + within
             + ") AS collapse_rank FROM " + from + " t WHERE " + where + ") WHERE collapse_rank = 1"
             + (order == null ? "" : " ORDER BY " + order) + " LIMIT " + fetch;
+    }
+
+    /**
+     * The statement for a page ranked by more than one clause's BM25
+     * ({@link Scoring#reorders}): each hit scores the BM25 of the text clause
+     * where it matches, plus what each other scoring clause adds where it
+     * matches ({@code infino_bonus}, a SQL number per row), as Lucene sums a
+     * bool's clauses; the page is the hits with the greatest sums. The
+     * engine ranks by BM25 alone, so the hits are cut into bands that share
+     * one bonus (the bonus takes few values: the sums of its clauses'
+     * scores) and each band's best by BM25 is ranked within it, the band's
+     * bounds riding with the ranked search as its filter; the page is the
+     * best of those. When the text clause is optional (a should beside no
+     * ranked clause), the hits it does not match score their bonus alone,
+     * the best of them read by it. With no text clause at all, the bonus is
+     * the score.
+     */
+    static String scoredStatement(Plan plan, String hit, String where, int fetch, boolean withSeq) {
+        Translation q = plan.query();
+        Scoring scoring = q.scoring();
+        String rowId = InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID);
+        List<String> names = new ArrayList<>();
+        names.add(InfinoQueryTranslator.OSID);
+        names.add(InfinoQueryTranslator.SOURCE);
+        if (withSeq) {
+            names.add(InfinoQueryTranslator.SEQ);
+        }
+        for (ScriptedField sf : plan.scriptFields()) {
+            names.add(sf.alias());
+        }
+        List<String> parts = new ArrayList<>();
+        for (Bonus b : scoring.bonuses()) {
+            parts.add("(" + b.expr() + ")");
+        }
+        String bonus = parts.isEmpty() ? "0.0" : String.join(" + ", parts);
+        TextClause text = q.principal() != null ? q.principal() : scoring.text();
+        List<String> branches = new ArrayList<>();
+        if (text == null) {
+            branches.add("SELECT " + hit + ", 0.0 AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.from() + " WHERE " + where);
+        } else {
+            // An optional text clause is a subquery in the predicate: true of every
+            // row its ranked search returns, false of every other.
+            String match = q.principal() != null ? null : q.textMatch(text);
+            String ranked = match == null ? where : where.replace(match, InfinoQueryTranslator.ALL);
+            List<Double> sums = bonusSums(scoring.bonuses());
+            if (sums == null) {
+                branches.add(
+                    "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.rankedFrom(text, RANK_WINDOW) + " WHERE " + ranked
+                );
+            } else {
+                int k = InfinoQueryTranslator.joinsAfterRanking(ranked) || InfinoQueryTranslator.joinsAfterRanking(bonus) ? RANK_WINDOW : fetch;
+                for (int i = 0; i < sums.size(); i++) {
+                    // The band around this sum: from halfway to the one below, to halfway to the one above.
+                    List<String> band = new ArrayList<>();
+                    if (!InfinoQueryTranslator.ALL.equals(ranked)) {
+                        band.add("(" + ranked + ")");
+                    }
+                    if (i > 0) {
+                        band.add("(" + bonus + ") >= " + InfinoQueryTranslator.scoreLiteral((sums.get(i - 1) + sums.get(i)) / 2));
+                    }
+                    if (i < sums.size() - 1) {
+                        band.add("(" + bonus + ") < " + InfinoQueryTranslator.scoreLiteral((sums.get(i) + sums.get(i + 1)) / 2));
+                    }
+                    branches.add(
+                        "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.rankedFrom(text, k)
+                            + (band.isEmpty() ? "" : " WHERE " + String.join(" AND ", band))
+                    );
+                }
+            }
+            if (match != null) {
+                String rest = "(" + where.replace(match, InfinoQueryTranslator.NONE) + ") AND " + InfinoQueryTranslator.not(match);
+                branches.add(
+                    "SELECT * FROM (SELECT " + hit + ", 0.0 AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.from() + " WHERE " + rest
+                        + " ORDER BY infino_bonus DESC, infino_row ASC LIMIT " + fetch + ") AS infino_rest"
+                );
+            }
+        }
+        // Hits that tie on score come in the order they were written, as stock orders them by their place in the index.
+        return "SELECT " + String.join(", ", names) + ", infino_bm25 + infino_bonus AS score FROM (" + String.join(" UNION ALL ", branches)
+            + ") AS infino_scored ORDER BY score DESC, infino_row ASC LIMIT " + fetch;
+    }
+
+    /**
+     * Every sum the bonuses can take on a row, ascending: 0, and each sum of
+     * one score from any of them. Null past {@link #MAX_SCORE_BANDS}.
+     */
+    static List<Double> bonusSums(List<Bonus> bonuses) {
+        java.util.TreeSet<Double> sums = new java.util.TreeSet<>(List.of(0.0));
+        for (Bonus b : bonuses) {
+            java.util.TreeSet<Double> next = new java.util.TreeSet<>(sums);
+            for (double s : sums) {
+                for (double v : b.values()) {
+                    next.add(s + v);
+                }
+            }
+            sums = next;
+            if (sums.size() > MAX_SCORE_BANDS) {
+                return null;
+            }
+        }
+        // Sums that differ only by rounding are one band.
+        List<Double> out = new ArrayList<>();
+        for (double s : sums) {
+            if (out.isEmpty() || s - out.get(out.size() - 1) > 1e-9) {
+                out.add(s);
+            }
+        }
+        return out;
     }
 
     /**
