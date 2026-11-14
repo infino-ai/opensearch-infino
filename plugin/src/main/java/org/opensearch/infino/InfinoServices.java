@@ -21,7 +21,10 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * The node services the plugin's filters need, taken by injection rather
@@ -138,6 +141,35 @@ public final class InfinoServices extends AbstractLifecycleComponent {
                 onFailure.accept(e);
             }
         });
+    }
+
+    /**
+     * {@code work} started on the node's {@code generic} pool, to run beside
+     * the caller's own work; already done, on the caller's thread, when no
+     * thread pool is bound. The generic pool grows with demand, so a caller
+     * that waits on the result never waits on a queue it holds a thread of.
+     */
+    static <T> CompletableFuture<T> beside(Supplier<T> work) {
+        ThreadPool pools = threadPool;
+        if (pools == null) {
+            return CompletableFuture.completedFuture(work.get());
+        }
+        return CompletableFuture.supplyAsync(work, pools.generic());
+    }
+
+    /** The result of {@code started}, waited for; its failure is thrown as it was raised. */
+    static <T> T await(CompletableFuture<T> started) {
+        try {
+            return started.join();
+        } catch (CompletionException e) {
+            if (e.getCause() instanceof RuntimeException r) {
+                throw r;
+            }
+            if (e.getCause() instanceof Error err) {
+                throw err;
+            }
+            throw e;
+        }
     }
 
     /** The current request's thread context, or null before the services are injected. */

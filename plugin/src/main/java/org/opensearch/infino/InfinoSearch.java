@@ -76,6 +76,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -609,7 +610,19 @@ public final class InfinoSearch {
         // vector entry points return ids and scores only.
         Map<String, Long> vectorSeqs = Map.of();
         boolean exact = trackTotal(source);
-        // The exact total, when it is read before the page: see the scored page below.
+        // A scored page counts its exact total before its rows (see countsFirst):
+        // a total of 0 plans no page at all.
+        boolean firstCount = plan.vector() == null
+            && size > 0
+            && !(bareRanked(plan) && !seqNoAndPrimaryTerm)
+            && countsFirst(source, count, scoredPage(plan));
+        // Otherwise the exact total and the page are separate engine calls,
+        // neither waiting on the other: the total is counted on another
+        // thread while the page is read.
+        CompletableFuture<Long> beside = plan.vector() == null && exact && count && size > 0 && !firstCount
+            ? InfinoServices.beside(() -> total(plan))
+            : null;
+        // The exact total, when it is read before the page.
         Long counted = null;
         boolean shortPage = false;
         if (size == 0 && !stockKnn) {
@@ -650,7 +663,7 @@ public final class InfinoSearch {
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
         } else {
             CountedRows read = countedRows(
-                countsFirst(source, count, scoredPage(plan)),
+                firstCount,
                 () -> total(plan),
                 () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm)
             );
@@ -666,6 +679,9 @@ public final class InfinoSearch {
             total = 0;
         } else if (exact && counted != null) {
             total = counted;
+        } else if (exact && beside != null) {
+            // Already counting: its answer is exact, and it is not left running past the request.
+            total = InfinoServices.await(beside);
         } else if (exact && shortPage) {
             total = rows.size();
         } else if (exact) {
