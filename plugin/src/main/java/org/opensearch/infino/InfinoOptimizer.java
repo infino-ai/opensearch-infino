@@ -11,6 +11,7 @@ import org.opensearch.threadpool.Scheduler;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
 
 /**
@@ -18,6 +19,13 @@ import java.util.function.BiFunction;
  * {@code index.infino.optimize_interval}. The interval is dynamic: a change
  * to it reschedules the index's started shards at once, rather than at their
  * next start.
+ *
+ * <p>Cancelling a task does not stop a run in progress, so a rescheduled task
+ * can fire while the old one is still compacting. Each shard's runnable is
+ * therefore wrapped once, at start, in a guard that a reschedule keeps: a run
+ * that finds the previous one still going is skipped rather than waiting, as
+ * the run in flight is already compacting the table and waiting would hold a
+ * pool thread for as long as that takes.
  */
 final class InfinoOptimizer {
 
@@ -33,7 +41,8 @@ final class InfinoOptimizer {
 
     /** Run {@code optimize} for {@code shard} every {@code interval}, replacing any task it had. */
     synchronized void start(ShardId shard, Runnable optimize, TimeValue interval) {
-        Task previous = tasks.put(shard, new Task(optimize, interval, schedule.apply(optimize, interval)));
+        Runnable run = oneAtATime(optimize);
+        Task previous = tasks.put(shard, new Task(run, interval, schedule.apply(run, interval)));
         if (previous != null) {
             previous.handle().cancel();
         }
@@ -57,6 +66,21 @@ final class InfinoOptimizer {
             task.handle().cancel();
             entry.setValue(new Task(task.run(), interval, schedule.apply(task.run(), interval)));
         }
+    }
+
+    /** {@code optimize}, skipped when called while a previous call is still running. */
+    private static Runnable oneAtATime(Runnable optimize) {
+        AtomicBoolean running = new AtomicBoolean();
+        return () -> {
+            if (!running.compareAndSet(false, true)) {
+                return;
+            }
+            try {
+                optimize.run();
+            } finally {
+                running.set(false);
+            }
+        };
     }
 
     /** The interval {@code shard} is compacted at, or null when it has no task. */

@@ -12,6 +12,8 @@ import org.opensearch.threadpool.Scheduler;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
@@ -122,5 +124,61 @@ public class InfinoOptimizerTests extends OpenSearchTestCase {
 
         assertTrue(scheduled.get(0).cancelled);
         assertEquals(MINUTE, optimizer.interval(logs0));
+    }
+
+    /** An optimize whose first call blocks until released, counting every call. */
+    private static final class SlowFirstRun implements Runnable {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final AtomicInteger calls = new AtomicInteger();
+
+        @Override
+        public void run() {
+            if (calls.incrementAndGet() == 1) {
+                entered.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
+    public void testAReplacementThatFiresDuringARunIsSkipped() throws Exception {
+        ShardId logs0 = new ShardId(LOGS, 0);
+        SlowFirstRun optimize = new SlowFirstRun();
+        optimizer.start(logs0, optimize, HOUR);
+        Thread first = new Thread(scheduled.get(0).run);
+        first.start();
+        assertTrue(optimize.entered.await(10, TimeUnit.SECONDS));
+
+        try {
+            optimizer.intervalChanged(LOGS, MINUTE);
+            scheduled.get(1).run.run();
+            assertEquals("a run overlapped the one in flight", 1, optimize.calls.get());
+        } finally {
+            optimize.release.countDown();
+            first.join(10_000);
+        }
+        scheduled.get(1).run.run();
+        assertEquals(2, optimize.calls.get());
+    }
+
+    public void testAStopDuringARunLetsItFinish() throws Exception {
+        ShardId logs0 = new ShardId(LOGS, 0);
+        SlowFirstRun optimize = new SlowFirstRun();
+        optimizer.start(logs0, optimize, HOUR);
+        Thread first = new Thread(scheduled.get(0).run);
+        first.start();
+        assertTrue(optimize.entered.await(10, TimeUnit.SECONDS));
+
+        optimizer.stop(logs0);
+        optimize.release.countDown();
+        first.join(10_000);
+
+        assertFalse(first.isAlive());
+        assertNull(optimizer.interval(logs0));
+        assertTrue(scheduled.get(0).cancelled);
     }
 }
