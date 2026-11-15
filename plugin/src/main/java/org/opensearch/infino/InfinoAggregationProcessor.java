@@ -3384,7 +3384,7 @@ public class InfinoAggregationProcessor {
         for (Map<String, Object> group : groups) {
             keyedTotal += asLong(group.get("doc_count"));
         }
-        groups.sort(order);
+        sortTerms(level, groups);
         List<Map<String, Object>> out = new ArrayList<>();
         for (Map<String, Object> group : groups.subList(0, Math.min(level.size, groups.size()))) {
             Map<String, Object> row = new HashMap<>(group);
@@ -3418,6 +3418,50 @@ public class InfinoAggregationProcessor {
             out = out == null ? c : out.thenComparing(c);
         }
         return out;
+    }
+
+    /**
+     * {@code groups} sorted in {@code level}'s terms order ({@link #termsOrder},
+     * which must not be null), each group's count and key read once instead of
+     * at every comparison: a string key is compared by its UTF-8 bytes, so it
+     * is encoded once per group rather than twice per comparison.
+     */
+    private static void sortTerms(Grouped level, List<Map<String, Object>> groups) {
+        record Keyed(Map<String, Object> group, long count, Comparable<Object> key) {}
+        Comparator<Keyed> order = null;
+        for (String term : level.orderTemplate.split(", ")) {
+            String[] parts = term.split(" ");
+            Comparator<Keyed> c = parts[0].equals("doc_count")
+                ? Comparator.comparingLong(Keyed::count)
+                : Comparator.comparing(Keyed::key, Comparator.nullsLast(Comparator.naturalOrder()));
+            if (parts[1].equals("DESC")) {
+                c = c.reversed();
+            }
+            order = order == null ? c : order.thenComparing(c);
+        }
+        List<Keyed> keyed = new ArrayList<>(groups.size());
+        for (Map<String, Object> group : groups) {
+            keyed.add(new Keyed(group, asLong(group.get("doc_count")), sortKey(level.keyKind, group.get("k0"))));
+        }
+        keyed.sort(order);
+        for (int i = 0; i < keyed.size(); i++) {
+            groups.set(i, keyed.get(i).group());
+        }
+    }
+
+    /** A present key of {@code kind} as a value whose natural order is {@link #compareKeys}'s; null stays null. */
+    @SuppressWarnings("unchecked")
+    private static Comparable<Object> sortKey(KeyKind kind, Object key) {
+        if (key == null) {
+            return null;
+        }
+        Comparable<?> out = switch (kind) {
+            case STR -> new BytesRef(key.toString());
+            case BOOL -> asBoolean(key);
+            case LONG, DATE -> asLong(key);
+            case DOUBLE -> asDouble(key, 0.0);
+        };
+        return (Comparable<Object>) out;
     }
 
     /** Two present keys of {@code kind} in the engine's order. */
