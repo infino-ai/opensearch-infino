@@ -10,17 +10,21 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.inject.Injector;
 import org.opensearch.common.settings.IndexScopedSettings;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.ingest.IngestService;
+import org.opensearch.plugins.Plugin;
+import org.opensearch.plugins.PluginsService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.function.Consumer;
 
 /**
@@ -71,6 +75,9 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoClient.bind(injector);
         // The security plugin's components, when it runs, come from the same injector.
         InfinoSecurity.bind(injector);
+        // Whether it runs here, which decides whether a search sees its own index (see InfinoAccess#searching).
+        List<String> plugins = injector.getInstance(PluginsService.class).filterPlugins(Plugin.class).stream().map(p -> p.getClass().getName()).toList();
+        InfinoAccess.securityRuns(InfinoSecurityCalls.runs(injector.getInstance(Settings.class), plugins));
         // Registered cluster state is sent as REST requests, whose bodies the
         // node parses with this, each in the empty context the node starts
         // with (no request has run on this thread yet).

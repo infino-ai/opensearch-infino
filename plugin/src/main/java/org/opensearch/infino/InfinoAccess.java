@@ -81,20 +81,34 @@ record InfinoAccess(
 
     private static volatile String securityIndex = DEFAULT_SECURITY_INDEX;
 
+    /** Whether the security plugin runs on this node, and so hides its own index from a search (see {@link #searching}). */
+    private static volatile boolean securityRuns = true;
+
     /** The security plugin's own index on this node, from its {@code plugins.security.config_index_name}. */
     static void securityIndex(String name) {
         securityIndex = name == null || name.isEmpty() ? DEFAULT_SECURITY_INDEX : name;
+    }
+
+    /** Whether the security plugin runs on this node (see {@link InfinoSecurityCalls#runs}). */
+    static void securityRuns(boolean runs) {
+        securityRuns = runs;
     }
 
     /**
      * What a search may read of {@code index}. The security plugin's own index
      * (its users, password hashes and roles) reads as holding no row, as that
      * plugin shows it to a search on a Lucene index: the table would otherwise
-     * hand it to anyone whose role reads {@code *}. Gets are not searches: the
-     * security plugin loads its configuration by id, from the table.
+     * hand it to anyone whose role reads {@code *}. As there, only while the
+     * security plugin runs, and not for an admin certificate or one of its
+     * own configuration reads (see {@link InfinoSecurityCalls#readsSecurityIndex}).
+     * Gets are not searches: the security plugin loads its configuration by
+     * id, from the table.
      */
     static InfinoAccess searching(String index) {
-        return index.equals(securityIndex) ? NO_ROWS : InfinoSecurity.access(index, InfinoSecurityCalls.SEARCH);
+        if (securityRuns && index.equals(securityIndex) && !InfinoSecurity.readsSecurityIndex()) {
+            return NO_ROWS;
+        }
+        return InfinoSecurity.access(index, InfinoSecurityCalls.SEARCH);
     }
 
     /** Whether the request reads no row of the index (see {@link #searching}). */

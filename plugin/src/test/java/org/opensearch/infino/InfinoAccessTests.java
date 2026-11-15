@@ -41,6 +41,20 @@ public class InfinoAccessTests extends OpenSearchTestCase {
         assertTrue(InfinoAccess.NONE.unrestricted());
     }
 
+    public void testASearchReadsTheSecurityIndexAsEmptyOnlyWhileTheSecurityPluginRuns() {
+        try {
+            InfinoAccess.securityRuns(true);
+            assertTrue(InfinoAccess.searching(InfinoAccess.DEFAULT_SECURITY_INDEX).readsNothing());
+            assertFalse(InfinoAccess.searching("logs").readsNothing());
+            // Disabled, in SSL-only mode or not installed, the security plugin hides nothing.
+            InfinoAccess.securityRuns(false);
+            assertFalse(InfinoAccess.searching(InfinoAccess.DEFAULT_SECURITY_INDEX).readsNothing());
+            assertTrue(InfinoAccess.searching(InfinoAccess.DEFAULT_SECURITY_INDEX).unrestricted());
+        } finally {
+            InfinoAccess.securityRuns(true);
+        }
+    }
+
     public void testHiddenFieldLeavesTheColumnsAndTheSource() {
         // A rule hiding every field named secret and, as the security plugin's
         // recursive check does, everything under a hidden object.

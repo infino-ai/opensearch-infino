@@ -8,6 +8,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.List;
 import java.util.function.Function;
 
 /** How the plugin calls into the security plugin by reflection, and when a folded document rule is honoured. */
@@ -77,6 +78,72 @@ public class InfinoSecurityCallsTests extends OpenSearchTestCase {
         // A get or multi-get has no query the rule could have been folded into.
         assertFalse(InfinoSecurityCalls.documentRuleFolded(context, "get"));
         assertFalse(InfinoSecurityCalls.documentRuleFolded(context, "mget"));
+    }
+
+    /** A user as the security plugin's: a plugin user or not. */
+    public static final class User {
+        private final boolean plugin;
+
+        User(boolean plugin) {
+            this.plugin = plugin;
+        }
+
+        public boolean isPluginUser() {
+            return plugin;
+        }
+    }
+
+    /** Admin certificates that name one user. */
+    public static final class AdminDns {
+        private final Object admin;
+
+        AdminDns(Object admin) {
+            this.admin = admin;
+        }
+
+        public boolean isAdmin(User user) {
+            return user == admin;
+        }
+    }
+
+    public void testTheSecurityPluginRunsWhenInstalledAndNeitherDisabledNorSslOnly() {
+        List<String> installed = List.of("org.opensearch.infino.InfinoPlugin", InfinoSecurityCalls.SECURITY_PLUGIN);
+        assertTrue(InfinoSecurityCalls.runs(Settings.EMPTY, installed));
+        assertTrue(InfinoSecurityCalls.runs(Settings.builder().put(InfinoSecurityCalls.SECURITY_DISABLED, false).build(), installed));
+        assertFalse(InfinoSecurityCalls.runs(Settings.builder().put(InfinoSecurityCalls.SECURITY_DISABLED, true).build(), installed));
+        assertFalse(InfinoSecurityCalls.runs(Settings.builder().put(InfinoSecurityCalls.SECURITY_SSL_ONLY, true).build(), installed));
+        assertFalse(InfinoSecurityCalls.runs(Settings.EMPTY, List.of("org.opensearch.infino.InfinoPlugin")));
+    }
+
+    public void testTheSecurityIndexIsReadByAnAdminCertificateOrAConfigurationReadOnly() throws Exception {
+        User admin = new User(false);
+        AdminDns dns = new AdminDns(admin);
+        ThreadContext context = new ThreadContext(Settings.EMPTY);
+        // No user: a node-internal request reads it as empty, as the security plugin's reader shows it.
+        assertFalse(InfinoSecurityCalls.readsSecurityIndex(context, dns));
+        try (ThreadContext.StoredContext ignored = context.stashContext()) {
+            context.putTransient(InfinoSecurityCalls.USER, admin);
+            assertTrue(InfinoSecurityCalls.readsSecurityIndex(context, dns));
+            // Admin certificates the plugin could not read lift nothing.
+            assertFalse(InfinoSecurityCalls.readsSecurityIndex(context, null));
+        }
+        try (ThreadContext.StoredContext ignored = context.stashContext()) {
+            context.putTransient(InfinoSecurityCalls.USER, new User(false));
+            assertFalse(InfinoSecurityCalls.readsSecurityIndex(context, dns));
+        }
+        try (ThreadContext.StoredContext ignored = context.stashContext()) {
+            // A plugin user lifts document rules, not the security index.
+            context.putTransient(InfinoSecurityCalls.USER, new User(true));
+            assertFalse(InfinoSecurityCalls.readsSecurityIndex(context, dns));
+        }
+        try (ThreadContext.StoredContext ignored = context.stashContext()) {
+            context.putHeader(InfinoSecurityCalls.CONF_REQUEST_HEADER, "true");
+            assertTrue(InfinoSecurityCalls.readsSecurityIndex(context, dns));
+        }
+        try (ThreadContext.StoredContext ignored = context.stashContext()) {
+            context.putHeader(InfinoSecurityCalls.CONF_REQUEST_HEADER, "false");
+            assertFalse(InfinoSecurityCalls.readsSecurityIndex(context, dns));
+        }
     }
 
     public void testAFailingReadReportDoesNotFailTheRead() {

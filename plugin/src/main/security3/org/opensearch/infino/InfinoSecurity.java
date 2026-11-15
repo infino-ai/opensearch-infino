@@ -349,6 +349,21 @@ final class InfinoSecurity {
         }
     }
 
+    /** Whether the request reads the security plugin's own index (see {@link InfinoSecurityCalls#readsSecurityIndex}). */
+    static boolean readsSecurityIndex() {
+        ThreadContext context = InfinoServices.threadContext();
+        if (context == null) {
+            return false;
+        }
+        Object user = context.getTransient(USER);
+        try {
+            Components security = user == null ? null : components(user);
+            return InfinoSecurityCalls.readsSecurityIndex(context, security == null ? null : security.adminDns());
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            throw InfinoAccess.refused("a search of the security plugin's own index is refused: its admin certificates could not be read: " + reason(e));
+        }
+    }
+
     /** What the request may see of {@code index}; {@code what} names the request in a refusal. */
     static InfinoAccess access(String index, String what) {
         ThreadContext context = InfinoServices.threadContext();
