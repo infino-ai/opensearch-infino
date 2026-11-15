@@ -601,6 +601,11 @@ public final class InfinoSearch {
                     SortSpec first = plan.sorts().get(0);
                     rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, wantsSource(source));
                 }
+                // Every row in no order: the engine's first rows in storage order,
+                // read with no statement planned.
+                if (rows == null && everyRowPage(plan) && !seqNoAndPrimaryTerm) {
+                    rows = InfinoNative.headRows(plan.table(), fetch, wantsSource(source));
+                }
                 if (rows == null) {
                     if (splitsMissingTail(plan)) {
                         // The rows past a present first sort value come first; the
@@ -779,6 +784,23 @@ public final class InfinoSearch {
             && !first.name().equals(InfinoSql.ROW_ID)
             && !first.name().equals(InfinoQueryTranslator.OSID)
             && first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()));
+    }
+
+    /**
+     * Whether the page is every row in no order: no predicate, text query,
+     * vector, sort, search_after, collapse or scripted field. The engine reads
+     * it as the table's first rows in storage order ({@link
+     * InfinoNative#headRows}), stock returning a match_all's hits in no
+     * order either.
+     */
+    static boolean everyRowPage(Plan plan) {
+        return plan.vector() == null
+            && plan.query().principal() == null
+            && InfinoQueryTranslator.ALL.equals(plan.hitWhere())
+            && plan.sorts().isEmpty()
+            && plan.searchAfter() == null
+            && plan.collapse() == null
+            && plan.scriptFields().isEmpty();
     }
 
     /**
