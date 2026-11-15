@@ -243,6 +243,7 @@ A table backs one live index. If two indices name the same table (explicitly, or
 | `infino.uri` | `memory://` | Where the tables live without an account: `file://`, `s3://`, `gs://` or `az://`. |
 | `infino.batch.docs` | `50000` | The most documents one write batch holds. |
 | `infino.batch.bytes` | 64 MiB | The most bytes one write batch holds. |
+| `infino.batch.concurrency` | half the `write` pool | The most appends to one table that run at once. Appends that name the same document id never run at once. |
 
 ## SQL
 

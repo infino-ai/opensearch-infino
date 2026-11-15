@@ -50,14 +50,20 @@ import java.util.function.Supplier;
  *
  * <p>Each engine append is a commit, and a bulk is acknowledged after the
  * append that carries its writes, so an acknowledged item is durable in the
- * table. To keep that without a commit per request, writes group-commit: a
- * bulk that arrives while no append is running starts one at once; bulks
- * that arrive while an append is running accumulate and go to the table as
- * the next append the moment it finishes. A client sending one bulk at a
- * time therefore waits only for its own append; clients sending in parallel
- * (every log shipper does) share appends, and the batch is bounded by a
- * document and a byte threshold. The append runs on the write pool, never
- * on the thread that took the request.
+ * table. Up to {@code infino.batch.concurrency} appends to one table run at
+ * once (the engine builds concurrent appends in parallel): a bulk that
+ * arrives while a slot is free starts an append at once; bulks that arrive
+ * while every slot is taken accumulate and go to the table as the next
+ * append the moment one finishes, bounded by a document and a byte
+ * threshold. The appends run on the write pool, never on the thread that
+ * took the request.
+ *
+ * <p>Two appends running at once never write the same id. A bulk that names
+ * an id (an index with a client id, a delete, an update) waits while a
+ * running append writes that id, and every bulk staged after it waits behind
+ * it, so writes to one id reach the table in the order they arrived. A
+ * document with a generated id names nothing, so a stream of them (the shape
+ * of a log stream) never waits.
  *
  * <p>A bulk's documents are parsed, conformed and converted to Arrow on a
  * write-pool thread before they join the batch, so that work overlaps the
@@ -78,8 +84,10 @@ import java.util.function.Supplier;
  *
  * <p>Each write is given the next sequence number of its table when its
  * batch is written, in the order the batch staged it, and the table stores
- * the number beside the row. A table's flushes run one at a time on this
- * node, so the numbers rise in the order the writes commit. One node writes
+ * the number beside the row. The numbers are unique per table; appends that
+ * run at once may commit out of the order of their numbers, which nothing
+ * reads: a condition on a sequence number compares the number stored for its
+ * id, and writes to one id never run at once. One node writes
  * a table, the one holding its index's primary shard (see
  * {@link InfinoBulkActionFilter#dispatch}); when that copy changes (the
  * primary moves, or another copy takes over) the next number is read from
@@ -100,6 +108,8 @@ public final class InfinoWriter {
     private static final long VERSION = InfinoDocumentVersion.VERSION;
     /** Primary term reported for every write; the table has no primary to fail over. */
     private static final long PRIMARY_TERM = InfinoDocumentVersion.PRIMARY_TERM;
+    /** Appends to one table that may run at once; 0 or less means half the write pool. */
+    private static final int MAX_CONCURRENT_APPENDS = Integer.getInteger("infino.batch.concurrency", 0);
     /** A table's next sequence number before its first flush on this node has read the highest the table holds. */
     private static final long UNREAD = -1L;
 
@@ -141,8 +151,21 @@ public final class InfinoWriter {
     /** One bulk's share of a batch: its outcomes and the listener that gets its response. */
     record Waiter(ShardId shardId, String indexName, List<Outcome> outcomes, BulkItemResponse[] items, long startNanos, ActionListener<BulkResponse> listener) {}
 
-    /** A bulk in its batch: the waiter, its prepared batch (null when it writes nothing), and the ids of the prepared rows in order. */
-    private record Staged(Waiter waiter, Pointer prepared, List<String> preparedIds, long bytes) {}
+    /**
+     * A bulk in its batch: the waiter, its prepared batch (null when it writes
+     * nothing), the ids of the prepared rows in order, the documents and source
+     * bytes it counts toward the bound, and the ids it names (see {@link #names}).
+     */
+    private record Staged(Waiter waiter, Pointer prepared, List<String> preparedIds, int docs, long bytes, Set<String> named) {}
+
+    /**
+     * Whether a write names its id: a client chose it, so another write may
+     * name it too. Only a generated id is known to be new, and it is never
+     * looked up.
+     */
+    private static boolean names(Write w) {
+        return w != null && w.lookup();
+    }
 
     /**
      * What one write became when its batch was written: the sequence number
@@ -164,18 +187,22 @@ public final class InfinoWriter {
         return o.write() != null && o.write().source() != null;
     }
 
-    /** The pending batch of one table, and whether an append is running for it. */
+    /** The pending writes of one table, and the appends running for it. */
     private static final class Batch {
         final Lock lock = new ReentrantLock();
         final List<Staged> staged = new ArrayList<>();
         int docs = 0;
         long bytes = 0;
-        boolean flushing = false;
+        /** Appends running for the table. */
+        int running = 0;
+        /** The ids the running appends name, with how many of them name each. */
+        final Map<String, Integer> busy = new HashMap<>();
+        /** Guards {@link #nextSeq} and {@link #seqAllocation}: appends running at once take numbers in turn. */
+        final Object seqLock = new Object();
         /**
          * The sequence number the next write is given; {@link InfinoWriter#UNREAD}
-         * until the first flush reads the table's highest. Only the running flush
-         * touches it, and flushes take turns through {@link #flushing}, set under
-         * {@link #lock}.
+         * until the first flush reads the table's highest. Read and advanced
+         * under {@link #seqLock}.
          */
         long nextSeq = UNREAD;
         /** The copy that wrote the table when {@link #nextSeq} was read; another copy since means it is read again. */
@@ -186,16 +213,32 @@ public final class InfinoWriter {
     private final Supplier<Executor> flushes;
     private final int maxBatchDocs;
     private final long maxBatchBytes;
+    private final int maxAppends;
     private final Map<String, Batch> batches = new ConcurrentHashMap<>();
 
     public InfinoWriter(ThreadPool threadPool) {
-        this(() -> threadPool.executor(ThreadPool.Names.WRITE), MAX_BATCH_DOCS, MAX_BATCH_BYTES);
+        this(
+            () -> threadPool.executor(ThreadPool.Names.WRITE),
+            MAX_BATCH_DOCS,
+            MAX_BATCH_BYTES,
+            MAX_CONCURRENT_APPENDS > 0 ? MAX_CONCURRENT_APPENDS : Math.max(1, threadPool.info(ThreadPool.Names.WRITE).getMax() / 2)
+        );
     }
 
     InfinoWriter(Supplier<Executor> flushes, int maxBatchDocs, long maxBatchBytes) {
+        this(flushes, maxBatchDocs, maxBatchBytes, 1);
+    }
+
+    /**
+     * {@code maxAppends} appends to one table run at once. They run on the
+     * write pool, as the bulks that feed them are prepared there, so it is
+     * kept under the pool's size: half of it by default.
+     */
+    InfinoWriter(Supplier<Executor> flushes, int maxBatchDocs, long maxBatchBytes, int maxAppends) {
         this.flushes = flushes;
         this.maxBatchDocs = maxBatchDocs;
         this.maxBatchBytes = maxBatchBytes;
+        this.maxAppends = Math.max(1, maxAppends);
     }
 
     /**
@@ -210,7 +253,11 @@ public final class InfinoWriter {
         long bytes = 0;
         // An update's document is made when its batch is written; it counts toward the bound as a document.
         int updates = 0;
+        Set<String> named = new HashSet<>();
         for (Outcome o : waiter.outcomes()) {
+            if (names(o.write())) {
+                named.add(o.write().id());
+            }
             if (carriesRow(o)) {
                 ids.add(o.write().id());
                 sources.add(o.write().source());
@@ -224,27 +271,31 @@ public final class InfinoWriter {
             waiter.listener().onFailure(new IllegalStateException("[infino] the bridge could not prepare the batch for " + table));
             return;
         }
-        Staged staged = new Staged(waiter, prepared, ids, bytes);
+        Staged staged = new Staged(waiter, prepared, ids, ids.size() + updates, bytes, named);
 
         Batch batch = batches.computeIfAbsent(table, t -> new Batch());
         boolean admitted;
-        boolean start = false;
+        List<List<Staged>> starts = new ArrayList<>();
         int pending;
         batch.lock.lock();
         try {
-            // A batch past its bound refuses more until the running append
+            // A batch past its bound refuses more until a running append
             // takes it. It never waits here: this is a write-pool thread, the
             // pool the appends themselves run on, and threads waiting on a
             // stalled append would leave none to run it.
             pending = batch.docs;
-            admitted = !refuse(batch.flushing, batch.docs, batch.bytes);
+            admitted = !refuse(batch.running > 0, batch.docs, batch.bytes);
             if (admitted) {
                 batch.staged.add(staged);
-                batch.docs += ids.size() + updates;
+                batch.docs += staged.docs();
                 batch.bytes += bytes;
-                start = !batch.flushing;
-                if (start) {
-                    batch.flushing = true;
+                while (batch.running < maxAppends) {
+                    List<Staged> next = take(batch);
+                    if (next.isEmpty()) {
+                        break;
+                    }
+                    batch.running++;
+                    starts.add(next);
                 }
             }
         } finally {
@@ -261,38 +312,73 @@ public final class InfinoWriter {
                             + pending
                             + " writes to table "
                             + table
-                            + " are waiting for the running append; the bulk is refused until the append takes them"
+                            + " are waiting for the running appends; the bulk is refused until an append takes them"
                     )
                 );
             return;
         }
-        if (start) {
-            flushes.get().execute(() -> flush(table, batch));
+        for (List<Staged> next : starts) {
+            flushes.get().execute(() -> flush(table, batch, next));
         }
     }
 
     /** Whether a bulk arriving now is refused: an append is running and the batch behind it is past its bound. */
-    private boolean refuse(boolean flushing, int docs, long bytes) {
-        return flushing && (docs >= maxBatchDocs || bytes >= maxBatchBytes);
+    private boolean refuse(boolean running, int docs, long bytes) {
+        return running && (docs >= maxBatchDocs || bytes >= maxBatchBytes);
     }
 
-    /** Append what is pending and answer the bulks it carries; repeat while more arrived meanwhile. */
-    private void flush(String table, Batch batch) {
-        while (true) {
-            List<Staged> staged;
-            batch.lock.lock();
-            try {
-                if (batch.staged.isEmpty()) {
-                    batch.flushing = false;
-                    return;
+    /**
+     * Take the next append's bulks, under the batch's lock: the staged bulks
+     * in order up to the first that names an id a running append names (it
+     * waits for that append, and every bulk after it waits behind it). Marks
+     * the ids the taken bulks name as busy. Empty when nothing can go now.
+     */
+    private static List<Staged> take(Batch batch) {
+        List<Staged> taken = new ArrayList<>();
+        for (Staged s : batch.staged) {
+            boolean blocked = false;
+            for (String id : s.named()) {
+                if (batch.busy.containsKey(id)) {
+                    blocked = true;
+                    break;
                 }
-                staged = new ArrayList<>(batch.staged);
-                batch.staged.clear();
-                batch.docs = 0;
-                batch.bytes = 0;
-            } finally {
-                batch.lock.unlock();
             }
+            if (blocked) {
+                break;
+            }
+            taken.add(s);
+        }
+        if (taken.isEmpty()) {
+            return taken;
+        }
+        batch.staged.subList(0, taken.size()).clear();
+        for (Staged s : taken) {
+            batch.docs -= s.docs();
+            batch.bytes -= s.bytes();
+            for (String id : s.named()) {
+                batch.busy.merge(id, 1, Integer::sum);
+            }
+        }
+        return taken;
+    }
+
+    /** Releases the ids an append's bulks named, under the batch's lock. */
+    private static void release(Batch batch, List<Staged> staged) {
+        for (Staged s : staged) {
+            for (String id : s.named()) {
+                batch.busy.computeIfPresent(id, (k, n) -> n == 1 ? null : n - 1);
+            }
+        }
+    }
+
+    /**
+     * Append the bulks taken for this append and answer them; then, while
+     * more can go, take the next ones and append them on this thread, and
+     * start appends for any further free slots.
+     */
+    private void flush(String table, Batch batch, List<Staged> first) {
+        List<Staged> staged = first;
+        while (true) {
             // The prepared handles are owned by apply(): it hands them to the
             // engine, which releases them whatever the outcome, or releases
             // them itself when it fails before that.
@@ -306,6 +392,32 @@ public final class InfinoWriter {
                 for (Staged s : staged) {
                     s.waiter().listener().onFailure(e);
                 }
+            }
+            List<List<Staged>> more = new ArrayList<>();
+            batch.lock.lock();
+            try {
+                release(batch, staged);
+                staged = take(batch);
+                if (staged.isEmpty()) {
+                    batch.running--;
+                }
+                // Releasing these ids may have unblocked bulks for slots another append left free.
+                while (batch.running < maxAppends) {
+                    List<Staged> next = take(batch);
+                    if (next.isEmpty()) {
+                        break;
+                    }
+                    batch.running++;
+                    more.add(next);
+                }
+            } finally {
+                batch.lock.unlock();
+            }
+            for (List<Staged> next : more) {
+                flushes.get().execute(() -> flush(table, batch, next));
+            }
+            if (staged.isEmpty()) {
+                return;
             }
         }
     }
@@ -343,9 +455,14 @@ public final class InfinoWriter {
         Map<String, Long> stored;
         try {
             String allocation = writerAllocation(staged);
-            if (batch.nextSeq == UNREAD || !Objects.equals(allocation, batch.seqAllocation)) {
-                batch.nextSeq = InfinoNative.maxSeq(table) + 1;
-                batch.seqAllocation = allocation;
+            synchronized (batch.seqLock) {
+                if (batch.nextSeq == UNREAD || !Objects.equals(allocation, batch.seqAllocation)) {
+                    // Numbers this node gave to appends still running are not in
+                    // the table yet: never go back below them.
+                    long read = InfinoNative.maxSeq(table) + 1;
+                    batch.nextSeq = batch.nextSeq == UNREAD ? read : Math.max(read, batch.nextSeq);
+                    batch.seqAllocation = allocation;
+                }
             }
             // A conditioned write is checked against the sequence numbers the table
             // stores, read in the same probe as which ids it holds; a batch without
@@ -380,56 +497,62 @@ public final class InfinoWriter {
         // The last write of each id that goes to the table.
         Map<String, Outcome> last = new LinkedHashMap<>();
         boolean folded = false;
-        try {
-            for (Staged s : staged) {
-                ShardId shardId = s.waiter().shardId();
-                for (Outcome o : s.waiter().outcomes()) {
-                    Write w = o.write();
-                    if (w == null) {
-                        continue;
-                    }
-                    Long current = standing.containsKey(w.id())
-                        ? standing.get(w.id())
-                        : existed.contains(w.id()) ? stored.getOrDefault(w.id(), InfinoDocumentVersion.UNTRACKED_SEQ_NO) : null;
-                    Exception rejection = w.create() && current != null
-                        ? new VersionConflictEngineException(shardId, w.id(), "document already exists")
-                        : InfinoDocumentVersion.conflict(shardId, o.item(), current);
-                    if (rejection == null && w.update() != null) {
-                        // The base is the write before it in this batch, else the table,
-                        // which holds every append before this one: flushes take turns.
-                        String base = documents.containsKey(w.id()) ? documents.get(w.id()) : current == null ? null : InfinoNative.getSourceFresh(table, w.id());
-                        String document = InfinoBulkActionFilter.merge(base, w.update());
-                        String why = document == null ? null : InfinoNative.checkDoc(table, document);
-                        if (document == null) {
-                            rejection = new DocumentMissingException(shardId, w.id());
-                        } else if (why != null) {
-                            rejection = refused(why);
-                        } else {
-                            merged.put(o, document);
+        // Numbers are taken in turn with the other appends running for the table.
+        // An update reads its base here too, under the lock; the ids it reads no
+        // running append writes.
+        synchronized (batch.seqLock) {
+            try {
+                for (Staged s : staged) {
+                    ShardId shardId = s.waiter().shardId();
+                    for (Outcome o : s.waiter().outcomes()) {
+                        Write w = o.write();
+                        if (w == null) {
+                            continue;
                         }
+                        Long current = standing.containsKey(w.id())
+                            ? standing.get(w.id())
+                            : existed.contains(w.id()) ? stored.getOrDefault(w.id(), InfinoDocumentVersion.UNTRACKED_SEQ_NO) : null;
+                        Exception rejection = w.create() && current != null
+                            ? new VersionConflictEngineException(shardId, w.id(), "document already exists")
+                            : InfinoDocumentVersion.conflict(shardId, o.item(), current);
+                        if (rejection == null && w.update() != null) {
+                            // The base is the write before it in this batch, else the table,
+                            // which holds every append of its id before this one: no running
+                            // append writes its id.
+                            String base = documents.containsKey(w.id()) ? documents.get(w.id()) : current == null ? null : InfinoNative.getSourceFresh(table, w.id());
+                            String document = InfinoBulkActionFilter.merge(base, w.update());
+                            String why = document == null ? null : InfinoNative.checkDoc(table, document);
+                            if (document == null) {
+                                rejection = new DocumentMissingException(shardId, w.id());
+                            } else if (why != null) {
+                                rejection = refused(why);
+                            } else {
+                                merged.put(o, document);
+                            }
+                        }
+                        if (rejection != null) {
+                            written.put(o, new Written(SequenceNumbers.UNASSIGNED_SEQ_NO, current != null, rejection));
+                            folded |= carriesRow(o); // the prepared batches carry its row; only the folded path leaves it out
+                            continue;
+                        }
+                        String document = merged.containsKey(o) ? merged.get(o) : w.source();
+                        long seq = batch.nextSeq++;
+                        written.put(o, new Written(seq, current != null, null));
+                        standing.put(w.id(), document == null ? null : seq);
+                        documents.put(w.id(), document);
+                        if (last.put(w.id(), o) != null) {
+                            folded = true; // the same id twice in one batch: written twice, or written and deleted
+                        }
+                        folded |= w.update() != null; // its document was made here: only the folded path prepares it
                     }
-                    if (rejection != null) {
-                        written.put(o, new Written(SequenceNumbers.UNASSIGNED_SEQ_NO, current != null, rejection));
-                        folded |= carriesRow(o); // the prepared batches carry its row; only the folded path leaves it out
-                        continue;
-                    }
-                    String document = merged.containsKey(o) ? merged.get(o) : w.source();
-                    long seq = batch.nextSeq++;
-                    written.put(o, new Written(seq, current != null, null));
-                    standing.put(w.id(), document == null ? null : seq);
-                    documents.put(w.id(), document);
-                    if (last.put(w.id(), o) != null) {
-                        folded = true; // the same id twice in one batch: written twice, or written and deleted
-                    }
-                    folded |= w.update() != null; // its document was made here: only the folded path prepares it
                 }
+            } catch (RuntimeException e) {
+                // An update's read of the table failed: the handles never reached the engine.
+                for (Staged s : staged) {
+                    InfinoNative.freePrepared(s.prepared());
+                }
+                throw e;
             }
-        } catch (RuntimeException e) {
-            // An update's read of the table failed: the handles never reached the engine.
-            for (Staged s : staged) {
-                InfinoNative.freePrepared(s.prepared());
-            }
-            throw e;
         }
         List<String> replaced = new ArrayList<>();
         List<String> tombstones = new ArrayList<>();
