@@ -10,10 +10,10 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.StoredField;
+import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.cluster.routing.ShardRouting;
-import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
@@ -495,8 +495,112 @@ public class InfinoEngine extends InternalEngine {
                 t instanceof Exception e ? e : new RuntimeException(t)
             );
         }
+        // A reader's cover is recorded as the internal manager opens it, before
+        // the external manager can hand it to a search (see CoverRecorder).
+        CoverRecorder<?> covers = new CoverRecorder<>(getReferenceManager(SearcherScope.INTERNAL), this::getProcessedLocalCheckpoint, coveredByReader);
+        getReferenceManager(SearcherScope.INTERNAL).addListener(covers.opening());
+        getReferenceManager(SearcherScope.EXTERNAL).addListener(covers.publishing());
         BY_TABLE.put(table, this);
         log.info("[infino] engine attached to table {} for {}", table, config.getShardId());
+    }
+
+    /**
+     * Records what each skeleton reader searches use covers before they can
+     * use it. The external reader manager publishes a reader the internal
+     * one opened, so the cover is taken when the internal one opens it: the
+     * operations processed when its refresh began. Recording it after the
+     * external refresh returns would leave a window where a search finds
+     * the reader with no cover, hides every stamped row, and the shard
+     * request cache keeps that short count for the reader's life.
+     *
+     * <p>Only readers an external refresh may publish are recorded, so
+     * refreshes no search sees (a flush's, a realtime get's) do not push
+     * the readers searches use out of the bounded map: one opened while an
+     * external refresh runs, and the latest one opened before it, which
+     * the external refresh publishes when the internal manager has nothing
+     * newer. Each external refresh records at most these two, and the
+     * reader it publishes is the newest, so it stays in the map until
+     * {@code READERS_REMEMBERED} newer readers have been published.
+     */
+    static final class CoverRecorder<R extends DirectoryReader> {
+        private final ReferenceManager<R> internal;
+        private final LongSupplier processed;
+        private final Map<Long, Long> coveredByReader;
+        /** The operations processed when the internal refresh under way began; guarded by its refresh lock. */
+        private long covering = UNSTAMPED;
+        /** The latest reader the internal manager opened and its cover, or -1 when there is none yet; guarded by this. */
+        private long latestVersion = -1;
+        private long latestCover = UNSTAMPED;
+        /** Whether an external refresh is under way; guarded by this. */
+        private boolean publishing = false;
+
+        CoverRecorder(ReferenceManager<R> internal, LongSupplier processed, Map<Long, Long> coveredByReader) {
+            this.internal = internal;
+            this.processed = processed;
+            this.coveredByReader = coveredByReader;
+        }
+
+        /** The listener for the internal manager: what each reader it opens covers. */
+        ReferenceManager.RefreshListener opening() {
+            return new ReferenceManager.RefreshListener() {
+                @Override
+                public void beforeRefresh() {
+                    covering = processed.getAsLong();
+                }
+
+                @Override
+                public void afterRefresh(boolean didRefresh) throws IOException {
+                    if (didRefresh) {
+                        opened(version(), covering);
+                    }
+                }
+            };
+        }
+
+        /** The listener for the external manager: the readers it may publish are recorded before it does. */
+        ReferenceManager.RefreshListener publishing() {
+            return new ReferenceManager.RefreshListener() {
+                @Override
+                public void beforeRefresh() {
+                    synchronized (CoverRecorder.this) {
+                        publishing = true;
+                        if (latestVersion >= 0) {
+                            record(latestVersion, latestCover);
+                        }
+                    }
+                }
+
+                @Override
+                public void afterRefresh(boolean didRefresh) {
+                    synchronized (CoverRecorder.this) {
+                        publishing = false;
+                    }
+                }
+            };
+        }
+
+        private synchronized void opened(long version, long cover) {
+            latestVersion = version;
+            latestCover = cover;
+            if (publishing) {
+                record(version, cover);
+            }
+        }
+
+        private void record(long version, long cover) {
+            synchronized (coveredByReader) {
+                coveredByReader.merge(version, cover, Math::max);
+            }
+        }
+
+        private long version() throws IOException {
+            R reader = internal.acquire();
+            try {
+                return reader.getVersion();
+            } finally {
+                internal.release(reader);
+            }
+        }
     }
 
     /**
@@ -542,26 +646,11 @@ public class InfinoEngine extends InternalEngine {
 
     /**
      * Record that the current external skeleton reader holds every operation
-     * up to {@code covered}, and stop stamping the ids it holds.
+     * up to {@code covered}, and stop stamping the ids it holds. What the
+     * reader covers for searches was recorded before it was published (see
+     * {@link CoverRecorder}).
      */
     private void rememberCovered(long covered) {
-        // The reader itself, not a searcher over it: a refresh may run before the
-        // shard has warmed its searchers up.
-        long version;
-        ReferenceManager<OpenSearchDirectoryReader> readers = getReferenceManager(SearcherScope.EXTERNAL);
-        try {
-            OpenSearchDirectoryReader reader = readers.acquire();
-            try {
-                version = reader.getVersion();
-            } finally {
-                readers.release(reader);
-            }
-        } catch (IOException e) {
-            throw new UncheckedIOException("[infino] reading the skeleton reader of " + shardId + " failed", e);
-        }
-        synchronized (coveredByReader) {
-            coveredByReader.merge(version, covered, Math::max);
-        }
         if (covered > latestCovered) {
             latestCovered = covered;
         }
