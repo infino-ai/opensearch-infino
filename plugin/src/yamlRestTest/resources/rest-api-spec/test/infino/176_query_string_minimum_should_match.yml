@@ -1,0 +1,316 @@
+---
+"query_string and simple_query_string read minimum_should_match, as a Lucene twin does":
+  # Stock applies minimum_should_match to the optional clauses of the clause
+  # list the string parses to. Before, the plugin never read it, so any one
+  # optional word matched.
+  - do:
+      indices.create:
+        index: qm_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: qm_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+              k: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: qm_inf
+        body:
+          - index: { _id: "d1" }
+          - { k: "d1", body: "alpha beta gamma" }
+          - index: { _id: "d2" }
+          - { k: "d2", body: "alpha beta" }
+          - index: { _id: "d3" }
+          - { k: "d3", body: "alpha" }
+          - index: { _id: "d4" }
+          - { k: "d4", body: "delta" }
+          - index: { _id: "d5" }
+          - { k: "d5", body: "beta gamma" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: qm_luc
+        body:
+          - index: { _id: "d1" }
+          - { k: "d1", body: "alpha beta gamma" }
+          - index: { _id: "d2" }
+          - { k: "d2", body: "alpha beta" }
+          - index: { _id: "d3" }
+          - { k: "d3", body: "alpha" }
+          - index: { _id: "d4" }
+          - { k: "d4", body: "delta" }
+          - index: { _id: "d5" }
+          - { k: "d5", body: "beta gamma" }
+  - match: { errors: false }
+
+  # Two of three words: one engine query, narrowed by the count.
+  - do:
+      search:
+        index: qm_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d5" }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d5" }
+
+  # Every word.
+  - do:
+      search:
+        index: qm_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: "100%" } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d1" }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: "100%" } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d1" }
+
+  # All but one.
+  - do:
+      search:
+        index: qm_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: -1 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d5" }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: -1 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d5" }
+
+  # A required word, and one of the optional ones.
+  - do:
+      search:
+        index: qm_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "+alpha beta gamma", default_field: body, minimum_should_match: 1 } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "+alpha beta gamma", default_field: body, minimum_should_match: 1 } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+
+  # Without it, the optional words beside a required one narrow nothing.
+  - do:
+      search:
+        index: qm_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "+alpha beta gamma", default_field: body } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "+alpha beta gamma", default_field: body } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+
+  # Field clauses, which are not one engine query.
+  - do:
+      search:
+        index: qm_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "body:alpha body:beta body:gamma", minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d5" }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "body:alpha body:beta body:gamma", minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d5" }
+
+  # simple_query_string reads it the same way.
+  - do:
+      search:
+        index: qm_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { simple_query_string: { query: "alpha beta gamma", fields: [ body ], minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d5" }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { simple_query_string: { query: "alpha beta gamma", fields: [ body ], minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d5" }
+
+  # Unsorted, the page is ranked: every word first, then the pair with the
+  # rarer word (gamma is in two documents, alpha in three).
+  - do:
+      search:
+        index: qm_luc
+        body:
+          size: 10
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d5" }
+  - match: { hits.hits.2._id: "d2" }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          size: 10
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d5" }
+  - match: { hits.hits.2._id: "d2" }
+  - set: { hits.hits.1._score: second }
+  - set: { hits.hits.2._score: third }
+  - gt: { hits.hits.0._score: $second }
+  - gt: { hits.hits.1._score: $third }
+
+  # More optional words than there are: stock matches nothing.
+  - do:
+      search:
+        index: qm_luc
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: 4 } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: 4 } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: qm_luc
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: "200%" } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: "200%" } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: qm_luc
+        body:
+          query: { query_string: { query: "+alpha beta gamma", default_field: body, minimum_should_match: 3 } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          query: { query_string: { query: "+alpha beta gamma", default_field: body, minimum_should_match: 3 } }
+  - match: { hits.total.value: 0 }
+
+  # A malformed form is the request's error, in either mode.
+  - do:
+      indices.create:
+        index: qm_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+  - do:
+      index:
+        index: qm_prx
+        id: d1
+        refresh: true
+        body: { body: "alpha beta gamma" }
+  - do:
+      catch: bad_request
+      search:
+        index: qm_luc
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: "2<" } }
+  - do:
+      catch: bad_request
+      search:
+        index: qm_inf
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: "2<" } }
+  - do:
+      catch: bad_request
+      search:
+        index: qm_prx
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: "2<" } }
