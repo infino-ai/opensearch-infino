@@ -83,6 +83,9 @@ public interface InfinoLib extends Library {
 
     Pointer infino_get(Pointer h, String name, String osid);
 
+    /** The sources of several osids at once, as a JSON object from each id the table holds to its source. */
+    Pointer infino_get_many(Pointer h, String name, String[] osids, int count);
+
     /** One id's document as {@code {"source", "seq"}}; "" when the table holds no such id. */
     Pointer infino_get_doc(Pointer h, String name, String osid);
 

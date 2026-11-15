@@ -1,0 +1,167 @@
+---
+"A date composite under one top-level date range is counted from the range index, with the same buckets as a Lucene twin":
+  # A query that is one range on a date column, with both bounds, and a
+  # composite whose one source is a date histogram on that column: the
+  # plugin counts each bucket of the range from the column's range index
+  # rather than grouping. The bounds are gt and lte, which stock rounds up
+  # to the end of their second (so 03:00:00.500 is past gt and 05:00:00.500
+  # is within lte); the buckets are zoned or offset; the order is
+  # descending; and the size cuts the page. Every request must give both
+  # indices the same buckets and after key.
+  - do:
+      indices.create:
+        index: dcr_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: dcr_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              n: { type: long }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: dcr_inf
+        body:
+          - index: { _id: "before" }
+          - { "@timestamp": "2026-01-01T02:00:00Z", n: 1 }
+          - index: { _id: "at_gt" }
+          - { "@timestamp": "2026-01-01T03:00:00Z", n: 2 }
+          - index: { _id: "within_gt_second" }
+          - { "@timestamp": "2026-01-01T03:00:00.500Z", n: 3 }
+          - index: { _id: "d3" }
+          - { "@timestamp": "2026-01-01T04:00:00Z", n: 4 }
+          - index: { _id: "d4" }
+          - { "@timestamp": "2026-01-01T06:00:00Z", n: 5 }
+          - index: { _id: "d5" }
+          - { "@timestamp": "2026-01-01T20:00:00Z", n: 6 }
+          - index: { _id: "d6" }
+          - { "@timestamp": "2026-01-02T10:00:00Z", n: 7 }
+          - index: { _id: "d6b" }
+          - { "@timestamp": "2026-01-02T23:00:00Z", n: 8 }
+          - index: { _id: "d7" }
+          - { "@timestamp": "2026-01-03T04:59:59Z", n: 9 }
+          - index: { _id: "at_lte" }
+          - { "@timestamp": "2026-01-03T05:00:00Z", n: 10 }
+          - index: { _id: "within_lte_second" }
+          - { "@timestamp": "2026-01-03T05:00:00.500Z", n: 11 }
+          - index: { _id: "past_lte" }
+          - { "@timestamp": "2026-01-03T05:00:01Z", n: 12 }
+          - index: { _id: "after" }
+          - { "@timestamp": "2026-01-03T12:00:00Z", n: 13 }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: dcr_luc
+        body:
+          - index: { _id: "before" }
+          - { "@timestamp": "2026-01-01T02:00:00Z", n: 1 }
+          - index: { _id: "at_gt" }
+          - { "@timestamp": "2026-01-01T03:00:00Z", n: 2 }
+          - index: { _id: "within_gt_second" }
+          - { "@timestamp": "2026-01-01T03:00:00.500Z", n: 3 }
+          - index: { _id: "d3" }
+          - { "@timestamp": "2026-01-01T04:00:00Z", n: 4 }
+          - index: { _id: "d4" }
+          - { "@timestamp": "2026-01-01T06:00:00Z", n: 5 }
+          - index: { _id: "d5" }
+          - { "@timestamp": "2026-01-01T20:00:00Z", n: 6 }
+          - index: { _id: "d6" }
+          - { "@timestamp": "2026-01-02T10:00:00Z", n: 7 }
+          - index: { _id: "d6b" }
+          - { "@timestamp": "2026-01-02T23:00:00Z", n: 8 }
+          - index: { _id: "d7" }
+          - { "@timestamp": "2026-01-03T04:59:59Z", n: 9 }
+          - index: { _id: "at_lte" }
+          - { "@timestamp": "2026-01-03T05:00:00Z", n: 10 }
+          - index: { _id: "within_lte_second" }
+          - { "@timestamp": "2026-01-03T05:00:00.500Z", n: 11 }
+          - index: { _id: "past_lte" }
+          - { "@timestamp": "2026-01-03T05:00:01Z", n: 12 }
+          - index: { _id: "after" }
+          - { "@timestamp": "2026-01-03T12:00:00Z", n: 13 }
+  - match: { errors: false }
+
+  # Calendar days in -05:00 (each starts at 05:00Z), newest first, cut to 3 of 4.
+  # In the range: d3 (Dec 31 local), d4 and d5 (Jan 1), d6, d6b and d7 (Jan 2),
+  # at_lte and within_lte_second (Jan 3).
+  - do:
+      search:
+        index: dcr_luc
+        body:
+          size: 0
+          query: { range: { "@timestamp": { gt: "2026-01-01T03:00:00Z", lte: "2026-01-03T05:00:00Z" } } }
+          aggs:
+            days:
+              composite:
+                size: 3
+                sources:
+                  - day: { date_histogram: { field: "@timestamp", calendar_interval: 1d, time_zone: "-05:00", order: desc } }
+  - match: { hits.total.value: 8 }
+  - length: { aggregations.days.buckets: 3 }
+  - match: { aggregations.days.buckets.0: { key: { day: 1767416400000 }, doc_count: 2 } }
+  - match: { aggregations.days.buckets.1: { key: { day: 1767330000000 }, doc_count: 3 } }
+  - match: { aggregations.days.buckets.2: { key: { day: 1767243600000 }, doc_count: 2 } }
+  - match: { aggregations.days.after_key: { day: 1767243600000 } }
+  - do:
+      search:
+        index: dcr_inf
+        body:
+          size: 0
+          query: { range: { "@timestamp": { gt: "2026-01-01T03:00:00Z", lte: "2026-01-03T05:00:00Z" } } }
+          aggs:
+            days:
+              composite:
+                size: 3
+                sources:
+                  - day: { date_histogram: { field: "@timestamp", calendar_interval: 1d, time_zone: "-05:00", order: desc } }
+  - match: { hits.total.value: 8 }
+  - length: { aggregations.days.buckets: 3 }
+  - match: { aggregations.days.buckets.0: { key: { day: 1767416400000 }, doc_count: 2 } }
+  - match: { aggregations.days.buckets.1: { key: { day: 1767330000000 }, doc_count: 3 } }
+  - match: { aggregations.days.buckets.2: { key: { day: 1767243600000 }, doc_count: 2 } }
+  - match: { aggregations.days.after_key: { day: 1767243600000 } }
+
+  # 12h buckets offset by 2h (starting at 02:00Z and 14:00Z), newest first, cut to 2 of 5.
+  - do:
+      search:
+        index: dcr_luc
+        body:
+          size: 0
+          query: { range: { "@timestamp": { gt: "2026-01-01T03:00:00Z", lte: "2026-01-03T05:00:00Z" } } }
+          aggs:
+            halves:
+              composite:
+                size: 2
+                sources:
+                  - half: { date_histogram: { field: "@timestamp", fixed_interval: 12h, offset: "+2h", order: desc } }
+  - length: { aggregations.halves.buckets: 2 }
+  - match: { aggregations.halves.buckets.0: { key: { half: 1767405600000 }, doc_count: 3 } }
+  - match: { aggregations.halves.buckets.1: { key: { half: 1767362400000 }, doc_count: 1 } }
+  - match: { aggregations.halves.after_key: { half: 1767362400000 } }
+  - do:
+      search:
+        index: dcr_inf
+        body:
+          size: 0
+          query: { range: { "@timestamp": { gt: "2026-01-01T03:00:00Z", lte: "2026-01-03T05:00:00Z" } } }
+          aggs:
+            halves:
+              composite:
+                size: 2
+                sources:
+                  - half: { date_histogram: { field: "@timestamp", fixed_interval: 12h, offset: "+2h", order: desc } }
+  - length: { aggregations.halves.buckets: 2 }
+  - match: { aggregations.halves.buckets.0: { key: { half: 1767405600000 }, doc_count: 3 } }
+  - match: { aggregations.halves.buckets.1: { key: { half: 1767362400000 }, doc_count: 1 } }
+  - match: { aggregations.halves.after_key: { half: 1767362400000 } }

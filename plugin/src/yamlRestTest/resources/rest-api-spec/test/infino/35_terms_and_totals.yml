@@ -199,6 +199,67 @@
   - match: { hits.total.value: 2 }
   - match: { aggregations.s.value: 37.0 }
 
+  # A page the hit statement cannot fill gives its total from its own rows,
+  # counted from the first row, not from where the page starts.
+  - do:
+      search:
+        index: tt
+        body:
+          from: 3
+          size: 10
+          track_total_hits: true
+  - match: { hits.total.value: 8 }
+  - match: { hits.total.relation: eq }
+  - length: { hits.hits: 5 }
+
+  # ... the same under a query,
+  - do:
+      search:
+        index: tt
+        body:
+          from: 4
+          size: 10
+          track_total_hits: true
+          query: { range: { n: { gte: 2 } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+
+  # ... when the page starts past the last row,
+  - do:
+      search:
+        index: tt
+        body:
+          from: 10
+          size: 5
+          track_total_hits: true
+  - match: { hits.total.value: 8 }
+  - length: { hits.hits: 0 }
+
+  # ... and with a post_filter, which narrows the rows and the total alike.
+  - do:
+      search:
+        index: tt
+        body:
+          from: 1
+          size: 10
+          track_total_hits: true
+          query: { range: { n: { gte: 2 } } }
+          post_filter: { term: { tag: a } }
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 1 }
+
+  # A full page still counts every row.
+  - do:
+      search:
+        index: tt
+        body:
+          from: 1
+          size: 2
+          track_total_hits: true
+          post_filter: { range: { n: { gte: 2 } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+
   # A bucket aggregation alone still reports the total.
   - do:
       search:

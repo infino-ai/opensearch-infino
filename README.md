@@ -1,13 +1,15 @@
 # Infino for OpenSearch
 
-An OpenSearch plugin that stores your indices in Infino tables instead of Lucene. The documents live on storage you choose (a local disk, an S3, GCS or Azure bucket, or a hosted Infino account), and OpenSearch's REST API, Dashboards, security plugin and cluster management work unchanged.
+An OpenSearch plugin that stores your indices in [Infino](https://github.com/infino-ai/infino) tables instead of Lucene. Infino is an Apache-2.0 retrieval engine, written in Rust, that keeps its tables on object storage and runs SQL, full-text and vector search over them. The documents live on storage you choose (a local disk, an S3, GCS or Azure bucket, or a hosted Infino account), and OpenSearch's REST API, Dashboards, security plugin and cluster management work unchanged.
 
 - **The same APIs.** Index, bulk, get, search, aggregations, scroll and Dashboards work unchanged. An index keeps its name, mapping, settings and aliases.
 - **One engine for every query.** Full-text search (BM25), vector search (kNN and hybrid) and SQL run on the same tables.
 - **Stateless nodes.** A node with an empty data directory brings every index back from storage, with its mapping and aliases.
 - **Not a fork.** The plugin installs into a released OpenSearch: 2.19.6, 3.0.0, 3.3.2, 3.6.0 or 3.9.0.
 
-**Contents:** [Quick start](#quick-start) · [How it works](#how-it-works) · [Install on a cluster](#install-on-a-cluster) · [Hosted account and stateless nodes](#hosted-account-and-stateless-nodes) · [Settings](#settings) · [SQL](#sql) · [What is supported](#what-is-supported) · [Writes](#writes) · [Build and test](#build-and-test)
+**Status: early.** The plugin is tested on the releases above with local storage and Dashboards; cloud buckets are not tested yet. Some of OpenSearch's own REST tests still fail with it, and known gaps are tracked in [the issues](https://github.com/infino-ai/opensearch-infino/issues). Among them: in default mode, an acknowledged write that the table refuses can be dropped ([#54](https://github.com/infino-ai/opensearch-infino/issues/54)). Try it on data you can rebuild before relying on it.
+
+**Contents:** [Quick start](#quick-start) · [How it works](#how-it-works) · [Install on a cluster](#install-on-a-cluster) · [Hosted account and stateless nodes](#hosted-account-and-stateless-nodes) · [Settings](#settings) · [SQL](#sql) · [What is supported](#what-is-supported) · [Writes](#writes) · [Build and test](#build-and-test) · [Repository layout](#repository-layout) · [License](#license)
 
 ## Quick start
 
@@ -35,7 +37,7 @@ The node's data volume belongs to the storage it was first started with, so to c
 
 ### b) Local build
 
-You need a Rust toolchain, a JDK 21, Gradle, and an OpenSearch 3.9.0 distribution to run it in.
+You need a Rust toolchain (the Docker build uses 1.95.0), a JDK 21, Gradle 9, and an [OpenSearch 3.9.0 distribution](https://opensearch.org/downloads/) to run it in. For another release, set `OPENSEARCH_VERSION` and use the Gradle that release wants (see [Build and test](#build-and-test)).
 
 ```bash
 ./scripts/build.sh                                      # the native bridge and the plugin zip
@@ -169,7 +171,7 @@ PUT _ingest/pipeline/embed
 
 ## Hosted account and stateless nodes
 
-With an Infino account, the tables live on the hosted service. It runs the engine, compacts the tables, and serves the agent and search APIs over the same data. The account stores the tables in an Infino bucket or in your own bucket, with customer-managed encryption keys (CMEK) supported. The node holds no table data.
+With an Infino account, the tables live on the hosted service. It runs the engine, compacts the tables, and serves Infino's own SQL and search APIs over the same data. The account stores the tables in an Infino bucket or in your own bucket, with customer-managed encryption keys (CMEK) supported. The node holds no table data.
 
 The account is node configuration, read at startup:
 
@@ -183,7 +185,7 @@ infino.platform.database: logs        # optional: the cluster's name when unset
 bin/opensearch-keystore add infino.platform.api_key    # or INFINO_API_KEY in the node's environment
 ```
 
-**Getting an account.** Start the node without these settings and ask for a free account:
+**Getting an account.** Start the node without these settings and ask for a free account. Sending `"accept": true` accepts Infino's [Terms of Service](https://www.infino.ai/terms), and from then on every document the cluster writes is sent to the hosted service:
 
 ```bash
 curl -XPOST localhost:9200/_plugins/_infino/account/trial -H 'Content-Type: application/json' -d '{"accept": true}'
@@ -259,7 +261,7 @@ An index with `index.infino.edges: true` holds a graph's edges: each document is
 
 **Queries:** `match_all`, `term`, `terms`, `range` (numbers and dates, with date math and time zones), `exists`, `prefix`, `wildcard`, `regexp`, `ids`, `match`, `match_phrase`, `multi_match`, `query_string` and `simple_query_string` (Lucene's classic syntax; fuzzy and proximity are refused), `bool` (with `minimum_should_match`), `nested` (see below), `script` (an expression subset of Painless), `infino_knn`, `infino_hybrid`, and the k-NN plugin's `knn`. A field named `x.keyword` reads the string column `x` by its whole value.
 
-A `nested` query (Dashboards' `has_reference` on saved objects' `references` is one) matches a document only when one entry of the array holds every clause, as stock does. The table flattens an array of objects into a column per member field, which loses which values share an entry, so the columns only narrow the documents to those that may match; each of those is then checked entry by entry from its source. Inside a nested query, `term`, `terms`, `match`, `range` and `exists` on keyword, numeric and boolean fields are served, combined by `bool` or a deeper `nested` query. A text or date field, any other clause, `inner_hits`, or a query that leaves more than 10,000 documents to check (`-Dinfino.nested.candidates.max`) is refused with a 400 that names it.
+A `nested` query (Dashboards' `has_reference` on saved objects' `references` is one) matches a document only when one entry of the array holds every clause, as stock does. The table flattens an array of objects into a column per member field, which loses which values share an entry, so the columns only narrow the documents to those that may match; each of those is then checked entry by entry from its source. Inside a nested query, `term`, `terms`, `match`, `range` and `exists` on keyword, numeric and boolean fields are served, combined by `bool` or a deeper `nested` query. A text or date field, any other clause, `inner_hits`, or a query that leaves more than 10,000 documents to check (`-Dinfino.nested.candidates.max`) is refused with a 400 that names it. The entries are read from the document as it was indexed, whatever the mapping's `_source` says, so a nested query is served on an index with `_source` disabled or with the path excluded from it. A nested query matches as stock does but is not scored by its entries (`score_mode` is ignored). Under `filter` it scores as stock does. Under `must` it adds nothing to the score, where stock adds its entries' score. A `bool` whose `should` holds a nested clause scores every hit 1.0, as it does with a `term` clause there.
 
 **Search:** sorting by fields; `from` and `size` up to `index.max_result_window`; `search_after`, `post_filter`, `collapse` and scroll; `_source` includes and excludes; exact `hits.total`. A search over several Infino-backed indices merges their pages by sort values or score and reduces their aggregations together, under `search.max_buckets`. `get` and `mget` read the table too.
 
@@ -325,8 +327,11 @@ No OpenSearch checkout is needed: the plugin builds against the release named by
 | `infino-capi/` | The native bridge, a Rust `cdylib` over the `infino` crate: JSON in, JSON out, with every document checked against the declared columns. |
 | `scripts/` | `build.sh`, `run.sh` (install into a distribution and start a node) and `check-all.sh`. |
 | `bench/` | `bench.py`: indexing and query latency against stock Lucene. |
-| `HANDOVER.md` | Design notes from the first prototype. |
 
 ## License
 
-Apache-2.0. The bridge and the plugin use only the published `infino` crate.
+Apache-2.0; see [LICENSE](LICENSE). The bridge and the plugin use only the published `infino` crate, which is Apache-2.0 too.
+
+## Contributing and security
+
+Bugs and feature requests go in [the issues](https://github.com/infino-ai/opensearch-infino/issues); pull requests are welcome, and `gradle check` (see [Build and test](#build-and-test)) should pass before you open one. Report a security problem privately, through [a security advisory](https://github.com/infino-ai/opensearch-infino/security/advisories/new), not in a public issue.

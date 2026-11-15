@@ -102,6 +102,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -2202,7 +2203,18 @@ public class InfinoAggregationProcessor {
     }
 
     /** One source of a composite aggregation: a key expression and how its values order and print. */
-    record CompositeSource(String name, Source source, String keyExpr, KeyKind keyKind, DocValueFormat format, boolean desc, boolean missingBucket, MissingOrder missingOrder) {
+    /** One source of a composite; {@code rounding} is a date histogram source's buckets, null for any other. */
+    record CompositeSource(
+        String name,
+        Source source,
+        String keyExpr,
+        KeyKind keyKind,
+        DocValueFormat format,
+        boolean desc,
+        boolean missingBucket,
+        MissingOrder missingOrder,
+        Rounding rounding
+    ) {
         /** Whether a missing key sorts before the present ones. */
         boolean nullsFirst() {
             return missingOrder == MissingOrder.FIRST || (missingOrder == MissingOrder.DEFAULT && !desc);
@@ -2317,7 +2329,7 @@ public class InfinoAggregationProcessor {
                 DocValueFormat format = kind == KeyKind.DATE
                     ? Grouped.dateFormat(s.format(), c, ZoneOffset.UTC)
                     : kind == KeyKind.BOOL ? DocValueFormat.BOOLEAN : DocValueFormat.RAW;
-                return new CompositeSource(s.name(), c, "(" + c.expr() + ")", kind, format, desc, s.missingBucket(), missing);
+                return new CompositeSource(s.name(), c, "(" + c.expr() + ")", kind, format, desc, s.missingBucket(), missing, null);
             }
             if (s instanceof DateHistogramValuesSourceBuilder dh) {
                 ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
@@ -2326,11 +2338,11 @@ public class InfinoAggregationProcessor {
                 Grouped.DateExpr expr = Grouped.dateExpr(agg, c, tz, fixed, calendar, dh.offset());
                 // As stock: the key is epoch milliseconds unless the source names a format.
                 DocValueFormat format = s.format() == null ? DocValueFormat.RAW : Grouped.dateFormat(s.format(), c, tz);
-                return new CompositeSource(s.name(), c, expr.keyExpr(), KeyKind.DATE, format, desc, s.missingBucket(), missing);
+                return new CompositeSource(s.name(), c, expr.keyExpr(), KeyKind.DATE, format, desc, s.missingBucket(), missing, expr.rounding());
             }
             if (s instanceof HistogramValuesSourceBuilder h) {
                 String keyExpr = Grouped.histExpr(agg, c, h.interval(), 0);
-                return new CompositeSource(s.name(), c, keyExpr, KeyKind.DOUBLE, DocValueFormat.RAW, desc, s.missingBucket(), missing);
+                return new CompositeSource(s.name(), c, keyExpr, KeyKind.DOUBLE, DocValueFormat.RAW, desc, s.missingBucket(), missing, null);
             }
             throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] of type [" + s.getClass().getSimpleName() + "] is not served");
         }
@@ -2723,6 +2735,91 @@ public class InfinoAggregationProcessor {
 
     /** The composite page: the GROUP BY over every key, past the after key, in key order, cut to size. */
     private InternalAggregation evalComposite(Composite c, String from, String where) {
+        List<Map<String, Object>> rows = countedDateBuckets(c, from, where);
+        if (rows == null) {
+            rows = groupedCompositeRows(c, from, where);
+        }
+        List<List<InternalAggregation>> topHits = new ArrayList<>();
+        List<List<InternalAggregation>> nested = new ArrayList<>();
+        for (Map<String, Object> row : rows) {
+            long docCount = asLong(row.get("doc_count"));
+            String bucket = "(" + where + ") AND " + bucketRestriction(c, row);
+            topHits.add(bucketHits(c, from, bucket, docCount));
+            nested.add(evalChildren(c.child, from, bucket, docCount));
+        }
+        return c.build(rows, topHits, nested);
+    }
+
+    /** Most date buckets {@link #countedDateBuckets} counts; past it one grouped statement reads them faster. */
+    static final int MAX_COUNTED_DATE_BUCKETS = 64;
+
+    /**
+     * A composite's page counted bucket by bucket from the date column's
+     * range index, with no statement planned, when that answers it: one date
+     * histogram source over the column the request's one range bounds (the
+     * range gives the buckets to count), no missing bucket, no after key, and
+     * nothing in a bucket but its count. Each bucket is one interval of the
+     * column ({@link InfinoNative#countWhere}), so the engine counts it from
+     * the index. Null when the composite is not of that shape, or spans more
+     * than {@link #MAX_COUNTED_DATE_BUCKETS} buckets.
+     */
+    private List<Map<String, Object>> countedDateBuckets(Composite c, String from, String where) {
+        Translation q = plan.query();
+        InfinoQueryTranslator.Span span = q.span();
+        if (span == null
+            || table == null
+            || !where.equals(q.where())
+            || !from.equals(q.from())
+            || c.sources.size() != 1
+            || c.after != null
+            || !c.metrics.isEmpty()
+            || !c.hits.isEmpty()
+            || c.child != null) {
+            return null;
+        }
+        CompositeSource s = c.sources.get(0);
+        String column = InfinoQueryTranslator.quoteIdent(span.column());
+        if (s.rounding() == null || s.missingBucket() || !s.source().expr().equals(column)) {
+            return null;
+        }
+        Rounding.Prepared rounding = s.rounding().prepareForUnknown();
+        List<Long> starts = new ArrayList<>();
+        List<String> predicates = new ArrayList<>();
+        long start = rounding.round(span.fromMillis());
+        while (start < span.untilMillis()) {
+            long next = rounding.nextRoundingValue(start);
+            if (next <= start || starts.size() == MAX_COUNTED_DATE_BUCKETS) {
+                return null;
+            }
+            long lo = Math.max(start, span.fromMillis());
+            long hi = Math.min(next, span.untilMillis());
+            predicates.add(column + " >= " + timestampLiteral(lo) + " AND " + column + " < " + timestampLiteral(hi));
+            starts.add(start);
+            start = next;
+        }
+        long[] counts = InfinoNative.countWhere(table, predicates);
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (int i = 0; i < counts.length; i++) {
+            if (counts[i] > 0) {
+                rows.add(Map.of("k0", starts.get(i), "doc_count", counts[i]));
+            }
+        }
+        if (s.desc()) {
+            Collections.reverse(rows);
+        }
+        return rows.size() > c.size ? rows.subList(0, c.size) : rows;
+    }
+
+    /**
+     * An instant as a literal of a date column's type, so a comparison with
+     * the column is one the engine counts from its range index as written.
+     */
+    static String timestampLiteral(long millis) {
+        return "arrow_cast('" + Instant.ofEpochMilli(millis) + "', 'Timestamp(Millisecond, Some(\"UTC\"))')";
+    }
+
+    /** A composite's page from one statement grouping by every source's key. */
+    private List<Map<String, Object>> groupedCompositeRows(Composite c, String from, String where) {
         List<String> keyCols = new ArrayList<>();
         List<String> present = new ArrayList<>();
         // The sources that read a field some document gives several values.
@@ -2741,16 +2838,7 @@ public class InfinoAggregationProcessor {
         String w = present.isEmpty() ? where : "(" + where + ") AND " + String.join(" AND ", present);
         String inner = groupStatement(keyCols, metrics, from, w, multi, "");
         String page = c.after == null ? "" : " WHERE " + c.keysetPredicate();
-        List<Map<String, Object>> rows = InfinoNative.sqlRows("SELECT * FROM (" + inner + ") t" + page + " ORDER BY " + c.order() + " LIMIT " + c.size);
-        List<List<InternalAggregation>> topHits = new ArrayList<>();
-        List<List<InternalAggregation>> nested = new ArrayList<>();
-        for (Map<String, Object> row : rows) {
-            long docCount = asLong(row.get("doc_count"));
-            String bucket = "(" + where + ") AND " + bucketRestriction(c, row);
-            topHits.add(bucketHits(c, from, bucket, docCount));
-            nested.add(evalChildren(c.child, from, bucket, docCount));
-        }
-        return c.build(rows, topHits, nested);
+        return InfinoNative.sqlRows("SELECT * FROM (" + inner + ") t" + page + " ORDER BY " + c.order() + " LIMIT " + c.size);
     }
 
     /**

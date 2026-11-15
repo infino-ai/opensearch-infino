@@ -17,7 +17,7 @@ esac
 INFINO_LIB="${INFINO_LIB:-$DEFAULT_LIB}"
 INFINO_URI="${INFINO_URI:-file://$HERE/data}"
 
-ZIP="$HERE/plugin/build/distributions/infino-engine-$OPENSEARCH_VERSION.zip"
+ZIP="$HERE/plugin/build/distributions/infino-engine.zip"
 echo "==> (re)installing plugin: $ZIP"
 "$DISTRO/bin/opensearch-plugin" remove infino-engine 2>/dev/null || true
 "$DISTRO/bin/opensearch-plugin" install -b "file://$ZIP"
