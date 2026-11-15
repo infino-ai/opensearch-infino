@@ -7,6 +7,7 @@ package org.opensearch.infino;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
@@ -61,6 +62,36 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
         String a = "{\"name\":\"logs\",\"table\":\"a\"}";
         String b = "{\"name\":\"logs\",\"table\":\"b\"}";
         assertEquals(InfinoRegistry.later(a, b), InfinoRegistry.later(b, a));
+    }
+
+    public void testAFailedRowIsTriedAgainSoonThenLessOftenUpToAMinute() {
+        assertEquals(TimeValue.timeValueSeconds(1), InfinoRegistry.retryDelay(1));
+        assertEquals(TimeValue.timeValueSeconds(2), InfinoRegistry.retryDelay(2));
+        assertEquals(TimeValue.timeValueSeconds(4), InfinoRegistry.retryDelay(3));
+        assertEquals(TimeValue.timeValueSeconds(32), InfinoRegistry.retryDelay(6));
+        assertEquals(InfinoRegistry.MAX_RETRY_DELAY, InfinoRegistry.retryDelay(7));
+        // However long it keeps failing, the wait stays at the most, never overflowing.
+        assertEquals(InfinoRegistry.MAX_RETRY_DELAY, InfinoRegistry.retryDelay(1_000));
+        assertEquals(InfinoRegistry.MAX_RETRY_DELAY, InfinoRegistry.retryDelay(Integer.MAX_VALUE));
+    }
+
+    public void testAWriteIsVisibleOnceTheReadWindowHasPassed() {
+        long window = TimeValue.timeValueSeconds(1).nanos();
+        long written = 5_000_000_000L;
+        assertEquals(window, InfinoNative.untilVisible(written, window, written));
+        assertEquals(window / 4, InfinoNative.untilVisible(written, window, written + window * 3 / 4));
+        assertTrue(InfinoNative.untilVisible(written, window, written + window) <= 0);
+        assertTrue(InfinoNative.untilVisible(written, 0, written) <= 0);
+    }
+
+    public void testARefreshOverATableThisNodeNeverWroteDoesNotWait() {
+        long start = System.nanoTime();
+        InfinoNative.awaitVisible("never_written");
+        assertTrue(System.nanoTime() - start < TimeValue.timeValueMillis(500).nanos());
+    }
+
+    public void testTheReadWindowDefaultsToASecond() {
+        assertEquals(TimeValue.timeValueSeconds(1), InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY));
     }
 
     public void testARowFromAnotherEngineIsCreatedWithoutWhatTheClusterDoesNotKnow() {

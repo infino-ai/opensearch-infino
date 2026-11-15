@@ -1178,7 +1178,10 @@ public class InfinoEngine extends InternalEngine {
     /**
      * Commit the writes through every operation applied so far, then refresh
      * the skeleton's reader and record what it covers: every operation
-     * applied before the refresh began.
+     * applied before the refresh began. On the hosted service the refresh
+     * returns once every read sees the commit ({@link InfinoNative#awaitVisible}),
+     * so a search after {@code refresh=true}, or one that {@code wait_for}
+     * released, finds the writes.
      */
     @Override
     public void refresh(String source) throws EngineException {
@@ -1188,6 +1191,7 @@ public class InfinoEngine extends InternalEngine {
         }
         commitBeforeLucene("refresh", getProcessedLocalCheckpoint());
         long covered = getProcessedLocalCheckpoint();
+        InfinoNative.awaitVisible(table);
         super.refresh(source);
         rememberCovered(covered);
     }
@@ -1199,6 +1203,7 @@ public class InfinoEngine extends InternalEngine {
         }
         commitBeforeLucene("refresh", getProcessedLocalCheckpoint());
         long covered = getProcessedLocalCheckpoint();
+        InfinoNative.awaitVisible(table);
         boolean refreshed = super.maybeRefresh(source);
         rememberCovered(covered);
         return refreshed;
