@@ -449,6 +449,28 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertTrue(sql, sql.endsWith(") AS infino_scored ORDER BY score DESC, infino_row ASC LIMIT 10"));
     }
 
+    /**
+     * Where documents give the term's field several values, its match is a
+     * subquery by id, which the engine plans in a filter only: the bonus
+     * reads it through a join by id, in every branch, and the bands rank
+     * the window, their bounds being no filter the ranked search takes.
+     */
+    public void testAShouldTermOnAListIsJoinedIntoTheScore() {
+        Map<String, Column> cols = columns();
+        cols.put("level[]", Column.list("level[]", "str"));
+        BoolQueryBuilder b = QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.termQuery("level", "error"));
+        Translation t = InfinoQueryTranslator.translate(b, cols, TABLE, NOW);
+        InfinoQueryTranslator.Bonus bonus = t.scoring().bonuses().get(0);
+        assertEquals("CASE WHEN infino_match0.infino_hit IS NOT NULL THEN 1.0 ELSE 0.0 END", bonus.expr());
+        assertTrue(bonus.join(), bonus.join().startsWith(" LEFT JOIN (SELECT osid AS infino_hit FROM \"os_logs_0\" WHERE ((\"level[]\" IS NULL AND \"level\" = 'error') OR osid IN (SELECT "));
+        assertTrue(bonus.join(), bonus.join().endsWith(") AS infino_match0 ON osid = infino_match0.infino_hit"));
+        String sql = hits(t, null, 10);
+        assertEquals(2, sql.split("FROM bm25_search\\('os_logs_0', 'message', 'disk', 10000, 'or'\\) LEFT JOIN \\(SELECT osid AS infino_hit ", -1).length - 1);
+        assertTrue(sql, sql.contains("FROM \"os_logs_0\" LEFT JOIN (SELECT osid AS infino_hit "));
+        // A term on a field no document gives several values stays in the score itself.
+        assertNull(translate(b).scoring().bonuses().get(0).join());
+    }
+
     /** A term in must adds its boost to every hit alike: the ranked search is the match's, as before, and the score shifts. */
     public void testAMustTermShiftsEveryScore() {
         BoolQueryBuilder b = QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(QueryBuilders.termQuery("level", "error"));
@@ -632,6 +654,11 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         t = InfinoQueryTranslator.translate(b, bm25TermColumns(), TABLE, NOW, counts(statements, 5, 3));
         assertEquals(java.util.List.of(1.0), t.scoring().bonuses().get(0).values());
         assertTrue(statements.isEmpty());
+        // A keyword multi-field of a use_similarity field is a plain keyword unless its own mapping says otherwise.
+        b = QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.termQuery("tag.keyword", "x"));
+        t = InfinoQueryTranslator.translate(b, bm25TermColumns(), TABLE, NOW, counts(statements, 5, 3));
+        assertEquals(java.util.List.of(1.0), t.scoring().bonuses().get(0).values());
+        assertTrue(statements.isEmpty());
     }
 
     /**
@@ -670,6 +697,27 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertSame(InfinoQueryTranslator.Scoring.NONE, t.unscored().scoring());
         assertEquals(t.where(), t.unscored().where());
         assertFalse(hits(t.unscored(), null, 10).contains("infino_bonus"));
+    }
+
+    /** The plan of a translated query, with no sort, collapse, post_filter or search_after. */
+    private static InfinoSearch.Plan plan(Translation t) {
+        return new InfinoSearch.Plan(TABLE, columns(), t, java.util.List.of(), null, null, null, null, java.util.List.of(), InfinoAccess.NONE, NOW);
+    }
+
+    /**
+     * A short page is its own total only where no ranked window narrows it:
+     * an optional text clause ranks its matches in one, so a filter keeping
+     * a hit past the window would leave the page short of the total.
+     */
+    public void testAShortPageIsItsTotalOnlyWithoutARankedWindow() {
+        assertTrue(InfinoSearch.shortPageIsTotal(plan(translate(QueryBuilders.termQuery("level", "error")))));
+        BoolQueryBuilder unranked = QueryBuilders.boolQuery().should(QueryBuilders.termQuery("level", "error")).should(QueryBuilders.rangeQuery("status").gte(500));
+        assertTrue(InfinoSearch.shortPageIsTotal(plan(translate(unranked))));
+        assertFalse(InfinoSearch.shortPageIsTotal(plan(translate(QueryBuilders.matchQuery("message", "disk")))));
+        BoolQueryBuilder optionalText = QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.termQuery("level", "error"));
+        Translation t = translate(optionalText);
+        assertNull(t.principal());
+        assertFalse(InfinoSearch.shortPageIsTotal(plan(t)));
     }
 
     // ---- nested ----

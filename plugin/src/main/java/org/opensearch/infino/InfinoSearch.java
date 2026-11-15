@@ -623,10 +623,7 @@ public final class InfinoSearch {
             if (sourcesById(plan) && wantsSource(source)) {
                 rows = withSources(plan.table(), rows, fetch);
             }
-            // A page the hit statement could not fill holds every row its
-            // predicate keeps, and that predicate is the total's (no keyset,
-            // collapse or ranked window narrows it), so its length is the total.
-            shortPage = rows.size() < fetch && q.principal() == null && plan.searchAfter() == null && plan.collapse() == null;
+            shortPage = rows.size() < fetch && shortPageIsTotal(plan);
         }
 
         long total;
@@ -634,10 +631,12 @@ public final class InfinoSearch {
             total = rows.size(); // kNN is inherently top-k
         } else if (exact && !count) {
             total = 0;
+        } else if (exact && counted != null) {
+            total = counted;
         } else if (exact && shortPage) {
             total = rows.size();
         } else if (exact) {
-            total = counted != null ? counted : total(plan);
+            total = total(plan);
         } else {
             total = rows.size();
         }
@@ -729,6 +728,20 @@ public final class InfinoSearch {
             hits.add(h);
         }
         return new Page(hits, total, exact || plan.vector() != null, maxScore);
+    }
+
+    /**
+     * Whether a page the hit statement could not fill holds every row its
+     * predicate keeps, and that predicate is the total's, so its length is
+     * the total: no keyset, collapse or ranked window narrows it. An
+     * optional text clause ranks its matches in a window too
+     * ({@link #scoredStatement}), though the plan has no principal.
+     */
+    static boolean shortPageIsTotal(Plan plan) {
+        return plan.query().principal() == null
+            && plan.query().scoring().text() == null
+            && plan.searchAfter() == null
+            && plan.collapse() == null;
     }
 
     /**
@@ -933,14 +946,19 @@ public final class InfinoSearch {
             names.add(sf.alias());
         }
         List<String> parts = new ArrayList<>();
+        // The relations the bonuses read, joined to each branch's rows by id.
+        StringBuilder joins = new StringBuilder();
         for (Bonus b : scoring.bonuses()) {
             parts.add("(" + b.expr() + ")");
+            if (b.join() != null) {
+                joins.append(b.join());
+            }
         }
         String bonus = parts.isEmpty() ? "0.0" : String.join(" + ", parts);
         TextClause text = q.principal() != null ? q.principal() : scoring.text();
         List<String> branches = new ArrayList<>();
         if (text == null) {
-            branches.add("SELECT " + hit + ", 0.0 AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.from() + " WHERE " + where);
+            branches.add("SELECT " + hit + ", 0.0 AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.from() + joins + " WHERE " + where);
         } else {
             // An optional text clause is a subquery in the predicate: true of every
             // row its ranked search returns, false of every other.
@@ -949,10 +967,12 @@ public final class InfinoSearch {
             List<Double> sums = bonusSums(scoring.bonuses());
             if (sums == null) {
                 branches.add(
-                    "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.rankedFrom(text, RANK_WINDOW) + " WHERE " + ranked
+                    "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.rankedFrom(text, RANK_WINDOW) + joins + " WHERE " + ranked
                 );
             } else {
-                int k = InfinoQueryTranslator.joinsAfterRanking(ranked) || InfinoQueryTranslator.joinsAfterRanking(bonus) ? RANK_WINDOW : fetch;
+                // A band's bounds on a joined bonus are no filter the ranked search takes.
+                boolean afterRanking = InfinoQueryTranslator.joinsAfterRanking(ranked) || InfinoQueryTranslator.joinsAfterRanking(bonus) || joins.length() > 0;
+                int k = afterRanking ? RANK_WINDOW : fetch;
                 for (int i = 0; i < sums.size(); i++) {
                     // The band around this sum: from halfway to the one below, to halfway to the one above.
                     List<String> band = new ArrayList<>();
@@ -966,7 +986,7 @@ public final class InfinoSearch {
                         band.add("(" + bonus + ") < " + InfinoQueryTranslator.scoreLiteral((sums.get(i) + sums.get(i + 1)) / 2));
                     }
                     branches.add(
-                        "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.rankedFrom(text, k)
+                        "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.rankedFrom(text, k) + joins
                             + (band.isEmpty() ? "" : " WHERE " + String.join(" AND ", band))
                     );
                 }
@@ -974,7 +994,7 @@ public final class InfinoSearch {
             if (match != null) {
                 String rest = "(" + where.replace(match, InfinoQueryTranslator.NONE) + ") AND " + InfinoQueryTranslator.not(match);
                 branches.add(
-                    "SELECT * FROM (SELECT " + hit + ", 0.0 AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.from() + " WHERE " + rest
+                    "SELECT * FROM (SELECT " + hit + ", 0.0 AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.from() + joins + " WHERE " + rest
                         + " ORDER BY infino_bonus DESC, infino_row ASC LIMIT " + fetch + ") AS infino_rest"
                 );
             }

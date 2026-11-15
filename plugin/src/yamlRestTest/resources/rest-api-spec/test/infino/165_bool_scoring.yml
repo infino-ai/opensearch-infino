@@ -651,3 +651,194 @@
   - match: { hits.hits.1._id: d2 }
   - gt: { hits.hits.1._score: 0.999000 }
   - lt: { hits.hits.1._score: 1.001000 }
+
+---
+"A term on a field some documents give several values scores beside a match, as a Lucene twin scores it":
+  # The term's membership in a list is a subquery by id, which the engine
+  # plans in a filter only: in the score it is read through a join. Before,
+  # the scored statement failed to plan.
+  - do:
+      indices.create:
+        index: sm_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { t: { type: text }, k: { type: keyword } } }
+  - do:
+      indices.create:
+        index: sm_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { t: { type: text }, k: { type: keyword } } }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sm_inf
+        body:
+          - index: { _id: "d1" }
+          - {"t": "a warm coat", "k": ["x", "a"]}
+          - index: { _id: "d2" }
+          - {"t": "the coat on the long rack beside the other coat and a hat", "k": "b"}
+          - index: { _id: "d3" }
+          - {"t": "coat", "k": ["b", "a"]}
+          - index: { _id: "d4" }
+          - {"t": "a red shoe", "k": "a"}
+          - index: { _id: "d5" }
+          - {"t": "a blue hat", "k": ["b", "c"]}
+  - match: { errors: false }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sm_luc
+        body:
+          - index: { _id: "d1" }
+          - {"t": "a warm coat", "k": ["x", "a"]}
+          - index: { _id: "d2" }
+          - {"t": "the coat on the long rack beside the other coat and a hat", "k": "b"}
+          - index: { _id: "d3" }
+          - {"t": "coat", "k": ["b", "a"]}
+          - index: { _id: "d4" }
+          - {"t": "a red shoe", "k": "a"}
+          - index: { _id: "d5" }
+          - {"t": "a blue hat", "k": ["b", "c"]}
+  - match: { errors: false }
+
+  # A should match beside the term: d3 and d1 hold a among several values, d4 holds it alone.
+  - do:
+      search:
+        index: sm_luc
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"term": {"k": "a"}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 1.359375 }
+  - lt: { hits.hits.0._score: 1.361375 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 1.284643 }
+  - lt: { hits.hits.1._score: 1.286643 }
+  - match: { hits.hits.2._id: d4 }
+  - gt: { hits.hits.2._score: 0.999000 }
+  - lt: { hits.hits.2._score: 1.001000 }
+  - match: { hits.hits.3._id: d2 }
+  - gt: { hits.hits.3._score: 0.221566 }
+  - lt: { hits.hits.3._score: 0.223566 }
+  - do:
+      search:
+        index: sm_inf
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"term": {"k": "a"}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 1.359375 }
+  - lt: { hits.hits.0._score: 1.361375 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 1.284643 }
+  - lt: { hits.hits.1._score: 1.286643 }
+  - match: { hits.hits.2._id: d4 }
+  - gt: { hits.hits.2._score: 0.999000 }
+  - lt: { hits.hits.2._score: 1.001000 }
+  - match: { hits.hits.3._id: d2 }
+  - gt: { hits.hits.3._score: 0.221566 }
+  - lt: { hits.hits.3._score: 0.223566 }
+
+  # Beside a must match, the term only reorders the match's hits.
+  - do:
+      search:
+        index: sm_luc
+        body: { query: {"bool": {"must": [{"match": {"t": "coat"}}], "should": [{"term": {"k": "b"}}]}} }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 1.359375 }
+  - lt: { hits.hits.0._score: 1.361375 }
+  - match: { hits.hits.1._id: d2 }
+  - gt: { hits.hits.1._score: 1.221566 }
+  - lt: { hits.hits.1._score: 1.223566 }
+  - match: { hits.hits.2._id: d1 }
+  - gt: { hits.hits.2._score: 0.284643 }
+  - lt: { hits.hits.2._score: 0.286643 }
+  - do:
+      search:
+        index: sm_inf
+        body: { query: {"bool": {"must": [{"match": {"t": "coat"}}], "should": [{"term": {"k": "b"}}]}} }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 1.359375 }
+  - lt: { hits.hits.0._score: 1.361375 }
+  - match: { hits.hits.1._id: d2 }
+  - gt: { hits.hits.1._score: 1.221566 }
+  - lt: { hits.hits.1._score: 1.223566 }
+  - match: { hits.hits.2._id: d1 }
+  - gt: { hits.hits.2._score: 0.284643 }
+  - lt: { hits.hits.2._score: 0.286643 }
+
+---
+"A keyword multi-field of a use_similarity keyword scores by its own mapping, as a Lucene twin scores it":
+  # k scores a term by BM25 (idf of 1 of 2 documents / 2.2); k.plain, a
+  # plain keyword, scores its boost. Before, k.plain took k's BM25.
+  - do:
+      indices.create:
+        index: sf_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { k: { type: keyword, use_similarity: true, fields: { plain: { type: keyword } } } } }
+  - do:
+      indices.create:
+        index: sf_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { k: { type: keyword, use_similarity: true, fields: { plain: { type: keyword } } } } }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sf_inf
+        body:
+          - index: { _id: "d1" }
+          - {"k": "a"}
+          - index: { _id: "d2" }
+          - {"k": "b"}
+  - match: { errors: false }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sf_luc
+        body:
+          - index: { _id: "d1" }
+          - {"k": "a"}
+          - index: { _id: "d2" }
+          - {"k": "b"}
+  - match: { errors: false }
+
+  - do:
+      search:
+        index: sf_luc
+        body: { query: {"term": {"k.plain": "a"}} }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - gt: { hits.hits.0._score: 0.999000 }
+  - lt: { hits.hits.0._score: 1.001000 }
+  - do:
+      search:
+        index: sf_inf
+        body: { query: {"term": {"k.plain": "a"}} }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - gt: { hits.hits.0._score: 0.999000 }
+  - lt: { hits.hits.0._score: 1.001000 }
+
+  - do:
+      search:
+        index: sf_luc
+        body: { query: {"term": {"k": "a"}} }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - gt: { hits.hits.0._score: 0.314067 }
+  - lt: { hits.hits.0._score: 0.316067 }
+  - do:
+      search:
+        index: sf_inf
+        body: { query: {"term": {"k": "a"}} }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - gt: { hits.hits.0._score: 0.314067 }
+  - lt: { hits.hits.0._score: 0.316067 }

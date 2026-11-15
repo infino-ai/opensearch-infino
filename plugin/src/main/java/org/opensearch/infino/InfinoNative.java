@@ -186,10 +186,11 @@ public final class InfinoNative {
         /**
          * This column read by its whole value, as a keyword multi-field of its
          * field reads it: no text index, so a term is the value, not one of its
-         * words.
+         * words. Its {@code use_similarity} is its own mapping's, not its
+         * field's: none here.
          */
         Column exact() {
-            return fts ? new Column(name, type, false, vector, mask, dateFormat, elem, similarity) : this;
+            return fts || similarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false) : this;
         }
 
         /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */

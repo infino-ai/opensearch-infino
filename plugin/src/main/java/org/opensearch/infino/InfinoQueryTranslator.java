@@ -165,9 +165,16 @@ final class InfinoQueryTranslator {
     /**
      * One clause's share of a hit's score beyond a text clause's BM25:
      * {@code expr} a SQL number per row (0 where the clause does not match),
-     * {@code values} the scores it takes where it does.
+     * {@code values} the scores it takes where it does. {@code join} is
+     * the relation {@code expr} reads, joined to the hits' rows by id (null
+     * for none): a clause whose predicate holds a subquery by id, which the
+     * engine plans only in a filter, matches where the join finds the row.
      */
-    record Bonus(String expr, List<Double> values) {}
+    record Bonus(String expr, List<Double> values, String join) {
+        Bonus(String expr, List<Double> values) {
+            this(expr, values, null);
+        }
+    }
 
     /**
      * How a hit scores, as Lucene sums a bool's scoring clauses: the BM25 of
@@ -400,7 +407,13 @@ final class InfinoQueryTranslator {
             if (p == null) {
                 return false;
             }
-            if (!NONE.equals(p)) {
+            if (joinsAfterRanking(p)) {
+                // The rows it matches, read in a filter and joined to the hits by id.
+                String alias = "infino_match" + bonuses.size();
+                String join = " LEFT JOIN (SELECT " + OSID + " AS infino_hit FROM " + quoteIdent(table) + " WHERE " + p + ") AS " + alias + " ON " + OSID
+                    + " = " + alias + ".infino_hit";
+                bonuses.add(new Bonus("CASE WHEN " + alias + ".infino_hit IS NOT NULL THEN " + scoreLiteral(w) + " ELSE 0.0 END", List.of(w), join));
+            } else if (!NONE.equals(p)) {
                 bonuses.add(new Bonus("CASE WHEN " + p + " THEN " + scoreLiteral(w) + " ELSE 0.0 END", List.of(w)));
             }
             return true;
