@@ -183,7 +183,8 @@ public class InfinoSearchActionFilter implements ActionFilter {
             // matches the entry its first run left; any other search is kept out of
             // the cache, where each run would only add an entry no search reads.
             if (shardCacheable(search, written, concrete, filters, exactAtCoordinator)) {
-                search.source(InfinoQueryExt.route(written, InfinoQueryExt.CACHED_REQUEST, false, 0L));
+                // The shard names its node's connection in the query, so the key moves with it.
+                search.source(InfinoQueryExt.route(written, InfinoQueryExt.CACHED_REQUEST, false, 0L).query(new InfinoConnectionQueryBuilder()));
             } else {
                 if (!Boolean.FALSE.equals(search.requestCache())) {
                     search.requestCache(false);

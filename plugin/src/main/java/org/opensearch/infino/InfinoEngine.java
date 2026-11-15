@@ -10,6 +10,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.StoredField;
+import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -495,8 +496,54 @@ public class InfinoEngine extends InternalEngine {
                 t instanceof Exception e ? e : new RuntimeException(t)
             );
         }
+        // Every external reader is an internal one, published once its internal
+        // refresh returns: what it covers is known before any search can use it.
+        ReferenceManager<OpenSearchDirectoryReader> internal = getReferenceManager(SearcherScope.INTERNAL);
+        internal.addListener(new CoverRecorder<>(internal, this::getProcessedLocalCheckpoint, coveredByReader));
         BY_TABLE.put(table, this);
         log.info("[infino] engine attached to table {} for {}", table, config.getShardId());
+    }
+
+    /**
+     * Records, as the internal reader manager opens each skeleton reader, the
+     * operations it holds: every one processed before its refresh began. The
+     * external manager publishes a reader only after the internal refresh
+     * that opened it returns, so a search never runs on a reader whose cut is
+     * still unknown, and a result the shard request cache keeps for a reader
+     * stays the answer for it.
+     */
+    static final class CoverRecorder<R extends DirectoryReader> implements ReferenceManager.RefreshListener {
+        private final ReferenceManager<R> readers;
+        private final LongSupplier processed;
+        private final Map<Long, Long> coveredByReader;
+        /** The operations processed when the refresh under way began; guarded by the manager's refresh lock. */
+        private long covering = UNSTAMPED;
+
+        CoverRecorder(ReferenceManager<R> readers, LongSupplier processed, Map<Long, Long> coveredByReader) {
+            this.readers = readers;
+            this.processed = processed;
+            this.coveredByReader = coveredByReader;
+        }
+
+        @Override
+        public void beforeRefresh() {
+            covering = processed.getAsLong();
+        }
+
+        @Override
+        public void afterRefresh(boolean didRefresh) throws IOException {
+            if (!didRefresh) {
+                return;
+            }
+            R reader = readers.acquire();
+            try {
+                synchronized (coveredByReader) {
+                    coveredByReader.merge(reader.getVersion(), covering, Math::max);
+                }
+            } finally {
+                readers.release(reader);
+            }
+        }
     }
 
     /**
