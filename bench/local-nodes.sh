@@ -12,8 +12,9 @@
 #   NODES      where the nodes live (default ./nodes); wiped per node
 #   BASE_PORT  http port of the default-mode node (default 9250)
 #   HEAP       JVM heap of each node (default 2g)
-#   COLUMN_CACHE  the engine's decoded-column cache per Infino node, bytes
-#              (default 4294967296, as the big5 races on GCP set it)
+#   COLUMN_CACHE  the engine's decoded-column cache per Infino node, bytes,
+#              written to the node's infino.yaml; unset, the node keeps the
+#              plugin's own default (infino.column_cache.size)
 #   ONLY       space-separated subset of "stock default proxy" to start
 #   KEEP       1: keep each node's data and tables, only stop it, reinstall
 #              the plugin from ZIP and LIB, and start it again (to compare
@@ -29,7 +30,11 @@ ONLY=${ONLY:-stock default proxy}
 V=$(basename "$TARBALL" | sed -E 's/^opensearch-([0-9.]+)-.*/\1/')
 
 column_cache() {  # home: the engine reads infino.yaml from the node's home
-  printf 'memory:\n  decoded_column_cache_bytes: %s\n' "${COLUMN_CACHE:-4294967296}" > "$1/infino.yaml"
+  if [ -n "${COLUMN_CACHE:-}" ]; then
+    printf 'memory:\n  decoded_column_cache_bytes: %s\n' "$COLUMN_CACHE" > "$1/infino.yaml"
+  else
+    rm -f "$1/infino.yaml"
+  fi
 }
 
 restart() {  # name: reinstall the plugin into a node that keeps its data
