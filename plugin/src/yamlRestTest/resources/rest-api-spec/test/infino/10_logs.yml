@@ -71,6 +71,30 @@
   - match: { hits.hits.0._id: d }
   - match: { hits.hits.1._id: b }
 
+  # Every document sorted on one field, with its source: a date from the
+  # field's range index, a keyword (which has none) by statement, ties in the
+  # order the documents were written.
+  - do:
+      search:
+        index: logs
+        body:
+          sort: [ { "@timestamp": asc } ]
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: a }
+  - match: { hits.hits.0._source.message: "disk full on node-3" }
+  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.2._id: d }
+  - do:
+      search:
+        index: logs
+        body:
+          sort: [ { level: asc } ]
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: a }
+  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.2._id: d }
+  - match: { hits.hits.2._source.message: "cache warm" }
+
   # Field-scoped text search, with a filter on the ranked candidates.
   - do:
       search:
@@ -179,3 +203,111 @@
         index: logs
         id: b
   - match: { _source.status: 201 }
+
+---
+"Ties on a sort read from the range index come in the order written, as on a Lucene twin":
+  # Every document, sorted on a date: the sorted search reads the page from
+  # the column's range index and breaks ties by row id, in both directions.
+  # The ids are written out of their own order, so the page's order is the
+  # order the documents were written, not the order of their ids. The page
+  # cuts through the tied documents.
+  - do:
+      indices.create:
+        index: ties_infino
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+  - do:
+      indices.create:
+        index: ties_lucene
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ties_infino, _id: z }
+          - { "@timestamp": "2026-10-24T10:00:00Z" }
+          - index: { _index: ties_infino, _id: m }
+          - { "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _index: ties_infino, _id: a }
+          - { "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _index: ties_infino, _id: q }
+          - { "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _index: ties_infino, _id: b }
+          - { "@timestamp": "2026-10-24T10:00:00Z" }
+          - index: { _index: ties_lucene, _id: z }
+          - { "@timestamp": "2026-10-24T10:00:00Z" }
+          - index: { _index: ties_lucene, _id: m }
+          - { "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _index: ties_lucene, _id: a }
+          - { "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _index: ties_lucene, _id: q }
+          - { "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _index: ties_lucene, _id: b }
+          - { "@timestamp": "2026-10-24T10:00:00Z" }
+  - match: { errors: false }
+
+  # The Lucene twin first: the order the Infino index must give.
+  - do:
+      search:
+        index: ties_lucene
+        body:
+          size: 4
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.total.value: 5 }
+  - match: { hits.hits.0._id: m }
+  - match: { hits.hits.1._id: a }
+  - match: { hits.hits.2._id: q }
+  - match: { hits.hits.3._id: z }
+  - do:
+      search:
+        index: ties_lucene
+        body:
+          size: 2
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.hits.0._id: m }
+  - match: { hits.hits.1._id: a }
+  - do:
+      search:
+        index: ties_lucene
+        body:
+          size: 3
+          sort: [ { "@timestamp": asc } ]
+  - match: { hits.hits.0._id: z }
+  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.2._id: m }
+
+  - do:
+      search:
+        index: ties_infino
+        body:
+          size: 4
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.total.value: 5 }
+  - match: { hits.hits.0._id: m }
+  - match: { hits.hits.1._id: a }
+  - match: { hits.hits.2._id: q }
+  - match: { hits.hits.3._id: z }
+  - do:
+      search:
+        index: ties_infino
+        body:
+          size: 2
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.hits.0._id: m }
+  - match: { hits.hits.1._id: a }
+  - do:
+      search:
+        index: ties_infino
+        body:
+          size: 3
+          sort: [ { "@timestamp": asc } ]
+  - match: { hits.hits.0._id: z }
+  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.2._id: m }

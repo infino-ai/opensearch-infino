@@ -588,20 +588,30 @@ public final class InfinoSearch {
             TextClause text = q.principal();
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
         } else {
-            if (splitsMissingTail(plan)) {
-                // The rows past a present first sort value come first; the
-                // rows missing it follow them all, so they are read only
-                // when the first part leaves the page short.
-                rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
-                if (rows.size() < fetch) {
-                    rows = new ArrayList<>(rows);
-                    rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
-                }
-            } else {
-                rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+            // Every row, sorted on one range-indexed field: the engine reads the
+            // page from the field's range index, so no statement is planned for
+            // it, and the page's sources by row id along with it.
+            rows = null;
+            if (indexSorted(plan) && !seqNoAndPrimaryTerm) {
+                SortSpec first = plan.sorts().get(0);
+                rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, wantsSource(source));
             }
-            if (sourcesById(plan) && wantsSource(source)) {
-                rows = withSources(plan.table(), rows, fetch);
+            if (rows == null) {
+                if (splitsMissingTail(plan)) {
+                    // The rows past a present first sort value come first; the
+                    // rows missing it follow them all, so they are read only
+                    // when the first part leaves the page short.
+                    rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
+                    if (rows.size() < fetch) {
+                        rows = new ArrayList<>(rows);
+                        rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
+                    }
+                } else {
+                    rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+                }
+                if (sourcesById(plan) && wantsSource(source)) {
+                    rows = withSources(plan.table(), rows, fetch);
+                }
             }
             // A page the hit statement could not fill holds every row its
             // predicate keeps, and that predicate is the total's (no keyset,
@@ -725,6 +735,34 @@ public final class InfinoSearch {
             && plan.searchAfter() == null
             && plan.collapse() == null
             && plan.scriptFields().isEmpty();
+    }
+
+    /**
+     * Whether the page is every row sorted on one field's own column, ties
+     * broken by the row id: the engine's sorted search, which reads it from
+     * the column's range index (and plans the statement itself for a column
+     * without one). A predicate, a text query, a vector, a search_after, a
+     * collapse, a scripted field, or a sort on an expression rather than a
+     * column takes the hit statement.
+     */
+    static boolean indexSorted(Plan plan) {
+        List<SortSpec> sorts = plan.sorts();
+        if (plan.vector() != null
+            || plan.query().principal() != null
+            || !InfinoQueryTranslator.ALL.equals(plan.hitWhere())
+            || plan.searchAfter() != null
+            || plan.collapse() != null
+            || !plan.scriptFields().isEmpty()
+            || sorts.size() != 2) {
+            return false;
+        }
+        SortSpec first = sorts.get(0);
+        SortSpec tie = sorts.get(1);
+        return tie.name().equals(InfinoSql.ROW_ID)
+            && !tie.desc()
+            && !first.name().equals(InfinoSql.ROW_ID)
+            && !first.name().equals(InfinoQueryTranslator.OSID)
+            && first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()));
     }
 
     /**
