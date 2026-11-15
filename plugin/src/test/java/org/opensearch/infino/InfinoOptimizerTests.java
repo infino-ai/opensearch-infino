@@ -12,15 +12,19 @@ import org.opensearch.threadpool.Scheduler;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 
 public class InfinoOptimizerTests extends OpenSearchTestCase {
 
     /** A task the fake scheduler was given, and whether it was cancelled. */
     private static final class Scheduled implements Scheduler.Cancellable {
+        final Runnable run;
         final TimeValue interval;
         boolean cancelled;
 
-        Scheduled(TimeValue interval) {
+        Scheduled(Runnable run, TimeValue interval) {
+            this.run = run;
             this.interval = interval;
         }
 
@@ -38,7 +42,7 @@ public class InfinoOptimizerTests extends OpenSearchTestCase {
 
     private final List<Scheduled> scheduled = new ArrayList<>();
     private final InfinoOptimizer optimizer = new InfinoOptimizer((run, interval) -> {
-        Scheduled s = new Scheduled(interval);
+        Scheduled s = new Scheduled(run, interval);
         scheduled.add(s);
         return s;
     });
@@ -51,8 +55,10 @@ public class InfinoOptimizerTests extends OpenSearchTestCase {
     public void testAnIntervalChangeReschedulesTheIndexsStartedShards() {
         ShardId logs0 = new ShardId(LOGS, 0);
         ShardId logs1 = new ShardId(LOGS, 1);
-        optimizer.start(logs0, () -> {}, HOUR);
-        optimizer.start(logs1, () -> {}, HOUR);
+        AtomicInteger logs0Runs = new AtomicInteger();
+        AtomicInteger logs1Runs = new AtomicInteger();
+        optimizer.start(logs0, logs0Runs::incrementAndGet, HOUR);
+        optimizer.start(logs1, logs1Runs::incrementAndGet, HOUR);
 
         optimizer.intervalChanged(LOGS, MINUTE);
 
@@ -63,6 +69,17 @@ public class InfinoOptimizerTests extends OpenSearchTestCase {
         assertTrue(scheduled.get(1).cancelled);
         assertEquals(MINUTE, scheduled.get(2).interval);
         assertFalse(scheduled.get(2).cancelled);
+        assertEquals(MINUTE, scheduled.get(3).interval);
+        assertFalse(scheduled.get(3).cancelled);
+
+        // The map's order decides which replacement is which shard's, so run
+        // one once and the other twice: each must reach a different callback.
+        Scheduled first = scheduled.get(2);
+        Scheduled second = scheduled.get(3);
+        first.run.run();
+        second.run.run();
+        second.run.run();
+        assertEquals(List.of(1, 2), Stream.of(logs0Runs.get(), logs1Runs.get()).sorted().toList());
     }
 
     public void testAnIntervalChangeLeavesOtherIndicesAlone() {
