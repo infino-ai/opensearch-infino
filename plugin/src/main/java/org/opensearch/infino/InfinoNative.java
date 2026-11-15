@@ -111,6 +111,7 @@ public final class InfinoNative {
     private static final Set<String> DATE_TYPES = Set.of("date", "date_nanos");
     /** The type of a multi-field that holds its field's value whole, the exact form of a text field. */
     private static final String KEYWORD_TYPE = "keyword";
+    private static final String USE_SIMILARITY = "use_similarity";
     /** The count's key in {@link #valueCounts}'s rows, as the engine names it. */
     static final String VALUE_COUNT = "count(*)";
     /** How long a prefetched source waits for its fetch phase. */
@@ -137,10 +138,25 @@ public final class InfinoNative {
      * leaves the node (null when it is not). {@code dateFormat} is the format
      * a date column's mapping declares (null for the default one). {@code elem}
      * is a list column's element type (null for any other column).
+     * {@code similarity} is whether its mapping is a keyword field with
+     * {@code use_similarity}, whose terms Lucene scores by BM25.
      */
-    public record Column(String name, String type, boolean fts, boolean vector, UnaryOperator<String> mask, String dateFormat, String elem) {
+    public record Column(
+        String name,
+        String type,
+        boolean fts,
+        boolean vector,
+        UnaryOperator<String> mask,
+        String dateFormat,
+        String elem,
+        boolean similarity
+    ) {
         public Column(String name, String type, boolean fts, boolean vector) {
-            this(name, type, fts, vector, null, null, null);
+            this(name, type, fts, vector, null, null, null, false);
+        }
+
+        public Column(String name, String type, boolean fts, boolean vector, UnaryOperator<String> mask, String dateFormat, String elem) {
+            this(name, type, fts, vector, mask, dateFormat, elem, false);
         }
 
         /** A list column of {@code elem} values. */
@@ -150,26 +166,41 @@ public final class InfinoNative {
 
         /** This column as the request sees it, its values masked by {@code mask}. */
         Column masked(UnaryOperator<String> mask) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity);
         }
 
         /** This column with the date format its mapping declares. */
         Column dated(String dateFormat) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity);
+        }
+
+        /** This column as a keyword field with {@code use_similarity} maps it. */
+        Column scoredBySimilarity() {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, true);
+        }
+
+        /**
+         * Whether Lucene scores a term on this field by BM25 rather than at a
+         * constant: a boolean field, whose term query is a plain one, and a
+         * keyword field with {@code use_similarity}.
+         */
+        boolean scoresTermsByBm25() {
+            return isBoolean() || similarity;
         }
 
         /**
          * This column read by its whole value, as a keyword multi-field of its
          * field reads it: no text index, so a term is the value, not one of its
-         * words.
+         * words. Its {@code use_similarity} is its own mapping's, not its
+         * field's: none here.
          */
         Column exact() {
-            return fts ? new Column(name, type, false, vector, mask, dateFormat, elem) : this;
+            return fts || similarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false) : this;
         }
 
         /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */
         Column element() {
-            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null) : this;
+            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null, similarity) : this;
         }
 
         public boolean isList() {
@@ -557,10 +588,16 @@ public final class InfinoNative {
      * {@code request.raw} under the text field {@code request}, as a dynamic
      * mapping's {@code name.keyword}); and each date field's declared format.
      */
-    record Mapping(Set<String> paths, Map<String, String> aliases, Map<String, String> keywordFields, Map<String, String> dateFormats) {
+    record Mapping(
+        Set<String> paths,
+        Map<String, String> aliases,
+        Map<String, String> keywordFields,
+        Map<String, String> dateFormats,
+        Set<String> similarityFields
+    ) {
         @SuppressWarnings("unchecked")
         static Mapping of(String mappingJson) {
-            Mapping out = new Mapping(new HashSet<>(), new LinkedHashMap<>(), new LinkedHashMap<>(), new LinkedHashMap<>());
+            Mapping out = new Mapping(new HashSet<>(), new LinkedHashMap<>(), new LinkedHashMap<>(), new LinkedHashMap<>(), new HashSet<>());
             Object root = object(mappingJson);
             // The mapping as the cluster keeps it sits under its type name.
             while (root instanceof Map<?, ?> m && !m.containsKey(PROPERTIES) && m.size() == 1) {
@@ -587,12 +624,18 @@ public final class InfinoNative {
                 if (field.get(TYPE) instanceof String type && DATE_TYPES.contains(type) && field.get(FORMAT) instanceof String format) {
                     dateFormats.put(path, format);
                 }
+                if (scoresBySimilarity(field)) {
+                    similarityFields.add(path);
+                }
                 if (field.get(MULTI_FIELDS) instanceof Map<?, ?> multi) {
                     for (Map.Entry<?, ?> sub : multi.entrySet()) {
                         String subPath = path + "." + sub.getKey();
                         paths.add(subPath);
                         if (sub.getValue() instanceof Map<?, ?> subField && KEYWORD_TYPE.equals(subField.get(TYPE))) {
                             keywordFields.put(subPath, path);
+                            if (scoresBySimilarity(subField)) {
+                                similarityFields.add(subPath);
+                            }
                         }
                     }
                 }
@@ -600,6 +643,11 @@ public final class InfinoNative {
                     walk((Map<String, Object>) inner, path);
                 }
             }
+        }
+
+        /** Whether {@code field} is a keyword field with {@code use_similarity}, as the mapping keeps it (a boolean or its string). */
+        private static boolean scoresBySimilarity(Map<?, ?> field) {
+            return KEYWORD_TYPE.equals(field.get(TYPE)) && "true".equals(String.valueOf(field.get(USE_SIMILARITY)));
         }
     }
 
@@ -645,6 +693,9 @@ public final class InfinoNative {
             );
             // A list column of a mapped field reads its dates as the field's do.
             String format = mapping == null ? null : mapping.dateFormats().get(InfinoQueryTranslator.fieldOf(column));
+            if (mapping != null && mapping.similarityFields().contains(column)) {
+                described = described.scoredBySimilarity();
+            }
             out.put(column, format == null ? described : described.dated(format));
         }
         for (Map.Entry<String, String> alias : (mapping == null ? Map.<String, String>of() : mapping.aliases()).entrySet()) {
@@ -656,7 +707,8 @@ public final class InfinoNative {
         for (Map.Entry<String, String> sub : (mapping == null ? Map.<String, String>of() : mapping.keywordFields()).entrySet()) {
             Column field = out.get(sub.getValue());
             if (field != null && field.isString()) {
-                out.putIfAbsent(sub.getKey(), field.exact());
+                Column exact = field.exact();
+                out.putIfAbsent(sub.getKey(), mapping.similarityFields().contains(sub.getKey()) ? exact.scoredBySimilarity() : exact);
             }
         }
         Map<String, Column> view = Collections.unmodifiableMap(out);
