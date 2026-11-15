@@ -92,7 +92,7 @@ public class InfinoFetchSubPhase implements FetchSubPhase {
                 one.fetchField(f.field, f.format);
             }
         }
-        InfinoAccess access = InfinoSecurity.access(shardId.getIndexName(), InfinoSecurityCalls.SEARCH);
+        InfinoAccess access = InfinoAccess.searching(shardId.getIndexName());
         InfinoSearch.Plan plan = InfinoSearch.plan(table, one, now, access);
         List<SearchHit> hits = InfinoSearch.page(shardId.getIndex(), plan, one, false).hits();
         return hits.isEmpty() ? new SearchHit(0, id, Map.of(), Map.of()) : hits.get(0);

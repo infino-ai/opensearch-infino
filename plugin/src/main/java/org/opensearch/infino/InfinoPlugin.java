@@ -247,6 +247,9 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     /** The directory {@link #CACHE_DIR} names under the node's data path by default. */
     static final String DEFAULT_CACHE_SUBDIR = "infino-cache";
 
+    /** The security plugin's setting naming its own index, which a search, get or SQL read reads as empty (see {@link InfinoAccess#reading}). */
+    static final String SECURITY_INDEX_SETTING = "plugins.security.config_index_name";
+
     private static final InfinoTables TABLES = new InfinoTables();
     private final Map<ShardId, Scheduler.Cancellable> optimizers = new ConcurrentHashMap<>();
     private final boolean defaultEnabled;
@@ -254,6 +257,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     private final InfinoAccount account;
 
     public InfinoPlugin(Settings settings) {
+        InfinoAccess.securityIndex(settings.get(SECURITY_INDEX_SETTING));
         this.defaultEnabled = INFINO_DEFAULT_ENABLED.get(settings);
         this.defaultModeEnabled = servesDefaultMode(settings);
         if (!defaultModeEnabled && !DEFAULT_MODE_ENABLED.exists(settings)) {
