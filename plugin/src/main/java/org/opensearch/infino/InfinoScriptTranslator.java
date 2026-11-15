@@ -1018,7 +1018,7 @@ final class InfinoScriptTranslator {
                         return fromMillis(one(c, scope));
                     }
                     if (c.name().equals("now")) {
-                        return fromMillis(new Sql(Long.toString(nowMillis), SqlType.INT));
+                        return fromMillis(new Sql(Long.toString(InfinoClock.read(nowMillis)), SqlType.INT));
                     }
                     throw refuse("calls Instant." + c.name() + ", which is not served");
                 }
@@ -1027,13 +1027,13 @@ final class InfinoScriptTranslator {
                         return emit(c.args().get(0), scope);
                     }
                     if (c.name().equals("now")) {
-                        return fromMillis(new Sql(Long.toString(nowMillis), SqlType.INT));
+                        return fromMillis(new Sql(Long.toString(InfinoClock.read(nowMillis)), SqlType.INT));
                     }
                     throw refuse("calls " + id.name() + "." + c.name() + ", which is not served");
                 }
                 case "System" -> {
                     if (c.name().equals("currentTimeMillis")) {
-                        return new Sql(Long.toString(nowMillis), SqlType.INT);
+                        return new Sql(Long.toString(InfinoClock.read(nowMillis)), SqlType.INT);
                     }
                     throw refuse("calls System." + c.name() + ", which is not served");
                 }
@@ -1260,7 +1260,7 @@ final class InfinoScriptTranslator {
         switch (n.className()) {
             case "Date" -> {
                 if (n.args().isEmpty()) {
-                    return fromMillis(new Sql(Long.toString(nowMillis), SqlType.INT));
+                    return fromMillis(new Sql(Long.toString(InfinoClock.read(nowMillis)), SqlType.INT));
                 }
                 Sql v = emit(n.args().get(0), scope);
                 return fromMillis(v);

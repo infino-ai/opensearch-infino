@@ -807,6 +807,28 @@
         index: rc_default
         body: { size: 1, sort: [ { n: desc } ] }
   - match: { hits.hits.0._id: "3" }
+  # A now inside query text reads the request's clock too, in the query or in an
+  # aggregation's filter: the counts are the real ones, and none is kept.
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, query: { query_string: { query: "at:[* TO now]" } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, query: { query_string: { query: "at:[* TO now]" } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, query: { query_string: { query: "at:>now-1h" } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, aggs: { recent: { filter: { query_string: { query: "at:[now-1d TO now]" } } } } }
+  - match: { aggregations.recent.doc_count: 0 }
   - do:
       indices.stats:
         index: rc_default

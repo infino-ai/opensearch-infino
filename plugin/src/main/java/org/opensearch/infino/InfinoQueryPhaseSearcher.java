@@ -77,7 +77,9 @@ import java.util.List;
  * its rows are in its place, and the coordinating node answers it once over
  * every reached shard's table, each at its shard's cut (see
  * {@link InfinoExactAggregation}). Every shard
- * reads {@code now} as the coordinating node set it. A scroll pages in a
+ * reads {@code now} as the coordinating node set it, and a search whose
+ * translation reads it is not kept in the shard request cache (see
+ * {@link #beforeQueryPhase}). A scroll pages in a
  * fixed order, the id's when the request names none: each round resumes
  * after the last hit the coordinating node handed out from this shard, as
  * proxy mode's scroll resumes after its last.
@@ -157,6 +159,75 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         };
     }
 
+    /**
+     * The time {@code now} means on this shard. A search routed to be kept
+     * in the shard request cache ({@link InfinoQueryExt#CACHED_REQUEST})
+     * carries no clock in its ext, which the cache keys on: it reads the
+     * coordinating node's clock from the shard request, which the cache
+     * leaves out of its key, as a stock shard reads it.
+     */
+    private static long clock(SearchContext context, InfinoQueryExt carried) {
+        return kept(carried) ? context.request().nowInMillis() : carried.nowMillis();
+    }
+
+    private static boolean kept(InfinoQueryExt carried) {
+        return carried != null && InfinoQueryExt.CACHED_REQUEST.equals(carried.request());
+    }
+
+    /**
+     * Before the shard request cache is consulted for a search routed to
+     * be kept: the shard translates it as its query phase will, and marks
+     * it not cacheable when the translation read the clock, as a stock
+     * shard marks a search whose parsing asked for the time. Any place a
+     * translation turns {@code now} into a time reads it through
+     * {@link InfinoClock}, so a {@code now} inside query text, an
+     * aggregation's filter or a date range is caught wherever it is
+     * written. A search the shard cannot translate is not kept either.
+     */
+    static void beforeQueryPhase(SearchContext context) {
+        if (!isEngineShard(context)) {
+            return;
+        }
+        InfinoQueryExt carried = InfinoQueryExt.carried(context.request().source());
+        if (!kept(carried)) {
+            return;
+        }
+        boolean readsClock;
+        try {
+            readsClock = readsClock(context, carried);
+        } catch (RuntimeException e) {
+            readsClock = true;
+        }
+        if (readsClock) {
+            context.getQueryShardContext().setIsCacheable(false);
+        }
+    }
+
+    /** Whether translating the search for this shard reads the clock: its query, sorts, filters and aggregations. */
+    private static boolean readsClock(SearchContext context, InfinoQueryExt carried) {
+        ShardId shardId = context.indexShard().shardId();
+        String table = InfinoPlugin.tables().ensure(context.indexShard().indexSettings().getIndexMetadata(), shardId.id());
+        InfinoAccess access = InfinoSecurity.access(shardId.getIndexName(), InfinoSecurityCalls.SEARCH);
+        SearchSourceBuilder source = carried.source();
+        long now = context.request().nowInMillis();
+        return InfinoClock.reads(() -> {
+            InfinoSearch.Plan plan = InfinoSearch.plan(table, source, now, access);
+            int position = 0;
+            for (AggregationBuilder b : InfinoSearch.builders(source)) {
+                InfinoAggregationProcessor.Spec.of(
+                    b,
+                    plan.cols(),
+                    table,
+                    qb -> InfinoQueryTranslator.predicate(qb, plan.cols(), table, now),
+                    access,
+                    position++,
+                    context.request().numberOfShards() > 1,
+                    now
+                );
+            }
+        });
+    }
+
     private static void serve(SearchContext context, ContextIndexSearcher searcher) throws IOException {
         InfinoQueryExt carried = InfinoQueryExt.carried(context.request().source());
         if (carried == null) {
@@ -177,7 +248,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         boolean laterRound = scroll != null && scroll.totalHits != null;
         SearchSourceBuilder source = scroll == null ? carried.source() : scrollRound(carried.source(), scroll, laterRound, searcher);
         // The coordinating node's clock, so every shard reads `now` the same.
-        long now = carried.nowMillis();
+        long now = clock(context, carried);
         // The rows this search's skeleton reader holds, as a stock shard's search sees its reader.
         Long cut = InfinoEngine.visibleSeqNo(table, readerVersion(searcher));
         long generation = InfinoEngine.generation(context.indexShard().indexSettings().getUUID());

@@ -179,9 +179,12 @@ public class InfinoSearchActionFilter implements ActionFilter {
                 answered = ActionListener.runAfter(answered, () -> InfinoExactAggregation.forget(id));
             }
             // The shard request cache keys on the routed request, its ext included. A
-            // search it may keep is routed with a fixed id and clock, so a repeat
-            // matches the entry its first run left; any other search is kept out of
-            // the cache, where each run would only add an entry no search reads.
+            // search it may keep is routed with a fixed id and no clock, so a repeat
+            // matches the entry its first run left; the shard reads the clock from the
+            // shard request, outside the key, and does not keep a search whose
+            // translation reads it (InfinoQueryPhaseSearcher#beforeQueryPhase). Any
+            // other search is kept out of the cache, where each run would only add an
+            // entry no search reads.
             if (shardCacheable(search, written, concrete, filters, exactAtCoordinator)) {
                 search.source(InfinoQueryExt.route(written, InfinoQueryExt.CACHED_REQUEST, false, 0L));
             } else {
@@ -213,9 +216,9 @@ public class InfinoSearchActionFilter implements ActionFilter {
      * not asked to skip it), with no hits to fetch, whose answer depends on
      * nothing but the shard's rows. The routed copy's id ties a shard's hits
      * to its fetch phase and a cardinality or percentiles aggregation over
-     * several shards to the search recorded for it; the clock is what
-     * {@code now} means. So none of these may be in play: an exact
-     * aggregation answered here, {@code now}, a script or a random score, a
+     * several shards to the search recorded for it. So none of these may be
+     * in play: an exact aggregation answered here, a {@code now} this check
+     * sees (the shard catches the rest), a script or a random score, a
      * filtering alias, or a rule of the security plugin narrowing what the
      * user sees, which the shard's key does not hold.
      */

@@ -138,7 +138,8 @@ public final class InfinoQueryExt extends SearchExtBuilder {
      * The id a search the shard request cache may keep is routed with: it
      * has no hits to fetch and no aggregation answered at the coordinating
      * node, so nothing is looked up by it, and a repeat of the search keys
-     * the same (see {@link InfinoSearchActionFilter}).
+     * the same (see {@link InfinoSearchActionFilter}). Its clock is 0: the
+     * shard reads the time from the shard request instead.
      */
     static final String CACHED_REQUEST = "cached";
 
