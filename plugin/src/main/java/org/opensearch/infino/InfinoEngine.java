@@ -448,6 +448,25 @@ public class InfinoEngine extends InternalEngine {
         COPIES.put(shard, new Copy(routing.primary(), routing.allocationId() == null ? null : routing.allocationId().getId()));
     }
 
+    /**
+     * The shards whose copy on this node has written its history into the
+     * table as primary ({@link #fillSeqNoGaps}): from then on, and not
+     * before, the table holds every write its skeleton reader holds.
+     */
+    private static final Set<ShardId> TOOK_OVER = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Whether this node's copy of {@code shard} may fill the shard request
+     * cache: a primary that has written its history into the table. A
+     * replica becoming primary keeps its skeleton reader while it fills the
+     * table, so a count it kept before the fill would be served after it
+     * for that reader's life.
+     */
+    static boolean fillsRequestCache(ShardId shard) {
+        Copy copy = COPIES.get(shard);
+        return copy != null && copy.primary() && TOOK_OVER.contains(shard);
+    }
+
     /** {@code shard}'s skeleton holds a document for every row of its table: ids need no lookup. */
     static void skeletonComplete(ShardId shard) {
         SKELETON_COMPLETE.add(shard);
@@ -456,6 +475,7 @@ public class InfinoEngine extends InternalEngine {
     /** This node no longer holds a copy of {@code shard}. */
     static void forgetCopy(ShardId shard) {
         COPIES.remove(shard);
+        TOOK_OVER.remove(shard);
         SKELETON_COMPLETE.remove(shard);
     }
 
@@ -1364,6 +1384,7 @@ public class InfinoEngine extends InternalEngine {
             Copy copy = COPIES.get(shardId);
             COPIES.put(shardId, new Copy(true, copy == null ? null : copy.allocationId()));
             fillTable();
+            TOOK_OVER.add(shardId);
         }
         return filled;
     }

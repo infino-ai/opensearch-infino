@@ -211,10 +211,12 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
      * a table another node writes, through a connection that may see it up
      * to a second late, while its reader stays the same. A count it read
      * too early would be served for that reader's life. A replica still
-     * answers every search; it only does not keep the answer.
+     * answers every search; it only does not keep the answer. A replica
+     * becoming primary starts keeping them once it has written its history
+     * into the table ({@link InfinoEngine#fillsRequestCache}).
      */
     private static boolean fillsRequestCache(SearchContext context) {
-        return context.indexShard().routingEntry().primary();
+        return context.indexShard().routingEntry().primary() && InfinoEngine.fillsRequestCache(context.indexShard().shardId());
     }
 
     /** Whether translating the search for this shard reads the clock: its query, sorts, filters and aggregations. */
