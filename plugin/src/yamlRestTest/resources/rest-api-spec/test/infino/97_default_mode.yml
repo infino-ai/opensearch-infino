@@ -729,3 +729,112 @@
   - match: { hits.hits.0._source.tag: x }
   - match:
       hits.hits.0._source.ip: /^[0-9a-f]{64}$/
+
+---
+"Default mode: a repeated search is answered from the shard request cache, and a write is seen by the next one":
+  - do:
+      indices.create:
+        index: rc_default
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { tag: { type: keyword }, n: { type: long }, at: { type: date } } }
+  - do:
+      bulk:
+        index: rc_default
+        refresh: true
+        body:
+          - index: { _id: "1" }
+          - { tag: x, n: 1, at: "2020-01-01T00:00:00Z" }
+          - index: { _id: "2" }
+          - { tag: x, n: 2, at: "2020-01-02T00:00:00Z" }
+
+  # Three times the same request: one miss, then two hits, as for a Lucene index.
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, aggs: { s: { sum: { field: n } }, t: { terms: { field: tag } } } }
+  - match: { aggregations.s.value: 3.0 }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, aggs: { s: { sum: { field: n } }, t: { terms: { field: tag } } } }
+  - match: { aggregations.s.value: 3.0 }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, aggs: { s: { sum: { field: n } }, t: { terms: { field: tag } } } }
+  - match: { aggregations.s.value: 3.0 }
+  - do:
+      indices.stats:
+        index: rc_default
+        metric: request_cache
+  - match: { indices.rc_default.primaries.request_cache.hit_count: 2 }
+  - match: { indices.rc_default.primaries.request_cache.miss_count: 1 }
+
+  # A write and a refresh give the shard a new reader: the next request misses and sees the write.
+  - do:
+      index:
+        index: rc_default
+        id: "3"
+        refresh: true
+        body: { tag: y, n: 4, at: "2020-01-03T00:00:00Z" }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, aggs: { s: { sum: { field: n } }, t: { terms: { field: tag } } } }
+  - match: { aggregations.s.value: 7.0 }
+
+  # Counting from now, request_cache=false and a request with hits are never kept.
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, query: { range: { at: { lte: now } } }, aggs: { s: { sum: { field: n } } } }
+  - match: { aggregations.s.value: 7.0 }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, query: { range: { at: { lte: now } } }, aggs: { s: { sum: { field: n } } } }
+  - match: { aggregations.s.value: 7.0 }
+  - do:
+      search:
+        index: rc_default
+        request_cache: false
+        body: { size: 0, aggs: { s: { sum: { field: n } } } }
+  - match: { aggregations.s.value: 7.0 }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 1, sort: [ { n: desc } ] }
+  - match: { hits.hits.0._id: "3" }
+  # A now inside query text reads the request's clock too, in the query or in an
+  # aggregation's filter: the counts are the real ones, and none is kept.
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, query: { query_string: { query: "at:[* TO now]" } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, query: { query_string: { query: "at:[* TO now]" } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, query: { query_string: { query: "at:>now-1h" } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, aggs: { recent: { filter: { query_string: { query: "at:[now-1d TO now]" } } } } }
+  - match: { aggregations.recent.doc_count: 0 }
+  - do:
+      indices.stats:
+        index: rc_default
+        metric: request_cache
+  - match: { indices.rc_default.primaries.request_cache.hit_count: 2 }
+  - match: { indices.rc_default.primaries.request_cache.miss_count: 2 }
+  - do:
+      indices.delete:
+        index: rc_default

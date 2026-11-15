@@ -16,6 +16,7 @@ import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.indices.IndicesService;
 import org.opensearch.ingest.IngestService;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.PluginsService;
@@ -46,6 +47,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     private static volatile IngestService ingestService;
     private static volatile IndexScopedSettings indexScopedSettings;
     private static volatile TransportService transportService;
+    private static volatile IndicesService indicesService;
 
     @Inject
     public InfinoServices(
@@ -72,6 +74,8 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoServices.indexScopedSettings = injector.getInstance(IndexScopedSettings.class);
         // A write to a table another node writes is sent there (see InfinoBulkActionFilter).
         InfinoServices.transportService = injector.getInstance(TransportService.class);
+        // The shards on this node, whose shard request cache an account switch clears (see InfinoRequestCache).
+        InfinoServices.indicesService = injector.getInstance(IndicesService.class);
         InfinoClient.bind(injector);
         // The security plugin's components, when it runs, come from the same injector.
         InfinoSecurity.bind(injector);
@@ -113,6 +117,11 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     static void bind(ClusterService clusterService, ThreadPool threadPool) {
         InfinoServices.clusterService = clusterService;
         InfinoServices.threadPool = threadPool;
+    }
+
+    /** The node's indices, or null before the services are injected. */
+    static IndicesService indicesService() {
+        return indicesService;
     }
 
     /** The node's transport, or null before the services are injected. */

@@ -17,9 +17,12 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.index.Index;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -175,7 +178,21 @@ public class InfinoSearchActionFilter implements ActionFilter {
                 // goes once it has: the records held are the searches in flight.
                 answered = ActionListener.runAfter(answered, () -> InfinoExactAggregation.forget(id));
             }
-            search.source(InfinoQueryExt.route(written, id, exactAtCoordinator, now));
+            // The shard request cache keys on the routed request, its ext included. A
+            // search it may keep is routed with a fixed id and no clock, so a repeat
+            // matches the entry its first run left; the shard reads the clock from the
+            // shard request, outside the key, and does not keep a search whose
+            // translation reads it (InfinoQueryPhaseSearcher#beforeQueryPhase). Any
+            // other search is kept out of the cache, where each run would only add an
+            // entry no search reads.
+            if (shardCacheable(search, written, concrete, filters, exactAtCoordinator)) {
+                search.source(InfinoQueryExt.route(written, InfinoQueryExt.CACHED_REQUEST, false, 0L));
+            } else {
+                if (!Boolean.FALSE.equals(search.requestCache())) {
+                    search.requestCache(false);
+                }
+                search.source(InfinoQueryExt.route(written, id, exactAtCoordinator, now));
+            }
             chain.proceed(task, action, request, answered);
             return;
         }
@@ -190,6 +207,51 @@ public class InfinoSearchActionFilter implements ActionFilter {
         long start = System.nanoTime();
         // The table is read on the search pool, never on the thread that took the request.
         InfinoServices.fork(ThreadPool.Names.SEARCH, listener::onFailure, () -> serve(search, state, names, infino, metadata, start, listener));
+    }
+
+    /**
+     * Whether the shard request cache may keep a default-mode search's
+     * shard results under a key a repeat of it shares: a search the cache
+     * keeps for a Lucene index ({@code size: 0}, no scroll, not profiled,
+     * not asked to skip it), with no hits to fetch, whose answer depends on
+     * nothing but the shard's rows. The routed copy's id ties a shard's hits
+     * to its fetch phase and a cardinality or percentiles aggregation over
+     * several shards to the search recorded for it. So none of these may be
+     * in play: an exact aggregation answered here, a {@code now} this check
+     * sees (the shard catches the rest), a script or a random score, a
+     * filtering alias, or a rule of the security plugin narrowing what the
+     * user sees, which the shard's key does not hold.
+     */
+    private static boolean shardCacheable(
+        SearchRequest search,
+        SearchSourceBuilder source,
+        String[] concrete,
+        Map<String, QueryBuilder> filters,
+        boolean exactAtCoordinator
+    ) {
+        if (exactAtCoordinator || Boolean.FALSE.equals(search.requestCache()) || search.scroll() != null) {
+            return false;
+        }
+        if (source.size() != 0 || source.profile()) {
+            return false;
+        }
+        for (QueryBuilder filter : filters.values()) {
+            if (filter != null) {
+                return false;
+            }
+        }
+        try {
+            for (String name : concrete) {
+                if (!InfinoSecurity.access(name, InfinoSecurityCalls.SEARCH).unrestricted()) {
+                    return false;
+                }
+            }
+            Map<String, Object> body = XContentHelper.convertToMap(new BytesArray(source.toString()), false, MediaTypeRegistry.JSON).v2();
+            return !InfinoRequestCache.changesWithoutWrites(body);
+        } catch (Exception e) {
+            // An access the security plugin refuses is refused by the shards; it is not kept.
+            return false;
+        }
     }
 
     /** Answer a search over proxy-mode indices from their tables. */

@@ -34,6 +34,7 @@ import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.Plugin;
@@ -42,6 +43,7 @@ import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.fetch.FetchSubPhase;
+import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.query.QueryPhaseSearcher;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -455,6 +457,13 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         }
         Index index = indexModule.getIndex();
         indexModule.addSettingsUpdateConsumer(OPTIMIZE_INTERVAL, interval -> optimizer.intervalChanged(index, interval));
+        // Whether the shard request cache may keep a search is decided before it is consulted.
+        indexModule.addSearchOperationListener(new SearchOperationListener() {
+            @Override
+            public void onPreQueryPhase(SearchContext searchContext) {
+                InfinoQueryPhaseSearcher.beforeQueryPhase(searchContext);
+            }
+        });
         indexModule.addIndexEventListener(new IndexEventListener() {
             // Which copy of a shard this node holds, for the engine (see InfinoEngine#writesTable).
             @Override
