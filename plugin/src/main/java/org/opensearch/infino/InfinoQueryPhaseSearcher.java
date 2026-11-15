@@ -182,7 +182,8 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
      * translation turns {@code now} into a time reads it through
      * {@link InfinoClock}, so a {@code now} inside query text, an
      * aggregation's filter or a date range is caught wherever it is
-     * written. A search the shard cannot translate is not kept either.
+     * written. A search the shard cannot translate is not kept either, nor
+     * one on a copy that may not fill the cache ({@link #fillsRequestCache}).
      */
     static void beforeQueryPhase(SearchContext context) {
         if (!isEngineShard(context)) {
@@ -192,15 +193,28 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         if (!kept(carried)) {
             return;
         }
-        boolean readsClock;
+        boolean keep;
         try {
-            readsClock = readsClock(context, carried);
+            keep = fillsRequestCache(context) && readsClock(context, carried) == false;
         } catch (RuntimeException e) {
-            readsClock = true;
+            keep = false;
         }
-        if (readsClock) {
+        if (keep == false) {
             context.getQueryShardContext().setIsCacheable(false);
         }
+    }
+
+    /**
+     * Whether this copy of the shard may fill the shard request cache: only
+     * its primary. The cache keys on the copy's skeleton reader, and a
+     * replica's reader does not say what its table holds: the replica reads
+     * a table another node writes, through a connection that may see it up
+     * to a second late, while its reader stays the same. A count it read
+     * too early would be served for that reader's life. A replica still
+     * answers every search; it only does not keep the answer.
+     */
+    private static boolean fillsRequestCache(SearchContext context) {
+        return context.indexShard().routingEntry().primary();
     }
 
     /** Whether translating the search for this shard reads the clock: its query, sorts, filters and aggregations. */
