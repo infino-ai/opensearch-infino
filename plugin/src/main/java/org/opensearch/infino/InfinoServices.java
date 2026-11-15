@@ -21,6 +21,7 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.function.Consumer;
@@ -169,6 +170,23 @@ public final class InfinoServices extends AbstractLifecycleComponent {
                 throw err;
             }
             throw e;
+        }
+    }
+
+    /**
+     * Waits for {@code started}, if any, to finish, for a caller that failed
+     * with {@code failure} while it ran: the work is not left running past
+     * the request that started it. Its own failure is suppressed into
+     * {@code failure}, which stays the one reported.
+     */
+    static void drain(CompletableFuture<?> started, Throwable failure) {
+        if (started == null) {
+            return;
+        }
+        try {
+            started.join();
+        } catch (CompletionException | CancellationException e) {
+            failure.addSuppressed(e.getCause() != null ? e.getCause() : e);
         }
     }
 
