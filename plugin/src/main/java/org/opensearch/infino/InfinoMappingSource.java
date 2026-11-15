@@ -80,6 +80,21 @@ record InfinoMappingSource(boolean enabled, String[] includes, String[] excludes
     }
 
     /**
+     * Refuses a hit of {@code index} fetched under {@code fetchSource} and
+     * {@code fetchFields} (the request's {@code fields}) when the mapping
+     * disables {@code _source}: a source filter ({@link #refuseFilters}) when
+     * the source is returned, and any {@code fields} ({@link #refuseFields}).
+     * Called on each hit a response carries, as stock's fetch phase refuses
+     * the hits it fetches, so a page that fetches none is answered.
+     */
+    void refuse(String index, FetchSourceContext fetchSource, List<?> fetchFields) {
+        if (fetchSource == null || fetchSource.fetchSource()) {
+            refuseFilters(index, fetchSource);
+        }
+        refuseFields(index, fetchFields);
+    }
+
+    /**
      * Refuses {@code request} when it filters the source of a hit of
      * {@code index} and the mapping disables {@code _source}, as stock's
      * fetch phase does.
@@ -116,7 +131,7 @@ record InfinoMappingSource(boolean enabled, String[] includes, String[] excludes
      * The source {@code src} as the mapping keeps it, which stock's
      * {@code fields} read: what its includes and excludes keep (the whole
      * of {@code src} when it names none). Not called when the mapping
-     * disables {@code _source}: {@link #refuseFields} refuses that first.
+     * disables {@code _source}: {@link #refuse} refuses its hits.
      */
     String kept(String src) {
         if (whole()) {

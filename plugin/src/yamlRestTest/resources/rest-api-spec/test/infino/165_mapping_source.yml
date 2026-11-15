@@ -57,6 +57,13 @@
   - do:
       catch: /Unable to retrieve the requested \[fields\] since _source is disabled in the mappings for index \[off_inf\]/
       search: { index: off_inf, body: { size: 0, aggs: { t: { top_hits: { size: 1, fields: [ rank ] } } } } }
+  # Only a hit the response carries is refused: a page past the last hit is answered.
+  - do: { search: { index: off_luc, body: { from: 1, size: 1, _source: [ rank ], fields: [ rank ], query: { match_all: {} } } } }
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 0 }
+  - do: { search: { index: off_inf, body: { from: 1, size: 1, _source: [ rank ], fields: [ rank ], query: { match_all: {} } } } }
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 0 }
   # Beside an index that keeps its source, stock fails only the disabled
   # index's shard, and so does default mode. Proxy mode answers a search
   # over several indices as one, so it fails the whole search (see the README).
@@ -68,11 +75,13 @@
   - match: { errors: false }
   - do: { search: { index: "off_luc,on_luc", body: { fields: [ rank ], query: { match_all: {} } } } }
   - match: { _shards.failed: 1 }
+  - match: { hits.total.value: 2 }
   - length: { hits.hits: 1 }
   - match: { hits.hits.0._id: d2 }
   - match: { hits.hits.0.fields: { rank: [ 2 ] } }
   - do: { search: { index: "off_inf,on_inf", body: { fields: [ rank ], query: { match_all: {} } } } }
   - match: { _shards.failed: 1 }
+  - match: { hits.total.value: 2 }
   - length: { hits.hits: 1 }
   - match: { hits.hits.0._id: d2 }
   - match: { hits.hits.0.fields: { rank: [ 2 ] } }
@@ -85,6 +94,17 @@
   - do:
       catch: /Unable to retrieve the requested \[fields\] since _source is disabled in the mappings for index \[off_px\]/
       search: { index: "off_px,on_px", body: { fields: [ rank ], query: { match_all: {} } } }
+  - do:
+      catch: /_source is disabled in the mappings for index \[off_px\]/
+      search: { index: off_px, body: { _source: [ rank ], query: { match_all: {} } } }
+  - do: { search: { index: off_px, body: { from: 1, size: 1, _source: [ rank ], fields: [ rank ], query: { match_all: {} } } } }
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 0 }
+  # The page keeps on_px's hit only, so nothing of off_px is fetched.
+  - do: { search: { index: "off_px,on_px", body: { size: 1, sort: [ { rank: desc } ], fields: [ rank ], query: { match_all: {} } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d2 }
+  - match: { hits.hits.0.fields: { rank: [ 2 ] } }
   - do: { search: { index: off_luc, body: { docvalue_fields: [ rank, note ], query: { match_all: {} } } } }
   - match: { hits.hits.0.fields: { rank: [ 1 ], note: [ a ] } }
   - do: { search: { index: off_inf, body: { docvalue_fields: [ rank, note ], query: { match_all: {} } } } }
