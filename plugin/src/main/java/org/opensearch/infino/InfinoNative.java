@@ -266,12 +266,9 @@ public final class InfinoNative {
             }
             COLUMNS.clear();
             SOURCES.invalidateAll();
-            // Moved before the swap and after it: a result read while it happens
-            // is kept under a connection no read after it names.
             InfinoRequestCache.changedAll();
             conn = p;
             opened = target;
-            InfinoRequestCache.changedAll();
         }
     }
 

@@ -646,8 +646,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     public List<QuerySpec<?>> getQueries() {
         return List.of(
             new QuerySpec<>(InfinoKnnQueryBuilder.NAME, InfinoKnnQueryBuilder::new, InfinoKnnQueryBuilder::fromXContent),
-            new QuerySpec<>(InfinoHybridQueryBuilder.NAME, InfinoHybridQueryBuilder::new, InfinoHybridQueryBuilder::fromXContent),
-            new QuerySpec<>(InfinoConnectionQueryBuilder.NAME, InfinoConnectionQueryBuilder::new, InfinoConnectionQueryBuilder::fromXContent)
+            new QuerySpec<>(InfinoHybridQueryBuilder.NAME, InfinoHybridQueryBuilder::new, InfinoHybridQueryBuilder::fromXContent)
         );
     }
 }

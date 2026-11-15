@@ -141,11 +141,6 @@ final class InfinoRequestCache {
         CONNECTION.incrementAndGet();
     }
 
-    /** Which connection the node reads through: moves on every reopen (see {@link InfinoNative#init}). */
-    static long connection() {
-        return CONNECTION.get();
-    }
-
     private static long generation(String table) {
         AtomicLong g = GENERATIONS.get(table);
         return g == null ? 0 : g.get();
