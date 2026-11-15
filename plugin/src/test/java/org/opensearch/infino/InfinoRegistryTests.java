@@ -90,6 +90,38 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
         assertTrue(System.nanoTime() - start < TimeValue.timeValueMillis(500).nanos());
     }
 
+    public void testARefreshAfterAHostedWriteWaitsOutTheReadWindow() {
+        TimeValue window = TimeValue.timeValueMillis(300);
+        InfinoNative.readWindow(window);
+        try {
+            long start = System.nanoTime();
+            InfinoNative.wrote("written_here", start);
+            InfinoNative.awaitVisible("written_here");
+            assertTrue(System.nanoTime() - start >= window.nanos());
+            // Once seen, the write no longer holds a refresh back.
+            long again = System.nanoTime();
+            InfinoNative.awaitVisible("written_here");
+            assertTrue(System.nanoTime() - again < window.nanos());
+        } finally {
+            InfinoNative.readWindow(InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY));
+        }
+    }
+
+    public void testAnOlderWriteNotedLastDoesNotCutTheWaitForANewerOne() {
+        TimeValue window = TimeValue.timeValueMillis(300);
+        InfinoNative.readWindow(window);
+        try {
+            long start = System.nanoTime();
+            InfinoNative.wrote("written_twice", start);
+            // A write that completed a window earlier, noted after the newer one.
+            InfinoNative.wrote("written_twice", start - window.nanos());
+            InfinoNative.awaitVisible("written_twice");
+            assertTrue(System.nanoTime() - start >= window.nanos());
+        } finally {
+            InfinoNative.readWindow(InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY));
+        }
+    }
+
     public void testTheReadWindowDefaultsToASecond() {
         assertEquals(TimeValue.timeValueSeconds(1), InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY));
     }

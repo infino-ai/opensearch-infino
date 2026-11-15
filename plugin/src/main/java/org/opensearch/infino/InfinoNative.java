@@ -331,8 +331,17 @@ public final class InfinoNative {
      */
     private static void wrote(String name) {
         if (hosted() && readWindowNanos > 0) {
-            WRITTEN.put(name, System.nanoTime());
+            wrote(name, System.nanoTime());
         }
+    }
+
+    /**
+     * Note a write to {@code name} that completed at {@code at}. Of two
+     * writes noted at once, the later stays, whichever is noted last, so a
+     * wait never ends before the later one is visible.
+     */
+    static void wrote(String name, long at) {
+        WRITTEN.merge(name, at, (a, b) -> b - a > 0 ? b : a);
     }
 
     /**

@@ -102,6 +102,10 @@ final class InfinoRegistry {
     private static final Map<String, IndexMetadata> pending = new ConcurrentHashMap<>();
     /** How many writes of each index's row have failed in a row, for how long to wait before the next. */
     private static final Map<String, Integer> failures = new ConcurrentHashMap<>();
+    /** When each row whose write failed may be tried again ({@link System#nanoTime}); a drain before then leaves it pending. */
+    private static final Map<String, Long> retryAt = new ConcurrentHashMap<>();
+    /** The rows with a retry scheduled: one each, however often a row fails meanwhile. */
+    private static final Set<String> scheduled = ConcurrentHashMap.newKeySet();
     /** The wait before a failed row is written again; each further failure doubles it. */
     static final TimeValue FIRST_RETRY_DELAY = TimeValue.timeValueSeconds(1);
     /** The longest wait between tries of a row that keeps failing. */
@@ -162,16 +166,39 @@ final class InfinoRegistry {
     }
 
     /**
-     * Write every index whose metadata moved since it was last recorded.
-     * Called from the generic pool after a state applies, and by every read
-     * of the registry first, so a read sees the state the manager has seen.
+     * Write every index whose metadata moved since it was last recorded, as
+     * the cluster holds it now; a row waiting out a failed write's delay
+     * stays pending until then. Called from the generic pool after a state
+     * applies, and by every read of the registry first, so a read sees the
+     * state the manager has seen.
      */
     private static synchronized void drain() {
+        if (!electedManager()) {
+            // The elected manager records every index from its own state; what
+            // this node queued while it was the manager may be older than that.
+            pending.clear();
+            failures.clear();
+            retryAt.clear();
+            return;
+        }
+        long now = System.nanoTime();
         for (String name : new ArrayList<>(pending.keySet())) {
-            IndexMetadata md = pending.remove(name);
-            if (md != null) {
-                record(md);
+            Long at = retryAt.get(name);
+            if (at != null && at - now > 0) {
+                continue;
             }
+            IndexMetadata md = pending.remove(name);
+            if (md == null) {
+                continue;
+            }
+            IndexMetadata current = current(md);
+            if (current == null) {
+                failures.remove(name);
+                retryAt.remove(name);
+                log.debug("[infino] index {} is gone; its registry row is not written", name);
+                continue;
+            }
+            record(current);
         }
     }
 
@@ -187,14 +214,11 @@ final class InfinoRegistry {
             write(name, rowOf(md));
             recorded.put(name, md.getVersion());
             failures.remove(name);
+            retryAt.remove(name);
         } catch (Exception e) {
-            if (!live(md)) {
-                failures.remove(name);
-                log.debug("[infino] index {} is gone; its registry row is not written", name, e);
-                return;
-            }
             int failed = failures.merge(name, 1, Integer::sum);
             TimeValue delay = retryDelay(failed);
+            retryAt.put(name, System.nanoTime() + delay.nanos());
             // Metadata queued since this write began is newer, and wins.
             pending.putIfAbsent(name, md);
             if (failed < WARN_AFTER_FAILURES) {
@@ -202,7 +226,7 @@ final class InfinoRegistry {
             } else {
                 log.warn("[infino] index {} could not be recorded in the registry ({} tries); trying again in {}", name, failed, delay, e);
             }
-            retryIn(delay);
+            retryIn(name, delay);
         }
     }
 
@@ -218,23 +242,47 @@ final class InfinoRegistry {
         return TimeValue.timeValueMillis(Math.min(max, first << doublings));
     }
 
-    /** Write what is pending again after {@code delay}, on the generic pool. */
-    private static void retryIn(TimeValue delay) {
+    /**
+     * Try {@code name}'s row again after {@code delay}, on the generic pool,
+     * unless a retry of it is already scheduled.
+     */
+    private static void retryIn(String name, TimeValue delay) {
         ThreadPool threadPool = InfinoServices.threadPool();
         if (threadPool == null) {
             return; // no node: the next state applied, or the next read of the registry, writes it
         }
-        threadPool.schedule(InfinoRegistry::drain, delay, ThreadPool.Names.GENERIC);
+        if (scheduled.add(name)) {
+            threadPool.schedule(() -> retry(name), delay, ThreadPool.Names.GENERIC);
+        }
     }
 
-    /** Whether the cluster still holds {@code md}'s index (the same one, not one since created under its name). */
-    private static boolean live(IndexMetadata md) {
+    /** A scheduled retry of {@code name}'s row: write what is due, and schedule the row again if it is still waiting. */
+    private static void retry(String name) {
+        scheduled.remove(name);
+        drain();
+        Long at = retryAt.get(name);
+        if (at != null && pending.containsKey(name)) {
+            retryIn(name, TimeValue.timeValueNanos(Math.max(0, at - System.nanoTime())));
+        }
+    }
+
+    /** Whether this node is the elected cluster manager, the one node that writes the registry's rows; true with no node. */
+    private static boolean electedManager() {
+        ClusterService clusterService = InfinoServices.clusterService();
+        return clusterService == null || clusterService.state().nodes().isLocalNodeElectedClusterManager();
+    }
+
+    /**
+     * {@code md}'s index as the cluster holds it now, or null once it is gone
+     * (or another index has since been created under its name).
+     */
+    private static IndexMetadata current(IndexMetadata md) {
         ClusterService clusterService = InfinoServices.clusterService();
         if (clusterService == null) {
-            return true;
+            return md;
         }
         IndexMetadata now = clusterService.state().metadata().index(md.getIndex().getName());
-        return now != null && now.getIndexUUID().equals(md.getIndexUUID());
+        return now != null && now.getIndexUUID().equals(md.getIndexUUID()) ? now : null;
     }
 
     /**
@@ -281,6 +329,7 @@ final class InfinoRegistry {
         pending.remove(name);
         recorded.remove(name);
         failures.remove(name);
+        retryAt.remove(name);
         try {
             declare();
             InfinoNative.deleteOsids(TABLE, new String[] { name }, 1);
