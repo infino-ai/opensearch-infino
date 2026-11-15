@@ -306,6 +306,21 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(InfinoQueryTranslator.oneToken(""));
     }
 
+    public void testAWordPastTheTokenLengthKeepsItsClause() {
+        String atBound = "a".repeat(254) + "b";
+        String pastBound = "a".repeat(255) + "b";
+        assertTrue(InfinoQueryTranslator.oneToken(atBound));
+        assertFalse(InfinoQueryTranslator.oneToken(pastBound));
+        Translation merged = translate(
+            QueryBuilders.queryStringQuery("message:" + atBound + " OR message:cache").defaultOperator(org.opensearch.index.query.Operator.AND)
+        );
+        assertEquals("token_match('os_logs_0', 'message', '" + atBound + " cache', 'or')", merged.from());
+        Translation split = translate(
+            QueryBuilders.queryStringQuery("message:" + pastBound + " OR message:cache").defaultOperator(org.opensearch.index.query.Operator.AND)
+        );
+        assertFalse(split.from() + " " + split.where(), (split.from() + split.where()).contains(pastBound + " cache"));
+    }
+
     public void testAPhraseOrASigilKeepsTheSubquery() {
         assertTrue(InfinoQueryTranslator.plainQuery("disk full"));
         assertFalse(InfinoQueryTranslator.plainQuery("\"disk full\""));

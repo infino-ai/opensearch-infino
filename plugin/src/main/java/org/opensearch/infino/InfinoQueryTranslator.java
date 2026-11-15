@@ -1327,13 +1327,21 @@ final class InfinoQueryTranslator {
     }
 
     /**
+     * The longest token both {@code standard} analyzers keep whole: Lucene's
+     * counts UTF-16 units and the engine's code points, and a longer word is
+     * split into pieces. {@link String#length} is at least the code points.
+     */
+    static final int MAX_TOKEN_CHARS = 255;
+
+    /**
      * Whether the {@code standard} analyzer surely reads {@code word} as one
      * token: letters and digits only, none of a script it splits into a token
-     * per character. Any other ({@code disk-full}, {@code a*}) may be several
-     * tokens, which its clause requires together and an any-word clause would not.
+     * per character, and no longer than {@link #MAX_TOKEN_CHARS}. Any other
+     * ({@code disk-full}, {@code a*}, 256 letters) may be several tokens, which
+     * its clause requires together and an any-word clause would not.
      */
     static boolean oneToken(String word) {
-        if (word.isEmpty()) {
+        if (word.isEmpty() || word.length() > MAX_TOKEN_CHARS) {
             return false;
         }
         return word.codePoints().allMatch(c -> {
