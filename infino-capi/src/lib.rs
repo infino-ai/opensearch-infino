@@ -3159,6 +3159,72 @@ pub unsafe extern "C" fn infino_sorted(
     .unwrap_or(ptr::null_mut())
 }
 
+/// The table's first `k` rows `predicate` keeps (an SQL expression over its
+/// columns), ordered by `column` (or, with `column` null or empty, by the one
+/// column `predicate` names), ascending or (`descending` non-zero)
+/// descending, rows sharing a value in row id order, each carrying `osid`,
+/// `_id`, the column when one is named and, when `with_source` is non-zero,
+/// `source`. Read from the column's range index with no statement planned
+/// when `predicate` is one interval on that range-indexed column; `null`
+/// otherwise, for the caller to plan the statement. The predicate's
+/// literals are coerced to the columns' types first, as a statement would
+/// read them, so a date compared with a string is an interval on the date.
+#[no_mangle]
+pub unsafe extern "C" fn infino_sorted_where(
+    h: *mut Bridge,
+    name: *const c_char,
+    column: *const c_char,
+    predicate: *const c_char,
+    descending: c_int,
+    k: c_int,
+    with_source: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(predicate)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(predicate) })
+        else {
+            return ptr::null_mut();
+        };
+        let column = unsafe { cstr(column) }.filter(|c| !c.is_empty());
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let schema = match DFSchema::try_from(table.schema().as_ref().clone()) {
+            Ok(s) => s,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        // A predicate the parser cannot read as one expression over the
+        // table's columns is no interval; the caller plans the statement.
+        let Ok(filter) = predicate_parser()
+            .parse_sql_expr(predicate, &schema)
+            .and_then(|expr| expr.rewrite(&mut TypeCoercionRewriter::new(&schema)))
+            .map(|t| t.data)
+        else {
+            return out_string("null".to_string());
+        };
+        let mut projection = vec![OSID, ROW_ID];
+        if let Some(column) = column.filter(|c| *c != ROW_ID) {
+            projection.push(column);
+        }
+        if with_source != 0 {
+            projection.push(SOURCE);
+        }
+        match table.sorted_search_where(
+            column,
+            &filter,
+            descending != 0,
+            k.max(0) as usize,
+            Some(&projection),
+        ) {
+            Ok(Some(b)) => out_string(batches_to_json(&without_column(&b, "score"))),
+            Ok(None) => out_string("null".to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// `batches` without their column `name`, when they have one.
 fn without_column(batches: &[RecordBatch], name: &str) -> Vec<RecordBatch> {
     batches

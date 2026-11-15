@@ -32,7 +32,10 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
+import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.ConstantScoreQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.TextClause;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
@@ -600,6 +603,22 @@ public final class InfinoSearch {
                 if (indexSorted(plan) && !seqNoAndPrimaryTerm) {
                     SortSpec first = plan.sorts().get(0);
                     rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, wantsSource(source));
+                } else if (intervalPage(plan) && onlyRanges(source.query()) && !seqNoAndPrimaryTerm) {
+                    // A page in no order of the rows one interval of a range-indexed
+                    // column keeps: its first rows in the column's order, from the
+                    // column's range index, when the predicate is one such interval.
+                    rows = InfinoNative.sortedRowsWhere(plan.table(), null, plan.hitWhere(), false, fetch, wantsSource(source));
+                } else if (afterInterval(plan) && !seqNoAndPrimaryTerm) {
+                    // A page after one present value of a range-indexed sort column:
+                    // the rows past it are one interval of the column, read from its
+                    // range index. They are the page when they fill it; otherwise the
+                    // rows missing the value follow them, and the statement reads both.
+                    SortSpec first = plan.sorts().get(0);
+                    String past = "(" + plan.hitWhere() + ") AND " + first.expr() + (first.desc() ? " < " : " > ") + afterLiteral(plan, first, plan.searchAfter()[0]);
+                    rows = InfinoNative.sortedRowsWhere(plan.table(), first.name(), past, first.desc(), fetch, wantsSource(source));
+                    if (rows != null && rows.size() < fetch) {
+                        rows = null;
+                    }
                 }
                 // Every row in no order: the engine's first rows in storage order,
                 // read with no statement planned.
@@ -801,6 +820,83 @@ public final class InfinoSearch {
             && plan.searchAfter() == null
             && plan.collapse() == null
             && plan.scriptFields().isEmpty();
+    }
+
+    /**
+     * Whether the page is the rows a predicate keeps, in no order: no text
+     * query, vector, sort, search_after, collapse or scripted field. The
+     * engine reads it from a range index when the predicate is one interval
+     * on a range-indexed column ({@link InfinoNative#sortedRowsWhere}),
+     * stock returning the matches in no order either.
+     */
+    static boolean intervalPage(Plan plan) {
+        return plan.vector() == null
+            && plan.query().principal() == null
+            && !InfinoQueryTranslator.ALL.equals(plan.hitWhere())
+            && plan.sorts().isEmpty()
+            && plan.searchAfter() == null
+            && plan.collapse() == null
+            && plan.scriptFields().isEmpty();
+    }
+
+    /**
+     * Whether {@code query} is ranges and nothing else: a range, or a bool
+     * of ranges that must (or filter) hold, with no should or must_not. Only
+     * such a query can be one interval of a range-indexed column, so only
+     * its page asks the engine for one ({@link #intervalPage}); the engine
+     * checks that the ranges are one interval on one such column.
+     */
+    static boolean onlyRanges(QueryBuilder query) {
+        if (query instanceof RangeQueryBuilder) {
+            return true;
+        }
+        if (query instanceof ConstantScoreQueryBuilder c) {
+            return onlyRanges(c.innerQuery());
+        }
+        if (query instanceof BoolQueryBuilder b) {
+            List<QueryBuilder> required = new ArrayList<>(b.must());
+            required.addAll(b.filter());
+            return b.should().isEmpty() && b.mustNot().isEmpty() && !required.isEmpty() && required.stream().allMatch(InfinoSearch::onlyRanges);
+        }
+        return false;
+    }
+
+    /**
+     * Whether the page continues after one present value of a sort on one
+     * field's own column, ties broken by the row id, with no text query,
+     * vector, collapse or scripted field: the rows past the value are one
+     * interval of that column when the predicate allows it.
+     */
+    static boolean afterInterval(Plan plan) {
+        List<SortSpec> sorts = plan.sorts();
+        Object[] after = plan.searchAfter();
+        if (plan.vector() != null
+            || plan.query().principal() != null
+            || plan.collapse() != null
+            || !plan.scriptFields().isEmpty()
+            || after == null
+            || after.length != 1
+            || after[0] == null
+            || sorts.size() != 2) {
+            return false;
+        }
+        SortSpec first = sorts.get(0);
+        SortSpec tie = sorts.get(1);
+        return tie.name().equals(InfinoSql.ROW_ID)
+            && !tie.desc()
+            && !first.name().equals(InfinoSql.ROW_ID)
+            && !first.name().equals(InfinoQueryTranslator.OSID)
+            && first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()));
+    }
+
+    /** A search_after value of sort {@code s} as a literal of its column's type, read as the keyset reads it. */
+    private static String afterLiteral(Plan plan, SortSpec s, Object value) {
+        Column sorted = plan.cols().get(s.name());
+        String lit = InfinoQueryTranslator.literalForType(s.type(), value, plan.nowMillis(), sorted == null ? null : sorted.dateFormat());
+        if (lit == null) {
+            throw new IllegalArgumentException("[infino] search_after value [" + value + "] is not a " + s.type().name().toLowerCase(Locale.ROOT));
+        }
+        return lit;
     }
 
     /**

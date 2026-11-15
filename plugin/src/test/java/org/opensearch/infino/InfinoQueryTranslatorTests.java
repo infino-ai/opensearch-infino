@@ -262,6 +262,61 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             NOW
         );
         assertFalse(InfinoSearch.indexSorted(byRowId));
+        // A predicate's rows in no order may come from a range index; a sort, or every row, does not.
+        InfinoSearch.Plan ranged = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.rangeQuery("status").gte(500).lt(600)),
+            java.util.List.of(),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertTrue(InfinoSearch.intervalPage(ranged));
+        assertFalse(InfinoSearch.intervalPage(filtered));
+        InfinoSearch.Plan everyRow = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchAllQuery()),
+            java.util.List.of(),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertFalse(InfinoSearch.intervalPage(everyRow));
+        // Only a query of ranges alone can be one interval: a term beside one, or a should, is not asked for.
+        assertTrue(InfinoSearch.onlyRanges(QueryBuilders.rangeQuery("status").gte(500)));
+        assertTrue(InfinoSearch.onlyRanges(QueryBuilders.boolQuery().must(QueryBuilders.rangeQuery("status").gte(500)).filter(QueryBuilders.rangeQuery("status").lt(600))));
+        assertFalse(InfinoSearch.onlyRanges(QueryBuilders.boolQuery().must(QueryBuilders.rangeQuery("status").gte(500)).must(QueryBuilders.termQuery("level", "error"))));
+        assertFalse(InfinoSearch.onlyRanges(QueryBuilders.boolQuery().should(QueryBuilders.rangeQuery("status").gte(500))));
+        assertFalse(InfinoSearch.onlyRanges(QueryBuilders.termQuery("level", "error")));
+        assertFalse(InfinoSearch.onlyRanges(null));
+        // A page after one present value of a column sort may come from its range index.
+        InfinoSearch.Plan afterOne = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchAllQuery()),
+            all.sorts(),
+            null,
+            null,
+            null,
+            new Object[] { 404 },
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertTrue(InfinoSearch.afterInterval(afterOne));
+        // Two values (the tiebreak's too) make the rows past them an OR, and no search_after is no page after one.
+        assertFalse(InfinoSearch.afterInterval(after));
+        assertFalse(InfinoSearch.afterInterval(all));
     }
 
     /** A match_all sorted by {@code status} descending, then by the row id, continuing after {@code after}, under {@code collapse}. */
