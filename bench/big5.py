@@ -11,8 +11,9 @@ loads every line of the data files. `run` sends each search once as a
 warmup, then `--calls` times, sampling the node's RSS every 20 ms while a call
 runs. A node that dies mid-search is reported as such and left out of the
 searches after it. Each answer is compared with stock's: hits.total, the
-set of top hit ids (scored searches may order ties differently), and the
-aggregations as JSON.
+set of top hit ids (scored searches may order ties differently), or for a
+sorted search the hits' sort values in order with the ids tied on each, and
+the aggregations as JSON.
 
 Linux only: a node's resident memory is read from /proc.
 """
@@ -48,6 +49,21 @@ def call(port, method, path, body=None, timeout=600, ndjson=False):
             return r.status, json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read() or b"{}")
+
+
+def top_hits(body, hits):
+    """The top hits to compare with stock's: their ids as a set, or, for a
+    search with a sort, each run of equal sort values in order with the ids
+    of that run as a set, so the order counts and only ties may differ."""
+    if "sort" not in body:
+        return sorted(h["_id"] for h in hits)
+    runs = []
+    for h in hits:
+        if runs and runs[-1][0] == h.get("sort"):
+            runs[-1][1].append(h["_id"])
+        else:
+            runs.append((h.get("sort"), [h["_id"]]))
+    return [[values, sorted(ids)] for values, ids in runs]
 
 
 def nodes(args):
@@ -181,7 +197,7 @@ def run(args):
             alive = rss_kb(pid) is not None
             if not alive:
                 dead.add(name)
-            ids = sorted(h["_id"] for h in res.get("hits", {}).get("hits", [])) if status == 200 else None
+            ids = top_hits(body, res.get("hits", {}).get("hits", [])) if status == 200 else None
             total = res.get("hits", {}).get("total") if status == 200 else None
             aggs = json.dumps(res.get("aggregations"), sort_keys=True) if status == 200 else None
             answer = (ids, json.dumps(total, sort_keys=True), aggs)

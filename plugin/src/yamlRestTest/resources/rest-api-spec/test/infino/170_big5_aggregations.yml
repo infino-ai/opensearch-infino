@@ -331,6 +331,144 @@
   - match: { aggregations.sig.buckets.0.bg_count: 1 }
 
 ---
+"significant_terms under adjacent long parents past 2^53, on a keyword and on a long, matches a Lucene twin":
+  # 9007199254740992 and 9007199254740993 round to the same double:
+  # each parent keeps its own foreground, and each long term its own
+  # background count.
+  - do:
+      indices.create:
+        index: big_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              p: { type: long }
+              n: { type: long }
+              tag: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: big_luc
+        body:
+          - index: { _id: "l1" }
+          - { p: 9007199254740992, n: 9007199254740992, tag: x }
+          - index: { _id: "l2" }
+          - { p: 9007199254740992, n: 9007199254740992, tag: x }
+          - index: { _id: "l3" }
+          - { p: 9007199254740993, n: 9007199254740993, tag: y }
+          - index: { _id: "l4" }
+          - { p: 1, n: 1, tag: z }
+          - index: { _id: "l5" }
+          - { p: 1, n: 1, tag: z }
+          - index: { _id: "l6" }
+          - { p: 1, n: 1, tag: z }
+  - match: { errors: false }
+  - do:
+      indices.create:
+        index: big_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              p: { type: long }
+              n: { type: long }
+              tag: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: big_inf
+        body:
+          - index: { _id: "l1" }
+          - { p: 9007199254740992, n: 9007199254740992, tag: x }
+          - index: { _id: "l2" }
+          - { p: 9007199254740992, n: 9007199254740992, tag: x }
+          - index: { _id: "l3" }
+          - { p: 9007199254740993, n: 9007199254740993, tag: y }
+          - index: { _id: "l4" }
+          - { p: 1, n: 1, tag: z }
+          - index: { _id: "l5" }
+          - { p: 1, n: 1, tag: z }
+          - index: { _id: "l6" }
+          - { p: 1, n: 1, tag: z }
+  - match: { errors: false }
+  - do:
+      search:
+        index: big_luc
+        body:
+          size: 0
+          aggs:
+            p:
+              terms: { field: p }
+              aggs:
+                sig: { significant_terms: { field: tag, min_doc_count: 1 } }
+  - length: { aggregations.p.buckets: 3 }
+  - match: { aggregations.p.buckets.1.key: 9007199254740992 }
+  - length: { aggregations.p.buckets.1.sig.buckets: 1 }
+  - match: { aggregations.p.buckets.1.sig.buckets.0.key: x }
+  - match: { aggregations.p.buckets.2.key: 9007199254740993 }
+  - length: { aggregations.p.buckets.2.sig.buckets: 1 }
+  - match: { aggregations.p.buckets.2.sig.buckets.0.key: y }
+  - do:
+      search:
+        index: big_luc
+        body:
+          size: 0
+          aggs:
+            p:
+              terms: { field: p }
+              aggs:
+                sig: { significant_terms: { field: n, min_doc_count: 1 } }
+  - length: { aggregations.p.buckets: 3 }
+  - match: { aggregations.p.buckets.1.key: 9007199254740992 }
+  - length: { aggregations.p.buckets.1.sig.buckets: 1 }
+  - match: { aggregations.p.buckets.1.sig.buckets.0.key: 9007199254740992 }
+  - match: { aggregations.p.buckets.1.sig.buckets.0.doc_count: 2 }
+  - match: { aggregations.p.buckets.1.sig.buckets.0.bg_count: 2 }
+  - match: { aggregations.p.buckets.2.key: 9007199254740993 }
+  - length: { aggregations.p.buckets.2.sig.buckets: 1 }
+  - match: { aggregations.p.buckets.2.sig.buckets.0.key: 9007199254740993 }
+  - match: { aggregations.p.buckets.2.sig.buckets.0.doc_count: 1 }
+  - match: { aggregations.p.buckets.2.sig.buckets.0.bg_count: 1 }
+  - do:
+      search:
+        index: big_inf
+        body:
+          size: 0
+          aggs:
+            p:
+              terms: { field: p }
+              aggs:
+                sig: { significant_terms: { field: tag, min_doc_count: 1 } }
+  - length: { aggregations.p.buckets: 3 }
+  - match: { aggregations.p.buckets.1.key: 9007199254740992 }
+  - length: { aggregations.p.buckets.1.sig.buckets: 1 }
+  - match: { aggregations.p.buckets.1.sig.buckets.0.key: x }
+  - match: { aggregations.p.buckets.2.key: 9007199254740993 }
+  - length: { aggregations.p.buckets.2.sig.buckets: 1 }
+  - match: { aggregations.p.buckets.2.sig.buckets.0.key: y }
+  - do:
+      search:
+        index: big_inf
+        body:
+          size: 0
+          aggs:
+            p:
+              terms: { field: p }
+              aggs:
+                sig: { significant_terms: { field: n, min_doc_count: 1 } }
+  - length: { aggregations.p.buckets: 3 }
+  - match: { aggregations.p.buckets.1.key: 9007199254740992 }
+  - length: { aggregations.p.buckets.1.sig.buckets: 1 }
+  - match: { aggregations.p.buckets.1.sig.buckets.0.key: 9007199254740992 }
+  - match: { aggregations.p.buckets.1.sig.buckets.0.doc_count: 2 }
+  - match: { aggregations.p.buckets.1.sig.buckets.0.bg_count: 2 }
+  - match: { aggregations.p.buckets.2.key: 9007199254740993 }
+  - length: { aggregations.p.buckets.2.sig.buckets: 1 }
+  - match: { aggregations.p.buckets.2.sig.buckets.0.key: 9007199254740993 }
+  - match: { aggregations.p.buckets.2.sig.buckets.0.doc_count: 1 }
+  - match: { aggregations.p.buckets.2.sig.buckets.0.bg_count: 1 }
+
+---
 "UTC minute, hour, day and fixed date keys before 1970 and outside 1677 to 2262 match a Lucene twin":
   # date_bin works in nanoseconds, which an i64 holds only from 1677-09-21
   # to 2262-04-11. A date outside that range must still get its bucket.

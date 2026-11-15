@@ -3540,9 +3540,15 @@ public class InfinoAggregationProcessor {
         if (key == null) {
             return NULL_KEY;
         }
+        // An integral key as itself: through a double, longs past 2^53 such as
+        // 9007199254740992 and 9007199254740993 would print the same.
+        if (key instanceof Long || key instanceof Integer || key instanceof Short || key instanceof Byte) {
+            return key.toString();
+        }
         if (key instanceof Number n) {
             double d = n.doubleValue();
-            return d == Math.rint(d) && Math.abs(d) < 9.0e15 ? Long.toString((long) d) : Double.toString(d);
+            // A whole double in a long's range prints as that long does, so the two meet.
+            return d == Math.rint(d) && d >= -0x1p63 && d < 0x1p63 ? Long.toString((long) d) : Double.toString(d);
         }
         return key.toString();
     }
