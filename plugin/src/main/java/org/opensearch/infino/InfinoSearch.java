@@ -625,51 +625,57 @@ public final class InfinoSearch {
         // The exact total, when it is read before the page.
         Long counted = null;
         boolean shortPage = false;
-        if (size == 0 && !stockKnn) {
-            rows = List.of();
-        } else if (plan.vector() != null) {
-            VectorRequest v = plan.vector();
-            String emb = floatsToJson(v.vector());
-            // The engine's top k for a knn query (the page is a window over them),
-            // otherwise as many as the page reaches. Either way each hit comes
-            // back with its id, score and source.
-            int want = stockKnn ? v.k() : Math.max(fetch, 1);
-            if (v.filter() != null) {
-                rows = InfinoNative.sqlRows(filteredKnnStatement(plan.table(), v));
-            } else {
-                String json = v.hybrid()
-                    ? InfinoNative.hybrid(plan.table(), v.textColumn(), v.textQuery(), v.vectorColumn(), emb, want)
-                    : InfinoNative.knn(plan.table(), v.vectorColumn(), emb, want);
-                rows = InfinoNative.rows(json);
-            }
-            knnDistance = !v.hybrid();
-            if (seqNoAndPrimaryTerm) {
-                // The vector entry points return ids, scores and sources; the page's
-                // sequence numbers come in one statement.
-                List<String> ids = new ArrayList<>();
-                for (int i = from; i < Math.min(rows.size(), fetch); i++) {
-                    Object id = rows.get(i).get(InfinoQueryTranslator.OSID);
-                    if (id != null) {
-                        ids.add(id.toString());
-                    }
+        try {
+            if (size == 0 && !stockKnn) {
+                rows = List.of();
+            } else if (plan.vector() != null) {
+                VectorRequest v = plan.vector();
+                String emb = floatsToJson(v.vector());
+                // The engine's top k for a knn query (the page is a window over them),
+                // otherwise as many as the page reaches. Either way each hit comes
+                // back with its id, score and source.
+                int want = stockKnn ? v.k() : Math.max(fetch, 1);
+                if (v.filter() != null) {
+                    rows = InfinoNative.sqlRows(filteredKnnStatement(plan.table(), v));
+                } else {
+                    String json = v.hybrid()
+                        ? InfinoNative.hybrid(plan.table(), v.textColumn(), v.textQuery(), v.vectorColumn(), emb, want)
+                        : InfinoNative.knn(plan.table(), v.vectorColumn(), emb, want);
+                    rows = InfinoNative.rows(json);
                 }
-                vectorSeqs = InfinoNative.storedSeqs(plan.table(), ids);
+                knnDistance = !v.hybrid();
+                if (seqNoAndPrimaryTerm) {
+                    // The vector entry points return ids, scores and sources; the page's
+                    // sequence numbers come in one statement.
+                    List<String> ids = new ArrayList<>();
+                    for (int i = from; i < Math.min(rows.size(), fetch); i++) {
+                        Object id = rows.get(i).get(InfinoQueryTranslator.OSID);
+                        if (id != null) {
+                            ids.add(id.toString());
+                        }
+                    }
+                    vectorSeqs = InfinoNative.storedSeqs(plan.table(), ids);
+                }
+            } else if (bareRanked(plan) && !seqNoAndPrimaryTerm) {
+                // A text query and nothing else: the engine's BM25 call returns
+                // the page with its sources, so no statement is planned for it. It
+                // returns no sequence numbers, so a request for them takes the hit statement.
+                TextClause text = q.principal();
+                rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
+            } else {
+                CountedRows read = countedRows(
+                    firstCount,
+                    () -> total(plan),
+                    () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm)
+                );
+                rows = read.rows();
+                counted = read.total();
+                shortPage = rows.size() < fetch && shortPageIsTotal(plan);
             }
-        } else if (bareRanked(plan) && !seqNoAndPrimaryTerm) {
-            // A text query and nothing else: the engine's BM25 call returns
-            // the page with its sources, so no statement is planned for it. It
-            // returns no sequence numbers, so a request for them takes the hit statement.
-            TextClause text = q.principal();
-            rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
-        } else {
-            CountedRows read = countedRows(
-                firstCount,
-                () -> total(plan),
-                () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm)
-            );
-            rows = read.rows();
-            counted = read.total();
-            shortPage = rows.size() < fetch && shortPageIsTotal(plan);
+        } catch (RuntimeException | Error e) {
+            // A page that fails waits out its count rather than leave it running past the request.
+            InfinoServices.drain(beside, e);
+            throw e;
         }
 
         long total;
