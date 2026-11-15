@@ -31,10 +31,10 @@ public class InfinoEngineTests extends OpenSearchTestCase {
      */
     private static final class External extends ReferenceManager<DirectoryReader> {
         private final ReferenceManager<DirectoryReader> internal;
-        private final Map<Long, Long> coveredByReader;
+        private final InfinoEngine.ReaderCovers coveredByReader;
         private final Map<Long, Long> published = new HashMap<>();
 
-        External(ReferenceManager<DirectoryReader> internal, Map<Long, Long> coveredByReader) throws IOException {
+        External(ReferenceManager<DirectoryReader> internal, InfinoEngine.ReaderCovers coveredByReader) throws IOException {
             this.internal = internal;
             this.coveredByReader = coveredByReader;
             current = internal.acquire();
@@ -48,9 +48,7 @@ public class InfinoEngineTests extends OpenSearchTestCase {
                 internal.release(reader);
                 return null;
             }
-            synchronized (coveredByReader) {
-                published.put(reader.getVersion(), coveredByReader.get(reader.getVersion()));
-            }
+            published.put(reader.getVersion(), coveredByReader.covered(reader.getVersion()));
             return reader;
         }
 
@@ -72,7 +70,7 @@ public class InfinoEngineTests extends OpenSearchTestCase {
 
     public void testAReaderIsCoveredBeforeItIsPublished() throws Exception {
         try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, new IndexWriterConfig())) {
-            Map<Long, Long> coveredByReader = new HashMap<>();
+            InfinoEngine.ReaderCovers coveredByReader = new InfinoEngine.ReaderCovers();
             AtomicLong processed = new AtomicLong(-1);
             try (
                 ReaderManager internal = new ReaderManager(writer);
@@ -91,17 +89,21 @@ public class InfinoEngineTests extends OpenSearchTestCase {
                     }
                 }
                 // A refresh with nothing new opens no reader and records nothing.
-                int recorded = coveredByReader.size();
-                processed.set(10);
-                external.maybeRefreshBlocking();
-                assertEquals(recorded, coveredByReader.size());
+                DirectoryReader last = external.acquire();
+                try {
+                    processed.set(10);
+                    external.maybeRefreshBlocking();
+                    assertEquals(Long.valueOf(2), coveredByReader.covered(last.getVersion()));
+                } finally {
+                    external.release(last);
+                }
             }
         }
     }
 
     public void testASearchDuringARefreshNeverMeetsAnUncoveredReader() throws Exception {
         try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, new IndexWriterConfig())) {
-            Map<Long, Long> coveredByReader = new HashMap<>();
+            InfinoEngine.ReaderCovers coveredByReader = new InfinoEngine.ReaderCovers();
             AtomicLong processed = new AtomicLong(-1);
             try (
                 ReaderManager internal = new ReaderManager(writer);
@@ -120,10 +122,8 @@ public class InfinoEngineTests extends OpenSearchTestCase {
                         try {
                             DirectoryReader reader = external.acquire();
                             try {
-                                synchronized (coveredByReader) {
-                                    if (!coveredByReader.containsKey(reader.getVersion())) {
-                                        uncovered.set("reader " + reader.getVersion() + " was searched before its cover was known");
-                                    }
+                                if (coveredByReader.covered(reader.getVersion()) == null) {
+                                    uncovered.set("reader " + reader.getVersion() + " was searched before its cover was known");
                                 }
                             } finally {
                                 external.release(reader);
@@ -143,6 +143,49 @@ public class InfinoEngineTests extends OpenSearchTestCase {
                 done.set(true);
                 searcher.join();
                 assertNull(uncovered.get(), uncovered.get());
+            }
+        }
+    }
+
+    public void testInternalRefreshesKeepThePublishedReadersCover() throws Exception {
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, new IndexWriterConfig())) {
+            InfinoEngine.ReaderCovers coveredByReader = new InfinoEngine.ReaderCovers();
+            AtomicLong processed = new AtomicLong(-1);
+            try (
+                ReaderManager internal = new ReaderManager(writer);
+                External external = new External(internal, coveredByReader)
+            ) {
+                internal.addListener(new InfinoEngine.CoverRecorder<>(internal, processed::get, coveredByReader));
+                external.addListener(new InfinoEngine.CoverPublisher<>(external, coveredByReader));
+                writer.addDocument(new Document());
+                processed.set(0);
+                external.maybeRefreshBlocking();
+                long searched;
+                DirectoryReader reader = external.acquire();
+                try {
+                    searched = reader.getVersion();
+                } finally {
+                    external.release(reader);
+                }
+                // With external refresh off, only the engine's own refreshes open readers.
+                writer.addDocument(new Document());
+                processed.set(1);
+                internal.maybeRefreshBlocking();
+                long unpublished;
+                reader = internal.acquire();
+                try {
+                    unpublished = reader.getVersion();
+                } finally {
+                    internal.release(reader);
+                }
+                for (long seq = 2; seq < InfinoEngine.READERS_REMEMBERED + 2; seq++) {
+                    writer.addDocument(new Document());
+                    processed.set(seq);
+                    internal.maybeRefreshBlocking();
+                }
+                assertEquals(Long.valueOf(0), coveredByReader.covered(searched));
+                // A reader no search was given is forgotten past the bound.
+                assertNull(coveredByReader.covered(unpublished));
             }
         }
     }

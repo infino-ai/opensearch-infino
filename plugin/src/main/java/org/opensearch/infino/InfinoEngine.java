@@ -167,7 +167,7 @@ public class InfinoEngine extends InternalEngine {
     /** Locks over ids that order each id's skeleton write with its record in the batch. */
     private static final int ID_LOCK_STRIPES = 1024;
     /** Skeleton readers whose covered sequence number is remembered; a search on an older one sees no stamped row. */
-    private static final int READERS_REMEMBERED = 1024;
+    static final int READERS_REMEMBERED = 1024;
     /** The sequence number of a row that every reader may show: no stamp. */
     private static final long UNSTAMPED = -1L;
     /**
@@ -410,12 +410,7 @@ public class InfinoEngine extends InternalEngine {
      */
     private final Map<String, Long> unrefreshed = new HashMap<>();
     /** The sequence number each recent skeleton reader covers, by the reader's version. */
-    private final Map<Long, Long> coveredByReader = new LinkedHashMap<>(16, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<Long, Long> eldest) {
-            return size() > READERS_REMEMBERED;
-        }
-    };
+    private final ReaderCovers coveredByReader = new ReaderCovers();
     /** The sequence number the latest skeleton reader covers. */
     private volatile long latestCovered = UNSTAMPED;
     /** Whether a refresh for {@link #MAX_UNREFRESHED} is queued. */
@@ -500,6 +495,8 @@ public class InfinoEngine extends InternalEngine {
         // refresh returns: what it covers is known before any search can use it.
         ReferenceManager<OpenSearchDirectoryReader> internal = getReferenceManager(SearcherScope.INTERNAL);
         internal.addListener(new CoverRecorder<>(internal, this::getProcessedLocalCheckpoint, coveredByReader));
+        ReferenceManager<OpenSearchDirectoryReader> external = getReferenceManager(SearcherScope.EXTERNAL);
+        external.addListener(new CoverPublisher<>(external, coveredByReader));
         BY_TABLE.put(table, this);
         log.info("[infino] engine attached to table {} for {}", table, config.getShardId());
     }
@@ -515,11 +512,11 @@ public class InfinoEngine extends InternalEngine {
     static final class CoverRecorder<R extends DirectoryReader> implements ReferenceManager.RefreshListener {
         private final ReferenceManager<R> readers;
         private final LongSupplier processed;
-        private final Map<Long, Long> coveredByReader;
+        private final ReaderCovers coveredByReader;
         /** The operations processed when the refresh under way began; guarded by the manager's refresh lock. */
         private long covering = UNSTAMPED;
 
-        CoverRecorder(ReferenceManager<R> readers, LongSupplier processed, Map<Long, Long> coveredByReader) {
+        CoverRecorder(ReferenceManager<R> readers, LongSupplier processed, ReaderCovers coveredByReader) {
             this.readers = readers;
             this.processed = processed;
             this.coveredByReader = coveredByReader;
@@ -537,12 +534,87 @@ public class InfinoEngine extends InternalEngine {
             }
             R reader = readers.acquire();
             try {
-                synchronized (coveredByReader) {
-                    coveredByReader.merge(reader.getVersion(), covering, Math::max);
-                }
+                coveredByReader.opened(reader.getVersion(), covering);
             } finally {
                 readers.release(reader);
             }
+        }
+    }
+
+    /**
+     * Keeps, as the external reader manager publishes each skeleton reader,
+     * the cover recorded when it was opened among the published readers'
+     * covers, which the internal-only refreshes cannot push out.
+     */
+    static final class CoverPublisher<R extends DirectoryReader> implements ReferenceManager.RefreshListener {
+        private final ReferenceManager<R> readers;
+        private final ReaderCovers coveredByReader;
+
+        CoverPublisher(ReferenceManager<R> readers, ReaderCovers coveredByReader) {
+            this.readers = readers;
+            this.coveredByReader = coveredByReader;
+        }
+
+        @Override
+        public void beforeRefresh() {}
+
+        @Override
+        public void afterRefresh(boolean didRefresh) throws IOException {
+            if (!didRefresh) {
+                return;
+            }
+            R reader = readers.acquire();
+            try {
+                coveredByReader.published(reader.getVersion());
+            } finally {
+                readers.release(reader);
+            }
+        }
+    }
+
+    /**
+     * The sequence number each recent skeleton reader covers, by the reader's
+     * version, as two bounded records: the readers the internal manager opened,
+     * which refreshes of the engine's own (a flush, a get) add to, and the
+     * readers searches were given. A reader is covered from its opening, so
+     * before it is published; the readers searches use stay remembered however
+     * many internal refreshes follow.
+     */
+    static final class ReaderCovers {
+        private final Map<Long, Long> opened = remembered();
+        private final Map<Long, Long> published = remembered();
+
+        private static Map<Long, Long> remembered() {
+            return new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<Long, Long> eldest) {
+                    return size() > READERS_REMEMBERED;
+                }
+            };
+        }
+
+        /** The internal manager opened reader {@code version}, holding every operation up to {@code covered}. */
+        synchronized void opened(long version, long covered) {
+            opened.merge(version, covered, Math::max);
+        }
+
+        /** Searches may now use reader {@code version}: keep its cover among the published readers'. */
+        synchronized void published(long version) {
+            Long covered = opened.get(version);
+            if (covered != null) {
+                published.merge(version, covered, Math::max);
+            }
+        }
+
+        /** Published reader {@code version} holds every operation up to {@code covered}. */
+        synchronized void covers(long version, long covered) {
+            published.merge(version, covered, Math::max);
+        }
+
+        /** What reader {@code version} covers, or null when it is not remembered. */
+        synchronized Long covered(long version) {
+            Long covered = published.get(version);
+            return covered != null ? covered : opened.get(version);
         }
     }
 
@@ -560,10 +632,7 @@ public class InfinoEngine extends InternalEngine {
         if (engine == null) {
             return null;
         }
-        Long covered;
-        synchronized (engine.coveredByReader) {
-            covered = engine.coveredByReader.get(readerVersion);
-        }
+        Long covered = engine.coveredByReader.covered(readerVersion);
         return engine.cutAt(covered == null ? UNSTAMPED : covered);
     }
 
@@ -606,9 +675,7 @@ public class InfinoEngine extends InternalEngine {
         } catch (IOException e) {
             throw new UncheckedIOException("[infino] reading the skeleton reader of " + shardId + " failed", e);
         }
-        synchronized (coveredByReader) {
-            coveredByReader.merge(version, covered, Math::max);
-        }
+        coveredByReader.covers(version, covered);
         if (covered > latestCovered) {
             latestCovered = covered;
         }
