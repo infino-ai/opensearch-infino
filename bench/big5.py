@@ -65,9 +65,57 @@ def rss_kb(pid):
     return None
 
 
+RALLY_BIG5 = "https://rally-tracks.elastic.co/big5"
+# Elastic's big5 corpus: each file's documents, from the big5 track.json.
+RALLY_BIG5_DOCS = [139000967, 157534429, 138860135, 155215122, 135967215, 142025858, 145339293, 157897411]
+
+
+def rally_batches(docs, batch):
+    """The first `docs` documents of Elastic's big5 corpus, the same share of
+    each of its 8 files (as the track's `ingest_percentage` takes them),
+    streamed from Elastic's server and decompressed on the way: nothing is
+    written to disk. The files are read in parallel and their batches
+    interleaved."""
+    import queue
+    import subprocess
+
+    total = sum(RALLY_BIG5_DOCS)
+    take = [round(n * docs / total) for n in RALLY_BIG5_DOCS]
+    out = queue.Queue(maxsize=64)
+
+    def read(i, n):
+        cmd = f"curl -sfL {RALLY_BIG5}/logs-{i + 1}.ndjson.bz2 | bzip2 -dc 2>/dev/null | head -n {n}"
+        proc = subprocess.Popen(["bash", "-o", "pipefail", "-c", cmd], stdout=subprocess.PIPE, bufsize=1 << 20)
+        buf, got = [], 0
+        for line in proc.stdout:
+            buf.append(b'{"index":{}}\n' + line.rstrip(b"\n") + b"\n")
+            got += 1
+            if len(buf) == batch:
+                out.put(b"".join(buf))
+                buf = []
+        if buf:
+            out.put(b"".join(buf))
+        proc.wait()
+        if got != n:
+            print(f"logs-{i + 1}: read {got} of {n} documents", file=sys.stderr, flush=True)
+        out.put(None)
+
+    readers = [threading.Thread(target=read, args=(i, n), daemon=True) for i, n in enumerate(take)]
+    for t in readers:
+        t.start()
+    left = len(readers)
+    while left:
+        b = out.get()
+        if b is None:
+            left -= 1
+        else:
+            yield b
+
+
 def load(args):
-    files = sorted(glob.glob(os.path.expanduser(args.data)))
-    if not files:
+    rally = int(args.data.split(":", 1)[1]) if args.data.startswith("rally:") else 0
+    files = [] if rally else sorted(glob.glob(os.path.expanduser(args.data)))
+    if not files and not rally:
         sys.exit(f"no data files match {args.data}")
     mapping = json.load(open(os.path.join(HERE, "big5-index.json")))
     for name, (port, _) in nodes(args).items():
@@ -79,6 +127,9 @@ def load(args):
             sys.exit(f"{name}: create {INDEX} returned {status}: {body}")
 
         def batches():
+            if rally:
+                yield from rally_batches(rally, args.batch)
+                return
             buf, n = [], 0
             for f in files:
                 with open(f, "rb") as fh:
@@ -212,7 +263,7 @@ def main():
     p.add_argument("--base-port", type=int, default=9250)
     sub = p.add_subparsers(dest="cmd", required=True)
     lo = sub.add_parser("load")
-    lo.add_argument("--data", required=True)
+    lo.add_argument("--data", required=True, help="a glob of ndjson files, or rally:N for the first N documents of Elastic's big5 corpus, streamed")
     lo.add_argument("--docs", type=int, default=0, help="stop after this many documents (0: all)")
     lo.add_argument("--batch", type=int, default=5000)
     lo.add_argument("--clients", type=int, default=4)

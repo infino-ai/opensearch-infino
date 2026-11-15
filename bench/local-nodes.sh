@@ -73,7 +73,7 @@ YML
   if [ "$name" != stock ]; then
     "$home/bin/opensearch-plugin" remove opensearch-neural-search >/dev/null
     "$home/bin/opensearch-plugin" install --batch "file://$(realpath "$ZIP")" >/dev/null
-    printf -- '-Dinfino.lib=%s\n-Dinfino.uri=file://%s\n' "$(realpath "$LIB")" "$NODES/$name/catalog" >> "$home/config/jvm.options"
+    printf -- '-Dinfino.lib=%s\n-Dinfino.uri=%s\n' "$(realpath "$LIB")" "${CATALOG_URI:-file://$NODES/$name/catalog}" >> "$home/config/jvm.options"
     [ "$name" = proxy ] && echo "infino.default_mode.enabled: false" >> "$home/config/opensearch.yml"
   fi
   column_cache "$home"
