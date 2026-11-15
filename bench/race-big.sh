@@ -5,6 +5,7 @@
 # 30 alternating calls, request_cache=false), two rounds after a warmup,
 # and one answer check.
 #   ZIP=... LIB=... NODES=... CATALOG_URI=gs://bucket/prefix DOCS=100000000 OUT=dir bench/race-big.sh
+# CLIENTS is how many bulks the loader keeps in flight (default 4).
 # START names the nodes started fresh and LOAD the nodes loaded (both default
 # to stock and proxy), so a run whose proxy load failed can redo just that.
 # Nothing else should compile or load on the host meanwhile: a build beside
@@ -32,7 +33,7 @@ grep -h "infino.uri" "$NODES/proxy/opensearch-3.9.0/config/jvm.options"
 log "nodes up"
 for n in $LOAD; do
   t0=$(date +%s)
-  python3 bench/big5.py --nodes "$NODES" load --only $n --data "rally:$DOCS" > "$OUT/load-$n.log" 2>&1
+  python3 bench/big5.py --nodes "$NODES" load --only $n --data "rally:$DOCS" --clients "${CLIENTS:-4}" > "$OUT/load-$n.log" 2>&1
   log "$n load $(( $(date +%s) - t0 )) s: $(tail -1 "$OUT/load-$n.log")"
   df -h / | tail -1; free -g | sed -n 2p
 done
