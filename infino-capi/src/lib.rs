@@ -3164,9 +3164,12 @@ pub unsafe extern "C" fn infino_sorted(
 /// column `predicate` names), ascending or (`descending` non-zero)
 /// descending, rows sharing a value in row id order, each carrying `osid`,
 /// `_id`, the column when one is named and, when `with_source` is non-zero,
-/// `source`. Read from the column's range index with no statement planned
-/// when `predicate` is one interval on that range-indexed column; `null`
-/// otherwise, for the caller to plan the statement. The predicate's
+/// `source`. Read from the column's range index with no statement planned:
+/// the predicate's ranges on the column pick the stretch of the index to
+/// read, and the rest of it is checked on the rows read, until `k` pass.
+/// `null`, for the caller to plan the statement, when the column has no
+/// range index, when the rest needs a statement to evaluate, or when it
+/// keeps too few of the rows read in order to find `k`. The predicate's
 /// literals are coerced to the columns' types first, as a statement would
 /// read them, so a date compared with a string is an interval on the date.
 #[no_mangle]
@@ -3195,7 +3198,7 @@ pub unsafe extern "C" fn infino_sorted_where(
             Err(e) => return err_json(&e.to_string()),
         };
         // A predicate the parser cannot read as one expression over the
-        // table's columns is no interval; the caller plans the statement.
+        // table's columns is left to the caller's statement.
         let Ok(filter) = predicate_parser()
             .parse_sql_expr(predicate, &schema)
             .and_then(|expr| expr.rewrite(&mut TypeCoercionRewriter::new(&schema)))
