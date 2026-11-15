@@ -74,6 +74,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 
 /**
@@ -546,75 +547,88 @@ public final class InfinoSearch {
         // vector entry points return ids and scores only.
         Map<String, Long> vectorSeqs = Map.of();
         boolean shortPage = false;
-        if (size == 0 && !stockKnn) {
-            rows = List.of();
-        } else if (plan.vector() != null) {
-            VectorRequest v = plan.vector();
-            String emb = floatsToJson(v.vector());
-            // The engine's top k for a knn query (the page is a window over them),
-            // otherwise as many as the page reaches. Either way each hit comes
-            // back with its id, score and source.
-            int want = stockKnn ? v.k() : Math.max(fetch, 1);
-            if (v.filter() != null) {
-                rows = InfinoNative.sqlRows(filteredKnnStatement(plan.table(), v));
-            } else {
-                String json = v.hybrid()
-                    ? InfinoNative.hybrid(plan.table(), v.textColumn(), v.textQuery(), v.vectorColumn(), emb, want)
-                    : InfinoNative.knn(plan.table(), v.vectorColumn(), emb, want);
-                rows = InfinoNative.rows(json);
-            }
-            knnDistance = !v.hybrid();
-            if (seqNoAndPrimaryTerm) {
-                // The vector entry points return ids, scores and sources; the page's
-                // sequence numbers come in one statement.
-                List<String> ids = new ArrayList<>();
-                for (int i = from; i < Math.min(rows.size(), fetch); i++) {
-                    Object id = rows.get(i).get(InfinoQueryTranslator.OSID);
-                    if (id != null) {
-                        ids.add(id.toString());
-                    }
-                }
-                vectorSeqs = InfinoNative.storedSeqs(plan.table(), ids);
-            }
-        } else if (bareRanked(plan) && !seqNoAndPrimaryTerm) {
-            // A text query and nothing else: the engine's BM25 call returns
-            // the page with its sources, so no statement is planned for it. It
-            // returns no sequence numbers, so a request for them takes the hit statement.
-            TextClause text = q.principal();
-            rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
-        } else {
-            // Every row, sorted on one range-indexed field: the engine reads the
-            // page from the field's range index, so no statement is planned for
-            // it, and the page's sources by row id along with it.
-            rows = null;
-            if (indexSorted(plan) && !seqNoAndPrimaryTerm) {
-                SortSpec first = plan.sorts().get(0);
-                rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, wantsSource(source));
-            }
-            if (rows == null) {
-                if (splitsMissingTail(plan)) {
-                    // The rows past a present first sort value come first; the
-                    // rows missing it follow them all, so they are read only
-                    // when the first part leaves the page short.
-                    rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
-                    if (rows.size() < fetch) {
-                        rows = new ArrayList<>(rows);
-                        rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
-                    }
+        // The exact total and the page are separate engine calls, neither
+        // waiting on the other: the total is counted on another thread while
+        // the page is read.
+        boolean exact = trackTotal(source);
+        long cap = capTotal ? countCap(source) : Long.MAX_VALUE;
+        CompletableFuture<Long> counted = plan.vector() == null && exact && count && size > 0
+            ? InfinoServices.beside(() -> total(plan, cap))
+            : null;
+        try {
+            if (size == 0 && !stockKnn) {
+                rows = List.of();
+            } else if (plan.vector() != null) {
+                VectorRequest v = plan.vector();
+                String emb = floatsToJson(v.vector());
+                // The engine's top k for a knn query (the page is a window over them),
+                // otherwise as many as the page reaches. Either way each hit comes
+                // back with its id, score and source.
+                int want = stockKnn ? v.k() : Math.max(fetch, 1);
+                if (v.filter() != null) {
+                    rows = InfinoNative.sqlRows(filteredKnnStatement(plan.table(), v));
                 } else {
-                    rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+                    String json = v.hybrid()
+                        ? InfinoNative.hybrid(plan.table(), v.textColumn(), v.textQuery(), v.vectorColumn(), emb, want)
+                        : InfinoNative.knn(plan.table(), v.vectorColumn(), emb, want);
+                    rows = InfinoNative.rows(json);
                 }
-                if (sourcesById(plan) && wantsSource(source)) {
-                    rows = withSources(plan.table(), rows, fetch);
+                knnDistance = !v.hybrid();
+                if (seqNoAndPrimaryTerm) {
+                    // The vector entry points return ids, scores and sources; the page's
+                    // sequence numbers come in one statement.
+                    List<String> ids = new ArrayList<>();
+                    for (int i = from; i < Math.min(rows.size(), fetch); i++) {
+                        Object id = rows.get(i).get(InfinoQueryTranslator.OSID);
+                        if (id != null) {
+                            ids.add(id.toString());
+                        }
+                    }
+                    vectorSeqs = InfinoNative.storedSeqs(plan.table(), ids);
                 }
+            } else if (bareRanked(plan) && !seqNoAndPrimaryTerm) {
+                // A text query and nothing else: the engine's BM25 call returns
+                // the page with its sources, so no statement is planned for it. It
+                // returns no sequence numbers, so a request for them takes the hit statement.
+                TextClause text = q.principal();
+                rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
+            } else {
+                // Every row, sorted on one range-indexed field: the engine reads the
+                // page from the field's range index, so no statement is planned for
+                // it, and the page's sources by row id along with it.
+                rows = null;
+                if (indexSorted(plan) && !seqNoAndPrimaryTerm) {
+                    SortSpec first = plan.sorts().get(0);
+                    rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, wantsSource(source));
+                }
+                if (rows == null) {
+                    if (splitsMissingTail(plan)) {
+                        // The rows past a present first sort value come first; the
+                        // rows missing it follow them all, so they are read only
+                        // when the first part leaves the page short.
+                        rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
+                        if (rows.size() < fetch) {
+                            rows = new ArrayList<>(rows);
+                            rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
+                        }
+                    } else {
+                        rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+                    }
+                    if (sourcesById(plan) && wantsSource(source)) {
+                        rows = withSources(plan.table(), rows, fetch);
+                    }
+                }
+                // A page the hit statement could not fill holds every row its
+                // predicate keeps, and that predicate is the total's (no keyset,
+                // collapse or ranked window narrows it), so its length is the total.
+                shortPage = rows.size() < fetch && q.principal() == null && plan.searchAfter() == null && plan.collapse() == null;
             }
-            // A page the hit statement could not fill holds every row its
-            // predicate keeps, and that predicate is the total's (no keyset,
-            // collapse or ranked window narrows it), so its length is the total.
-            shortPage = rows.size() < fetch && q.principal() == null && plan.searchAfter() == null && plan.collapse() == null;
+        } catch (RuntimeException | Error e) {
+            // A page that fails waits out its count rather than leave it running past the request.
+            InfinoServices.drain(counted, e);
+            throw e;
         }
 
-        boolean exact = trackTotal(source);
         long total;
         if (plan.vector() != null) {
             total = rows.size(); // kNN is inherently top-k
@@ -622,13 +636,13 @@ public final class InfinoSearch {
             total = 0;
         } else if (exact && shortPage) {
             total = rows.size();
+            // The count started beside the page is not needed, but is waited
+            // out rather than left running past the request.
+            if (counted != null) {
+                counted.handle((n, e) -> null).join();
+            }
         } else if (exact) {
-            // The total counts what the query and post_filter keep, before
-            // any collapse and regardless of where the page starts.
-            long cap = capTotal ? countCap(source) : Long.MAX_VALUE;
-            total = plan.postWhere() == null
-                ? count(plan.table(), q, cap)
-                : count(plan.table(), new Translation(q.table(), plan.hitWhere(), q.principal()), cap);
+            total = counted != null ? InfinoServices.await(counted) : total(plan, cap);
         } else {
             total = rows.size();
         }
@@ -1201,6 +1215,18 @@ public final class InfinoSearch {
         } catch (RuntimeException e) {
             return v;
         }
+    }
+
+    /**
+     * The request's exact total: what the query and post_filter keep, before
+     * any collapse and regardless of where the page starts, counted only as
+     * far as {@code cap}.
+     */
+    private static long total(Plan plan, long cap) {
+        Translation q = plan.query();
+        return plan.postWhere() == null
+            ? count(plan.table(), q, cap)
+            : count(plan.table(), new Translation(q.table(), plan.hitWhere(), q.principal()), cap);
     }
 
     /** The exact number of rows the request matches. */
