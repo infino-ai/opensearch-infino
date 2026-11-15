@@ -1298,8 +1298,9 @@ final class InfinoQueryTranslator {
 
     /**
      * {@code clauses}, optional clauses of one group, as one text clause
-     * matching any of their words, when each is a single plain word (no
-     * phrase, wildcard, fuzziness or proximity) and all reach the same one
+     * matching any of their words, when each is a single plain word that is
+     * one analyzed token (no phrase, wildcard, fuzziness, proximity or
+     * {@code disk-full}, see {@link #oneToken}) and all reach the same one
      * text column: a field clause naming it, or a bare word whose default
      * fields hold that text column and no other field the word could match.
      * Null otherwise, and the clauses are read one by one.
@@ -1312,7 +1313,7 @@ final class InfinoQueryTranslator {
                 return null;
             }
             String word = plainTerms(t.text());
-            if (word.isEmpty() || word.indexOf(' ') >= 0 || word.indexOf('*') >= 0 || word.indexOf('?') >= 0) {
+            if (!oneToken(word)) {
                 return null;
             }
             String reached = t.field() == null ? onlyTextColumn(targets) : onlyTextColumn(List.of(t.field()));
@@ -1323,6 +1324,25 @@ final class InfinoQueryTranslator {
             words.add(word);
         }
         return column == null ? null : textClause(column, String.join(" ", words), "or", positive);
+    }
+
+    /**
+     * Whether the {@code standard} analyzer surely reads {@code word} as one
+     * token: letters and digits only, none of a script it splits into a token
+     * per character. Any other ({@code disk-full}, {@code a*}) may be several
+     * tokens, which its clause requires together and an any-word clause would not.
+     */
+    static boolean oneToken(String word) {
+        if (word.isEmpty()) {
+            return false;
+        }
+        return word.codePoints().allMatch(c -> {
+            if (!Character.isLetterOrDigit(c) || Character.isIdeographic(c)) {
+                return false;
+            }
+            Character.UnicodeScript script = Character.UnicodeScript.of(c);
+            return script != Character.UnicodeScript.HIRAGANA && script != Character.UnicodeScript.KATAKANA;
+        });
     }
 
     /** The one text column {@code fields} name, when they name exactly one field the table has and it is a text column. */

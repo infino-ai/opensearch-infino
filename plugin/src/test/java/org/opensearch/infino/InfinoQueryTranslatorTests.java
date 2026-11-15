@@ -283,6 +283,29 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(required.from(), required.from().contains("'monkey jackal'"));
     }
 
+    /**
+     * A word the analyzer splits ({@code disk-full}) is a clause needing all
+     * its tokens, so it stays apart; one-token words beside it still merge.
+     */
+    public void testAWordOfSeveralTokensKeepsItsClause() {
+        Translation merged = translate(
+            QueryBuilders.queryStringQuery("message:disk OR message:cache").defaultOperator(org.opensearch.index.query.Operator.AND)
+        );
+        assertEquals("token_match('os_logs_0', 'message', 'disk cache', 'or')", merged.from());
+        Translation split = translate(
+            QueryBuilders.queryStringQuery("message:disk-full OR message:cache").defaultOperator(org.opensearch.index.query.Operator.AND)
+        );
+        assertFalse(split.from() + " " + split.where(), (split.from() + split.where()).contains("'disk full cache'"));
+        assertFalse(split.from() + " " + split.where(), (split.from() + split.where()).contains("'disk-full cache'"));
+        assertTrue(InfinoQueryTranslator.oneToken("disk"));
+        assertTrue(InfinoQueryTranslator.oneToken("e2e"));
+        assertFalse(InfinoQueryTranslator.oneToken("disk-full"));
+        assertFalse(InfinoQueryTranslator.oneToken("disk.full,"));
+        assertFalse(InfinoQueryTranslator.oneToken("di*"));
+        assertFalse(InfinoQueryTranslator.oneToken("日本"));
+        assertFalse(InfinoQueryTranslator.oneToken(""));
+    }
+
     public void testAPhraseOrASigilKeepsTheSubquery() {
         assertTrue(InfinoQueryTranslator.plainQuery("disk full"));
         assertFalse(InfinoQueryTranslator.plainQuery("\"disk full\""));

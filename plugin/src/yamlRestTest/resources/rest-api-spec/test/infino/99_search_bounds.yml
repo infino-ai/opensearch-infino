@@ -164,3 +164,118 @@
   - do:
       indices.delete:
         index: totals
+
+---
+"A total capped by track_total_hits leaves the aggregations' population whole":
+  # The aggregations take the query's total as their population: top_hits
+  # reports it, and significant_terms compares each term's count with it.
+  - do:
+      indices.create:
+        index: capagg_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, tag: { type: keyword } } }
+  - do:
+      indices.create:
+        index: capagg_default
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, tag: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        body: |
+          { "index": { "_index": "capagg_proxy", "_id": "1" } }
+          { "message": "disk full", "tag": "shared" }
+          { "index": { "_index": "capagg_proxy", "_id": "2" } }
+          { "message": "disk full", "tag": "shared" }
+          { "index": { "_index": "capagg_proxy", "_id": "3" } }
+          { "message": "disk full", "tag": "shared" }
+          { "index": { "_index": "capagg_proxy", "_id": "4" } }
+          { "message": "disk full", "tag": "shared" }
+          { "index": { "_index": "capagg_proxy", "_id": "5" } }
+          { "message": "disk full", "tag": "shared" }
+          { "index": { "_index": "capagg_proxy", "_id": "6" } }
+          { "message": "cache warm", "tag": "other" }
+          { "index": { "_index": "capagg_proxy", "_id": "7" } }
+          { "message": "cache warm", "tag": "other" }
+          { "index": { "_index": "capagg_default", "_id": "1" } }
+          { "message": "disk full", "tag": "shared" }
+          { "index": { "_index": "capagg_default", "_id": "2" } }
+          { "message": "disk full", "tag": "shared" }
+          { "index": { "_index": "capagg_default", "_id": "3" } }
+          { "message": "disk full", "tag": "shared" }
+          { "index": { "_index": "capagg_default", "_id": "4" } }
+          { "message": "disk full", "tag": "shared" }
+          { "index": { "_index": "capagg_default", "_id": "5" } }
+          { "message": "disk full", "tag": "shared" }
+          { "index": { "_index": "capagg_default", "_id": "6" } }
+          { "message": "cache warm", "tag": "other" }
+          { "index": { "_index": "capagg_default", "_id": "7" } }
+          { "message": "cache warm", "tag": "other" }
+  - do:
+      search:
+        index: capagg_proxy
+        body:
+          size: 1
+          track_total_hits: 2
+          query: { bool: { should: [ { match_phrase: { message: "disk full" } } ] } }
+          aggs:
+            top: { top_hits: { size: 1 } }
+            sig: { significant_terms: { field: tag, min_doc_count: 1 } }
+  - match: { hits.total: { value: 2, relation: gte } }
+  - match: { aggregations.top.hits.total: { value: 5, relation: eq } }
+  - match: { aggregations.sig.doc_count: 5 }
+  - match: { aggregations.sig.buckets.0.key: shared }
+  - match: { aggregations.sig.buckets.0.doc_count: 5 }
+  - do:
+      search:
+        index: capagg_default
+        body:
+          size: 1
+          track_total_hits: 2
+          query: { bool: { should: [ { match_phrase: { message: "disk full" } } ] } }
+          aggs:
+            top: { top_hits: { size: 1 } }
+            sig: { significant_terms: { field: tag, min_doc_count: 1 } }
+  - match: { hits.total: { value: 2, relation: gte } }
+  - match: { aggregations.top.hits.total: { value: 5, relation: eq } }
+  - match: { aggregations.sig.doc_count: 5 }
+  - match: { aggregations.sig.buckets.0.key: shared }
+  - match: { aggregations.sig.buckets.0.doc_count: 5 }
+  - do:
+      indices.delete:
+        index: capagg_proxy,capagg_default
+
+---
+"A query_string word the analyzer splits needs all its tokens beside another optional word":
+  - do:
+      indices.create:
+        index: qsplit
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: qsplit, _id: "1" }
+          - { message: "disk full" }
+          - index: { _index: qsplit, _id: "2" }
+          - { message: "disk only" }
+          - index: { _index: qsplit, _id: "3" }
+          - { message: "full only" }
+          - index: { _index: qsplit, _id: "4" }
+          - { message: "cache warm" }
+  # disk-full is the tokens disk and full, both required under AND: rows 2 and
+  # 3 hold one of them and match neither clause.
+  - do:
+      search:
+        index: qsplit
+        body:
+          query: { query_string: { query: "message:disk-full OR message:cache", default_operator: AND } }
+  - match: { hits.total: { value: 2, relation: eq } }
+  - length: { hits.hits: 2 }
+  - do:
+      indices.delete:
+        index: qsplit

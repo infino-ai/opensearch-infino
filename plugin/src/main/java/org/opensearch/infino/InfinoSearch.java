@@ -1250,7 +1250,10 @@ public final class InfinoSearch {
             // reads its total beside the aggregations rather than in a count of its own.
             boolean sharedTotal = !builders.isEmpty() && plan.vector() == null && plan.postWhere() == null && trackTotal(perIndex);
             boolean countWithAggs = sharedTotal && perIndex.size() == 0;
-            Page page = page(index, plan, perIndex, !countWithAggs, scrollId == null);
+            // A total the aggregations take as their population is counted in
+            // full: a capped one would undercount it (top_hits' total, a
+            // significant_terms subset size).
+            Page page = page(index, plan, perIndex, !countWithAggs, scrollId == null && !sharedTotal);
             if (!builders.isEmpty()) {
                 InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(index).evaluate(
                     builders,
