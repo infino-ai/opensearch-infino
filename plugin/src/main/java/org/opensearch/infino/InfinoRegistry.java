@@ -173,16 +173,17 @@ final class InfinoRegistry {
      * state the manager has seen.
      */
     private static synchronized void drain() {
-        if (!electedManager()) {
-            // The elected manager records every index from its own state; what
-            // this node queued while it was the manager may be older than that.
-            pending.clear();
-            failures.clear();
-            retryAt.clear();
-            return;
-        }
         long now = System.nanoTime();
         for (String name : new ArrayList<>(pending.keySet())) {
+            if (!electedManager()) {
+                // The elected manager records every index from its own state; what
+                // this node queued while it was the manager may be older than that.
+                // Asked before each row, as the node can lose the election mid-drain.
+                pending.clear();
+                failures.clear();
+                retryAt.clear();
+                return;
+            }
             Long at = retryAt.get(name);
             if (at != null && at - now > 0) {
                 continue;

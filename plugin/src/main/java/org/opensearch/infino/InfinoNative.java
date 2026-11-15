@@ -245,6 +245,16 @@ public final class InfinoNative {
     }
 
     /**
+     * For tests that stand a bridge of their own in for the library (null to
+     * load the library again): the next call opens its connection through it.
+     */
+    static synchronized void useLib(InfinoLib bridge) {
+        lib = bridge;
+        conn = null;
+        opened = null;
+    }
+
+    /**
      * Open the connection the node is configured for, if it is not the one
      * open. A connection in use is not closed when another replaces it: a
      * call in flight on another thread still holds it, and an account

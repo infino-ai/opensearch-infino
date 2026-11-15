@@ -102,6 +102,12 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         return clusterService;
     }
 
+    /** For tests that drive the registry without a node: the cluster it reads and the pool it retries on (null for none). */
+    static void bind(ClusterService clusterService, ThreadPool threadPool) {
+        InfinoServices.clusterService = clusterService;
+        InfinoServices.threadPool = threadPool;
+    }
+
     /** The node's transport, or null before the services are injected. */
     static TransportService transportService() {
         return transportService;

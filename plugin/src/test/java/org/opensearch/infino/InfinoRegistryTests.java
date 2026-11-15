@@ -4,15 +4,34 @@
 
 package org.opensearch.infino;
 
+import com.sun.jna.Memory;
+import com.sun.jna.Pointer;
+
+import org.opensearch.Version;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
+import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.threadpool.TestThreadPool;
+import org.opensearch.threadpool.ThreadPool;
 
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 
 public class InfinoRegistryTests extends OpenSearchTestCase {
 
@@ -73,6 +92,166 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
         // However long it keeps failing, the wait stays at the most, never overflowing.
         assertEquals(InfinoRegistry.MAX_RETRY_DELAY, InfinoRegistry.retryDelay(1_000));
         assertEquals(InfinoRegistry.MAX_RETRY_DELAY, InfinoRegistry.retryDelay(Integer.MAX_VALUE));
+    }
+
+    public void testAFailedRowIsWrittenByItsScheduledRetryAsTheClusterHoldsItThen() throws Exception {
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        StubBridge bridge = new StubBridge();
+        try {
+            bind(clusterService, threadPool, bridge);
+            IndexMetadata first = index("retried", "retried-uuid", 1);
+            ClusterServiceUtils.setState(clusterService, withIndices(clusterService.state(), first));
+            bridge.failing = true;
+            InfinoRegistry.record(first);
+            assertTrue(bridge.appended.isEmpty());
+            // The service comes back, and the index moves on while its row waits.
+            ClusterServiceUtils.setState(clusterService, withIndices(clusterService.state(), index("retried", "retried-uuid", 2)));
+            bridge.failing = false;
+            assertBusy(() -> assertEquals(1, bridge.appended.size()), 10, TimeUnit.SECONDS);
+            assertEquals(2L, ((Number) InfinoNative.object(bridge.appended.get(0)).get("version")).longValue());
+        } finally {
+            unbind(clusterService, threadPool);
+        }
+    }
+
+    public void testAScheduledRetryOfADeletedIndexWritesNothing() throws Exception {
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        StubBridge bridge = new StubBridge();
+        try {
+            bind(clusterService, threadPool, bridge);
+            IndexMetadata deleted = index("deleted", "deleted-uuid", 1);
+            IndexMetadata live = index("live", "live-uuid", 1);
+            ClusterServiceUtils.setState(clusterService, withIndices(clusterService.state(), deleted, live));
+            bridge.failing = true;
+            // The deleted index's row fails first, so it is due by the time the live one is.
+            InfinoRegistry.record(deleted);
+            InfinoRegistry.record(live);
+            ClusterServiceUtils.setState(
+                clusterService,
+                ClusterState.builder(clusterService.state()).metadata(Metadata.builder(clusterService.state().metadata()).remove("deleted"))
+            );
+            bridge.failing = false;
+            assertBusy(() -> assertEquals(1, bridge.appended.size()), 10, TimeUnit.SECONDS);
+            // A read drains what is due, after any drain under way.
+            InfinoRegistry.rows();
+            assertEquals(1, bridge.appended.size());
+            assertEquals("live", InfinoNative.object(bridge.appended.get(0)).get("name"));
+        } finally {
+            unbind(clusterService, threadPool);
+        }
+    }
+
+    public void testANodeThatLosesTheElectionMidDrainWritesNoFurtherRow() throws Exception {
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        StubBridge bridge = new StubBridge();
+        try {
+            // No pool for the registry: nothing retries on its own, the read below drains.
+            bind(clusterService, null, bridge);
+            IndexMetadata a = index("first_row", "first-uuid", 1);
+            IndexMetadata b = index("second_row", "second-uuid", 1);
+            ClusterServiceUtils.setState(clusterService, withIndices(clusterService.state(), a, b));
+            bridge.failing = true;
+            InfinoRegistry.record(a);
+            InfinoRegistry.record(b);
+            bridge.failing = false;
+            // Another node is elected as soon as this one writes a row.
+            DiscoveryNode other = new DiscoveryNode("other", buildNewFakeTransportAddress(), Version.CURRENT);
+            bridge.onAppend = () -> ClusterServiceUtils.setState(
+                clusterService,
+                ClusterState.builder(clusterService.state())
+                    .nodes(DiscoveryNodes.builder(clusterService.state().nodes()).add(other).clusterManagerNodeId(other.getId()))
+            );
+            // Both rows wait out their first delay, then one read drains them together.
+            Thread.sleep(InfinoRegistry.retryDelay(1).millis() + 100);
+            InfinoRegistry.rows();
+            assertEquals(1, bridge.appended.size());
+            assertFalse(clusterService.state().nodes().isLocalNodeElectedClusterManager());
+        } finally {
+            unbind(clusterService, threadPool);
+        }
+    }
+
+    private static void bind(ClusterService clusterService, ThreadPool threadPool, StubBridge bridge) {
+        InfinoServices.bind(clusterService, threadPool);
+        InfinoNative.useLib(bridge.lib());
+    }
+
+    private static void unbind(ClusterService clusterService, ThreadPool threadPool) {
+        InfinoServices.bind(null, null);
+        InfinoNative.useLib(null);
+        clusterService.close();
+        terminate(threadPool);
+    }
+
+    private static IndexMetadata index(String name, String uuid, long version) {
+        return IndexMetadata.builder(name)
+            .settings(settings(Version.CURRENT).put(IndexMetadata.SETTING_INDEX_UUID, uuid))
+            .numberOfShards(1)
+            .numberOfReplicas(0)
+            .version(version)
+            .build();
+    }
+
+    private static ClusterState withIndices(ClusterState state, IndexMetadata... indices) {
+        Metadata.Builder metadata = Metadata.builder(state.metadata());
+        for (IndexMetadata md : indices) {
+            metadata.put(md, false);
+        }
+        return ClusterState.builder(state).metadata(metadata).build();
+    }
+
+    /**
+     * A bridge that answers the registry's calls, failing each write while
+     * {@link #failing}, and keeps the source of every row it appends.
+     */
+    private static final class StubBridge implements InvocationHandler {
+        volatile boolean failing;
+        volatile Runnable onAppend = () -> {};
+        final List<String> appended = new CopyOnWriteArrayList<>();
+        private volatile String prepared;
+
+        InfinoLib lib() {
+            return (InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, this);
+        }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) {
+            switch (method.getName()) {
+                case "infino_open_with":
+                    return new Memory(1);
+                case "infino_ensure_table":
+                    return string("{}");
+                case "infino_sql":
+                    // The registry counts a row's copies before every write.
+                    return string(failing ? "{\"error\":\"the service is down\"}" : "[{\"held\":0}]");
+                case "infino_prepare_batch": {
+                    byte[] buf = (byte[]) args[2];
+                    int idEnd = ((int[]) args[4])[0];
+                    int srcEnd = ((int[]) args[5])[0];
+                    prepared = new String(buf, idEnd, srcEnd - idEnd, StandardCharsets.UTF_8);
+                    return new Memory(1);
+                }
+                case "infino_append_prepared":
+                    appended.add(prepared);
+                    onAppend.run();
+                    return string("{\"ok\":1,\"failed\":[]}");
+                case "infino_delete_osids":
+                    return 0;
+                default:
+                    return null; // the frees
+            }
+        }
+
+        private static Pointer string(String s) {
+            byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+            Memory m = new Memory(bytes.length + 1);
+            m.write(0, bytes, 0, bytes.length);
+            m.setByte(bytes.length, (byte) 0);
+            return m;
+        }
     }
 
     public void testAWriteIsVisibleOnceTheReadWindowHasPassed() {
