@@ -36,6 +36,28 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         return InfinoQueryTranslator.translate(qb, columns(), TABLE, NOW);
     }
 
+    public void testARangeOnADateColumnCarriesItsSpan() {
+        // Both bounds as written: from the lower, inclusive, to the upper, exclusive.
+        InfinoQueryTranslator.Span span = translate(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00").lt("2023-01-02T10:00:00")).span();
+        assertEquals(new InfinoQueryTranslator.Span("@timestamp", Instant.parse("2023-01-02T00:00:00Z").toEpochMilli(), Instant.parse("2023-01-02T10:00:00Z").toEpochMilli()), span);
+        // gt and lte on a day round up to its last millisecond, so the span starts and ends a millisecond past it.
+        span = translate(QueryBuilders.rangeQuery("@timestamp").gt("2023-01-01").lte("2023-01-02").format("yyyy-MM-dd")).span();
+        assertEquals(Instant.parse("2023-01-02T00:00:00Z").toEpochMilli(), span.fromMillis());
+        assertEquals(Instant.parse("2023-01-03T00:00:00Z").toEpochMilli(), span.untilMillis());
+        // An open range, a range on a number, or anything but a range carries none.
+        assertNull(translate(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00")).span());
+        assertNull(translate(QueryBuilders.rangeQuery("status").gte(500).lt(600)).span());
+        assertNull(
+            translate(QueryBuilders.boolQuery().filter(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00").lt("2023-01-03T00:00:00")).filter(QueryBuilders.termQuery("level", "error")))
+                .span()
+        );
+        assertNull(translate(QueryBuilders.matchAllQuery()).span());
+        assertEquals(
+            "arrow_cast('2023-01-02T00:00:00Z', 'Timestamp(Millisecond, Some(\"UTC\"))')",
+            InfinoAggregationProcessor.timestampLiteral(Instant.parse("2023-01-02T00:00:00Z").toEpochMilli())
+        );
+    }
+
     public void testMatchAllAndFilters() {
         assertEquals("1=1", translate(QueryBuilders.matchAllQuery()).where());
         assertEquals("\"level\" = 'error'", translate(QueryBuilders.termQuery("level", "error")).where());
@@ -162,6 +184,45 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         // A collapse keeps the first row of each value through a window, whose rows carry their sources.
         String collapsed = sortedHits(columns().get("level"));
         assertTrue(collapsed, collapsed.startsWith("SELECT osid, source, "));
+    }
+
+    /** A match_all sorted by {@code status} descending, then by the row id, continuing after {@code after}, under {@code collapse}. */
+    private static InfinoSearch.Plan afterPlan(Object[] after, Column collapse) {
+        return new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchAllQuery()),
+            java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true), InfinoSearch.SortSpec.rowId()),
+            null,
+            null,
+            collapse,
+            after,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+    }
+
+    public void testASearchAfterPageReadsThePresentRowsBeforeTheMissingOnes() {
+        // After a present first value, the rows past it are a plain range on
+        // the sort column; the rows missing it sort after them all and are
+        // their own statement, read only for a short page.
+        InfinoSearch.Plan plan = afterPlan(new Object[] { 404, "7" }, null);
+        assertTrue(InfinoSearch.splitsMissingTail(plan));
+        String whole = InfinoSearch.hitStatement(plan, 10, false);
+        assertTrue(whole, whole.contains("(\"status\" < 404 OR \"status\" IS NULL)"));
+        String present = InfinoSearch.hitStatement(plan, 10, false, InfinoSearch.Keyset.PRESENT);
+        assertTrue(present, present.contains("AND ((\"status\" < 404) OR (\"status\" = 404 AND (\"_id\" > CAST('7' AS DECIMAL(38, 0)) OR \"_id\" IS NULL)))"));
+        assertFalse(present, present.contains("\"status\" IS NULL"));
+        assertTrue(present, present.endsWith("ORDER BY \"status\" DESC NULLS LAST, \"_id\" ASC NULLS LAST LIMIT 10"));
+        String missing = InfinoSearch.hitStatement(plan, 3, false, InfinoSearch.Keyset.MISSING);
+        assertTrue(missing, missing.contains("WHERE (1=1) AND \"status\" IS NULL ORDER BY "));
+        assertTrue(missing, missing.endsWith(" LIMIT 3"));
+        // After a missing first value only the deeper sorts decide, and a
+        // collapse ranks a value's rows across both parts: one statement each.
+        assertFalse(InfinoSearch.splitsMissingTail(afterPlan(new Object[] { null, "7" }, null)));
+        assertFalse(InfinoSearch.splitsMissingTail(afterPlan(new Object[] { 404, "7" }, columns().get("level"))));
+        assertFalse(InfinoSearch.splitsMissingTail(afterPlan(null, null)));
     }
 
     public void testTiesBreakByTheEngineRowId() {
@@ -570,5 +631,92 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             () -> translateSaved(hasReference("visualization", "mig-header"), new Rows(Map.of("s9", "{\"type\":\"dashboard\"}"), true))
         );
         assertTrue(e.getMessage(), e.getMessage().contains("document [s9] has values under [references] its source does not hold"));
+    }
+
+    // ---- nested at depth ----
+
+    /** Orders whose items are nested and whose items' tags are nested inside them, flattened to a column per member. */
+    private static Map<String, Column> orderColumns() {
+        Map<String, Column> cols = new LinkedHashMap<>();
+        cols.put("osid", new Column("osid", "str", false, false));
+        cols.put("source", new Column("source", "str", false, false));
+        cols.put("items.sku", new Column("items.sku", "str", false, false));
+        cols.put("items.tags.name", new Column("items.tags.name", "str", false, false));
+        cols.put("items.tags.color", new Column("items.tags.color", "str", false, false));
+        cols.put("items.sku[]", Column.list("items.sku[]", "str"));
+        cols.put("items.tags.name[]", Column.list("items.tags.name[]", "str"));
+        cols.put("items.tags.color[]", Column.list("items.tags.color[]", "str"));
+        return cols;
+    }
+
+    /**
+     * o1's item a has a tag named size that is red. o2's item a has a size tag and a red tag, but not one
+     * tag that is both. o3 has the red size tag, but on item b, not on item a.
+     */
+    private static Map<String, String> orders() {
+        Map<String, String> docs = new LinkedHashMap<>();
+        docs.put("o1", "{\"items\":[{\"sku\":\"a\",\"tags\":[{\"name\":\"size\",\"color\":\"red\"},{\"name\":\"fit\",\"color\":\"blue\"}]}]}");
+        docs.put("o2", "{\"items\":[{\"sku\":\"a\",\"tags\":[{\"name\":\"size\",\"color\":\"blue\"},{\"name\":\"fit\",\"color\":\"red\"}]}]}");
+        docs.put("o3", "{\"items\":[{\"sku\":\"a\",\"tags\":[{\"name\":\"fit\",\"color\":\"blue\"}]},{\"sku\":\"b\",\"tags\":[{\"name\":\"size\",\"color\":\"red\"}]}]}");
+        return docs;
+    }
+
+    private static org.opensearch.index.query.NestedQueryBuilder redSizeTag() {
+        return QueryBuilders.nestedQuery(
+            "items.tags",
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.termQuery("items.tags.name", "size"))
+                .must(QueryBuilders.termQuery("items.tags.color", "red")),
+            org.apache.lucene.search.join.ScoreMode.None
+        );
+    }
+
+    /**
+     * A nested query inside a nested query holds every clause on one inner entry, and that entry inside the
+     * one outer entry its siblings hold on: not a name and a color from two tags (o2), nor an inner match
+     * on an item the outer clause does not hold on (o3).
+     */
+    public void testNestedUnderNestedMatchesOneEntryAtEachLevel() {
+        org.opensearch.index.query.QueryBuilder q = QueryBuilders.nestedQuery("items", redSizeTag(), org.apache.lucene.search.join.ScoreMode.None);
+        assertEquals("osid IN ('o1', 'o3')", InfinoQueryTranslator.translate(q, orderColumns(), "os_orders_0", NOW, new Rows(orders(), true)).where());
+        q = QueryBuilders.nestedQuery(
+            "items",
+            QueryBuilders.boolQuery().must(QueryBuilders.termQuery("items.sku", "a")).must(redSizeTag()),
+            org.apache.lucene.search.join.ScoreMode.None
+        );
+        assertEquals("osid IN ('o1')", InfinoQueryTranslator.translate(q, orderColumns(), "os_orders_0", NOW, new Rows(orders(), true)).where());
+        // A must_not of the inner nested query holds on every item without a red size tag: o1's has one, o2's does not, o3's item a does not.
+        q = QueryBuilders.nestedQuery(
+            "items",
+            QueryBuilders.boolQuery().must(QueryBuilders.termQuery("items.sku", "a")).mustNot(redSizeTag()),
+            org.apache.lucene.search.join.ScoreMode.None
+        );
+        assertEquals("osid IN ('o2', 'o3')", InfinoQueryTranslator.translate(q, orderColumns(), "os_orders_0", NOW, new Rows(orders(), true)).where());
+    }
+
+    /**
+     * A path three levels deep is read through objects, arrays and dotted keys alike, an entry at a time:
+     * p2 has the rel and the href asked for in two links, and p3 writes its parent as a dotted key.
+     */
+    public void testNestedPathSeveralLevelsDeep() {
+        Map<String, Column> cols = new LinkedHashMap<>();
+        cols.put("osid", new Column("osid", "str", false, false));
+        cols.put("source", new Column("source", "str", false, false));
+        cols.put("site.meta.links.rel", new Column("site.meta.links.rel", "str", false, false));
+        cols.put("site.meta.links.href", new Column("site.meta.links.href", "str", false, false));
+        cols.put("site.meta.links.rel[]", Column.list("site.meta.links.rel[]", "str"));
+        cols.put("site.meta.links.href[]", Column.list("site.meta.links.href[]", "str"));
+        Map<String, String> docs = new LinkedHashMap<>();
+        docs.put("p1", "{\"site\":{\"meta\":{\"links\":[{\"rel\":\"next\",\"href\":\"a\"},{\"rel\":\"prev\",\"href\":\"b\"}]}}}");
+        docs.put("p2", "{\"site\":{\"meta\":{\"links\":[{\"rel\":\"next\",\"href\":\"b\"},{\"rel\":\"prev\",\"href\":\"a\"}]}}}");
+        docs.put("p3", "{\"site.meta\":{\"links\":[{\"rel\":\"next\",\"href\":\"a\"}]}}");
+        org.opensearch.index.query.QueryBuilder q = QueryBuilders.nestedQuery(
+            "site.meta.links",
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.termQuery("site.meta.links.rel", "next"))
+                .must(QueryBuilders.termQuery("site.meta.links.href", "a")),
+            org.apache.lucene.search.join.ScoreMode.None
+        );
+        assertEquals("osid IN ('p1', 'p3')", InfinoQueryTranslator.translate(q, cols, "os_pages_0", NOW, new Rows(docs, true)).where());
     }
 }

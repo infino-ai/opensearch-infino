@@ -6,6 +6,8 @@ package org.opensearch.infino;
 
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
@@ -19,6 +21,7 @@ import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.document.DocumentField;
+import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.unit.TimeValue;
@@ -408,9 +411,20 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         return visitor.id();
     }
 
-    /** The Lucene document of an id in the shard's skeleton, or -1 when it has none. */
+    /**
+     * The root Lucene document of an id in the shard's skeleton, or -1 when it
+     * has none. A document's nested entries are Lucene documents of their own
+     * that carry its id too, ahead of it in its block; the fetch phase takes a
+     * hit on one of them for an inner hit and gives it {@code _nested}, so
+     * only the root document, the one stock's non-nested filter keeps, may
+     * stand for the hit.
+     */
     private static int docId(ContextIndexSearcher searcher, String id) throws IOException {
-        TopDocs td = searcher.search(new TermQuery(new Term(IdFieldMapper.NAME, Uid.encodeId(id))), 1);
+        Query root = new BooleanQuery.Builder().add(
+            new TermQuery(new Term(IdFieldMapper.NAME, Uid.encodeId(id))),
+            BooleanClause.Occur.FILTER
+        ).add(Queries.newNonNestedFilter(), BooleanClause.Occur.FILTER).build();
+        TopDocs td = searcher.search(root, 1);
         return td.scoreDocs.length == 0 ? -1 : td.scoreDocs[0].doc;
     }
 

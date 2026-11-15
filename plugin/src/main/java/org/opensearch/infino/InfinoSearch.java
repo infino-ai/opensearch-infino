@@ -540,6 +540,7 @@ public final class InfinoSearch {
         // A vector hit's sequence number, by id, when the request asks for it: the
         // vector entry points return ids and scores only.
         Map<String, Long> vectorSeqs = Map.of();
+        boolean shortPage = false;
         if (size == 0 && !stockKnn) {
             rows = List.of();
         } else if (plan.vector() != null) {
@@ -577,10 +578,25 @@ public final class InfinoSearch {
             TextClause text = q.principal();
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
         } else {
-            rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+            if (splitsMissingTail(plan)) {
+                // The rows past a present first sort value come first; the
+                // rows missing it follow them all, so they are read only
+                // when the first part leaves the page short.
+                rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
+                if (rows.size() < fetch) {
+                    rows = new ArrayList<>(rows);
+                    rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
+                }
+            } else {
+                rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+            }
             if (sourcesById(plan) && wantsSource(source)) {
                 rows = withSources(plan.table(), rows, fetch);
             }
+            // A page the hit statement could not fill holds every row its
+            // predicate keeps, and that predicate is the total's (no keyset,
+            // collapse or ranked window narrows it), so its length is the total.
+            shortPage = rows.size() < fetch && q.principal() == null && plan.searchAfter() == null && plan.collapse() == null;
         }
 
         boolean exact = trackTotal(source);
@@ -589,6 +605,8 @@ public final class InfinoSearch {
             total = rows.size(); // kNN is inherently top-k
         } else if (exact && !count) {
             total = 0;
+        } else if (exact && shortPage) {
+            total = rows.size();
         } else if (exact) {
             // The total counts what the query and post_filter keep, before
             // any collapse and regardless of where the page starts.
@@ -751,6 +769,39 @@ public final class InfinoSearch {
      * row of each collapse value in the request's order, through a window.
      */
     static String hitStatement(Plan plan, int fetch, boolean withSeq) {
+        return hitStatement(plan, fetch, withSeq, Keyset.WHOLE);
+    }
+
+    /** Which of a search_after's rows a hit statement reads (see {@link #splitsMissingTail}). */
+    enum Keyset {
+        /** Every row past the search_after values. */
+        WHOLE,
+        /** The rows past them whose first sort value is present. */
+        PRESENT,
+        /** The rows missing the first sort value, which sort after every present one. */
+        MISSING
+    }
+
+    /**
+     * Whether a search_after page is read in two parts: the rows past a
+     * present first sort value, then, only when those leave the page short,
+     * the rows missing that value. Missing values sort last, so the second
+     * part follows the first whole, and the first part is a plain range on
+     * the sort column, which the engine answers from its range index; one
+     * statement holding both would weigh {@code s < v OR s IS NULL} on every
+     * row. Not under a collapse, whose window ranks a value's rows across
+     * both parts.
+     */
+    static boolean splitsMissingTail(Plan plan) {
+        Object[] after = plan.searchAfter();
+        return after != null
+            && after.length > 0
+            && after[0] != null
+            && plan.collapse() == null
+            && !plan.sorts().get(0).name().equals(InfinoSql.ROW_ID);
+    }
+
+    static String hitStatement(Plan plan, int fetch, boolean withSeq, Keyset part) {
         Translation q = plan.query();
         StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID);
         if (!sourcesById(plan)) {
@@ -773,7 +824,7 @@ public final class InfinoSearch {
         }
         String where = plan.hitWhere();
         if (plan.searchAfter() != null) {
-            where = "(" + where + ") AND " + keysetPredicate(plan);
+            where = "(" + where + ") AND " + keysetPredicate(plan, part);
         }
         boolean sorted = !plan.sorts().isEmpty();
         boolean ranked = !sorted && q.principal() != null;
@@ -813,9 +864,13 @@ public final class InfinoSearch {
      * turned for a descending sort. The order puts missing values last, so
      * after a present value the missing rows still follow ({@code OR s IS
      * NULL}), after a missing one only the deeper sorts decide, and a
-     * missing value compares equal to itself.
+     * missing value compares equal to itself. {@code part} keeps the rows
+     * whose first sort value is present, or only those missing it.
      */
-    private static String keysetPredicate(Plan plan) {
+    private static String keysetPredicate(Plan plan, Keyset part) {
+        if (part == Keyset.MISSING) {
+            return plan.sorts().get(0).expr() + " IS NULL";
+        }
         List<String> alternatives = new ArrayList<>();
         List<String> equal = new ArrayList<>();
         long now = plan.nowMillis();
@@ -837,7 +892,8 @@ public final class InfinoSearch {
                 if (lit == null) {
                     throw new IllegalArgumentException("[infino] search_after value [" + value + "] is not a " + s.type().name().toLowerCase(Locale.ROOT));
                 }
-                strict = "(" + col + (s.desc() ? " < " : " > ") + lit + " OR " + col + " IS NULL)";
+                String past = col + (s.desc() ? " < " : " > ") + lit;
+                strict = i == 0 && part == Keyset.PRESENT ? past : "(" + past + " OR " + col + " IS NULL)";
                 same = col + " = " + lit;
             }
             List<String> conj = new ArrayList<>(equal);
