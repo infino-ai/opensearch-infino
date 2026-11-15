@@ -215,3 +215,102 @@
   - match: { hits.hits.0._id: "d1" }
   - match: { hits.hits.1._id: "d2" }
   - match: { hits.hits.2._id: "d5" }
+
+  # Unsorted, the page is ranked: every word first, then the pair with the
+  # rarer word (gamma is in two documents, alpha in three).
+  - do:
+      search:
+        index: qm_luc
+        body:
+          size: 10
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d5" }
+  - match: { hits.hits.2._id: "d2" }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          size: 10
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d5" }
+  - match: { hits.hits.2._id: "d2" }
+  - set: { hits.hits.1._score: second }
+  - set: { hits.hits.2._score: third }
+  - gt: { hits.hits.0._score: $second }
+  - gt: { hits.hits.1._score: $third }
+
+  # More optional words than there are: stock matches nothing.
+  - do:
+      search:
+        index: qm_luc
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: 4 } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: 4 } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: qm_luc
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: "200%" } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: "200%" } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: qm_luc
+        body:
+          query: { query_string: { query: "+alpha beta gamma", default_field: body, minimum_should_match: 3 } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          query: { query_string: { query: "+alpha beta gamma", default_field: body, minimum_should_match: 3 } }
+  - match: { hits.total.value: 0 }
+
+  # A malformed form is the request's error, in either mode.
+  - do:
+      indices.create:
+        index: qm_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+  - do:
+      index:
+        index: qm_prx
+        id: d1
+        refresh: true
+        body: { body: "alpha beta gamma" }
+  - do:
+      catch: bad_request
+      search:
+        index: qm_luc
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: "2<" } }
+  - do:
+      catch: bad_request
+      search:
+        index: qm_inf
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: "2<" } }
+  - do:
+      catch: bad_request
+      search:
+        index: qm_prx
+        body:
+          query: { query_string: { query: "alpha beta gamma", default_field: body, minimum_should_match: "2<" } }

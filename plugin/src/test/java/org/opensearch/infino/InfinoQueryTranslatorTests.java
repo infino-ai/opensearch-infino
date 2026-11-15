@@ -295,9 +295,30 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
 
     public void testQueryStringReadsMinimumShouldMatch() {
         // Two of three optional words: the engine query still ranks, and a count narrows it.
-        String two = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("2")).where();
+        Translation ranked = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("2"));
+        assertEquals(new InfinoQueryTranslator.TextClause("message", "alpha beta gamma", "or"), ranked.principal());
+        String two = ranked.where();
         assertTrue(two, two.contains(">= 2)"));
         assertEquals(3, two.split("THEN 1 ELSE 0 END", -1).length - 1);
+        // One of the optional words alone asks nothing more than the list: the plain translation, ranked, no count.
+        Translation one = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("1"));
+        Translation plain = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message"));
+        assertEquals(plain.where(), one.where());
+        assertEquals(plain.principal(), one.principal());
+        // More than there are matches nothing, as stock does; exactly as many is a count of all three.
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("4")).where());
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("200%")).where());
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("+alpha beta gamma").defaultField("message").minimumShouldMatch("3")).where());
+        assertTrue(translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("3")).where().contains(">= 3)"));
+        assertTrue(translate(QueryBuilders.queryStringQuery("+alpha beta gamma").defaultField("message").minimumShouldMatch("2")).where().contains(">= 2)"));
+        // A malformed form is the request's error, as stock's reader makes it.
+        for (String bad : new String[] { "2<", "two" }) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch(bad))
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("minimum_should_match [" + bad + "]"));
+        }
         // Stock's reading of the forms: 100% of three is three, -1 of three is two.
         assertTrue(translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("100%")).where().contains(">= 3)"));
         assertTrue(translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("-1")).where().contains(">= 2)"));

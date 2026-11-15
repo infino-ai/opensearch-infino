@@ -1286,8 +1286,19 @@ final class InfinoQueryTranslator {
         }
         Node parsed = InfinoLuceneQuery.parse(q, op);
         if (minimumShouldMatch != null && parsed instanceof Bool b && !b.should().isEmpty()) {
-            int required = Queries.calculateMinShouldMatch(b.should().size(), minimumShouldMatch);
-            if (required > 0) {
+            int required;
+            try {
+                required = Queries.calculateMinShouldMatch(b.should().size(), minimumShouldMatch);
+            } catch (RuntimeException e) {
+                // Stock's reader fails on a malformed form such as "2<" or "two"; it is the request's fault.
+                throw new InfinoLuceneQuery.Malformed("[" + q + "] has minimum_should_match [" + minimumShouldMatch + "], which is not a valid form");
+            }
+            if (required > b.should().size()) {
+                // More than there are: stock matches nothing.
+                return NONE;
+            }
+            if (required > 1 || (required == 1 && !b.must().isEmpty())) {
+                // One optional clause, with none required, is what the list already asks.
                 return atLeastOptional(b, required, targets, positive, q, op);
             }
         }
