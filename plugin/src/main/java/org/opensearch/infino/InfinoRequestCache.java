@@ -16,9 +16,12 @@ import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.IndexService;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.indices.IndicesRequestCache;
+import org.opensearch.indices.IndicesService;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
 import java.util.Collection;
@@ -139,6 +142,30 @@ final class InfinoRequestCache {
     /** Every table changed at once: the connection now reads from somewhere else. */
     static void changedAll() {
         CONNECTION.incrementAndGet();
+    }
+
+    /**
+     * Clear the shard request cache of every default-mode shard on this
+     * node: its answers were read over the connection that was just
+     * replaced (an account taken into use or forgotten), and the cache
+     * keys on the shard's reader, which the switch does not change. A
+     * search that read over the old connection and finishes after the
+     * clear can still leave an entry; a switch is rare, and the next write
+     * and refresh moves the key past it.
+     */
+    static void clearShardCaches() {
+        IndicesService indices = InfinoServices.indicesService();
+        if (indices == null) {
+            return;
+        }
+        for (IndexService index : indices) {
+            if (InfinoPlugin.inDefaultMode(index.getIndexSettings().getSettings()) == false) {
+                continue;
+            }
+            for (int shard : index.shardIds()) {
+                indices.clearIndexShardCache(new ShardId(index.index(), shard), false, false, true);
+            }
+        }
     }
 
     private static long generation(String table) {
