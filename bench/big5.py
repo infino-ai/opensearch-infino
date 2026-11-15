@@ -70,12 +70,14 @@ RALLY_BIG5 = "https://rally-tracks.elastic.co/big5"
 RALLY_BIG5_DOCS = [139000967, 157534429, 138860135, 155215122, 135967215, 142025858, 145339293, 157897411]
 
 
-def rally_batches(docs, batch):
+def rally_batches(docs, batch, files=None, skip=0):
     """The first `docs` documents of Elastic's big5 corpus, the same share of
     each of its 8 files (as the track's `ingest_percentage` takes them),
     streamed from Elastic's server and decompressed on the way: nothing is
     written to disk. The files are read in parallel and their batches
-    interleaved."""
+    interleaved. `files` (1-based numbers) limits it to those files, and
+    `skip` drops the first lines of each, so a load whose stream for a file
+    ended early can be finished: same share, starting after what it got."""
     import queue
     import subprocess
 
@@ -84,7 +86,7 @@ def rally_batches(docs, batch):
     out = queue.Queue(maxsize=64)
 
     def read(i, n):
-        cmd = f"curl -sfL {RALLY_BIG5}/logs-{i + 1}.ndjson.bz2 | bzip2 -dc 2>/dev/null | head -n {n}"
+        cmd = f"curl -sfL {RALLY_BIG5}/logs-{i + 1}.ndjson.bz2 | bzip2 -dc 2>/dev/null | head -n {n} | tail -n +{skip + 1}"
         proc = subprocess.Popen(["bash", "-o", "pipefail", "-c", cmd], stdout=subprocess.PIPE, bufsize=1 << 20)
         buf, got = [], 0
         for line in proc.stdout:
@@ -96,11 +98,12 @@ def rally_batches(docs, batch):
         if buf:
             out.put(b"".join(buf))
         proc.wait()
-        if got != n:
-            print(f"logs-{i + 1}: read {got} of {n} documents", file=sys.stderr, flush=True)
+        if got != n - skip:
+            print(f"logs-{i + 1}: read {got} of {n - skip} documents", file=sys.stderr, flush=True)
         out.put(None)
 
-    readers = [threading.Thread(target=read, args=(i, n), daemon=True) for i, n in enumerate(take)]
+    picked = [(i, n) for i, n in enumerate(take) if not files or i + 1 in files]
+    readers = [threading.Thread(target=read, args=(i, n), daemon=True) for i, n in picked]
     for t in readers:
         t.start()
     left = len(readers)
@@ -121,14 +124,16 @@ def load(args):
     for name, (port, _) in nodes(args).items():
         if args.only and name not in args.only.split(","):
             continue
-        call(port, "DELETE", f"/{INDEX}")
-        status, body = call(port, "PUT", f"/{INDEX}", mapping)
-        if status != 200:
-            sys.exit(f"{name}: create {INDEX} returned {status}: {body}")
+        if not args.append:
+            call(port, "DELETE", f"/{INDEX}")
+            status, body = call(port, "PUT", f"/{INDEX}", mapping)
+            if status != 200:
+                sys.exit(f"{name}: create {INDEX} returned {status}: {body}")
 
         def batches():
             if rally:
-                yield from rally_batches(rally, args.batch)
+                picked = {int(f) for f in args.rally_files.split(",")} if args.rally_files else None
+                yield from rally_batches(rally, args.batch, picked, args.rally_skip)
                 return
             buf, n = [], 0
             for f in files:
@@ -163,7 +168,9 @@ def load(args):
                         time.sleep(1)
                         continue
                     if body.get("errors"):
-                        errors[0] += sum(1 for i in body["items"] if i["index"].get("error"))
+                        failed = [i["index"]["error"] for i in body["items"] if i["index"].get("error")]
+                        errors[0] += len(failed)
+                        print(f"item error: {json.dumps(failed[0])[:500]}", file=sys.stderr, flush=True)
                     break
 
         threads = [threading.Thread(target=worker) for _ in range(args.clients)]
@@ -267,6 +274,9 @@ def main():
     lo.add_argument("--docs", type=int, default=0, help="stop after this many documents (0: all)")
     lo.add_argument("--batch", type=int, default=5000)
     lo.add_argument("--clients", type=int, default=4)
+    lo.add_argument("--append", action="store_true", help="add to the index as it stands instead of recreating it")
+    lo.add_argument("--rally-files", help="with rally:N, only these of the corpus's files (1-based, comma-separated)")
+    lo.add_argument("--rally-skip", type=int, default=0, help="with rally:N, skip this many leading documents of each file read")
     lo.add_argument("--only", help="comma-separated node names to load (default: every node)")
     ru = sub.add_parser("run")
     ru.add_argument("--calls", type=int, default=20)

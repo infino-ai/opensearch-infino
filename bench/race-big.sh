@@ -17,6 +17,8 @@ cd "$(dirname "$0")/.."
 TARBALL=${TARBALL:-/home/ubuntu/osnodes/dl/opensearch-3.9.0-linux-x64.tar.gz}
 mkdir -p "$OUT" "$NODES"
 log() { echo "== $(date +%T) $*"; }
+# RACE_ONLY=1 skips starting and loading: it races the nodes already up.
+if [ -z "${RACE_ONLY:-}" ]; then
 # Any node on the race ports, wherever it lives, stops first.
 START=${START:-stock proxy}; LOAD=${LOAD:-proxy stock}
 ports=""; for n in $START; do case $n in stock) ports="$ports or sport = :9251" ;; proxy) ports="$ports or sport = :9252" ;; esac; done
@@ -39,6 +41,7 @@ for n in $LOAD; do
   df -h / | tail -1; free -g | sed -n 2p
 done
 sleep 300   # merges and compaction settle
+fi
 for port in 9251 9252; do echo "$port $(curl -s localhost:$port/big5/_count)"; done
 du -sh "$NODES/stock" "$NODES/proxy"
 python3 bench/big5.py --nodes "$NODES" run --calls 3 --searches default > /dev/null 2>&1
