@@ -37,6 +37,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 
@@ -91,6 +92,10 @@ public final class InfinoNative {
     private static volatile Target opened;
     /** The target the node is configured for: its own URI until the settings or the account route say otherwise. */
     private static volatile Target wanted = Target.node();
+    /** How long a read on the hosted service may trail a write ({@link InfinoPlugin#PLATFORM_READ_WINDOW}), in nanoseconds. */
+    private static volatile long readWindowNanos = InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY).nanos();
+    /** When each table was last written on the hosted service ({@link System#nanoTime}), until a wait sees the window pass. */
+    private static final Map<String, Long> WRITTEN = new ConcurrentHashMap<>();
     private static final Map<String, Map<String, Column>> COLUMNS = new ConcurrentHashMap<>();
     /** What each table's mapping declares, from the mapping it was last declared with. */
     private static final Map<String, Mapping> MAPPINGS = new ConcurrentHashMap<>();
@@ -240,6 +245,16 @@ public final class InfinoNative {
     }
 
     /**
+     * For tests that stand a bridge of their own in for the library (null to
+     * load the library again): the next call opens its connection through it.
+     */
+    static synchronized void useLib(InfinoLib bridge) {
+        lib = bridge;
+        conn = null;
+        opened = null;
+    }
+
+    /**
      * Open the connection the node is configured for, if it is not the one
      * open. A connection in use is not closed when another replaces it: a
      * call in flight on another thread still holds it, and an account
@@ -312,6 +327,61 @@ public final class InfinoNative {
     /** Whether the tables are served from the hosted service rather than the node's own storage. */
     public static boolean hosted() {
         return wanted.hosted();
+    }
+
+    /** Take {@code window} as how long a hosted read may trail a write, at boot. */
+    static void readWindow(TimeValue window) {
+        readWindowNanos = window.nanos();
+    }
+
+    /**
+     * Note a write to {@code name}. On the hosted service a read may be
+     * answered from a snapshot taken before it, for up to the read window;
+     * the node's own storage answers every read with what was written.
+     */
+    private static void wrote(String name) {
+        if (hosted() && readWindowNanos > 0) {
+            wrote(name, System.nanoTime());
+        }
+    }
+
+    /**
+     * Note a write to {@code name} that completed at {@code at}. Of two
+     * writes noted at once, the later stays, whichever is noted last, so a
+     * wait never ends before the later one is visible.
+     */
+    static void wrote(String name, long at) {
+        WRITTEN.merge(name, at, (a, b) -> b - a > 0 ? b : a);
+    }
+
+    /**
+     * Wait until every read of {@code name} sees what this node has written
+     * to it: until the read window has passed since its last write. Returns
+     * at once when the window has passed, or the table is not hosted, or
+     * this node has not written it. What a refresh waits on, so that a
+     * search after it ({@code refresh=true}, {@code wait_for}) finds the
+     * writes it covered.
+     */
+    public static void awaitVisible(String name) {
+        Long at = WRITTEN.get(name);
+        if (at == null) {
+            return;
+        }
+        long left = untilVisible(at, readWindowNanos, System.nanoTime());
+        if (left > 0) {
+            try {
+                TimeUnit.NANOSECONDS.sleep(left);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        WRITTEN.remove(name, at);
+    }
+
+    /** Nanoseconds from {@code now} until a write at {@code writtenAt} is visible to every read; zero or less once it is. */
+    static long untilVisible(long writtenAt, long window, long now) {
+        return writtenAt + window - now;
     }
 
     /** How the tables are served, for a status report. */
@@ -466,6 +536,7 @@ public final class InfinoNative {
             takeOrThrow(lib.infino_ensure_table(conn, name, mappingJson));
         } finally {
             InfinoRequestCache.changed(name);
+            wrote(name);
         }
         MAPPINGS.put(name, Mapping.of(mappingJson));
         // A lookup while the table was declared cached its columns without what the mapping adds.
@@ -606,6 +677,7 @@ public final class InfinoNative {
             return lib.infino_drop(conn, name);
         } finally {
             InfinoRequestCache.changed(name);
+            WRITTEN.remove(name); // nothing of it is left to see
         }
     }
 
@@ -773,6 +845,7 @@ public final class InfinoNative {
             );
         } finally {
             InfinoRequestCache.changed(name);
+            wrote(name);
         }
         List<PreparedFailure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
@@ -804,6 +877,7 @@ public final class InfinoNative {
             out = object(takeOrThrow(lib.infino_index_batch_buf(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), n)));
         } finally {
             InfinoRequestCache.changed(name);
+            wrote(name);
         }
         List<Failure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
@@ -820,6 +894,7 @@ public final class InfinoNative {
             return lib.infino_delete_osids(conn, name, osids, n);
         } finally {
             InfinoRequestCache.changed(name);
+            wrote(name);
         }
     }
 

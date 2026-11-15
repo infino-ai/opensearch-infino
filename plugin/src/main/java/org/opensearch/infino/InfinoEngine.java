@@ -495,6 +495,15 @@ public class InfinoEngine extends InternalEngine {
                 t instanceof Exception e ? e : new RuntimeException(t)
             );
         }
+        // The shard's refresh listeners note how far a refresh reaches before it
+        // and release the writes it covers after it. The wait for hosted reads
+        // goes between the two, ahead of the release: a write committed while a
+        // refresh waits is covered by it, and is waited for too.
+        ReferenceManager<OpenSearchDirectoryReader> readers = getReferenceManager(SearcherScope.EXTERNAL);
+        List<ReferenceManager.RefreshListener> configured = config.getExternalRefreshListener();
+        configured.forEach(readers::removeListener);
+        readers.addListener(new AwaitVisible());
+        configured.forEach(readers::addListener);
         BY_TABLE.put(table, this);
         log.info("[infino] engine attached to table {} for {}", table, config.getShardId());
     }
@@ -1178,7 +1187,10 @@ public class InfinoEngine extends InternalEngine {
     /**
      * Commit the writes through every operation applied so far, then refresh
      * the skeleton's reader and record what it covers: every operation
-     * applied before the refresh began.
+     * applied before the refresh began. On the hosted service the refresh
+     * returns once every read sees the commit ({@link AwaitVisible}), so a
+     * search after {@code refresh=true}, or one that {@code wait_for}
+     * released, finds the writes.
      */
     @Override
     public void refresh(String source) throws EngineException {
@@ -1190,6 +1202,22 @@ public class InfinoEngine extends InternalEngine {
         long covered = getProcessedLocalCheckpoint();
         super.refresh(source);
         rememberCovered(covered);
+    }
+
+    /**
+     * Wait, as a refresh ends, until every read of the table sees what this
+     * node has written to it ({@link InfinoNative#awaitVisible}). It runs
+     * ahead of the shard's refresh listeners, after they noted what the
+     * refresh covers, so the writes they release are visible when they do.
+     */
+    private final class AwaitVisible implements ReferenceManager.RefreshListener {
+        @Override
+        public void beforeRefresh() {}
+
+        @Override
+        public void afterRefresh(boolean didRefresh) {
+            InfinoNative.awaitVisible(table);
+        }
     }
 
     @Override
