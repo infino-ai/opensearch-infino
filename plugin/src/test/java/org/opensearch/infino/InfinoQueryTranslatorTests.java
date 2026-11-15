@@ -232,6 +232,45 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         expectThrows(IllegalArgumentException.class, () -> statusSort(desc, "not a number"));
     }
 
+    public void testASortsMissingValueIsReadAsStockReadsIt() {
+        org.opensearch.search.sort.SortOrder desc = org.opensearch.search.sort.SortOrder.DESC;
+        // An integer stays exact past a double's precision, and a fraction is cut to a long.
+        assertEquals("COALESCE(\"status\", 9007199254740993)", statusSort(desc, 9007199254740993L).get(0).expr());
+        assertEquals("COALESCE(\"status\", 3)", statusSort(desc, 3.5).get(0).expr());
+        assertEquals("COALESCE(\"status\", 300)", statusSort(desc, "300").get(0).expr());
+        expectThrows(IllegalArgumentException.class, () -> statusSort(desc, "3.5"));
+        // A date's is its epoch milliseconds, as a literal of the column's type.
+        org.opensearch.search.sort.FieldSortBuilder date = org.opensearch.search.sort.SortBuilders.fieldSort("@timestamp").order(desc).missing(1000);
+        assertEquals(
+            "COALESCE(\"@timestamp\", arrow_cast(1000, 'Timestamp(Millisecond, Some(\"UTC\"))'))",
+            InfinoSearch.sorts(java.util.List.of(date), columns(), NOW).get(0).expr()
+        );
+        org.opensearch.search.sort.FieldSortBuilder dateText = org.opensearch.search.sort.SortBuilders.fieldSort("@timestamp").order(desc).missing("2020-01-01");
+        expectThrows(IllegalArgumentException.class, () -> InfinoSearch.sorts(java.util.List.of(dateText), columns(), NOW));
+    }
+
+    public void testACollapseUnderASortsMissingValueKeepsItsOwnValue() {
+        // The sort selects the stand-in under the column's name; the collapse value is the column's own.
+        java.util.List<InfinoSearch.SortSpec> sorts = new java.util.ArrayList<>(statusSort(org.opensearch.search.sort.SortOrder.DESC, 3));
+        sorts.add(InfinoSearch.SortSpec.rowId());
+        InfinoSearch.Plan plan = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchAllQuery()),
+            sorts,
+            null,
+            null,
+            columns().get("status"),
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        String sql = InfinoSearch.hitStatement(plan, 10, false);
+        assertTrue(sql, sql.contains("COALESCE(\"status\", 3) AS \"status\""));
+        assertTrue(sql, sql.contains(", \"status\" AS collapse_key"));
+    }
+
     public void testASearchAfterPageUnderMissingFirst() {
         java.util.List<InfinoSearch.SortSpec> first = statusSort(org.opensearch.search.sort.SortOrder.DESC, "_first");
         // After a present value the missing rows are behind the page, so they are not read.
@@ -259,6 +298,9 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         InfinoSearch.SortSpec descFirst = statusSort(org.opensearch.search.sort.SortOrder.DESC, "_first").get(0);
         assertTrue(descFirst.missingStandIn(Long.MAX_VALUE));
         assertFalse(descFirst.missingStandIn(Long.MIN_VALUE));
+        // A missing value given as a value leaves no row missing: the least long is a value then.
+        assertFalse(statusSort(org.opensearch.search.sort.SortOrder.DESC, 300).get(0).missingStandIn(Long.MIN_VALUE));
+        assertFalse(statusSort(org.opensearch.search.sort.SortOrder.ASC, Long.MAX_VALUE).get(0).missingStandIn(Long.MAX_VALUE));
         // Text has no stand-in: its missing value is handed back as null.
         assertFalse(InfinoSearch.SortSpec.of(columns().get("level"), true).missingStandIn("-9223372036854775808"));
     }

@@ -127,6 +127,8 @@ public final class InfinoSearch {
     private static final int ROW_ID_DIGITS = 38;
     /** The sort a scroll without one pages by: the document id, which {@link #columnFor} resolves to the id column. */
     private static final String ID_SORT_FIELD = "_id";
+    /** The alias the hit statement selects a collapsed hit's own value under. */
+    private static final String COLLAPSE_KEY = "collapse_key";
 
     private InfinoSearch() {}
 
@@ -178,11 +180,14 @@ public final class InfinoSearch {
      * for a script), {@code type} how a search_after value for it is written.
      * {@code nullsFirst} puts the rows missing the value before the others
      * (the request's {@code missing: _first}); by default they come last,
-     * in either direction, as stock's {@code _last}.
+     * in either direction, as stock's {@code _last}. {@code noneMissing}
+     * marks a sort whose expression gives every row a value (the request's
+     * {@code missing} value stands in), so no search_after value for it
+     * stands for a missing one.
      */
-    record SortSpec(String expr, String name, SqlType type, boolean desc, boolean nullsFirst) {
+    record SortSpec(String expr, String name, SqlType type, boolean desc, boolean nullsFirst, boolean noneMissing) {
         SortSpec(String expr, String name, SqlType type, boolean desc) {
-            this(expr, name, type, desc, false);
+            this(expr, name, type, desc, false, false);
         }
 
         /**
@@ -191,7 +196,7 @@ public final class InfinoSearch {
          * other value standing in for a missing one, as stock sorts such a
          * row by that value and hands it back as the hit's sort value.
          */
-        SortSpec withMissing(Object missing, Column c, long nowMillis) {
+        SortSpec withMissing(Object missing, long nowMillis) {
             if (missing == null) {
                 return this;
             }
@@ -200,13 +205,35 @@ public final class InfinoSearch {
                 return this;
             }
             if ("_first".equals(text)) {
-                return new SortSpec(expr, name, type, desc, true);
+                return new SortSpec(expr, name, type, desc, true, false);
             }
-            String lit = InfinoQueryTranslator.literalForType(type, missing instanceof BytesRef ? text : missing, nowMillis, c == null ? null : c.dateFormat());
+            String lit = replacement(missing instanceof BytesRef ? text : missing, nowMillis);
             if (lit == null) {
                 throw new IllegalArgumentException("[infino] sort missing value [" + text + "] on [" + name + "] is not a " + type.name().toLowerCase(Locale.ROOT));
             }
-            return new SortSpec("COALESCE(" + expr + ", " + lit + ")", name, type, desc, false);
+            return new SortSpec("COALESCE(" + expr + ", " + lit + ")", name, type, desc, false, true);
+        }
+
+        /**
+         * The request's {@code missing} value as a literal of this sort's
+         * type, read as stock's comparator reads it: a number as a long for
+         * an integer or a date (3.5 is 3, a date's number its epoch
+         * milliseconds), as a double for a float, and text parsed as one;
+         * null when it is not one.
+         */
+        private String replacement(Object missing, long nowMillis) {
+            try {
+                return switch (type) {
+                    case INT -> Long.toString(missing instanceof Number n ? n.longValue() : Long.parseLong(missing.toString()));
+                    case DATE -> "arrow_cast("
+                        + (missing instanceof Number n ? n.longValue() : Long.parseLong(missing.toString()))
+                        + ", 'Timestamp(Millisecond, Some(\"UTC\"))')";
+                    case FLOAT -> Double.toString(missing instanceof Number n ? n.doubleValue() : Double.parseDouble(missing.toString()));
+                    default -> InfinoQueryTranslator.literalForType(type, missing, nowMillis);
+                };
+            } catch (NumberFormatException e) {
+                return null;
+            }
         }
 
         /**
@@ -217,6 +244,9 @@ public final class InfinoSearch {
          * the page continues among the missing rows, as stock compares them.
          */
         boolean missingStandIn(Object value) {
+            if (noneMissing) {
+                return false;
+            }
             boolean least = desc != nullsFirst;
             return switch (type) {
                 case INT, DATE -> value instanceof Number n
@@ -530,7 +560,7 @@ public final class InfinoSearch {
             boolean desc = fs.order() == SortOrder.DESC;
             Column values = c.isList() ? c : InfinoQueryTranslator.listOf(cols, c);
             if (values == null) {
-                out.add(SortSpec.of(c, desc).withMissing(fs.missing(), c, nowMillis));
+                out.add(SortSpec.of(c, desc).withMissing(fs.missing(), nowMillis));
                 continue;
             }
             SortMode mode = fs.sortMode();
@@ -540,7 +570,7 @@ public final class InfinoSearch {
             // Stock's default mode is the least value ascending and the greatest
             // descending; an explicit min or max picks that value either way.
             boolean greatest = mode == null ? desc : mode == SortMode.MAX;
-            out.add(SortSpec.ofValues(c, values, greatest, desc).withMissing(fs.missing(), c, nowMillis));
+            out.add(SortSpec.ofValues(c, values, greatest, desc).withMissing(fs.missing(), nowMillis));
         }
         return out;
     }
@@ -731,7 +761,7 @@ public final class InfinoSearch {
             if (plan.collapse() != null) {
                 // A collapsed hit carries its collapse value, as stock does.
                 String field = plan.collapse().name();
-                Object value = row.get(field);
+                Object value = row.get(COLLAPSE_KEY);
                 h.setDocumentField(field, new DocumentField(field, value == null ? List.of() : List.of(value)));
             }
             for (ScriptedField sf : plan.scriptFields()) {
@@ -829,8 +859,9 @@ public final class InfinoSearch {
             }
             hit.append(", ").append(s.expr()).append(" AS ").append(InfinoQueryTranslator.quoteIdent(s.name()));
         }
-        if (plan.collapse() != null && plan.sorts().stream().noneMatch(s -> s.name().equals(plan.collapse().name()))) {
-            hit.append(", ").append(InfinoQueryTranslator.quoteIdent(plan.collapse().name()));
+        if (plan.collapse() != null) {
+            // Under its own alias: a sort on the column under a missing value selects the stand-in under the column's name.
+            hit.append(", ").append(InfinoQueryTranslator.quoteIdent(plan.collapse().name())).append(" AS ").append(COLLAPSE_KEY);
         }
         for (ScriptedField sf : plan.scriptFields()) {
             hit.append(", ").append(sf.expr()).append(" AS ").append(sf.alias());

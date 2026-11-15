@@ -569,3 +569,238 @@
           query: { ids: { values: [ "m1" ] } }
           sort: [ { n: { order: desc, missing: 3 } } ]
   - match: { hits.hits.0.sort.0: 3 }
+
+---
+"A missing value is read as a Lucene twin reads it: a long exactly, a fraction cut to a long, a date's number as milliseconds":
+  - do:
+      indices.create:
+        index: sm4_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              d: { type: date }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: sm4_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              d: { type: date }
+              k: { type: keyword }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sm4_inf
+        body:
+          - index: { _id: "p" }
+          - { n: 3, d: "1970-01-01T00:00:02Z", k: "a" }
+          - index: { _id: "m" }
+          - { k: "b" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sm4_luc
+        body:
+          - index: { _id: "p" }
+          - { n: 3, d: "1970-01-01T00:00:02Z", k: "a" }
+          - index: { _id: "m" }
+          - { k: "b" }
+  - match: { errors: false }
+
+  # A long past a double's precision stays exact.
+  - do:
+      search:
+        index: sm4_luc
+        body:
+          query: { ids: { values: [ "m" ] } }
+          sort: [ { n: { order: desc, missing: 9007199254740993 } } ]
+  - match: { hits.hits.0.sort.0: 9007199254740993 }
+  - do:
+      search:
+        index: sm4_inf
+        body:
+          query: { ids: { values: [ "m" ] } }
+          sort: [ { n: { order: desc, missing: 9007199254740993 } } ]
+  - match: { hits.hits.0.sort.0: 9007199254740993 }
+  # 3.5 is cut to 3, so the missing row ties with p and k breaks the tie.
+  - do:
+      search:
+        index: sm4_luc
+        body:
+          sort: [ { n: { order: desc, missing: 3.5 } }, { k: asc } ]
+  - match: { hits.hits.0._id: "p" }
+  - match: { hits.hits.1._id: "m" }
+  - do:
+      search:
+        index: sm4_inf
+        body:
+          sort: [ { n: { order: desc, missing: 3.5 } }, { k: asc } ]
+  - match: { hits.hits.0._id: "p" }
+  - match: { hits.hits.1._id: "m" }
+  # A date's missing number is epoch milliseconds, handed back as the sort value.
+  - do:
+      search:
+        index: sm4_luc
+        body:
+          sort: [ { d: { order: desc, missing: 1000 } } ]
+  - match: { hits.hits.0._id: "p" }
+  - match: { hits.hits.1._id: "m" }
+  - match: { hits.hits.1.sort.0: 1000 }
+  - do:
+      search:
+        index: sm4_inf
+        body:
+          sort: [ { d: { order: desc, missing: 1000 } } ]
+  - match: { hits.hits.0._id: "p" }
+  - match: { hits.hits.1._id: "m" }
+  - match: { hits.hits.1.sort.0: 1000 }
+
+---
+"A page after a missing value given as the greatest long continues among the missing rows, as a Lucene twin pages it":
+  - do:
+      indices.create:
+        index: sm5_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: sm5_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              k: { type: keyword }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sm5_inf
+        body:
+          - index: { _id: "p" }
+          - { n: 3, k: "p" }
+          - index: { _id: "m1" }
+          - { k: "m1" }
+          - index: { _id: "m2" }
+          - { k: "m2" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sm5_luc
+        body:
+          - index: { _id: "p" }
+          - { n: 3, k: "p" }
+          - index: { _id: "m1" }
+          - { k: "m1" }
+          - index: { _id: "m2" }
+          - { k: "m2" }
+  - match: { errors: false }
+  - do:
+      search:
+        index: sm5_luc
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: 9223372036854775807 } }, { k: asc } ]
+  - match: { hits.hits.0._id: "p" }
+  - match: { hits.hits.1._id: "m1" }
+  - set: { hits.hits.1.sort: after_sm5_luc }
+  - do:
+      search:
+        index: sm5_luc
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: 9223372036854775807 } }, { k: asc } ]
+          search_after: $after_sm5_luc
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "m2" }
+  - do:
+      search:
+        index: sm5_inf
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: 9223372036854775807 } }, { k: asc } ]
+  - match: { hits.hits.0._id: "p" }
+  - match: { hits.hits.1._id: "m1" }
+  - set: { hits.hits.1.sort: after_sm5_inf }
+  - do:
+      search:
+        index: sm5_inf
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: 9223372036854775807 } }, { k: asc } ]
+          search_after: $after_sm5_inf
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "m2" }
+
+---
+"A collapse under a sort's missing value groups by the field's own value, as a Lucene twin groups it":
+  # One index holds n: 3, the other a row missing n; the missing value 3 sorts
+  # the missing row as 3 but leaves it a group of its own.
+  - do:
+      indices.create:
+        index: sm6a_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      indices.create:
+        index: sm6b_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              other: { type: long }
+  - do:
+      indices.create:
+        index: sm6a_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      indices.create:
+        index: sm6b_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              other: { type: long }
+  - do:
+      index: { index: sm6a_inf, id: "p", refresh: true, body: { n: 3 } }
+  - do:
+      index: { index: sm6b_inf, id: "m", refresh: true, body: { other: 1 } }
+  - do:
+      index: { index: sm6a_luc, id: "p", refresh: true, body: { n: 3 } }
+  - do:
+      index: { index: sm6b_luc, id: "m", refresh: true, body: { other: 1 } }
+  - do:
+      search:
+        index: sm6a_luc,sm6b_luc
+        body:
+          collapse: { field: n }
+          sort: [ { n: { order: desc, missing: 3 } } ]
+  - length: { hits.hits: 2 }
+  - do:
+      search:
+        index: sm6a_inf,sm6b_inf
+        body:
+          collapse: { field: n }
+          sort: [ { n: { order: desc, missing: 3 } } ]
+  - length: { hits.hits: 2 }
