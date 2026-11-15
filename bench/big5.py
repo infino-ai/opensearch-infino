@@ -26,11 +26,13 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 INDEX = "big5"
-SEARCHES = {s["name"]: s["body"] for s in json.load(open(os.path.join(HERE, "big5-searches.json")))}
+# Each search's body and its URL parameters (pre_filter_shard_size, ...).
+SEARCHES = {s["name"]: (s["body"], s.get("params", {})) for s in json.load(open(os.path.join(HERE, "big5-searches.json")))}
 PORTS = {"default": 0, "stock": 1, "proxy": 2}
 
 
@@ -85,7 +87,8 @@ def load(args):
             for f in files:
                 with open(f, "rb") as fh:
                     for line in fh:
-                        buf.append(b'{"index":{}}\n' + line.rstrip(b"\n") + b"\n")
+                        # The document's place in the input as its id, the same on every node.
+                        buf.append(b'{"index":{"_id":"%d"}}\n' % n + line.rstrip(b"\n") + b"\n")
                         n += 1
                         if len(buf) == args.batch:
                             yield b"".join(buf)
@@ -136,7 +139,8 @@ def run(args):
     order = ["stock"] + [n for n in ns if n != "stock"]
     wanted = args.searches.split(",") if args.searches else [s for s in SEARCHES if s not in args.skip.split(",")]
     for search in wanted:
-        body = SEARCHES[search]
+        body, params = SEARCHES[search]
+        query = urllib.parse.urlencode({"request_cache": "false", **params})
         for name in order:
             if name not in ns or name in dead:
                 continue
@@ -163,7 +167,7 @@ def run(args):
                 t.start()
                 t0 = time.perf_counter()
                 try:
-                    status, res = call(port, "POST", f"/{INDEX}/_search?request_cache=false", body, timeout=args.timeout)
+                    status, res = call(port, "POST", f"/{INDEX}/_search?{query}", body, timeout=args.timeout)
                 except Exception as e:  # the node died or stopped answering
                     status, res = None, {"error": repr(e)}
                 elapsed = (time.perf_counter() - t0) * 1000

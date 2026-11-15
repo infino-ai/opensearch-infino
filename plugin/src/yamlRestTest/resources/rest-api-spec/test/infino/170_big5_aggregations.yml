@@ -152,6 +152,185 @@
   - match: { aggregations.groups.buckets.1.sig.buckets.0.score: $score_a }
 
 ---
+"significant_terms under parents whose keys hold the separator, beside fields named p0, k0 and count(*), matches a Lucene twin":
+  # The parent tuples (a\u0001b, c) and (a, b\u0001c) are two buckets, each
+  # with its own foreground; the fields p0 and k0 share the batched
+  # statement's aliases; count(*) is the name the engine's value counts give
+  # their count, which the whole-table background must not ask for.
+  - do:
+      indices.create:
+        index: sep_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              g1: { type: keyword }
+              g2: { type: keyword }
+              tag: { type: keyword }
+              p0: { type: keyword }
+              k0: { type: keyword }
+              "count(*)": { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: sep_luc
+        body:
+          - index: { _id: "s1" }
+          - { g1: "a\u0001b", g2: c, tag: x, p0: q, k0: q, "count(*)": u }
+          - index: { _id: "s2" }
+          - { g1: a, g2: "b\u0001c", tag: y, p0: r, k0: r, "count(*)": v }
+          - index: { _id: "s3" }
+          - { g1: d, g2: e, tag: z, p0: q, k0: r, "count(*)": w }
+  - match: { errors: false }
+  - do:
+      indices.create:
+        index: sep_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              g1: { type: keyword }
+              g2: { type: keyword }
+              tag: { type: keyword }
+              p0: { type: keyword }
+              k0: { type: keyword }
+              "count(*)": { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: sep_inf
+        body:
+          - index: { _id: "s1" }
+          - { g1: "a\u0001b", g2: c, tag: x, p0: q, k0: q, "count(*)": u }
+          - index: { _id: "s2" }
+          - { g1: a, g2: "b\u0001c", tag: y, p0: r, k0: r, "count(*)": v }
+          - index: { _id: "s3" }
+          - { g1: d, g2: e, tag: z, p0: q, k0: r, "count(*)": w }
+  - match: { errors: false }
+  - do:
+      search:
+        index: sep_luc
+        body:
+          size: 0
+          aggs:
+            g1:
+              terms: { field: g1 }
+              aggs:
+                g2:
+                  terms: { field: g2 }
+                  aggs:
+                    sig: { significant_terms: { field: tag, min_doc_count: 1 } }
+  - length: { aggregations.g1.buckets: 3 }
+  - match: { aggregations.g1.buckets.0.key: a }
+  - match: { aggregations.g1.buckets.0.g2.buckets.0.key: "b\u0001c" }
+  - length: { aggregations.g1.buckets.0.g2.buckets.0.sig.buckets: 1 }
+  - match: { aggregations.g1.buckets.0.g2.buckets.0.sig.buckets.0.key: y }
+  - match: { aggregations.g1.buckets.1.key: "a\u0001b" }
+  - match: { aggregations.g1.buckets.1.g2.buckets.0.key: c }
+  - length: { aggregations.g1.buckets.1.g2.buckets.0.sig.buckets: 1 }
+  - match: { aggregations.g1.buckets.1.g2.buckets.0.sig.buckets.0.key: x }
+  - do:
+      search:
+        index: sep_luc
+        body:
+          size: 0
+          aggs:
+            g1:
+              terms: { field: g1 }
+              aggs:
+                sig: { significant_terms: { field: tag, min_doc_count: 1 } }
+  - length: { aggregations.g1.buckets: 3 }
+  - match: { aggregations.g1.buckets.0.key: a }
+  - length: { aggregations.g1.buckets.0.sig.buckets: 1 }
+  - match: { aggregations.g1.buckets.0.sig.buckets.0.key: y }
+  - match: { aggregations.g1.buckets.2.key: d }
+  - match: { aggregations.g1.buckets.2.sig.buckets.0.key: z }
+  - do:
+      search:
+        index: sep_luc
+        body:
+          size: 0
+          aggs:
+            sig: { significant_terms: { field: "count(*)", min_doc_count: 1 } }
+  - match: { aggregations.sig.doc_count: 3 }
+  - match: { aggregations.sig.bg_count: 3 }
+  - length: { aggregations.sig.buckets: 0 }
+  - do:
+      search:
+        index: sep_luc
+        body:
+          size: 0
+          query: { term: { g1: d } }
+          aggs:
+            sig: { significant_terms: { field: "count(*)", min_doc_count: 1 } }
+  - match: { aggregations.sig.doc_count: 1 }
+  - match: { aggregations.sig.bg_count: 3 }
+  - length: { aggregations.sig.buckets: 1 }
+  - match: { aggregations.sig.buckets.0.key: w }
+  - match: { aggregations.sig.buckets.0.bg_count: 1 }
+  - do:
+      search:
+        index: sep_inf
+        body:
+          size: 0
+          aggs:
+            g1:
+              terms: { field: g1 }
+              aggs:
+                g2:
+                  terms: { field: g2 }
+                  aggs:
+                    sig: { significant_terms: { field: tag, min_doc_count: 1 } }
+  - length: { aggregations.g1.buckets: 3 }
+  - match: { aggregations.g1.buckets.0.key: a }
+  - match: { aggregations.g1.buckets.0.g2.buckets.0.key: "b\u0001c" }
+  - length: { aggregations.g1.buckets.0.g2.buckets.0.sig.buckets: 1 }
+  - match: { aggregations.g1.buckets.0.g2.buckets.0.sig.buckets.0.key: y }
+  - match: { aggregations.g1.buckets.1.key: "a\u0001b" }
+  - match: { aggregations.g1.buckets.1.g2.buckets.0.key: c }
+  - length: { aggregations.g1.buckets.1.g2.buckets.0.sig.buckets: 1 }
+  - match: { aggregations.g1.buckets.1.g2.buckets.0.sig.buckets.0.key: x }
+  - do:
+      search:
+        index: sep_inf
+        body:
+          size: 0
+          aggs:
+            g1:
+              terms: { field: g1 }
+              aggs:
+                sig: { significant_terms: { field: tag, min_doc_count: 1 } }
+  - length: { aggregations.g1.buckets: 3 }
+  - match: { aggregations.g1.buckets.0.key: a }
+  - length: { aggregations.g1.buckets.0.sig.buckets: 1 }
+  - match: { aggregations.g1.buckets.0.sig.buckets.0.key: y }
+  - match: { aggregations.g1.buckets.2.key: d }
+  - match: { aggregations.g1.buckets.2.sig.buckets.0.key: z }
+  - do:
+      search:
+        index: sep_inf
+        body:
+          size: 0
+          aggs:
+            sig: { significant_terms: { field: "count(*)", min_doc_count: 1 } }
+  - match: { aggregations.sig.doc_count: 3 }
+  - match: { aggregations.sig.bg_count: 3 }
+  - length: { aggregations.sig.buckets: 0 }
+  - do:
+      search:
+        index: sep_inf
+        body:
+          size: 0
+          query: { term: { g1: d } }
+          aggs:
+            sig: { significant_terms: { field: "count(*)", min_doc_count: 1 } }
+  - match: { aggregations.sig.doc_count: 1 }
+  - match: { aggregations.sig.bg_count: 3 }
+  - length: { aggregations.sig.buckets: 1 }
+  - match: { aggregations.sig.buckets.0.key: w }
+  - match: { aggregations.sig.buckets.0.bg_count: 1 }
+
+---
 "UTC minute, hour, day and fixed date keys before 1970 and outside 1677 to 2262 match a Lucene twin":
   # date_bin works in nanoseconds, which an i64 holds only from 1677-09-21
   # to 2262-04-11. A date outside that range must still get its bucket.

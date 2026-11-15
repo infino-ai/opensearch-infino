@@ -297,6 +297,8 @@ public class InfinoAggregationProcessor {
             || s.keyKind != KeyKind.STR
             || s.source.column() == null
             || s.source.multi()
+            // The engine's value counts name their count column so, and refuse a field of that name.
+            || InfinoNative.VALUE_COUNT.equals(s.source.column())
             || !InfinoQueryTranslator.ALL.equals(s.backgroundWhere)
             || plan.access().documentsWhere(InfinoNative.columns(s.table), s.table, plan.nowMillis()) != null) {
             return null;
@@ -3156,6 +3158,12 @@ public class InfinoAggregationProcessor {
             parentCols.add("p" + j);
         }
         String partition = String.join(", ", parentCols);
+        // By SELECT position, as groupStatement groups: a field named p0 or k0
+        // would take the alias's place in a GROUP BY by name.
+        StringBuilder positions = new StringBuilder();
+        for (int j = 1; j <= n + 1; j++) {
+            positions.append(j == 1 ? "" : ", ").append(j);
+        }
         for (BucketSpec leaf : leaves) {
             if (!(leaf instanceof Significant s) || !s.metrics.isEmpty()) {
                 continue;
@@ -3170,12 +3178,12 @@ public class InfinoAggregationProcessor {
             String having = s.minDocCount > 1 ? " HAVING COUNT(*) >= " + s.minDocCount : "";
             String inner = "SELECT " + String.join(", ", parents) + ", " + key + " AS k0, COUNT(*) AS doc_count FROM " + from
                 + " WHERE (" + where + ") AND " + tupleRestriction(chain, kept, n, false) + " AND " + key + " IS NOT NULL GROUP BY "
-                + String.join(", ", parentCols) + ", k0" + having;
+                + positions + having;
             List<Map<String, Object>> rows = InfinoNative.sqlRows(
                 "SELECT * FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY doc_count DESC, k0 ASC) AS rn FROM ("
                     + inner + ") t) WHERE rn <= " + s.candidates + " ORDER BY " + partition + ", rn"
             );
-            Map<String, List<Map<String, Object>>> byTuple = new HashMap<>();
+            Map<List<String>, List<Map<String, Object>>> byTuple = new HashMap<>();
             for (Map<String, Object> row : rows) {
                 List<Object> tuple = new ArrayList<>();
                 for (int j = 0; j < n; j++) {
@@ -3184,11 +3192,11 @@ public class InfinoAggregationProcessor {
                 Map<String, Object> fg = new HashMap<>();
                 fg.put("k0", row.get("k0"));
                 fg.put("doc_count", row.get("doc_count"));
-                byTuple.computeIfAbsent(keyString(tuple), k -> new ArrayList<>()).add(fg);
+                byTuple.computeIfAbsent(tupleKey(tuple), k -> new ArrayList<>()).add(fg);
             }
             Map<String, List<Map<String, Object>>> byWhere = new HashMap<>();
             for (List<Object> tuple : kept) {
-                List<Map<String, Object>> fg = byTuple.get(keyString(tuple));
+                List<Map<String, Object>> fg = byTuple.get(tupleKey(tuple));
                 if (fg == null) {
                     // No candidate came back under this bucket's keys: the bucket
                     // reads its own foreground, so a key the statement printed
@@ -3517,6 +3525,15 @@ public class InfinoAggregationProcessor {
             sb.append(keyString(key));
         }
         return sb.toString();
+    }
+
+    /** A key tuple as each key's {@link #keyString}, apart, so no key's text can run into the next's. */
+    private static List<String> tupleKey(List<Object> tuple) {
+        List<String> out = new ArrayList<>(tuple.size());
+        for (Object key : tuple) {
+            out.add(keyString(key));
+        }
+        return out;
     }
 
     private static String keyString(Object key) {
