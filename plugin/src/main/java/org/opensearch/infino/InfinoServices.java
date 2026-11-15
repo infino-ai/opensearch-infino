@@ -75,7 +75,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoClient.bind(injector);
         // The security plugin's components, when it runs, come from the same injector.
         InfinoSecurity.bind(injector);
-        // Whether it runs here, which decides whether a search sees its own index (see InfinoAccess#searching).
+        // Whether it runs here, which decides whether a read sees its own index (see InfinoAccess#reading).
         List<String> plugins = injector.getInstance(PluginsService.class).filterPlugins(Plugin.class).stream().map(p -> p.getClass().getName()).toList();
         InfinoAccess.securityRuns(InfinoSecurityCalls.runs(injector.getInstance(Settings.class), plugins));
         // Registered cluster state is sent as REST requests, whose bodies the

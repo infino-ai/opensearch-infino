@@ -247,7 +247,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     /** The directory {@link #CACHE_DIR} names under the node's data path by default. */
     static final String DEFAULT_CACHE_SUBDIR = "infino-cache";
 
-    /** The security plugin's setting naming its own index, which a search reads as empty (see {@link InfinoAccess#searching}). */
+    /** The security plugin's setting naming its own index, which a search, get or SQL read reads as empty (see {@link InfinoAccess#reading}). */
     static final String SECURITY_INDEX_SETTING = "plugins.security.config_index_name";
 
     private static final InfinoTables TABLES = new InfinoTables();

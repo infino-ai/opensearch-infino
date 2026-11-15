@@ -46,6 +46,27 @@
         index: .opendistro_security
   - match: { count: 0 }
 
+  # A get is answered through the same reader there, so it finds nothing either.
+  - do:
+      catch: missing
+      get:
+        index: .opendistro_security
+        id: internalusers
+  - match: { found: false }
+
+  - do:
+      mget:
+        body: { docs: [ { _index: .opendistro_security, _id: internalusers }, { _index: .opendistro_security, _id: roles } ] }
+  - match: { docs.0.found: false }
+  - match: { docs.1.found: false }
+
+  # SQL reads no system index, this one included.
+  - do:
+      catch: forbidden
+      infino.sql:
+        body: { query: "SELECT count(*) AS c FROM \".opendistro_security\"" }
+  - match: { error.reason: "/is.a.system.index/" }
+
   # The security plugin still reads its configuration from the table: a user it knows logs in.
   - do:
       headers: { Authorization: "Basic c3Rhcl91c2VyOmFkbWlu" }

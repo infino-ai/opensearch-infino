@@ -152,7 +152,7 @@ final class InfinoSecurity {
             Helpers security = user == null ? null : helpers(user);
             return InfinoSecurityCalls.readsSecurityIndex(context, security == null ? null : security.adminDns());
         } catch (ReflectiveOperationException | RuntimeException e) {
-            throw InfinoAccess.refused("a search of the security plugin's own index is refused: its admin certificates could not be read: " + reason(e));
+            throw InfinoAccess.refused("a read of the security plugin's own index is refused: its admin certificates could not be read: " + reason(e));
         }
     }
 
