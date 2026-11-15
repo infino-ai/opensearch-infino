@@ -699,6 +699,31 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(hits(t.unscored(), null, 10).contains("infino_bonus"));
     }
 
+    /**
+     * A request sorted by _score ascending reads the least sums first when
+     * no text clause scores; with one, whose BM25 ranks only its best hits,
+     * it is unscored. A descending _score sort keeps the greatest first.
+     */
+    public void testAnAscendingScoreSortReadsTheLeastSumsFirst() {
+        org.opensearch.search.builder.SearchSourceBuilder source = new org.opensearch.search.builder.SearchSourceBuilder();
+        assertFalse(InfinoSearch.sortsByScoreAscending(source));
+        assertFalse(InfinoSearch.sortsByScoreAscending(new org.opensearch.search.builder.SearchSourceBuilder().sort(new org.opensearch.search.sort.ScoreSortBuilder())));
+        assertFalse(InfinoSearch.sortsByScoreAscending(new org.opensearch.search.builder.SearchSourceBuilder().sort("_doc").sort(new org.opensearch.search.sort.ScoreSortBuilder().order(org.opensearch.search.sort.SortOrder.ASC))));
+        assertTrue(InfinoSearch.sortsByScoreAscending(new org.opensearch.search.builder.SearchSourceBuilder().sort(new org.opensearch.search.sort.ScoreSortBuilder().order(org.opensearch.search.sort.SortOrder.ASC))));
+
+        BoolQueryBuilder b = QueryBuilders.boolQuery().should(QueryBuilders.termQuery("level", "error")).should(QueryBuilders.rangeQuery("status").gte(500));
+        Translation t = translate(b);
+        assertTrue(hits(t, null, 10).endsWith(") AS infino_scored ORDER BY score DESC, infino_row ASC LIMIT 10"));
+        assertTrue(t.ascending().scoring().ascending());
+        assertEquals(t.scoring().bonuses(), t.ascending().scoring().bonuses());
+        String sql = hits(t.ascending(), null, 10);
+        assertTrue(sql, sql.endsWith(") AS infino_scored ORDER BY score ASC, infino_row ASC LIMIT 10"));
+
+        Translation text = translate(QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.termQuery("level", "error")));
+        assertNotNull(text.scoring().text());
+        assertSame(InfinoQueryTranslator.Scoring.NONE, text.ascending().scoring());
+    }
+
     /** The plan of a translated query, with no sort, collapse, post_filter or search_after. */
     private static InfinoSearch.Plan plan(Translation t) {
         return new InfinoSearch.Plan(TABLE, columns(), t, java.util.List.of(), null, null, null, null, java.util.List.of(), InfinoAccess.NONE, NOW);

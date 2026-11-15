@@ -309,6 +309,8 @@ public final class InfinoSearch {
             // Stock orders such a page by the index and scores nothing, so
             // the clauses' scores never reorder it.
             query = query.unscored();
+        } else if (sorts.isEmpty() && sortsByScoreAscending(source)) {
+            query = query.ascending();
         }
         String postWhere = null;
         if (source.postFilter() != null) {
@@ -1001,7 +1003,7 @@ public final class InfinoSearch {
         }
         // Hits that tie on score come in the order they were written, as stock orders them by their place in the index.
         return "SELECT " + String.join(", ", names) + ", infino_bm25 + infino_bonus AS score FROM (" + String.join(" UNION ALL ", branches)
-            + ") AS infino_scored ORDER BY score DESC, infino_row ASC LIMIT " + fetch;
+            + ") AS infino_scored ORDER BY score " + (scoring.ascending() ? "ASC" : "DESC") + ", infino_row ASC LIMIT " + fetch;
     }
 
     /**
@@ -1549,6 +1551,14 @@ public final class InfinoSearch {
             && !source.sorts().isEmpty()
             && source.sorts().get(0) instanceof FieldSortBuilder fs
             && FieldSortBuilder.DOC_FIELD_NAME.equals(fs.getFieldName());
+    }
+
+    /** Whether the first sort {@code source} names is the score, ascending. */
+    static boolean sortsByScoreAscending(SearchSourceBuilder source) {
+        return source.sorts() != null
+            && !source.sorts().isEmpty()
+            && source.sorts().get(0) instanceof ScoreSortBuilder ss
+            && ss.order() == SortOrder.ASC;
     }
 
     /** A sort a scroll pages past in the id's order: {@code _doc}, or the score. */

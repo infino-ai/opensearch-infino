@@ -184,9 +184,15 @@ final class InfinoQueryTranslator {
      * in should, or a nested clause, whose score is its entries'). The text
      * clause is the principal when there is one; otherwise {@code text}, a
      * text clause in should, whose BM25 counts where it matches.
+     * {@code ascending} when the request sorts by the score ascending: the
+     * least sums come first.
      */
-    record Scoring(TextClause text, double offset, List<Bonus> bonuses) {
+    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending) {
         static final Scoring NONE = new Scoring(null, 0, List.of());
+
+        Scoring(TextClause text, double offset, List<Bonus> bonuses) {
+            this(text, offset, bonuses, false);
+        }
 
         /** Whether hits rank by more than the principal's BM25 alone: then {@code offset} only shifts every score alike. */
         boolean reorders() {
@@ -212,6 +218,18 @@ final class InfinoQueryTranslator {
         /** This translation with no clause but the principal's BM25 scoring the hits. */
         Translation unscored() {
             return new Translation(table, where, principal, Scoring.NONE, span);
+        }
+
+        /**
+         * This translation with its hits in ascending score. Only the bonuses
+         * of a query with no text clause are summed over every hit; a text
+         * clause's BM25 ranks its best hits only, so such a query is unscored.
+         */
+        Translation ascending() {
+            if (principal != null || scoring.text() != null) {
+                return unscored();
+            }
+            return new Translation(table, where, principal, new Scoring(null, scoring.offset(), scoring.bonuses(), true), span);
         }
 
         /** The relation the predicate applies to: the table, or its token-match set. */
