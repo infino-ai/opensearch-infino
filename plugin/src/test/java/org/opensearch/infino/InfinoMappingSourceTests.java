@@ -36,6 +36,17 @@ public class InfinoMappingSourceTests extends OpenSearchTestCase {
         return XContentHelper.convertToMap(new BytesArray(s), false, MediaTypeRegistry.JSON).v2();
     }
 
+    public void testAMappingIsReadOnceAndAChangedOneAfresh() {
+        MappingMetadata excluding = new MappingMetadata("_doc", Map.of("_source", Map.of("excludes", List.of("items")), "properties", Map.of()));
+        InfinoMappingSource first = InfinoMappingSource.of(excluding);
+        assertSame("the same mapping is not read again", first, InfinoMappingSource.of(excluding));
+        MappingMetadata including = new MappingMetadata("_doc", Map.of("_source", Map.of("includes", List.of("rank")), "properties", Map.of()));
+        InfinoMappingSource changed = InfinoMappingSource.of(including);
+        assertNotSame("a changed mapping is read afresh", first, changed);
+        assertArrayEquals(new String[] { "rank" }, changed.includes());
+        assertArrayEquals(new String[] { "items" }, InfinoMappingSource.of(excluding).excludes());
+    }
+
     public void testAMappingThatSaysNothingKeepsTheSourceWhole() {
         assertSame(InfinoMappingSource.WHOLE, InfinoMappingSource.of(null));
         assertSame(InfinoMappingSource.WHOLE, InfinoMappingSource.of(new MappingMetadata("_doc", Map.of("properties", Map.of()))));

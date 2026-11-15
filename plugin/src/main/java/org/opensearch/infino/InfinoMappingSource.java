@@ -17,8 +17,10 @@ import org.opensearch.search.fetch.subphase.FetchSourceContext;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.WeakHashMap;
 
 /**
  * What a document's {@code _source} keeps under its index's mapping, as
@@ -33,11 +35,29 @@ record InfinoMappingSource(boolean enabled, String[] includes, String[] excludes
     /** A mapping that keeps the source whole, as one that says nothing of it does. */
     static final InfinoMappingSource WHOLE = new InfinoMappingSource(true, new String[0], new String[0]);
 
+    /**
+     * Each mapping's {@code _source}, read once. Reading it parses the whole
+     * mapping, which a search, get or mget would otherwise do on every
+     * request. Keyed by the mapping, so a changed mapping is read afresh, and
+     * weakly, so a mapping the cluster state no longer holds is let go.
+     */
+    private static final Map<MappingMetadata, InfinoMappingSource> READ = Collections.synchronizedMap(new WeakHashMap<>());
+
     /** The {@code _source} of {@code mapping}; {@link #WHOLE} when there is none or it says nothing. */
     static InfinoMappingSource of(MappingMetadata mapping) {
         if (mapping == null) {
             return WHOLE;
         }
+        InfinoMappingSource kept = READ.get(mapping);
+        if (kept == null) {
+            kept = read(mapping);
+            READ.put(mapping, kept);
+        }
+        return kept;
+    }
+
+    /** {@link #of}, read from the mapping itself. */
+    private static InfinoMappingSource read(MappingMetadata mapping) {
         if (!(mapping.sourceAsMap().get(SourceFieldMapper.NAME) instanceof Map<?, ?> source)) {
             return WHOLE;
         }
