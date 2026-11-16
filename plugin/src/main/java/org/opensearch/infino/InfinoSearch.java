@@ -577,12 +577,15 @@ public final class InfinoSearch {
         if (indexSorted(plan) && !seqNoAndPrimaryTerm) {
             // Every row, sorted on one range-indexed field: the engine reads the
             // page from the field's range index, so no statement is planned for
-            // it, and the page's sources by row id along with it. Null when the
-            // bridge leaves the page to the statement.
+            // it. Its sources are looked up by id afterwards, as the statement's
+            // are: asked for them, the engine would put them in the statement it
+            // plans when fewer than a page of rows have a value, which sorts
+            // every row with its source. Null when the bridge leaves the page to
+            // the statement.
             SortSpec first = plan.sorts().get(0);
-            rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, wantsSource(source));
+            rows = InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch);
             if (rows != null) {
-                return rows;
+                return sourcesById(plan) && wantsSource(source) ? withSources(plan.table(), rows, fetch) : rows;
             }
         }
         if (splitsMissingTail(plan)) {

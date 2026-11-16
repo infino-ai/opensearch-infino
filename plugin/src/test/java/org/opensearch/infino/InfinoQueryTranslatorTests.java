@@ -201,6 +201,8 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             NOW
         );
         assertTrue(InfinoSearch.indexSorted(all));
+        // Its sources are looked up by id once the page is read, not read with it.
+        assertTrue(InfinoSearch.sourcesById(all));
         // A predicate narrows the rows: the hit statement.
         InfinoSearch.Plan filtered = new InfinoSearch.Plan(
             TABLE,
