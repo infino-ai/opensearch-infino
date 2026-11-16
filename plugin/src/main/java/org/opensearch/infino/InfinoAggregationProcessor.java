@@ -1313,7 +1313,8 @@ public class InfinoAggregationProcessor {
         final int size;
         final List<SortSpec> sorts;
         final FetchSourceContext source;
-        final List<FieldAndFormat> fields;
+        final List<FieldAndFormat> docValueFields;
+        final List<FieldAndFormat> fetchFields;
         final Map<String, Column> cols;
         final InfinoAccess access;
 
@@ -1321,7 +1322,8 @@ public class InfinoAggregationProcessor {
             TopHitsAggregationBuilder b,
             List<SortSpec> sorts,
             FetchSourceContext source,
-            List<FieldAndFormat> fields,
+            List<FieldAndFormat> docValueFields,
+            List<FieldAndFormat> fetchFields,
             Map<String, Column> cols,
             InfinoAccess access
         ) {
@@ -1330,7 +1332,8 @@ public class InfinoAggregationProcessor {
             this.size = b.size() < 0 ? DEFAULT_TOP_HITS_SIZE : b.size();
             this.sorts = sorts;
             this.source = source;
-            this.fields = fields;
+            this.docValueFields = docValueFields;
+            this.fetchFields = fetchFields;
             this.cols = cols;
             this.access = access;
         }
@@ -1350,8 +1353,17 @@ public class InfinoAggregationProcessor {
             } catch (IllegalArgumentException e) {
                 throw new Unsupported("aggregation [" + b.getName() + "] " + e.getMessage());
             }
-            // docvalue_fields and fields are read from the hit's source; stored_fields adds nothing the source lacks.
-            return new TopHits(b, sorts, b.fetchSource(), InfinoSearch.requestedFields(b.docValueFields(), b.fetchFields()), cols, access);
+            // docvalue_fields and fields are read from the hit's source (see InfinoSearch.fillRequested);
+            // stored_fields adds nothing the source lacks.
+            return new TopHits(
+                b,
+                sorts,
+                b.fetchSource(),
+                InfinoSearch.requestedFields(b.docValueFields(), null),
+                InfinoSearch.requestedFields(null, b.fetchFields()),
+                cols,
+                access
+            );
         }
 
         /** The columns a hit row carries beyond the id and the source. */
@@ -1377,7 +1389,20 @@ public class InfinoAggregationProcessor {
 
         /** This aggregation over the bucket's rows (in order, at most {@link #fetch()} of them) and its row count; the hits name {@code index}. */
         InternalAggregation build(List<Map<String, Object>> rows, long bucketCount, Index index) {
-            return InfinoSearch.topHits((TopHitsAggregationBuilder) builder, from, size, sorts, source, fields, cols, access, rows, bucketCount, index);
+            return InfinoSearch.topHits(
+                (TopHitsAggregationBuilder) builder,
+                from,
+                size,
+                sorts,
+                source,
+                docValueFields,
+                fetchFields,
+                cols,
+                access,
+                rows,
+                bucketCount,
+                index
+            );
         }
 
         InternalAggregation empty() {
@@ -2810,6 +2835,87 @@ public class InfinoAggregationProcessor {
         return rows.size() > c.size ? rows.subList(0, c.size) : rows;
     }
 
+    /** Most buckets {@link #rangeCountedHistogram} counts in one statement; past it the grouped statement reads them. */
+    static final int MAX_RANGE_COUNTED_BUCKETS = 1024;
+
+    /**
+     * A date histogram's buckets as one {@code COUNT(*) FILTER (WHERE range)}
+     * per bucket, in one statement, which the engine counts from the date
+     * column's range index, every bucket in one pass over each superfile,
+     * with no row read: a histogram whose buckets hold nothing but their
+     * count, over a field that is the column itself, with no missing value
+     * and no hard bounds, over the plain table either unfiltered or filtered
+     * by the request's one range on the same column. The buckets run from
+     * the range's start to its end, or with no range from the column's
+     * least value to its greatest. Rows only for the buckets that hold a
+     * row, keyed as the grouped statement keys them. Null when the
+     * histogram is not of that shape, the table holds no value, or it spans
+     * more than {@link #MAX_RANGE_COUNTED_BUCKETS} buckets.
+     */
+    private List<Map<String, Object>> rangeCountedHistogram(Grouped level, String from, String where) {
+        if (level.date == null
+            || table == null
+            || !level.metrics.isEmpty()
+            || !level.hits.isEmpty()
+            || level.child != null
+            || !(level.builder instanceof DateHistogramAggregationBuilder dh)
+            || dh.missing() != null
+            || dh.hardBounds() != null
+            || level.source.column() == null
+            || level.source.onlyWhere() != null
+            || level.source.multi()) {
+            return null;
+        }
+        String column = InfinoQueryTranslator.quoteIdent(level.source.column());
+        if (!level.source.expr().equals(column) || !from.equals(InfinoQueryTranslator.quoteIdent(table))) {
+            return null;
+        }
+        long lo;
+        long until;
+        boolean unfiltered = "1=1".equals(where);
+        if (unfiltered) {
+            List<Map<String, Object>> ends = InfinoNative.sqlRows("SELECT MIN(" + column + ") AS lo, MAX(" + column + ") AS hi FROM " + from);
+            if (ends.isEmpty() || ends.get(0).get("lo") == null || ends.get(0).get("hi") == null) {
+                return null;
+            }
+            lo = asLong(ends.get(0).get("lo"));
+            until = asLong(ends.get(0).get("hi")) + 1;
+        } else {
+            Translation q = plan.query();
+            InfinoQueryTranslator.Span span = q.span();
+            if (span == null || !where.equals(q.where()) || !from.equals(q.from()) || !column.equals(InfinoQueryTranslator.quoteIdent(span.column()))) {
+                return null;
+            }
+            lo = span.fromMillis();
+            until = span.untilMillis();
+        }
+        Rounding.Prepared rounding = level.date.rounding().prepareForUnknown();
+        List<Long> starts = new ArrayList<>();
+        List<String> counts = new ArrayList<>();
+        long start = rounding.round(lo);
+        while (start < until) {
+            long next = rounding.nextRoundingValue(start);
+            if (next <= start || starts.size() == MAX_RANGE_COUNTED_BUCKETS) {
+                return null;
+            }
+            counts.add("COUNT(*) FILTER (WHERE " + column + " >= " + timestampLiteral(start) + " AND " + column + " < " + timestampLiteral(next) + ") AS b" + starts.size());
+            starts.add(start);
+            start = next;
+        }
+        if (starts.isEmpty()) {
+            return List.of();
+        }
+        Map<String, Object> row = oneRow("SELECT " + String.join(", ", counts) + " FROM " + from + (unfiltered ? "" : " WHERE " + where));
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (int i = 0; i < starts.size(); i++) {
+            long n = asLong(row.get("b" + i));
+            if (n > 0) {
+                rows.add(Map.of("k0", starts.get(i), "doc_count", n));
+            }
+        }
+        return rows;
+    }
+
     /**
      * An instant as a literal of a date column's type, so a comparison with
      * the column is one the engine counts from its range index as written.
@@ -2897,6 +3003,9 @@ public class InfinoAggregationProcessor {
             String inner = levelInner(chain, i, from, where, restriction, level.terms);
             String parents = String.join(", ", aliases.subList(0, i));
             List<Map<String, Object>> rows = i == 0 && level.terms ? pickTopTerms(level, inner, readAhead) : null;
+            if (rows == null && i == 0 && chain.size() == 1 && leafChild == null) {
+                rows = rangeCountedHistogram(level, from, where);
+            }
             if (rows == null) {
                 String sql;
                 if (level.terms) {
@@ -3080,7 +3189,7 @@ public class InfinoAggregationProcessor {
         for (Map<String, Object> group : groups) {
             keyedTotal += asLong(group.get("doc_count"));
         }
-        groups.sort(order);
+        sortTerms(level, groups);
         List<Map<String, Object>> out = new ArrayList<>();
         for (Map<String, Object> group : groups.subList(0, Math.min(level.size, groups.size()))) {
             Map<String, Object> row = new HashMap<>(group);
@@ -3114,6 +3223,50 @@ public class InfinoAggregationProcessor {
             out = out == null ? c : out.thenComparing(c);
         }
         return out;
+    }
+
+    /**
+     * {@code groups} sorted in {@code level}'s terms order ({@link #termsOrder},
+     * which must not be null), each group's count and key read once instead of
+     * at every comparison: a string key is compared by its UTF-8 bytes, so it
+     * is encoded once per group rather than twice per comparison.
+     */
+    private static void sortTerms(Grouped level, List<Map<String, Object>> groups) {
+        record Keyed(Map<String, Object> group, long count, Comparable<Object> key) {}
+        Comparator<Keyed> order = null;
+        for (String term : level.orderTemplate.split(", ")) {
+            String[] parts = term.split(" ");
+            Comparator<Keyed> c = parts[0].equals("doc_count")
+                ? Comparator.comparingLong(Keyed::count)
+                : Comparator.comparing(Keyed::key, Comparator.nullsLast(Comparator.naturalOrder()));
+            if (parts[1].equals("DESC")) {
+                c = c.reversed();
+            }
+            order = order == null ? c : order.thenComparing(c);
+        }
+        List<Keyed> keyed = new ArrayList<>(groups.size());
+        for (Map<String, Object> group : groups) {
+            keyed.add(new Keyed(group, asLong(group.get("doc_count")), sortKey(level.keyKind, group.get("k0"))));
+        }
+        keyed.sort(order);
+        for (int i = 0; i < keyed.size(); i++) {
+            groups.set(i, keyed.get(i).group());
+        }
+    }
+
+    /** A present key of {@code kind} as a value whose natural order is {@link #compareKeys}'s; null stays null. */
+    @SuppressWarnings("unchecked")
+    private static Comparable<Object> sortKey(KeyKind kind, Object key) {
+        if (key == null) {
+            return null;
+        }
+        Comparable<?> out = switch (kind) {
+            case STR -> new BytesRef(key.toString());
+            case BOOL -> asBoolean(key);
+            case LONG, DATE -> asLong(key);
+            case DOUBLE -> asDouble(key, 0.0);
+        };
+        return (Comparable<Object>) out;
     }
 
     /** Two present keys of {@code kind} in the engine's order. */

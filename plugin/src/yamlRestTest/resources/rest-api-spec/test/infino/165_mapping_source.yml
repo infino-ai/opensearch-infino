@@ -1,0 +1,232 @@
+# The same mapping and documents go to an Infino-backed index and to a
+# Lucene twin, for a mapping that disables _source, one that excludes a
+# field from it and one that keeps only some fields. The table keeps each
+# document as it was indexed (nested queries read it, see 160_nested), so
+# what a hit, a top_hits hit, a get and an mget return must follow the
+# mapping's _source as stock's does.
+---
+"With _source disabled, a hit, a get and an mget carry none, as on a Lucene twin":
+  - do:
+      indices.create:
+        index: off_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { _source: { enabled: false }, properties: { rank: { type: long }, note: { type: keyword }, items: { type: nested, properties: { name: { type: keyword } } } } }
+  - do:
+      indices.create:
+        index: off_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { _source: { enabled: false }, properties: { rank: { type: long }, note: { type: keyword }, items: { type: nested, properties: { name: { type: keyword } } } } }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do: { bulk: { refresh: true, index: off_inf, body: [ { index: { _id: d1 } }, { rank: 1, note: a, items: [ { name: size } ] } ] } }
+  - match: { errors: false }
+  - do: { bulk: { refresh: true, index: off_luc, body: [ { index: { _id: d1 } }, { rank: 1, note: a, items: [ { name: size } ] } ] } }
+  - match: { errors: false }
+  - do: { search: { index: off_luc, body: { query: { match_all: {} } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - is_false: hits.hits.0._source
+  - do: { search: { index: off_inf, body: { query: { match_all: {} } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - is_false: hits.hits.0._source
+  # Asking for some of it is refused, as stock refuses it.
+  - do:
+      catch: /_source is disabled in the mappings for index \[off_luc\]/
+      search: { index: off_luc, body: { _source: [ rank ], query: { match_all: {} } } }
+  - do:
+      catch: /_source is disabled in the mappings for index \[off_inf\]/
+      search: { index: off_inf, body: { _source: [ rank ], query: { match_all: {} } } }
+  - do:
+      catch: /_source is disabled in the mappings for index \[off_luc\]/
+      search: { index: off_luc, body: { size: 0, aggs: { t: { top_hits: { size: 1, _source: [ rank ] } } } } }
+  - do:
+      catch: /_source is disabled in the mappings for index \[off_inf\]/
+      search: { index: off_inf, body: { size: 0, aggs: { t: { top_hits: { size: 1, _source: [ rank ] } } } } }
+  # The fields API reads the source, so it is refused too; doc values are not the source.
+  - do:
+      catch: /Unable to retrieve the requested \[fields\] since _source is disabled in the mappings for index \[off_luc\]/
+      search: { index: off_luc, body: { fields: [ rank ], query: { match_all: {} } } }
+  - do:
+      catch: /Unable to retrieve the requested \[fields\] since _source is disabled in the mappings for index \[off_inf\]/
+      search: { index: off_inf, body: { fields: [ rank ], query: { match_all: {} } } }
+  - do:
+      catch: /Unable to retrieve the requested \[fields\] since _source is disabled in the mappings for index \[off_luc\]/
+      search: { index: off_luc, body: { size: 0, aggs: { t: { top_hits: { size: 1, fields: [ rank ] } } } } }
+  - do:
+      catch: /Unable to retrieve the requested \[fields\] since _source is disabled in the mappings for index \[off_inf\]/
+      search: { index: off_inf, body: { size: 0, aggs: { t: { top_hits: { size: 1, fields: [ rank ] } } } } }
+  # Only a hit the response carries is refused: a page past the last hit is answered.
+  - do: { search: { index: off_luc, body: { from: 1, size: 1, _source: [ rank ], fields: [ rank ], query: { match_all: {} } } } }
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 0 }
+  - do: { search: { index: off_inf, body: { from: 1, size: 1, _source: [ rank ], fields: [ rank ], query: { match_all: {} } } } }
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 0 }
+  # Beside an index that keeps its source, stock fails only the disabled
+  # index's shard, and so does default mode. Proxy mode answers a search
+  # over several indices as one, so it fails the whole search (see the README).
+  - do: { indices.create: { index: on_luc, body: { settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }, mappings: { properties: { rank: { type: long } } } } } }
+  - do: { indices.create: { index: on_inf, body: { settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }, mappings: { properties: { rank: { type: long } } } } } }
+  - do: { bulk: { refresh: true, index: on_luc, body: [ { index: { _id: d2 } }, { rank: 2 } ] } }
+  - match: { errors: false }
+  - do: { bulk: { refresh: true, index: on_inf, body: [ { index: { _id: d2 } }, { rank: 2 } ] } }
+  - match: { errors: false }
+  - do: { search: { index: "off_luc,on_luc", body: { fields: [ rank ], query: { match_all: {} } } } }
+  - match: { _shards.failed: 1 }
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: d2 }
+  - match: { hits.hits.0.fields: { rank: [ 2 ] } }
+  - do: { search: { index: "off_inf,on_inf", body: { fields: [ rank ], query: { match_all: {} } } } }
+  - match: { _shards.failed: 1 }
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: d2 }
+  - match: { hits.hits.0.fields: { rank: [ 2 ] } }
+  - do: { indices.create: { index: off_px, body: { settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }, mappings: { _source: { enabled: false }, properties: { rank: { type: long } } } } } }
+  - do: { indices.create: { index: on_px, body: { settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }, mappings: { properties: { rank: { type: long } } } } } }
+  - do: { bulk: { refresh: true, index: off_px, body: [ { index: { _id: d1 } }, { rank: 1 } ] } }
+  - match: { errors: false }
+  - do: { bulk: { refresh: true, index: on_px, body: [ { index: { _id: d2 } }, { rank: 2 } ] } }
+  - match: { errors: false }
+  - do:
+      catch: /Unable to retrieve the requested \[fields\] since _source is disabled in the mappings for index \[off_px\]/
+      search: { index: "off_px,on_px", body: { fields: [ rank ], query: { match_all: {} } } }
+  - do:
+      catch: /_source is disabled in the mappings for index \[off_px\]/
+      search: { index: off_px, body: { _source: [ rank ], query: { match_all: {} } } }
+  - do: { search: { index: off_px, body: { from: 1, size: 1, _source: [ rank ], fields: [ rank ], query: { match_all: {} } } } }
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 0 }
+  # The page keeps on_px's hit only, so nothing of off_px is fetched.
+  - do: { search: { index: "off_px,on_px", body: { size: 1, sort: [ { rank: desc } ], fields: [ rank ], query: { match_all: {} } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d2 }
+  - match: { hits.hits.0.fields: { rank: [ 2 ] } }
+  - do: { search: { index: off_luc, body: { docvalue_fields: [ rank, note ], query: { match_all: {} } } } }
+  - match: { hits.hits.0.fields: { rank: [ 1 ], note: [ a ] } }
+  - do: { search: { index: off_inf, body: { docvalue_fields: [ rank, note ], query: { match_all: {} } } } }
+  - match: { hits.hits.0.fields: { rank: [ 1 ], note: [ a ] } }
+  # A nested query still reads the entries.
+  - do: { search: { index: off_inf, body: { query: { nested: { path: items, query: { term: { items.name: size } } } } } } }
+  - match: { hits.total.value: 1 }
+  - is_false: hits.hits.0._source
+  - do: { search: { index: off_luc, body: { size: 0, aggs: { t: { top_hits: { size: 1 } } } } } }
+  - match: { aggregations.t.hits.hits.0._id: d1 }
+  - is_false: aggregations.t.hits.hits.0._source
+  - do: { search: { index: off_inf, body: { size: 0, aggs: { t: { top_hits: { size: 1 } } } } } }
+  - match: { aggregations.t.hits.hits.0._id: d1 }
+  - is_false: aggregations.t.hits.hits.0._source
+  - do: { get: { index: off_luc, id: d1 } }
+  - match: { found: true }
+  - is_false: _source
+  - do: { get: { index: off_inf, id: d1 } }
+  - match: { found: true }
+  - is_false: _source
+  - do: { mget: { body: { docs: [ { _index: off_luc, _id: d1 } ] } } }
+  - match: { docs.0.found: true }
+  - is_false: docs.0._source
+  - do: { mget: { body: { docs: [ { _index: off_inf, _id: d1 } ] } } }
+  - match: { docs.0.found: true }
+  - is_false: docs.0._source
+  # A get that filters the source finds the document, with none.
+  - do: { get: { index: off_luc, id: d1, _source_includes: rank } }
+  - match: { found: true }
+  - is_false: _source
+  - do: { get: { index: off_inf, id: d1, _source_includes: rank } }
+  - match: { found: true }
+  - is_false: _source
+
+---
+"With _source excluding a field, a hit, a get and an mget leave it out, as on a Lucene twin":
+  - do:
+      indices.create:
+        index: ex_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { _source: { excludes: [ items ] }, properties: { rank: { type: long }, note: { type: keyword }, items: { type: nested, properties: { name: { type: keyword } } } } }
+  - do:
+      indices.create:
+        index: ex_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { _source: { excludes: [ items ] }, properties: { rank: { type: long }, note: { type: keyword }, items: { type: nested, properties: { name: { type: keyword } } } } }
+  - do: { bulk: { refresh: true, index: ex_inf, body: [ { index: { _id: d1 } }, { rank: 1, note: a, items: [ { name: size } ] } ] } }
+  - match: { errors: false }
+  - do: { bulk: { refresh: true, index: ex_luc, body: [ { index: { _id: d1 } }, { rank: 1, note: a, items: [ { name: size } ] } ] } }
+  - match: { errors: false }
+  - do: { search: { index: ex_luc, body: { query: { match_all: {} } } } }
+  - match: { hits.hits.0._source: { rank: 1, note: a } }
+  - do: { search: { index: ex_inf, body: { query: { match_all: {} } } } }
+  - match: { hits.hits.0._source: { rank: 1, note: a } }
+  # The request's own filter applies to what the mapping keeps.
+  - do: { search: { index: ex_luc, body: { _source: [ rank, items ], query: { match_all: {} } } } }
+  - match: { hits.hits.0._source: { rank: 1 } }
+  - do: { search: { index: ex_inf, body: { _source: [ rank, items ], query: { match_all: {} } } } }
+  - match: { hits.hits.0._source: { rank: 1 } }
+  # A nested query still reads the excluded entries.
+  - do: { search: { index: ex_inf, body: { query: { nested: { path: items, query: { term: { items.name: size } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._source: { rank: 1, note: a } }
+  - do: { search: { index: ex_luc, body: { size: 0, aggs: { t: { top_hits: { size: 1 } } } } } }
+  - match: { aggregations.t.hits.hits.0._source: { rank: 1, note: a } }
+  - do: { search: { index: ex_inf, body: { size: 0, aggs: { t: { top_hits: { size: 1 } } } } } }
+  - match: { aggregations.t.hits.hits.0._source: { rank: 1, note: a } }
+  - do: { get: { index: ex_luc, id: d1 } }
+  - match: { _source: { rank: 1, note: a } }
+  - do: { get: { index: ex_inf, id: d1 } }
+  - match: { _source: { rank: 1, note: a } }
+  - do: { mget: { body: { docs: [ { _index: ex_luc, _id: d1 } ] } } }
+  - match: { docs.0._source: { rank: 1, note: a } }
+  - do: { mget: { body: { docs: [ { _index: ex_inf, _id: d1 } ] } } }
+  - match: { docs.0._source: { rank: 1, note: a } }
+
+---
+"With _source including some fields, a hit, a get and an mget keep only those, as on a Lucene twin":
+  - do:
+      indices.create:
+        index: in_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { _source: { includes: [ rank, items ] }, properties: { rank: { type: long }, note: { type: keyword }, items: { type: nested, properties: { name: { type: keyword } } } } }
+  - do:
+      indices.create:
+        index: in_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { _source: { includes: [ rank, items ] }, properties: { rank: { type: long }, note: { type: keyword }, items: { type: nested, properties: { name: { type: keyword } } } } }
+  - do: { bulk: { refresh: true, index: in_inf, body: [ { index: { _id: d1 } }, { rank: 1, note: a, items: [ { name: size } ] } ] } }
+  - match: { errors: false }
+  - do: { bulk: { refresh: true, index: in_luc, body: [ { index: { _id: d1 } }, { rank: 1, note: a, items: [ { name: size } ] } ] } }
+  - match: { errors: false }
+  - do: { search: { index: in_luc, body: { query: { match_all: {} } } } }
+  - match: { hits.hits.0._source: { rank: 1, items: [ { name: size } ] } }
+  - do: { search: { index: in_inf, body: { query: { match_all: {} } } } }
+  - match: { hits.hits.0._source: { rank: 1, items: [ { name: size } ] } }
+  - do: { search: { index: in_luc, body: { size: 0, aggs: { t: { top_hits: { size: 1 } } } } } }
+  - match: { aggregations.t.hits.hits.0._source: { rank: 1, items: [ { name: size } ] } }
+  - do: { search: { index: in_inf, body: { size: 0, aggs: { t: { top_hits: { size: 1 } } } } } }
+  - match: { aggregations.t.hits.hits.0._source: { rank: 1, items: [ { name: size } ] } }
+  # The fields API reads what the mapping keeps; doc values hold every field.
+  - do: { search: { index: in_luc, body: { fields: [ rank, note ], query: { match_all: {} } } } }
+  - match: { hits.hits.0.fields: { rank: [ 1 ] } }
+  - do: { search: { index: in_inf, body: { fields: [ rank, note ], query: { match_all: {} } } } }
+  - match: { hits.hits.0.fields: { rank: [ 1 ] } }
+  - do: { search: { index: in_luc, body: { size: 0, aggs: { t: { top_hits: { size: 1, fields: [ rank, note ] } } } } } }
+  - match: { aggregations.t.hits.hits.0.fields: { rank: [ 1 ] } }
+  - do: { search: { index: in_inf, body: { size: 0, aggs: { t: { top_hits: { size: 1, fields: [ rank, note ] } } } } } }
+  - match: { aggregations.t.hits.hits.0.fields: { rank: [ 1 ] } }
+  - do: { search: { index: in_luc, body: { docvalue_fields: [ note ], query: { match_all: {} } } } }
+  - match: { hits.hits.0.fields: { note: [ a ] } }
+  - do: { search: { index: in_inf, body: { docvalue_fields: [ note ], query: { match_all: {} } } } }
+  - match: { hits.hits.0.fields: { note: [ a ] } }
+  - do: { get: { index: in_luc, id: d1 } }
+  - match: { _source: { rank: 1, items: [ { name: size } ] } }
+  - do: { get: { index: in_inf, id: d1 } }
+  - match: { _source: { rank: 1, items: [ { name: size } ] } }
+  - do: { mget: { body: { docs: [ { _index: in_luc, _id: d1 } ] } } }
+  - match: { docs.0._source: { rank: 1, items: [ { name: size } ] } }
+  - do: { mget: { body: { docs: [ { _index: in_inf, _id: d1 } ] } } }
+  - match: { docs.0._source: { rank: 1, items: [ { name: size } ] } }
