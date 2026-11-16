@@ -577,7 +577,7 @@ public final class InfinoSearch {
         boolean resumed
     ) {
         if (readsUnsorted(plan, resumed)) {
-            return InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm));
+            return InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm, wantsSource(source)));
         }
         List<Map<String, Object>> rows;
         if (splitsMissingTail(plan)) {
@@ -909,12 +909,15 @@ public final class InfinoSearch {
     /**
      * The statement {@link #readsUnsorted} reads a page with: the sorted
      * statement's rows ({@link #hitStatement}, unranked, as a field sort
-     * selects them) with no order, each with its source. A text query is
-     * neither ranked by BM25 nor scored, so the page is the rows the sorted
-     * read would select, not the best-scoring ones.
+     * selects them) with no order, each with its source when
+     * {@code withSource} (the hit returns it or reads requested fields from
+     * it). A text query is neither ranked by BM25 nor scored, so the page is
+     * the rows the sorted read would select, not the best-scoring ones.
      */
-    static String unsortedStatement(Plan plan, int fetch, boolean withSeq) {
-        String hit = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "");
+    static String unsortedStatement(Plan plan, int fetch, boolean withSeq, boolean withSource) {
+        String hit = InfinoQueryTranslator.OSID
+            + (withSource ? ", " + InfinoQueryTranslator.SOURCE : "")
+            + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "");
         return "SELECT " + hit + " FROM " + plan.query().from() + " WHERE " + plan.hitWhere() + " LIMIT " + fetch;
     }
 
