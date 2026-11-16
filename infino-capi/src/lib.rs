@@ -3147,6 +3147,7 @@ pub unsafe extern "C" fn infino_sorted(
 /// otherwise, for the caller to plan the statement. The predicate's
 /// literals are coerced to the columns' types first, as a statement would
 /// read them, so a date compared with a string is an interval on the date.
+/// Also `null` for a column named `score`, as [`infino_sorted`] is.
 #[no_mangle]
 pub unsafe extern "C" fn infino_sorted_where(
     h: *mut Bridge,
@@ -3164,6 +3165,11 @@ pub unsafe extern "C" fn infino_sorted_where(
             return ptr::null_mut();
         };
         let column = unsafe { cstr(column) }.filter(|c| !c.is_empty());
+        // The page drops the engine's `score` column, which would drop a
+        // field of that name with it: the caller plans the statement.
+        if column == Some(SORTED_SCORE) {
+            return out_string("null".to_string());
+        }
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
@@ -3195,7 +3201,7 @@ pub unsafe extern "C" fn infino_sorted_where(
             k.max(0) as usize,
             Some(&projection),
         ) {
-            Ok(Some(b)) => out_string(batches_to_json(&without_column(&b, "score"))),
+            Ok(Some(b)) => out_string(batches_to_json(&without_column(&b, SORTED_SCORE))),
             Ok(None) => out_string("null".to_string()),
             Err(e) => err_json(&e.to_string()),
         }
@@ -5406,6 +5412,10 @@ mod tests {
             .collect();
         assert_eq!(got, [("b".to_string(), 10), ("a".to_string(), 20)]);
         assert_eq!(sorted("score"), "null");
+        let after_score = take(unsafe {
+            infino_sorted_where(h, c("scored").as_ptr(), c("score").as_ptr(), c("score > 1").as_ptr(), 0, 10, 0)
+        });
+        assert_eq!(after_score, "null");
         unsafe { (*h).hosted = true };
         assert_eq!(sorted("status"), "null");
         unsafe { (*h).hosted = false };

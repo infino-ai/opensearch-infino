@@ -275,6 +275,25 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             NOW
         );
         assertFalse(InfinoSearch.intervalPage(everyRow));
+        // A should beside the range scores the hits, and they come in score order: the scored statement.
+        Translation shouldBeside = translate(
+            QueryBuilders.boolQuery().filter(QueryBuilders.rangeQuery("status").gte(500).lt(600)).should(QueryBuilders.termQuery("level", "error"))
+        );
+        assertTrue(shouldBeside.scoring().reorders());
+        InfinoSearch.Plan scored = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            shouldBeside,
+            java.util.List.of(),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertFalse(InfinoSearch.intervalPage(scored));
         // Only a query of ranges alone can be one interval: a term beside one, or a should, is not asked for.
         assertTrue(InfinoSearch.onlyRanges(QueryBuilders.rangeQuery("status").gte(500)));
         assertTrue(InfinoSearch.onlyRanges(QueryBuilders.boolQuery().must(QueryBuilders.rangeQuery("status").gte(500)).filter(QueryBuilders.rangeQuery("status").lt(600))));

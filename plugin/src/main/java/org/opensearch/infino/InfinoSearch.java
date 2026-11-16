@@ -873,11 +873,14 @@ public final class InfinoSearch {
      * query, vector, sort, search_after, collapse or scripted field. The
      * engine reads it from a range index when the predicate is one interval
      * on a range-indexed column ({@link InfinoNative#sortedRowsWhere}),
-     * stock returning the matches in no order either.
+     * stock returning the matches in no order either. A page ranked by its
+     * clauses' scores ({@link Scoring#reorders}) is in score order, so it
+     * takes the scored statement.
      */
     static boolean intervalPage(Plan plan) {
         return plan.vector() == null
             && plan.query().principal() == null
+            && !plan.query().scoring().reorders()
             && !InfinoQueryTranslator.ALL.equals(plan.hitWhere())
             && plan.sorts().isEmpty()
             && plan.searchAfter() == null
