@@ -1209,6 +1209,9 @@ public class InfinoEngine extends InternalEngine {
      * node has written to it ({@link InfinoNative#awaitVisible}). It runs
      * ahead of the shard's refresh listeners, after they noted what the
      * refresh covers, so the writes they release are visible when they do.
+     * A write the refresh covers may not be in the table yet, its own sync
+     * committing it only after the wait began: on the hosted service the
+     * writes applied so far are committed first, so the wait covers them.
      */
     private final class AwaitVisible implements ReferenceManager.RefreshListener {
         @Override
@@ -1216,7 +1219,24 @@ public class InfinoEngine extends InternalEngine {
 
         @Override
         public void afterRefresh(boolean didRefresh) {
+            if (InfinoNative.hosted()) {
+                commitBeforeLucene("refresh", appliedSoFar());
+            }
             InfinoNative.awaitVisible(table);
+        }
+    }
+
+    /**
+     * The local checkpoint once every write under way is recorded: it
+     * reaches each operation applied before the call, as a write holds
+     * {@link #recordLock} from its apply to its record.
+     */
+    private long appliedSoFar() {
+        recordLock.writeLock().lock();
+        try {
+            return getProcessedLocalCheckpoint();
+        } finally {
+            recordLock.writeLock().unlock();
         }
     }
 

@@ -360,23 +360,27 @@ public final class InfinoNative {
      * at once when the window has passed, or the table is not hosted, or
      * this node has not written it. What a refresh waits on, so that a
      * search after it ({@code refresh=true}, {@code wait_for}) finds the
-     * writes it covered.
+     * writes it covered. An interrupt does not cut the wait short, as the
+     * writes would then be released unseen; it is kept for the caller.
      */
     public static void awaitVisible(String name) {
         Long at = WRITTEN.get(name);
         if (at == null) {
             return;
         }
-        long left = untilVisible(at, readWindowNanos, System.nanoTime());
-        if (left > 0) {
+        boolean interrupted = false;
+        long left;
+        while ((left = untilVisible(at, readWindowNanos, System.nanoTime())) > 0) {
             try {
                 TimeUnit.NANOSECONDS.sleep(left);
             } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
+                interrupted = true;
             }
         }
         WRITTEN.remove(name, at);
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /** Nanoseconds from {@code now} until a write at {@code writtenAt} is visible to every read; zero or less once it is. */

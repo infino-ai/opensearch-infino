@@ -32,7 +32,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class InfinoRegistryTests extends OpenSearchTestCase {
 
@@ -222,6 +224,45 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
         }
     }
 
+    public void testReadersThatComeWhileTheFirstWaitsOutTheReadWindowWaitToo() throws Exception {
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        StubBridge bridge = new StubBridge();
+        TimeValue window = TimeValue.timeValueMillis(800);
+        InfinoNative.readWindow(window);
+        try {
+            bind(clusterService, null, bridge);
+            long start = System.nanoTime();
+            InfinoNative.wrote(InfinoRegistry.TABLE, start);
+            List<Long> returned = new CopyOnWriteArrayList<>();
+            List<Thread> readers = new ArrayList<>();
+            for (int i = 0; i < 2; i++) {
+                Thread reader = new Thread(() -> {
+                    InfinoRegistry.rawRows();
+                    returned.add(System.nanoTime());
+                });
+                reader.start();
+                readers.add(reader);
+            }
+            for (Thread reader : readers) {
+                reader.join();
+            }
+            assertEquals(2, returned.size());
+            for (long at : returned) {
+                assertTrue("a reader returned before the read window passed", at - start >= window.nanos());
+            }
+            // Once settled, a read no longer waits.
+            InfinoNative.wrote(InfinoRegistry.TABLE, System.nanoTime());
+            long again = System.nanoTime();
+            InfinoRegistry.rawRows();
+            assertTrue(System.nanoTime() - again < window.nanos());
+        } finally {
+            InfinoNative.readWindow(InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY));
+            InfinoNative.awaitVisible(InfinoRegistry.TABLE);
+            unbind(clusterService, threadPool);
+        }
+    }
+
     /** Stand {@code bridge} in for the library, on a node that has not declared the registry table yet. */
     private static void bind(ClusterService clusterService, ThreadPool threadPool, StubBridge bridge) {
         InfinoServices.bind(clusterService, threadPool);
@@ -344,6 +385,30 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
             long again = System.nanoTime();
             InfinoNative.awaitVisible("written_here");
             assertTrue(System.nanoTime() - again < window.nanos());
+        } finally {
+            InfinoNative.readWindow(InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY));
+        }
+    }
+
+    public void testAnInterruptedRefreshStillWaitsOutTheReadWindowAndKeepsTheInterrupt() throws Exception {
+        TimeValue window = TimeValue.timeValueMillis(600);
+        InfinoNative.readWindow(window);
+        try {
+            long start = System.nanoTime();
+            InfinoNative.wrote("written_interrupted", start);
+            AtomicLong returned = new AtomicLong();
+            AtomicBoolean keptInterrupt = new AtomicBoolean();
+            Thread waiter = new Thread(() -> {
+                InfinoNative.awaitVisible("written_interrupted");
+                returned.set(System.nanoTime());
+                keptInterrupt.set(Thread.currentThread().isInterrupted());
+            });
+            waiter.start();
+            Thread.sleep(100);
+            waiter.interrupt();
+            waiter.join();
+            assertTrue("the wait ended before the read window passed", returned.get() - start >= window.nanos());
+            assertTrue(keptInterrupt.get());
         } finally {
             InfinoNative.readWindow(InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY));
         }

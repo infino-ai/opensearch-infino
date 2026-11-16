@@ -534,8 +534,15 @@ final class InfinoRegistry {
      */
     private static void declareToRead() {
         declare();
-        if (settled.compareAndSet(false, true)) {
-            InfinoNative.awaitVisible(TABLE);
+        if (settled.get()) {
+            return;
+        }
+        // Every reader that comes meanwhile waits too: none reads before the window has passed.
+        synchronized (settled) {
+            if (!settled.get()) {
+                InfinoNative.awaitVisible(TABLE);
+                settled.set(true);
+            }
         }
     }
 
