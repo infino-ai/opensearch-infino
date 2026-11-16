@@ -162,11 +162,6 @@ public final class InfinoSearch {
             return InfinoSearch.orderBy(sorts);
         }
 
-        /** This plan with no sort: its rows in no order. */
-        Plan unsorted() {
-            return new Plan(table, cols, query, List.of(), vector, postWhere, collapse, searchAfter, scriptFields, access, nowMillis);
-        }
-
         /** The predicate the hits satisfy: the query's and the post_filter's. */
         String hitWhere() {
             return postWhere == null ? query.where() : "(" + query.where() + ") AND (" + postWhere + ")";
@@ -581,21 +576,23 @@ public final class InfinoSearch {
         boolean seqNoAndPrimaryTerm,
         boolean resumed
     ) {
-        Plan read = readsUnsorted(plan, resumed) ? plan.unsorted() : plan;
+        if (readsUnsorted(plan, resumed)) {
+            return InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm));
+        }
         List<Map<String, Object>> rows;
-        if (splitsMissingTail(read)) {
+        if (splitsMissingTail(plan)) {
             // The rows past a present first sort value come first; the
             // rows missing it follow them all, so they are read only
             // when the first part leaves the page short.
-            rows = InfinoNative.sqlRows(hitStatement(read, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
+            rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
             if (rows.size() < fetch) {
                 rows = new ArrayList<>(rows);
-                rows.addAll(InfinoNative.sqlRows(hitStatement(read, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
+                rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
             }
         } else {
-            rows = InfinoNative.sqlRows(hitStatement(read, fetch, seqNoAndPrimaryTerm));
+            rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
         }
-        if (sourcesById(read) && wantsSource(source)) {
+        if (sourcesById(plan) && wantsSource(source)) {
             rows = withSources(plan.table(), rows, fetch);
         }
         return rows;
@@ -907,6 +904,18 @@ public final class InfinoSearch {
      */
     static boolean readsUnsorted(Plan plan, boolean resumed) {
         return !resumed && sortsNothing(plan);
+    }
+
+    /**
+     * The statement {@link #readsUnsorted} reads a page with: the sorted
+     * statement's rows ({@link #hitStatement}, unranked, as a field sort
+     * selects them) with no order, each with its source. A text query is
+     * neither ranked by BM25 nor scored, so the page is the rows the sorted
+     * read would select, not the best-scoring ones.
+     */
+    static String unsortedStatement(Plan plan, int fetch, boolean withSeq) {
+        String hit = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "");
+        return "SELECT " + hit + " FROM " + plan.query().from() + " WHERE " + plan.hitWhere() + " LIMIT " + fetch;
     }
 
     /**

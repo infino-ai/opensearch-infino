@@ -236,6 +236,30 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertTrue(hits, hits.endsWith("ORDER BY \"status\" DESC NULLS LAST, \"_id\" ASC NULLS LAST LIMIT 10"));
     }
 
+    public void testAnUnsortedPageKeepsTheSortsUnrankedRows() {
+        // A text query sorted on a field no row holds is read with no order,
+        // from the same unranked relation the sorted read selects from: not
+        // BM25's best, and with no score.
+        InfinoSearch.Plan plan = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchQuery("message", "disk")),
+            java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true), InfinoSearch.SortSpec.rowId()),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        String sorted = InfinoSearch.hitStatement(plan, 1, false);
+        String unsorted = InfinoSearch.unsortedStatement(plan, 1, false);
+        assertEquals("SELECT osid, source FROM token_match('os_logs_0', 'message', 'disk', 'or') WHERE 1=1 LIMIT 1", unsorted);
+        assertTrue(sorted, sorted.contains(" FROM token_match('os_logs_0', 'message', 'disk', 'or') WHERE 1=1 ORDER BY "));
+        assertEquals("SELECT osid, source, osseq FROM \"os_logs_0\" WHERE 1=1 LIMIT 5", InfinoSearch.unsortedStatement(afterPlan(null, null), 5, true));
+    }
+
     public void testTiesBreakByTheEngineRowId() {
         // Rows sharing the sort value are ordered by the engine's row id, which
         // the engine answers from its range index; a page continuing from a row

@@ -199,7 +199,7 @@
       indices.create:
         index: scr3
         body:
-          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
           mappings:
             properties:
               tag: { type: keyword }
