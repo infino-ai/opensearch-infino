@@ -121,8 +121,9 @@ def load(args):
         lock = threading.Lock()
         it = batches()
         errors = [0]
-        # A batch that never loaded: the node would hold a different document
-        # set from the others, so the load stops and fails instead.
+        # A batch that never loaded, or input that could not be read: the node
+        # would hold a different document set from the others, so the load
+        # stops and fails instead.
         failures = []
         start = time.time()
 
@@ -148,7 +149,11 @@ def load(args):
         def worker():
             while True:
                 with lock:
-                    b = None if failures else next(it, None)
+                    try:
+                        b = None if failures else next(it, None)
+                    except Exception as e:  # an input file that cannot be read
+                        failures.append(f"reading the input: {e!r}")
+                        b = None
                 if b is None:
                     return
                 failure = send(b)
@@ -163,7 +168,7 @@ def load(args):
         for t in threads:
             t.join()
         if failures:
-            sys.exit(f"{name}: a _bulk batch did not load, stopped: {failures[0]}")
+            sys.exit(f"{name}: load stopped: {failures[0]}")
         call(port, "POST", f"/{INDEX}/_refresh")
         _, count = call(port, "GET", f"/{INDEX}/_count")
         print(f"{name}: {count.get('count')} docs in {time.time() - start:.0f} s, {errors[0]} item errors", flush=True)
