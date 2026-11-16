@@ -1759,7 +1759,17 @@ fn conform_doc(
     kept: &HashMap<String, Kept>,
     stamp: Option<&str>,
 ) -> Result<Map<String, Value>, String> {
-    let doc: Value = serde_json::from_str(source).map_err(|e| format!("malformed JSON: {e}"))?;
+    conform_doc_shaped(source, schema, kept, stamp).map(|(flat, _)| flat)
+}
+
+/// [`conform_doc`], with the document's draft skeleton from the same parse.
+fn conform_doc_shaped(
+    source: &str,
+    schema: &Schema,
+    kept: &HashMap<String, Kept>,
+    stamp: Option<&str>,
+) -> Result<(Map<String, Value>, skeleton::Draft), String> {
+    let (doc, draft) = skeleton::parse(source)?;
     let obj = doc
         .as_object()
         .ok_or_else(|| "the document is not an object".to_string())?;
@@ -1826,7 +1836,7 @@ fn conform_doc(
     for (path, values) in lists {
         flat.insert(path, values);
     }
-    Ok(flat)
+    Ok((flat, draft))
 }
 
 /// Declare the list columns ([`LIST_SUFFIX`]) the rows need and the table
@@ -1933,12 +1943,12 @@ pub unsafe extern "C" fn infino_index_batch(
 
         let mut failed: Vec<Value> = Vec::new();
         let mut rows: Vec<(usize, Map<String, Value>)> = Vec::with_capacity(n);
-        let mut sources: Vec<&str> = Vec::with_capacity(n);
+        let mut drafts: Vec<skeleton::Draft> = Vec::with_capacity(n);
         for i in 0..n {
             let osid = unsafe { cstr(os_p[i]) }.unwrap_or("");
             let source = unsafe { cstr(sr_p[i]) }.unwrap_or("{}");
-            let mut flat = match conform_doc(source, &schema, &kept, stamp.as_deref()) {
-                Ok(flat) => flat,
+            let (mut flat, draft) = match conform_doc_shaped(source, &schema, &kept, stamp.as_deref()) {
+                Ok(shaped) => shaped,
                 Err(why) => {
                     failed.push(json!({ "i": i, "reason": why }));
                     continue;
@@ -1947,7 +1957,7 @@ pub unsafe extern "C" fn infino_index_batch(
             flat.insert(OSID.into(), Value::String(osid.to_string()));
             flat.remove(SOURCE);
             rows.push((i, flat));
-            sources.push(source);
+            drafts.push(draft);
         }
 
         let mut maps: Vec<Map<String, Value>> = rows.iter().map(|(_, m)| m.clone()).collect();
@@ -1969,7 +1979,7 @@ pub unsafe extern "C" fn infino_index_batch(
         };
         let mut values: Vec<Value> = maps.into_iter().map(Value::Object).collect();
         let converted = rows_to_batch(&values, &table_schema).ok();
-        if let Err(why) = with_documents(&sources, &mut values, converted, &table_schema) {
+        if let Err(why) = with_documents(&drafts, &mut values, converted, &table_schema) {
             return err_json(&why);
         }
         let indexed: Vec<(usize, Value)> = rows
@@ -2116,10 +2126,10 @@ unsafe fn prepare(
         start = rt_end;
     }
 
-    let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
+    let parsed: Vec<Result<(Map<String, Value>, skeleton::Draft), String>> = rows_in
         .par_iter()
         .map(|(id, src, routing, seq, op)| {
-            conform_doc(src, &schema, &kept, stamp.as_deref()).map(|mut flat| {
+            conform_doc_shaped(src, &schema, &kept, stamp.as_deref()).map(|(mut flat, draft)| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 // A field named like the document column is the document's,
                 // kept in its residual: the column itself is rebuilt, never written.
@@ -2136,18 +2146,20 @@ unsafe fn prepare(
                 if *seq >= 0 || *op >= 0 {
                     flat.insert(GEN.into(), json!(gen));
                 }
-                flat
+                (flat, draft)
             })
         })
         .collect();
     let mut failed: Vec<(usize, String)> = Vec::new();
     let mut index_of: Vec<usize> = Vec::with_capacity(n);
     let mut rows: Vec<Map<String, Value>> = Vec::with_capacity(n);
+    let mut drafts: Vec<skeleton::Draft> = Vec::with_capacity(n);
     for (i, r) in parsed.into_iter().enumerate() {
         match r {
-            Ok(flat) => {
+            Ok((flat, draft)) => {
                 index_of.push(i);
                 rows.push(flat);
+                drafts.push(draft);
             }
             Err(why) => failed.push((i, why)),
         }
@@ -2169,8 +2181,7 @@ unsafe fn prepare(
     } else {
         rows_to_batch(&values, &table_schema).ok()
     };
-    let sources: Vec<&str> = index_of.iter().map(|&i| rows_in[i].1).collect();
-    let batch = with_documents(&sources, &mut values, batch, &table_schema)?;
+    let batch = with_documents(&drafts, &mut values, batch, &table_schema)?;
     Ok(Prepared {
         n,
         batch,
@@ -2181,20 +2192,21 @@ unsafe fn prepare(
 }
 
 /// Give each document its skeleton and residual, the stored columns the
-/// engine rebuilds `source` from: in each row (`values[j]` is the document
-/// `sources[j]`), and in `batch` (row `j` likewise) when the rows were
-/// converted, which the shapes are read against.
+/// engine rebuilds `source` from, from the draft its one parse made: in
+/// each row (`values[j]` is the document `drafts[j]` was parsed from), and
+/// in `batch` (row `j` likewise) when the rows were converted, which the
+/// slots are filled against.
 fn with_documents(
-    sources: &[&str],
+    drafts: &[skeleton::Draft],
     values: &mut [Value],
     batch: Option<RecordBatch>,
     table_schema: &TableSchema,
 ) -> Result<Option<RecordBatch>, String> {
-    let shapes: Vec<skeleton::Shape> = sources
-        .iter()
+    let shapes: Vec<skeleton::Shape> = drafts
+        .par_iter()
         .enumerate()
-        .map(|(j, src)| skeleton::shape(src, j, batch.as_ref(), table_schema))
-        .collect::<Result<_, _>>()?;
+        .map(|(j, draft)| skeleton::shape(draft, j, batch.as_ref(), table_schema))
+        .collect();
     let (skeleton_name, residual_name) = (skeleton_column(SOURCE), residual_column(SOURCE));
     for (value, shape) in values.iter_mut().zip(&shapes) {
         if let Value::Object(row) = value {
