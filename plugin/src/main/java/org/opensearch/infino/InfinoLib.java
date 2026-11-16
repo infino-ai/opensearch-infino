@@ -105,7 +105,7 @@ public interface InfinoLib extends Library {
 
     Pointer infino_bm25(Pointer h, String name, String column, String query, String mode, int k);
 
-    Pointer infino_sorted(Pointer h, String name, String column, int descending, int k, int withSource);
+    Pointer infino_sorted(Pointer h, String name, String column, int descending, int k);
 
     Pointer infino_sorted_where(Pointer h, String name, String column, String predicate, int descending, int k, int withSource);
 
