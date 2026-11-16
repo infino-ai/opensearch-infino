@@ -984,10 +984,11 @@ public final class InfinoSearch {
 
     /**
      * Whether the page is every row in no order: no predicate, text query,
-     * vector, sort, search_after, collapse or scripted field. The engine reads
-     * it as the table's first rows in storage order ({@link
-     * InfinoNative#headRows}), stock returning a match_all's hits in no
-     * order either.
+     * vector, sort, search_after, collapse or scripted field, and no optional
+     * clause that ranks the rows ({@link Scoring#reorders}, read by {@link
+     * #scoredStatement}). The engine reads it as the table's first rows in
+     * storage order ({@link InfinoNative#headRows}), stock returning a
+     * match_all's hits in no order either.
      */
     static boolean everyRowPage(Plan plan) {
         return plan.vector() == null
