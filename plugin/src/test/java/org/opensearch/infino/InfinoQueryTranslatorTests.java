@@ -153,6 +153,37 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         return InfinoSearch.hitStatement(plan, 10, false);
     }
 
+    /** The hit statement for {@code t} sorted by {@code status}. */
+    private static String sortedHitsOf(Translation t) {
+        InfinoSearch.Plan plan = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            t,
+            java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true)),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        return InfinoSearch.hitStatement(plan, 10, false);
+    }
+
+    /**
+     * A sorted page ranks nothing, so its plain-words text clause is a
+     * text_match on the table's rows, which the engine's top-k checks row by
+     * row in the sort's order. A phrase needs the token index and keeps it.
+     */
+    public void testASortedPagesPlainWordsAreAPredicateOnTheTable() {
+        String plain = sortedHitsOf(translate(QueryBuilders.matchQuery("message", "error timeout")));
+        assertTrue(plain, plain.contains(" FROM \"os_logs_0\" WHERE (1=1) AND text_match(\"message\", 'error timeout', 'or') ORDER BY "));
+        assertFalse(plain, plain.contains("token_match("));
+        String phrase = sortedHitsOf(translate(QueryBuilders.matchPhraseQuery("message", "error timeout")));
+        assertTrue(phrase, phrase.contains(" FROM token_match("));
+    }
+
     public void testASortedPageReadsItsSourcesAfterTheSort() {
         // The sort weighs every row it keeps; its statement selects ids and sort
         // values only, and the page's sources are read by id afterwards.
