@@ -309,6 +309,31 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertNull(InfinoSearch.rangeColumn(p, QueryBuilders.rangeQuery("nope").gte(1)));
         assertNull(InfinoSearch.rangeColumn(p, QueryBuilders.termQuery("level", "error")));
         assertNull(InfinoSearch.rangeColumn(p, null));
+        // The statement a deep page in no order falls back to reads the rows in the
+        // range index's order, so from/size windows served by the index and by the
+        // statement cut one order; without a range there is none to keep.
+        String deep = InfinoSearch.hitStatement(InfinoSearch.inRangeOrder(ranged, QueryBuilders.rangeQuery("status").gte(500).lt(600)), 5000, false);
+        assertTrue(deep, deep.endsWith("ORDER BY \"status\" ASC NULLS LAST, \"_id\" ASC NULLS LAST LIMIT 5000"));
+        BoolQueryBuilder rangeAndTerm = QueryBuilders.boolQuery()
+            .filter(QueryBuilders.rangeQuery("status").gte(500))
+            .filter(QueryBuilders.termQuery("level", "error"));
+        InfinoSearch.Plan rangeAndTermPlan = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(rangeAndTerm),
+            java.util.List.of(),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        String deepFiltered = InfinoSearch.hitStatement(InfinoSearch.inRangeOrder(rangeAndTermPlan, rangeAndTerm), 5000, false);
+        assertTrue(deepFiltered, deepFiltered.endsWith("ORDER BY \"status\" ASC NULLS LAST, \"_id\" ASC NULLS LAST LIMIT 5000"));
+        assertSame(everyRow, InfinoSearch.inRangeOrder(everyRow, QueryBuilders.matchAllQuery()));
+        assertSame(filtered, InfinoSearch.inRangeOrder(filtered, QueryBuilders.termQuery("level", "error")));
         // A page after one present value of a column sort may come from its range index.
         InfinoSearch.Plan afterOne = new InfinoSearch.Plan(
             TABLE,

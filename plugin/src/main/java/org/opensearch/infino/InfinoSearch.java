@@ -595,12 +595,12 @@ public final class InfinoSearch {
             SortSpec first = plan.sorts().get(0);
             return InfinoNative.sortedRowsWhere(plan.table(), first.name(), plan.hitWhere(), first.desc(), fetch, wantsSource(source));
         }
-        String range = intervalPage(plan) ? rangeColumn(plan, source.query()) : null;
+        Column range = intervalPage(plan) ? rangeField(plan, source.query()) : null;
         if (range != null) {
             // A page in no order of the rows a predicate with a range keeps:
             // its first rows in the range column's order, from that column's
             // range index, checked against the rest of the predicate.
-            return InfinoNative.sortedRowsWhere(plan.table(), range, plan.hitWhere(), false, fetch, wantsSource(source));
+            return InfinoNative.sortedRowsWhere(plan.table(), range.name(), plan.hitWhere(), false, fetch, wantsSource(source));
         }
         if (afterInterval(plan)) {
             // A page after one present value of a range-indexed sort column:
@@ -615,12 +615,43 @@ public final class InfinoSearch {
         return null;
     }
 
+    /**
+     * The plan the hit statement reads a page in no order with: the page the
+     * range index may serve ({@link #rangeField}) in that index's order, the
+     * range column ascending, ties by row id, missing values last. The engine
+     * serves a shallow page from the index and leaves a deep one, past the
+     * rows it reads, to the statement, so every from/size window of the
+     * request has to cut that one order; in scan order the statement's
+     * windows would repeat some rows and skip others. Every other plan as it
+     * is. The rows keep the page's own plan: they carry no sort values.
+     */
+    static Plan inRangeOrder(Plan plan, QueryBuilder query) {
+        Column range = intervalPage(plan) ? rangeField(plan, query) : null;
+        if (range == null) {
+            return plan;
+        }
+        return new Plan(
+            plan.table(),
+            plan.cols(),
+            plan.query(),
+            List.of(SortSpec.of(range, false), SortSpec.rowId()),
+            plan.vector(),
+            plan.postWhere(),
+            plan.collapse(),
+            plan.searchAfter(),
+            plan.scriptFields(),
+            plan.access(),
+            plan.nowMillis()
+        );
+    }
+
     /** The page's rows from a column's range index or its hit statement, with their sources when they are read by id. */
-    private static List<Map<String, Object>> hitRows(Plan plan, SearchSourceBuilder source, int fetch, boolean seqNoAndPrimaryTerm) {
-        List<Map<String, Object>> rows = seqNoAndPrimaryTerm ? null : rangeIndexRows(plan, source, fetch);
+    private static List<Map<String, Object>> hitRows(Plan page, SearchSourceBuilder source, int fetch, boolean seqNoAndPrimaryTerm) {
+        List<Map<String, Object>> rows = seqNoAndPrimaryTerm ? null : rangeIndexRows(page, source, fetch);
         if (rows != null) {
             return rows;
         }
+        Plan plan = seqNoAndPrimaryTerm ? page : inRangeOrder(page, source.query());
         if (splitsMissingTail(plan)) {
             // The rows past a present first sort value come first; the
             // rows missing it follow them all, so they are read only
@@ -922,18 +953,23 @@ public final class InfinoSearch {
      * predicate on the rows it gives, or answers that the statement should.
      */
     static String rangeColumn(Plan plan, QueryBuilder query) {
+        Column c = rangeField(plan, query);
+        return c == null ? null : c.name();
+    }
+
+    /** The column {@link #rangeColumn} names, as the table holds it. */
+    static Column rangeField(Plan plan, QueryBuilder query) {
         if (query instanceof RangeQueryBuilder r) {
-            Column c = plan.cols().get(r.fieldName());
-            return c == null ? null : c.name();
+            return plan.cols().get(r.fieldName());
         }
         if (query instanceof ConstantScoreQueryBuilder c) {
-            return rangeColumn(plan, c.innerQuery());
+            return rangeField(plan, c.innerQuery());
         }
         if (query instanceof BoolQueryBuilder b) {
             List<QueryBuilder> required = new ArrayList<>(b.must());
             required.addAll(b.filter());
             for (QueryBuilder clause : required) {
-                String column = rangeColumn(plan, clause);
+                Column column = rangeField(plan, clause);
                 if (column != null) {
                     return column;
                 }
