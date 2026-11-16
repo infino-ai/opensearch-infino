@@ -4,6 +4,7 @@
 
 package org.opensearch.infino;
 
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import org.apache.lucene.search.join.ScoreMode;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.OpenSearchSecurityException;
@@ -1666,6 +1667,9 @@ final class InfinoQueryTranslator {
         return "\"" + value.replace("\"", " ") + "\"";
     }
 
+    /** A closed phrase of a simple_query_string with no escape in it, whose words are no operators in either syntax. */
+    private static final Pattern SIMPLE_PHRASE = Pattern.compile("\"[^\"\\\\]*\"");
+
     /** What separates the runs of an engine text query: Unicode white space, as the engine splits it. */
     private static final Pattern QUERY_WHITESPACE = Pattern.compile("(?U)\\s+");
 
@@ -1881,10 +1885,12 @@ final class InfinoQueryTranslator {
     /**
      * Whether an analyzer may make more than one word of {@code text}: it
      * holds a character that is not a letter or digit, or an ideograph or
-     * kana, which the standard analyzer makes a word each.
+     * kana, which the standard analyzer makes a word each, or it is longer
+     * than the standard tokenizer's longest token, which it splits there.
      */
     private static boolean maybeSeveralWords(String text) {
-        return text.codePoints()
+        return text.length() > StandardAnalyzer.DEFAULT_MAX_TOKEN_LENGTH
+            || text.codePoints()
             .anyMatch(
                 c -> !Character.isLetterOrDigit(c)
                     || Character.isIdeographic(c)
@@ -1897,11 +1903,13 @@ final class InfinoQueryTranslator {
      * The first word of a simple_query_string that holds an operator of
      * either syntax ({@code -} leading a word, {@code +}, {@code |},
      * parentheses, {@code *}, {@code ~}, a field prefix, a range, a regular
-     * expression, an escape, a boost, or AND / OR / NOT), or null when the
-     * string is plain words and phrases, which both syntaxes read alike.
+     * expression, an escape, a boost, or AND / OR / NOT) outside a phrase,
+     * or null when the string is plain words and phrases, which both syntaxes
+     * read alike. A phrase is checked as its bounds only, so what follows it
+     * ({@code ~2}) is still an operator.
      */
     private static String simpleSyntax(String q) {
-        for (String word : QUERY_WHITESPACE.split(q.trim())) {
+        for (String word : QUERY_WHITESPACE.split(SIMPLE_PHRASE.matcher(q.trim()).replaceAll("\"\""))) {
             if (word.startsWith("-") || word.equals("AND") || word.equals("OR") || word.equals("NOT")) {
                 return word;
             }

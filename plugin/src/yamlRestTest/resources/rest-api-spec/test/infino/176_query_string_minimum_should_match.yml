@@ -566,3 +566,137 @@
           size: 10
           sort: [ { k: asc } ]
           query: { simple_query_string: { query: "alpha beta -gamma", fields: [ body ], minimum_should_match: 2 } }
+
+---
+"minimum_should_match beside a word the tokenizer splits by length, and a phrase holding an operator's word":
+  # The standard tokenizer splits a word longer than 255 characters there, so
+  # stock counts its pieces; the plugin serves 255 and refuses 256. In
+  # simple_query_string a word inside a phrase is no operator.
+  - do:
+      indices.create:
+        index: qm3_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: qm3_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+              k: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: qm3_inf
+        body:
+          - index: { _id: "d1" }
+          - { k: "d1", body: "alpha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+          - index: { _id: "d2" }
+          - { k: "d2", body: "alpha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+          - index: { _id: "d3" }
+          - { k: "d3", body: "alpha or beta" }
+          - index: { _id: "d4" }
+          - { k: "d4", body: "beta" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: qm3_luc
+        body:
+          - index: { _id: "d1" }
+          - { k: "d1", body: "alpha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+          - index: { _id: "d2" }
+          - { k: "d2", body: "alpha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+          - index: { _id: "d3" }
+          - { k: "d3", body: "alpha or beta" }
+          - index: { _id: "d4" }
+          - { k: "d4", body: "beta" }
+  - match: { errors: false }
+
+  # 255 characters is one token: two of three clauses.
+  - do:
+      search:
+        index: qm3_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa beta", default_field: body, minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+  - do:
+      search:
+        index: qm3_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa beta", default_field: body, minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+
+  # 256 characters is two tokens, so stock counts four clauses; the plugin refuses.
+  - do:
+      search:
+        index: qm3_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa beta", default_field: body, minimum_should_match: 3 } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d2" }
+  - do:
+      catch: bad_request
+      search:
+        index: qm3_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa beta", default_field: body, minimum_should_match: 3 } }
+
+  # A quoted OR is a word of the phrase.
+  - do:
+      search:
+        index: qm3_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { simple_query_string: { query: "\"alpha OR beta\"", fields: [ body ], minimum_should_match: 2 } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d3" }
+  - do:
+      search:
+        index: qm3_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { simple_query_string: { query: "\"alpha OR beta\"", fields: [ body ], minimum_should_match: 2 } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d3" }
+
+  # Unquoted, the plugin would read OR as the query_string operator; it refuses.
+  - do:
+      search:
+        index: qm3_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { simple_query_string: { query: "alpha OR beta", fields: [ body ], minimum_should_match: 2 } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d3" }
+  - do:
+      catch: bad_request
+      search:
+        index: qm3_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { simple_query_string: { query: "alpha OR beta", fields: [ body ], minimum_should_match: 2 } }

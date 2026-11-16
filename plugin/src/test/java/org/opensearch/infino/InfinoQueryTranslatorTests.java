@@ -429,6 +429,31 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             () -> translate(QueryBuilders.simpleQueryStringQuery("alpha beta -gamma").field("message").minimumShouldMatch("2"))
         );
         assertTrue(simple.getMessage(), simple.getMessage().contains("[-gamma]"));
+        // Inside a phrase a word is no operator in either syntax; after it, ~ still is.
+        assertNotNull(translate(QueryBuilders.simpleQueryStringQuery("\"alpha OR beta\"").field("message").minimumShouldMatch("2")));
+        assertTrue(
+            translate(QueryBuilders.simpleQueryStringQuery("gamma \"alpha -beta\"").field("message").minimumShouldMatch("2"))
+                .where()
+                .contains(">= 2)")
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.simpleQueryStringQuery("alpha OR beta").field("message").minimumShouldMatch("2"))
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.simpleQueryStringQuery("\"alpha beta\"~2 gamma").field("message").minimumShouldMatch("2"))
+        );
+        // The standard tokenizer splits a word longer than 255 characters there.
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("alpha " + "a".repeat(255) + " beta").defaultField("message").minimumShouldMatch("3"))
+                .where()
+                .contains(">= 3)")
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("alpha " + "a".repeat(256) + " beta").defaultField("message").minimumShouldMatch("3"))
+        );
         // Without minimum_should_match, nothing here is refused.
         assertNotNull(translate(QueryBuilders.queryStringQuery("alpha beta").field("message").field("level")));
         assertNotNull(translate(QueryBuilders.queryStringQuery("foo-bar").defaultField("message")));
