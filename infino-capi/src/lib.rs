@@ -41,7 +41,7 @@ use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::common::tree_node::TreeNode;
@@ -1843,6 +1843,26 @@ fn ensure_list_columns(
     Ok(true)
 }
 
+/// Run `append` until the table's writer is free for it, for up to ten
+/// seconds. Appends to one table run at once, sharing its writer; an append
+/// whose batch adds a column takes the writer whole, and is refused at once
+/// while another holds it (several first appends of a new field race for
+/// it). An append is all or nothing, so a refused one is run again once
+/// the other lands: by then the column exists and it shares the writer.
+fn waiting(mut append: impl FnMut() -> Result<(), InfinoError>) -> Result<(), InfinoError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pause = Duration::from_millis(5);
+    loop {
+        match append() {
+            Err(InfinoError::Conflict(_)) if Instant::now() < deadline => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(200));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Append rows, isolating the ones the engine refuses: a refused batch is
 /// split in halves until each refused document stands alone and is reported
 /// with the engine's reason, while every accepted half is one append.
@@ -1851,7 +1871,7 @@ fn append_checked(table: &Supertable, rows: &[(usize, Value)], failed: &mut Vec<
         return;
     }
     let values: Vec<Value> = rows.iter().map(|(_, v)| v.clone()).collect();
-    match table.append_rows(&values) {
+    match waiting(|| table.append_rows(&values)) {
         Ok(()) => {}
         Err(e) if rows.len() == 1 => {
             failed.push(json!({ "i": rows[0].0, "reason": e.to_string() }));
@@ -2313,7 +2333,7 @@ fn append_prepared(
     let mut fresh_landed = joined.is_none();
     if let Some(batch) = &joined {
         if replaced.is_empty() {
-            fresh_landed = table.append(batch).is_ok();
+            fresh_landed = waiting(|| table.append(batch)).is_ok();
         } else {
             match split_by_osid(batch, replaced) {
                 Some((replacing, fresh)) => {
@@ -2332,7 +2352,7 @@ fn append_prepared(
                             }
                         }
                     }
-                    fresh_landed = fresh.num_rows() == 0 || table.append(&fresh).is_ok();
+                    fresh_landed = fresh.num_rows() == 0 || waiting(|| table.append(&fresh)).is_ok();
                 }
                 None => {
                     let why = "the batch carries no readable id column".to_string();
