@@ -396,6 +396,25 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertNull(translate(QueryBuilders.queryStringQuery("status:abc message:alpha message:beta").defaultField("message").minimumShouldMatch("4")));
     }
 
+    public void testQueryStringMinimumShouldMatchSkipsBlankPhrasesOnText() {
+        // Stock's analysis drops "" and " " on a text field: 75% of two optional clauses is one.
+        String blank = translate(QueryBuilders.queryStringQuery("alpha \"\" beta").defaultField("message").minimumShouldMatch("75%")).where();
+        assertEquals(translate(QueryBuilders.queryStringQuery("alpha \"\" beta").defaultField("message")).where(), blank);
+        assertEquals(
+            blank,
+            translate(QueryBuilders.queryStringQuery("alpha \" \" beta").defaultField("message").minimumShouldMatch("75%")).where()
+        );
+        assertEquals(blank, translate(QueryBuilders.simpleQueryStringQuery("alpha \"\" beta").field("message").minimumShouldMatch("75%")).where());
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("alpha \"\" beta gamma").defaultField("message").minimumShouldMatch("3")).where()
+                .contains(">= 3)")
+        );
+        // On a keyword column the empty value is a clause: 75% of three is two.
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("level:alpha level:\"\" level:beta").minimumShouldMatch("75%")).where().contains(">= 2)")
+        );
+    }
+
     public void testQueryStringMinimumShouldMatchRefusedWhereStockCountsOtherClauses() {
         // Over several fields stock reads a run of words as one dis_max clause.
         IllegalArgumentException fields = expectThrows(
@@ -443,6 +462,24 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         expectThrows(
             IllegalArgumentException.class,
             () -> translate(QueryBuilders.simpleQueryStringQuery("\"alpha beta\"~2 gamma").field("message").minimumShouldMatch("2"))
+        );
+        // An operator touching a phrase's quote is still a word of its own.
+        IllegalArgumentException touching = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.simpleQueryStringQuery("\"alpha\"OR beta").field("message").minimumShouldMatch("2"))
+        );
+        assertTrue(touching.getMessage(), touching.getMessage().contains("[OR]"));
+        assertNotNull(translate(QueryBuilders.simpleQueryStringQuery("\"alpha\"beta gamma").field("message").minimumShouldMatch("2")));
+        // The standard tokenizer splits a word where its script changes.
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("alpha ไทยabc beta").defaultField("message").minimumShouldMatch("3"))
+        );
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("alpha ไทย beta").defaultField("message").minimumShouldMatch("3")).where().contains(">= 3)")
+        );
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("alpha abc123 beta").defaultField("message").minimumShouldMatch("3")).where().contains(">= 3)")
         );
         // The standard tokenizer splits a word longer than 255 characters there.
         assertTrue(

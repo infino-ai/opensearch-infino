@@ -700,3 +700,324 @@
           size: 10
           sort: [ { k: asc } ]
           query: { simple_query_string: { query: "alpha OR beta", fields: [ body ], minimum_should_match: 2 } }
+
+---
+"minimum_should_match beside a blank phrase, a change of script, and an operator touching a quote":
+  # Stock's analysis makes no clause of a blank phrase on a text field, so it
+  # is not counted; on a keyword field the empty value is a clause. The
+  # standard tokenizer splits a word where its script changes. An operator
+  # touching a phrase's quote is still an operator.
+  - do:
+      indices.create:
+        index: qm4_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+              tag: { type: keyword }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: qm4_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+              tag: { type: keyword }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: qm4_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+              tag: { type: keyword }
+              k: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: qm4_luc
+        body:
+          - index: { _id: "d1" }
+          - { k: "d1", body: "alpha beta gamma" }
+          - index: { _id: "d2" }
+          - { k: "d2", body: "alpha beta" }
+          - index: { _id: "d3" }
+          - { k: "d3", body: "alpha" }
+          - index: { _id: "d4" }
+          - { k: "d4", body: "beta" }
+          - index: { _id: "d5" }
+          - { k: "d5", body: "delta" }
+          - index: { _id: "d6" }
+          - { k: "d6", body: "alpha ไทยabc" }
+          - index: { _id: "d7" }
+          - { k: "d7", body: "alpha or" }
+          - index: { _id: "d8" }
+          - { k: "d8", tag: "", body: "alpha" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: qm4_inf
+        body:
+          - index: { _id: "d1" }
+          - { k: "d1", body: "alpha beta gamma" }
+          - index: { _id: "d2" }
+          - { k: "d2", body: "alpha beta" }
+          - index: { _id: "d3" }
+          - { k: "d3", body: "alpha" }
+          - index: { _id: "d4" }
+          - { k: "d4", body: "beta" }
+          - index: { _id: "d5" }
+          - { k: "d5", body: "delta" }
+          - index: { _id: "d6" }
+          - { k: "d6", body: "alpha ไทยabc" }
+          - index: { _id: "d7" }
+          - { k: "d7", body: "alpha or" }
+          - index: { _id: "d8" }
+          - { k: "d8", tag: "", body: "alpha" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: qm4_prx
+        body:
+          - index: { _id: "d1" }
+          - { k: "d1", body: "alpha beta gamma" }
+          - index: { _id: "d2" }
+          - { k: "d2", body: "alpha beta" }
+          - index: { _id: "d3" }
+          - { k: "d3", body: "alpha" }
+          - index: { _id: "d4" }
+          - { k: "d4", body: "beta" }
+          - index: { _id: "d5" }
+          - { k: "d5", body: "delta" }
+          - index: { _id: "d6" }
+          - { k: "d6", body: "alpha ไทยabc" }
+          - index: { _id: "d7" }
+          - { k: "d7", body: "alpha or" }
+          - index: { _id: "d8" }
+          - { k: "d8", tag: "", body: "alpha" }
+  - match: { errors: false }
+  # A blank phrase on text: 75% of two clauses is one.
+  - do:
+      search:
+        index: qm4_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha \"\" beta", default_field: body, minimum_should_match: "75%" } }
+  - match: { hits.total.value: 7 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+  - match: { hits.hits.3._id: "d4" }
+  - match: { hits.hits.4._id: "d6" }
+  - match: { hits.hits.5._id: "d7" }
+  - match: { hits.hits.6._id: "d8" }
+  - do:
+      search:
+        index: qm4_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha \"\" beta", default_field: body, minimum_should_match: "75%" } }
+  - match: { hits.total.value: 7 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+  - match: { hits.hits.3._id: "d4" }
+  - match: { hits.hits.4._id: "d6" }
+  - match: { hits.hits.5._id: "d7" }
+  - match: { hits.hits.6._id: "d8" }
+  - do:
+      search:
+        index: qm4_prx
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha \"\" beta", default_field: body, minimum_should_match: "75%" } }
+  - match: { hits.total.value: 7 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+  - match: { hits.hits.3._id: "d4" }
+  - match: { hits.hits.4._id: "d6" }
+  - match: { hits.hits.5._id: "d7" }
+  - match: { hits.hits.6._id: "d8" }
+  - do:
+      search:
+        index: qm4_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha \" \" beta", default_field: body, minimum_should_match: "75%" } }
+  - match: { hits.total.value: 7 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+  - match: { hits.hits.3._id: "d4" }
+  - match: { hits.hits.4._id: "d6" }
+  - match: { hits.hits.5._id: "d7" }
+  - match: { hits.hits.6._id: "d8" }
+  - do:
+      search:
+        index: qm4_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha \" \" beta", default_field: body, minimum_should_match: "75%" } }
+  - match: { hits.total.value: 7 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+  - match: { hits.hits.3._id: "d4" }
+  - match: { hits.hits.4._id: "d6" }
+  - match: { hits.hits.5._id: "d7" }
+  - match: { hits.hits.6._id: "d8" }
+  - do:
+      search:
+        index: qm4_prx
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha \" \" beta", default_field: body, minimum_should_match: "75%" } }
+  - match: { hits.total.value: 7 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+  - match: { hits.hits.3._id: "d4" }
+  - match: { hits.hits.4._id: "d6" }
+  - match: { hits.hits.5._id: "d7" }
+  - match: { hits.hits.6._id: "d8" }
+  - do:
+      search:
+        index: qm4_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { simple_query_string: { query: "alpha \"\" beta", fields: [ body ], minimum_should_match: "75%" } }
+  - match: { hits.total.value: 7 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+  - match: { hits.hits.3._id: "d4" }
+  - match: { hits.hits.4._id: "d6" }
+  - match: { hits.hits.5._id: "d7" }
+  - match: { hits.hits.6._id: "d8" }
+  - do:
+      search:
+        index: qm4_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { simple_query_string: { query: "alpha \"\" beta", fields: [ body ], minimum_should_match: "75%" } }
+  - match: { hits.total.value: 7 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+  - match: { hits.hits.3._id: "d4" }
+  - match: { hits.hits.4._id: "d6" }
+  - match: { hits.hits.5._id: "d7" }
+  - match: { hits.hits.6._id: "d8" }
+  - do:
+      search:
+        index: qm4_prx
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { simple_query_string: { query: "alpha \"\" beta", fields: [ body ], minimum_should_match: "75%" } }
+  - match: { hits.total.value: 7 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d3" }
+  - match: { hits.hits.3._id: "d4" }
+  - match: { hits.hits.4._id: "d6" }
+  - match: { hits.hits.5._id: "d7" }
+  - match: { hits.hits.6._id: "d8" }
+  # The empty keyword value is a clause: both are required.
+  - do:
+      search:
+        index: qm4_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "tag:\"\" body:alpha", minimum_should_match: "100%" } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d8" }
+  - do:
+      search:
+        index: qm4_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "tag:\"\" body:alpha", minimum_should_match: "100%" } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d8" }
+  - do:
+      search:
+        index: qm4_prx
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "tag:\"\" body:alpha", minimum_should_match: "100%" } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d8" }
+  # ไทยabc is two tokens, so stock counts four clauses; the plugin refuses.
+  - do:
+      search:
+        index: qm4_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha ไทยabc beta", default_field: body, minimum_should_match: 3 } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d6" }
+  - do:
+      catch: bad_request
+      search:
+        index: qm4_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha ไทยabc beta", default_field: body, minimum_should_match: 3 } }
+  - do:
+      catch: bad_request
+      search:
+        index: qm4_prx
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "alpha ไทยabc beta", default_field: body, minimum_should_match: 3 } }
+  # OR after a closing quote is simple syntax's word or; the plugin refuses.
+  - do:
+      search:
+        index: qm4_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { simple_query_string: { query: "\"alpha\"OR beta", fields: [ body ], minimum_should_match: 2 } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.2._id: "d7" }
+  - do:
+      catch: bad_request
+      search:
+        index: qm4_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { simple_query_string: { query: "\"alpha\"OR beta", fields: [ body ], minimum_should_match: 2 } }
+  - do:
+      catch: bad_request
+      search:
+        index: qm4_prx
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { simple_query_string: { query: "\"alpha\"OR beta", fields: [ body ], minimum_should_match: 2 } }

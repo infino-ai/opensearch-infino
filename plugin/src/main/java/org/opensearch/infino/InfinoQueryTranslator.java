@@ -4,7 +4,8 @@
 
 package org.opensearch.infino;
 
-import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.analysis.standard.StandardTokenizer;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.apache.lucene.search.join.ScoreMode;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.OpenSearchSecurityException;
@@ -47,6 +48,9 @@ import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoScriptTranslator.Sql;
 import org.opensearch.infino.InfinoScriptTranslator.SqlType;
 
+import java.io.IOException;
+import java.io.StringReader;
+import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
@@ -1764,6 +1768,11 @@ final class InfinoQueryTranslator {
         if (b == null) {
             return node(parsed, targets, positive, q, op);
         }
+        // Stock's analysis makes no clause of a blank phrase on text, so it is not counted.
+        List<Node> counted = b.should().stream().filter(s -> !tokenless(s, targets)).toList();
+        if (counted.size() < b.should().size()) {
+            b = new Bool(b.must(), counted, b.mustNot());
+        }
         int required;
         try {
             required = Queries.calculateMinShouldMatch(b.should().size(), minimumShouldMatch);
@@ -1873,6 +1882,28 @@ final class InfinoQueryTranslator {
         }
     }
 
+    /**
+     * A blank phrase ({@code ""}, {@code " "}) on text columns only: the
+     * analyzer makes no token of it, so stock drops the clause. On a keyword
+     * column it is the empty value, a clause like any other.
+     */
+    private boolean tokenless(Node n, List<String> targets) {
+        if (!(n instanceof Term t) || !t.quoted() || t.slop() > 0 || t.fuzzy() > 0 || !t.text().isBlank()) {
+            return false;
+        }
+        List<String> fields = t.field() == null ? targets : List.of(t.field());
+        if (fields.isEmpty()) {
+            return false;
+        }
+        for (String f : fields) {
+            Column c = column(f);
+            if (c == null || !c.fts()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** A term matched as text: on the default fields, or on a text column. */
     private boolean textTerm(Term t) {
         if (t.field() == null) {
@@ -1885,18 +1916,33 @@ final class InfinoQueryTranslator {
     /**
      * Whether an analyzer may make more than one word of {@code text}: it
      * holds a character that is not a letter or digit, or an ideograph or
-     * kana, which the standard analyzer makes a word each, or it is longer
-     * than the standard tokenizer's longest token, which it splits there.
+     * kana, which the standard analyzer makes a word each, or the standard
+     * tokenizer does not keep it as one token (a change of script such as
+     * {@code ไทยabc}, or a word longer than its longest token).
      */
     private static boolean maybeSeveralWords(String text) {
-        return text.length() > StandardAnalyzer.DEFAULT_MAX_TOKEN_LENGTH
-            || text.codePoints()
+        return text.codePoints()
             .anyMatch(
                 c -> !Character.isLetterOrDigit(c)
                     || Character.isIdeographic(c)
                     || Character.UnicodeScript.of(c) == Character.UnicodeScript.HIRAGANA
                     || Character.UnicodeScript.of(c) == Character.UnicodeScript.KATAKANA
-            );
+            ) || !oneStandardToken(text);
+    }
+
+    /** Whether the standard tokenizer makes exactly one token of the whole of {@code text}. */
+    private static boolean oneStandardToken(String text) {
+        try (StandardTokenizer tokenizer = new StandardTokenizer()) {
+            CharTermAttribute term = tokenizer.addAttribute(CharTermAttribute.class);
+            tokenizer.setReader(new StringReader(text));
+            tokenizer.reset();
+            boolean one = tokenizer.incrementToken() && term.length() == text.length() && !tokenizer.incrementToken();
+            tokenizer.end();
+            return one;
+        } catch (IOException e) {
+            // A string reader does not fail.
+            throw new UncheckedIOException(e);
+        }
     }
 
     /**
@@ -1905,11 +1951,12 @@ final class InfinoQueryTranslator {
      * parentheses, {@code *}, {@code ~}, a field prefix, a range, a regular
      * expression, an escape, a boost, or AND / OR / NOT) outside a phrase,
      * or null when the string is plain words and phrases, which both syntaxes
-     * read alike. A phrase is checked as its bounds only, so what follows it
-     * ({@code ~2}) is still an operator.
+     * read alike. A phrase is checked as its bounds only, a word of its own,
+     * so what follows it ({@code ~2}, or {@code OR} in {@code "alpha"OR})
+     * is still an operator.
      */
     private static String simpleSyntax(String q) {
-        for (String word : QUERY_WHITESPACE.split(SIMPLE_PHRASE.matcher(q.trim()).replaceAll("\"\""))) {
+        for (String word : QUERY_WHITESPACE.split(SIMPLE_PHRASE.matcher(q.trim()).replaceAll(" \"\" ").trim())) {
             if (word.startsWith("-") || word.equals("AND") || word.equals("OR") || word.equals("NOT")) {
                 return word;
             }
