@@ -122,6 +122,8 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                     docsOf.put(e.getKey(), InfinoNative.docs(e.getKey(), e.getValue(), null));
                 }
             }
+            // What each index's mapping keeps of a document's _source, read once per index.
+            Map<String, InfinoMappingSource> storedOf = new HashMap<>();
             MultiGetItemResponse[] responses = new MultiGetItemResponse[mget.getItems().size()];
             for (int i = 0; i < responses.length; i++) {
                 MultiGetRequest.Item item = mget.getItems().get(i);
@@ -130,7 +132,15 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                 InfinoNative.Doc doc = byId != null ? byId.get(item.id()) : InfinoGetActionFilter.docOf(md, tableOfItem[i], item.id());
                 String routing = InfinoGetActionFilter.routingOf(md, tableOfItem[i], item.id(), doc);
                 GetResponse get = new GetResponse(
-                    InfinoGetActionFilter.result(md.getIndex().getName(), item.id(), doc, accessOf.get(item.index()), item.fetchSourceContext(), routing)
+                    InfinoGetActionFilter.result(
+                        md.getIndex().getName(),
+                        item.id(),
+                        doc,
+                        accessOf.get(item.index()),
+                        storedOf.computeIfAbsent(item.index(), k -> InfinoMappingSource.of(md.mapping())),
+                        item.fetchSourceContext(),
+                        routing
+                    )
                 );
                 responses[i] = new MultiGetItemResponse(get, null);
             }
