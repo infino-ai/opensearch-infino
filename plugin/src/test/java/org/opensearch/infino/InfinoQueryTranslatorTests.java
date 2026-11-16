@@ -321,6 +321,28 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(split.from() + " " + split.where(), (split.from() + split.where()).contains(pastBound + " cache"));
     }
 
+    /**
+     * Only ASCII letters and digits merge. The engine splits Thai into a token
+     * per character ({@code ไทย} is three), as it does Han and Hiragana, so
+     * such a word keeps the clause that requires all its tokens; other
+     * non-ASCII words keep theirs too.
+     */
+    public void testANonAsciiWordKeepsItsClause() {
+        assertFalse(InfinoQueryTranslator.oneToken("ไทย"));
+        assertFalse(InfinoQueryTranslator.oneToken("ພາສາ"));
+        assertFalse(InfinoQueryTranslator.oneToken("ひらがな"));
+        assertFalse(InfinoQueryTranslator.oneToken("カタカナ"));
+        assertFalse(InfinoQueryTranslator.oneToken("café"));
+        assertFalse(InfinoQueryTranslator.oneToken("İstanbul"));
+        assertFalse(InfinoQueryTranslator.oneToken("ｄｉｓｋ"));
+        assertFalse(InfinoQueryTranslator.oneToken("disk_full"));
+        assertTrue(InfinoQueryTranslator.oneToken("Disk42"));
+        Translation split = translate(
+            QueryBuilders.queryStringQuery("message:ไทย OR message:cache").defaultOperator(org.opensearch.index.query.Operator.AND)
+        );
+        assertFalse(split.from() + " " + split.where(), (split.from() + split.where()).contains("ไทย cache"));
+    }
+
     public void testAPhraseOrASigilKeepsTheSubquery() {
         assertTrue(InfinoQueryTranslator.plainQuery("disk full"));
         assertFalse(InfinoQueryTranslator.plainQuery("\"disk full\""));

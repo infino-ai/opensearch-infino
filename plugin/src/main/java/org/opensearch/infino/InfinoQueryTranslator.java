@@ -1329,28 +1329,34 @@ final class InfinoQueryTranslator {
     /**
      * The longest token both {@code standard} analyzers keep whole: Lucene's
      * counts UTF-16 units and the engine's code points, and a longer word is
-     * split into pieces. {@link String#length} is at least the code points.
+     * split into pieces. For the ASCII words {@link #oneToken} takes, the two
+     * counts are the same.
      */
     static final int MAX_TOKEN_CHARS = 255;
 
     /**
-     * Whether the {@code standard} analyzer surely reads {@code word} as one
-     * token: letters and digits only, none of a script it splits into a token
-     * per character, and no longer than {@link #MAX_TOKEN_CHARS}. Any other
-     * ({@code disk-full}, {@code a*}, 256 letters) may be several tokens, which
-     * its clause requires together and an any-word clause would not.
+     * Whether the engine's {@code standard} analyzer surely reads {@code word}
+     * as one token: ASCII letters and digits only, and no longer than
+     * {@link #MAX_TOKEN_CHARS}. Any other word may be several tokens, which its
+     * own clause requires together and an any-word clause would not:
+     * {@code disk-full} and {@code a*} split at the punctuation, a longer word
+     * into pieces, and the engine's UAX #29 segmenter gives a token per
+     * character to Han, Hiragana and the scripts Lucene reads as one
+     * South-East Asian run ({@code ไทย} is three). An allow-list rather than a
+     * list of the scripts it splits, so a script left off keeps its own clause,
+     * which is always right, only not merged.
      */
     static boolean oneToken(String word) {
         if (word.isEmpty() || word.length() > MAX_TOKEN_CHARS) {
             return false;
         }
-        return word.codePoints().allMatch(c -> {
-            if (!Character.isLetterOrDigit(c) || Character.isIdeographic(c)) {
+        for (int i = 0; i < word.length(); i++) {
+            char c = word.charAt(i);
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
                 return false;
             }
-            Character.UnicodeScript script = Character.UnicodeScript.of(c);
-            return script != Character.UnicodeScript.HIRAGANA && script != Character.UnicodeScript.KATAKANA;
-        });
+        }
+        return true;
     }
 
     /** The one text column {@code fields} name, when they name exactly one field the table has and it is a text column. */
