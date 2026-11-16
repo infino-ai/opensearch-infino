@@ -35,6 +35,8 @@ INDEX = "big5"
 # Each search's body and its URL parameters (pre_filter_shard_size, ...).
 SEARCHES = {s["name"]: (s["body"], s.get("params", {})) for s in json.load(open(os.path.join(HERE, "big5-searches.json")))}
 PORTS = {"default": 0, "stock": 1, "proxy": 2}
+# Tries of one _bulk batch while the node answers 429, a second apart.
+BULK_TRIES = 20
 
 
 def call(port, method, path, body=None, timeout=600, ndjson=False):
@@ -119,28 +121,49 @@ def load(args):
         lock = threading.Lock()
         it = batches()
         errors = [0]
+        # A batch that never loaded: the node would hold a different document
+        # set from the others, so the load stops and fails instead.
+        failures = []
         start = time.time()
+
+        def send(b):
+            """Bulk-load one batch, retrying while the node pushes back; the
+            reason it failed, or None."""
+            for _ in range(BULK_TRIES):
+                try:
+                    status, body = call(port, "POST", f"/{INDEX}/_bulk", b, ndjson=True)
+                except Exception as e:  # no answer, or one that is not JSON
+                    return repr(e)
+                if status == 429:
+                    time.sleep(1)
+                    continue
+                if status != 200:
+                    return f"HTTP {status}: {json.dumps(body)[:500]}"
+                if body.get("errors"):
+                    with lock:
+                        errors[0] += sum(1 for i in body["items"] if i["index"].get("error"))
+                return None
+            return f"HTTP 429 on all {BULK_TRIES} tries"
 
         def worker():
             while True:
                 with lock:
-                    b = next(it, None)
+                    b = None if failures else next(it, None)
                 if b is None:
                     return
-                for _ in range(20):
-                    status, body = call(port, "POST", f"/{INDEX}/_bulk", b, ndjson=True)
-                    if status == 429:
-                        time.sleep(1)
-                        continue
-                    if body.get("errors"):
-                        errors[0] += sum(1 for i in body["items"] if i["index"].get("error"))
-                    break
+                failure = send(b)
+                if failure:
+                    with lock:
+                        failures.append(failure)
+                    return
 
         threads = [threading.Thread(target=worker) for _ in range(args.clients)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
+        if failures:
+            sys.exit(f"{name}: a _bulk batch did not load, stopped: {failures[0]}")
         call(port, "POST", f"/{INDEX}/_refresh")
         _, count = call(port, "GET", f"/{INDEX}/_count")
         print(f"{name}: {count.get('count')} docs in {time.time() - start:.0f} s, {errors[0]} item errors", flush=True)

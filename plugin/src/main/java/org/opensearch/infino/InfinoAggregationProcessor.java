@@ -180,6 +180,8 @@ public class InfinoAggregationProcessor {
     /** The earliest and latest epoch milliseconds date_bin can take: it works in nanoseconds, in an i64. */
     private static final long DATE_BIN_MIN_MILLIS = Long.MIN_VALUE / 1_000_000L;
     private static final long DATE_BIN_MAX_MILLIS = Long.MAX_VALUE / 1_000_000L;
+    /** The Arrow type of a date in UTC epoch milliseconds, as a cast names it: what a date key is computed in. */
+    private static final String UTC_MILLIS = "'Timestamp(Millisecond, Some(\"UTC\"))'";
     /** The Arrow type a mapped date's column holds, which a date the index does not map is read as. */
     private static final String UNMAPPED_DATE_TYPE = "Timestamp(ms, \"UTC\")";
     /** How bucket keys are printed when the request names no format. */
@@ -1797,17 +1799,26 @@ public class InfinoAggregationProcessor {
          * so a date outside that range (less an interval and the offset at each
          * end, which the bucket's start may reach) is floored in epoch
          * milliseconds instead, which hold any date the field can.
+         *
+         * <p>Both branches read {@code source} as UTC milliseconds first. A
+         * table this plugin makes keeps dates that way already, and the cast
+         * is free; one written elsewhere may keep them in micro- or
+         * nanoseconds, whose Int64 is not an epoch in milliseconds. The
+         * rounding to milliseconds is date_trunc's, which floors, so a date
+         * before 1970 with a fraction of a millisecond stays in its bucket; a
+         * cast alone would round it toward zero.
          */
         static String utcBin(String source, long ms, long offset) {
+            String millis = "arrow_cast(date_trunc('millisecond', " + source + "), " + UTC_MILLIS + ")";
             String origin = offset == 0 ? "" : ", TIMESTAMP '1970-01-01T00:00:00Z' + INTERVAL '" + offset + " milliseconds'";
-            String binned = "date_bin(INTERVAL '" + ms + " milliseconds', " + source + origin + ")";
+            String binned = "date_bin(INTERVAL '" + ms + " milliseconds', " + millis + origin + ")";
             long margin = ms + (offset < 0 ? -offset : offset);
             long lo = DATE_BIN_MIN_MILLIS + margin;
             long hi = DATE_BIN_MAX_MILLIS - margin;
-            String epoch = "arrow_cast(" + source + ", 'Int64')";
+            String epoch = "arrow_cast(" + millis + ", 'Int64')";
             String shifted = "(" + epoch + " - (" + offset + "))";
             String floored = "arrow_cast(" + shifted + " - ((" + shifted + " % " + ms + ") + " + ms + ") % " + ms + " + (" + offset + "), "
-                + "'Timestamp(Millisecond, Some(\"UTC\"))')";
+                + UTC_MILLIS + ")";
             if (lo > hi) {
                 return floored;
             }
