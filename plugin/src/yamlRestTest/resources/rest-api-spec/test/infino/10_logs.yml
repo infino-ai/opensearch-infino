@@ -311,3 +311,69 @@
   - match: { hits.hits.0._id: z }
   - match: { hits.hits.1._id: b }
   - match: { hits.hits.2._id: m }
+
+---
+"A sort on a field named score carries the field's values, as on a Lucene twin":
+  # The engine's sorted search puts its own score under `score`, so a field
+  # of that name is sorted by the hit statement, and each hit's sort value is
+  # the field's.
+  - do:
+      indices.create:
+        index: scored_infino
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              score: { type: long }
+  - do:
+      indices.create:
+        index: scored_lucene
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              score: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: scored_infino, _id: a }
+          - { score: 2 }
+          - index: { _index: scored_infino, _id: b }
+          - { score: 1 }
+          - index: { _index: scored_lucene, _id: a }
+          - { score: 2 }
+          - index: { _index: scored_lucene, _id: b }
+          - { score: 1 }
+  - match: { errors: false }
+
+  - do:
+      search:
+        index: scored_lucene
+        body:
+          size: 2
+          sort: [ { score: asc } ]
+  - match: { hits.hits.0._id: b }
+  - match: { hits.hits.0.sort.0: 1 }
+  - match: { hits.hits.1._id: a }
+  - match: { hits.hits.1.sort.0: 2 }
+  - do:
+      search:
+        index: scored_infino
+        body:
+          size: 2
+          sort: [ { score: asc } ]
+  - match: { hits.hits.0._id: b }
+  - match: { hits.hits.0.sort.0: 1 }
+  - match: { hits.hits.1._id: a }
+  - match: { hits.hits.1.sort.0: 2 }
+  - do:
+      search:
+        index: scored_infino
+        body:
+          size: 2
+          sort: [ { score: desc } ]
+  - match: { hits.hits.0._id: a }
+  - match: { hits.hits.0.sort.0: 2 }
+  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.1.sort.0: 1 }

@@ -3078,6 +3078,9 @@ pub unsafe extern "C" fn infino_bm25(
     .unwrap_or(ptr::null_mut())
 }
 
+/// The column the engine's sorted search fills with its own (zero) score.
+const SORTED_SCORE: &str = "score";
+
 /// The table's first `k` rows by `column`, ascending or (`descending`
 /// non-zero) descending, rows sharing a value in row id order and rows
 /// without one last, each carrying `osid`, `_id`, the column and, when
@@ -3085,9 +3088,12 @@ pub unsafe extern "C" fn infino_bm25(
 /// row asks for when it sorts on one field, in one call. The sources are
 /// read by row id along with the page, not looked up by `osid` afterwards.
 /// `null` when the column has no range index: the engine's sorted search
-/// serves only a range-indexed column, and the caller plans the statement. The engine reads it from the column's range index with no
-/// statement planned, and plans the statement itself for a column without
-/// one.
+/// serves only a range-indexed column, and the caller plans the statement.
+/// Also `null`, with no schema read, on a hosted connection (whose sorted
+/// search forwards a statement anyway, so the schema request would only add
+/// a round trip) and for a column named `score`: the engine's sorted search
+/// puts its own score under that name, and the page drops it, which would
+/// drop the field's values with it.
 #[no_mangle]
 pub unsafe extern "C" fn infino_sorted(
     h: *mut Bridge,
@@ -3103,6 +3109,9 @@ pub unsafe extern "C" fn infino_sorted(
         else {
             return ptr::null_mut();
         };
+        if conn.hosted || column == SORTED_SCORE {
+            return out_string("null".to_string());
+        }
         let range_indexed = match conn.conn.schema(name) {
             Ok(schema) => schema
                 .fields()
@@ -3121,7 +3130,7 @@ pub unsafe extern "C" fn infino_sorted(
         let projection = if with_source != 0 { &with[..] } else { &with[..3] };
         match table.sorted_search(column, descending != 0, k.max(0) as usize, Some(projection)) {
             // The engine fixes every row's `score` at zero; a sorted hit has none.
-            Ok(b) => out_string(batches_to_json(&without_column(&b, "score"))),
+            Ok(b) => out_string(batches_to_json(&without_column(&b, SORTED_SCORE))),
             Err(e) => err_json(&e.to_string()),
         }
     }))
@@ -5305,5 +5314,35 @@ mod tests {
             assert_eq!(check(doc), Err(no_timestamp("@timestamp")), "{doc}");
         }
         assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, None).is_ok());
+    }
+
+    /// A sorted page on a range-indexed field carries the field's values; a
+    /// field named `score`, and any field on a hosted connection, is left to
+    /// the hit statement (`null`) before any schema is read.
+    #[test]
+    fn a_sorted_page_carries_its_values_and_a_score_field_or_a_hosted_connection_is_left_to_the_statement() {
+        let h = open_logs();
+        let scored = r#"{"properties":{"score":{"type":"long"},"status":{"type":"long"}}}"#;
+        take(unsafe { infino_ensure_table(h, c("scored").as_ptr(), c(scored).as_ptr()) });
+        let ids = [c("a"), c("b")];
+        let srcs = [c(r#"{"score":2,"status":20}"#), c(r#"{"score":1,"status":10}"#)];
+        let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+        let sp: Vec<*const c_char> = srcs.iter().map(|x| x.as_ptr()).collect();
+        take(unsafe { infino_index_batch(h, c("scored").as_ptr(), idp.as_ptr(), sp.as_ptr(), 2) });
+        let sorted = |column: &str| {
+            take(unsafe { infino_sorted(h, c("scored").as_ptr(), c(column).as_ptr(), 0, 10, 0) })
+        };
+        let page: Value = serde_json::from_str(&sorted("status")).unwrap();
+        let rows = page.as_array().unwrap_or_else(|| panic!("{page}"));
+        let got: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| (r[OSID].as_str().unwrap().to_string(), r["status"].as_i64().unwrap()))
+            .collect();
+        assert_eq!(got, [("b".to_string(), 10), ("a".to_string(), 20)]);
+        assert_eq!(sorted("score"), "null");
+        unsafe { (*h).hosted = true };
+        assert_eq!(sorted("status"), "null");
+        unsafe { (*h).hosted = false };
+        close(h);
     }
 }
