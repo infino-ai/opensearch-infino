@@ -1,0 +1,144 @@
+---
+"update_by_query on an index with a nested field rewrites every document, as on a Lucene twin":
+  # The same mapping and documents on an Infino-backed index and on a Lucene
+  # twin; update_by_query must update every document, keep its nested
+  # entries, and leave nested queries matching as before.
+  - do:
+      indices.create:
+        index: ubq_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { rank: { type: long }, note: { type: keyword }, items: { type: nested, properties: { name: { type: keyword }, qty: { type: long } } } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ubq_luc
+        body:
+          - index: { _id: "d1" }
+          - { rank: 1, note: a, items: [ { name: size, qty: 1 }, { name: color, qty: 2 } ] }
+          - index: { _id: "d2" }
+          - { rank: 2, note: b, items: [ { name: weight, qty: 3 } ] }
+          - index: { _id: "d3" }
+          - { rank: 3, note: c }
+  - match: { errors: false }
+  - do:
+      indices.create:
+        index: ubq_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { rank: { type: long }, note: { type: keyword }, items: { type: nested, properties: { name: { type: keyword }, qty: { type: long } } } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ubq_inf
+        body:
+          - index: { _id: "d1" }
+          - { rank: 1, note: a, items: [ { name: size, qty: 1 }, { name: color, qty: 2 } ] }
+          - index: { _id: "d2" }
+          - { rank: 2, note: b, items: [ { name: weight, qty: 3 } ] }
+          - index: { _id: "d3" }
+          - { rank: 3, note: c }
+  - match: { errors: false }
+  - do:
+      update_by_query:
+        index: ubq_luc
+        refresh: true
+        timeout: 20s
+        body: { script: { source: "ctx._source.rank = ctx._source.rank * 10", lang: painless } }
+  - match: { updated: 3 }
+  - match: { version_conflicts: 0 }
+  - match: { failures: [] }
+  - do: { get: { index: ubq_luc, id: d1 } }
+  - match: { _source.rank: 10 }
+  - match: { _source.items.1.name: color }
+  - do: { search: { index: ubq_luc, body: { query: { nested: { path: items, query: { term: { items.name: size } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - do: { search: { index: ubq_luc, body: { query: { range: { rank: { gte: 20 } } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      update_by_query:
+        index: ubq_inf
+        refresh: true
+        timeout: 20s
+        body: { script: { source: "ctx._source.rank = ctx._source.rank * 10", lang: painless } }
+  - match: { updated: 3 }
+  - match: { version_conflicts: 0 }
+  - match: { failures: [] }
+  - do: { get: { index: ubq_inf, id: d1 } }
+  - match: { _source.rank: 10 }
+  - match: { _source.items.1.name: color }
+  - do: { search: { index: ubq_inf, body: { query: { nested: { path: items, query: { term: { items.name: size } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - do: { search: { index: ubq_inf, body: { query: { range: { rank: { gte: 20 } } } } } }
+  - match: { hits.total.value: 2 }
+
+
+---
+"update_by_query without a script rewrites a document with nested entries once, as on a Lucene twin":
+  # A scroll sorted by _doc, which update_by_query sends, resumes each round
+  # after the id of the last hit it handed out. With one document, the
+  # second round must find nothing past it and the request must end with
+  # the document rewritten once.
+  - do:
+      indices.create:
+        index: ubq_plain_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { rank: { type: long }, note: { type: keyword }, items: { type: nested, properties: { name: { type: keyword } } } } }
+  - do: { bulk: { refresh: true, index: ubq_plain_luc, body: [ { index: { _id: d1 } }, { rank: 1, note: a, items: [ { name: size } ] } ] } }
+  - match: { errors: false }
+  - do: { update_by_query: { index: ubq_plain_luc, refresh: true, timeout: 20s } }
+  - match: { total: 1 }
+  - match: { updated: 1 }
+  - match: { version_conflicts: 0 }
+  - match: { failures: [] }
+  - do: { search: { index: ubq_plain_luc, body: { query: { nested: { path: items, query: { term: { items.name: size } } } } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      indices.create:
+        index: ubq_plain_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { rank: { type: long }, note: { type: keyword }, items: { type: nested, properties: { name: { type: keyword } } } } }
+  - do: { bulk: { refresh: true, index: ubq_plain_inf, body: [ { index: { _id: d1 } }, { rank: 1, note: a, items: [ { name: size } ] } ] } }
+  - match: { errors: false }
+  - do: { update_by_query: { index: ubq_plain_inf, refresh: true, timeout: 20s } }
+  - match: { total: 1 }
+  - match: { updated: 1 }
+  - match: { version_conflicts: 0 }
+  - match: { failures: [] }
+  - do: { search: { index: ubq_plain_inf, body: { query: { nested: { path: items, query: { term: { items.name: size } } } } } } }
+  - match: { hits.total.value: 1 }
+
+---
+"update_by_query without a script on a mapping that excludes the nested field from _source, as on a Lucene twin":
+  # The rewrite reads the document back and writes it again under the
+  # sequence number its hit carried; a conflict here was a 409.
+  - do:
+      indices.create:
+        index: ubq_excl_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { _source: { excludes: [ items ] }, properties: { rank: { type: long }, note: { type: keyword }, items: { type: nested, properties: { name: { type: keyword } } } } }
+  - do: { bulk: { refresh: true, index: ubq_excl_luc, body: [ { index: { _id: d1 } }, { rank: 1, note: a, items: [ { name: size } ] } ] } }
+  - match: { errors: false }
+  - do: { update_by_query: { index: ubq_excl_luc, refresh: true, timeout: 20s } }
+  - match: { total: 1 }
+  - match: { updated: 1 }
+  - match: { version_conflicts: 0 }
+  - match: { failures: [] }
+  - do:
+      indices.create:
+        index: ubq_excl_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { _source: { excludes: [ items ] }, properties: { rank: { type: long }, note: { type: keyword }, items: { type: nested, properties: { name: { type: keyword } } } } }
+  - do: { bulk: { refresh: true, index: ubq_excl_inf, body: [ { index: { _id: d1 } }, { rank: 1, note: a, items: [ { name: size } ] } ] } }
+  - match: { errors: false }
+  - do: { update_by_query: { index: ubq_excl_inf, refresh: true, timeout: 20s } }
+  - match: { total: 1 }
+  - match: { updated: 1 }
+  - match: { version_conflicts: 0 }
+  - match: { failures: [] }
