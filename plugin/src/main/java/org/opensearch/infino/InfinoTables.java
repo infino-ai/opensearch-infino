@@ -24,6 +24,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -59,6 +60,10 @@ public final class InfinoTables {
     private static final Logger log = LogManager.getLogger(InfinoTables.class);
     /** What a shard's table adds to the index's table name, before the shard's number. */
     private static final String SHARD_SUFFIX = "_shard";
+    /** Where an index's settings name its default similarity. */
+    private static final String DEFAULT_SIMILARITY_PREFIX = "index.similarity.default.";
+    /** A similarity's setting naming its type. */
+    private static final String SIMILARITY_TYPE = "type";
     /** Mapping keys and field types the default-mode columns are declared with. */
     private static final String PROPERTIES = "properties";
     private static final String TYPE = "type";
@@ -295,11 +300,20 @@ public final class InfinoTables {
             if (last != null && last == version) {
                 return table;
             }
-            InfinoNative.ensureTable(table, tableMapping(md));
+            InfinoNative.ensureTable(table, tableMapping(md), defaultBm25(md.getSettings()));
             declared.put(table, version);
             log.info("[infino] table {} declared from mapping version {} of {}", table, version, md.getIndex().getName());
         }
         return table;
+    }
+
+    /**
+     * Whether the index's default similarity is the default BM25: it names
+     * none, or names BM25 with no parameters of its own.
+     */
+    static boolean defaultBm25(Settings indexSettings) {
+        Settings similarity = indexSettings.getByPrefix(DEFAULT_SIMILARITY_PREFIX);
+        return similarity.isEmpty() || similarity.keySet().equals(Set.of(SIMILARITY_TYPE)) && InfinoNative.BM25.equals(similarity.get(SIMILARITY_TYPE));
     }
 
     /**
