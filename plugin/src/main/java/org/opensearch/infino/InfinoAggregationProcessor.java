@@ -2835,14 +2835,14 @@ public class InfinoAggregationProcessor {
         return rows.size() > c.size ? rows.subList(0, c.size) : rows;
     }
 
-    /** Most buckets {@link #rangeCountedHistogram} counts in one statement; past it the grouped statement reads them. */
+    /** Most buckets {@link #rangeCountedHistogram} counts in one call; past it the grouped statement reads them. */
     static final int MAX_RANGE_COUNTED_BUCKETS = 1024;
 
     /**
-     * A date histogram's buckets as one {@code COUNT(*) FILTER (WHERE range)}
-     * per bucket, in one statement, which the engine counts from the date
-     * column's range index, every bucket in one pass over each superfile,
-     * with no row read: a histogram whose buckets hold nothing but their
+     * A date histogram's buckets as one interval of the date column each,
+     * counted in one engine call with no statement planned ({@link
+     * InfinoNative#countWhere}), which counts them from the column's range
+     * index, every bucket in one pass over each superfile, with no row read: a histogram whose buckets hold nothing but their
      * count, over a field that is the column itself, with no missing value
      * and no hard bounds, over the plain table either unfiltered or filtered
      * by the request's one range on the same column. The buckets run from
@@ -2891,24 +2891,28 @@ public class InfinoAggregationProcessor {
         }
         Rounding.Prepared rounding = level.date.rounding().prepareForUnknown();
         List<Long> starts = new ArrayList<>();
-        List<String> counts = new ArrayList<>();
+        List<String> predicates = new ArrayList<>();
         long start = rounding.round(lo);
         while (start < until) {
             long next = rounding.nextRoundingValue(start);
             if (next <= start || starts.size() == MAX_RANGE_COUNTED_BUCKETS) {
                 return null;
             }
-            counts.add("COUNT(*) FILTER (WHERE " + column + " >= " + timestampLiteral(start) + " AND " + column + " < " + timestampLiteral(next) + ") AS b" + starts.size());
+            String bucket = column + " >= " + timestampLiteral(start) + " AND " + column + " < " + timestampLiteral(next);
+            predicates.add(unfiltered ? bucket : "(" + where + ") AND " + bucket);
             starts.add(start);
             start = next;
         }
         if (starts.isEmpty()) {
             return List.of();
         }
-        Map<String, Object> row = oneRow("SELECT " + String.join(", ", counts) + " FROM " + from + (unfiltered ? "" : " WHERE " + where));
+        // One engine call with no statement planned: the engine counts every
+        // bucket, an interval of the column, in one pass over each superfile's
+        // range index.
+        long[] counts = InfinoNative.countWhere(table, predicates);
         List<Map<String, Object>> rows = new ArrayList<>();
         for (int i = 0; i < starts.size(); i++) {
-            long n = asLong(row.get("b" + i));
+            long n = counts[i];
             if (n > 0) {
                 rows.add(Map.of("k0", starts.get(i), "doc_count", n));
             }
