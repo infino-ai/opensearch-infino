@@ -2810,6 +2810,87 @@ public class InfinoAggregationProcessor {
         return rows.size() > c.size ? rows.subList(0, c.size) : rows;
     }
 
+    /** Most buckets {@link #rangeCountedHistogram} counts in one statement; past it the grouped statement reads them. */
+    static final int MAX_RANGE_COUNTED_BUCKETS = 1024;
+
+    /**
+     * A date histogram's buckets as one {@code COUNT(*) FILTER (WHERE range)}
+     * per bucket, in one statement, which the engine counts from the date
+     * column's range index, every bucket in one pass over each superfile,
+     * with no row read: a histogram whose buckets hold nothing but their
+     * count, over a field that is the column itself, with no missing value
+     * and no hard bounds, over the plain table either unfiltered or filtered
+     * by the request's one range on the same column. The buckets run from
+     * the range's start to its end, or with no range from the column's
+     * least value to its greatest. Rows only for the buckets that hold a
+     * row, keyed as the grouped statement keys them. Null when the
+     * histogram is not of that shape, the table holds no value, or it spans
+     * more than {@link #MAX_RANGE_COUNTED_BUCKETS} buckets.
+     */
+    private List<Map<String, Object>> rangeCountedHistogram(Grouped level, String from, String where) {
+        if (level.date == null
+            || table == null
+            || !level.metrics.isEmpty()
+            || !level.hits.isEmpty()
+            || level.child != null
+            || !(level.builder instanceof DateHistogramAggregationBuilder dh)
+            || dh.missing() != null
+            || dh.hardBounds() != null
+            || level.source.column() == null
+            || level.source.onlyWhere() != null
+            || level.source.multi()) {
+            return null;
+        }
+        String column = InfinoQueryTranslator.quoteIdent(level.source.column());
+        if (!level.source.expr().equals(column) || !from.equals(InfinoQueryTranslator.quoteIdent(table))) {
+            return null;
+        }
+        long lo;
+        long until;
+        boolean unfiltered = "1=1".equals(where);
+        if (unfiltered) {
+            List<Map<String, Object>> ends = InfinoNative.sqlRows("SELECT MIN(" + column + ") AS lo, MAX(" + column + ") AS hi FROM " + from);
+            if (ends.isEmpty() || ends.get(0).get("lo") == null || ends.get(0).get("hi") == null) {
+                return null;
+            }
+            lo = asLong(ends.get(0).get("lo"));
+            until = asLong(ends.get(0).get("hi")) + 1;
+        } else {
+            Translation q = plan.query();
+            InfinoQueryTranslator.Span span = q.span();
+            if (span == null || !where.equals(q.where()) || !from.equals(q.from()) || !column.equals(InfinoQueryTranslator.quoteIdent(span.column()))) {
+                return null;
+            }
+            lo = span.fromMillis();
+            until = span.untilMillis();
+        }
+        Rounding.Prepared rounding = level.date.rounding().prepareForUnknown();
+        List<Long> starts = new ArrayList<>();
+        List<String> counts = new ArrayList<>();
+        long start = rounding.round(lo);
+        while (start < until) {
+            long next = rounding.nextRoundingValue(start);
+            if (next <= start || starts.size() == MAX_RANGE_COUNTED_BUCKETS) {
+                return null;
+            }
+            counts.add("COUNT(*) FILTER (WHERE " + column + " >= " + timestampLiteral(start) + " AND " + column + " < " + timestampLiteral(next) + ") AS b" + starts.size());
+            starts.add(start);
+            start = next;
+        }
+        if (starts.isEmpty()) {
+            return List.of();
+        }
+        Map<String, Object> row = oneRow("SELECT " + String.join(", ", counts) + " FROM " + from + (unfiltered ? "" : " WHERE " + where));
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (int i = 0; i < starts.size(); i++) {
+            long n = asLong(row.get("b" + i));
+            if (n > 0) {
+                rows.add(Map.of("k0", starts.get(i), "doc_count", n));
+            }
+        }
+        return rows;
+    }
+
     /**
      * An instant as a literal of a date column's type, so a comparison with
      * the column is one the engine counts from its range index as written.
@@ -2897,6 +2978,9 @@ public class InfinoAggregationProcessor {
             String inner = levelInner(chain, i, from, where, restriction, level.terms);
             String parents = String.join(", ", aliases.subList(0, i));
             List<Map<String, Object>> rows = i == 0 && level.terms ? pickTopTerms(level, inner, readAhead) : null;
+            if (rows == null && i == 0 && chain.size() == 1 && leafChild == null) {
+                rows = rangeCountedHistogram(level, from, where);
+            }
             if (rows == null) {
                 String sql;
                 if (level.terms) {
