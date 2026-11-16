@@ -32,6 +32,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod read_sql;
+mod skeleton;
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
@@ -58,8 +59,9 @@ use infino::serde_json::{self, json, Map, Value};
 use infino::{
     connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions,
     Connection, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaPatch,
-    Supertable,
+    Supertable, TableSchema,
 };
+use infino::document::{residual_column, skeleton_column};
 use rayon::prelude::*;
 
 /// The OpenSearch `_id` of a row.
@@ -95,7 +97,7 @@ const MULTI_VALUE_SEPARATOR: &str = " ";
 /// the field's own type, declared the first time a document needs it. The
 /// field's own column is null for that document, except a string field's,
 /// which keeps the values joined so its text index sees every token.
-const LIST_SUFFIX: &str = "[]";
+pub(crate) const LIST_SUFFIX: &str = "[]";
 /// The name Arrow gives a list column's element.
 const LIST_ITEM: &str = "item";
 /// A float of this magnitude or more is past the whole numbers a float holds
@@ -1275,14 +1277,17 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
         Err(InfinoError::NotFound(_)) => {
             let mut fields = vec![
                 Field::new(OSID, DataType::LargeUtf8, false),
-                Field::new(SOURCE, DataType::LargeUtf8, true),
                 Field::new(SEQ, DataType::Int64, true),
             ];
             // The id column carries an FTS index: a GET by id is then a term
             // lookup (`exact_match`) instead of a scan of the column, and the
             // manifest's per-superfile term bloom skips the files that cannot
             // hold the id. Scalar columns have only min/max per superfile.
-            let mut spec = IndexSpec::new().fts(FtsField::new(OSID.to_string()));
+            // The document is a column the engine rebuilds from the typed
+            // columns and each row's skeleton, so it is not stored twice.
+            let mut spec = IndexSpec::new()
+                .fts(FtsField::new(OSID.to_string()))
+                .document(SOURCE);
             for f in &mapped {
                 fields.push(Field::new(&f.path, f.data_type.clone(), true));
                 if f.fts {
@@ -1928,6 +1933,7 @@ pub unsafe extern "C" fn infino_index_batch(
 
         let mut failed: Vec<Value> = Vec::new();
         let mut rows: Vec<(usize, Map<String, Value>)> = Vec::with_capacity(n);
+        let mut sources: Vec<&str> = Vec::with_capacity(n);
         for i in 0..n {
             let osid = unsafe { cstr(os_p[i]) }.unwrap_or("");
             let source = unsafe { cstr(sr_p[i]) }.unwrap_or("{}");
@@ -1939,8 +1945,8 @@ pub unsafe extern "C" fn infino_index_batch(
                 }
             };
             flat.insert(OSID.into(), Value::String(osid.to_string()));
-            flat.insert(SOURCE.into(), Value::String(source.to_string()));
             rows.push((i, flat));
+            sources.push(source);
         }
 
         let mut maps: Vec<Map<String, Value>> = rows.iter().map(|(_, m)| m.clone()).collect();
@@ -1956,10 +1962,19 @@ pub unsafe extern "C" fn infino_index_batch(
             Err(why) => return err_json(&why),
         };
         unify_new_paths(&mut maps, &schema);
+        let table_schema = match conn.conn.schema(name) {
+            Ok(s) => s,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let mut values: Vec<Value> = maps.into_iter().map(Value::Object).collect();
+        let converted = rows_to_batch(&values, &table_schema).ok();
+        if let Err(why) = with_documents(&sources, &mut values, converted, &table_schema) {
+            return err_json(&why);
+        }
         let indexed: Vec<(usize, Value)> = rows
             .iter()
-            .zip(maps)
-            .map(|((i, _), m)| (*i, Value::Object(m)))
+            .zip(values)
+            .map(|((i, _), v)| (*i, v))
             .collect();
         append_checked(&table, &indexed, &mut failed);
         let ok = n - failed.len();
@@ -2105,7 +2120,6 @@ unsafe fn prepare(
         .map(|(id, src, routing, seq, op)| {
             conform_doc(src, &schema, &kept, stamp.as_deref()).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
-                flat.insert(SOURCE.into(), Value::String((*src).to_string()));
                 if !routing.is_empty() {
                     flat.insert(ROUTING.into(), Value::String((*routing).to_string()));
                 }
@@ -2145,12 +2159,14 @@ unsafe fn prepare(
         (table_schema, schema)
     };
     unify_new_paths(&mut rows, &schema);
-    let values: Vec<Value> = rows.into_iter().map(Value::Object).collect();
+    let mut values: Vec<Value> = rows.into_iter().map(Value::Object).collect();
     let batch = if values.is_empty() {
         None
     } else {
         rows_to_batch(&values, &table_schema).ok()
     };
+    let sources: Vec<&str> = index_of.iter().map(|&i| rows_in[i].1).collect();
+    let batch = with_documents(&sources, &mut values, batch, &table_schema)?;
     Ok(Prepared {
         n,
         batch,
@@ -2158,6 +2174,50 @@ unsafe fn prepare(
         index_of,
         failed,
     })
+}
+
+/// Give each document its skeleton and residual, the stored columns the
+/// engine rebuilds `source` from: in each row (`values[j]` is the document
+/// `sources[j]`), and in `batch` (row `j` likewise) when the rows were
+/// converted, which the shapes are read against.
+fn with_documents(
+    sources: &[&str],
+    values: &mut [Value],
+    batch: Option<RecordBatch>,
+    table_schema: &TableSchema,
+) -> Result<Option<RecordBatch>, String> {
+    let shapes: Vec<skeleton::Shape> = sources
+        .iter()
+        .enumerate()
+        .map(|(j, src)| skeleton::shape(src, j, batch.as_ref(), table_schema))
+        .collect::<Result<_, _>>()?;
+    let (skeleton_name, residual_name) = (skeleton_column(SOURCE), residual_column(SOURCE));
+    for (value, shape) in values.iter_mut().zip(&shapes) {
+        if let Value::Object(row) = value {
+            row.insert(skeleton_name.clone(), Value::String(shape.skeleton.clone()));
+            if let Some(residual) = &shape.residual {
+                row.insert(residual_name.clone(), Value::String(residual.clone()));
+            }
+        }
+    }
+    let Some(batch) = batch else {
+        return Ok(None);
+    };
+    let schema = batch.schema();
+    let mut columns = batch.columns().to_vec();
+    if let Ok(at) = schema.index_of(&skeleton_name) {
+        columns[at] = Arc::new(StringArray::from(
+            shapes.iter().map(|s| Some(s.skeleton.as_str())).collect::<Vec<_>>(),
+        ));
+    }
+    if let Ok(at) = schema.index_of(&residual_name) {
+        columns[at] = Arc::new(LargeStringArray::from(
+            shapes.iter().map(|s| s.residual.as_deref()).collect::<Vec<_>>(),
+        ));
+    }
+    RecordBatch::try_new(schema, columns)
+        .map(Some)
+        .map_err(|e| format!("document columns: {e}"))
 }
 
 /// The batch's rows whose `osid` is in `ids`, and the rest, as two batches;
@@ -4512,7 +4572,6 @@ mod tests {
                 // The same columns, declared directly, with no term index on the id column.
                 let fields = vec![
                     Field::new(OSID, DataType::LargeUtf8, false),
-                    Field::new(SOURCE, DataType::LargeUtf8, true),
                     Field::new("category", DataType::LargeUtf8, true),
                     Field::new("price", DataType::Float64, true),
                     Field::new("text", DataType::LargeUtf8, true),
@@ -4521,7 +4580,9 @@ mod tests {
                     .create_table(
                         "bench",
                         Arc::new(Schema::new(fields)),
-                        IndexSpec::new().fts(FtsField::new("text".to_string())),
+                        IndexSpec::new()
+                            .fts(FtsField::new("text".to_string()))
+                            .document(SOURCE),
                     )
                     .unwrap();
             }
