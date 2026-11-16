@@ -536,12 +536,6 @@ public final class InfinoSearch {
     // ---- one index ----
 
     /**
-     * The hits of one index for the request's window, each carrying its
-     * source, with the total. With {@code count} false an exact total is left
-     * for the caller, which reads it beside the aggregations (the page's total
-     * is then 0 until replaced).
-     */
-    /**
      * The total: what the query and post_filter keep, before any collapse
      * and regardless of where the page starts.
      */
@@ -576,13 +570,18 @@ public final class InfinoSearch {
         return new CountedRows(counted == 0 ? List.of() : hits.get(), counted);
     }
 
-    /** The page's rows from its hit statement, with their sources when they are read by id. */
-    private static List<Map<String, Object>> hitRows(Plan plan, SearchSourceBuilder source, int fetch, boolean seqNoAndPrimaryTerm) {
-        // A sort on a field no row holds a value in orders nothing: every
-        // hit's sort value is missing, so the page is the predicate's rows
-        // in no order, read as an unsorted search reads them, as stock reads
-        // a sort on a field no document has. The hits still carry the sort.
-        Plan read = sortsNothing(plan) ? plan.unsorted() : plan;
+    /**
+     * The page's rows from its hit statement, with their sources when they
+     * are read by id; {@code resumed} as {@link #page} takes it.
+     */
+    private static List<Map<String, Object>> hitRows(
+        Plan plan,
+        SearchSourceBuilder source,
+        int fetch,
+        boolean seqNoAndPrimaryTerm,
+        boolean resumed
+    ) {
+        Plan read = readsUnsorted(plan, resumed) ? plan.unsorted() : plan;
         List<Map<String, Object>> rows;
         if (splitsMissingTail(read)) {
             // The rows past a present first sort value come first; the
@@ -602,7 +601,24 @@ public final class InfinoSearch {
         return rows;
     }
 
+    /**
+     * The hits of one index for the request's window, each carrying its
+     * source, with the total. With {@code count} false an exact total is left
+     * for the caller, which reads it beside the aggregations (the page's total
+     * is then 0 until replaced).
+     */
     static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count) {
+        return page(index, plan, source, count, false);
+    }
+
+    /**
+     * As {@link #page(Index, Plan, SearchSourceBuilder, boolean)}, and with
+     * {@code resumed} when a later page resumes after this page's last hit
+     * from its sort values (a scroll's): those must then carry the row id
+     * the sort is broken by, so the page is read in its sort's order even
+     * when that sort orders nothing ({@link #sortsNothing}).
+     */
+    static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count, boolean resumed) {
         final int from = Math.max(0, source.from());
         final int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
         final int fetch = from + size;
@@ -662,7 +678,7 @@ public final class InfinoSearch {
             CountedRows read = countedRows(
                 countsFirst(source, count, scoredPage(plan)),
                 () -> total(plan),
-                () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm)
+                () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed)
             );
             rows = read.rows();
             counted = read.total();
@@ -880,15 +896,19 @@ public final class InfinoSearch {
     }
 
     /**
-     * Whether a search_after page is read in two parts: the rows past a
-     * present first sort value, then, only when those leave the page short,
-     * the rows missing that value. Missing values sort last, so the second
-     * part follows the first whole, and the first part is a plain range on
-     * the sort column, which the engine answers from its range index; one
-     * statement holding both would weigh {@code s < v OR s IS NULL} on every
-     * row. Not under a collapse, whose window ranks a value's rows across
-     * both parts.
+     * Whether the page is read as the unsorted search reads it: its sort
+     * orders nothing ({@link #sortsNothing}), so every hit's sort value is
+     * missing and the page is the predicate's rows in no order, as stock
+     * reads a sort on a field no document has. The hits still carry the
+     * sort. Not when a later page resumes from the hits' sort values
+     * ({@code resumed}, a scroll): the unsorted read selects no row id, so
+     * every value would be missing and the keyset past them would keep no
+     * row; that page is read in the sort's order, the row id's.
      */
+    static boolean readsUnsorted(Plan plan, boolean resumed) {
+        return !resumed && sortsNothing(plan);
+    }
+
     /**
      * Whether the page's sort orders nothing: one field's own column, then
      * the row id, from the page's start, over a column no row of the table
@@ -914,6 +934,16 @@ public final class InfinoSearch {
         return present.length == 1 && present[0] == 0;
     }
 
+    /**
+     * Whether a search_after page is read in two parts: the rows past a
+     * present first sort value, then, only when those leave the page short,
+     * the rows missing that value. Missing values sort last, so the second
+     * part follows the first whole, and the first part is a plain range on
+     * the sort column, which the engine answers from its range index; one
+     * statement holding both would weigh {@code s < v OR s IS NULL} on every
+     * row. Not under a collapse, whose window ranks a value's rows across
+     * both parts.
+     */
     static boolean splitsMissingTail(Plan plan) {
         Object[] after = plan.searchAfter();
         return after != null
@@ -1526,7 +1556,8 @@ public final class InfinoSearch {
             // reads its total beside the aggregations rather than in a count of its own.
             boolean sharedTotal = !builders.isEmpty() && plan.vector() == null && plan.postWhere() == null && trackTotal(perIndex);
             boolean countWithAggs = sharedTotal && perIndex.size() == 0;
-            Page page = page(index, plan, perIndex, !countWithAggs);
+            // A scroll's next page resumes from this one's last hits (the cursor below).
+            Page page = page(index, plan, perIndex, !countWithAggs, after != null);
             if (!builders.isEmpty()) {
                 InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(index).evaluate(
                     builders,

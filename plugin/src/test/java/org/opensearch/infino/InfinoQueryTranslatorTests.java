@@ -225,6 +225,17 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(InfinoSearch.splitsMissingTail(afterPlan(null, null)));
     }
 
+    public void testAScrollPageIsReadInItsSortsOrder() {
+        // A page a later page resumes from (a scroll's) is read in its sort's
+        // order even when the sort orders nothing, so each hit carries the row
+        // id the next page resumes after: the column's presence is not counted.
+        InfinoSearch.Plan plan = afterPlan(null, null);
+        assertFalse(InfinoSearch.readsUnsorted(plan, true));
+        String hits = InfinoSearch.hitStatement(plan, 10, false);
+        assertTrue(hits, hits.contains("\"_id\" AS \"_id\""));
+        assertTrue(hits, hits.endsWith("ORDER BY \"status\" DESC NULLS LAST, \"_id\" ASC NULLS LAST LIMIT 10"));
+    }
+
     public void testTiesBreakByTheEngineRowId() {
         // Rows sharing the sort value are ordered by the engine's row id, which
         // the engine answers from its range index; a page continuing from a row

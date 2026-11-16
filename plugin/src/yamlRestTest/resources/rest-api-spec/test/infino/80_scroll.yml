@@ -192,3 +192,49 @@
         index: rx2
         id: c1
   - match: { _source.n: 10 }
+
+---
+"Scroll: a sort on a field no document holds pages on past its first batch":
+  - do:
+      indices.create:
+        index: scr3
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              never: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: scr3, _id: "e1" }
+          - { tag: x }
+          - index: { _index: scr3, _id: "e2" }
+          - { tag: y }
+          - index: { _index: scr3, _id: "e3" }
+          - { tag: x }
+  - match: { errors: false }
+
+  # Every hit's sort value is missing; each batch still resumes after the last one's last hit.
+  - do:
+      search:
+        index: scr3
+        scroll: 1m
+        body: { size: 2, sort: [ { never: asc } ] }
+  - set: { _scroll_id: sid }
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0.sort: [ null ] }
+  - do:
+      scroll:
+        body: { scroll_id: $sid, scroll: 1m }
+  - length: { hits.hits: 1 }
+  - do:
+      scroll:
+        body: { scroll_id: $sid, scroll: 1m }
+  - length: { hits.hits: 0 }
+  - do:
+      clear_scroll:
+        body: { scroll_id: $sid }
+  - match: { succeeded: true }
