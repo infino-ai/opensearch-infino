@@ -570,7 +570,10 @@ public class InfinoEngine extends InternalEngine {
 
                 @Override
                 public void afterRefresh(boolean didRefresh) throws IOException {
-                    if (didRefresh) {
+                    // The reader a shard opens with was never opened by a refresh;
+                    // the first refresh that finds it still current covers it, or
+                    // a shard with no new writes would hide every stamped row.
+                    if (didRefresh || openedNone()) {
                         opened(version(), covering);
                     }
                 }
@@ -597,6 +600,10 @@ public class InfinoEngine extends InternalEngine {
                     }
                 }
             };
+        }
+
+        private synchronized boolean openedNone() {
+            return latestVersion < 0;
         }
 
         private synchronized void opened(long version, long cover) {

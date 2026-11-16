@@ -102,6 +102,25 @@ public class InfinoEngineTests extends OpenSearchTestCase {
         }
     }
 
+    public void testTheReaderAShardOpensWithIsCoveredByARefreshWithNoWrites() throws Exception {
+        try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, new IndexWriterConfig())) {
+            // Rows written before a restart: the shard opens a reader that already holds them.
+            for (int i = 0; i < 3; i++) {
+                writer.addDocument(new Document());
+            }
+            writer.commit();
+            Map<Long, Long> coveredByReader = new HashMap<>();
+            AtomicLong processed = new AtomicLong(2);
+            try (ReaderManager internal = new ReaderManager(writer); External external = new External(internal, coveredByReader)) {
+                record(internal, external, processed, coveredByReader);
+                long opened = version(external);
+                external.maybeRefreshBlocking();
+                assertEquals(opened, version(external));
+                assertEquals(Long.valueOf(2), coveredByReader.get(opened));
+            }
+        }
+    }
+
     public void testASearchDuringARefreshNeverMeetsAnUncoveredReader() throws Exception {
         try (Directory dir = newDirectory(); IndexWriter writer = new IndexWriter(dir, new IndexWriterConfig())) {
             Map<Long, Long> coveredByReader = new HashMap<>();
