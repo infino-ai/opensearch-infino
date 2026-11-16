@@ -1945,6 +1945,7 @@ pub unsafe extern "C" fn infino_index_batch(
                 }
             };
             flat.insert(OSID.into(), Value::String(osid.to_string()));
+            flat.remove(SOURCE);
             rows.push((i, flat));
             sources.push(source);
         }
@@ -2120,6 +2121,9 @@ unsafe fn prepare(
         .map(|(id, src, routing, seq, op)| {
             conform_doc(src, &schema, &kept, stamp.as_deref()).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
+                // A field named like the document column is the document's,
+                // kept in its residual: the column itself is rebuilt, never written.
+                flat.remove(SOURCE);
                 if !routing.is_empty() {
                     flat.insert(ROUTING.into(), Value::String((*routing).to_string()));
                 }
@@ -2194,28 +2198,42 @@ fn with_documents(
     let (skeleton_name, residual_name) = (skeleton_column(SOURCE), residual_column(SOURCE));
     for (value, shape) in values.iter_mut().zip(&shapes) {
         if let Value::Object(row) = value {
+            // The engine takes both stored columns or neither: a document with
+            // nothing in its residual carries it as null.
             row.insert(skeleton_name.clone(), Value::String(shape.skeleton.clone()));
-            if let Some(residual) = &shape.residual {
-                row.insert(residual_name.clone(), Value::String(residual.clone()));
-            }
+            row.insert(
+                residual_name.clone(),
+                shape.residual.clone().map_or(Value::Null, Value::String),
+            );
         }
     }
     let Some(batch) = batch else {
         return Ok(None);
     };
+    // The converted batch carries only the paths the rows held: the two
+    // stored columns are set where it has them and added where it does not.
+    let skeletons: Arc<dyn Array> = Arc::new(StringArray::from(
+        shapes.iter().map(|s| Some(s.skeleton.as_str())).collect::<Vec<_>>(),
+    ));
+    let residuals: Arc<dyn Array> = Arc::new(LargeStringArray::from(
+        shapes.iter().map(|s| s.residual.as_deref()).collect::<Vec<_>>(),
+    ));
     let schema = batch.schema();
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
     let mut columns = batch.columns().to_vec();
-    if let Ok(at) = schema.index_of(&skeleton_name) {
-        columns[at] = Arc::new(StringArray::from(
-            shapes.iter().map(|s| Some(s.skeleton.as_str())).collect::<Vec<_>>(),
-        ));
+    for (name, data_type, array) in [
+        (&skeleton_name, DataType::Utf8, skeletons),
+        (&residual_name, DataType::LargeUtf8, residuals),
+    ] {
+        match schema.index_of(name) {
+            Ok(at) => columns[at] = array,
+            Err(_) => {
+                fields.push(Field::new(name.as_str(), data_type, true));
+                columns.push(array);
+            }
+        }
     }
-    if let Ok(at) = schema.index_of(&residual_name) {
-        columns[at] = Arc::new(LargeStringArray::from(
-            shapes.iter().map(|s| s.residual.as_deref()).collect::<Vec<_>>(),
-        ));
-    }
-    RecordBatch::try_new(schema, columns)
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map(Some)
         .map_err(|e| format!("document columns: {e}"))
 }
