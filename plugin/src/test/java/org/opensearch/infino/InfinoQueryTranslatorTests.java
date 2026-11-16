@@ -190,6 +190,20 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
                 pagePlan(QueryBuilders.matchAllQuery(), java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true)))
             )
         );
+        // A should clause that keeps every row but ranks them is read in score order, not storage order.
+        BoolQueryBuilder ranked = QueryBuilders.boolQuery().should(QueryBuilders.termQuery("level", "error")).minimumShouldMatch(0);
+        InfinoSearch.Plan rankedPlan = pagePlan(ranked, java.util.List.of());
+        assertEquals(InfinoQueryTranslator.ALL, rankedPlan.hitWhere());
+        assertTrue(rankedPlan.query().scoring().reorders());
+        assertFalse(InfinoSearch.everyRowPage(rankedPlan));
+        assertFalse(
+            InfinoSearch.everyRowPage(
+                pagePlan(
+                    QueryBuilders.boolQuery().must(QueryBuilders.matchAllQuery()).should(QueryBuilders.termQuery("level", "error")),
+                    java.util.List.of()
+                )
+            )
+        );
     }
 
     public void testASortedPageReadsItsSourcesAfterTheSort() {
