@@ -114,6 +114,13 @@ public final class InfinoNative {
     private static final String USE_SIMILARITY = "use_similarity";
     /** The count's key in {@link #valueCounts}'s rows, as the engine names it. */
     static final String VALUE_COUNT = "count(*)";
+
+    /**
+     * Experiment: every call the engine answers without a statement
+     * (sorted, sorted where, head, count where, value counts) is a SQL
+     * statement instead, to measure the SQL paths against those calls.
+     */
+    static final boolean SQL_ONLY = Boolean.parseBoolean(System.getProperty("infino.sql_only", "true"));
     /** How long a prefetched source waits for its fetch phase. */
     private static final TimeValue SOURCE_PREFETCH_TTL = TimeValue.timeValueSeconds(30);
     /** Bytes of prefetched sources held at once across requests. */
@@ -1122,6 +1129,9 @@ public final class InfinoNative {
      * the column has no range index, which the sorted search needs.
      */
     public static List<Map<String, Object>> sortedRows(String n, String column, boolean desc, int k, boolean withSource) {
+        if (SQL_ONLY) {
+            return null;
+        }
         init();
         String out = takeOrThrow(lib.infino_sorted(conn, n, column, desc ? 1 : 0, k, withSource ? 1 : 0)).trim();
         log.debug("[infino] sorted: {} {} {} k={} -> {} chars", n, column, desc ? "desc" : "asc", k, out.length());
@@ -1142,6 +1152,9 @@ public final class InfinoNative {
      * read in order to fill the page within a few thousand.
      */
     public static List<Map<String, Object>> sortedRowsWhere(String n, String column, String predicate, boolean desc, int k, boolean withSource) {
+        if (SQL_ONLY) {
+            return null;
+        }
         init();
         String out = takeOrThrow(lib.infino_sorted_where(conn, n, column, predicate, desc ? 1 : 0, k, withSource ? 1 : 0)).trim();
         log.debug("[infino] sorted where: {} {} {} {} k={} -> {} chars", n, column, predicate, desc ? "desc" : "asc", k, out.length());
@@ -1161,6 +1174,22 @@ public final class InfinoNative {
      * from its range index with no statement, and runs one aggregate otherwise.
      */
     public static long[] countWhere(String n, List<String> predicates) {
+        if (SQL_ONLY) {
+            if (predicates.isEmpty()) {
+                return new long[0];
+            }
+            StringBuilder q = new StringBuilder("SELECT ");
+            for (int i = 0; i < predicates.size(); i++) {
+                q.append(i == 0 ? "" : ", ").append("COUNT(*) FILTER (WHERE ").append(predicates.get(i)).append(") AS c").append(i);
+            }
+            q.append(" FROM ").append(InfinoQueryTranslator.quoteIdent(n));
+            Map<String, Object> row = sqlRows(q.toString()).get(0);
+            long[] counts = new long[predicates.size()];
+            for (int i = 0; i < counts.length; i++) {
+                counts[i] = ((Number) row.get("c" + i)).longValue();
+            }
+            return counts;
+        }
         init();
         String out = takeOrThrow(lib.infino_count_where(conn, n, jsonArray(predicates)));
         try (XContentParser parser = parser(out)) {
@@ -1197,6 +1226,9 @@ public final class InfinoNative {
      * caller to plan the statement.
      */
     public static List<Map<String, Object>> headRows(String n, int k, boolean withSource) {
+        if (SQL_ONLY) {
+            return null;
+        }
         init();
         String out = takeOrThrow(lib.infino_head(conn, n, k, withSource ? 1 : 0)).trim();
         log.debug("[infino] head: {} k={} -> {} chars", n, k, out.length());
@@ -1211,6 +1243,13 @@ public final class InfinoNative {
      * count otherwise. Null when there are more than {@code maxRows}.
      */
     public static List<Map<String, Object>> valueCounts(String n, String column, int maxRows) {
+        if (SQL_ONLY) {
+            String c = InfinoQueryTranslator.quoteIdent(column);
+            List<Map<String, Object>> rows = sqlRows(
+                "SELECT " + c + " AS " + c + ", COUNT(*) AS " + InfinoQueryTranslator.quoteIdent(VALUE_COUNT) + " FROM " + InfinoQueryTranslator.quoteIdent(n) + " GROUP BY " + c + " LIMIT " + (maxRows + 1)
+            );
+            return rows.size() > maxRows ? null : rows;
+        }
         init();
         String out = takeOrThrow(lib.infino_value_counts(conn, n, column, maxRows)).trim();
         return out.equals("null") ? null : rows(out);
