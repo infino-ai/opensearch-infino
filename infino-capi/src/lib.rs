@@ -2225,7 +2225,9 @@ fn with_documents(
     let shapes: Vec<skeleton::Shape> = drafts
         .par_iter()
         .enumerate()
-        .map(|(j, draft)| skeleton::shape(draft, j, batch.as_ref(), table_schema))
+        .map_init(skeleton::Lookups::default, |lookups, (j, draft)| {
+            skeleton::shape(draft, j, batch.as_ref(), table_schema, lookups)
+        })
         .collect();
     let (skeleton_name, residual_name) = (skeleton_column(SOURCE), residual_column(SOURCE));
     for (value, shape) in values.iter_mut().zip(&shapes) {

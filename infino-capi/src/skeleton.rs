@@ -21,30 +21,31 @@
 //! Otherwise the value goes to the residual as written.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use infino::arrow_array::{Array, RecordBatch};
 use infino::arrow_schema::DataType;
 use infino::document::{render_value, residual, Slot};
 use infino::serde_json::{self, Map, Number, Value};
-use infino::TableSchema;
+use infino::{FieldId, TableSchema};
 
 use crate::LIST_SUFFIX;
 
-/// A parsed document's skeleton before its slots are known.
+/// A parsed document's skeleton before its slots are known: its compact
+/// text with a hole where each scalar goes, the scalars' raw texts in one
+/// buffer, and the document's distinct paths, numbered.
 pub(crate) struct Draft {
-    /// Compact text pieces, and where each scalar goes, in order.
-    pieces: Vec<Piece>,
+    text: String,
+    /// `(offset in text, scalar)` of each hole, in order.
+    holes: Vec<(usize, u32)>,
     scalars: Vec<Scalar>,
-}
-
-enum Piece {
-    Text(String),
-    Scalar(usize),
+    raws: String,
+    paths: Vec<String>,
 }
 
 struct Scalar {
-    path: String,
-    raw: String,
+    path: u16,
+    raw: Range<usize>,
     kind: Kind,
 }
 
@@ -66,6 +67,37 @@ pub(crate) struct Shape {
     pub(crate) residual: Option<String>,
 }
 
+/// Where a path's values are stored in a batch: its own column and its list
+/// column (`path[]`), each with the column's index in the batch and field id
+/// in the table, looked up once per batch.
+#[derive(Clone, Copy, Default)]
+struct Columns {
+    own: Option<(usize, FieldId)>,
+    list: Option<(usize, FieldId)>,
+}
+
+/// The column lookups of one batch, shared by its documents (one per thread).
+#[derive(Default)]
+pub(crate) struct Lookups(HashMap<String, Columns>);
+
+impl Lookups {
+    fn of(&mut self, path: &str, batch: &RecordBatch, schema: &TableSchema) -> Columns {
+        if let Some(found) = self.0.get(path) {
+            return *found;
+        }
+        let at = |name: &str| {
+            let index = batch.schema().index_of(name).ok()?;
+            Some((index, schema.id_of(name)?))
+        };
+        let found = Columns {
+            own: at(path),
+            list: at(&format!("{path}{LIST_SUFFIX}")),
+        };
+        self.0.insert(path.to_owned(), found);
+        found
+    }
+}
+
 /// Parse `source` once: its value (the object `flatten` reads) and its draft
 /// skeleton.
 pub(crate) fn parse(source: &str) -> Result<(Value, Draft), String> {
@@ -73,32 +105,40 @@ pub(crate) fn parse(source: &str) -> Result<(Value, Draft), String> {
         bytes: source.as_bytes(),
         at: 0,
         draft: Draft {
-            pieces: Vec::new(),
+            text: String::with_capacity(source.len() / 2),
+            holes: Vec::new(),
             scalars: Vec::new(),
+            raws: String::with_capacity(source.len() / 2),
+            paths: Vec::new(),
         },
-        text: String::with_capacity(source.len() / 2),
+        path: String::new(),
     };
     p.ws();
-    let value = p.value("")?;
+    let value = p.value()?;
     p.ws();
     if p.at != p.bytes.len() {
         return Err("malformed JSON: text after the value".into());
     }
-    p.flush();
     Ok((value, p.draft))
 }
 
 /// The shape of the document `draft` was parsed from, stored as row `row` of
 /// `batch`. With no batch (the rows could not be converted) every value is
 /// kept in the residual, so the document still rebuilds exactly.
-pub(crate) fn shape(draft: &Draft, row: usize, batch: Option<&RecordBatch>, schema: &TableSchema) -> Shape {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+pub(crate) fn shape(
+    draft: &Draft,
+    row: usize,
+    batch: Option<&RecordBatch>,
+    schema: &TableSchema,
+    lookups: &mut Lookups,
+) -> Shape {
+    let mut counts = vec![0u32; draft.paths.len()];
     for s in &draft.scalars {
         if s.kind != Kind::Null {
-            *counts.entry(s.path.as_str()).or_insert(0) += 1;
+            counts[s.path as usize] += 1;
         }
     }
-    let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut seen = vec![0u32; draft.paths.len()];
     let mut slots: Vec<Option<Slot>> = Vec::with_capacity(draft.scalars.len());
     let mut kept: Vec<&str> = Vec::new();
     for s in &draft.scalars {
@@ -106,56 +146,74 @@ pub(crate) fn shape(draft: &Draft, row: usize, batch: Option<&RecordBatch>, sche
             slots.push(None);
             continue;
         }
-        let k = {
-            let n = seen.entry(s.path.as_str()).or_insert(0);
-            *n += 1;
-            *n - 1
-        };
-        let many = counts.get(s.path.as_str()).copied().unwrap_or(0) > 1;
-        match batch.and_then(|b| locate(b, schema, s, k, many, row)) {
+        let k = seen[s.path as usize] as usize;
+        seen[s.path as usize] += 1;
+        let many = counts[s.path as usize] > 1;
+        let raw = &draft.raws[s.raw.clone()];
+        let slot = batch.and_then(|b| {
+            let columns = lookups.of(&draft.paths[s.path as usize], b, schema);
+            locate(b, columns, s.kind, raw, k, many, row)
+        });
+        match slot {
             Some(slot) => slots.push(Some(slot)),
             None => {
-                kept.push(s.raw.as_str());
+                kept.push(raw);
                 slots.push(Some(Slot::Residual(kept.len() - 1)));
             }
         }
     }
-    let mut skeleton = String::new();
-    for piece in &draft.pieces {
-        match piece {
-            Piece::Text(text) => skeleton.push_str(text),
-            Piece::Scalar(i) => match slots[*i] {
-                Some(slot) => skeleton.push_str(&slot.to_string()),
-                None => skeleton.push_str(&draft.scalars[*i].raw),
-            },
+    let mut skeleton = String::with_capacity(draft.text.len() + draft.holes.len() * 4);
+    let mut from = 0;
+    for &(at, i) in &draft.holes {
+        skeleton.push_str(&draft.text[from..at]);
+        match slots[i as usize] {
+            Some(slot) => {
+                use std::fmt::Write;
+                let _ = write!(skeleton, "{slot}");
+            }
+            None => skeleton.push_str(&draft.raws[draft.scalars[i as usize].raw.clone()]),
         }
+        from = at;
     }
+    skeleton.push_str(&draft.text[from..]);
     let residual = (!kept.is_empty()).then(|| residual(kept.iter().copied()));
     Shape { skeleton, residual }
 }
 
 /// The slot of the `k`-th value of its path in row `row`, when the stored
 /// value is exactly what the document wrote.
-fn locate(batch: &RecordBatch, schema: &TableSchema, s: &Scalar, k: usize, many: bool, row: usize) -> Option<Slot> {
-    let list = format!("{}{LIST_SUFFIX}", s.path);
-    for (name, is_list_column) in [(list.as_str(), true), (s.path.as_str(), false)] {
-        let Some(array) = batch.column_by_name(name) else {
-            continue;
-        };
+fn locate(
+    batch: &RecordBatch,
+    columns: Columns,
+    kind: Kind,
+    raw: &str,
+    k: usize,
+    many: bool,
+    row: usize,
+) -> Option<Slot> {
+    // Several values: the list column, element k; or the path's own column
+    // when the engine typed it a list. One value: the path's own column, or
+    // its first element when that column is a list.
+    let candidates: [Option<(usize, FieldId, bool)>; 2] = if many {
+        [columns.list.map(|(i, f)| (i, f, true)), columns.own.map(|(i, f)| (i, f, false))]
+    } else {
+        [columns.own.map(|(i, f)| (i, f, false)), None]
+    };
+    for (index, field, is_list_column) in candidates.into_iter().flatten() {
+        let array = batch.column(index);
         let listed = is_list_column || matches!(array.data_type(), DataType::List(_) | DataType::LargeList(_));
         let (slot, element) = match (many, listed) {
-            (true, true) => (Slot::Element(schema.id_of(name)?, k), Some(k)),
-            (false, false) => (Slot::Value(schema.id_of(name)?), None),
-            // One value in a column the engine typed a list: its first element.
-            (false, true) if !is_list_column => (Slot::Element(schema.id_of(name)?, 0), Some(0)),
-            _ => continue,
+            (true, true) => (Slot::Element(field, k), Some(k)),
+            (false, false) => (Slot::Value(field), None),
+            (false, true) => (Slot::Element(field, 0), Some(0)),
+            (true, false) => continue,
         };
         let value_type = match array.data_type() {
             DataType::List(f) | DataType::LargeList(f) => f.data_type().clone(),
             other => other.clone(),
         };
         let as_written = matches!(
-            (s.kind, &value_type),
+            (kind, &value_type),
             (Kind::PlainString, DataType::LargeUtf8 | DataType::Utf8 | DataType::Utf8View)
                 | (Kind::Integer, DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8)
                 | (Kind::Bool, DataType::Boolean)
@@ -163,7 +221,7 @@ fn locate(batch: &RecordBatch, schema: &TableSchema, s: &Scalar, k: usize, many:
         if as_written && !array.is_null(row) {
             return Some(slot);
         }
-        if render_value(array.as_ref(), row, element).as_deref() == Some(s.raw.as_str()) {
+        if render_value(array.as_ref(), row, element).as_deref() == Some(raw) {
             return Some(slot);
         }
     }
@@ -174,17 +232,12 @@ struct Parser<'a> {
     bytes: &'a [u8],
     at: usize,
     draft: Draft,
-    /// Compact text not yet pushed as a piece.
-    text: String,
+    /// The path of the value being read, `.`-joined; extended and cut back
+    /// as objects are entered and left.
+    path: String,
 }
 
-impl Parser<'_> {
-    fn flush(&mut self) {
-        if !self.text.is_empty() {
-            self.draft.pieces.push(Piece::Text(std::mem::take(&mut self.text)));
-        }
-    }
-
+impl<'a> Parser<'a> {
     fn ws(&mut self) {
         while self.at < self.bytes.len() && matches!(self.bytes[self.at], b' ' | b'\t' | b'\n' | b'\r') {
             self.at += 1;
@@ -199,60 +252,80 @@ impl Parser<'_> {
         format!("malformed JSON: {what} at {}", self.at)
     }
 
-    fn raw(&self, start: usize) -> &str {
+    /// The input's text from `start` to here: borrowed from the input, not
+    /// the parser, so the parser can go on writing while it is held.
+    fn raw(&self, start: usize) -> &'a str {
+        let bytes: &'a [u8] = self.bytes;
         // The input is a &str and every token starts and ends on an ASCII byte.
-        std::str::from_utf8(&self.bytes[start..self.at]).unwrap_or("")
+        std::str::from_utf8(&bytes[start..self.at]).unwrap_or("")
     }
 
-    fn value(&mut self, path: &str) -> Result<Value, String> {
+    /// The number of the current path, numbering it when it is new.
+    fn path_id(&mut self) -> u16 {
+        let paths = &mut self.draft.paths;
+        match paths.iter().position(|p| *p == self.path) {
+            Some(i) => i as u16,
+            None => {
+                paths.push(self.path.clone());
+                (paths.len() - 1) as u16
+            }
+        }
+    }
+
+    fn value(&mut self) -> Result<Value, String> {
         match self.peek() {
-            Some(b'{') => self.object(path),
-            Some(b'[') => self.array(path),
-            Some(_) => self.scalar(path),
+            Some(b'{') => self.object(),
+            Some(b'[') => self.array(),
+            Some(_) => self.scalar(),
             None => Err(self.bad("value expected")),
         }
     }
 
-    fn object(&mut self, path: &str) -> Result<Value, String> {
+    fn object(&mut self) -> Result<Value, String> {
         self.at += 1;
-        self.text.push('{');
+        self.draft.text.push('{');
         let mut map = Map::new();
         self.ws();
         if self.peek() == Some(b'}') {
             self.at += 1;
-            self.text.push('}');
+            self.draft.text.push('}');
             return Ok(Value::Object(map));
         }
         loop {
             self.ws();
             let start = self.at;
             let escaped = self.string()?;
-            let raw_key = self.raw(start).to_owned();
+            let raw_key = self.raw(start);
             let key = if escaped {
-                serde_json::from_str::<String>(&raw_key).map_err(|e| format!("malformed JSON: {e}"))?
+                serde_json::from_str::<String>(raw_key).map_err(|e| format!("malformed JSON: {e}"))?
             } else {
                 raw_key[1..raw_key.len() - 1].to_owned()
             };
-            self.text.push_str(&raw_key);
-            self.text.push(':');
+            self.draft.text.push_str(raw_key);
+            self.draft.text.push(':');
             self.ws();
             if self.peek() != Some(b':') {
                 return Err(self.bad("':' expected"));
             }
             self.at += 1;
             self.ws();
-            let child = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
-            let value = self.value(&child)?;
-            map.insert(key, value);
+            let outer = self.path.len();
+            if outer > 0 {
+                self.path.push('.');
+            }
+            self.path.push_str(&key);
+            let value = self.value();
+            self.path.truncate(outer);
+            map.insert(key, value?);
             self.ws();
             match self.peek() {
                 Some(b',') => {
                     self.at += 1;
-                    self.text.push(',');
+                    self.draft.text.push(',');
                 }
                 Some(b'}') => {
                     self.at += 1;
-                    self.text.push('}');
+                    self.draft.text.push('}');
                     return Ok(Value::Object(map));
                 }
                 _ => return Err(self.bad("',' or '}' expected")),
@@ -261,28 +334,28 @@ impl Parser<'_> {
     }
 
     /// An array's entries keep the array's path, as `flatten` paths them.
-    fn array(&mut self, path: &str) -> Result<Value, String> {
+    fn array(&mut self) -> Result<Value, String> {
         self.at += 1;
-        self.text.push('[');
+        self.draft.text.push('[');
         let mut items = Vec::new();
         self.ws();
         if self.peek() == Some(b']') {
             self.at += 1;
-            self.text.push(']');
+            self.draft.text.push(']');
             return Ok(Value::Array(items));
         }
         loop {
             self.ws();
-            items.push(self.value(path)?);
+            items.push(self.value()?);
             self.ws();
             match self.peek() {
                 Some(b',') => {
                     self.at += 1;
-                    self.text.push(',');
+                    self.draft.text.push(',');
                 }
                 Some(b']') => {
                     self.at += 1;
-                    self.text.push(']');
+                    self.draft.text.push(']');
                     return Ok(Value::Array(items));
                 }
                 _ => return Err(self.bad("',' or ']' expected")),
@@ -315,7 +388,7 @@ impl Parser<'_> {
         Err(self.bad("unterminated string"))
     }
 
-    fn scalar(&mut self, path: &str) -> Result<Value, String> {
+    fn scalar(&mut self) -> Result<Value, String> {
         let start = self.at;
         let (value, kind) = if self.peek() == Some(b'"') {
             let escaped = self.string()?;
@@ -341,12 +414,15 @@ impl Parser<'_> {
                 _ => number(raw).ok_or_else(|| format!("malformed JSON: bad value {raw:?}"))?,
             }
         };
-        let raw = self.raw(start).to_owned();
-        self.flush();
-        self.draft.pieces.push(Piece::Scalar(self.draft.scalars.len()));
+        let path = self.path_id();
+        let from = self.draft.raws.len();
+        let raw_end = self.at;
+        self.draft.raws.push_str(std::str::from_utf8(&self.bytes[start..raw_end]).unwrap_or(""));
+        let index = self.draft.scalars.len() as u32;
+        self.draft.holes.push((self.draft.text.len(), index));
         self.draft.scalars.push(Scalar {
-            path: path.to_owned(),
-            raw,
+            path,
+            raw: from..self.draft.raws.len(),
             kind,
         });
         Ok(value)
@@ -459,7 +535,7 @@ mod tests {
         });
         let batch = infino::rows_to_batch(&[row], &table_schema).unwrap();
         let (_, draft) = parse(SHAPES).unwrap();
-        let shape = shape(&draft, 0, Some(&batch), &table_schema);
+        let shape = shape(&draft, 0, Some(&batch), &table_schema, &mut Lookups::default());
         // Every value a column holds is a slot; the rest are kept as written.
         assert!(!shape.skeleton.contains("PUT") && !shape.skeleton.contains("info"), "{}", shape.skeleton);
         assert!(shape.skeleton.contains(r#""http.method":#"#) && shape.skeleton.contains(r#""http":{"method":#"#), "{}", shape.skeleton);
@@ -486,7 +562,7 @@ mod tests {
         .unwrap();
         let schema = conn.schema("t").unwrap();
         let (_, draft) = parse(r#"{"a.b": 1, "c": {"d": ["x", null, {}], "e": []}, "f": null}"#).unwrap();
-        let shape = shape(&draft, 0, None, &schema);
+        let shape = shape(&draft, 0, None, &schema, &mut Lookups::default());
         assert_eq!(shape.skeleton, r#"{"a.b":#r0,"c":{"d":[#r1,null,{}],"e":[]},"f":null}"#);
         assert_eq!(shape.residual.as_deref(), Some(r#"[1,"x"]"#));
     }
