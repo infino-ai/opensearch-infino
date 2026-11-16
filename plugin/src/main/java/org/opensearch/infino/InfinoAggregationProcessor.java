@@ -1313,7 +1313,8 @@ public class InfinoAggregationProcessor {
         final int size;
         final List<SortSpec> sorts;
         final FetchSourceContext source;
-        final List<FieldAndFormat> fields;
+        final List<FieldAndFormat> docValueFields;
+        final List<FieldAndFormat> fetchFields;
         final Map<String, Column> cols;
         final InfinoAccess access;
 
@@ -1321,7 +1322,8 @@ public class InfinoAggregationProcessor {
             TopHitsAggregationBuilder b,
             List<SortSpec> sorts,
             FetchSourceContext source,
-            List<FieldAndFormat> fields,
+            List<FieldAndFormat> docValueFields,
+            List<FieldAndFormat> fetchFields,
             Map<String, Column> cols,
             InfinoAccess access
         ) {
@@ -1330,7 +1332,8 @@ public class InfinoAggregationProcessor {
             this.size = b.size() < 0 ? DEFAULT_TOP_HITS_SIZE : b.size();
             this.sorts = sorts;
             this.source = source;
-            this.fields = fields;
+            this.docValueFields = docValueFields;
+            this.fetchFields = fetchFields;
             this.cols = cols;
             this.access = access;
         }
@@ -1350,8 +1353,17 @@ public class InfinoAggregationProcessor {
             } catch (IllegalArgumentException e) {
                 throw new Unsupported("aggregation [" + b.getName() + "] " + e.getMessage());
             }
-            // docvalue_fields and fields are read from the hit's source; stored_fields adds nothing the source lacks.
-            return new TopHits(b, sorts, b.fetchSource(), InfinoSearch.requestedFields(b.docValueFields(), b.fetchFields()), cols, access);
+            // docvalue_fields and fields are read from the hit's source (see InfinoSearch.fillRequested);
+            // stored_fields adds nothing the source lacks.
+            return new TopHits(
+                b,
+                sorts,
+                b.fetchSource(),
+                InfinoSearch.requestedFields(b.docValueFields(), null),
+                InfinoSearch.requestedFields(null, b.fetchFields()),
+                cols,
+                access
+            );
         }
 
         /** The columns a hit row carries beyond the id and the source. */
@@ -1377,7 +1389,20 @@ public class InfinoAggregationProcessor {
 
         /** This aggregation over the bucket's rows (in order, at most {@link #fetch()} of them) and its row count; the hits name {@code index}. */
         InternalAggregation build(List<Map<String, Object>> rows, long bucketCount, Index index) {
-            return InfinoSearch.topHits((TopHitsAggregationBuilder) builder, from, size, sorts, source, fields, cols, access, rows, bucketCount, index);
+            return InfinoSearch.topHits(
+                (TopHitsAggregationBuilder) builder,
+                from,
+                size,
+                sorts,
+                source,
+                docValueFields,
+                fetchFields,
+                cols,
+                access,
+                rows,
+                bucketCount,
+                index
+            );
         }
 
         InternalAggregation empty() {

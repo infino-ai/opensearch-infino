@@ -22,9 +22,7 @@ import org.opensearch.common.regex.Regex;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateFormatters;
 import org.opensearch.common.util.BigArrays;
-import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
-import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.common.bytes.BytesArray;
@@ -32,7 +30,6 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
-import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
@@ -66,8 +63,6 @@ import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.search.sort.SortMode;
 import org.opensearch.search.sort.SortOrder;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -679,9 +674,11 @@ public final class InfinoSearch {
             total = rows.size();
         }
 
-        FetchSourceContext sourceFilter = sourceFilter(source.fetchSource());
         boolean withSource = returnsSource(source);
-        List<FieldAndFormat> fields = requestedFields(source.docValueFields(), source.fetchFields());
+        // What the mapping's _source keeps of each document: the table keeps it whole.
+        List<FieldAndFormat> docValueFields = requestedFields(source.docValueFields(), null);
+        List<FieldAndFormat> fetchFields = requestedFields(null, source.fetchFields());
+        InfinoMappingSource stored = withSource || !fetchFields.isEmpty() ? InfinoMappingSource.of(mapping(index)) : InfinoMappingSource.WHOLE;
         boolean version = Boolean.TRUE.equals(source.version());
         SearchShardTarget target = target(index);
         List<SearchHit> hits = new ArrayList<>();
@@ -732,15 +729,20 @@ public final class InfinoSearch {
                 );
                 h.setPrimaryTerm(InfinoDocumentVersion.PRIMARY_TERM);
             }
-            if (withSource || !fields.isEmpty()) {
+            if (withSource || !docValueFields.isEmpty() || !fetchFields.isEmpty()) {
                 String src = String.valueOf(row.get(InfinoQueryTranslator.SOURCE));
                 // The source as the user may see it: hidden fields gone, masked values hashed.
                 src = plan.access().read(id.toString(), src);
                 if (src != null && !src.isEmpty()) {
+                    // A disabled source is refused on the hits a response carries,
+                    // not here: the page holds every row up to the window's end.
                     if (withSource) {
-                        h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
+                        BytesReference shown = stored.shown(src, source.fetchSource());
+                        if (shown != null) {
+                            h.sourceRef(shown);
+                        }
                     }
-                    fillFields(h, src, fields, plan.cols());
+                    fillRequested(h, src, stored, docValueFields, fetchFields, plan.cols());
                 }
             }
             if (!plan.sorts().isEmpty()) {
@@ -1135,16 +1137,6 @@ public final class InfinoSearch {
         return upTo == null || upTo != SearchContext.TRACK_TOTAL_HITS_DISABLED;
     }
 
-    /** The source includes/excludes of {@code ctx}, or null when the source is returned whole (or not at all). */
-    private static FetchSourceContext sourceFilter(FetchSourceContext ctx) {
-        if (ctx == null || !ctx.fetchSource()) {
-            return null;
-        }
-        boolean includes = ctx.includes() != null && ctx.includes().length > 0;
-        boolean excludes = ctx.excludes() != null && ctx.excludes().length > 0;
-        return includes || excludes ? ctx : null;
-    }
-
     /** The index's mapping from the cluster state, or null when it cannot be read there. */
     private static MappingMetadata mapping(Index index) {
         ClusterService clusters = InfinoServices.clusterService();
@@ -1170,15 +1162,18 @@ public final class InfinoSearch {
         int size,
         List<SortSpec> sorts,
         FetchSourceContext fetchSource,
-        List<FieldAndFormat> fields,
+        List<FieldAndFormat> docValueFields,
+        List<FieldAndFormat> fetchFields,
         Map<String, Column> cols,
         InfinoAccess access,
         List<Map<String, Object>> rows,
         long bucketCount,
         Index index
     ) {
-        FetchSourceContext sourceFilter = sourceFilter(fetchSource);
         boolean withSource = fetchSource == null || fetchSource.fetchSource();
+        InfinoMappingSource stored = (withSource || !fetchFields.isEmpty()) && index != null
+            ? InfinoMappingSource.of(mapping(index))
+            : InfinoMappingSource.WHOLE;
         float score = sorts.isEmpty() ? 1.0f : Float.NaN;
         SearchShardTarget target = index == null ? null : target(index);
         List<SearchHit> hits = new ArrayList<>();
@@ -1192,13 +1187,18 @@ public final class InfinoSearch {
                 h.shard(target);
             }
             h.score(score);
-            if (withSource || !fields.isEmpty()) {
+            if (withSource || !docValueFields.isEmpty() || !fetchFields.isEmpty()) {
                 String src = access.read(id.toString(), String.valueOf(row.get(InfinoQueryTranslator.SOURCE)));
                 if (!src.isEmpty()) {
+                    // Stock's top_hits fetches each of its from + size hits on the shard.
+                    stored.refuse(index == null ? null : index.getName(), fetchSource, fetchFields);
                     if (withSource) {
-                        h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
+                        BytesReference shown = stored.shown(src, fetchSource);
+                        if (shown != null) {
+                            h.sourceRef(shown);
+                        }
                     }
-                    fillFields(h, src, fields, cols);
+                    fillRequested(h, src, stored, docValueFields, fetchFields, cols);
                 }
             }
             if (!sorts.isEmpty()) {
@@ -1241,19 +1241,42 @@ public final class InfinoSearch {
     }
 
     /**
-     * Each requested field on the hit under {@code fields}, read from the
-     * hit's source (the table holds what was sent, so a field's value is the
-     * source's value at that path): a date column in the requested format,
-     * else its mapping's, everything else as it is. A field alias carries the
-     * values of the field it names, as stock reads it. A missing path is left
-     * out, as stock does.
+     * The requested fields on the hit, as stock's fetch phase reads them:
+     * {@code docvalue_fields} from the document as it was indexed (the doc
+     * values hold every field, whatever the mapping's {@code _source}
+     * keeps), then {@code fields} from the source as the mapping keeps it,
+     * none when the mapping disables {@code _source} (the hits a response
+     * carries are refused then, see {@link InfinoMappingSource#refuse}). A
+     * field asked for both ways takes the {@code fields} value when the
+     * source holds it, as stock's fields phase runs after its doc values
+     * phase. A mapping that keeps the source whole reads it once for both.
      */
-    static void fillFields(SearchHit h, String src, List<FieldAndFormat> fields, Map<String, Column> cols) {
-        if (fields.isEmpty()) {
-            return;
+    static void fillRequested(
+        SearchHit h,
+        String src,
+        InfinoMappingSource stored,
+        List<FieldAndFormat> docValueFields,
+        List<FieldAndFormat> fetchFields,
+        Map<String, Column> cols
+    ) {
+        Map<String, Object> flat = docValueFields.isEmpty() ? null : flat(src);
+        if (flat != null) {
+            fillFields(h, flat, docValueFields, cols);
         }
-        Map<String, Object> flat = new LinkedHashMap<>();
-        flatten("", XContentHelper.convertToMap(new BytesArray(src), true, MediaTypeRegistry.JSON).v2(), flat);
+        if (!fetchFields.isEmpty() && stored.enabled()) {
+            fillFields(h, flat != null && stored.whole() ? flat : flat(stored.kept(src)), fetchFields, cols);
+        }
+    }
+
+    /**
+     * Each requested field on the hit under {@code fields}, read from the
+     * hit's source, given as its leaves by dotted path ({@link #flat}; the
+     * table holds what was sent, so a field's value is the source's value at
+     * that path): a date column in the requested format, else its mapping's,
+     * everything else as it is. A field alias carries the values of the field
+     * it names, as stock reads it. A missing path is left out, as stock does.
+     */
+    private static void fillFields(SearchHit h, Map<String, Object> flat, List<FieldAndFormat> fields, Map<String, Column> cols) {
         for (FieldAndFormat f : fields) {
             for (Map.Entry<String, Object> e : flat.entrySet()) {
                 if (Regex.simpleMatch(f.field, e.getKey())) {
@@ -1288,6 +1311,13 @@ public final class InfinoSearch {
             out.add(value);
         }
         return out;
+    }
+
+    /** The leaves of the source {@code src} by dotted path ({@link #flatten}). */
+    private static Map<String, Object> flat(String src) {
+        Map<String, Object> flat = new LinkedHashMap<>();
+        flatten("", XContentHelper.convertToMap(new BytesArray(src), true, MediaTypeRegistry.JSON).v2(), flat);
+        return flat;
     }
 
     /** The source's leaves by dotted path; a list of scalars stays one value. */
@@ -1331,16 +1361,6 @@ public final class InfinoSearch {
             return printer.format(at.atZone(ZoneOffset.UTC));
         } catch (RuntimeException e) {
             return v;
-        }
-    }
-
-    static BytesReference filtered(String src, FetchSourceContext filter) {
-        Map<String, Object> map = XContentHelper.convertToMap(new BytesArray(src), true, MediaTypeRegistry.JSON).v2();
-        try (XContentBuilder b = XContentFactory.jsonBuilder()) {
-            b.map(XContentMapValues.filter(map, filter.includes(), filter.excludes()));
-            return BytesReference.bytes(b);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
         }
     }
 
@@ -1486,6 +1506,7 @@ public final class InfinoSearch {
             pages.add(page);
         }
         SearchHits hits = merge(pages, source, sorts, total);
+        refuse(indices, hits, source);
         Map<Index, Object[]> cursor = null;
         if (after != null) {
             // Where each index stopped: the sort values of its last hit on this
@@ -1525,6 +1546,23 @@ public final class InfinoSearch {
             SearchResponse.Clusters.EMPTY
         );
         return new Searched(response, cursor);
+    }
+
+    /**
+     * Refuses the response when one of its {@code hits} is of an index whose
+     * mapping disables {@code _source} and {@code source} filters the source
+     * or asks for {@code fields} ({@link InfinoMappingSource#refuse}): only
+     * the hits the window keeps, as stock's fetch phase fetches only those.
+     */
+    private static void refuse(List<Index> indices, SearchHits hits, SearchSourceBuilder source) {
+        List<FieldAndFormat> fetchFields = requestedFields(null, source.fetchFields());
+        for (SearchHit h : hits.getHits()) {
+            for (Index index : indices) {
+                if (index.getName().equals(h.getIndex())) {
+                    InfinoMappingSource.of(mapping(index)).refuse(index.getName(), source.fetchSource(), fetchFields);
+                }
+            }
+        }
     }
 
     /**
