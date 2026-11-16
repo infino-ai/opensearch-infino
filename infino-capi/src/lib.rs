@@ -3106,7 +3106,9 @@ pub unsafe extern "C" fn infino_sorted(
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name), Some(column)) =
-            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(column) })
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(column)
+            })
         else {
             return ptr::null_mut();
         };
@@ -3128,7 +3130,12 @@ pub unsafe extern "C" fn infino_sorted(
             Err(e) => return err_json(&e.to_string()),
         };
         let projection = [OSID, ROW_ID, column];
-        match table.sorted_search(column, descending != 0, k.max(0) as usize, Some(&projection[..])) {
+        match table.sorted_search(
+            column,
+            descending != 0,
+            k.max(0) as usize,
+            Some(&projection[..]),
+        ) {
             // The engine fixes every row's `score` at zero; a sorted hit has none.
             Ok(b) => out_string(batches_to_json(&without_column(&b, SORTED_SCORE))),
             Err(e) => err_json(&e.to_string()),
@@ -5320,27 +5327,42 @@ mod tests {
     /// no sources; a field named `score`, and any field on a hosted connection, is left to
     /// the hit statement (`null`) before any schema is read.
     #[test]
-    fn a_sorted_page_carries_its_values_and_a_score_field_or_a_hosted_connection_is_left_to_the_statement() {
+    fn a_sorted_page_carries_its_values_and_a_score_field_or_a_hosted_connection_is_left_to_the_statement(
+    ) {
         let h = open_logs();
         let scored = r#"{"properties":{"score":{"type":"long"},"status":{"type":"long"}}}"#;
         take(unsafe { infino_ensure_table(h, c("scored").as_ptr(), c(scored).as_ptr()) });
-        let ids = [c("a"), c("b")];
-        let srcs = [c(r#"{"score":2,"status":20}"#), c(r#"{"score":1,"status":10}"#)];
+        // `c` has no `status`, so only two of the three rows have a value:
+        // the range indexes cannot answer the page and the engine plans its
+        // statement.
+        let ids = [c("a"), c("b"), c("c")];
+        let srcs = [
+            c(r#"{"score":2,"status":20}"#),
+            c(r#"{"score":1,"status":10}"#),
+            c(r#"{"score":3}"#),
+        ];
         let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
         let sp: Vec<*const c_char> = srcs.iter().map(|x| x.as_ptr()).collect();
-        take(unsafe { infino_index_batch(h, c("scored").as_ptr(), idp.as_ptr(), sp.as_ptr(), 2) });
-        let sorted = |column: &str| {
+        take(unsafe { infino_index_batch(h, c("scored").as_ptr(), idp.as_ptr(), sp.as_ptr(), 3) });
+        let sorted = move |column: &str| {
             take(unsafe { infino_sorted(h, c("scored").as_ptr(), c(column).as_ptr(), 0, 10) })
         };
         let page: Value = serde_json::from_str(&sorted("status")).unwrap();
         let rows = page.as_array().unwrap_or_else(|| panic!("{page}"));
-        let got: Vec<(String, i64)> = rows
+        let got: Vec<(String, Option<i64>)> = rows
             .iter()
-            .map(|r| (r[OSID].as_str().unwrap().to_string(), r["status"].as_i64().unwrap()))
+            .map(|r| (r[OSID].as_str().unwrap().to_string(), r["status"].as_i64()))
             .collect();
-        assert_eq!(got, [("b".to_string(), 10), ("a".to_string(), 20)]);
-        // Fewer rows than k, so the engine planned the page's statement; the
-        // sources are still left to the caller's lookup by `osid`.
+        assert_eq!(
+            got,
+            [
+                ("b".to_string(), Some(10)),
+                ("a".to_string(), Some(20)),
+                ("c".to_string(), None)
+            ]
+        );
+        // The statement's page still leaves the sources to the caller's
+        // lookup by `osid`.
         assert!(rows.iter().all(|r| r.get(SOURCE).is_none()), "{page}");
         assert_eq!(sorted("score"), "null");
         unsafe { (*h).hosted = true };

@@ -377,3 +377,44 @@
   - match: { hits.hits.0.sort.0: 2 }
   - match: { hits.hits.1._id: b }
   - match: { hits.hits.1.sort.0: 1 }
+
+---
+"A sorted proxy-mode page with seq_no_primary_term carries each document's own sequence number":
+  # The range index holds no sequence numbers, so such a page is left to the
+  # hit statement, which reads them from the table.
+  - do:
+      indices.create:
+        index: seqno_sorted_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              rank: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: seqno_sorted_proxy, _id: a }
+          - { rank: 1 }
+          - index: { _index: seqno_sorted_proxy, _id: b }
+          - { rank: 2 }
+          - index: { _index: seqno_sorted_proxy, _id: c }
+          - { rank: 3 }
+  - match: { errors: false }
+  - set: { items.0.index._seq_no: seq_a }
+  - set: { items.1.index._seq_no: seq_b }
+  - set: { items.2.index._seq_no: seq_c }
+  - set: { items.2.index._primary_term: term_c }
+
+  - do:
+      search:
+        index: seqno_sorted_proxy
+        body: { sort: [ { rank: desc } ], seq_no_primary_term: true }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: c }
+  - match: { hits.hits.0._seq_no: $seq_c }
+  - match: { hits.hits.0._primary_term: $term_c }
+  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.1._seq_no: $seq_b }
+  - match: { hits.hits.2._id: a }
+  - match: { hits.hits.2._seq_no: $seq_a }
