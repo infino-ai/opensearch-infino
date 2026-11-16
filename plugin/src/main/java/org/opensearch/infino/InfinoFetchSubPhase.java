@@ -41,6 +41,10 @@ public class InfinoFetchSubPhase implements FetchSubPhase {
         String table = InfinoPlugin.tables().ensure(context.getIndexSettings().getIndexMetadata(), shardId.id());
         SearchSourceBuilder written = carried.source();
         long now = carried.nowMillis();
+        // The query phase built every row up to the window's end; a disabled
+        // _source is refused here, on the hits the coordinating node fetches.
+        InfinoMappingSource stored = InfinoMappingSource.of(context.getIndexSettings().getIndexMetadata().mapping());
+        List<FieldAndFormat> fetchFields = InfinoSearch.requestedFields(null, written.fetchFields());
         return new FetchSubPhaseProcessor() {
             @Override
             public void setNextReader(LeafReaderContext readerContext) {
@@ -53,6 +57,7 @@ public class InfinoFetchSubPhase implements FetchSubPhase {
                 if (id == null) {
                     return;
                 }
+                stored.refuse(shardId.getIndexName(), written.fetchSource(), fetchFields);
                 SearchHit kept = InfinoQueryPhaseSearcher.take(carried.request(), shardId, id);
                 if (kept == null) {
                     kept = reread(table, shardId, id, written, now);

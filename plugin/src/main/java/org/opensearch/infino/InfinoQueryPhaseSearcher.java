@@ -241,7 +241,13 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         }
         boolean sorted = !plan.sorts().isEmpty();
         boolean collapsed = plan.collapse() != null;
-        SortField[] sortFields = sorted ? sortFields(plan.sorts()) : collapsed ? new SortField[] { SortField.FIELD_SCORE } : null;
+        // A request sorted by the score ascending, least first: the shards'
+        // hits merge by the score reversed, as stock's sorted top docs carry it.
+        boolean scoreAscending = !sorted && !collapsed && InfinoSearch.sortsByScoreAscending(source);
+        SortField[] sortFields = sorted ? sortFields(plan.sorts())
+            : collapsed ? new SortField[] { SortField.FIELD_SCORE }
+            : scoreAscending ? new SortField[] { SCORE_ASCENDING }
+            : null;
         List<ScoreDoc> docs = new ArrayList<>(rows.size());
         List<Object> collapseValues = new ArrayList<>();
         for (SearchHit h : rows) {
@@ -253,7 +259,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             float score = Float.isNaN(h.getScore()) && !sorted ? 1.0f : h.getScore();
             if (sorted) {
                 docs.add(new FieldDoc(doc, score, sortValues(h.getSortValues(), plan.sorts())));
-            } else if (collapsed) {
+            } else if (collapsed || scoreAscending) {
                 docs.add(new FieldDoc(doc, score, new Object[] { score }));
             } else {
                 docs.add(new ScoreDoc(doc, score));
@@ -272,7 +278,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
                 sortFields,
                 collapseValues.toArray()
             );
-        } else if (sorted) {
+        } else if (sorted || scoreAscending) {
             topDocs = new TopFieldDocs(totalHits, docs.toArray(new FieldDoc[0]), sortFields);
         } else {
             topDocs = new TopDocs(totalHits, docs.toArray(new ScoreDoc[0]));
@@ -434,6 +440,9 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
      * table's values compare, each in its direction with missing values
      * last (or first under {@code missing: _first}), as the plan orders them.
      */
+    /** The score, least first: a {@code _score} sort ascending. */
+    private static final SortField SCORE_ASCENDING = new SortField(null, SortField.Type.SCORE, true);
+
     private static SortField[] sortFields(List<SortSpec> sorts) {
         SortField[] out = new SortField[sorts.size()];
         for (int i = 0; i < out.length; i++) {
