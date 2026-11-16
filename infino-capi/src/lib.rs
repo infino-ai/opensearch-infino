@@ -3083,10 +3083,12 @@ const SORTED_SCORE: &str = "score";
 
 /// The table's first `k` rows by `column`, ascending or (`descending`
 /// non-zero) descending, rows sharing a value in row id order and rows
-/// without one last, each carrying `osid`, `_id`, the column and, when
-/// `with_source` is non-zero, `source`: the page a search that keeps every
-/// row asks for when it sorts on one field, in one call. The sources are
-/// read by row id along with the page, not looked up by `osid` afterwards.
+/// without one last, each carrying `osid`, `_id` and the column: the page a
+/// search that keeps every row asks for when it sorts on one field, in one
+/// call. No `source`: the caller looks the page's sources up by `osid`
+/// afterwards. Asked for one, the engine would carry it into the statement
+/// it plans when fewer than `k` rows have a value, and read every row's
+/// source rather than the page's.
 /// `null` when the column has no range index: the engine's sorted search
 /// serves only a range-indexed column, and the caller plans the statement.
 /// Also `null`, with no schema read, on a hosted connection (whose sorted
@@ -3101,7 +3103,6 @@ pub unsafe extern "C" fn infino_sorted(
     column: *const c_char,
     descending: c_int,
     k: c_int,
-    with_source: c_int,
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name), Some(column)) =
@@ -3126,9 +3127,8 @@ pub unsafe extern "C" fn infino_sorted(
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
-        let with = [OSID, ROW_ID, column, SOURCE];
-        let projection = if with_source != 0 { &with[..] } else { &with[..3] };
-        match table.sorted_search(column, descending != 0, k.max(0) as usize, Some(projection)) {
+        let projection = [OSID, ROW_ID, column];
+        match table.sorted_search(column, descending != 0, k.max(0) as usize, Some(&projection[..])) {
             // The engine fixes every row's `score` at zero; a sorted hit has none.
             Ok(b) => out_string(batches_to_json(&without_column(&b, SORTED_SCORE))),
             Err(e) => err_json(&e.to_string()),
@@ -5391,8 +5391,8 @@ mod tests {
         assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, None).is_ok());
     }
 
-    /// A sorted page on a range-indexed field carries the field's values; a
-    /// field named `score`, and any field on a hosted connection, is left to
+    /// A sorted page on a range-indexed field carries the field's values and
+    /// no sources; a field named `score`, and any field on a hosted connection, is left to
     /// the hit statement (`null`) before any schema is read.
     #[test]
     fn a_sorted_page_carries_its_values_and_a_score_field_or_a_hosted_connection_is_left_to_the_statement() {
@@ -5405,7 +5405,7 @@ mod tests {
         let sp: Vec<*const c_char> = srcs.iter().map(|x| x.as_ptr()).collect();
         take(unsafe { infino_index_batch(h, c("scored").as_ptr(), idp.as_ptr(), sp.as_ptr(), 2) });
         let sorted = |column: &str| {
-            take(unsafe { infino_sorted(h, c("scored").as_ptr(), c(column).as_ptr(), 0, 10, 0) })
+            take(unsafe { infino_sorted(h, c("scored").as_ptr(), c(column).as_ptr(), 0, 10) })
         };
         let page: Value = serde_json::from_str(&sorted("status")).unwrap();
         let rows = page.as_array().unwrap_or_else(|| panic!("{page}"));
@@ -5414,6 +5414,9 @@ mod tests {
             .map(|r| (r[OSID].as_str().unwrap().to_string(), r["status"].as_i64().unwrap()))
             .collect();
         assert_eq!(got, [("b".to_string(), 10), ("a".to_string(), 20)]);
+        // Fewer rows than k, so the engine planned the page's statement; the
+        // sources are still left to the caller's lookup by `osid`.
+        assert!(rows.iter().all(|r| r.get(SOURCE).is_none()), "{page}");
         assert_eq!(sorted("score"), "null");
         let after_score = take(unsafe {
             infino_sorted_where(h, c("scored").as_ptr(), c("score").as_ptr(), c("score > 1").as_ptr(), 0, 10, 0)
