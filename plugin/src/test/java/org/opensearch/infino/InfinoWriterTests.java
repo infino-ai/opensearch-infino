@@ -17,6 +17,7 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -143,5 +144,32 @@ public class InfinoWriterTests extends OpenSearchTestCase {
 
         writer.submit("u", deletes(pending(), "x"));
         assertEquals("another table's ids are its own", 2, appendsStarted.get());
+    }
+
+    /**
+     * An append the write pool refuses answers its bulk with the refusal (a
+     * 429) and gives back its slot and the ids it named, so a later bulk
+     * naming them starts its own append. Before, the bulk was never answered,
+     * and its ids and slot stayed taken for good.
+     */
+    public void testAnAppendThePoolRefusesAnswersItsBulkAndFreesItsIdsAndSlot() {
+        AtomicInteger refusals = new AtomicInteger(1);
+        AtomicInteger appendsStarted = new AtomicInteger();
+        Executor pool = task -> {
+            if (refusals.getAndDecrement() > 0) {
+                throw new OpenSearchRejectedExecutionException("the write queue is full");
+            }
+            appendsStarted.incrementAndGet();
+        };
+        InfinoWriter writer = new InfinoWriter(() -> pool, 10, Long.MAX_VALUE, 1);
+
+        AtomicReference<Exception> refused = new AtomicReference<>();
+        writer.submit("t", deletes(ActionListener.wrap(r -> fail("a refused append answered as written"), refused::set), "x"));
+        Exception e = refused.get();
+        assertNotNull("the bulk whose append the pool refused was never answered", e);
+        assertEquals("the REST layer answers it with 429", RestStatus.TOO_MANY_REQUESTS, ExceptionsHelper.status(e));
+
+        writer.submit("t", deletes(pending(), "x"));
+        assertEquals("x and the table's only slot are free again", 1, appendsStarted.get());
     }
 }

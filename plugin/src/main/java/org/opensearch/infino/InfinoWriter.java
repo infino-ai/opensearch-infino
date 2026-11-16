@@ -29,8 +29,10 @@ import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -41,6 +43,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
@@ -317,8 +320,48 @@ public final class InfinoWriter {
                 );
             return;
         }
-        for (List<Staged> next : starts) {
-            flushes.get().execute(() -> flush(table, batch, next));
+        start(table, batch, starts);
+    }
+
+    /**
+     * Hand appends taken under the batch's lock to the write pool. An append
+     * the pool refuses (its queue is full, or the node is closing) answers
+     * its bulks with the refusal, a 429 for a full queue, and nothing of them
+     * is written; it gives back its slot and the ids it named, and the bulks
+     * it held back are taken as {@link #flush} takes them, so none is left
+     * staged with no append to take it.
+     */
+    private void start(String table, Batch batch, List<List<Staged>> appends) {
+        Deque<List<Staged>> pending = new ArrayDeque<>(appends);
+        while (!pending.isEmpty()) {
+            List<Staged> next = pending.poll();
+            try {
+                flushes.get().execute(() -> flush(table, batch, next));
+                continue;
+            } catch (RejectedExecutionException e) {
+                log.warn("[infino] the write pool refused an append of {} bulks to {}", next.size(), table, e);
+                for (Staged s : next) {
+                    if (s.prepared() != null) {
+                        InfinoNative.freePrepared(s.prepared());
+                    }
+                    s.waiter().listener().onFailure(e);
+                }
+            }
+            batch.lock.lock();
+            try {
+                release(batch, next);
+                batch.running--;
+                while (batch.running < maxAppends) {
+                    List<Staged> more = take(batch);
+                    if (more.isEmpty()) {
+                        break;
+                    }
+                    batch.running++;
+                    pending.add(more);
+                }
+            } finally {
+                batch.lock.unlock();
+            }
         }
     }
 
@@ -413,9 +456,7 @@ public final class InfinoWriter {
             } finally {
                 batch.lock.unlock();
             }
-            for (List<Staged> next : more) {
-                flushes.get().execute(() -> flush(table, batch, next));
-            }
+            start(table, batch, more);
             if (staged.isEmpty()) {
                 return;
             }
