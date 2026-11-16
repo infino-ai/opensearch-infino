@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class InfinoRegistryTests extends OpenSearchTestCase {
 
@@ -174,9 +175,58 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
         }
     }
 
+    public void testARegistryTableWhoseDeclarationFailedIsDeclaredAgainByTheNextWrite() {
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        StubBridge bridge = new StubBridge();
+        try {
+            // No pool for the registry: nothing retries on its own, the calls below write.
+            bind(clusterService, null, bridge);
+            IndexMetadata md = index("declared_late", "declared-late-uuid", 1);
+            bridge.declareFailing = true;
+            InfinoRegistry.record(md);
+            assertTrue(bridge.appended.isEmpty());
+            // The service takes the declaration now; the next write makes it again before writing.
+            bridge.declareFailing = false;
+            InfinoRegistry.record(md);
+            assertEquals(1, bridge.appended.size());
+            assertEquals(2, bridge.declarations.get());
+        } finally {
+            InfinoRegistry.forget("declared_late");
+            unbind(clusterService, threadPool);
+        }
+    }
+
+    public void testForgettingAnIndexDoesNotWaitOutTheReadWindowButTheNextWriteDoes() {
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        StubBridge bridge = new StubBridge();
+        TimeValue window = TimeValue.timeValueSeconds(1);
+        InfinoNative.readWindow(window);
+        try {
+            bind(clusterService, null, bridge);
+            // The registry table, written on the hosted service a moment ago.
+            long start = System.nanoTime();
+            InfinoNative.wrote(InfinoRegistry.TABLE, start);
+            // A delete reads nothing back; it runs on the cluster applier thread.
+            InfinoRegistry.forget("gone");
+            assertTrue(System.nanoTime() - start < window.nanos());
+            // A write reads the table back first (its rows under the id), so it waits.
+            InfinoRegistry.record(index("kept", "kept-uuid", 1));
+            assertEquals(1, bridge.appended.size());
+            assertTrue(System.nanoTime() - start >= window.nanos());
+        } finally {
+            InfinoNative.readWindow(InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY));
+            InfinoRegistry.forget("kept");
+            unbind(clusterService, threadPool);
+        }
+    }
+
+    /** Stand {@code bridge} in for the library, on a node that has not declared the registry table yet. */
     private static void bind(ClusterService clusterService, ThreadPool threadPool, StubBridge bridge) {
         InfinoServices.bind(clusterService, threadPool);
         InfinoNative.useLib(bridge.lib());
+        InfinoRegistry.undeclare();
     }
 
     private static void unbind(ClusterService clusterService, ThreadPool threadPool) {
@@ -205,10 +255,15 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
 
     /**
      * A bridge that answers the registry's calls, failing each write while
-     * {@link #failing}, and keeps the source of every row it appends.
+     * {@link #failing}, and keeps the source of every row it appends. Its
+     * table is read only once a declaration of it has succeeded; each
+     * declaration fails while {@link #declareFailing}.
      */
     private static final class StubBridge implements InvocationHandler {
         volatile boolean failing;
+        volatile boolean declareFailing;
+        final AtomicInteger declarations = new AtomicInteger();
+        private volatile boolean declared;
         volatile Runnable onAppend = () -> {};
         final List<String> appended = new CopyOnWriteArrayList<>();
         private volatile String prepared;
@@ -223,9 +278,17 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
                 case "infino_open_with":
                     return new Memory(1);
                 case "infino_ensure_table":
+                    declarations.incrementAndGet();
+                    if (declareFailing) {
+                        return string("{\"error\":\"the service is down\"}");
+                    }
+                    declared = true;
                     return string("{}");
                 case "infino_sql":
                     // The registry counts a row's copies before every write.
+                    if (declared == false) {
+                        return string("{\"error\":\"table os_index not found\"}");
+                    }
                     return string(failing ? "{\"error\":\"the service is down\"}" : "[{\"held\":0}]");
                 case "infino_prepare_batch": {
                     byte[] buf = (byte[]) args[2];

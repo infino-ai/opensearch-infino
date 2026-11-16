@@ -116,8 +116,10 @@ final class InfinoRegistry {
      * it for a moment, and the next try finds it.
      */
     private static final int WARN_AFTER_FAILURES = 3;
-    /** Whether the registry table has been declared on the connection. */
+    /** Whether the registry table has been declared on the connection; set only once a declaration succeeds. */
     private static final AtomicBoolean declared = new AtomicBoolean();
+    /** Whether a call that reads the registry back has waited out the read window since the table was declared. */
+    private static final AtomicBoolean settled = new AtomicBoolean();
     /** Whether this node has rebuilt the indices from the registry since it started. */
     private static final AtomicBoolean rebuilt = new AtomicBoolean();
 
@@ -295,7 +297,7 @@ final class InfinoRegistry {
      * replace of one refuses: those rows go, and one is appended.
      */
     static void write(String id, String source) {
-        declare();
+        declareToRead();
         long held = heldRows(id);
         if (held > 1) {
             InfinoNative.deleteOsids(TABLE, new String[] { id }, 1);
@@ -332,6 +334,8 @@ final class InfinoRegistry {
         failures.remove(name);
         retryAt.remove(name);
         try {
+            // A delete reads nothing back: no wait for the read window, which
+            // would hold the cluster applier thread this runs on.
             declare();
             InfinoNative.deleteOsids(TABLE, new String[] { name }, 1);
         } catch (Exception e) {
@@ -392,7 +396,7 @@ final class InfinoRegistry {
     /** Every row of the registry table, each its id and source, after what moved is written. */
     static List<Map<String, Object>> rawRows() {
         drain();
-        declare();
+        declareToRead();
         return InfinoNative.sqlRows(
             "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM " + InfinoQueryTranslator.quoteIdent(TABLE)
         );
@@ -504,15 +508,41 @@ final class InfinoRegistry {
         }));
     }
 
+    /**
+     * Declare the registry table on the connection, unless it has been. A
+     * declaration that fails leaves it undeclared, so the next call (a
+     * write's retry, say) declares it again.
+     */
     private static void declare() {
-        if (declared.compareAndSet(false, true)) {
-            InfinoNative.ensureTable(TABLE, "{}");
-            // The first write reads the table back (heldRows), and on the
-            // hosted service a read can miss a table this new for a moment:
-            // wait out the read window once per node life. A write that still
-            // misses it is tried again (record).
+        if (declared.get()) {
+            return;
+        }
+        synchronized (declared) {
+            if (!declared.get()) {
+                InfinoNative.ensureTable(TABLE, "{}");
+                declared.set(true);
+            }
+        }
+    }
+
+    /**
+     * Declare the registry table for a call that reads it back. A write
+     * reads it first (heldRows), and on the hosted service a read can miss a
+     * table this new for a moment: the first such call waits out the read
+     * window, once per node life. A write that still misses it is tried
+     * again (record).
+     */
+    private static void declareToRead() {
+        declare();
+        if (settled.compareAndSet(false, true)) {
             InfinoNative.awaitVisible(TABLE);
         }
+    }
+
+    /** For tests: the next call declares the registry table again, as on a node that has just started. */
+    static void undeclare() {
+        declared.set(false);
+        settled.set(false);
     }
 
     /** One row: the index as a create request would describe it, plus its table and the metadata version it was recorded at. */
