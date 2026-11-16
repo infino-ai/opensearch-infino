@@ -2684,6 +2684,61 @@ pub unsafe extern "C" fn infino_get(
     .unwrap_or(ptr::null_mut())
 }
 
+/// Most lookups [`infino_get_many`] runs at once.
+const GET_MANY_THREADS: usize = 16;
+
+/// The raw `_source` JSON of several osids, as one JSON object from each id
+/// the table holds to its source; an id it does not hold is absent.
+///
+/// Each id is looked up as [`infino_get`] looks it up, through the id
+/// column's index. A page of a sorted search reads its sources this way once
+/// its ids are chosen, and the lookups ran one call after another; here they
+/// run side by side, at most [`GET_MANY_THREADS`] at once, so a page costs
+/// about what its slowest lookup does.
+#[no_mangle]
+pub unsafe extern "C" fn infino_get_many(
+    h: *mut Bridge,
+    name: *const c_char,
+    osids: *const *const c_char,
+    count: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
+            return ptr::null_mut();
+        };
+        let ids: Vec<&str> = if osids.is_null() || count <= 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(osids, count as usize) }
+                .iter()
+                .filter_map(|p| unsafe { cstr(*p) })
+                .collect()
+        };
+        let mut found = serde_json::Map::new();
+        for chunk in ids.chunks(GET_MANY_THREADS) {
+            let sources: Vec<Option<String>> = std::thread::scope(|scope| {
+                let lookups: Vec<_> = chunk
+                    .iter()
+                    .map(|id| {
+                        scope.spawn(move || get_row(conn, name, id).map(|(source, _)| source))
+                    })
+                    .collect();
+                lookups
+                    .into_iter()
+                    .map(|lookup| lookup.join().ok().flatten())
+                    .collect()
+            });
+            for (id, source) in chunk.iter().zip(sources) {
+                if let Some(source) = source.filter(|s| !s.is_empty()) {
+                    found.insert((*id).to_owned(), Value::String(source));
+                }
+            }
+        }
+        out_json(Value::Object(found))
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// One osid's document as `{"source": .., "seq": n}`, its sequence number
 /// what a conditional write on it is checked against; "" if absent.
 #[no_mangle]
@@ -3023,6 +3078,9 @@ pub unsafe extern "C" fn infino_bm25(
     .unwrap_or(ptr::null_mut())
 }
 
+/// The column the engine's sorted search fills with its own (zero) score.
+const SORTED_SCORE: &str = "score";
+
 /// The table's first `k` rows by `column`, ascending or (`descending`
 /// non-zero) descending, rows sharing a value in row id order and rows
 /// without one last, each carrying `osid`, `_id`, the column and, when
@@ -3030,9 +3088,12 @@ pub unsafe extern "C" fn infino_bm25(
 /// row asks for when it sorts on one field, in one call. The sources are
 /// read by row id along with the page, not looked up by `osid` afterwards.
 /// `null` when the column has no range index: the engine's sorted search
-/// serves only a range-indexed column, and the caller plans the statement. The engine reads it from the column's range index with no
-/// statement planned, and plans the statement itself for a column without
-/// one.
+/// serves only a range-indexed column, and the caller plans the statement.
+/// Also `null`, with no schema read, on a hosted connection (whose sorted
+/// search forwards a statement anyway, so the schema request would only add
+/// a round trip) and for a column named `score`: the engine's sorted search
+/// puts its own score under that name, and the page drops it, which would
+/// drop the field's values with it.
 #[no_mangle]
 pub unsafe extern "C" fn infino_sorted(
     h: *mut Bridge,
@@ -3048,6 +3109,9 @@ pub unsafe extern "C" fn infino_sorted(
         else {
             return ptr::null_mut();
         };
+        if conn.hosted || column == SORTED_SCORE {
+            return out_string("null".to_string());
+        }
         let range_indexed = match conn.conn.schema(name) {
             Ok(schema) => schema
                 .fields()
@@ -3066,7 +3130,7 @@ pub unsafe extern "C" fn infino_sorted(
         let projection = if with_source != 0 { &with[..] } else { &with[..3] };
         match table.sorted_search(column, descending != 0, k.max(0) as usize, Some(projection)) {
             // The engine fixes every row's `score` at zero; a sorted hit has none.
-            Ok(b) => out_string(batches_to_json(&without_column(&b, "score"))),
+            Ok(b) => out_string(batches_to_json(&without_column(&b, SORTED_SCORE))),
             Err(e) => err_json(&e.to_string()),
         }
     }))
@@ -3086,6 +3150,7 @@ pub unsafe extern "C" fn infino_sorted(
 /// keeps too few of the rows read in order to find `k`. The predicate's
 /// literals are coerced to the columns' types first, as a statement would
 /// read them, so a date compared with a string is an interval on the date.
+/// Also `null` for a column named `score`, as [`infino_sorted`] is.
 #[no_mangle]
 pub unsafe extern "C" fn infino_sorted_where(
     h: *mut Bridge,
@@ -3103,6 +3168,11 @@ pub unsafe extern "C" fn infino_sorted_where(
             return ptr::null_mut();
         };
         let column = unsafe { cstr(column) }.filter(|c| !c.is_empty());
+        // The page drops the engine's `score` column, which would drop a
+        // field of that name with it: the caller plans the statement.
+        if column == Some(SORTED_SCORE) {
+            return out_string("null".to_string());
+        }
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
@@ -3134,7 +3204,7 @@ pub unsafe extern "C" fn infino_sorted_where(
             k.max(0) as usize,
             Some(&projection),
         ) {
-            Ok(Some(b)) => out_string(batches_to_json(&without_column(&b, "score"))),
+            Ok(Some(b)) => out_string(batches_to_json(&without_column(&b, SORTED_SCORE))),
             Ok(None) => out_string("null".to_string()),
             Err(e) => err_json(&e.to_string()),
         }
@@ -3226,9 +3296,17 @@ pub unsafe extern "C" fn infino_count_where(
         // this table's columns alone, and the parser plans its subquery
         // against its own context, not the table's: such counts run as one
         // statement.
+        // Each predicate as a statement would read it: coerced to the
+        // columns' types, so a date compared with a string literal is a
+        // comparison with a timestamp, which the table counts from its range
+        // index rather than by reading every row.
         let Ok(exprs) = predicates
             .iter()
-            .map(|p| predicate_parser().parse_sql_expr(p, &schema))
+            .map(|p| {
+                let expr = predicate_parser().parse_sql_expr(p, &schema)?;
+                expr.rewrite(&mut TypeCoercionRewriter::new(&schema))
+                    .map(|t| t.data)
+            })
             .collect::<Result<Vec<_>, _>>()
         else {
             return count_where_by_sql(&conn.conn, name, &predicates);
@@ -3644,6 +3722,15 @@ mod tests {
         take(unsafe { infino_get(h, c("logs").as_ptr(), c(osid).as_ptr()) })
     }
 
+    fn get_many(h: *mut Bridge, osids: &[&str]) -> Value {
+        let ids: Vec<CString> = osids.iter().map(|x| c(x)).collect();
+        let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+        let out = take(unsafe {
+            infino_get_many(h, c("logs").as_ptr(), idp.as_ptr(), osids.len() as c_int)
+        });
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
     fn delete(h: *mut Bridge, osids: &[&str]) -> c_int {
         let ids: Vec<CString> = osids.iter().map(|x| c(x)).collect();
         let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
@@ -3851,20 +3938,33 @@ mod tests {
         index(
             h,
             &[
-                ("a", r#"{"status":200,"took":1.5,"level":"info"}"#),
-                ("b", r#"{"status":404,"took":30.0,"level":"warn"}"#),
-                ("c", r#"{"status":500,"took":2.5,"level":"error"}"#),
+                (
+                    "a",
+                    r#"{"@timestamp":"2026-10-24T10:00:00Z","status":200,"took":1.5,"level":"info"}"#,
+                ),
+                (
+                    "b",
+                    r#"{"@timestamp":"2026-10-24T10:01:00Z","status":404,"took":30.0,"level":"warn"}"#,
+                ),
+                (
+                    "c",
+                    r#"{"@timestamp":"2026-10-24T10:02:00Z","status":500,"took":2.5,"level":"error"}"#,
+                ),
                 ("d", r#"{"message":"no status"}"#),
             ],
         );
-        // Every row, ranges the index counts, and two shapes it leaves to the
-        // aggregate: a keyword column and an OR.
+        // Every row, ranges the index counts, two shapes it leaves to the
+        // aggregate (a keyword column and an OR), and a date compared with a
+        // string literal, which the count coerces to a timestamp as a
+        // statement does.
         let predicates = [
             "1=1",
             r#"(1=1 AND ("status" >= 400))"#,
             r#"("took") < 10"#,
             r#""level" = 'info'"#,
             r#""status" < 300 OR "took" > 20"#,
+            r#""@timestamp" >= '2026-10-24T10:01:00Z'"#,
+            r#"("@timestamp" >= '2026-10-24T10:00:00Z' AND "@timestamp" < '2026-10-24T10:02:00Z')"#,
         ];
         let filtered: Vec<String> = predicates
             .iter()
@@ -3884,7 +3984,7 @@ mod tests {
         });
         let counts: Vec<u64> = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
         assert_eq!(counts, expected);
-        assert_eq!(counts, [4, 2, 2, 1, 2]);
+        assert_eq!(counts, [4, 2, 2, 1, 2, 2, 2]);
         // A text clause joined by id, which reads the token index through a
         // subquery, beside the whole table.
         let joined = [
@@ -4047,6 +4147,13 @@ mod tests {
         // Fetch returns the document as sent.
         let src = get(h, "a");
         assert!(src.contains("\"tags\":[\"x\",\"y\"]"), "{src}");
+        // Several at once: each id the table holds, as one get returns it;
+        // an id it does not hold, absent.
+        let many = get_many(h, &["a", "b", "no-such-id"]);
+        assert_eq!(many["a"].as_str(), Some(src.as_str()), "{many}");
+        assert_eq!(many["b"].as_str(), Some(get(h, "b").as_str()), "{many}");
+        assert_eq!(many.as_object().map(|o| o.len()), Some(2), "{many}");
+        assert_eq!(get_many(h, &[]), json!({}));
         close(h);
     }
 
@@ -5282,5 +5389,39 @@ mod tests {
             assert_eq!(check(doc), Err(no_timestamp("@timestamp")), "{doc}");
         }
         assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, None).is_ok());
+    }
+
+    /// A sorted page on a range-indexed field carries the field's values; a
+    /// field named `score`, and any field on a hosted connection, is left to
+    /// the hit statement (`null`) before any schema is read.
+    #[test]
+    fn a_sorted_page_carries_its_values_and_a_score_field_or_a_hosted_connection_is_left_to_the_statement() {
+        let h = open_logs();
+        let scored = r#"{"properties":{"score":{"type":"long"},"status":{"type":"long"}}}"#;
+        take(unsafe { infino_ensure_table(h, c("scored").as_ptr(), c(scored).as_ptr()) });
+        let ids = [c("a"), c("b")];
+        let srcs = [c(r#"{"score":2,"status":20}"#), c(r#"{"score":1,"status":10}"#)];
+        let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+        let sp: Vec<*const c_char> = srcs.iter().map(|x| x.as_ptr()).collect();
+        take(unsafe { infino_index_batch(h, c("scored").as_ptr(), idp.as_ptr(), sp.as_ptr(), 2) });
+        let sorted = |column: &str| {
+            take(unsafe { infino_sorted(h, c("scored").as_ptr(), c(column).as_ptr(), 0, 10, 0) })
+        };
+        let page: Value = serde_json::from_str(&sorted("status")).unwrap();
+        let rows = page.as_array().unwrap_or_else(|| panic!("{page}"));
+        let got: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| (r[OSID].as_str().unwrap().to_string(), r["status"].as_i64().unwrap()))
+            .collect();
+        assert_eq!(got, [("b".to_string(), 10), ("a".to_string(), 20)]);
+        assert_eq!(sorted("score"), "null");
+        let after_score = take(unsafe {
+            infino_sorted_where(h, c("scored").as_ptr(), c("score").as_ptr(), c("score > 1").as_ptr(), 0, 10, 0)
+        });
+        assert_eq!(after_score, "null");
+        unsafe { (*h).hosted = true };
+        assert_eq!(sorted("status"), "null");
+        unsafe { (*h).hosted = false };
+        close(h);
     }
 }

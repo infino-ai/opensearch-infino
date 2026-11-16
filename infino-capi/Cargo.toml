@@ -2,7 +2,9 @@
 name = "infino-capi"
 version = "0.1.0"
 edition = "2021"
-description = "Thin C-ABI bridge over the Infino engine, for the OpenSearch-on-Infino spike"
+description = "C-ABI bridge over the Infino engine, for the Infino for OpenSearch plugin"
+license = "Apache-2.0"
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -13,7 +15,9 @@ crate-type = ["cdylib", "rlib"]
 # node whose account is set up holds no table data of its own.
 # `graph-index` serves the graph walks (`graph_walk`, `graph_rank`) to SQL and
 # builds an edge table's adjacency index on optimize.
-infino = { version = "0.11.21", features = ["remote", "graph-index"] }
+# Pinned exactly: 0.11.25 bounds the hosted client's waits, and 0.11.26 writes
+# the manifest list format 4.0, which earlier builds cannot read.
+infino = { version = "=0.11.27", features = ["remote", "graph-index"] }
 # serde_json comes re-exported from infino, so the two never disagree.
 # Same major as infino so the delete-predicate Expr is the same type infino expects.
 datafusion = "54"
@@ -30,3 +34,12 @@ ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 # those threads and is as fast here. Cargo builds the binding once with the
 # union of every dependent's features, so naming it here moves the engine's too.
 libmimalloc-sys = { version = "0.1", features = ["v2"] }
+
+# The engine's own release profile: thin LTO across the engine and its
+# dependencies, one codegen unit. A dependency's profile does not apply to
+# the crate that builds it, so without this the binding builds with Cargo's
+# defaults (no LTO, sixteen codegen units).
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,5 +1,6 @@
 # Rust build
 infino-capi/target/
+/target/
 
 # Gradle/Java build
 plugin/build/

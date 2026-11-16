@@ -1,13 +1,15 @@
 # Infino for OpenSearch
 
-An OpenSearch plugin that stores your indices in Infino tables instead of Lucene. The documents live on storage you choose (a local disk, an S3, GCS or Azure bucket, or a hosted Infino account), and OpenSearch's REST API, Dashboards, security plugin and cluster management work unchanged.
+An OpenSearch plugin that stores your indices in [Infino](https://github.com/infino-ai/infino) tables instead of Lucene. Infino is an Apache-2.0 retrieval engine, written in Rust, that keeps its tables on object storage and runs SQL, full-text and vector search over them. The documents live on storage you choose (a local disk, an S3, GCS or Azure bucket, or a hosted Infino account), and OpenSearch's REST API, Dashboards, security plugin and cluster management work unchanged.
 
 - **The same APIs.** Index, bulk, get, search, aggregations, scroll and Dashboards work unchanged. An index keeps its name, mapping, settings and aliases.
 - **One engine for every query.** Full-text search (BM25), vector search (kNN and hybrid) and SQL run on the same tables.
 - **Stateless nodes.** A node with an empty data directory brings every index back from storage, with its mapping and aliases.
 - **Not a fork.** The plugin installs into a released OpenSearch: 2.19.6, 3.0.0, 3.3.2, 3.6.0 or 3.9.0.
 
-**Contents:** [Quick start](#quick-start) · [How it works](#how-it-works) · [Install on a cluster](#install-on-a-cluster) · [Hosted account and stateless nodes](#hosted-account-and-stateless-nodes) · [Settings](#settings) · [SQL](#sql) · [What is supported](#what-is-supported) · [Writes](#writes) · [Build and test](#build-and-test)
+**Status: early.** The plugin is tested on the releases above with local storage and Dashboards; cloud buckets are not tested yet. Some of OpenSearch's own REST tests still fail with it, and known gaps are tracked in [the issues](https://github.com/infino-ai/opensearch-infino/issues). Among them: in default mode, an acknowledged write that the table refuses can be dropped ([#54](https://github.com/infino-ai/opensearch-infino/issues/54)). Try it on data you can rebuild before relying on it.
+
+**Contents:** [Quick start](#quick-start) · [How it works](#how-it-works) · [Install on a cluster](#install-on-a-cluster) · [Hosted account and stateless nodes](#hosted-account-and-stateless-nodes) · [Settings](#settings) · [SQL](#sql) · [What is supported](#what-is-supported) · [Writes](#writes) · [Build and test](#build-and-test) · [Repository layout](#repository-layout) · [License](#license)
 
 ## Quick start
 
@@ -35,7 +37,7 @@ The node's data volume belongs to the storage it was first started with, so to c
 
 ### b) Local build
 
-You need a Rust toolchain, a JDK 21, Gradle, and an OpenSearch 3.9.0 distribution to run it in.
+You need a Rust toolchain (the Docker build uses 1.95.0), a JDK 21, Gradle 9, and an [OpenSearch 3.9.0 distribution](https://opensearch.org/downloads/) to run it in. For another release, set `OPENSEARCH_VERSION` and use the Gradle that release wants (see [Build and test](#build-and-test)).
 
 ```bash
 ./scripts/build.sh                                      # the native bridge and the plugin zip
@@ -169,7 +171,7 @@ PUT _ingest/pipeline/embed
 
 ## Hosted account and stateless nodes
 
-With an Infino account, the tables live on the hosted service. It runs the engine, compacts the tables, and serves the agent and search APIs over the same data. The account stores the tables in an Infino bucket or in your own bucket, with customer-managed encryption keys (CMEK) supported. The node holds no table data.
+With an Infino account, the tables live on the hosted service. It runs the engine, compacts the tables, and serves Infino's own SQL and search APIs over the same data. The account stores the tables in an Infino bucket or in your own bucket, with customer-managed encryption keys (CMEK) supported. The node holds no table data.
 
 The account is node configuration, read at startup:
 
@@ -183,7 +185,7 @@ infino.platform.database: logs        # optional: the cluster's name when unset
 bin/opensearch-keystore add infino.platform.api_key    # or INFINO_API_KEY in the node's environment
 ```
 
-**Getting an account.** Start the node without these settings and ask for a free account:
+**Getting an account.** Start the node without these settings and ask for a free account. Sending `"accept": true` accepts Infino's [Terms of Service](https://www.infino.ai/terms), and from then on every document the cluster writes is sent to the hosted service:
 
 ```bash
 curl -XPOST localhost:9200/_plugins/_infino/account/trial -H 'Content-Type: application/json' -d '{"accept": true}'
@@ -259,9 +261,19 @@ An index with `index.infino.edges: true` holds a graph's edges: each document is
 
 **Queries:** `match_all`, `term`, `terms`, `range` (numbers and dates, with date math and time zones), `exists`, `prefix`, `wildcard`, `regexp`, `ids`, `match`, `match_phrase`, `multi_match`, `query_string` and `simple_query_string` (Lucene's classic syntax; fuzzy and proximity are refused), `bool` (with `minimum_should_match`), `nested` (see below), `script` (an expression subset of Painless), `infino_knn`, `infino_hybrid`, and the k-NN plugin's `knn`. A field named `x.keyword` reads the string column `x` by its whole value.
 
-A `nested` query (Dashboards' `has_reference` on saved objects' `references` is one) matches a document only when one entry of the array holds every clause, as stock does. The table flattens an array of objects into a column per member field, which loses which values share an entry, so the columns only narrow the documents to those that may match; each of those is then checked entry by entry from its source. Inside a nested query, `term`, `terms`, `match`, `range` and `exists` on keyword, numeric and boolean fields are served, combined by `bool` or a deeper `nested` query. A text or date field, any other clause, `inner_hits`, or a query that leaves more than 10,000 documents to check (`-Dinfino.nested.candidates.max`) is refused with a 400 that names it.
+A `nested` query (Dashboards' `has_reference` on saved objects' `references` is one) matches a document only when one entry of the array holds every clause, as stock does. The table flattens an array of objects into a column per member field, which loses which values share an entry, so the columns only narrow the documents to those that may match; each of those is then checked entry by entry from its source. Inside a nested query, `term`, `terms`, `match`, `range` and `exists` on keyword, numeric and boolean fields are served, combined by `bool` or a deeper `nested` query. A text or date field, any other clause, `inner_hits`, or a query that leaves more than 10,000 documents to check (`-Dinfino.nested.candidates.max`) is refused with a 400 that names it. The entries are read from the document as it was indexed, whatever the mapping's `_source` says, so a nested query is served on an index with `_source` disabled or with the path excluded from it. A nested query scores as stock scores it: each matching entry scores as its query does on it, and the entries' scores are read by `score_mode` (`avg` by default), times the query's `boost` (see Scoring).
 
-**Search:** sorting by fields; `from` and `size` up to `index.max_result_window`; `search_after`, `post_filter`, `collapse` and scroll; `_source` includes and excludes; exact `hits.total`. A search over several Infino-backed indices merges their pages by sort values or score and reduces their aggregations together, under `search.max_buckets`. `get` and `mget` read the table too.
+**Scoring:** a `bool` scores as stock sums its clauses. The BM25 of one text clause (a `match` or `match_phrase` on a text field) counts on the hits it matches, in `must` or in `should`. A `terms`, `range`, `exists`, `ids`, `prefix`, `wildcard`, `regexp` or `match_all`, and a `term`, `match` or `match_phrase` on any other field but a text one, adds its `boost` (1.0 by default) on the hits it matches, as stock's constant-score queries do. A `term`, `match` or `match_phrase` on a boolean field, or on a keyword field with `use_similarity`, adds its BM25, as stock scores it: such a field has no norms, so every hit it matches scores `boost × idf / 2.2`, with the idf counted over the table's documents that hold the field. A `nested` clause adds its entries' score. These hold in `must` and in `should` alike. A `filter` or `must_not` clause adds nothing. When `should` or `nested` clauses reorder the hits, hits that tie on score come in the order they were written. A page ranked by a text clause alone keeps its ties in the order the engine's ranked search returns them. A request sorted by `_doc` first is not reordered by its other clauses' scores: with no text clause its hits come in the order they were written, as stock's do. A request sorted by `_score` ascending first, with no text clause, gets its least scores first, as stock's does. Where the score differs from stock:
+
+- Only one text clause is scored. A second text clause in `must`, or a text clause in `should` beside one in `must`, adds nothing to the score. With no text clause in `must`, two text clauses in `should`, or any `should` or `must` clause the table does not score (a `term` on a text field, a `multi_match` over several fields, a `query_string`, a `bool` inside it), leave every hit the same score: 1.0, or what the `must` clauses above add. So does a `constant_score` clause in `should`, a `term` on a boolean or `use_similarity` keyword field that some document gives several values, and a `nested` clause whose entries such a `term` scores.
+- A text clause in `filter` scores its BM25, where stock scores it 0. A `bool` of `filter` clauses alone scores every hit 1.0, where stock scores 0.
+- A `boost` on a text clause or on a `bool` is not applied.
+- Sorted by `_doc` first, a page with a text clause is still ranked by that clause's BM25, where stock returns it in index order.
+- Sorted by `_score` ascending first, a page with a text clause is scored as if sorted by `_doc` (above): a text clause in `must` ranks it by BM25, greatest first, where stock returns the least scores first.
+- When the scoring clauses' scores can sum to more than 64 different values, or the query holds a clause the engine applies after ranking (on a field some document gives several values, or a text clause on a second field), the hits the text clause matches are chosen from its 10,000 best by BM25, so a hit past them that the other clauses lift can be missed.
+- Under `collapse`, `should` clauses and `nested` clauses add nothing to the score, and a text clause in `should` is not scored: with no text clause in `must`, every hit scores the same, 1.0 or what the `must` clauses above add.
+
+**Search:** sorting by fields; `from` and `size` up to `index.max_result_window`; `search_after`, `post_filter`, `collapse` and scroll; `_source` includes and excludes; exact `hits.total`. A hit, a `get` and an `mget` carry `_source` as the mapping's `_source` keeps it, as stock does: none when it is disabled, and only what its `includes` and `excludes` keep (the table still holds the document as it was indexed). A search that filters `_source` on an index whose mapping disables it is refused with a 400, as stock refuses it. The `fields` API reads the source as the mapping keeps it, so it leaves out what the mapping excludes, and asking for `fields` on an index whose mapping disables `_source` is refused with stock's 400; `docvalue_fields` read the document as it was indexed, as stock's doc values hold every field. As in stock, only a hit the response carries is refused, so a page past that index's hits is answered and the total counts them. When one index of a search over several refuses it this way, stock and default mode fail only that index's shards and answer from the rest; proxy mode answers the search as one, so the whole search fails with the 400 when the page carries a hit of that index. A search over several Infino-backed indices merges their pages by sort values or score and reduces their aggregations together, under `search.max_buckets`. `get` and `mget` read the table too.
 
 **Aggregations:** `value_count`, `sum`, `avg`, `min`, `max`, `cardinality` (exact), `percentiles` (t-digest), `percentile_ranks`; `terms` over string, boolean, numeric and date columns, with `size` and `min_doc_count`, ordered by count, key or a sibling metric; `date_histogram` (fixed or calendar intervals, time zone, a fixed offset, `min_doc_count`, numeric `extended_bounds`); `histogram` (interval and offset); `filters` (with `other_bucket`); `range`; `date_range`; `composite`; `top_hits`; `significant_terms`; bucket aggregations nested to any depth; pipeline aggregations.
 
@@ -325,8 +337,11 @@ No OpenSearch checkout is needed: the plugin builds against the release named by
 | `infino-capi/` | The native bridge, a Rust `cdylib` over the `infino` crate: JSON in, JSON out, with every document checked against the declared columns. |
 | `scripts/` | `build.sh`, `run.sh` (install into a distribution and start a node) and `check-all.sh`. |
 | `bench/` | `bench.py`: indexing and query latency against stock Lucene. |
-| `HANDOVER.md` | Design notes from the first prototype. |
 
 ## License
 
-Apache-2.0. The bridge and the plugin use only the published `infino` crate.
+Apache-2.0; see [LICENSE](LICENSE). The bridge and the plugin use only the published `infino` crate, which is Apache-2.0 too.
+
+## Contributing and security
+
+Bugs and feature requests go in [the issues](https://github.com/infino-ai/opensearch-infino/issues); pull requests are welcome, and `gradle check` (see [Build and test](#build-and-test)) should pass before you open one. Report a security problem privately, through [a security advisory](https://github.com/infino-ai/opensearch-infino/security/advisories/new), not in a public issue.
