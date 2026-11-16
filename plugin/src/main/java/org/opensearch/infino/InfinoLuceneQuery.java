@@ -64,12 +64,27 @@ final class InfinoLuceneQuery {
 
     /** The tree of {@code query}; {@code op} is the operator for clauses with none between them. */
     static Node parse(String query, Operator op) {
+        return parseTop(query, op).node();
+    }
+
+    /**
+     * The tree of a whole query string, and whether Lucene reads it as a
+     * clause list of one required clause: a lone clause with {@code +}
+     * ({@code +alpha}, {@code +(alpha beta)}) is a list where the same
+     * clause without it is the clause itself. The tree is the clause either
+     * way; the difference shows only where something counts the list's
+     * optional clauses.
+     */
+    record Parsed(Node node, boolean requiredAlone) {}
+
+    /** As {@link #parse}, with {@link Parsed#requiredAlone()}. */
+    static Parsed parseTop(String query, Operator op) {
         Parser p = new Parser(query, op);
         Node n = p.group();
         if (p.pos < p.tokens.size() - 1) {
             throw new Malformed("[" + query + "] has text after the end of the query: [" + p.tokens.get(p.pos).text() + "]");
         }
-        return n;
+        return new Parsed(n, p.requiredAlone);
     }
 
     // ---- tokens ----
@@ -251,10 +266,16 @@ final class InfinoLuceneQuery {
     private static final class Clause {
         final Node node;
         Occur occur;
+        /** Written with {@code +}. */
+        final boolean plus;
+        /** A parenthesized group, with or without a field prefix. */
+        final boolean group;
 
-        Clause(Node node, Occur occur) {
+        Clause(Node node, Occur occur, boolean plus, boolean group) {
             this.node = node;
             this.occur = occur;
+            this.plus = plus;
+            this.group = group;
         }
     }
 
@@ -263,6 +284,14 @@ final class InfinoLuceneQuery {
         final Operator op;
         final String query;
         int pos;
+        /**
+         * Whether the group last read is, as Lucene reads it, a list of one
+         * required clause; a lone unmarked parenthesized group leaves it as
+         * its inner group set it, since Lucene returns that inner list.
+         * The outermost group is read last, so after parsing it describes
+         * the whole query.
+         */
+        boolean requiredAlone;
 
         Parser(String query, Operator op) {
             this.query = query;
@@ -302,6 +331,11 @@ final class InfinoLuceneQuery {
                     Kind k = take().kind();
                     mod = k == Kind.PLUS ? Kind.PLUS : (mod == Kind.NOT ? null : Kind.NOT);
                 }
+                int at = pos;
+                if (tokens.get(at).kind() == Kind.WORD && tokens.get(at + 1).kind() == Kind.COLON) {
+                    at += 2;
+                }
+                boolean paren = tokens.get(at).kind() == Kind.LPAREN;
                 Node value = clauseValue();
                 // The operator before this clause settles the clause before it.
                 if (!clauses.isEmpty() && conj == Kind.AND) {
@@ -324,14 +358,22 @@ final class InfinoLuceneQuery {
                 } else {
                     occur = conj == Kind.OR && mod != Kind.PLUS ? Occur.SHOULD : Occur.MUST;
                 }
-                clauses.add(new Clause(value, occur));
+                clauses.add(new Clause(value, occur, mod == Kind.PLUS, paren));
             }
             if (clauses.isEmpty()) {
+                requiredAlone = false;
                 return new All();
             }
             if (clauses.size() == 1 && clauses.get(0).occur != Occur.MUST_NOT) {
-                return clauses.get(0).node;
+                Clause only = clauses.get(0);
+                if (only.plus) {
+                    requiredAlone = true;
+                } else if (!only.group) {
+                    requiredAlone = false;
+                }
+                return only.node;
             }
+            requiredAlone = false;
             List<Node> must = new ArrayList<>();
             List<Node> should = new ArrayList<>();
             List<Node> mustNot = new ArrayList<>();

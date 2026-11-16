@@ -4,9 +4,12 @@
 
 package org.opensearch.infino;
 
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MultiMatchQueryBuilder;
+import org.opensearch.index.query.Operator;
 import org.opensearch.index.query.QueryBuilders;
+import org.opensearch.index.query.QueryShardException;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
 import org.opensearch.test.OpenSearchTestCase;
@@ -350,13 +353,14 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("1=0", translate(QueryBuilders.queryStringQuery("+alpha beta gamma").defaultField("message").minimumShouldMatch("3")).where());
         assertTrue(translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("3")).where().contains(">= 3)"));
         assertTrue(translate(QueryBuilders.queryStringQuery("+alpha beta gamma").defaultField("message").minimumShouldMatch("2")).where().contains(">= 2)"));
-        // A malformed form is the request's error, as stock's reader makes it.
+        // A malformed form is the request's error, reported as stock reports a query it cannot build.
         for (String bad : new String[] { "2<", "two" }) {
-            IllegalArgumentException e = expectThrows(
-                IllegalArgumentException.class,
+            QueryShardException e = expectThrows(
+                QueryShardException.class,
                 () -> translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch(bad))
             );
-            assertTrue(e.getMessage(), e.getMessage().contains("minimum_should_match [" + bad + "]"));
+            assertEquals(RestStatus.BAD_REQUEST, e.status());
+            assertTrue(e.getMessage(), e.getMessage().startsWith("failed to create query: "));
         }
         // Stock's reading of the forms: 100% of three is three, -1 of three is two.
         assertTrue(translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("100%")).where().contains(">= 3)"));
@@ -368,6 +372,66 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         String none = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message")).where();
         assertFalse(none, none.contains("THEN 1 ELSE 0 END"));
         assertTrue(translate(QueryBuilders.simpleQueryStringQuery("alpha beta gamma").field("message").minimumShouldMatch("2")).where().contains(">= 2)"));
+    }
+
+    public void testQueryStringMinimumShouldMatchWithNoOptionalClause() {
+        // Stock applies the value to a clause list with no optional clause too, and it then matches nothing.
+        assertEquals(
+            "1=0",
+            translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").defaultOperator(Operator.AND).minimumShouldMatch("2"))
+                .where()
+        );
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("-delta").defaultField("message").minimumShouldMatch("1")).where());
+        // A lone clause with + is such a list; the same clause without it is no list at all.
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("+alpha").defaultField("message").minimumShouldMatch("1")).where());
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("+(alpha beta)").defaultField("message").minimumShouldMatch("1")).where());
+        Translation lone = translate(QueryBuilders.queryStringQuery("alpha").defaultField("message"));
+        Translation loneAsked = translate(QueryBuilders.queryStringQuery("alpha").defaultField("message").minimumShouldMatch("2"));
+        assertEquals(lone.where(), loneAsked.where());
+        assertEquals(lone.principal(), loneAsked.principal());
+        // A value asking for none changes nothing.
+        Translation required = translate(QueryBuilders.queryStringQuery("+alpha").defaultField("message"));
+        assertEquals(required.where(), translate(QueryBuilders.queryStringQuery("+alpha").defaultField("message").minimumShouldMatch("-1")).where());
+        // Stock builds every clause before it counts: a numeric clause the column cannot read is still refused.
+        assertNull(translate(QueryBuilders.queryStringQuery("status:abc message:alpha message:beta").defaultField("message").minimumShouldMatch("4")));
+    }
+
+    public void testQueryStringMinimumShouldMatchRefusedWhereStockCountsOtherClauses() {
+        // Over several fields stock reads a run of words as one dis_max clause.
+        IllegalArgumentException fields = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("alpha beta").field("message").field("level").minimumShouldMatch("2"))
+        );
+        assertTrue(fields.getMessage(), fields.getMessage().contains("more than one field"));
+        // Each word with its field is a clause of its own, as in stock.
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("message:alpha message:beta").field("message").field("level").minimumShouldMatch("2"))
+                .where()
+                .contains(">= 2)")
+        );
+        // A word the analyzer may split is one clause or several in stock, by where it sits.
+        IllegalArgumentException lone = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("foo-bar").defaultField("message").minimumShouldMatch("2"))
+        );
+        assertTrue(lone.getMessage(), lone.getMessage().contains("[foo-bar]"));
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("alpha foo-bar").defaultField("message").minimumShouldMatch("2"))
+        );
+        // Quoted, it is one phrase clause in both.
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("alpha \"foo-bar\"").defaultField("message").minimumShouldMatch("2")).where().contains(">= 2)")
+        );
+        // simple_query_string's own syntax makes other clauses of an operator: there -gamma is optional.
+        IllegalArgumentException simple = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.simpleQueryStringQuery("alpha beta -gamma").field("message").minimumShouldMatch("2"))
+        );
+        assertTrue(simple.getMessage(), simple.getMessage().contains("[-gamma]"));
+        // Without minimum_should_match, nothing here is refused.
+        assertNotNull(translate(QueryBuilders.queryStringQuery("alpha beta").field("message").field("level")));
+        assertNotNull(translate(QueryBuilders.queryStringQuery("foo-bar").defaultField("message")));
     }
 
     public void testQueryStringOverEveryTextColumn() {
