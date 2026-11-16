@@ -157,6 +157,11 @@ public final class InfinoSearch {
             return InfinoSearch.orderBy(sorts);
         }
 
+        /** This plan with no sort: its rows in no order. */
+        Plan unsorted() {
+            return new Plan(table, cols, query, List.of(), vector, postWhere, collapse, searchAfter, scriptFields, access, nowMillis);
+        }
+
         /** The predicate the hits satisfy: the query's and the post_filter's. */
         String hitWhere() {
             return postWhere == null ? query.where() : "(" + query.where() + ") AND (" + postWhere + ")";
@@ -578,19 +583,24 @@ public final class InfinoSearch {
             TextClause text = q.principal();
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
         } else {
-            if (splitsMissingTail(plan)) {
+            // A sort on a field no row holds a value in orders nothing: every
+            // hit's sort value is missing, so the page is the predicate's rows
+            // in no order, read as an unsorted search reads them, as stock reads
+            // a sort on a field no document has. The hits still carry the sort.
+            Plan read = sortsNothing(plan) ? plan.unsorted() : plan;
+            if (splitsMissingTail(read)) {
                 // The rows past a present first sort value come first; the
                 // rows missing it follow them all, so they are read only
                 // when the first part leaves the page short.
-                rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
+                rows = InfinoNative.sqlRows(hitStatement(read, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
                 if (rows.size() < fetch) {
                     rows = new ArrayList<>(rows);
-                    rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
+                    rows.addAll(InfinoNative.sqlRows(hitStatement(read, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
                 }
             } else {
-                rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+                rows = InfinoNative.sqlRows(hitStatement(read, fetch, seqNoAndPrimaryTerm));
             }
-            if (sourcesById(plan) && wantsSource(source)) {
+            if (sourcesById(read) && wantsSource(source)) {
                 rows = withSources(plan.table(), rows, fetch);
             }
             // A page the hit statement could not fill holds every row its
@@ -792,6 +802,31 @@ public final class InfinoSearch {
      * row. Not under a collapse, whose window ranks a value's rows across
      * both parts.
      */
+    /**
+     * Whether the page's sort orders nothing: one field's own column, then
+     * the row id, from the page's start, over a column no row of the table
+     * holds a value in (where every value is missing, missing first or last
+     * and either direction order the same). The column's presence is counted
+     * from the superfiles' statistics, with no row read.
+     */
+    static boolean sortsNothing(Plan plan) {
+        List<SortSpec> sorts = plan.sorts();
+        if (plan.vector() != null || plan.collapse() != null || plan.searchAfter() != null || !plan.scriptFields().isEmpty() || sorts.size() != 2) {
+            return false;
+        }
+        SortSpec first = sorts.get(0);
+        SortSpec tie = sorts.get(1);
+        if (!tie.name().equals(InfinoSql.ROW_ID)
+            || tie.desc()
+            || first.name().equals(InfinoSql.ROW_ID)
+            || first.name().equals(InfinoQueryTranslator.OSID)
+            || !first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()))) {
+            return false;
+        }
+        long[] present = InfinoNative.countWhere(plan.table(), List.of(first.expr() + " IS NOT NULL"));
+        return present.length == 1 && present[0] == 0;
+    }
+
     static boolean splitsMissingTail(Plan plan) {
         Object[] after = plan.searchAfter();
         return after != null
