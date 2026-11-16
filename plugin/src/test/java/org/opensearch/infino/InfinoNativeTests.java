@@ -49,6 +49,17 @@ public class InfinoNativeTests extends OpenSearchTestCase {
         assertEquals(Map.of("request.raw", "request"), m.keywordFields());
     }
 
+    /** A keyword field, or a keyword multi-field, mapped with use_similarity is read as one whose terms Lucene scores by BM25. */
+    public void testUseSimilarityKeywordFieldsAreRead() {
+        Mapping m = Mapping.of("""
+            {"properties":{
+              "tag":{"type":"keyword","use_similarity":true},
+              "plain":{"type":"keyword"},
+              "off":{"type":"keyword","use_similarity":false},
+              "title":{"type":"text","fields":{"raw":{"type":"keyword","use_similarity":"true"}}}}}""");
+        assertEquals(Set.of("tag", "title.raw"), m.similarityFields());
+    }
+
     public void testAMappingWithoutTheTypeNameIsReadTheSame() {
         Mapping m = Mapping.of("{\"properties\":{\"a\":{\"type\":\"alias\",\"path\":\"b\"},\"b\":{\"type\":\"long\"}}}");
         assertEquals(Set.of("a", "b"), m.paths());
