@@ -1236,7 +1236,17 @@ public final class InfinoSearch {
         String from;
         String order;
         if (sorted) {
-            from = q.from();
+            // A sorted page has no score to rank by, so a plain-words text clause
+            // is a predicate on the table's rows: the engine's top-k then reads
+            // rows in the sort column's order and checks it on each, rather than
+            // sorting every row the token index matches.
+            String text = q.principalPredicate();
+            if (text != null) {
+                from = InfinoQueryTranslator.quoteIdent(q.table());
+                where = "(" + where + ") AND " + text;
+            } else {
+                from = q.from();
+            }
             order = String.join(", ", plan.orderBy());
         } else if (ranked) {
             // The engine ranks within the rows the predicate keeps, so the page
