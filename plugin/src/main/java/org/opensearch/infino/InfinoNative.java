@@ -104,6 +104,8 @@ public final class InfinoNative {
     private static final String FORMAT = "format";
     /** The mapping types whose values are dates. */
     private static final Set<String> DATE_TYPES = Set.of("date", "date_nanos");
+    /** The mapping types whose values a sort compares as 32-bit floats (stock's float comparator). */
+    private static final Set<String> FLOAT_TYPES = Set.of("float", "half_float");
     /** The type of a multi-field that holds its field's value whole, the exact form of a text field. */
     private static final String KEYWORD_TYPE = "keyword";
     private static final String USE_SIMILARITY = "use_similarity";
@@ -550,7 +552,8 @@ public final class InfinoNative {
      * keyword multi-field's dotted path to its field's, since the field's
      * column holds the value the multi-field indexes whole (a log mapping's
      * {@code request.raw} under the text field {@code request}, as a dynamic
-     * mapping's {@code name.keyword}); and each date field's declared format.
+     * mapping's {@code name.keyword}); each date field's declared format;
+     * and each {@code float} or {@code half_float} field ({@code floatFields}).
      */
     record Mapping(
         Set<String> paths,
@@ -559,6 +562,7 @@ public final class InfinoNative {
         Map<String, String> dateFormats,
         Set<String> similarityFields,
         Set<String> otherSimilarityFields,
+        Set<String> floatFields,
         boolean defaultBm25
     ) {
         /** {@link #of(String, boolean)} under the default BM25 similarity. */
@@ -579,6 +583,7 @@ public final class InfinoNative {
                 new LinkedHashMap<>(),
                 new LinkedHashMap<>(),
                 new LinkedHashMap<>(),
+                new HashSet<>(),
                 new HashSet<>(),
                 new HashSet<>(),
                 defaultBm25
@@ -608,6 +613,9 @@ public final class InfinoNative {
                 // An object field has no type.
                 if (field.get(TYPE) instanceof String type && DATE_TYPES.contains(type) && field.get(FORMAT) instanceof String format) {
                     dateFormats.put(path, format);
+                }
+                if (field.get(TYPE) instanceof String type && FLOAT_TYPES.contains(type)) {
+                    floatFields.add(path);
                 }
                 if (scoresBySimilarity(field)) {
                     similarityFields.add(path);
@@ -663,6 +671,16 @@ public final class InfinoNative {
     static boolean maps(String table, String field) {
         Mapping mapping = MAPPINGS.get(table);
         return mapping == null || mapping.paths().contains(field);
+    }
+
+    /**
+     * The fields of {@code table} its mapping declares {@code float} or
+     * {@code half_float}, which a sort compares as 32-bit floats; empty for
+     * a table no mapping has declared yet.
+     */
+    static Set<String> floatFields(String table) {
+        Mapping mapping = MAPPINGS.get(table);
+        return mapping == null ? Set.of() : mapping.floatFields();
     }
 
     /**

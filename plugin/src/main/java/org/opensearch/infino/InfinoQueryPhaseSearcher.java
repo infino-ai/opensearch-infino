@@ -497,20 +497,20 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         return out;
     }
 
-    /** The search_after values a scroll resumes from, from the sort values of the last hit handed out: missing stand-ins back to missing. */
-    private static Object[] searchAfter(Object[] fields) {
+    /**
+     * The search_after values a scroll resumes from, from the sort values of
+     * the last hit handed out: text as text, the rest as it is. A missing
+     * value's stand-in (the least or greatest long, or an infinity) is read
+     * back as missing by the plan ({@link InfinoSearch.SortSpec#missingStandIn}),
+     * which knows the side its sort puts the missing rows on and whether a
+     * {@code missing} value leaves none missing; that value, even the least
+     * or greatest long, is a present one there.
+     */
+    static Object[] searchAfter(Object[] fields) {
         Object[] out = new Object[fields.length];
         for (int i = 0; i < fields.length; i++) {
             Object v = fields[i];
-            if (v instanceof BytesRef b) {
-                out[i] = b.utf8ToString();
-            } else if (v instanceof Long l && (l == Long.MAX_VALUE || l == Long.MIN_VALUE)) {
-                out[i] = null;
-            } else if (v instanceof Double d && d.isInfinite()) {
-                out[i] = null;
-            } else {
-                out[i] = v;
-            }
+            out[i] = v instanceof BytesRef b ? b.utf8ToString() : v;
         }
         return out;
     }

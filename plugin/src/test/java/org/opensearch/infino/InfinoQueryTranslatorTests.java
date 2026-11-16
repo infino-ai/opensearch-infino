@@ -278,7 +278,121 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
         String sql = InfinoSearch.hitStatement(plan, 10, false);
         assertTrue(sql, sql.contains("COALESCE(\"status\", 3) AS \"status\""));
-        assertTrue(sql, sql.contains(", \"status\" AS collapse_key"));
+        assertTrue(sql, sql.contains(", \"status\" AS \"collapse_key\""));
+    }
+
+    public void testACollapseKeyAliasStepsAroundAFieldOfItsName() {
+        // A field named collapse_key (or collapse_rank) would make the
+        // statement's own alias ambiguous, so the alias takes a leading underscore.
+        Map<String, Column> cols = new LinkedHashMap<>(columns());
+        cols.put("collapse_key", new Column("collapse_key", "str", false, false));
+        cols.put("collapse_rank", new Column("collapse_rank", "i64", false, false));
+        java.util.List<InfinoSearch.SortSpec> sorts = java.util.List.of(InfinoSearch.SortSpec.of(cols.get("collapse_key"), false), InfinoSearch.SortSpec.rowId());
+        InfinoSearch.Plan plan = new InfinoSearch.Plan(
+            TABLE,
+            cols,
+            translate(QueryBuilders.matchAllQuery()),
+            sorts,
+            null,
+            null,
+            cols.get("status"),
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertEquals("_collapse_key", InfinoSearch.freeAlias(plan, "collapse_key"));
+        String sql = InfinoSearch.hitStatement(plan, 10, false);
+        assertTrue(sql, sql.contains(", \"collapse_key\" AS \"collapse_key\", "));
+        assertTrue(sql, sql.contains(", \"status\" AS \"_collapse_key\""));
+        assertTrue(sql, sql.contains("AS \"_collapse_rank\" FROM ") && sql.contains("WHERE \"_collapse_rank\" = 1"));
+    }
+
+    public void testABooleanSortsMissingValueIsALong() {
+        // Stock's comparator reads a boolean as a long (true is 1), and its
+        // missing value as one: 1 ties with true, and text is refused.
+        Map<String, Column> cols = new LinkedHashMap<>(columns());
+        cols.put("ok", new Column("ok", "bool", false, false));
+        org.opensearch.search.sort.FieldSortBuilder one = org.opensearch.search.sort.SortBuilders.fieldSort("ok").missing(1);
+        InfinoSearch.SortSpec s = InfinoSearch.sorts(java.util.List.of(one), cols, NOW).get(0);
+        assertEquals("COALESCE(CAST(\"ok\" AS BIGINT), 1)", s.expr());
+        assertEquals(InfinoScriptTranslator.SqlType.INT, s.type());
+        assertFalse(s.missingStandIn(Long.MAX_VALUE));
+        org.opensearch.search.sort.FieldSortBuilder text = org.opensearch.search.sort.SortBuilders.fieldSort("ok").missing("1");
+        assertEquals("COALESCE(CAST(\"ok\" AS BIGINT), 1)", InfinoSearch.sorts(java.util.List.of(text), cols, NOW).get(0).expr());
+        org.opensearch.search.sort.FieldSortBuilder word = org.opensearch.search.sort.SortBuilders.fieldSort("ok").missing("true");
+        expectThrows(IllegalArgumentException.class, () -> InfinoSearch.sorts(java.util.List.of(word), cols, NOW));
+    }
+
+    public void testAFloatSortsMissingValueAtItsMappingsPrecision() {
+        // A float field's column holds each value as the 32-bit float stock
+        // keeps, and stock's comparator reads the missing value as one too.
+        Map<String, Column> cols = new LinkedHashMap<>(columns());
+        cols.put("took", new Column("took", "f64", false, false));
+        org.opensearch.search.sort.FieldSortBuilder sort = org.opensearch.search.sort.SortBuilders.fieldSort("took").missing(3.1);
+        assertEquals("COALESCE(\"took\", 3.0999999046325684)", InfinoSearch.sorts(java.util.List.of(sort), cols, java.util.Set.of("took"), NOW).get(0).expr());
+        org.opensearch.search.sort.FieldSortBuilder text = org.opensearch.search.sort.SortBuilders.fieldSort("took").missing("3.1");
+        assertEquals("COALESCE(\"took\", 3.0999999046325684)", InfinoSearch.sorts(java.util.List.of(text), cols, java.util.Set.of("took"), NOW).get(0).expr());
+        // A double keeps the value as written.
+        assertEquals("COALESCE(\"took\", 3.1)", InfinoSearch.sorts(java.util.List.of(sort), cols, NOW).get(0).expr());
+    }
+
+    public void testAnInfiniteMissingValuePutsTheMissingRowsOnItsSide() {
+        // No present value is infinite, so +Infinity is past every one: last
+        // ascending, first descending; -Infinity the other way; NaN as
+        // +Infinity. The statement holds no infinite literal.
+        Map<String, Column> cols = new LinkedHashMap<>(columns());
+        cols.put("took", new Column("took", "f64", false, false));
+        org.opensearch.search.sort.SortOrder asc = org.opensearch.search.sort.SortOrder.ASC;
+        org.opensearch.search.sort.SortOrder desc = org.opensearch.search.sort.SortOrder.DESC;
+        Object[][] cases = {
+            { "Infinity", asc, "\"took\" ASC NULLS LAST" },
+            { "Infinity", desc, "\"took\" DESC NULLS FIRST" },
+            { Double.POSITIVE_INFINITY, desc, "\"took\" DESC NULLS FIRST" },
+            { "-Infinity", asc, "\"took\" ASC NULLS FIRST" },
+            { "-Infinity", desc, "\"took\" DESC NULLS LAST" },
+            { "NaN", asc, "\"took\" ASC NULLS LAST" },
+            { 1e300, desc, "\"took\" DESC NULLS LAST" } };
+        for (Object[] c : cases) {
+            org.opensearch.search.sort.FieldSortBuilder sort = org.opensearch.search.sort.SortBuilders.fieldSort("took")
+                .order((org.opensearch.search.sort.SortOrder) c[1])
+                .missing(c[0]);
+            java.util.List<InfinoSearch.SortSpec> sorts = InfinoSearch.sorts(java.util.List.of(sort), cols, NOW);
+            if (c[0] instanceof Double d && Double.isFinite(d)) {
+                // A finite double stays one, past a float's range.
+                assertEquals("COALESCE(\"took\", 1.0E300)", sorts.get(0).expr());
+                // The same value on a float field is a float's infinity: the missing rows past every present one.
+                sorts = InfinoSearch.sorts(java.util.List.of(sort), cols, java.util.Set.of("took"), NOW);
+                assertEquals(java.util.List.of("\"took\" DESC NULLS FIRST"), InfinoSearch.orderBy(sorts));
+                continue;
+            }
+            assertEquals(java.util.Arrays.toString(c), java.util.List.of((String) c[2]), InfinoSearch.orderBy(sorts));
+        }
+        // The hit hands back the infinity, which a search_after reads back as missing.
+        org.opensearch.search.sort.FieldSortBuilder inf = org.opensearch.search.sort.SortBuilders.fieldSort("took").order(desc).missing("Infinity");
+        assertTrue(InfinoSearch.sorts(java.util.List.of(inf), cols, NOW).get(0).missingStandIn(Double.POSITIVE_INFINITY));
+    }
+
+    public void testASearchAfterPageIsOneStatementWhenNoMissingRowFollowsThePresentOnes() {
+        // Under missing: _first the missing rows come first, so none follow a
+        // present value; under a missing value none is missing at all.
+        org.opensearch.search.sort.SortOrder desc = org.opensearch.search.sort.SortOrder.DESC;
+        assertFalse(InfinoSearch.splitsMissingTail(afterSorted(statusSort(desc, "_first"), new Object[] { 404, "7" })));
+        assertFalse(InfinoSearch.splitsMissingTail(afterSorted(statusSort(desc, 300), new Object[] { 404, "7" })));
+        assertTrue(InfinoSearch.splitsMissingTail(afterSorted(statusSort(desc, "_last"), new Object[] { 404, "7" })));
+    }
+
+    public void testAScrollResumesFromItsLastHitsSortValuesAsTheyAre() {
+        // The plan reads a stand-in back as missing by its own sort; a scroll
+        // sorted under missing: Long.MAX_VALUE resumes from that value.
+        assertArrayEquals(
+            new Object[] { Long.MAX_VALUE, Long.MIN_VALUE, Double.POSITIVE_INFINITY, "a", null },
+            InfinoQueryPhaseSearcher.searchAfter(
+                new Object[] { Long.MAX_VALUE, Long.MIN_VALUE, Double.POSITIVE_INFINITY, new org.apache.lucene.util.BytesRef("a"), null }
+            )
+        );
+        assertFalse(statusSort(org.opensearch.search.sort.SortOrder.ASC, Long.MAX_VALUE).get(0).missingStandIn(Long.MAX_VALUE));
+        assertTrue(statusSort(org.opensearch.search.sort.SortOrder.ASC, null).get(0).missingStandIn(Long.MAX_VALUE));
     }
 
     public void testASearchAfterPageUnderMissingFirst() {

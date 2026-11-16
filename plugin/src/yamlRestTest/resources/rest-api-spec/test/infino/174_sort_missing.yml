@@ -804,3 +804,391 @@
           collapse: { field: n }
           sort: [ { n: { order: desc, missing: 3 } } ]
   - length: { hits.hits: 2 }
+
+---
+"A boolean sort's missing value is read as a long, as a Lucene twin reads it: 1 ties with true, text is refused":
+  - do:
+      indices.create:
+        index: sm7_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: boolean }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: sm7_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: boolean }
+              k: { type: keyword }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sm7_inf
+        body:
+          - index: { _id: "a" }
+          - { n: true, k: "a" }
+          - index: { _id: "b" }
+          - { k: "b" }
+          - index: { _id: "c" }
+          - { n: false, k: "c" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sm7_luc
+        body:
+          - index: { _id: "a" }
+          - { n: true, k: "a" }
+          - index: { _id: "b" }
+          - { k: "b" }
+          - index: { _id: "c" }
+          - { n: false, k: "c" }
+  - match: { errors: false }
+  - do:
+      search:
+        index: sm7_luc
+        body:
+          sort: [ { n: { order: asc, missing: 1 } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "c" }
+  - match: { hits.hits.1._id: "a" }
+  - match: { hits.hits.2._id: "b" }
+  - do:
+      search:
+        index: sm7_inf
+        body:
+          sort: [ { n: { order: asc, missing: 1 } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "c" }
+  - match: { hits.hits.1._id: "a" }
+  - match: { hits.hits.2._id: "b" }
+  - do:
+      catch: bad_request
+      search:
+        index: sm7_luc
+        body:
+          sort: [ { n: { order: asc, missing: "true" } } ]
+  - do:
+      catch: bad_request
+      search:
+        index: sm7_inf
+        body:
+          sort: [ { n: { order: asc, missing: "true" } } ]
+
+---
+"A float field's missing value is read as a float, as a Lucene twin reads it":
+  # The column holds 3.1 as the float stock keeps; a missing value of 3.1 read
+  # as a double would sort past it.
+  - do:
+      indices.create:
+        index: sm8_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: float }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: sm8_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: float }
+              k: { type: keyword }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sm8_inf
+        body:
+          - index: { _id: "a" }
+          - { n: 3.1, k: "a" }
+          - index: { _id: "b" }
+          - { k: "b" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sm8_luc
+        body:
+          - index: { _id: "a" }
+          - { n: 3.1, k: "a" }
+          - index: { _id: "b" }
+          - { k: "b" }
+  - match: { errors: false }
+  - do:
+      search:
+        index: sm8_luc
+        body:
+          sort: [ { n: { order: desc, missing: 3.1 } }, { k: asc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "a" }
+  - match: { hits.hits.1._id: "b" }
+  - do:
+      search:
+        index: sm8_inf
+        body:
+          sort: [ { n: { order: desc, missing: 3.1 } }, { k: asc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "a" }
+  - match: { hits.hits.1._id: "b" }
+
+---
+"An infinite missing value puts the rows missing the field past every present one, as a Lucene twin sorts them":
+  - do:
+      indices.create:
+        index: sm9_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: double }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: sm9_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: double }
+              k: { type: keyword }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sm9_inf
+        body:
+          - index: { _id: "a" }
+          - { n: 1.5, k: "a" }
+          - index: { _id: "b" }
+          - { k: "b" }
+          - index: { _id: "c" }
+          - { n: -2.5, k: "c" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sm9_luc
+        body:
+          - index: { _id: "a" }
+          - { n: 1.5, k: "a" }
+          - index: { _id: "b" }
+          - { k: "b" }
+          - index: { _id: "c" }
+          - { n: -2.5, k: "c" }
+  - match: { errors: false }
+  - do:
+      search:
+        index: sm9_luc
+        body:
+          sort: [ { n: { order: asc, missing: "Infinity" } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "c" }
+  - match: { hits.hits.1._id: "a" }
+  - match: { hits.hits.2._id: "b" }
+  - do:
+      search:
+        index: sm9_luc
+        body:
+          sort: [ { n: { order: desc, missing: "Infinity" } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "b" }
+  - match: { hits.hits.1._id: "a" }
+  - match: { hits.hits.2._id: "c" }
+  - do:
+      search:
+        index: sm9_luc
+        body:
+          sort: [ { n: { order: desc, missing: "-Infinity" } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "a" }
+  - match: { hits.hits.1._id: "c" }
+  - match: { hits.hits.2._id: "b" }
+  - do:
+      search:
+        index: sm9_inf
+        body:
+          sort: [ { n: { order: asc, missing: "Infinity" } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "c" }
+  - match: { hits.hits.1._id: "a" }
+  - match: { hits.hits.2._id: "b" }
+  - do:
+      search:
+        index: sm9_inf
+        body:
+          sort: [ { n: { order: desc, missing: "Infinity" } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "b" }
+  - match: { hits.hits.1._id: "a" }
+  - match: { hits.hits.2._id: "c" }
+  - do:
+      search:
+        index: sm9_inf
+        body:
+          sort: [ { n: { order: desc, missing: "-Infinity" } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "a" }
+  - match: { hits.hits.1._id: "c" }
+  - match: { hits.hits.2._id: "b" }
+
+---
+"A collapse beside a sort on a field named collapse_key is served, as a Lucene twin serves it":
+  - do:
+      indices.create:
+        index: sm10_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              collapse_key: { type: keyword }
+  - do:
+      indices.create:
+        index: sm10_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              collapse_key: { type: keyword }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sm10_inf
+        body:
+          - index: { _id: "a" }
+          - { n: 3, collapse_key: "x" }
+          - index: { _id: "b" }
+          - { n: 3, collapse_key: "y" }
+          - index: { _id: "c" }
+          - { n: 4, collapse_key: "w" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sm10_luc
+        body:
+          - index: { _id: "a" }
+          - { n: 3, collapse_key: "x" }
+          - index: { _id: "b" }
+          - { n: 3, collapse_key: "y" }
+          - index: { _id: "c" }
+          - { n: 4, collapse_key: "w" }
+  - match: { errors: false }
+  - do:
+      search:
+        index: sm10_luc
+        body:
+          collapse: { field: n }
+          sort: [ { collapse_key: asc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "c" }
+  - match: { hits.hits.1._id: "a" }
+  - match: { hits.hits.0.fields.n.0: 4 }
+  - match: { hits.hits.1.fields.n.0: 3 }
+  - do:
+      search:
+        index: sm10_inf
+        body:
+          collapse: { field: n }
+          sort: [ { collapse_key: asc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "c" }
+  - match: { hits.hits.1._id: "a" }
+  - match: { hits.hits.0.fields.n.0: 4 }
+  - match: { hits.hits.1.fields.n.0: 3 }
+
+---
+"A scroll under a missing value of the greatest long reaches every row missing the field, as a Lucene twin's does":
+  - do:
+      indices.create:
+        index: sm11_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: sm11_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              k: { type: keyword }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: sm11_inf
+        body:
+          - index: { _id: "p" }
+          - { n: 3, k: "p" }
+          - index: { _id: "m1" }
+          - { k: "m1" }
+          - index: { _id: "m2" }
+          - { k: "m2" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sm11_luc
+        body:
+          - index: { _id: "p" }
+          - { n: 3, k: "p" }
+          - index: { _id: "m1" }
+          - { k: "m1" }
+          - index: { _id: "m2" }
+          - { k: "m2" }
+  - match: { errors: false }
+  - do:
+      search:
+        index: sm11_luc
+        scroll: 1m
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: 9223372036854775807 } }, { k: asc } ]
+  - set: { _scroll_id: sid_luc }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p" }
+  - match: { hits.hits.1._id: "m1" }
+  - do:
+      scroll:
+        body: { scroll_id: $sid_luc, scroll: 1m }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "m2" }
+  - do:
+      clear_scroll:
+        body: { scroll_id: $sid_luc }
+  - do:
+      search:
+        index: sm11_inf
+        scroll: 1m
+        body:
+          size: 2
+          sort: [ { n: { order: asc, missing: 9223372036854775807 } }, { k: asc } ]
+  - set: { _scroll_id: sid_inf }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p" }
+  - match: { hits.hits.1._id: "m1" }
+  - do:
+      scroll:
+        body: { scroll_id: $sid_inf, scroll: 1m }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "m2" }
+  - do:
+      clear_scroll:
+        body: { scroll_id: $sid_inf }
