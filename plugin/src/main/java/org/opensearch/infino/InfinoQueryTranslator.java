@@ -371,7 +371,8 @@ final class InfinoQueryTranslator {
 
     /** A clause every hit matches: the root, or a must clause of a bool every hit matches. */
     private void required(QueryBuilder qb, double[] offset, List<Bonus> bonuses, List<TextClause> texts, boolean[] unscored) {
-        if (qb instanceof BoolQueryBuilder b) {
+        // A bool with no clause is a match_all: it scores its boost (constantScore).
+        if (qb instanceof BoolQueryBuilder b && b.hasClauses()) {
             // A filter or must_not clause scores nothing.
             for (QueryBuilder c : b.must()) {
                 required(c, offset, bonuses, texts, unscored);
@@ -471,7 +472,9 @@ final class InfinoQueryTranslator {
             || qb instanceof RangeQueryBuilder
             || qb instanceof ExistsQueryBuilder
             || qb instanceof IdsQueryBuilder
-            || qb instanceof MatchAllQueryBuilder) {
+            || qb instanceof MatchAllQueryBuilder
+            || qb instanceof BoolQueryBuilder b && !b.hasClauses()) {
+            // A bool with no clause is a match_all in stock, which scores its boost.
             return (double) qb.boost();
         }
         String field = null;
@@ -1253,6 +1256,10 @@ final class InfinoQueryTranslator {
         }
         if (qb instanceof ExistsQueryBuilder e) {
             return scoring(entryExists(e, path, scope), qb.boost());
+        }
+        if (qb instanceof BoolQueryBuilder b && !b.hasClauses()) {
+            // Stock reads a bool with no clause as a match_all: every entry scores its boost.
+            return scoring(e -> true, qb.boost());
         }
         if (qb instanceof BoolQueryBuilder b) {
             List<EntryScore> scored = new ArrayList<>();

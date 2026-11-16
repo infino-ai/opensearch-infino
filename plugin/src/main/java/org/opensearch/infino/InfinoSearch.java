@@ -82,6 +82,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 /**
  * Answers one {@code _search} for one Infino-backed index from its table,
@@ -548,6 +550,53 @@ public final class InfinoSearch {
         return plan.postWhere() == null ? count(plan.table(), q) : count(plan.table(), q.withWhere(plan.hitWhere()));
     }
 
+    /** A page's rows, and its exact total when it was counted before them (null otherwise). */
+    record CountedRows(List<Map<String, Object>> rows, Long total) {}
+
+    /**
+     * Whether a page's exact total is counted before its rows: a scored page
+     * ({@link #scoredPage}), the costliest statement to plan, when the
+     * request counts an exact total anyway ({@code count} and its
+     * {@code track_total_hits}).
+     */
+    static boolean countsFirst(SearchSourceBuilder source, boolean count, boolean scored) {
+        return scored && count && trackTotal(source);
+    }
+
+    /**
+     * A page's rows from {@code hits}, its total from {@code total} first
+     * when {@code countFirst}: a total of 0 leaves no hit to read, and the
+     * hit statement is not planned at all.
+     */
+    static CountedRows countedRows(boolean countFirst, LongSupplier total, Supplier<List<Map<String, Object>>> hits) {
+        if (!countFirst) {
+            return new CountedRows(hits.get(), null);
+        }
+        long counted = total.getAsLong();
+        return new CountedRows(counted == 0 ? List.of() : hits.get(), counted);
+    }
+
+    /** The page's rows from its hit statement, with their sources when they are read by id. */
+    private static List<Map<String, Object>> hitRows(Plan plan, SearchSourceBuilder source, int fetch, boolean seqNoAndPrimaryTerm) {
+        List<Map<String, Object>> rows;
+        if (splitsMissingTail(plan)) {
+            // The rows past a present first sort value come first; the
+            // rows missing it follow them all, so they are read only
+            // when the first part leaves the page short.
+            rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
+            if (rows.size() < fetch) {
+                rows = new ArrayList<>(rows);
+                rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
+            }
+        } else {
+            rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+        }
+        if (sourcesById(plan) && wantsSource(source)) {
+            rows = withSources(plan.table(), rows, fetch);
+        }
+        return rows;
+    }
+
     static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count) {
         final int from = Math.max(0, source.from());
         final int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
@@ -604,27 +653,14 @@ public final class InfinoSearch {
             // returns no sequence numbers, so a request for them takes the hit statement.
             TextClause text = q.principal();
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
-        } else if (exact && count && scoredPage(plan) && (counted = total(plan)) == 0) {
-            // A scored page is the costliest statement to plan, and the total is
-            // counted anyway: read first, a total of 0 leaves no hit to rank,
-            // and the statement is not planned.
-            rows = List.of();
         } else {
-            if (splitsMissingTail(plan)) {
-                // The rows past a present first sort value come first; the
-                // rows missing it follow them all, so they are read only
-                // when the first part leaves the page short.
-                rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
-                if (rows.size() < fetch) {
-                    rows = new ArrayList<>(rows);
-                    rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
-                }
-            } else {
-                rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
-            }
-            if (sourcesById(plan) && wantsSource(source)) {
-                rows = withSources(plan.table(), rows, fetch);
-            }
+            CountedRows read = countedRows(
+                countsFirst(source, count, scoredPage(plan)),
+                () -> total(plan),
+                () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm)
+            );
+            rows = read.rows();
+            counted = read.total();
             shortPage = rows.size() < fetch && shortPageIsTotal(plan);
         }
 
@@ -1641,7 +1677,10 @@ public final class InfinoSearch {
         }
         if (pages.size() > 1) {
             boolean sorted = all.stream().anyMatch(h -> h.getSortValues().length > 0);
-            all.sort(sorted ? bySortValues(sorts) : Comparator.comparing(SearchHit::getScore, Comparator.reverseOrder()));
+            Comparator<SearchHit> byScore = sortsByScoreAscending(source)
+                ? Comparator.comparing(SearchHit::getScore)
+                : Comparator.comparing(SearchHit::getScore, Comparator.reverseOrder());
+            all.sort(sorted ? bySortValues(sorts) : byScore);
         }
         int from = Math.max(0, source.from());
         int size = source.size() < 0 ? DEFAULT_SIZE : source.size();

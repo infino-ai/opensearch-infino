@@ -662,6 +662,64 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
     }
 
     /**
+     * Under a similarity other than the default BM25 (the index's default or
+     * the field's own), a term on a boolean field or a use_similarity keyword
+     * keeps its boost as its score, as Lucene's boolean similarity gives it,
+     * and nothing is counted for it.
+     */
+    public void testATermUnderAnotherSimilarityKeepsItsBoost() {
+        Map<String, Column> cols = columns();
+        cols.put("flag", new Column("flag", "bool", false, false).scoredByOtherSimilarity());
+        cols.put("tag", new Column("tag", "str", false, false).scoredBySimilarity().scoredByOtherSimilarity());
+        for (org.opensearch.index.query.QueryBuilder term : java.util.List.<org.opensearch.index.query.QueryBuilder>of(
+            QueryBuilders.termQuery("flag", true),
+            QueryBuilders.termQuery("tag", "x").boost(2)
+        )) {
+            java.util.List<String> statements = new java.util.ArrayList<>();
+            BoolQueryBuilder b = QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(term);
+            Translation t = InfinoQueryTranslator.translate(b, cols, TABLE, NOW, counts(statements, 5, 3));
+            assertEquals(term.toString(), java.util.List.of((double) term.boost()), t.scoring().bonuses().get(0).values());
+            assertTrue(statements.toString(), statements.isEmpty());
+        }
+    }
+
+    /**
+     * A field scores by another similarity when its mapping names one other
+     * than BM25, or names none under an index whose default is another; a
+     * keyword multi-field by its own mapping's, not its field's.
+     */
+    public void testAMappingNamesTheFieldsScoredByAnotherSimilarity() {
+        String mapping = "{\"properties\":{"
+            + "\"f\":{\"type\":\"boolean\"},"
+            + "\"b\":{\"type\":\"keyword\",\"similarity\":\"boolean\",\"fields\":{\"raw\":{\"type\":\"keyword\"}}},"
+            + "\"m\":{\"type\":\"keyword\",\"similarity\":\"BM25\"}}}";
+        InfinoNative.Mapping bm25 = InfinoNative.Mapping.of(mapping, true);
+        assertEquals(java.util.Set.of("b"), bm25.otherSimilarityFields());
+        InfinoNative.Mapping other = InfinoNative.Mapping.of(mapping, false);
+        assertEquals(java.util.Set.of("f", "b", "b.raw"), other.otherSimilarityFields());
+
+        assertTrue(InfinoTables.defaultBm25(org.opensearch.common.settings.Settings.EMPTY));
+        assertTrue(InfinoTables.defaultBm25(org.opensearch.common.settings.Settings.builder().put("index.similarity.default.type", "BM25").build()));
+        assertFalse(InfinoTables.defaultBm25(org.opensearch.common.settings.Settings.builder().put("index.similarity.default.type", "boolean").build()));
+        assertFalse(
+            InfinoTables.defaultBm25(
+                org.opensearch.common.settings.Settings.builder()
+                    .put("index.similarity.default.type", "BM25")
+                    .put("index.similarity.default.k1", "2.0")
+                    .build()
+            )
+        );
+    }
+
+    /** A bool with no clause is a match_all, as stock reads it: it scores its boost, in must and in should. */
+    public void testABoolWithNoClauseScoresAsMatchAll() {
+        Translation t = translate(QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(QueryBuilders.boolQuery()));
+        assertEquals(1.0, t.scoring().offset(), 1e-9);
+        t = translate(QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.boolQuery().boost(3)));
+        assertEquals(java.util.List.of(3.0), t.scoring().bonuses().get(0).values());
+    }
+
+    /**
      * Where documents give the boolean field several values, a term's
      * frequency and the field's average length vary by document: the table
      * cannot score it, and with no ranked clause the hits keep one score.

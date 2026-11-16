@@ -795,6 +795,42 @@
   - gt: { hits.hits.3._score: -0.001000 }
   - lt: { hits.hits.3._score: 0.001000 }
 
+  # A bool with no clause inside the nested query is a match_all: each entry scores 1.0.
+  - do:
+      search:
+        index: nsc_luc
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "query": {"bool": {}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 1.359376 }
+  - lt: { hits.hits.0._score: 1.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 1.284643 }
+  - lt: { hits.hits.1._score: 1.286643 }
+  - match: { hits.hits.2._id: d2 }
+  - gt: { hits.hits.2._score: 1.221566 }
+  - lt: { hits.hits.2._score: 1.223566 }
+  - match: { hits.hits.3._id: d5 }
+  - gt: { hits.hits.3._score: 0.999000 }
+  - lt: { hits.hits.3._score: 1.001000 }
+  - do:
+      search:
+        index: nsc_inf
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "query": {"bool": {}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 1.359376 }
+  - lt: { hits.hits.0._score: 1.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 1.284643 }
+  - lt: { hits.hits.1._score: 1.286643 }
+  - match: { hits.hits.2._id: d2 }
+  - gt: { hits.hits.2._score: 1.221566 }
+  - lt: { hits.hits.2._score: 1.223566 }
+  - match: { hits.hits.3._id: d5 }
+  - gt: { hits.hits.3._score: 0.999000 }
+  - lt: { hits.hits.3._score: 1.001000 }
+
   # In must, the nested clause adds its score to every hit: a pair of terms on one entry scores 2.0.
   - do:
       search:
