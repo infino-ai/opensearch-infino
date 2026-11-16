@@ -574,13 +574,23 @@ public final class InfinoSearch {
     /**
      * The page's rows from its hit statement, with their sources when they are
      * read by id; every row in no order ({@link #everyRowPage}) is the
-     * engine's first rows in storage order, read with no statement planned.
+     * engine's first rows in storage order, and a predicate's rows in no order
+     * ({@link #filteredRowPage}) the first of those it keeps, both read with
+     * no statement planned.
      */
     private static List<Map<String, Object>> hitRows(Plan plan, SearchSourceBuilder source, int fetch, boolean seqNoAndPrimaryTerm) {
         List<Map<String, Object>> rows;
         if (everyRowPage(plan) && !seqNoAndPrimaryTerm) {
             // Null when the table answers no head call: the statement is planned as before.
             rows = InfinoNative.headRows(plan.table(), fetch, wantsSource(source));
+            if (rows != null) {
+                return rows;
+            }
+        }
+        if (filteredRowPage(plan) && !seqNoAndPrimaryTerm) {
+            // Null when the engine cannot check the predicate alone, or reads
+            // too far without filling the page: the statement is planned then.
+            rows = InfinoNative.headRowsWhere(plan.table(), plan.hitWhere(), fetch, wantsSource(source));
             if (rows != null) {
                 return rows;
             }
@@ -825,6 +835,24 @@ public final class InfinoSearch {
             && plan.query().principal() == null
             && !plan.query().scoring().reorders()
             && InfinoQueryTranslator.ALL.equals(plan.hitWhere())
+            && plan.sorts().isEmpty()
+            && plan.searchAfter() == null
+            && plan.collapse() == null
+            && plan.scriptFields().isEmpty();
+    }
+
+    /**
+     * Whether the page is the rows a predicate keeps in no order: what {@link
+     * #everyRowPage} reads, under a predicate. The engine reads it as the
+     * first rows in storage order the predicate keeps ({@link
+     * InfinoNative#headRowsWhere}), stock returning such a filter's hits in
+     * no order either.
+     */
+    static boolean filteredRowPage(Plan plan) {
+        return plan.vector() == null
+            && plan.query().principal() == null
+            && !plan.query().scoring().reorders()
+            && !InfinoQueryTranslator.ALL.equals(plan.hitWhere())
             && plan.sorts().isEmpty()
             && plan.searchAfter() == null
             && plan.collapse() == null

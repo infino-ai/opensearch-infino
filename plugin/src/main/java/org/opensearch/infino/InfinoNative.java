@@ -1174,6 +1174,22 @@ public final class InfinoNative {
     }
 
     /**
+     * The first {@code k} live rows of table {@code n} that {@code predicate}
+     * (an SQL condition over its columns) keeps, in storage order, each with
+     * its id and, when {@code withSource}, its source: the page of a search
+     * that keeps a predicate's rows in no order, in one engine call with no
+     * statement to plan. Null when the engine cannot check the predicate
+     * alone or finds too few rows to fill the page early, for the caller to
+     * plan the statement.
+     */
+    public static List<Map<String, Object>> headRowsWhere(String n, String predicate, int k, boolean withSource) {
+        init();
+        String out = takeOrThrow(lib.infino_head_where(conn, n, predicate, k, withSource ? 1 : 0)).trim();
+        log.debug("[infino] head_where: {} k={} where {} -> {} chars", n, k, predicate, out.length());
+        return out.equals("null") ? null : rows(out);
+    }
+
+    /**
      * A column's rows counted per value, without a statement: one row per
      * value (under the column's name, null for the rows without one) with its
      * count under {@link #VALUE_COUNT}. The engine reads them from the table's

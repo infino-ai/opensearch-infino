@@ -3282,6 +3282,58 @@ pub unsafe extern "C" fn infino_head(
     .unwrap_or(ptr::null_mut())
 }
 
+/// The table's first `k` live rows `predicate` keeps (an SQL expression over
+/// its columns), in storage order, each carrying `osid` and, when
+/// `with_source` is non-zero, `source`: the page a search that keeps a
+/// predicate's rows in no order asks for, in one call with no statement
+/// planned. The engine checks the predicate a row group at a time over the
+/// columns it names, kept decoded across calls, and skips a superfile whose
+/// value tables show none of its values passes. `null`, for the caller to
+/// plan the statement, when the predicate does not parse as one expression
+/// over the table's columns, when the engine cannot check it alone, when it
+/// keeps too few rows to fill the page within some dozens of row groups,
+/// and from a hosted table. The literals are coerced to the columns' types
+/// first, as a statement would read them.
+#[no_mangle]
+pub unsafe extern "C" fn infino_head_where(
+    h: *mut Bridge,
+    name: *const c_char,
+    predicate: *const c_char,
+    k: c_int,
+    with_source: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(predicate)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(predicate) })
+        else {
+            return ptr::null_mut();
+        };
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let schema = match DFSchema::try_from(table.schema().as_ref().clone()) {
+            Ok(s) => s,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let Ok(filter) = predicate_parser()
+            .parse_sql_expr(predicate, &schema)
+            .and_then(|expr| expr.rewrite(&mut TypeCoercionRewriter::new(&schema)))
+            .map(|t| t.data)
+        else {
+            return out_string("null".to_string());
+        };
+        let with = [OSID, SOURCE];
+        let projection = if with_source != 0 { &with[..] } else { &with[..1] };
+        match table.head_where(&filter, k.max(0) as usize, Some(projection)) {
+            Ok(Some(b)) => out_string(batches_to_json(&b)),
+            Ok(None) => out_string("null".to_string()),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// Unranked full-text match set: the osids of every row matching `query` on
 /// `column`. Backs query-scoped aggregations over a text query.
 #[no_mangle]

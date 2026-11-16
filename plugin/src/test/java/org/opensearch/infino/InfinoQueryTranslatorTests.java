@@ -206,6 +206,31 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
     }
 
+    public void testAPredicatesRowsInNoOrderAreTheEnginesFilteredHead() {
+        // A predicate's rows in no order: the first the engine's head call keeps.
+        assertTrue(InfinoSearch.filteredRowPage(pagePlan(QueryBuilders.termQuery("level", "error"), java.util.List.of())));
+        assertTrue(
+            InfinoSearch.filteredRowPage(
+                pagePlan(QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error")), java.util.List.of())
+            )
+        );
+        // Every row is the plain head call's; a text query or a sort reads through the hit statement.
+        assertFalse(InfinoSearch.filteredRowPage(pagePlan(QueryBuilders.matchAllQuery(), java.util.List.of())));
+        assertFalse(InfinoSearch.filteredRowPage(pagePlan(QueryBuilders.matchQuery("message", "fox"), java.util.List.of())));
+        assertFalse(
+            InfinoSearch.filteredRowPage(
+                pagePlan(QueryBuilders.termQuery("level", "error"), java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true)))
+            )
+        );
+        // A should clause that ranks the rows it keeps is read in score order.
+        BoolQueryBuilder ranked = QueryBuilders.boolQuery()
+            .filter(QueryBuilders.termQuery("level", "error"))
+            .should(QueryBuilders.termQuery("status", 500));
+        InfinoSearch.Plan rankedPlan = pagePlan(ranked, java.util.List.of());
+        assertTrue(rankedPlan.query().scoring().reorders());
+        assertFalse(InfinoSearch.filteredRowPage(rankedPlan));
+    }
+
     public void testASortedPageReadsItsSourcesAfterTheSort() {
         // The sort weighs every row it keeps; its statement selects ids and sort
         // values only, and the page's sources are read by id afterwards.
