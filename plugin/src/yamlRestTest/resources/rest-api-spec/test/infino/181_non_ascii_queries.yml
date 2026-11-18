@@ -1,0 +1,93 @@
+# Searches whose text is not ASCII answer as stock whatever the node's locale.
+# The engine gets statements as JNA strings; under a non-UTF-8 locale such as
+# LANG=C every non-ASCII character used to become '?', so these found nothing.
+setup:
+  - do:
+      indices.create:
+        index: nonascii_lucene
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text } } }
+  - do:
+      indices.create:
+        index: nonascii_default
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text } } }
+  - do:
+      indices.create:
+        index: nonascii_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: nonascii_lucene, _id: "1" }
+          - { message: "ไทย" }
+          - index: { _index: nonascii_lucene, _id: "2" }
+          - { message: "café crème" }
+          - index: { _index: nonascii_lucene, _id: "3" }
+          - { message: "東京 タワー" }
+          - index: { _index: nonascii_lucene, _id: "4" }
+          - { message: "cache" }
+          - index: { _index: nonascii_default, _id: "1" }
+          - { message: "ไทย" }
+          - index: { _index: nonascii_default, _id: "2" }
+          - { message: "café crème" }
+          - index: { _index: nonascii_default, _id: "3" }
+          - { message: "東京 タワー" }
+          - index: { _index: nonascii_default, _id: "4" }
+          - { message: "cache" }
+          - index: { _index: nonascii_proxy, _id: "1" }
+          - { message: "ไทย" }
+          - index: { _index: nonascii_proxy, _id: "2" }
+          - { message: "café crème" }
+          - index: { _index: nonascii_proxy, _id: "3" }
+          - { message: "東京 タワー" }
+          - index: { _index: nonascii_proxy, _id: "4" }
+          - { message: "cache" }
+
+---
+"A match on a non-ASCII word finds its document as stock does":
+  - do: { search: { index: nonascii_lucene, body: { query: { match: { message: "café" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do: { search: { index: nonascii_default, body: { query: { match: { message: "café" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do: { search: { index: nonascii_proxy, body: { query: { match: { message: "café" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do: { search: { index: nonascii_lucene, body: { query: { match: { message: { query: "ไทย", operator: and } } } } } }
+  - match: { hits.total.value: 1 }
+  - do: { search: { index: nonascii_default, body: { query: { match: { message: { query: "ไทย", operator: and } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do: { search: { index: nonascii_proxy, body: { query: { match: { message: { query: "ไทย", operator: and } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do: { search: { index: nonascii_lucene, body: { query: { match: { message: { query: "東京", operator: and } } } } } }
+  - match: { hits.total.value: 1 }
+  - do: { search: { index: nonascii_default, body: { query: { match: { message: { query: "東京", operator: and } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - do: { search: { index: nonascii_proxy, body: { query: { match: { message: { query: "東京", operator: and } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - do:
+      indices.delete:
+        index: nonascii_lucene,nonascii_default,nonascii_proxy
+
+---
+"A query string mixing a non-ASCII word with an ASCII one counts both":
+  - do: { search: { index: nonascii_lucene, body: { query: { query_string: { query: "message:café OR message:cache" } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: nonascii_default, body: { query: { query_string: { query: "message:café OR message:cache" } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: nonascii_proxy, body: { query: { query_string: { query: "message:café OR message:cache" } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      indices.delete:
+        index: nonascii_lucene,nonascii_default,nonascii_proxy
