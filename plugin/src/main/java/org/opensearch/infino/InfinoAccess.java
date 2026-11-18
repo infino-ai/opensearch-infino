@@ -14,6 +14,7 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.infino.InfinoNative.Column;
@@ -68,6 +69,59 @@ record InfinoAccess(
 
     /** No restriction: the request sees the index whole. */
     static final InfinoAccess NONE = new InfinoAccess(null, null, null, null);
+
+    /** The security plugin's index when its {@code plugins.security.config_index_name} is unset. */
+    static final String DEFAULT_SECURITY_INDEX = ".opendistro_security";
+
+    /** A document rule that keeps no row. */
+    private static final List<QueryBuilder> NO_ROW = List.of(new MatchNoneQueryBuilder());
+
+    /** A read of the security plugin's own index: no row of it (see {@link #reading}). */
+    static final InfinoAccess NO_ROWS = new InfinoAccess(NO_ROW, null, null);
+
+    private static volatile String securityIndex = DEFAULT_SECURITY_INDEX;
+
+    /** Whether the security plugin runs on this node, and so hides its own index from a read (see {@link #reading}). */
+    private static volatile boolean securityRuns = true;
+
+    /** The security plugin's own index on this node, from its {@code plugins.security.config_index_name}. */
+    static void securityIndex(String name) {
+        securityIndex = name == null || name.isEmpty() ? DEFAULT_SECURITY_INDEX : name;
+    }
+
+    /** Whether the security plugin runs on this node (see {@link InfinoSecurityCalls#runs}). */
+    static void securityRuns(boolean runs) {
+        securityRuns = runs;
+    }
+
+    /** What a search may read of {@code index} (see {@link #reading}). */
+    static InfinoAccess searching(String index) {
+        return reading(index, InfinoSecurityCalls.SEARCH);
+    }
+
+    /**
+     * What a search, get or SQL read may read of {@code index}; {@code what}
+     * names the request in a refusal. The security plugin's own index (its
+     * users, password hashes and roles) reads as holding no row, as that
+     * plugin shows it on a Lucene index: a search through its reader, and a
+     * get too, which it turns non-realtime so the same reader answers it. The
+     * table would otherwise hand the index to anyone whose role reads
+     * {@code *}. As there, only while the security plugin runs, and not for an
+     * admin certificate or one of its own configuration reads, which load the
+     * configuration by id, from the table (see
+     * {@link InfinoSecurityCalls#readsSecurityIndex}).
+     */
+    static InfinoAccess reading(String index, String what) {
+        if (securityRuns && index.equals(securityIndex) && !InfinoSecurity.readsSecurityIndex()) {
+            return NO_ROWS;
+        }
+        return InfinoSecurity.access(index, what);
+    }
+
+    /** Whether the request reads no row of the index (see {@link #reading}). */
+    boolean readsNothing() {
+        return documents == NO_ROW;
+    }
 
     InfinoAccess(List<QueryBuilder> documents, Predicate<String> fieldVisible, Function<String, UnaryOperator<String>> maskOf) {
         this(documents, fieldVisible, maskOf, null);

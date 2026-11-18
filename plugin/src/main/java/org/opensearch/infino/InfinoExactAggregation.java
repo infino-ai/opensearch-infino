@@ -151,6 +151,17 @@ final class InfinoExactAggregation extends InternalAggregation {
         if (builder == null) {
             throw new IllegalStateException("[infino] the search names no aggregation [" + getName() + "]");
         }
+        // A part the search reads no row of (the security plugin's own index) adds nothing to the answer.
+        List<Part> read = new ArrayList<>();
+        for (Part p : all) {
+            InfinoAccess access = routed.access().get(p.index());
+            if (access == null || !access.readsNothing()) {
+                read.add(p);
+            }
+        }
+        if (!read.isEmpty()) {
+            all = read;
+        }
         // One order whatever order the shards answered in, so the statement is the same.
         all.sort(Comparator.comparing(Part::index).thenComparing(Part::table));
         boolean severalIndices = all.stream().map(Part::index).distinct().count() > 1;

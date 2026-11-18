@@ -16,3 +16,6 @@ bench/*.out
 
 # Docker compose secrets
 .env
+
+# Python bytecode
+__pycache__/

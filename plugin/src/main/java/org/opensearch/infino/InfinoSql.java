@@ -205,7 +205,7 @@ final class InfinoSql {
                     continue; // as a search over a pattern reads only the indices it may
                 }
                 IndexMetadata md = infinoIndex(state, name, index);
-                InfinoAccess access = InfinoSecurity.access(index, WHAT);
+                InfinoAccess access = InfinoAccess.reading(index, WHAT);
                 // An index in default mode keeps its rows in a table per shard: each is a part.
                 for (String table : InfinoPlugin.tables().ensureAll(md)) {
                     Map<String, Column> columns = InfinoNative.columns(table);

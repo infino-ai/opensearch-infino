@@ -40,8 +40,8 @@ use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
-use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::common::tree_node::TreeNode;
@@ -447,6 +447,9 @@ pub struct Bridge {
     /// one value at, from the mapping's `_data_stream_timestamp` (set with
     /// [`Bridge::kept`]).
     stamps: RwLock<HashMap<String, Arc<str>>>,
+    /// Each table's [`Gate`], by name: the order in which this node's
+    /// writes take the table's writer.
+    gates: Mutex<HashMap<String, Arc<Gate>>>,
 }
 
 impl Bridge {
@@ -506,6 +509,12 @@ impl Bridge {
         if let Ok(mut tables) = self.tables.write() {
             tables.remove(name);
         }
+    }
+
+    /// The [`Gate`] of `name`'s writes on this node.
+    fn gate(&self, name: &str) -> Arc<Gate> {
+        let mut gates = self.gates.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(gates.entry(name.to_string()).or_default())
     }
 }
 
@@ -589,6 +598,7 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
         hosted,
         kept: RwLock::new(HashMap::new()),
         stamps: RwLock::new(HashMap::new()),
+        gates: Mutex::new(HashMap::new()),
     })
 }
 
@@ -724,6 +734,11 @@ struct MappedField {
     path: String,
     data_type: DataType,
     fts: bool,
+    /// A `keyword` field the mapping indexes: the table gives it a full-text
+    /// index without positions, so `=` and `IN` are answered from its
+    /// dictionary instead of a scan. Reported to the plugin as no text index
+    /// ([`infino_columns`]), so it is still read as a keyword.
+    exact: bool,
     vector: Option<(usize, Metric)>,
     /// A numeric or date field the mapping indexes, as OpenSearch indexes
     /// every such field for ranges unless it says `"index": false`: the
@@ -1116,6 +1131,7 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             path,
             data_type,
             fts,
+            exact: ty == Some("keyword") && indexed,
             vector,
             range: ranged && indexed,
             precision: ty.and_then(|ty| Precision::of(ty, def)),
@@ -1179,13 +1195,24 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                     }),
                     _ => None,
                 });
+            // The index a keyword field added now gets: the same, without positions.
+            let exact_index = text_index.clone().map(|index| match index {
+                ColumnIndex::Fts { stopwords, stemmer, stored, bm25, .. } => ColumnIndex::Fts {
+                    stopwords,
+                    stemmer,
+                    positions: false,
+                    stored,
+                    bm25,
+                },
+                other => other,
+            });
             let mut conflicts: Vec<String> = Vec::new();
             for f in &mapped {
                 let present = schema.field_with_name(&f.path).is_ok();
                 let indexed = table_schema
                     .fields()
                     .iter()
-                    .any(|c| c.name == f.path && matches!(c.index, Some(ColumnIndex::Fts { .. })));
+                    .any(|c| c.name == f.path && is_text_index(&c.name, &c.index));
                 // A column's index is fixed when the column is added, so a text field
                 // the table holds without one cannot be served as text.
                 if f.fts && present && !indexed {
@@ -1228,8 +1255,9 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                     if f.range {
                         patch.with_index(ColumnIndex::Range)
                     } else {
-                        match (&text_index, f.fts) {
-                            (Some(index), true) => patch.with_index(index.clone()),
+                        match (&text_index, &exact_index, f.fts, f.exact) {
+                            (Some(index), _, true, _) => patch.with_index(index.clone()),
+                            (_, Some(index), false, true) => patch.with_index(index.clone()),
                             _ => patch,
                         }
                     }
@@ -1246,9 +1274,10 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
             }
             let added = patches.len();
             if added > 0 {
-                table
-                    .apply_schema(&SchemaPatch::new(patches), None)
-                    .map_err(|e| e.to_string())?;
+                let patch = SchemaPatch::new(patches);
+                let gate = bridge.gate(name);
+                let _pass = gate.whole();
+                waiting(|| table.apply_schema(&patch, None)).map_err(|e| e.to_string())?;
             }
             Ok(json!({ "created": false, "added": added }))
         }
@@ -1269,6 +1298,8 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                     // Positions let a quoted phrase match adjacent terms in
                     // order (match_phrase, quoted atoms of a query_string).
                     spec = spec.fts(FtsField::new(f.path.clone()).positions(true));
+                } else if f.exact {
+                    spec = spec.fts(FtsField::new(f.path.clone()));
                 }
                 if let Some((dim, metric)) = f.vector {
                     spec = spec.vector(f.path.clone(), dim, metric);
@@ -1328,6 +1359,17 @@ fn type_name(dt: &DataType) -> &'static str {
     }
 }
 
+/// Whether a column's index serves it as text: a full-text index with
+/// positions, as a mapped `text` field gets, or the id column's. A `keyword`
+/// field's index has no positions: the column is still a keyword, answered
+/// exactly, whose dictionary only spares `=` and `IN` a scan.
+fn is_text_index(column: &str, index: &Option<ColumnIndex>) -> bool {
+    match index {
+        Some(ColumnIndex::Fts { positions, .. }) => *positions || column == OSID,
+        _ => false,
+    }
+}
+
 /// Columns of a table as JSON `[{"name","type","elem","fts","vector"}]`,
 /// type in {i64,f64,bool,str,ts,vec,list,other}, `elem` a list column's
 /// element type (null for any other). `""` if the table is absent.
@@ -1354,7 +1396,7 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                             "name": f.name,
                             "type": type_name(&f.data_type),
                             "elem": elem,
-                            "fts": matches!(f.index, Some(ColumnIndex::Fts { .. })),
+                            "fts": is_text_index(&f.name, &f.index),
                             "vector": matches!(f.index, Some(ColumnIndex::Vector { .. })),
                         })
                     })
@@ -1831,7 +1873,12 @@ fn ensure_list_columns(
         return Ok(false);
     }
     let table = bridge.table(name).map_err(|e| e.to_string())?;
-    let applied = table.apply_schema(&SchemaPatch::new(patches), None);
+    let patch = SchemaPatch::new(patches);
+    let applied = {
+        let gate = bridge.gate(name);
+        let _pass = gate.whole();
+        waiting(|| table.apply_schema(&patch, None))
+    };
     // The cached handle predates the change either way.
     bridge.forget(name);
     if let Err(e) = applied {
@@ -1843,23 +1890,143 @@ fn ensure_list_columns(
     Ok(true)
 }
 
+/// Run `write` until the table's writer is free for it, for up to ten
+/// seconds. Appends to one table run at once, sharing its writer; an append
+/// whose batch adds a column takes the writer whole, and is refused at once
+/// while another holds it (several first appends of a new field race for
+/// it). A write is all or nothing, so a refused one is run again once the
+/// other lands: by then the column exists and it shares the writer. The
+/// writes this node takes the writer whole for (a replace, a delete, a
+/// schema change) go through the table's [`Gate`] instead, so a write that
+/// shares the writer never waits here for one of those.
+fn waiting<T>(mut write: impl FnMut() -> Result<T, InfinoError>) -> Result<T, InfinoError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pause = Duration::from_millis(5);
+    loop {
+        match write() {
+            Err(InfinoError::Conflict(_)) if Instant::now() < deadline => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(200));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// The order in which this node's writes to one table take its writer. The
+/// engine shares the writer among appends and gives it whole to a replace,
+/// a delete or a schema change, which waits for the appends in flight; but
+/// a write that finds the writer held whole, or claimed, is refused at once
+/// rather than waiting. Appends to one table run at once, so without the
+/// gate two replaces (or deletes) of different ids would refuse each other,
+/// and the appends behind a long replace would give up after
+/// [`waiting`]'s deadline. Through the gate, appends pass together, and a
+/// whole write passes alone: it stops new appends, waits for those passing
+/// to finish, and they wait for it, as long as it runs.
+///
+/// A pass is held only around one engine call, never across another pass:
+/// an append that waited on the gate while holding a pass would never get
+/// one once a whole write claimed the gate.
+#[derive(Default)]
+struct Gate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    /// Appends passing.
+    shared: usize,
+    /// A whole write passing, or waiting for the appends passing to finish.
+    whole: bool,
+}
+
+/// A write's way through a [`Gate`]; dropping it lets the next ones through.
+struct Pass<'a> {
+    gate: &'a Gate,
+    whole: bool,
+}
+
+impl Gate {
+    fn lock(&self) -> MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn wait<'a>(&self, state: MutexGuard<'a, GateState>) -> MutexGuard<'a, GateState> {
+        self.changed
+            .wait(state)
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Pass beside the other appends, once no whole write passes or waits.
+    fn append(&self) -> Pass<'_> {
+        let mut state = self.lock();
+        while state.whole {
+            state = self.wait(state);
+        }
+        state.shared += 1;
+        Pass {
+            gate: self,
+            whole: false,
+        }
+    }
+
+    /// Pass alone: claim the gate, then wait for the appends passing.
+    fn whole(&self) -> Pass<'_> {
+        let mut state = self.lock();
+        while state.whole {
+            state = self.wait(state);
+        }
+        state.whole = true;
+        while state.shared > 0 {
+            state = self.wait(state);
+        }
+        Pass {
+            gate: self,
+            whole: true,
+        }
+    }
+}
+
+impl Drop for Pass<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.lock();
+        if self.whole {
+            state.whole = false;
+        } else {
+            state.shared -= 1;
+        }
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
+
 /// Append rows, isolating the ones the engine refuses: a refused batch is
 /// split in halves until each refused document stands alone and is reported
 /// with the engine's reason, while every accepted half is one append.
-fn append_checked(table: &Supertable, rows: &[(usize, Value)], failed: &mut Vec<Value>) {
+fn append_checked(
+    table: &Supertable,
+    gate: &Gate,
+    rows: &[(usize, Value)],
+    failed: &mut Vec<Value>,
+) {
     if rows.is_empty() {
         return;
     }
     let values: Vec<Value> = rows.iter().map(|(_, v)| v.clone()).collect();
-    match table.append_rows(&values) {
+    let appended = {
+        let _pass = gate.append();
+        waiting(|| table.append_rows(&values))
+    };
+    match appended {
         Ok(()) => {}
         Err(e) if rows.len() == 1 => {
             failed.push(json!({ "i": rows[0].0, "reason": e.to_string() }));
         }
         Err(_) => {
             let (a, b) = rows.split_at(rows.len() / 2);
-            append_checked(table, a, failed);
-            append_checked(table, b, failed);
+            append_checked(table, gate, a, failed);
+            append_checked(table, gate, b, failed);
         }
     }
 }
@@ -1928,7 +2095,7 @@ pub unsafe extern "C" fn infino_index_batch(
             .zip(maps)
             .map(|((i, _), m)| (*i, Value::Object(m)))
             .collect();
-        append_checked(&table, &indexed, &mut failed);
+        append_checked(&table, &conn.gate(name), &indexed, &mut failed);
         let ok = n - failed.len();
         out_json(json!({ "ok": ok, "failed": failed }))
     }))
@@ -1980,7 +2147,7 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             Err(e) => return err_json(&e.to_string()),
         };
         let n = prepared.n;
-        let failed = append_prepared(&table, vec![prepared], &[], &[]);
+        let failed = append_prepared(&table, &conn.gate(name), vec![prepared], &[], &[]);
         let failed: Vec<Value> = failed
             .into_iter()
             .map(|(_, i, reason)| json!({ "i": i, "reason": reason }))
@@ -2274,6 +2441,7 @@ fn stamp_seqs(p: &mut Prepared, seqs: &[i64]) -> Result<(), String> {
 /// (batch index, document index, reason).
 fn append_prepared(
     table: &Supertable,
+    gate: &Gate,
     mut prepared: Vec<Prepared>,
     replaced: &[String],
     seqs: &[Vec<i64>],
@@ -2313,7 +2481,8 @@ fn append_prepared(
     let mut fresh_landed = joined.is_none();
     if let Some(batch) = &joined {
         if replaced.is_empty() {
-            fresh_landed = table.append(batch).is_ok();
+            let _pass = gate.append();
+            fresh_landed = waiting(|| table.append(batch)).is_ok();
         } else {
             match split_by_osid(batch, replaced) {
                 Some((replacing, fresh)) => {
@@ -2325,14 +2494,21 @@ fn append_prepared(
                         let carried = osids_of(&replacing);
                         let pred = col(OSID)
                             .in_list(carried.iter().map(|s| lit(s.clone())).collect(), false);
-                        if let Err(e) = table.update(pred, &replacing) {
+                        let replace = {
+                            let _pass = gate.whole();
+                            waiting(|| table.update(pred.clone(), &replacing))
+                        };
+                        if let Err(e) = replace {
                             let why = format!("replace: {e}");
                             for (b, i) in replaced_rows(&prepared, &carried) {
                                 failed.push((b, i, why.clone()));
                             }
                         }
                     }
-                    fresh_landed = fresh.num_rows() == 0 || table.append(&fresh).is_ok();
+                    fresh_landed = fresh.num_rows() == 0 || {
+                        let _pass = gate.append();
+                        waiting(|| table.append(&fresh)).is_ok()
+                    };
                 }
                 None => {
                     let why = "the batch carries no readable id column".to_string();
@@ -2381,7 +2557,7 @@ fn append_prepared(
             indexed.push((p.index_of[j], v));
         }
         let mut refused: Vec<Value> = Vec::new();
-        append_checked(table, &indexed, &mut refused);
+        append_checked(table, gate, &indexed, &mut refused);
         for r in refused {
             let i = r["i"].as_u64().unwrap_or(0) as usize;
             failed.push((b, i, r["reason"].as_str().unwrap_or("refused").to_string()));
@@ -2559,7 +2735,7 @@ pub unsafe extern "C" fn infino_append_prepared(
                 })
                 .collect()
         };
-        let failed = append_prepared(&table, owned, &replaced, &per_batch);
+        let failed = append_prepared(&table, &conn.gate(name), owned, &replaced, &per_batch);
         let ok = n.saturating_sub(failed.len());
         let failed: Vec<Value> = failed
             .into_iter()
@@ -2607,7 +2783,13 @@ pub unsafe extern "C" fn infino_delete_osids(
             Ok(t) => t,
             Err(_) => return 0,
         };
-        match table.delete(col(OSID).in_list(ids, false)) {
+        let pred = col(OSID).in_list(ids, false);
+        let deleted = {
+            let gate = conn.gate(name);
+            let _pass = gate.whole();
+            waiting(|| table.delete(pred.clone()))
+        };
+        match deleted {
             Ok(_) => 0,
             Err(e) => {
                 eprintln!("[capi] delete_osids: {e}");
@@ -4025,6 +4207,64 @@ mod tests {
         close(h);
     }
 
+    /// A keyword field gets an index without positions, at creation and when
+    /// mapped later: still a keyword to the plugin, and `=` and `IN` still
+    /// match whole values exactly, case and all.
+    #[test]
+    fn a_keyword_field_gets_an_exact_index_and_stays_a_keyword() {
+        let h = open_logs();
+        let out = ensure(
+            h,
+            r#"{"properties":{"host":{"type":"keyword"},"tag":{"type":"keyword","index":false}}}"#,
+        );
+        assert!(out.contains("\"added\":2"), "{out}");
+        let index_of = |name: &str| {
+            let bridge = unsafe { &*h };
+            let schema = bridge.conn.schema("logs").unwrap();
+            schema.fields().iter().find(|f| f.name == name).map(|f| f.index.clone()).unwrap()
+        };
+        for name in ["level", "host"] {
+            assert!(
+                matches!(index_of(name), Some(ColumnIndex::Fts { positions: false, .. })),
+                "{name}: {:?}",
+                index_of(name)
+            );
+        }
+        assert!(index_of("tag").is_none(), "{:?}", index_of("tag"));
+        assert!(matches!(index_of("message"), Some(ColumnIndex::Fts { positions: true, .. })));
+        let cols = columns(h);
+        let fts_of = |n: &str| cols.as_array().unwrap().iter().find(|c| c["name"] == n).unwrap()["fts"].clone();
+        assert_eq!(
+            (fts_of("level"), fts_of("host"), fts_of("message"), fts_of("osid")),
+            (json!(false), json!(false), json!(true), json!(true))
+        );
+
+        index(
+            h,
+            &[
+                ("k1", r#"{"level":"Disk Full","host":"a"}"#),
+                ("k2", r#"{"level":"disk","host":"b"}"#),
+                ("k3", r#"{"level":"DISK","host":"a"}"#),
+            ],
+        );
+        let ids = |q: &str| -> Vec<String> {
+            let mut v: Vec<String> = sql(h, q)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["osid"].as_str().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids("SELECT osid FROM logs WHERE level = 'disk'"), ["k2"]);
+        assert_eq!(ids("SELECT osid FROM logs WHERE level = 'full'"), Vec::<String>::new());
+        assert_eq!(ids("SELECT osid FROM logs WHERE level = 'Disk Full'"), ["k1"]);
+        assert_eq!(ids("SELECT osid FROM logs WHERE level IN ('DISK', 'disk')"), ["k2", "k3"]);
+        assert_eq!(ids("SELECT osid FROM logs WHERE host = 'a' AND level <> 'disk'"), ["k1", "k3"]);
+        close(h);
+    }
+
     /// A field named like a reserved column, added after the table exists,
     /// leaves the column alone, as it does at creation (#23).
     #[test]
@@ -4835,6 +5075,88 @@ mod tests {
         let rows = sql(h, "SELECT COUNT(*) AS c FROM logs");
         assert_eq!(rows[0]["c"], 0, "{rows}");
         assert_eq!(optimize(h), 0);
+        close(h);
+    }
+
+    /// A whole write (a replace, a delete, a schema change) waits for the
+    /// appends passing the gate, and an append that arrives while it waits
+    /// or passes waits for it in turn.
+    #[test]
+    fn a_whole_write_passes_the_gate_alone() {
+        use std::sync::mpsc;
+        let gate = Gate::default();
+        let append = gate.append();
+        std::thread::scope(|s| {
+            let g = &gate;
+            let (whole_tx, whole_rx) = mpsc::channel();
+            s.spawn(move || {
+                let _whole = g.whole();
+                whole_tx.send("whole").unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+            });
+            assert!(
+                whole_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+                "a whole write passed beside an append"
+            );
+            while !g.lock().whole {
+                std::thread::yield_now();
+            }
+            let (append_tx, append_rx) = mpsc::channel();
+            s.spawn(move || {
+                let _append = g.append();
+                append_tx.send("append").unwrap();
+            });
+            assert!(
+                append_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+                "an append passed a gate a whole write had claimed"
+            );
+            drop(append);
+            assert_eq!(whole_rx.recv_timeout(Duration::from_secs(5)), Ok("whole"));
+            assert_eq!(append_rx.recv_timeout(Duration::from_secs(5)), Ok("append"));
+        });
+    }
+
+    /// Replaces and deletes of different ids, run at once against one
+    /// table, all land. Each takes the table's writer whole, which the engine
+    /// refuses at once to a second while the first holds it; the gate lines
+    /// them up instead.
+    #[test]
+    fn replaces_and_deletes_of_different_ids_run_at_once_and_all_land() {
+        let h = open_logs();
+        let docs: Vec<(String, String)> = (0..16)
+            .map(|i| {
+                (
+                    format!("d{i}"),
+                    format!(r#"{{"level":"info","status":{i}}}"#),
+                )
+            })
+            .collect();
+        let pairs: Vec<(&str, &str)> = docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let out = index(h, &pairs);
+        assert_eq!(out["ok"], 16, "{out}");
+        // The bridge is shared by every JVM thread; the pointer crosses as an address.
+        let at = h as usize;
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                s.spawn(move || {
+                    let h = at as *mut Bridge;
+                    let id = format!("d{i}");
+                    let p = prepared(h, &[(id.as_str(), r#"{"level":"warn","status":100}"#)]);
+                    let out = append_replacing(h, p, &[id.as_str()]);
+                    assert_eq!(out["ok"], 1, "{out}");
+                });
+            }
+            for i in 8..16 {
+                s.spawn(move || {
+                    let h = at as *mut Bridge;
+                    assert_eq!(delete(h, &[format!("d{i}").as_str()]), 0);
+                });
+            }
+        });
+        let rows = sql(h, "SELECT COUNT(*) AS c FROM logs WHERE status = 100");
+        assert_eq!(rows[0]["c"], 8, "{rows}");
+        let rows = sql(h, "SELECT COUNT(*) AS c FROM logs");
+        assert_eq!(rows[0]["c"], 8, "{rows}");
         close(h);
     }
 

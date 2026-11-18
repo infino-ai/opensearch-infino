@@ -37,6 +37,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 
@@ -91,6 +92,10 @@ public final class InfinoNative {
     private static volatile Target opened;
     /** The target the node is configured for: its own URI until the settings or the account route say otherwise. */
     private static volatile Target wanted = Target.node();
+    /** How long a read on the hosted service may trail a write ({@link InfinoPlugin#PLATFORM_READ_WINDOW}), in nanoseconds. */
+    private static volatile long readWindowNanos = InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY).nanos();
+    /** When each table was last written on the hosted service ({@link System#nanoTime}), until a wait sees the window pass. */
+    private static final Map<String, Long> WRITTEN = new ConcurrentHashMap<>();
     private static final Map<String, Map<String, Column>> COLUMNS = new ConcurrentHashMap<>();
     /** What each table's mapping declares, from the mapping it was last declared with. */
     private static final Map<String, Mapping> MAPPINGS = new ConcurrentHashMap<>();
@@ -104,6 +109,8 @@ public final class InfinoNative {
     private static final String FORMAT = "format";
     /** The mapping types whose values are dates. */
     private static final Set<String> DATE_TYPES = Set.of("date", "date_nanos");
+    /** The mapping types whose values a sort compares as 32-bit floats (stock's float comparator). */
+    private static final Set<String> FLOAT_TYPES = Set.of("float", "half_float");
     /** The type of a multi-field that holds its field's value whole, the exact form of a text field. */
     private static final String KEYWORD_TYPE = "keyword";
     private static final String USE_SIMILARITY = "use_similarity";
@@ -301,6 +308,16 @@ public final class InfinoNative {
     }
 
     /**
+     * For tests that stand a bridge of their own in for the library (null to
+     * load the library again): the next call opens its connection through it.
+     */
+    static synchronized void useLib(InfinoLib bridge) {
+        lib = bridge;
+        conn = null;
+        opened = null;
+    }
+
+    /**
      * Open the connection the node is configured for, if it is not the one
      * open. A connection in use is not closed when another replaces it: a
      * call in flight on another thread still holds it, and an account
@@ -373,6 +390,65 @@ public final class InfinoNative {
     /** Whether the tables are served from the hosted service rather than the node's own storage. */
     public static boolean hosted() {
         return wanted.hosted();
+    }
+
+    /** Take {@code window} as how long a hosted read may trail a write, at boot. */
+    static void readWindow(TimeValue window) {
+        readWindowNanos = window.nanos();
+    }
+
+    /**
+     * Note a write to {@code name}. On the hosted service a read may be
+     * answered from a snapshot taken before it, for up to the read window;
+     * the node's own storage answers every read with what was written.
+     */
+    private static void wrote(String name) {
+        if (hosted() && readWindowNanos > 0) {
+            wrote(name, System.nanoTime());
+        }
+    }
+
+    /**
+     * Note a write to {@code name} that completed at {@code at}. Of two
+     * writes noted at once, the later stays, whichever is noted last, so a
+     * wait never ends before the later one is visible.
+     */
+    static void wrote(String name, long at) {
+        WRITTEN.merge(name, at, (a, b) -> b - a > 0 ? b : a);
+    }
+
+    /**
+     * Wait until every read of {@code name} sees what this node has written
+     * to it: until the read window has passed since its last write. Returns
+     * at once when the window has passed, or the table is not hosted, or
+     * this node has not written it. What a refresh waits on, so that a
+     * search after it ({@code refresh=true}, {@code wait_for}) finds the
+     * writes it covered. An interrupt does not cut the wait short, as the
+     * writes would then be released unseen; it is kept for the caller.
+     */
+    public static void awaitVisible(String name) {
+        Long at = WRITTEN.get(name);
+        if (at == null) {
+            return;
+        }
+        boolean interrupted = false;
+        long left;
+        while ((left = untilVisible(at, readWindowNanos, System.nanoTime())) > 0) {
+            try {
+                TimeUnit.NANOSECONDS.sleep(left);
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        WRITTEN.remove(name, at);
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Nanoseconds from {@code now} until a write at {@code writtenAt} is visible to every read; zero or less once it is. */
+    static long untilVisible(long writtenAt, long window, long now) {
+        return writtenAt + window - now;
     }
 
     /** How the tables are served, for a status report. */
@@ -536,6 +612,7 @@ public final class InfinoNative {
             takeOrThrow(lib.infino_ensure_table(conn, name, mappingJson));
         } finally {
             InfinoRequestCache.changed(name);
+            wrote(name);
         }
         MAPPINGS.put(name, Mapping.of(mappingJson, defaultBm25));
         // A lookup while the table was declared cached its columns without what the mapping adds.
@@ -550,7 +627,8 @@ public final class InfinoNative {
      * keyword multi-field's dotted path to its field's, since the field's
      * column holds the value the multi-field indexes whole (a log mapping's
      * {@code request.raw} under the text field {@code request}, as a dynamic
-     * mapping's {@code name.keyword}); and each date field's declared format.
+     * mapping's {@code name.keyword}); each date field's declared format;
+     * and each {@code float} or {@code half_float} field ({@code floatFields}).
      */
     record Mapping(
         Set<String> paths,
@@ -559,6 +637,7 @@ public final class InfinoNative {
         Map<String, String> dateFormats,
         Set<String> similarityFields,
         Set<String> otherSimilarityFields,
+        Set<String> floatFields,
         boolean defaultBm25
     ) {
         /** {@link #of(String, boolean)} under the default BM25 similarity. */
@@ -579,6 +658,7 @@ public final class InfinoNative {
                 new LinkedHashMap<>(),
                 new LinkedHashMap<>(),
                 new LinkedHashMap<>(),
+                new HashSet<>(),
                 new HashSet<>(),
                 new HashSet<>(),
                 defaultBm25
@@ -608,6 +688,9 @@ public final class InfinoNative {
                 // An object field has no type.
                 if (field.get(TYPE) instanceof String type && DATE_TYPES.contains(type) && field.get(FORMAT) instanceof String format) {
                     dateFormats.put(path, format);
+                }
+                if (field.get(TYPE) instanceof String type && FLOAT_TYPES.contains(type)) {
+                    floatFields.add(path);
                 }
                 if (scoresBySimilarity(field)) {
                     similarityFields.add(path);
@@ -663,6 +746,16 @@ public final class InfinoNative {
     static boolean maps(String table, String field) {
         Mapping mapping = MAPPINGS.get(table);
         return mapping == null || mapping.paths().contains(field);
+    }
+
+    /**
+     * The fields of {@code table} its mapping declares {@code float} or
+     * {@code half_float}, which a sort compares as 32-bit floats; empty for
+     * a table no mapping has declared yet.
+     */
+    static Set<String> floatFields(String table) {
+        Mapping mapping = MAPPINGS.get(table);
+        return mapping == null ? Set.of() : mapping.floatFields();
     }
 
     /**
@@ -743,6 +836,7 @@ public final class InfinoNative {
             return lib.infino_drop(conn, name);
         } finally {
             InfinoRequestCache.changed(name);
+            WRITTEN.remove(name); // nothing of it is left to see
         }
     }
 
@@ -910,6 +1004,7 @@ public final class InfinoNative {
             );
         } finally {
             InfinoRequestCache.changed(name);
+            wrote(name);
         }
         List<PreparedFailure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
@@ -941,6 +1036,7 @@ public final class InfinoNative {
             out = object(takeOrThrow(lib.infino_index_batch_buf(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), n)));
         } finally {
             InfinoRequestCache.changed(name);
+            wrote(name);
         }
         List<Failure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
@@ -957,6 +1053,7 @@ public final class InfinoNative {
             return lib.infino_delete_osids(conn, name, osids, n);
         } finally {
             InfinoRequestCache.changed(name);
+            wrote(name);
         }
     }
 

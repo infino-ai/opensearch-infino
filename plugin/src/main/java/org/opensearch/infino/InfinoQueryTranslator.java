@@ -4,13 +4,17 @@
 
 package org.opensearch.infino;
 
+import org.apache.lucene.analysis.standard.StandardTokenizer;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.apache.lucene.search.join.ScoreMode;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.OpenSearchSecurityException;
+import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateMathParser;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
@@ -24,6 +28,7 @@ import org.opensearch.index.query.NestedQueryBuilder;
 import org.opensearch.index.query.Operator;
 import org.opensearch.index.query.PrefixQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryShardException;
 import org.opensearch.index.query.QueryStringQueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.RegexpQueryBuilder;
@@ -43,6 +48,9 @@ import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoScriptTranslator.Sql;
 import org.opensearch.infino.InfinoScriptTranslator.SqlType;
 
+import java.io.IOException;
+import java.io.StringReader;
+import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
@@ -892,10 +900,10 @@ final class InfinoQueryTranslator {
             return textOnFields(new ArrayList<>(mm.fields().keySet()), String.valueOf(mm.value()), mm.operator(), positive, asPhrase, true);
         }
         if (qb instanceof QueryStringQueryBuilder qs) {
-            return queryString(qs.queryString(), qs.defaultField(), new ArrayList<>(qs.fields().keySet()), qs.defaultOperator(), positive);
+            return queryString(qs.queryString(), qs.defaultField(), new ArrayList<>(qs.fields().keySet()), qs.defaultOperator(), qs.minimumShouldMatch(), false, positive);
         }
         if (qb instanceof SimpleQueryStringBuilder sqs) {
-            return queryString(sqs.value(), null, new ArrayList<>(sqs.fields().keySet()), sqs.defaultOperator(), positive);
+            return queryString(sqs.value(), null, new ArrayList<>(sqs.fields().keySet()), sqs.defaultOperator(), sqs.minimumShouldMatch(), true, positive);
         }
         if (qb instanceof BoolQueryBuilder b) {
             return bool(b, positive);
@@ -1663,6 +1671,9 @@ final class InfinoQueryTranslator {
         return "\"" + value.replace("\"", " ") + "\"";
     }
 
+    /** A closed phrase of a simple_query_string with no escape in it, whose words are no operators in either syntax. */
+    private static final Pattern SIMPLE_PHRASE = Pattern.compile("\"[^\"\\\\]*\"");
+
     /** What separates the runs of an engine text query: Unicode white space, as the engine splits it. */
     private static final Pattern QUERY_WHITESPACE = Pattern.compile("(?U)\\s+");
 
@@ -1708,9 +1719,22 @@ final class InfinoQueryTranslator {
      * comparison on a date column takes date math. Boosts change nothing
      * here and are dropped. Fuzziness and proximity have no counterpart in
      * the token index and are refused with the clause named, as is a range
-     * without a field.
+     * without a field. {@code minimumShouldMatch} applies to the optional
+     * clauses of the top level only, as stock applies it to the query the
+     * string parses to when that query is a clause list; where the plugin
+     * cannot tell that list's clauses as stock counts them, it is refused
+     * (see {@link #refuseUncountedClauses}). {@code simple} is a
+     * simple_query_string, which has no default field of its own.
      */
-    private String queryString(String query, String defaultField, List<String> fields, Operator op, boolean positive) {
+    private String queryString(
+        String query,
+        String defaultField,
+        List<String> fields,
+        Operator op,
+        String minimumShouldMatch,
+        boolean simple,
+        boolean positive
+    ) {
         String q = query == null ? "" : query.trim();
         if (q.isEmpty() || "*".equals(q) || "*:*".equals(q)) {
             return ALL;
@@ -1732,7 +1756,282 @@ final class InfinoQueryTranslator {
                 }
             }
         }
-        return node(InfinoLuceneQuery.parse(q, op), targets, positive, q, op);
+        InfinoLuceneQuery.Parsed top = InfinoLuceneQuery.parseTop(q, op);
+        Node parsed = top.node();
+        if (minimumShouldMatch == null) {
+            return node(parsed, targets, positive, q, op);
+        }
+        refuseUncountedClauses(top, q, minimumShouldMatch, simple, oneField(fields, simple ? null : defaultField), targets);
+        // Stock applies the value only to a clause list; a lone clause with +
+        // is a list of that one required clause, with no optional one.
+        Bool b = top.requiredAlone() ? new Bool(List.of(parsed), List.of(), List.of()) : parsed instanceof Bool list ? list : null;
+        if (b == null) {
+            return node(parsed, targets, positive, q, op);
+        }
+        // Stock's analysis makes no clause of a blank phrase on text, so it is not counted.
+        List<Node> counted = b.should().stream().filter(s -> !tokenless(s, targets)).toList();
+        if (counted.size() < b.should().size()) {
+            b = new Bool(b.must(), counted, b.mustNot());
+        }
+        int required;
+        try {
+            required = Queries.calculateMinShouldMatch(b.should().size(), minimumShouldMatch);
+        } catch (RuntimeException e) {
+            // Stock's reader fails on a malformed form such as "2<" or "two", and
+            // stock reports that as it reports any query it cannot build.
+            throw new QueryShardException((Index) null, "failed to create query: {}", e, e.getMessage());
+        }
+        if (required > b.should().size()) {
+            // More than there are, or any where none is optional (default_operator
+            // AND, or only prohibited clauses): stock matches nothing. Stock builds
+            // every clause first, so one the table cannot take is still refused.
+            return node(parsed, targets, false, q, op) == null ? null : NONE;
+        }
+        if (required > 1 || (required == 1 && !b.must().isEmpty())) {
+            // One optional clause, with none required, is what the list already asks.
+            return atLeastOptional(b, required, targets, positive, q, op);
+        }
+        return node(parsed, targets, positive, q, op);
+    }
+
+    /** Whether stock reads a query string over exactly one field: one named, with no pattern. */
+    private static boolean oneField(List<String> fields, String defaultField) {
+        String only = fields.size() == 1 ? fields.get(0) : fields.isEmpty() ? defaultField : null;
+        return only != null && only.indexOf('*') < 0;
+    }
+
+    /**
+     * Refuses a {@code minimum_should_match} whose count the plugin cannot
+     * make over the clauses stock counts. Stock (Lucene's parser, splitting
+     * on operators only) analyzes a run of words with no operator between
+     * them as one text: over one field each word the analyzer makes of the
+     * run is a clause, over several fields the run is one clause joining the
+     * fields with dis_max, and a lone word that analyzes to several words
+     * ({@code foo-bar}) is itself the clause list. The plugin's tree has a
+     * clause per word as written and does not run the analyzer, so where
+     * those differ it cannot count as stock does. simple_query_string is
+     * read here in the query_string syntax, which differs from the simple
+     * one wherever the string holds an operator ({@code -gamma} there is an
+     * optional clause matching the documents without gamma).
+     */
+    private void refuseUncountedClauses(InfinoLuceneQuery.Parsed top, String q, String spec, boolean simple, boolean oneField, List<String> targets) {
+        Node parsed = top.node();
+        String asked = "[" + q + "] has minimum_should_match [" + spec + "]";
+        if (simple) {
+            String operator = simpleSyntax(q);
+            if (operator != null) {
+                throw new InfinoLuceneQuery.Malformed(
+                    "(simple_query_string) "
+                        + asked
+                        + " and the operator in ["
+                        + operator
+                        + "], which the plugin reads in the query_string syntax: stock's simple syntax makes other clauses of it, so the count would not be stock's"
+                );
+            }
+            if (parsed instanceof Term t && (!oneField || (!t.quoted() && maybeSeveralWords(t.text())))) {
+                throw new InfinoLuceneQuery.Malformed(
+                    "(simple_query_string) "
+                        + asked
+                        + " on a lone clause, which stock counts over its fields or the words the analyzer makes of it; the plugin does not run the analyzer"
+                );
+            }
+            return;
+        }
+        if (top.requiredAlone()) {
+            // One required clause and no optional one, whatever it holds.
+            return;
+        }
+        if (parsed instanceof Term t) {
+            if (!t.quoted() && textTerm(t, targets) && maybeSeveralWords(t.text())) {
+                throw new InfinoLuceneQuery.Malformed(
+                    asked
+                        + " on the lone term ["
+                        + t.text()
+                        + "], which stock counts over the words the analyzer makes of it; the plugin does not run the analyzer"
+                );
+            }
+            return;
+        }
+        if (!(parsed instanceof Bool b)) {
+            return;
+        }
+        int bare = 0;
+        for (List<Node> clauses : List.of(b.must(), b.should())) {
+            boolean optional = clauses == b.should();
+            for (Node n : clauses) {
+                if (n instanceof Term t && !t.quoted()) {
+                    if (t.field() == null) {
+                        bare++;
+                    }
+                    if (optional && textTerm(t, targets) && maybeSeveralWords(t.text())) {
+                        throw new InfinoLuceneQuery.Malformed(
+                            asked
+                                + " and the optional term ["
+                                + t.text()
+                                + "], which stock counts as one clause or as each word the analyzer makes of it, by where it sits; the plugin does not run the analyzer"
+                        );
+                    }
+                }
+            }
+        }
+        if (bare >= 2 && !textTargets(targets)) {
+            throw new InfinoLuceneQuery.Malformed(
+                asked
+                    + " on keyword fields only: stock reads a run of words there as one value, which the plugin does not tell apart from a clause per word; give each word its field"
+            );
+        }
+        if (!oneField && bare >= 2) {
+            throw new InfinoLuceneQuery.Malformed(
+                asked
+                    + " over more than one field: stock reads a run of words there as one clause over the fields (dis_max), which the plugin does not tell apart from a clause per word; name one field, or give each word its field"
+            );
+        }
+    }
+
+    /**
+     * A blank phrase ({@code ""}, {@code " "}) on text columns only: the
+     * analyzer makes no token of it, so stock drops the clause. On a keyword
+     * column it is the empty value, a clause like any other.
+     */
+    private boolean tokenless(Node n, List<String> targets) {
+        if (!(n instanceof Term t) || !t.quoted() || t.slop() > 0 || t.fuzzy() > 0 || !t.text().isBlank()) {
+            return false;
+        }
+        List<String> fields = t.field() == null ? targets : List.of(t.field());
+        if (fields.isEmpty()) {
+            return false;
+        }
+        for (String f : fields) {
+            Column c = column(f);
+            if (c == null || !c.fts()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** A term matched as text: on a text column, or on default fields of which one is text. */
+    private boolean textTerm(Term t, List<String> targets) {
+        if (t.field() == null) {
+            return textTargets(targets);
+        }
+        Column c = column(t.field());
+        return c != null && c.fts();
+    }
+
+    /**
+     * Whether the default fields may read a term as text: false only when
+     * every one is a keyword column, which matches the term as one exact
+     * value, as stock's keyword analyzer keeps it whole.
+     */
+    private boolean textTargets(List<String> targets) {
+        if (targets.isEmpty()) {
+            return true;
+        }
+        for (String f : targets) {
+            Column c = column(f);
+            if (c == null || c.fts()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether an analyzer may make more than one word of {@code text}: it
+     * holds a character that is not a letter or digit, or an ideograph or
+     * kana, which the standard analyzer makes a word each, or the standard
+     * tokenizer does not keep it as one token (a change of script such as
+     * {@code ไทยabc}, or a word longer than its longest token).
+     */
+    private static boolean maybeSeveralWords(String text) {
+        return text.codePoints()
+            .anyMatch(
+                c -> !Character.isLetterOrDigit(c)
+                    || Character.isIdeographic(c)
+                    || Character.UnicodeScript.of(c) == Character.UnicodeScript.HIRAGANA
+                    || Character.UnicodeScript.of(c) == Character.UnicodeScript.KATAKANA
+            ) || !oneStandardToken(text);
+    }
+
+    /** Whether the standard tokenizer makes exactly one token of the whole of {@code text}. */
+    private static boolean oneStandardToken(String text) {
+        try (StandardTokenizer tokenizer = new StandardTokenizer()) {
+            CharTermAttribute term = tokenizer.addAttribute(CharTermAttribute.class);
+            tokenizer.setReader(new StringReader(text));
+            tokenizer.reset();
+            boolean one = tokenizer.incrementToken() && term.length() == text.length() && !tokenizer.incrementToken();
+            tokenizer.end();
+            return one;
+        } catch (IOException e) {
+            // A string reader does not fail.
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
+     * The first word of a simple_query_string that holds an operator of
+     * either syntax ({@code -} leading a word, {@code +}, {@code |},
+     * parentheses, {@code *}, {@code ~}, a field prefix, a range, a regular
+     * expression, an escape, a boost, or AND / OR / NOT) outside a phrase,
+     * or null when the string is plain words and phrases, which both syntaxes
+     * read alike. A phrase is checked as its bounds only, a word of its own,
+     * so what follows it ({@code ~2}, or {@code OR} in {@code "alpha"OR})
+     * is still an operator.
+     */
+    private static String simpleSyntax(String q) {
+        for (String word : QUERY_WHITESPACE.split(SIMPLE_PHRASE.matcher(q.trim()).replaceAll(" \"\" ").trim())) {
+            if (word.startsWith("-") || word.equals("AND") || word.equals("OR") || word.equals("NOT")) {
+                return word;
+            }
+            for (int i = 0; i < word.length(); i++) {
+                if ("+|()*~!&:[]{}/\\^<>".indexOf(word.charAt(i)) >= 0) {
+                    return word;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * A query string's top clause list with at least {@code required} of its
+     * optional clauses matching: its required clauses, the count over its
+     * optional ones, and none of its prohibited ones. When the list is one
+     * engine query, that query still ranks the rows (BM25 over every clause,
+     * as stock scores the clauses that match), and the count narrows them.
+     */
+    private String atLeastOptional(Bool b, int required, List<String> targets, boolean positive, String query, Operator op) {
+        List<String> optional = new ArrayList<>();
+        for (Node s : b.should()) {
+            String p = node(s, targets, false, query, op);
+            if (p == null) {
+                return null;
+            }
+            optional.add(p);
+        }
+        String count = atLeast(optional, required);
+        String engine = engineQuery(b);
+        if (engine != null) {
+            String ranked = textOnFields(targets, engine, Operator.OR, positive, false, false, true);
+            return ranked == null ? null : "(" + ranked + " AND " + count + ")";
+        }
+        List<String> and = new ArrayList<>();
+        for (Node m : b.must()) {
+            String p = node(m, targets, positive, query, op);
+            if (p == null) {
+                return null;
+            }
+            and.add(p);
+        }
+        and.add(count);
+        for (Node x : b.mustNot()) {
+            String p = node(x, targets, false, query, op);
+            if (p == null) {
+                return null;
+            }
+            and.add(not(p));
+        }
+        return "(" + String.join(" AND ", and) + ")";
     }
 
     /** The predicate of one node of a query string's tree, or null when the table cannot take it; {@code op} reads a bare term's words. */
