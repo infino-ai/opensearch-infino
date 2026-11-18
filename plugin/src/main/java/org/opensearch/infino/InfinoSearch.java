@@ -585,6 +585,18 @@ public final class InfinoSearch {
             }
         } else {
             rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+            if (rows.size() < fetch && rankedInWindow(plan)) {
+                // The rows removed after the ranking may have used up the window
+                // while matches remain past it (a minimum_should_match count, a
+                // text clause on another column): rank every candidate then, so
+                // the page holds what the total counts.
+                TextClause text = plan.query().principal();
+                long candidates = InfinoNative.count(plan.table(), text.column(), text.query(), text.mode());
+                if (candidates > RANK_WINDOW) {
+                    int window = (int) Math.min(Integer.MAX_VALUE, candidates);
+                    rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.WHOLE, window));
+                }
+            }
         }
         if (sourcesById(plan) && wantsSource(source)) {
             rows = withSources(plan.table(), rows, fetch);
@@ -771,6 +783,21 @@ public final class InfinoSearch {
     }
 
     /**
+     * Whether the page's hits are the principal's BM25 ranking cut to
+     * {@link #RANK_WINDOW} candidates before a step removes rows
+     * ({@link #hitStatement}), so a page that step leaves short may have
+     * matches past the window.
+     */
+    static boolean rankedInWindow(Plan plan) {
+        String where = plan.hitWhere();
+        return plan.searchAfter() == null
+            && plan.sorts().isEmpty()
+            && !scoredPage(plan)
+            && plan.query().principal() != null
+            && (InfinoQueryTranslator.joinsAfterRanking(where) || (!InfinoQueryTranslator.ALL.equals(where) && plan.collapse() != null));
+    }
+
+    /**
      * Whether a page the hit statement could not fill holds every row its
      * predicate keeps, and that predicate is the total's, so its length is
      * the total: no keyset, collapse or ranked window narrows it. An
@@ -889,6 +916,14 @@ public final class InfinoSearch {
     }
 
     static String hitStatement(Plan plan, int fetch, boolean withSeq, Keyset part) {
+        return hitStatement(plan, fetch, withSeq, part, RANK_WINDOW);
+    }
+
+    /**
+     * As {@link #hitStatement(Plan, int, boolean, Keyset)}, ranking
+     * {@code window} candidates where a step removes rows after the ranking.
+     */
+    static String hitStatement(Plan plan, int fetch, boolean withSeq, Keyset part, int window) {
         Translation q = plan.query();
         StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID);
         if (!sourcesById(plan)) {
@@ -929,7 +964,7 @@ public final class InfinoSearch {
             // ranking needs more candidates to choose from.
             boolean filtered = !InfinoQueryTranslator.ALL.equals(where);
             boolean narrowedAfterRanking = InfinoQueryTranslator.joinsAfterRanking(where) || (filtered && plan.collapse() != null);
-            from = q.rankedFrom(narrowedAfterRanking ? RANK_WINDOW : fetch);
+            from = q.rankedFrom(narrowedAfterRanking ? window : fetch);
             hit.append(", score");
             order = "score DESC";
         } else {

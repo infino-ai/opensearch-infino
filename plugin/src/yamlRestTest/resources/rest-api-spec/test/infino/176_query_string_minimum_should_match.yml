@@ -144,6 +144,28 @@
   - match: { hits.hits.0._id: "d1" }
   - match: { hits.hits.1._id: "d2" }
 
+  # The same with field clauses, which are not one engine query: the required clause is its own predicate.
+  - do:
+      search:
+        index: qm_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "+body:alpha body:beta body:gamma", minimum_should_match: 1 } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+  - do:
+      search:
+        index: qm_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "+body:alpha body:beta body:gamma", minimum_should_match: 1 } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d2" }
+
   # Without it, the optional words beside a required one narrow nothing.
   - do:
       search:
@@ -1021,3 +1043,201 @@
           size: 10
           sort: [ { k: asc } ]
           query: { simple_query_string: { query: "\"alpha\"OR beta", fields: [ body ], minimum_should_match: 2 } }
+
+---
+"minimum_should_match on a keyword default field":
+  # A keyword field keeps a term whole, so stock matches foo-bar there as one
+  # exact value and counts it as one clause. A run of words is one value
+  # there too, which the plugin does not tell apart from a clause per word,
+  # so it refuses that.
+  - do:
+      indices.create:
+        index: qm5_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+              tag: { type: keyword }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: qm5_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+              tag: { type: keyword }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: qm5_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+              tag: { type: keyword }
+              k: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: qm5_luc
+        body:
+          - index: { _id: "d1" }
+          - { k: "d1", tag: "foo-bar", body: "alpha beta" }
+          - index: { _id: "d2" }
+          - { k: "d2", tag: "foo", body: "alpha" }
+          - index: { _id: "d3" }
+          - { k: "d3", tag: "foo bar", body: "alpha" }
+          - index: { _id: "d4" }
+          - { k: "d4", tag: "foo-bar", body: "delta" }
+          - index: { _id: "d5" }
+          - { k: "d5", tag: "bar", body: "alpha" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: qm5_inf
+        body:
+          - index: { _id: "d1" }
+          - { k: "d1", tag: "foo-bar", body: "alpha beta" }
+          - index: { _id: "d2" }
+          - { k: "d2", tag: "foo", body: "alpha" }
+          - index: { _id: "d3" }
+          - { k: "d3", tag: "foo bar", body: "alpha" }
+          - index: { _id: "d4" }
+          - { k: "d4", tag: "foo-bar", body: "delta" }
+          - index: { _id: "d5" }
+          - { k: "d5", tag: "bar", body: "alpha" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: qm5_prx
+        body:
+          - index: { _id: "d1" }
+          - { k: "d1", tag: "foo-bar", body: "alpha beta" }
+          - index: { _id: "d2" }
+          - { k: "d2", tag: "foo", body: "alpha" }
+          - index: { _id: "d3" }
+          - { k: "d3", tag: "foo bar", body: "alpha" }
+          - index: { _id: "d4" }
+          - { k: "d4", tag: "foo-bar", body: "delta" }
+          - index: { _id: "d5" }
+          - { k: "d5", tag: "bar", body: "alpha" }
+  - match: { errors: false }
+  # foo-bar is one exact value of tag, and a lone term is no list.
+  - do:
+      search:
+        index: qm5_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "foo-bar", default_field: tag, minimum_should_match: 2 } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d4" }
+  - do:
+      search:
+        index: qm5_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "foo-bar", default_field: tag, minimum_should_match: 2 } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d4" }
+  - do:
+      search:
+        index: qm5_prx
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "foo-bar", default_field: tag, minimum_should_match: 2 } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "d1" }
+  - match: { hits.hits.1._id: "d4" }
+  # Two of foo-bar and body:alpha, the keyword term counted as one clause.
+  - do:
+      search:
+        index: qm5_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "foo-bar body:alpha", default_field: tag, minimum_should_match: 2 } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d1" }
+  - do:
+      search:
+        index: qm5_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "foo-bar body:alpha", default_field: tag, minimum_should_match: 2 } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d1" }
+  - do:
+      search:
+        index: qm5_prx
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "foo-bar body:alpha", default_field: tag, minimum_should_match: 2 } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d1" }
+  # A required clause, then two of the optional ones: the keyword term among them.
+  - do:
+      search:
+        index: qm5_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "+body:alpha foo-bar tag:foo body:beta", default_field: tag, minimum_should_match: 2 } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d1" }
+  - do:
+      search:
+        index: qm5_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "+body:alpha foo-bar tag:foo body:beta", default_field: tag, minimum_should_match: 2 } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d1" }
+  - do:
+      search:
+        index: qm5_prx
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "+body:alpha foo-bar tag:foo body:beta", default_field: tag, minimum_should_match: 2 } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d1" }
+  # A run of words is one value of tag for stock; the plugin refuses.
+  - do:
+      search:
+        index: qm5_luc
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "foo bar", default_field: tag, minimum_should_match: 2 } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d3" }
+  - do:
+      catch: bad_request
+      search:
+        index: qm5_inf
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "foo bar", default_field: tag, minimum_should_match: 2 } }
+  - do:
+      catch: bad_request
+      search:
+        index: qm5_prx
+        body:
+          size: 10
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "foo bar", default_field: tag, minimum_should_match: 2 } }

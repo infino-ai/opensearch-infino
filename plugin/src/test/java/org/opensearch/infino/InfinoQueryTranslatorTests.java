@@ -415,6 +415,58 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
     }
 
+    public void testQueryStringMinimumShouldMatchOnAKeywordDefaultField() {
+        // A keyword column keeps foo-bar whole: one exact value, a lone term, no list.
+        assertEquals(
+            translate(QueryBuilders.queryStringQuery("level:foo-bar")).where(),
+            translate(QueryBuilders.queryStringQuery("foo-bar").defaultField("level").minimumShouldMatch("2")).where()
+        );
+        // Beside another clause it is one counted clause.
+        String two = translate(QueryBuilders.queryStringQuery("foo-bar message:alpha").defaultField("level").minimumShouldMatch("2")).where();
+        assertTrue(two, two.contains("\"level\" = 'foo-bar'"));
+        assertTrue(two, two.contains(">= 2)"));
+        // A run of words is one value there for stock: refused.
+        IllegalArgumentException run = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("foo bar").defaultField("level").minimumShouldMatch("2"))
+        );
+        assertTrue(run.getMessage(), run.getMessage().contains("keyword fields only"));
+        // Next to a text column it may still be split: refused as before.
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("foo-bar").field("message").field("level").minimumShouldMatch("2"))
+        );
+    }
+
+    public void testAShortPageRankedInAWindowIsRankedAgain() {
+        // A count over the optional clauses removes rows after the ranking: a short page may have used up the window.
+        Translation counted = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("2"));
+        InfinoSearch.Plan plan = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            counted,
+            java.util.List.of(),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertTrue(InfinoSearch.rankedInWindow(plan));
+        String wider = InfinoSearch.hitStatement(plan, 10, false, InfinoSearch.Keyset.WHOLE, 50_000);
+        assertTrue(wider, wider.contains(", 50000, 'or')"));
+        assertTrue(InfinoSearch.hitStatement(plan, 10, false).contains(", 10000, 'or')"));
+        // A filter the engine applies while it ranks leaves no window to run out.
+        Translation plain = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message"));
+        assertFalse(
+            InfinoSearch.rankedInWindow(
+                new InfinoSearch.Plan(TABLE, columns(), plain, java.util.List.of(), null, null, null, null, java.util.List.of(), InfinoAccess.NONE, NOW)
+            )
+        );
+    }
+
     public void testQueryStringMinimumShouldMatchRefusedWhereStockCountsOtherClauses() {
         // Over several fields stock reads a run of words as one dis_max clause.
         IllegalArgumentException fields = expectThrows(

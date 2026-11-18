@@ -1761,7 +1761,7 @@ final class InfinoQueryTranslator {
         if (minimumShouldMatch == null) {
             return node(parsed, targets, positive, q, op);
         }
-        refuseUncountedClauses(top, q, minimumShouldMatch, simple, oneField(fields, simple ? null : defaultField));
+        refuseUncountedClauses(top, q, minimumShouldMatch, simple, oneField(fields, simple ? null : defaultField), targets);
         // Stock applies the value only to a clause list; a lone clause with +
         // is a list of that one required clause, with no optional one.
         Bool b = top.requiredAlone() ? new Bool(List.of(parsed), List.of(), List.of()) : parsed instanceof Bool list ? list : null;
@@ -1814,7 +1814,7 @@ final class InfinoQueryTranslator {
      * one wherever the string holds an operator ({@code -gamma} there is an
      * optional clause matching the documents without gamma).
      */
-    private void refuseUncountedClauses(InfinoLuceneQuery.Parsed top, String q, String spec, boolean simple, boolean oneField) {
+    private void refuseUncountedClauses(InfinoLuceneQuery.Parsed top, String q, String spec, boolean simple, boolean oneField, List<String> targets) {
         Node parsed = top.node();
         String asked = "[" + q + "] has minimum_should_match [" + spec + "]";
         if (simple) {
@@ -1842,7 +1842,7 @@ final class InfinoQueryTranslator {
             return;
         }
         if (parsed instanceof Term t) {
-            if (!t.quoted() && textTerm(t) && maybeSeveralWords(t.text())) {
+            if (!t.quoted() && textTerm(t, targets) && maybeSeveralWords(t.text())) {
                 throw new InfinoLuceneQuery.Malformed(
                     asked
                         + " on the lone term ["
@@ -1863,7 +1863,7 @@ final class InfinoQueryTranslator {
                     if (t.field() == null) {
                         bare++;
                     }
-                    if (optional && textTerm(t) && maybeSeveralWords(t.text())) {
+                    if (optional && textTerm(t, targets) && maybeSeveralWords(t.text())) {
                         throw new InfinoLuceneQuery.Malformed(
                             asked
                                 + " and the optional term ["
@@ -1873,6 +1873,12 @@ final class InfinoQueryTranslator {
                     }
                 }
             }
+        }
+        if (bare >= 2 && !textTargets(targets)) {
+            throw new InfinoLuceneQuery.Malformed(
+                asked
+                    + " on keyword fields only: stock reads a run of words there as one value, which the plugin does not tell apart from a clause per word; give each word its field"
+            );
         }
         if (!oneField && bare >= 2) {
             throw new InfinoLuceneQuery.Malformed(
@@ -1904,13 +1910,31 @@ final class InfinoQueryTranslator {
         return true;
     }
 
-    /** A term matched as text: on the default fields, or on a text column. */
-    private boolean textTerm(Term t) {
+    /** A term matched as text: on a text column, or on default fields of which one is text. */
+    private boolean textTerm(Term t, List<String> targets) {
         if (t.field() == null) {
-            return true;
+            return textTargets(targets);
         }
         Column c = column(t.field());
         return c != null && c.fts();
+    }
+
+    /**
+     * Whether the default fields may read a term as text: false only when
+     * every one is a keyword column, which matches the term as one exact
+     * value, as stock's keyword analyzer keeps it whole.
+     */
+    private boolean textTargets(List<String> targets) {
+        if (targets.isEmpty()) {
+            return true;
+        }
+        for (String f : targets) {
+            Column c = column(f);
+            if (c == null || c.fts()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
