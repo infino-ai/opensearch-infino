@@ -9,6 +9,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
+import org.apache.lucene.util.BytesRef;
 import org.opensearch.action.OriginalIndices;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchResponseSections;
@@ -131,6 +132,10 @@ public final class InfinoSearch {
     private static final int ROW_ID_DIGITS = 38;
     /** The sort a scroll without one pages by: the document id, which {@link #columnFor} resolves to the id column. */
     private static final String ID_SORT_FIELD = "_id";
+    /** The alias the hit statement selects a collapsed hit's own value under, unless the plan has a name of that kind ({@link #freeAlias}). */
+    private static final String COLLAPSE_KEY = "collapse_key";
+    /** The alias of a collapse's window rank, likewise. */
+    private static final String COLLAPSE_RANK = "collapse_rank";
 
     private InfinoSearch() {}
 
@@ -180,8 +185,152 @@ public final class InfinoSearch {
      * {@code expr} is what the statement orders by and selects, {@code name}
      * the alias its value comes back under (the column's name, or one made
      * for a script), {@code type} how a search_after value for it is written.
+     * {@code nullsFirst} puts the rows missing the value before the others
+     * (the request's {@code missing: _first}); by default they come last,
+     * in either direction, as stock's {@code _last}. {@code noneMissing}
+     * marks a sort whose expression gives every row a value (the request's
+     * {@code missing} value stands in), so no search_after value for it
+     * stands for a missing one.
      */
-    record SortSpec(String expr, String name, SqlType type, boolean desc) {
+    record SortSpec(String expr, String name, SqlType type, boolean desc, boolean nullsFirst, boolean noneMissing) {
+        SortSpec(String expr, String name, SqlType type, boolean desc) {
+            this(expr, name, type, desc, false, false);
+        }
+
+        /** {@link #withMissing(Object, boolean, long)} on a field not mapped {@code float} or {@code half_float}. */
+        SortSpec withMissing(Object missing, long nowMillis) {
+            return withMissing(missing, false, nowMillis);
+        }
+
+        /**
+         * This sort under the request's {@code missing}: {@code _last} (or
+         * none) as it is, {@code _first} with the missing rows first, and any
+         * other value standing in for a missing one, as stock sorts such a
+         * row by that value and hands it back as the hit's sort value.
+         * {@code asFloat} marks a field mapped {@code float} or
+         * {@code half_float}, whose value stock's comparator reads as a
+         * 32-bit float. A boolean's value is a long, as stock's comparator
+         * reads it (a present value is 0 or 1), so the sort becomes one on
+         * longs. An infinite floating-point value (or NaN, which stock's
+         * comparator orders past every other) puts the missing rows past
+         * every present value on its side, as {@code _first} or
+         * {@code _last} does: no present value is one, since stock refuses
+         * a non-finite value for a floating-point field.
+         */
+        SortSpec withMissing(Object missing, boolean asFloat, long nowMillis) {
+            if (missing == null) {
+                return this;
+            }
+            String text = missing instanceof BytesRef b ? b.utf8ToString() : missing.toString();
+            if ("_last".equals(text)) {
+                return this;
+            }
+            if ("_first".equals(text)) {
+                return new SortSpec(expr, name, type, desc, true, false);
+            }
+            Object value = missing instanceof BytesRef ? text : missing;
+            if (type == SqlType.FLOAT) {
+                Double d = floating(value, asFloat);
+                if (d == null) {
+                    throw notA(text, "float");
+                }
+                if (!Double.isFinite(d)) {
+                    boolean greatest = d != Double.NEGATIVE_INFINITY;
+                    return new SortSpec(expr, name, type, desc, greatest == desc, false);
+                }
+                return new SortSpec("COALESCE(" + expr + ", " + Double.toString(d) + ")", name, type, desc, false, true);
+            }
+            if (type == SqlType.BOOL) {
+                Long l = integral(value);
+                if (l == null) {
+                    throw notA(text, "long");
+                }
+                return new SortSpec("COALESCE(CAST(" + expr + " AS BIGINT), " + l + ")", name, SqlType.INT, desc, false, true);
+            }
+            String lit = replacement(value, nowMillis);
+            if (lit == null) {
+                throw notA(text, type.name().toLowerCase(Locale.ROOT));
+            }
+            return new SortSpec("COALESCE(" + expr + ", " + lit + ")", name, type, desc, false, true);
+        }
+
+        private IllegalArgumentException notA(String text, String what) {
+            return new IllegalArgumentException("[infino] sort missing value [" + text + "] on [" + name + "] is not a " + what);
+        }
+
+        /**
+         * The request's {@code missing} value as a literal of this sort's
+         * type, read as stock's comparator reads it: a number as a long for
+         * an integer or a date (3.5 is 3, a date's number its epoch
+         * milliseconds), and text parsed as one; null when it is not one.
+         */
+        private String replacement(Object missing, long nowMillis) {
+            return switch (type) {
+                case INT -> {
+                    Long l = integral(missing);
+                    yield l == null ? null : Long.toString(l);
+                }
+                case DATE -> {
+                    Long l = integral(missing);
+                    yield l == null ? null : "arrow_cast(" + l + ", 'Timestamp(Millisecond, Some(\"UTC\"))')";
+                }
+                default -> {
+                    try {
+                        yield InfinoQueryTranslator.literalForType(type, missing, nowMillis);
+                    } catch (NumberFormatException e) {
+                        yield null;
+                    }
+                }
+            };
+        }
+
+        /** {@code missing} as stock's long comparator reads it: a number cut to a long, text parsed as one; null when it is not one. */
+        private static Long integral(Object missing) {
+            try {
+                return missing instanceof Number n ? n.longValue() : Long.parseLong(missing.toString());
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+
+        /**
+         * {@code missing} as stock's floating-point comparator reads it: a
+         * 32-bit float when {@code asFloat}, else a double, from a number or
+         * parsed text; null when it is not one.
+         */
+        private static Double floating(Object missing, boolean asFloat) {
+            try {
+                if (asFloat) {
+                    return (double) (missing instanceof Number n ? n.floatValue() : Float.parseFloat(missing.toString()));
+                }
+                return missing instanceof Number n ? n.doubleValue() : Double.parseDouble(missing.toString());
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+
+        /**
+         * Whether {@code value}, a search_after value for this sort, is the
+         * stand-in a default-mode hit hands back for a row missing the value
+         * (the least or greatest long, or an infinity, whichever sorts on the
+         * missing rows' side): the client sends back what the hit gave it, and
+         * the page continues among the missing rows, as stock compares them.
+         */
+        boolean missingStandIn(Object value) {
+            if (noneMissing) {
+                return false;
+            }
+            boolean least = desc != nullsFirst;
+            return switch (type) {
+                case INT, DATE -> value instanceof Number n
+                    && !(value instanceof Double || value instanceof Float)
+                    && n.longValue() == (least ? Long.MIN_VALUE : Long.MAX_VALUE)
+                    || value instanceof String t && t.equals(Long.toString(least ? Long.MIN_VALUE : Long.MAX_VALUE));
+                case FLOAT -> value instanceof Number n && n.doubleValue() == (least ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY)
+                    || value instanceof String t && t.equals(least ? "-Infinity" : "Infinity");
+                default -> false;
+            };
+        }
         static SortSpec of(Column c, boolean desc) {
             return new SortSpec(InfinoQueryTranslator.quoteIdent(c.name()), c.name(), InfinoScriptTranslator.typeOf(c), desc);
         }
@@ -301,7 +450,7 @@ public final class InfinoSearch {
             query = query.withWhere(where);
         }
         log.debug("[infino] query {} -> FROM {} WHERE {}", qb, query.from(), query.where());
-        List<SortSpec> sorts = sorts(source.sorts(), cols, nowMillis);
+        List<SortSpec> sorts = sorts(source.sorts(), cols, InfinoNative.floatFields(table), nowMillis);
         if (sorts.isEmpty() && sortsByDocFirst(source)) {
             // Stock orders such a page by the index and scores nothing, so
             // the clauses' scores never reorder it.
@@ -369,6 +518,12 @@ public final class InfinoSearch {
             }
             if (vector != null) {
                 throw new IllegalArgumentException("[infino] search_after is not served with a vector query");
+            }
+            searchAfter = searchAfter.clone();
+            for (int i = 0; i < searchAfter.length; i++) {
+                if (searchAfter[i] != null && sorts.get(i).missingStandIn(searchAfter[i])) {
+                    searchAfter[i] = null;
+                }
             }
         }
         Plan plan = new Plan(table, cols, query, sorts, vector, postWhere, collapse, searchAfter, scriptFields, access, nowMillis);
@@ -449,6 +604,15 @@ public final class InfinoSearch {
      * has no column for. {@code nowMillis} is what a script's clock reads.
      */
     static List<SortSpec> sorts(List<SortBuilder<?>> sorts, Map<String, Column> cols, long nowMillis) {
+        return sorts(sorts, cols, Set.of(), nowMillis);
+    }
+
+    /**
+     * {@link #sorts(List, Map, long)}, where {@code floatFields} are the
+     * fields mapped {@code float} or {@code half_float}, whose sort's
+     * {@code missing} value stock reads as a 32-bit float.
+     */
+    static List<SortSpec> sorts(List<SortBuilder<?>> sorts, Map<String, Column> cols, Set<String> floatFields, long nowMillis) {
         List<SortSpec> out = new ArrayList<>();
         if (sorts == null) {
             return out;
@@ -483,9 +647,10 @@ public final class InfinoSearch {
                 throw InfinoAccess.refused("sort on [" + fs.getFieldName() + "], a field masked for this user, is not served");
             }
             boolean desc = fs.order() == SortOrder.DESC;
+            boolean asFloat = floatFields.contains(InfinoQueryTranslator.fieldOf(c.name()));
             Column values = c.isList() ? c : InfinoQueryTranslator.listOf(cols, c);
             if (values == null) {
-                out.add(SortSpec.of(c, desc));
+                out.add(SortSpec.of(c, desc).withMissing(fs.missing(), asFloat, nowMillis));
                 continue;
             }
             SortMode mode = fs.sortMode();
@@ -495,16 +660,16 @@ public final class InfinoSearch {
             // Stock's default mode is the least value ascending and the greatest
             // descending; an explicit min or max picks that value either way.
             boolean greatest = mode == null ? desc : mode == SortMode.MAX;
-            out.add(SortSpec.ofValues(c, values, greatest, desc));
+            out.add(SortSpec.ofValues(c, values, greatest, desc).withMissing(fs.missing(), asFloat, nowMillis));
         }
         return out;
     }
 
-    /** ORDER BY terms for the sorts: each expression in its direction, missing values last. */
+    /** ORDER BY terms for the sorts: each expression in its direction, missing values where the sort puts them. */
     static List<String> orderBy(List<SortSpec> sorts) {
         List<String> out = new ArrayList<>(sorts.size());
         for (SortSpec s : sorts) {
-            out.add(s.expr() + (s.desc() ? " DESC" : " ASC") + " NULLS LAST");
+            out.add(s.expr() + (s.desc() ? " DESC" : " ASC") + (s.nullsFirst() ? " NULLS FIRST" : " NULLS LAST"));
         }
         return out;
     }
@@ -683,6 +848,7 @@ public final class InfinoSearch {
         SearchShardTarget target = target(index);
         List<SearchHit> hits = new ArrayList<>();
         float maxScore = Float.NaN;
+        String collapseKey = plan.collapse() == null ? null : freeAlias(plan, COLLAPSE_KEY);
         // Every row up to the window's end: the window itself is applied once,
         // over the merged pages, as a coordinator applies it over its shards.
         int end = Math.min(rows.size(), fetch);
@@ -757,7 +923,7 @@ public final class InfinoSearch {
             if (plan.collapse() != null) {
                 // A collapsed hit carries its collapse value, as stock does.
                 String field = plan.collapse().name();
-                Object value = row.get(field);
+                Object value = row.get(collapseKey);
                 h.setDocumentField(field, new DocumentField(field, value == null ? List.of() : List.of(value)));
             }
             for (ScriptedField sf : plan.scriptFields()) {
@@ -877,15 +1043,41 @@ public final class InfinoSearch {
      * the sort column, which the engine answers from its range index; one
      * statement holding both would weigh {@code s < v OR s IS NULL} on every
      * row. Not under a collapse, whose window ranks a value's rows across
-     * both parts.
+     * both parts; not under {@code missing: _first}, whose missing rows
+     * come before every present one; and not under a {@code missing}
+     * value, which leaves no row missing the sort's value.
      */
     static boolean splitsMissingTail(Plan plan) {
         Object[] after = plan.searchAfter();
-        return after != null
-            && after.length > 0
-            && after[0] != null
-            && plan.collapse() == null
-            && !plan.sorts().get(0).name().equals(InfinoSql.ROW_ID);
+        if (after == null || after.length == 0 || after[0] == null || plan.collapse() != null) {
+            return false;
+        }
+        SortSpec first = plan.sorts().get(0);
+        return !first.name().equals(InfinoSql.ROW_ID) && !first.nullsFirst() && !first.noneMissing();
+    }
+
+    /**
+     * {@code base}, or that with as many leading underscores as it takes to
+     * be a name no column, sort or scripted field of the plan selects or
+     * reads: an alias of the hit statement's own, which a field of the same
+     * name would make ambiguous.
+     */
+    static String freeAlias(Plan plan, String base) {
+        Set<String> taken = new HashSet<>(plan.cols().keySet());
+        taken.add(InfinoQueryTranslator.OSID);
+        taken.add(InfinoQueryTranslator.SOURCE);
+        taken.add(InfinoQueryTranslator.SEQ);
+        for (SortSpec s : plan.sorts()) {
+            taken.add(s.name());
+        }
+        for (ScriptedField sf : plan.scriptFields()) {
+            taken.add(sf.alias());
+        }
+        String alias = base;
+        while (taken.contains(alias)) {
+            alias = "_" + alias;
+        }
+        return alias;
     }
 
     static String hitStatement(Plan plan, int fetch, boolean withSeq, Keyset part) {
@@ -903,8 +1095,12 @@ public final class InfinoSearch {
             }
             hit.append(", ").append(s.expr()).append(" AS ").append(InfinoQueryTranslator.quoteIdent(s.name()));
         }
-        if (plan.collapse() != null && plan.sorts().stream().noneMatch(s -> s.name().equals(plan.collapse().name()))) {
-            hit.append(", ").append(InfinoQueryTranslator.quoteIdent(plan.collapse().name()));
+        if (plan.collapse() != null) {
+            // Under its own alias: a sort on the column under a missing value selects the stand-in under the column's name.
+            hit.append(", ")
+                .append(InfinoQueryTranslator.quoteIdent(plan.collapse().name()))
+                .append(" AS ")
+                .append(InfinoQueryTranslator.quoteIdent(freeAlias(plan, COLLAPSE_KEY)));
         }
         for (ScriptedField sf : plan.scriptFields()) {
             hit.append(", ").append(sf.expr()).append(" AS ").append(sf.alias());
@@ -943,8 +1139,9 @@ public final class InfinoSearch {
         // id's order when the request names none, so the page is stable).
         String within = order == null ? InfinoQueryTranslator.OSID + " ASC" : order;
         String partition = InfinoQueryTranslator.quoteIdent(plan.collapse().name());
+        String rank = InfinoQueryTranslator.quoteIdent(freeAlias(plan, COLLAPSE_RANK));
         return "SELECT " + hit + " FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY " + within
-            + ") AS collapse_rank FROM " + from + " t WHERE " + where + ") WHERE collapse_rank = 1"
+            + ") AS " + rank + " FROM " + from + " t WHERE " + where + ") WHERE " + rank + " = 1"
             + (order == null ? "" : " ORDER BY " + order) + " LIMIT " + fetch;
     }
 
@@ -1075,10 +1272,13 @@ public final class InfinoSearch {
     /**
      * The rows after the search_after values in the request's sort order:
      * {@code (s1 > v1) OR (s1 = v1 AND s2 > v2) OR ...}, each comparison
-     * turned for a descending sort. The order puts missing values last, so
-     * after a present value the missing rows still follow ({@code OR s IS
-     * NULL}), after a missing one only the deeper sorts decide, and a
-     * missing value compares equal to itself. {@code part} keeps the rows
+     * turned for a descending sort. By default the order puts missing values
+     * last, so after a present value the missing rows still follow ({@code
+     * OR s IS NULL}), and after a missing one only the deeper sorts decide.
+     * Under {@code missing: _first} the missing rows come before every
+     * present one, so after a missing value every present row follows ({@code
+     * s IS NOT NULL}), and after a present one the missing rows are behind.
+     * A missing value compares equal to itself. {@code part} keeps the rows
      * whose first sort value is present, or only those missing it.
      */
     private static String keysetPredicate(Plan plan, Keyset part) {
@@ -1095,7 +1295,7 @@ public final class InfinoSearch {
             String strict;
             String same;
             if (value == null) {
-                strict = InfinoQueryTranslator.NONE;
+                strict = s.nullsFirst() ? col + " IS NOT NULL" : InfinoQueryTranslator.NONE;
                 same = col + " IS NULL";
             } else {
                 // A date sort's value as text is read by its field's own format, as stock reads it.
@@ -1107,7 +1307,7 @@ public final class InfinoSearch {
                     throw new IllegalArgumentException("[infino] search_after value [" + value + "] is not a " + s.type().name().toLowerCase(Locale.ROOT));
                 }
                 String past = col + (s.desc() ? " < " : " > ") + lit;
-                strict = i == 0 && part == Keyset.PRESENT ? past : "(" + past + " OR " + col + " IS NULL)";
+                strict = s.nullsFirst() || i == 0 && part == Keyset.PRESENT ? past : "(" + past + " OR " + col + " IS NULL)";
                 same = col + " = " + lit;
             }
             List<String> conj = new ArrayList<>(equal);
@@ -1749,17 +1949,23 @@ public final class InfinoSearch {
     @SuppressWarnings({ "unchecked", "rawtypes" })
     private static Comparator<SearchHit> bySortValues(List<SortSpec> sorts) {
         List<Boolean> desc = new ArrayList<>();
+        List<Boolean> nullsFirst = new ArrayList<>();
         for (SortSpec s : sorts) {
             desc.add(s.desc());
+            nullsFirst.add(s.nullsFirst());
         }
         return (a, b) -> {
             Object[] va = a.getSortValues();
             Object[] vb = b.getSortValues();
             for (int i = 0; i < Math.min(va.length, vb.length); i++) {
                 if (va[i] == null || vb[i] == null) {
-                    // Missing values last in both directions, as each index's own
-                    // statement orders them (NULLS LAST): never turned by a descending sort.
+                    // Missing values where each index's own statement orders them
+                    // (NULLS LAST, or NULLS FIRST under missing: _first): never turned
+                    // by a descending sort.
                     int nulls = va[i] == null ? (vb[i] == null ? 0 : 1) : -1;
+                    if (i < nullsFirst.size() && nullsFirst.get(i)) {
+                        nulls = -nulls;
+                    }
                     if (nulls != 0) {
                         return nulls;
                     }

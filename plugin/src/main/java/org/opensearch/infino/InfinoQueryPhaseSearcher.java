@@ -438,7 +438,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
      * The sort fields the coordinating node merges the shards' hits by: one
      * per sort of the plan (the request's, then the id), typed as the
      * table's values compare, each in its direction with missing values
-     * last, as the plan orders them.
+     * last (or first under {@code missing: _first}), as the plan orders them.
      */
     /** The score, least first: a {@code _score} sort ascending. */
     private static final SortField SCORE_ASCENDING = new SortField(null, SortField.Type.SCORE, true);
@@ -449,7 +449,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             SortSpec s = sorts.get(i);
             SortField.Type type = sortType(s.type());
             SortField f = new SortField(s.name(), type, s.desc());
-            f.setMissingValue(missing(type, s.desc()));
+            f.setMissingValue(missing(type, s));
             out[i] = f;
         }
         return out;
@@ -463,12 +463,17 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         };
     }
 
-    /** The value a missing sort value stands in as, so it sorts last in its direction. */
-    private static Object missing(SortField.Type type, boolean desc) {
+    /**
+     * The value a missing sort value stands in as, so it sorts where the plan
+     * puts it in its direction: the least value when that side comes last in
+     * a descending sort or first in an ascending one, else the greatest.
+     */
+    private static Object missing(SortField.Type type, SortSpec s) {
+        boolean least = s.desc() != s.nullsFirst();
         return switch (type) {
-            case LONG -> desc ? Long.MIN_VALUE : Long.MAX_VALUE;
-            case DOUBLE -> desc ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
-            default -> desc ? SortField.STRING_FIRST : SortField.STRING_LAST;
+            case LONG -> least ? Long.MIN_VALUE : Long.MAX_VALUE;
+            case DOUBLE -> least ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
+            default -> least ? SortField.STRING_FIRST : SortField.STRING_LAST;
         };
     }
 
@@ -480,7 +485,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             SortSpec s = sorts.get(i);
             SortField.Type type = sortType(s.type());
             if (v == null) {
-                out[i] = type == SortField.Type.STRING ? null : missing(type, s.desc());
+                out[i] = type == SortField.Type.STRING ? null : missing(type, s);
                 continue;
             }
             out[i] = switch (type) {
@@ -492,20 +497,20 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         return out;
     }
 
-    /** The search_after values a scroll resumes from, from the sort values of the last hit handed out: missing stand-ins back to missing. */
-    private static Object[] searchAfter(Object[] fields) {
+    /**
+     * The search_after values a scroll resumes from, from the sort values of
+     * the last hit handed out: text as text, the rest as it is. A missing
+     * value's stand-in (the least or greatest long, or an infinity) is read
+     * back as missing by the plan ({@link InfinoSearch.SortSpec#missingStandIn}),
+     * which knows the side its sort puts the missing rows on and whether a
+     * {@code missing} value leaves none missing; that value, even the least
+     * or greatest long, is a present one there.
+     */
+    static Object[] searchAfter(Object[] fields) {
         Object[] out = new Object[fields.length];
         for (int i = 0; i < fields.length; i++) {
             Object v = fields[i];
-            if (v instanceof BytesRef b) {
-                out[i] = b.utf8ToString();
-            } else if (v instanceof Long l && (l == Long.MAX_VALUE || l == Long.MIN_VALUE)) {
-                out[i] = null;
-            } else if (v instanceof Double d && d.isInfinite()) {
-                out[i] = null;
-            } else {
-                out[i] = v;
-            }
+            out[i] = v instanceof BytesRef b ? b.utf8ToString() : v;
         }
         return out;
     }
