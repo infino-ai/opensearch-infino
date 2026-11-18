@@ -271,10 +271,7 @@ final class InfinoQueryTranslator {
          * token index (a phrase, a required or an excluded word).
          */
         String principalPredicate() {
-            if (principal == null || !plainQuery(principal.query())) {
-                return null;
-            }
-            return TEXT_PREDICATE + quoteIdent(principal.column()) + ", " + literal(principal.query()) + ", " + literal(principal.mode()) + ")";
+            return principal == null || !plainQuery(principal.query()) ? null : textPredicate(table, principal);
         }
 
         /** The ranked relation for hits: BM25 over the principal clause, {@code k} candidates. */

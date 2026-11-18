@@ -515,8 +515,9 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
         String sorted = InfinoSearch.hitStatement(plan, 1, false);
         String unsorted = InfinoSearch.unsortedStatement(plan, 1, false, true);
-        assertEquals("SELECT osid, source FROM token_match('os_logs_0', 'message', 'disk', 'or') WHERE 1=1 ORDER BY \"_id\" LIMIT 1", unsorted);
-        assertTrue(sorted, sorted.contains(" FROM token_match('os_logs_0', 'message', 'disk', 'or') WHERE 1=1 ORDER BY "));
+        // Plain words are a text_match on the table in both: rows in the page's order, each checked.
+        assertEquals("SELECT osid, source FROM \"os_logs_0\" WHERE (1=1) AND text_match(\"message\", 'disk', 'or') ORDER BY \"_id\" LIMIT 1", unsorted);
+        assertTrue(sorted, sorted.contains(" FROM \"os_logs_0\" WHERE (1=1) AND text_match(\"message\", 'disk', 'or') ORDER BY "));
         assertEquals(
             "SELECT osid, source, osseq FROM \"os_logs_0\" WHERE 1=1 ORDER BY \"_id\" LIMIT 5",
             InfinoSearch.unsortedStatement(afterPlan(null, null), 5, true, true)
