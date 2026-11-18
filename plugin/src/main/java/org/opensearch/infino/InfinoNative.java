@@ -37,6 +37,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 
@@ -91,6 +92,10 @@ public final class InfinoNative {
     private static volatile Target opened;
     /** The target the node is configured for: its own URI until the settings or the account route say otherwise. */
     private static volatile Target wanted = Target.node();
+    /** How long a read on the hosted service may trail a write ({@link InfinoPlugin#PLATFORM_READ_WINDOW}), in nanoseconds. */
+    private static volatile long readWindowNanos = InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY).nanos();
+    /** When each table was last written on the hosted service ({@link System#nanoTime}), until a wait sees the window pass. */
+    private static final Map<String, Long> WRITTEN = new ConcurrentHashMap<>();
     private static final Map<String, Map<String, Column>> COLUMNS = new ConcurrentHashMap<>();
     /** What each table's mapping declares, from the mapping it was last declared with. */
     private static final Map<String, Mapping> MAPPINGS = new ConcurrentHashMap<>();
@@ -104,8 +109,15 @@ public final class InfinoNative {
     private static final String FORMAT = "format";
     /** The mapping types whose values are dates. */
     private static final Set<String> DATE_TYPES = Set.of("date", "date_nanos");
+    /** The mapping types whose values a sort compares as 32-bit floats (stock's float comparator). */
+    private static final Set<String> FLOAT_TYPES = Set.of("float", "half_float");
     /** The type of a multi-field that holds its field's value whole, the exact form of a text field. */
     private static final String KEYWORD_TYPE = "keyword";
+    private static final String USE_SIMILARITY = "use_similarity";
+    /** A field's own similarity, which overrides the index's default. */
+    private static final String SIMILARITY = "similarity";
+    /** The similarity a field scores by unless it or its index names another. */
+    static final String BM25 = "BM25";
     /** The count's key in {@link #valueCounts}'s rows, as the engine names it. */
     static final String VALUE_COUNT = "count(*)";
     /** How long a prefetched source waits for its fetch phase. */
@@ -132,10 +144,42 @@ public final class InfinoNative {
      * leaves the node (null when it is not). {@code dateFormat} is the format
      * a date column's mapping declares (null for the default one). {@code elem}
      * is a list column's element type (null for any other column).
+     * {@code similarity} is whether its mapping is a keyword field with
+     * {@code use_similarity}, whose terms Lucene scores by BM25.
+     * {@code otherSimilarity} is whether its field scores by a similarity
+     * other than the default BM25: its mapping names one, or the index's
+     * default is another.
      */
-    public record Column(String name, String type, boolean fts, boolean vector, UnaryOperator<String> mask, String dateFormat, String elem) {
+    public record Column(
+        String name,
+        String type,
+        boolean fts,
+        boolean vector,
+        UnaryOperator<String> mask,
+        String dateFormat,
+        String elem,
+        boolean similarity,
+        boolean otherSimilarity
+    ) {
+        public Column(
+            String name,
+            String type,
+            boolean fts,
+            boolean vector,
+            UnaryOperator<String> mask,
+            String dateFormat,
+            String elem,
+            boolean similarity
+        ) {
+            this(name, type, fts, vector, mask, dateFormat, elem, similarity, false);
+        }
+
         public Column(String name, String type, boolean fts, boolean vector) {
-            this(name, type, fts, vector, null, null, null);
+            this(name, type, fts, vector, null, null, null, false);
+        }
+
+        public Column(String name, String type, boolean fts, boolean vector, UnaryOperator<String> mask, String dateFormat, String elem) {
+            this(name, type, fts, vector, mask, dateFormat, elem, false);
         }
 
         /** A list column of {@code elem} values. */
@@ -145,26 +189,50 @@ public final class InfinoNative {
 
         /** This column as the request sees it, its values masked by {@code mask}. */
         Column masked(UnaryOperator<String> mask) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity);
         }
 
         /** This column with the date format its mapping declares. */
         Column dated(String dateFormat) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity);
+        }
+
+        /** This column as a keyword field with {@code use_similarity} maps it. */
+        Column scoredBySimilarity() {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, true, otherSimilarity);
+        }
+
+        /** This column as a field scored by a similarity other than the default BM25. */
+        Column scoredByOtherSimilarity() {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, true);
+        }
+
+        /**
+         * Whether Lucene scores a term on this field by BM25 rather than at a
+         * constant: a boolean field, whose term query is a plain one, and a
+         * keyword field with {@code use_similarity}, under the default BM25.
+         * Under another similarity such a term keeps its boost as its score:
+         * exactly stock's under {@code boolean}, which scores a matching term
+         * its boost, and the table's score from before for the others, which
+         * it does not compute.
+         */
+        boolean scoresTermsByBm25() {
+            return (isBoolean() || similarity) && !otherSimilarity;
         }
 
         /**
          * This column read by its whole value, as a keyword multi-field of its
          * field reads it: no text index, so a term is the value, not one of its
-         * words.
+         * words. Its {@code use_similarity} and similarity are its own
+         * mapping's, not its field's: neither here.
          */
         Column exact() {
-            return fts ? new Column(name, type, false, vector, mask, dateFormat, elem) : this;
+            return fts || similarity || otherSimilarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false, false) : this;
         }
 
         /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */
         Column element() {
-            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null) : this;
+            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null, similarity, otherSimilarity) : this;
         }
 
         public boolean isList() {
@@ -240,6 +308,16 @@ public final class InfinoNative {
     }
 
     /**
+     * For tests that stand a bridge of their own in for the library (null to
+     * load the library again): the next call opens its connection through it.
+     */
+    static synchronized void useLib(InfinoLib bridge) {
+        lib = bridge;
+        conn = null;
+        opened = null;
+    }
+
+    /**
      * Open the connection the node is configured for, if it is not the one
      * open. A connection in use is not closed when another replaces it: a
      * call in flight on another thread still holds it, and an account
@@ -312,6 +390,65 @@ public final class InfinoNative {
     /** Whether the tables are served from the hosted service rather than the node's own storage. */
     public static boolean hosted() {
         return wanted.hosted();
+    }
+
+    /** Take {@code window} as how long a hosted read may trail a write, at boot. */
+    static void readWindow(TimeValue window) {
+        readWindowNanos = window.nanos();
+    }
+
+    /**
+     * Note a write to {@code name}. On the hosted service a read may be
+     * answered from a snapshot taken before it, for up to the read window;
+     * the node's own storage answers every read with what was written.
+     */
+    private static void wrote(String name) {
+        if (hosted() && readWindowNanos > 0) {
+            wrote(name, System.nanoTime());
+        }
+    }
+
+    /**
+     * Note a write to {@code name} that completed at {@code at}. Of two
+     * writes noted at once, the later stays, whichever is noted last, so a
+     * wait never ends before the later one is visible.
+     */
+    static void wrote(String name, long at) {
+        WRITTEN.merge(name, at, (a, b) -> b - a > 0 ? b : a);
+    }
+
+    /**
+     * Wait until every read of {@code name} sees what this node has written
+     * to it: until the read window has passed since its last write. Returns
+     * at once when the window has passed, or the table is not hosted, or
+     * this node has not written it. What a refresh waits on, so that a
+     * search after it ({@code refresh=true}, {@code wait_for}) finds the
+     * writes it covered. An interrupt does not cut the wait short, as the
+     * writes would then be released unseen; it is kept for the caller.
+     */
+    public static void awaitVisible(String name) {
+        Long at = WRITTEN.get(name);
+        if (at == null) {
+            return;
+        }
+        boolean interrupted = false;
+        long left;
+        while ((left = untilVisible(at, readWindowNanos, System.nanoTime())) > 0) {
+            try {
+                TimeUnit.NANOSECONDS.sleep(left);
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        WRITTEN.remove(name, at);
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Nanoseconds from {@code now} until a write at {@code writtenAt} is visible to every read; zero or less once it is. */
+    static long untilVisible(long writtenAt, long window, long now) {
+        return writtenAt + window - now;
     }
 
     /** How the tables are served, for a status report. */
@@ -457,8 +594,17 @@ public final class InfinoNative {
 
     // ---- schema ----
 
-    /** Create the table from a mapping, or add the mapped fields it lacks. */
+    /** Create the table from a mapping, or add the mapped fields it lacks, under the default BM25 similarity. */
     public static void ensureTable(String name, String mappingJson) {
+        ensureTable(name, mappingJson, true);
+    }
+
+    /**
+     * Create the table from a mapping, or add the mapped fields it lacks.
+     * {@code defaultBm25} is whether the index's default similarity is the
+     * default BM25 ({@link Mapping}).
+     */
+    public static void ensureTable(String name, String mappingJson, boolean defaultBm25) {
         init();
         COLUMNS.remove(name);
         InfinoRequestCache.changed(name);
@@ -466,8 +612,9 @@ public final class InfinoNative {
             takeOrThrow(lib.infino_ensure_table(conn, name, mappingJson));
         } finally {
             InfinoRequestCache.changed(name);
+            wrote(name);
         }
-        MAPPINGS.put(name, Mapping.of(mappingJson));
+        MAPPINGS.put(name, Mapping.of(mappingJson, defaultBm25));
         // A lookup while the table was declared cached its columns without what the mapping adds.
         COLUMNS.remove(name);
     }
@@ -480,12 +627,42 @@ public final class InfinoNative {
      * keyword multi-field's dotted path to its field's, since the field's
      * column holds the value the multi-field indexes whole (a log mapping's
      * {@code request.raw} under the text field {@code request}, as a dynamic
-     * mapping's {@code name.keyword}); and each date field's declared format.
+     * mapping's {@code name.keyword}); each date field's declared format;
+     * and each {@code float} or {@code half_float} field ({@code floatFields}).
      */
-    record Mapping(Set<String> paths, Map<String, String> aliases, Map<String, String> keywordFields, Map<String, String> dateFormats) {
-        @SuppressWarnings("unchecked")
+    record Mapping(
+        Set<String> paths,
+        Map<String, String> aliases,
+        Map<String, String> keywordFields,
+        Map<String, String> dateFormats,
+        Set<String> similarityFields,
+        Set<String> otherSimilarityFields,
+        Set<String> floatFields,
+        boolean defaultBm25
+    ) {
+        /** {@link #of(String, boolean)} under the default BM25 similarity. */
         static Mapping of(String mappingJson) {
-            Mapping out = new Mapping(new HashSet<>(), new LinkedHashMap<>(), new LinkedHashMap<>(), new LinkedHashMap<>());
+            return of(mappingJson, true);
+        }
+
+        /**
+         * The mapping {@code mappingJson} declares, its fields' similarity
+         * read under an index whose default is the default BM25 when
+         * {@code defaultBm25}: each field scoring by another similarity is in
+         * {@code otherSimilarityFields}.
+         */
+        @SuppressWarnings("unchecked")
+        static Mapping of(String mappingJson, boolean defaultBm25) {
+            Mapping out = new Mapping(
+                new HashSet<>(),
+                new LinkedHashMap<>(),
+                new LinkedHashMap<>(),
+                new LinkedHashMap<>(),
+                new HashSet<>(),
+                new HashSet<>(),
+                new HashSet<>(),
+                defaultBm25
+            );
             Object root = object(mappingJson);
             // The mapping as the cluster keeps it sits under its type name.
             while (root instanceof Map<?, ?> m && !m.containsKey(PROPERTIES) && m.size() == 1) {
@@ -512,12 +689,27 @@ public final class InfinoNative {
                 if (field.get(TYPE) instanceof String type && DATE_TYPES.contains(type) && field.get(FORMAT) instanceof String format) {
                     dateFormats.put(path, format);
                 }
+                if (field.get(TYPE) instanceof String type && FLOAT_TYPES.contains(type)) {
+                    floatFields.add(path);
+                }
+                if (scoresBySimilarity(field)) {
+                    similarityFields.add(path);
+                }
+                if (scoresByOtherSimilarity(field)) {
+                    otherSimilarityFields.add(path);
+                }
                 if (field.get(MULTI_FIELDS) instanceof Map<?, ?> multi) {
                     for (Map.Entry<?, ?> sub : multi.entrySet()) {
                         String subPath = path + "." + sub.getKey();
                         paths.add(subPath);
                         if (sub.getValue() instanceof Map<?, ?> subField && KEYWORD_TYPE.equals(subField.get(TYPE))) {
                             keywordFields.put(subPath, path);
+                            if (scoresBySimilarity(subField)) {
+                                similarityFields.add(subPath);
+                            }
+                            if (scoresByOtherSimilarity(subField)) {
+                                otherSimilarityFields.add(subPath);
+                            }
                         }
                     }
                 }
@@ -525,6 +717,23 @@ public final class InfinoNative {
                     walk((Map<String, Object>) inner, path);
                 }
             }
+        }
+
+        /**
+         * Whether {@code field} scores by a similarity other than the default
+         * BM25: the one its mapping names, or the index's default when it
+         * names none. A named similarity is the default BM25 only by that
+         * name; any other, a custom BM25 with its own parameters included,
+         * scores otherwise.
+         */
+        private boolean scoresByOtherSimilarity(Map<?, ?> field) {
+            Object named = field.get(SIMILARITY);
+            return named == null ? !defaultBm25 : !BM25.equals(String.valueOf(named));
+        }
+
+        /** Whether {@code field} is a keyword field with {@code use_similarity}, as the mapping keeps it (a boolean or its string). */
+        private static boolean scoresBySimilarity(Map<?, ?> field) {
+            return KEYWORD_TYPE.equals(field.get(TYPE)) && "true".equals(String.valueOf(field.get(USE_SIMILARITY)));
         }
     }
 
@@ -537,6 +746,16 @@ public final class InfinoNative {
     static boolean maps(String table, String field) {
         Mapping mapping = MAPPINGS.get(table);
         return mapping == null || mapping.paths().contains(field);
+    }
+
+    /**
+     * The fields of {@code table} its mapping declares {@code float} or
+     * {@code half_float}, which a sort compares as 32-bit floats; empty for
+     * a table no mapping has declared yet.
+     */
+    static Set<String> floatFields(String table) {
+        Mapping mapping = MAPPINGS.get(table);
+        return mapping == null ? Set.of() : mapping.floatFields();
     }
 
     /**
@@ -570,6 +789,12 @@ public final class InfinoNative {
             );
             // A list column of a mapped field reads its dates as the field's do.
             String format = mapping == null ? null : mapping.dateFormats().get(InfinoQueryTranslator.fieldOf(column));
+            if (mapping != null && mapping.similarityFields().contains(column)) {
+                described = described.scoredBySimilarity();
+            }
+            if (mapping != null && mapping.otherSimilarityFields().contains(InfinoQueryTranslator.fieldOf(column))) {
+                described = described.scoredByOtherSimilarity();
+            }
             out.put(column, format == null ? described : described.dated(format));
         }
         for (Map.Entry<String, String> alias : (mapping == null ? Map.<String, String>of() : mapping.aliases()).entrySet()) {
@@ -581,7 +806,12 @@ public final class InfinoNative {
         for (Map.Entry<String, String> sub : (mapping == null ? Map.<String, String>of() : mapping.keywordFields()).entrySet()) {
             Column field = out.get(sub.getValue());
             if (field != null && field.isString()) {
-                out.putIfAbsent(sub.getKey(), field.exact());
+                Column exact = field.exact();
+                Column scored = mapping.similarityFields().contains(sub.getKey()) ? exact.scoredBySimilarity() : exact;
+                if (mapping.otherSimilarityFields().contains(sub.getKey())) {
+                    scored = scored.scoredByOtherSimilarity();
+                }
+                out.putIfAbsent(sub.getKey(), scored);
             }
         }
         Map<String, Column> view = Collections.unmodifiableMap(out);
@@ -606,6 +836,7 @@ public final class InfinoNative {
             return lib.infino_drop(conn, name);
         } finally {
             InfinoRequestCache.changed(name);
+            WRITTEN.remove(name); // nothing of it is left to see
         }
     }
 
@@ -773,6 +1004,7 @@ public final class InfinoNative {
             );
         } finally {
             InfinoRequestCache.changed(name);
+            wrote(name);
         }
         List<PreparedFailure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
@@ -804,6 +1036,7 @@ public final class InfinoNative {
             out = object(takeOrThrow(lib.infino_index_batch_buf(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), n)));
         } finally {
             InfinoRequestCache.changed(name);
+            wrote(name);
         }
         List<Failure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
@@ -820,6 +1053,7 @@ public final class InfinoNative {
             return lib.infino_delete_osids(conn, name, osids, n);
         } finally {
             InfinoRequestCache.changed(name);
+            wrote(name);
         }
     }
 
@@ -884,6 +1118,23 @@ public final class InfinoNative {
      */
     public static Map<String, String> sources(String name, Collection<String> osids) {
         Map<String, String> out = new HashMap<>();
+        if (osids.size() > 1) {
+            // One call for the page: the bridge runs its lookups side by side.
+            init();
+            String json = take(lib.infino_get_many(conn, name, osids.toArray(new String[0]), osids.size()));
+            if (json != null && !json.isEmpty()) {
+                try (XContentParser parser = parser(json)) {
+                    for (Map.Entry<String, Object> entry : parser.map().entrySet()) {
+                        if (entry.getValue() instanceof String source && !source.isEmpty()) {
+                            out.put(entry.getKey(), source);
+                        }
+                    }
+                    return out;
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }
+        }
         for (String id : osids) {
             String source = getSourceFresh(name, id);
             if (source != null && !source.isEmpty()) {

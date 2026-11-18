@@ -6,6 +6,8 @@ package org.opensearch.infino;
 
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
@@ -19,6 +21,7 @@ import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.document.DocumentField;
+import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.unit.TimeValue;
@@ -170,7 +173,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         // it for this shard, as it does for a stock shard (null: the index whole).
         // The coordinating node checked the table answers it (InfinoAliasFilter).
         AliasFilter aliases = context.request().getAliasFilter();
-        InfinoAccess access = InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH)
+        InfinoAccess access = InfinoAccess.searching(index.getName())
             .filteredBy(aliases == null ? null : aliases.getQueryBuilder());
 
         ScrollContext scroll = context.scrollContext();
@@ -201,8 +204,10 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         boolean exact = trackTotal(source);
         boolean sharedTotal = !here.isEmpty() && !deferred && plan.vector() == null && plan.postWhere() == null && exact;
         boolean countWithAggs = sharedTotal && source.size() == 0;
-        // A total the aggregations take as their population is counted in full (see InfinoSearch.search).
-        InfinoSearch.Page page = InfinoSearch.page(index, plan, source, !countWithAggs, scroll == null && !sharedTotal);
+        // A total the aggregations take as their population is counted in full
+        // (see InfinoSearch.search); a scroll's next round resumes from this
+        // round's last hit (see scrollRound).
+        InfinoSearch.Page page = InfinoSearch.page(index, plan, source, !countWithAggs, scroll == null && !sharedTotal, scroll != null);
         long total = page.total();
         if (!builders.isEmpty()) {
             // A search over several shards (this index's, or other indices')
@@ -239,7 +244,13 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         }
         boolean sorted = !plan.sorts().isEmpty();
         boolean collapsed = plan.collapse() != null;
-        SortField[] sortFields = sorted ? sortFields(plan.sorts()) : collapsed ? new SortField[] { SortField.FIELD_SCORE } : null;
+        // A request sorted by the score ascending, least first: the shards'
+        // hits merge by the score reversed, as stock's sorted top docs carry it.
+        boolean scoreAscending = !sorted && !collapsed && InfinoSearch.sortsByScoreAscending(source);
+        SortField[] sortFields = sorted ? sortFields(plan.sorts())
+            : collapsed ? new SortField[] { SortField.FIELD_SCORE }
+            : scoreAscending ? new SortField[] { SCORE_ASCENDING }
+            : null;
         List<ScoreDoc> docs = new ArrayList<>(rows.size());
         List<Object> collapseValues = new ArrayList<>();
         for (SearchHit h : rows) {
@@ -251,7 +262,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             float score = Float.isNaN(h.getScore()) && !sorted ? 1.0f : h.getScore();
             if (sorted) {
                 docs.add(new FieldDoc(doc, score, sortValues(h.getSortValues(), plan.sorts())));
-            } else if (collapsed) {
+            } else if (collapsed || scoreAscending) {
                 docs.add(new FieldDoc(doc, score, new Object[] { score }));
             } else {
                 docs.add(new ScoreDoc(doc, score));
@@ -270,7 +281,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
                 sortFields,
                 collapseValues.toArray()
             );
-        } else if (sorted) {
+        } else if (sorted || scoreAscending) {
             topDocs = new TopFieldDocs(totalHits, docs.toArray(new FieldDoc[0]), sortFields);
         } else {
             topDocs = new TopDocs(totalHits, docs.toArray(new ScoreDoc[0]));
@@ -409,9 +420,20 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         return visitor.id();
     }
 
-    /** The Lucene document of an id in the shard's skeleton, or -1 when it has none. */
+    /**
+     * The root Lucene document of an id in the shard's skeleton, or -1 when it
+     * has none. A document's nested entries are Lucene documents of their own
+     * that carry its id too, ahead of it in its block; the fetch phase takes a
+     * hit on one of them for an inner hit and gives it {@code _nested}, so
+     * only the root document, the one stock's non-nested filter keeps, may
+     * stand for the hit.
+     */
     private static int docId(ContextIndexSearcher searcher, String id) throws IOException {
-        TopDocs td = searcher.search(new TermQuery(new Term(IdFieldMapper.NAME, Uid.encodeId(id))), 1);
+        Query root = new BooleanQuery.Builder().add(
+            new TermQuery(new Term(IdFieldMapper.NAME, Uid.encodeId(id))),
+            BooleanClause.Occur.FILTER
+        ).add(Queries.newNonNestedFilter(), BooleanClause.Occur.FILTER).build();
+        TopDocs td = searcher.search(root, 1);
         return td.scoreDocs.length == 0 ? -1 : td.scoreDocs[0].doc;
     }
 
@@ -419,15 +441,18 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
      * The sort fields the coordinating node merges the shards' hits by: one
      * per sort of the plan (the request's, then the id), typed as the
      * table's values compare, each in its direction with missing values
-     * last, as the plan orders them.
+     * last (or first under {@code missing: _first}), as the plan orders them.
      */
+    /** The score, least first: a {@code _score} sort ascending. */
+    private static final SortField SCORE_ASCENDING = new SortField(null, SortField.Type.SCORE, true);
+
     private static SortField[] sortFields(List<SortSpec> sorts) {
         SortField[] out = new SortField[sorts.size()];
         for (int i = 0; i < out.length; i++) {
             SortSpec s = sorts.get(i);
             SortField.Type type = sortType(s.type());
             SortField f = new SortField(s.name(), type, s.desc());
-            f.setMissingValue(missing(type, s.desc()));
+            f.setMissingValue(missing(type, s));
             out[i] = f;
         }
         return out;
@@ -441,12 +466,17 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         };
     }
 
-    /** The value a missing sort value stands in as, so it sorts last in its direction. */
-    private static Object missing(SortField.Type type, boolean desc) {
+    /**
+     * The value a missing sort value stands in as, so it sorts where the plan
+     * puts it in its direction: the least value when that side comes last in
+     * a descending sort or first in an ascending one, else the greatest.
+     */
+    private static Object missing(SortField.Type type, SortSpec s) {
+        boolean least = s.desc() != s.nullsFirst();
         return switch (type) {
-            case LONG -> desc ? Long.MIN_VALUE : Long.MAX_VALUE;
-            case DOUBLE -> desc ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
-            default -> desc ? SortField.STRING_FIRST : SortField.STRING_LAST;
+            case LONG -> least ? Long.MIN_VALUE : Long.MAX_VALUE;
+            case DOUBLE -> least ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
+            default -> least ? SortField.STRING_FIRST : SortField.STRING_LAST;
         };
     }
 
@@ -458,7 +488,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             SortSpec s = sorts.get(i);
             SortField.Type type = sortType(s.type());
             if (v == null) {
-                out[i] = type == SortField.Type.STRING ? null : missing(type, s.desc());
+                out[i] = type == SortField.Type.STRING ? null : missing(type, s);
                 continue;
             }
             out[i] = switch (type) {
@@ -470,20 +500,20 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         return out;
     }
 
-    /** The search_after values a scroll resumes from, from the sort values of the last hit handed out: missing stand-ins back to missing. */
-    private static Object[] searchAfter(Object[] fields) {
+    /**
+     * The search_after values a scroll resumes from, from the sort values of
+     * the last hit handed out: text as text, the rest as it is. A missing
+     * value's stand-in (the least or greatest long, or an infinity) is read
+     * back as missing by the plan ({@link InfinoSearch.SortSpec#missingStandIn}),
+     * which knows the side its sort puts the missing rows on and whether a
+     * {@code missing} value leaves none missing; that value, even the least
+     * or greatest long, is a present one there.
+     */
+    static Object[] searchAfter(Object[] fields) {
         Object[] out = new Object[fields.length];
         for (int i = 0; i < fields.length; i++) {
             Object v = fields[i];
-            if (v instanceof BytesRef b) {
-                out[i] = b.utf8ToString();
-            } else if (v instanceof Long l && (l == Long.MAX_VALUE || l == Long.MIN_VALUE)) {
-                out[i] = null;
-            } else if (v instanceof Double d && d.isInfinite()) {
-                out[i] = null;
-            } else {
-                out[i] = v;
-            }
+            out[i] = v instanceof BytesRef b ? b.utf8ToString() : v;
         }
         return out;
     }
