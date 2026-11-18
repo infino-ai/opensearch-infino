@@ -4,9 +4,12 @@
 
 package org.opensearch.infino;
 
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MultiMatchQueryBuilder;
+import org.opensearch.index.query.Operator;
 import org.opensearch.index.query.QueryBuilders;
+import org.opensearch.index.query.QueryShardException;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
 import org.opensearch.test.OpenSearchTestCase;
@@ -596,6 +599,219 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("(\"level\" = 'error')", translate(b).where());
         b.minimumShouldMatch(1);
         assertEquals("(\"level\" = 'error' AND (\"status\" = 500))", translate(b).where());
+    }
+
+    public void testQueryStringReadsMinimumShouldMatch() {
+        // Two of three optional words: the engine query still ranks, and a count narrows it.
+        Translation ranked = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("2"));
+        assertEquals(new InfinoQueryTranslator.TextClause("message", "alpha beta gamma", "or"), ranked.principal());
+        String two = ranked.where();
+        assertTrue(two, two.contains(">= 2)"));
+        assertEquals(3, two.split("THEN 1 ELSE 0 END", -1).length - 1);
+        // One of the optional words alone asks nothing more than the list: the plain translation, ranked, no count.
+        Translation one = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("1"));
+        Translation plain = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message"));
+        assertEquals(plain.where(), one.where());
+        assertEquals(plain.principal(), one.principal());
+        // More than there are matches nothing, as stock does; exactly as many is a count of all three.
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("4")).where());
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("200%")).where());
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("+alpha beta gamma").defaultField("message").minimumShouldMatch("3")).where());
+        assertTrue(translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("3")).where().contains(">= 3)"));
+        assertTrue(translate(QueryBuilders.queryStringQuery("+alpha beta gamma").defaultField("message").minimumShouldMatch("2")).where().contains(">= 2)"));
+        // A malformed form is the request's error, reported as stock reports a query it cannot build.
+        for (String bad : new String[] { "2<", "two" }) {
+            QueryShardException e = expectThrows(
+                QueryShardException.class,
+                () -> translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch(bad))
+            );
+            assertEquals(RestStatus.BAD_REQUEST, e.status());
+            assertTrue(e.getMessage(), e.getMessage().startsWith("failed to create query: "));
+        }
+        // Stock's reading of the forms: 100% of three is three, -1 of three is two.
+        assertTrue(translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("100%")).where().contains(">= 3)"));
+        assertTrue(translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("-1")).where().contains(">= 2)"));
+        // One is a plain OR over the optional words, ANDed with the required one.
+        String required = translate(QueryBuilders.queryStringQuery("+alpha beta gamma").defaultField("message").minimumShouldMatch("1")).where();
+        assertTrue(required, required.contains(" AND ("));
+        // Without it, nothing changes; and simple_query_string reads it too.
+        String none = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message")).where();
+        assertFalse(none, none.contains("THEN 1 ELSE 0 END"));
+        assertTrue(translate(QueryBuilders.simpleQueryStringQuery("alpha beta gamma").field("message").minimumShouldMatch("2")).where().contains(">= 2)"));
+    }
+
+    public void testQueryStringMinimumShouldMatchWithNoOptionalClause() {
+        // Stock applies the value to a clause list with no optional clause too, and it then matches nothing.
+        assertEquals(
+            "1=0",
+            translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").defaultOperator(Operator.AND).minimumShouldMatch("2"))
+                .where()
+        );
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("-delta").defaultField("message").minimumShouldMatch("1")).where());
+        // A lone clause with + is such a list; the same clause without it is no list at all.
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("+alpha").defaultField("message").minimumShouldMatch("1")).where());
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("+(alpha beta)").defaultField("message").minimumShouldMatch("1")).where());
+        Translation lone = translate(QueryBuilders.queryStringQuery("alpha").defaultField("message"));
+        Translation loneAsked = translate(QueryBuilders.queryStringQuery("alpha").defaultField("message").minimumShouldMatch("2"));
+        assertEquals(lone.where(), loneAsked.where());
+        assertEquals(lone.principal(), loneAsked.principal());
+        // A value asking for none changes nothing.
+        Translation required = translate(QueryBuilders.queryStringQuery("+alpha").defaultField("message"));
+        assertEquals(required.where(), translate(QueryBuilders.queryStringQuery("+alpha").defaultField("message").minimumShouldMatch("-1")).where());
+        // Stock builds every clause before it counts: a numeric clause the column cannot read is still refused.
+        assertNull(translate(QueryBuilders.queryStringQuery("status:abc message:alpha message:beta").defaultField("message").minimumShouldMatch("4")));
+    }
+
+    public void testQueryStringMinimumShouldMatchSkipsBlankPhrasesOnText() {
+        // Stock's analysis drops "" and " " on a text field: 75% of two optional clauses is one.
+        String blank = translate(QueryBuilders.queryStringQuery("alpha \"\" beta").defaultField("message").minimumShouldMatch("75%")).where();
+        assertEquals(translate(QueryBuilders.queryStringQuery("alpha \"\" beta").defaultField("message")).where(), blank);
+        assertEquals(
+            blank,
+            translate(QueryBuilders.queryStringQuery("alpha \" \" beta").defaultField("message").minimumShouldMatch("75%")).where()
+        );
+        assertEquals(blank, translate(QueryBuilders.simpleQueryStringQuery("alpha \"\" beta").field("message").minimumShouldMatch("75%")).where());
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("alpha \"\" beta gamma").defaultField("message").minimumShouldMatch("3")).where()
+                .contains(">= 3)")
+        );
+        // On a keyword column the empty value is a clause: 75% of three is two.
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("level:alpha level:\"\" level:beta").minimumShouldMatch("75%")).where().contains(">= 2)")
+        );
+    }
+
+    public void testQueryStringMinimumShouldMatchOnAKeywordDefaultField() {
+        // A keyword column keeps foo-bar whole: one exact value, a lone term, no list.
+        assertEquals(
+            translate(QueryBuilders.queryStringQuery("level:foo-bar")).where(),
+            translate(QueryBuilders.queryStringQuery("foo-bar").defaultField("level").minimumShouldMatch("2")).where()
+        );
+        // Beside another clause it is one counted clause.
+        String two = translate(QueryBuilders.queryStringQuery("foo-bar message:alpha").defaultField("level").minimumShouldMatch("2")).where();
+        assertTrue(two, two.contains("\"level\" = 'foo-bar'"));
+        assertTrue(two, two.contains(">= 2)"));
+        // A run of words is one value there for stock: refused.
+        IllegalArgumentException run = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("foo bar").defaultField("level").minimumShouldMatch("2"))
+        );
+        assertTrue(run.getMessage(), run.getMessage().contains("keyword fields only"));
+        // Next to a text column it may still be split: refused as before.
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("foo-bar").field("message").field("level").minimumShouldMatch("2"))
+        );
+    }
+
+    public void testAShortPageRankedInAWindowIsRankedAgain() {
+        // A count over the optional clauses removes rows after the ranking: a short page may have used up the window.
+        Translation counted = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message").minimumShouldMatch("2"));
+        InfinoSearch.Plan plan = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            counted,
+            java.util.List.of(),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        assertTrue(InfinoSearch.rankedInWindow(plan));
+        String wider = InfinoSearch.hitStatement(plan, 10, false, InfinoSearch.Keyset.WHOLE, 50_000);
+        assertTrue(wider, wider.contains(", 50000, 'or')"));
+        assertTrue(InfinoSearch.hitStatement(plan, 10, false).contains(", 10000, 'or')"));
+        // A filter the engine applies while it ranks leaves no window to run out.
+        Translation plain = translate(QueryBuilders.queryStringQuery("alpha beta gamma").defaultField("message"));
+        assertFalse(
+            InfinoSearch.rankedInWindow(
+                new InfinoSearch.Plan(TABLE, columns(), plain, java.util.List.of(), null, null, null, null, java.util.List.of(), InfinoAccess.NONE, NOW)
+            )
+        );
+    }
+
+    public void testQueryStringMinimumShouldMatchRefusedWhereStockCountsOtherClauses() {
+        // Over several fields stock reads a run of words as one dis_max clause.
+        IllegalArgumentException fields = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("alpha beta").field("message").field("level").minimumShouldMatch("2"))
+        );
+        assertTrue(fields.getMessage(), fields.getMessage().contains("more than one field"));
+        // Each word with its field is a clause of its own, as in stock.
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("message:alpha message:beta").field("message").field("level").minimumShouldMatch("2"))
+                .where()
+                .contains(">= 2)")
+        );
+        // A word the analyzer may split is one clause or several in stock, by where it sits.
+        IllegalArgumentException lone = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("foo-bar").defaultField("message").minimumShouldMatch("2"))
+        );
+        assertTrue(lone.getMessage(), lone.getMessage().contains("[foo-bar]"));
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("alpha foo-bar").defaultField("message").minimumShouldMatch("2"))
+        );
+        // Quoted, it is one phrase clause in both.
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("alpha \"foo-bar\"").defaultField("message").minimumShouldMatch("2")).where().contains(">= 2)")
+        );
+        // simple_query_string's own syntax makes other clauses of an operator: there -gamma is optional.
+        IllegalArgumentException simple = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.simpleQueryStringQuery("alpha beta -gamma").field("message").minimumShouldMatch("2"))
+        );
+        assertTrue(simple.getMessage(), simple.getMessage().contains("[-gamma]"));
+        // Inside a phrase a word is no operator in either syntax; after it, ~ still is.
+        assertNotNull(translate(QueryBuilders.simpleQueryStringQuery("\"alpha OR beta\"").field("message").minimumShouldMatch("2")));
+        assertTrue(
+            translate(QueryBuilders.simpleQueryStringQuery("gamma \"alpha -beta\"").field("message").minimumShouldMatch("2"))
+                .where()
+                .contains(">= 2)")
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.simpleQueryStringQuery("alpha OR beta").field("message").minimumShouldMatch("2"))
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.simpleQueryStringQuery("\"alpha beta\"~2 gamma").field("message").minimumShouldMatch("2"))
+        );
+        // An operator touching a phrase's quote is still a word of its own.
+        IllegalArgumentException touching = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.simpleQueryStringQuery("\"alpha\"OR beta").field("message").minimumShouldMatch("2"))
+        );
+        assertTrue(touching.getMessage(), touching.getMessage().contains("[OR]"));
+        assertNotNull(translate(QueryBuilders.simpleQueryStringQuery("\"alpha\"beta gamma").field("message").minimumShouldMatch("2")));
+        // The standard tokenizer splits a word where its script changes.
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("alpha ไทยabc beta").defaultField("message").minimumShouldMatch("3"))
+        );
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("alpha ไทย beta").defaultField("message").minimumShouldMatch("3")).where().contains(">= 3)")
+        );
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("alpha abc123 beta").defaultField("message").minimumShouldMatch("3")).where().contains(">= 3)")
+        );
+        // The standard tokenizer splits a word longer than 255 characters there.
+        assertTrue(
+            translate(QueryBuilders.queryStringQuery("alpha " + "a".repeat(255) + " beta").defaultField("message").minimumShouldMatch("3"))
+                .where()
+                .contains(">= 3)")
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("alpha " + "a".repeat(256) + " beta").defaultField("message").minimumShouldMatch("3"))
+        );
+        // Without minimum_should_match, nothing here is refused.
+        assertNotNull(translate(QueryBuilders.queryStringQuery("alpha beta").field("message").field("level")));
+        assertNotNull(translate(QueryBuilders.queryStringQuery("foo-bar").defaultField("message")));
     }
 
     public void testQueryStringOverEveryTextColumn() {
