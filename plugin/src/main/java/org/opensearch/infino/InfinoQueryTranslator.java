@@ -284,14 +284,26 @@ final class InfinoQueryTranslator {
                 + ")";
         }
 
-        /** The predicate {@code text} is as a clause other than the ranked one: the ids its token match holds. */
+        /**
+         * The predicate {@code text} is as a clause other than the ranked one,
+         * exactly as the translator wrote it into {@link #where} (see
+         * {@link #textPredicate}).
+         */
         String textMatch(TextClause text) {
-            return textSubquery(table, text);
+            return textPredicate(table, text);
         }
     }
 
-    /** The ids a text clause matches, as a subquery over the token index of {@code table}. */
-    private static String textSubquery(String table, TextClause text) {
+    /**
+     * The predicate a text clause other than the ranked one is: the engine's
+     * {@code text_match} on the column for plain words ({@link #plainQuery}),
+     * otherwise the ids its token match holds, as a subquery over the token
+     * index of {@code table}.
+     */
+    private static String textPredicate(String table, TextClause text) {
+        if (plainQuery(text.query())) {
+            return TEXT_PREDICATE + quoteIdent(text.column()) + ", " + literal(text.query()) + ", " + literal(text.mode()) + ")";
+        }
         return TEXT_SUBQUERY + literal(table) + ", " + literal(text.column()) + ", " + literal(text.query()) + ", " + literal(text.mode()) + "))";
     }
 
@@ -1609,10 +1621,7 @@ final class InfinoQueryTranslator {
             principal = new TextClause(column, principal.query() + " " + query, mode);
             return ALL;
         }
-        if (plainQuery(query)) {
-            return TEXT_PREDICATE + quoteIdent(column) + ", " + literal(query) + ", " + literal(mode) + ")";
-        }
-        return textSubquery(table, new TextClause(column, query, mode));
+        return textPredicate(table, new TextClause(column, query, mode));
     }
 
     /**

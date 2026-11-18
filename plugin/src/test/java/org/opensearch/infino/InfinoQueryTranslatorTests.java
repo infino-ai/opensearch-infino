@@ -1015,7 +1015,8 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertTrue(s.reorders());
         String sql = hits(t, null, 10);
         String bonus = "((CASE WHEN \"level\" = 'error' THEN 1.0 ELSE 0.0 END))";
-        String match = "osid IN (SELECT osid FROM token_match('os_logs_0', 'message', 'disk', 'or'))";
+        // A plain word is the engine's text_match, as the translator writes it into the predicate.
+        String match = "text_match(\"message\", 'disk', 'or')";
         // The band without the term's share, and the band with it: the match's ten best in each.
         assertTrue(sql, sql.contains("FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') WHERE (((1=1 OR \"level\" = 'error'))) AND " + bonus + " < 0.5"));
         assertTrue(sql, sql.contains("FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') WHERE (((1=1 OR \"level\" = 'error'))) AND " + bonus + " >= 0.5"));
