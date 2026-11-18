@@ -590,3 +590,128 @@
   - match: { aggregations.o.buckets.1.key_as_string: "1969-12-31T06:00:00.000Z" }
   - match: { aggregations.o.buckets.1.doc_count: 2 }
   - match: { aggregations.o.buckets.2.key_as_string: "2300-06-15T06:00:00.000Z" }
+
+---
+"Zoned fixed date keys outside 1677 to 2262 fall on local time and match a Lucene twin":
+  # The zoned fixed_interval key bins the local wall-clock time and reads
+  # the start back in the zone. date_bin holds only 1677-09-21 to 2262-04-11
+  # in nanoseconds, so outside it the local milliseconds are floored instead;
+  # a floor of the UTC instant would put 05:30:45Z in 1600 at 04:00Z, not at
+  # 10:00 local (04:30Z). Asia/Kolkata was +05:53:28 (LMT) in 1600, so its
+  # first key is 10:00 local at that offset, checked by its epoch value.
+  - do:
+      indices.create:
+        index: dzk_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              ts: { type: date }
+  - do:
+      indices.create:
+        index: dzk_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              ts: { type: date }
+  - do:
+      bulk:
+        refresh: true
+        index: dzk_inf
+        body:
+          - index: { _id: "e1" }
+          - { ts: "1600-03-01T05:30:45Z" }
+          - index: { _id: "e2" }
+          - { ts: "1969-12-31T23:30:45Z" }
+          - index: { _id: "e3" }
+          - { ts: "1970-01-01T00:30:45Z" }
+          - index: { _id: "e4" }
+          - { ts: "2300-06-15T13:45:45Z" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: dzk_luc
+        body:
+          - index: { _id: "e1" }
+          - { ts: "1600-03-01T05:30:45Z" }
+          - index: { _id: "e2" }
+          - { ts: "1969-12-31T23:30:45Z" }
+          - index: { _id: "e3" }
+          - { ts: "1970-01-01T00:30:45Z" }
+          - index: { _id: "e4" }
+          - { ts: "2300-06-15T13:45:45Z" }
+  - match: { errors: false }
+
+  - do:
+      search:
+        index: dzk_luc
+        body:
+          size: 0
+          aggs:
+            p: { date_histogram: { field: ts, fixed_interval: 2h, time_zone: "+05:30", min_doc_count: 1 } }
+            k: { date_histogram: { field: ts, fixed_interval: 2h, time_zone: Asia/Kolkata, min_doc_count: 1 } }
+            o: { date_histogram: { field: ts, fixed_interval: 1d, offset: "+6h", time_zone: "+05:30", min_doc_count: 1 } }
+  - length: { aggregations.p.buckets: 4 }
+  - match: { aggregations.p.buckets.0.key: -11670895800000 }
+  - match: { aggregations.p.buckets.0.key_as_string: "1600-03-01T10:00:00.000+05:30" }
+  - match: { aggregations.p.buckets.1.key: -5400000 }
+  - match: { aggregations.p.buckets.1.key_as_string: "1970-01-01T04:00:00.000+05:30" }
+  - match: { aggregations.p.buckets.2.key: 1800000 }
+  - match: { aggregations.p.buckets.2.key_as_string: "1970-01-01T06:00:00.000+05:30" }
+  - match: { aggregations.p.buckets.3.key: 10428093000000 }
+  - match: { aggregations.p.buckets.3.key_as_string: "2300-06-15T18:00:00.000+05:30" }
+  - length: { aggregations.k.buckets: 4 }
+  - match: { aggregations.k.buckets.0.key: -11670897208000 }
+  - match: { aggregations.k.buckets.1.key: -5400000 }
+  - match: { aggregations.k.buckets.1.key_as_string: "1970-01-01T04:00:00.000+05:30" }
+  - match: { aggregations.k.buckets.2.key: 1800000 }
+  - match: { aggregations.k.buckets.2.key_as_string: "1970-01-01T06:00:00.000+05:30" }
+  - match: { aggregations.k.buckets.3.key: 10428093000000 }
+  - match: { aggregations.k.buckets.3.key_as_string: "2300-06-15T18:00:00.000+05:30" }
+  - length: { aggregations.o.buckets: 4 }
+  - match: { aggregations.o.buckets.0.key: -11670910200000 }
+  - match: { aggregations.o.buckets.0.key_as_string: "1600-03-01T06:00:00.000+05:30" }
+  - match: { aggregations.o.buckets.1.key: -84600000 }
+  - match: { aggregations.o.buckets.1.key_as_string: "1969-12-31T06:00:00.000+05:30" }
+  - match: { aggregations.o.buckets.2.key: 1800000 }
+  - match: { aggregations.o.buckets.2.key_as_string: "1970-01-01T06:00:00.000+05:30" }
+  - match: { aggregations.o.buckets.3.key: 10428049800000 }
+  - match: { aggregations.o.buckets.3.key_as_string: "2300-06-15T06:00:00.000+05:30" }
+
+  - do:
+      search:
+        index: dzk_inf
+        body:
+          size: 0
+          aggs:
+            p: { date_histogram: { field: ts, fixed_interval: 2h, time_zone: "+05:30", min_doc_count: 1 } }
+            k: { date_histogram: { field: ts, fixed_interval: 2h, time_zone: Asia/Kolkata, min_doc_count: 1 } }
+            o: { date_histogram: { field: ts, fixed_interval: 1d, offset: "+6h", time_zone: "+05:30", min_doc_count: 1 } }
+  - length: { aggregations.p.buckets: 4 }
+  - match: { aggregations.p.buckets.0.key: -11670895800000 }
+  - match: { aggregations.p.buckets.0.key_as_string: "1600-03-01T10:00:00.000+05:30" }
+  - match: { aggregations.p.buckets.1.key: -5400000 }
+  - match: { aggregations.p.buckets.1.key_as_string: "1970-01-01T04:00:00.000+05:30" }
+  - match: { aggregations.p.buckets.2.key: 1800000 }
+  - match: { aggregations.p.buckets.2.key_as_string: "1970-01-01T06:00:00.000+05:30" }
+  - match: { aggregations.p.buckets.3.key: 10428093000000 }
+  - match: { aggregations.p.buckets.3.key_as_string: "2300-06-15T18:00:00.000+05:30" }
+  - length: { aggregations.k.buckets: 4 }
+  - match: { aggregations.k.buckets.0.key: -11670897208000 }
+  - match: { aggregations.k.buckets.1.key: -5400000 }
+  - match: { aggregations.k.buckets.1.key_as_string: "1970-01-01T04:00:00.000+05:30" }
+  - match: { aggregations.k.buckets.2.key: 1800000 }
+  - match: { aggregations.k.buckets.2.key_as_string: "1970-01-01T06:00:00.000+05:30" }
+  - match: { aggregations.k.buckets.3.key: 10428093000000 }
+  - match: { aggregations.k.buckets.3.key_as_string: "2300-06-15T18:00:00.000+05:30" }
+  - length: { aggregations.o.buckets: 4 }
+  - match: { aggregations.o.buckets.0.key: -11670910200000 }
+  - match: { aggregations.o.buckets.0.key_as_string: "1600-03-01T06:00:00.000+05:30" }
+  - match: { aggregations.o.buckets.1.key: -84600000 }
+  - match: { aggregations.o.buckets.1.key_as_string: "1969-12-31T06:00:00.000+05:30" }
+  - match: { aggregations.o.buckets.2.key: 1800000 }
+  - match: { aggregations.o.buckets.2.key_as_string: "1970-01-01T06:00:00.000+05:30" }
+  - match: { aggregations.o.buckets.3.key: 10428049800000 }
+  - match: { aggregations.o.buckets.3.key_as_string: "2300-06-15T06:00:00.000+05:30" }
