@@ -715,6 +715,7 @@ final class InfinoQueryTranslator {
      * rule or an alias filter, which the user did not write, compares them.
      */
     Column column(String field) {
+        refuseColumnless(field);
         Column c = resolve(field);
         if (c != null && c.masked() && !trusted) {
             throw InfinoAccess.refused("a query on [" + field + "], a field masked for this user, is not served");
@@ -800,6 +801,10 @@ final class InfinoQueryTranslator {
      * reserved columns are never a document's field.
      */
     private String exists(String field) {
+        String meta = metadataExists(field);
+        if (meta != null) {
+            return meta;
+        }
         // Whether a field has a value tells nothing of a masked one's: its hash is shown.
         Column c = resolve(field);
         if (c != null) {
@@ -807,6 +812,7 @@ final class InfinoQueryTranslator {
             String own = quoteIdent(c.name()) + " IS NOT NULL";
             return values == null ? own : "(" + own + " OR " + quoteIdent(values.name()) + " IS NOT NULL)";
         }
+        refuseColumnless(field);
         String under = field + ".";
         // OpenSearch's own field-pattern matcher, named in full: this class's Regex is a query node.
         boolean pattern = org.opensearch.common.regex.Regex.isSimpleMatchPattern(field);
@@ -821,6 +827,44 @@ final class InfinoQueryTranslator {
             }
         }
         return present.isEmpty() ? NONE : "(" + String.join(" OR ", present) + ")";
+    }
+
+    /**
+     * The rows an exists on a metadata field matches, as stock's: every
+     * document has an {@code _id}, {@code _index}, {@code _seq_no} and
+     * {@code _version}; {@code _routing} is the documents written with a
+     * routing value, which only a default-mode table keeps. {@code _source}
+     * cannot be searched, and stock says so. Null for any other field.
+     */
+    private String metadataExists(String field) {
+        switch (field) {
+            case "_id", "_index", "_seq_no", "_version" -> {
+                return ALL;
+            }
+            case "_routing" -> {
+                if (cols.get(ROUTING) == null) {
+                    throw new IllegalArgumentException("[infino] exists on [_routing] is not served: the table keeps no routing values");
+                }
+                return quoteIdent(ROUTING) + " IS NOT NULL";
+            }
+            case "_source" -> throw new QueryShardException((Index) null, "The _source field is not searchable", (Throwable) null);
+            default -> {
+                return null;
+            }
+        }
+    }
+
+    /**
+     * Refuses a query on a field the index maps but the table keeps no
+     * column of (a multi-field of another type or with a normalizer), or
+     * whose values the mapping normalizes: answered over the raw values or
+     * as unmapped, it would be a wrong answer.
+     */
+    private void refuseColumnless(String field) {
+        String why = InfinoNative.unservedField(table, field);
+        if (why != null) {
+            throw new IllegalArgumentException("[infino] a query on [" + field + "], " + why + ", is not served");
+        }
     }
 
     /**
@@ -864,6 +908,10 @@ final class InfinoQueryTranslator {
                 String terms = plainTerms(String.valueOf(t.value()));
                 return terms.isEmpty() ? NONE : textClause(c.name(), terms, "and", false);
             }
+            if (t.caseInsensitive() && c != null && t.value() != null) {
+                String lit = literal(String.valueOf(t.value()));
+                return anyValue(caseless(c, "term"), v -> "lower(" + v + ") = lower(" + lit + ")");
+            }
             return equality(t.fieldName(), t.value());
         }
         if (qb instanceof TermsQueryBuilder ts) {
@@ -887,14 +935,22 @@ final class InfinoQueryTranslator {
             if (c != null && c.fts()) {
                 return termPattern(c, wildcardToRegex(p.value()), true);
             }
+            if (p.caseInsensitive() && c != null) {
+                return caselessLike(caseless(c, "prefix"), escapeLike(p.value()) + "%");
+            }
             return like(p.fieldName(), escapeLike(p.value()) + "%");
         }
         if (qb instanceof WildcardQueryBuilder w) {
             Column c = column(w.fieldName());
             if (c != null && c.fts()) {
-                return termPattern(c, wildcardToRegex(w.value()), w.value().endsWith("*"));
+                return termPattern(c, wildcardToRegex(w.value(), true), w.value().endsWith("*") && !w.value().endsWith("\\*"));
             }
-            return like(w.fieldName(), wildcardToLike(w.value()));
+            // A backslash escapes the character after it, as Lucene's wildcard reads it.
+            String pattern = escapedWildcardToLike(w.value());
+            if (w.caseInsensitive() && c != null) {
+                return caselessLike(caseless(c, "wildcard"), pattern);
+            }
+            return like(w.fieldName(), pattern);
         }
         if (qb instanceof RegexpQueryBuilder re) {
             Column c = column(re.fieldName());
@@ -906,7 +962,8 @@ final class InfinoQueryTranslator {
             }
             // A Lucene regexp is anchored to the whole value.
             String anchored = literal("^(?:" + re.value() + ")$");
-            return anyValue(c, v -> "regexp_like(" + v + ", " + anchored + ")");
+            String flags = re.caseInsensitive() ? ", 'i'" : "";
+            return anyValue(c, v -> "regexp_like(" + v + ", " + anchored + flags + ")");
         }
         if (qb instanceof IdsQueryBuilder ids) {
             if (ids.ids().isEmpty()) {
@@ -926,6 +983,13 @@ final class InfinoQueryTranslator {
             return text(mp.fieldName(), String.valueOf(mp.value()), Operator.AND, positive, true);
         }
         if (qb instanceof MultiMatchQueryBuilder mm) {
+            if (mm.type() == MultiMatchQueryBuilder.Type.BOOL_PREFIX || mm.type() == MultiMatchQueryBuilder.Type.PHRASE_PREFIX) {
+                // Their last term is a prefix, which the table's text match does not read; as
+                // match_bool_prefix and match_phrase_prefix, they are refused, not answered as a match.
+                throw new IllegalArgumentException(
+                    "[infino] multi_match of type [" + mm.type().parseField().getPreferredName() + "] is not served"
+                );
+            }
             boolean asPhrase = mm.type() == MultiMatchQueryBuilder.Type.PHRASE;
             return textOnFields(new ArrayList<>(mm.fields().keySet()), String.valueOf(mm.value()), mm.operator(), positive, asPhrase, true);
         }
@@ -2342,9 +2406,22 @@ final class InfinoQueryTranslator {
 
     /** A Lucene wildcard as a regular expression: {@code *} any run within a term, {@code ?} one character, the rest literal. */
     private static String wildcardToRegex(String s) {
+        return wildcardToRegex(s, false);
+    }
+
+    /** {@link #wildcardToRegex(String)}, a backslash escaping the character after it when {@code escapes}, as a wildcard query reads it. */
+    private static String wildcardToRegex(String s, boolean escapes) {
         StringBuilder out = new StringBuilder();
         for (int i = 0; i < s.length(); i++) {
             char ch = s.charAt(i);
+            if (escapes && ch == '\\' && i + 1 < s.length()) {
+                ch = s.charAt(++i);
+                if ("\\.[]{}()+-?^$|*".indexOf(ch) >= 0) {
+                    out.append('\\');
+                }
+                out.append(ch);
+                continue;
+            }
             switch (ch) {
                 case '*' -> out.append("[^\\s]*");
                 case '?' -> out.append("[^\\s]");
@@ -2479,6 +2556,51 @@ final class InfinoQueryTranslator {
             return null;
         }
         return anyValue(c, v -> v + " LIKE " + literal(pattern));
+    }
+
+    /**
+     * A string column a case-insensitive {@code query} compares by its
+     * lowercased values; any other refuses, as stock refuses such a query
+     * on a field that is not a string.
+     */
+    private Column caseless(Column c, String query) {
+        if (!c.element().isString()) {
+            throw new IllegalArgumentException("[infino] a case_insensitive " + query + " on [" + fieldOf(c.name()) + "], which is not a string field, is not served");
+        }
+        return c;
+    }
+
+    /** The rows where a value of a string field matches a LIKE pattern, both lowercased. */
+    private String caselessLike(Column c, String pattern) {
+        String lit = literal(pattern);
+        return anyValue(c, v -> "lower(" + v + ") LIKE lower(" + lit + ")");
+    }
+
+    /**
+     * A Lucene wildcard as a LIKE pattern: {@code *} any run, {@code ?} one
+     * character, a backslash escaping the character after it (a trailing
+     * one is itself), the rest literal.
+     */
+    static String escapedWildcardToLike(String s) {
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch == '\\' && i + 1 < s.length()) {
+                ch = s.charAt(++i);
+                if (ch == '%' || ch == '_' || ch == '\\') {
+                    out.append('\\');
+                }
+                out.append(ch);
+                continue;
+            }
+            switch (ch) {
+                case '*' -> out.append('%');
+                case '?' -> out.append('_');
+                case '%', '_', '\\' -> out.append('\\').append(ch);
+                default -> out.append(ch);
+            }
+        }
+        return out.toString();
     }
 
     private static String escapeLike(String s) {

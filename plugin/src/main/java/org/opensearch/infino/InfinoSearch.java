@@ -33,6 +33,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
+import org.opensearch.index.mapper.SourceFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Bonus;
@@ -54,6 +55,7 @@ import org.opensearch.search.aggregations.metrics.InternalTopHits;
 import org.opensearch.search.aggregations.metrics.TopHitsAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.collapse.CollapseBuilder;
+import org.opensearch.search.fetch.StoredFieldsContext;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.search.fetch.subphase.FieldAndFormat;
 import org.opensearch.search.internal.SearchContext;
@@ -1077,7 +1079,15 @@ public final class InfinoSearch {
 
     /** Whether a hit's response carries its source. */
     private static boolean returnsSource(SearchSourceBuilder source) {
-        return source.fetchSource() == null || source.fetchSource().fetchSource();
+        if (source.fetchSource() != null) {
+            return source.fetchSource().fetchSource();
+        }
+        // As stock: stored_fields asked for without _source (or _none_) leave the source out.
+        StoredFieldsContext stored = source.storedFields();
+        if (stored == null) {
+            return true;
+        }
+        return stored.fetchFields() && stored.fieldNames() != null && stored.fieldNames().contains(SourceFieldMapper.NAME);
     }
 
     /** Whether a hit needs its source: to return it, or to read requested fields from it. */
@@ -1613,6 +1623,9 @@ public final class InfinoSearch {
      * as {@code *} stays a pattern and is matched against the source's paths
      * per hit.
      */
+    /** The docvalue_fields format that stands for the field's own: no format. */
+    private static final String USE_FIELD_MAPPING = "use_field_mapping";
+
     static List<FieldAndFormat> requestedFields(List<FieldAndFormat> docValues, List<FieldAndFormat> fetch) {
         Map<String, FieldAndFormat> byField = new LinkedHashMap<>();
         for (List<FieldAndFormat> group : List.of(docValues == null ? List.<FieldAndFormat>of() : docValues, fetch == null ? List.<FieldAndFormat>of() : fetch)) {
@@ -1644,10 +1657,10 @@ public final class InfinoSearch {
     ) {
         Map<String, Object> flat = docValueFields.isEmpty() ? null : flat(src);
         if (flat != null) {
-            fillFields(h, flat, docValueFields, cols);
+            fillFields(h, flat, docValueFields, cols, true);
         }
         if (!fetchFields.isEmpty() && stored.enabled()) {
-            fillFields(h, flat != null && stored.whole() ? flat : flat(stored.kept(src)), fetchFields, cols);
+            fillFields(h, flat != null && stored.whole() ? flat : flat(stored.kept(src)), fetchFields, cols, false);
         }
     }
 
@@ -1659,26 +1672,38 @@ public final class InfinoSearch {
      * everything else as it is. A field alias carries the values of the field
      * it names, as stock reads it. A missing path is left out, as stock does.
      */
-    private static void fillFields(SearchHit h, Map<String, Object> flat, List<FieldAndFormat> fields, Map<String, Column> cols) {
+    private static void fillFields(SearchHit h, Map<String, Object> flat, List<FieldAndFormat> fields, Map<String, Column> cols, boolean docValues) {
         for (FieldAndFormat f : fields) {
             for (Map.Entry<String, Object> e : flat.entrySet()) {
                 if (Regex.simpleMatch(f.field, e.getKey())) {
-                    fillField(h, e.getKey(), e.getValue(), cols.get(e.getKey()), f.format);
+                    fillField(h, e.getKey(), e.getValue(), cols.get(e.getKey()), f.format, docValues);
                 }
             }
             for (Map.Entry<String, Column> e : cols.entrySet()) {
                 Column c = e.getValue();
                 if (InfinoNative.isAlias(e.getKey(), c) && Regex.simpleMatch(f.field, e.getKey()) && flat.containsKey(c.name())) {
-                    fillField(h, e.getKey(), flat.get(c.name()), c, f.format);
+                    fillField(h, e.getKey(), flat.get(c.name()), c, f.format, docValues);
                 }
             }
         }
     }
 
-    /** One field on the hit under {@code name}: the source's value at its path, a date in {@code format}. */
-    private static void fillField(SearchHit h, String name, Object value, Column c, String format) {
+    /**
+     * One field on the hit under {@code name}: the source's value at its path, a date in
+     * {@code format}, and a number of {@code docvalue_fields} in its decimal {@code format}, as
+     * stock's doc values format gives it ({@code "#.0"} gives {@code 1} as {@code "1.0"}).
+     */
+    private static void fillField(SearchHit h, String name, Object value, Column c, String format, boolean docValues) {
+        DocValueFormat decimal = docValues && c != null && c.element().isNumeric() && format != null && !USE_FIELD_MAPPING.equals(format)
+            ? new DocValueFormat.Decimal(format)
+            : null;
         List<Object> values = new ArrayList<>();
         for (Object v : leaves(value, new ArrayList<>())) {
+            if (decimal != null && v instanceof Number n) {
+                // A long field's doc values are longs, a double field's doubles.
+                values.add("i64".equals(c.element().type()) ? decimal.format(n.longValue()) : decimal.format(n.doubleValue()));
+                continue;
+            }
             values.add(c != null && c.isTimestamp() ? formatDate(v, format, c.dateFormat()) : v);
         }
         h.setDocumentField(name, new DocumentField(name, values));

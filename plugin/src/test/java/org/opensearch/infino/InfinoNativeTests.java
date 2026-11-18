@@ -60,6 +60,24 @@ public class InfinoNativeTests extends OpenSearchTestCase {
         assertEquals(Set.of("tag", "title.raw"), m.similarityFields());
     }
 
+    /**
+     * A wildcard multi-field reads its field's value whole, as a keyword one; one with a
+     * normalizer, and a keyword or wildcard field with one, are normalized, not read as written.
+     */
+    public void testWildcardMultiFieldsAndNormalizedFieldsAreRead() {
+        Mapping m = Mapping.of("""
+            {"properties":{
+              "w":{"type":"wildcard","fields":{
+                "lower":{"type":"wildcard","normalizer":"lowercase"},
+                "dv":{"type":"wildcard","doc_values":true},
+                "num":{"type":"long"}}},
+              "k":{"type":"keyword","normalizer":"lowercase"},
+              "t":{"type":"text","fields":{"keyword":{"type":"keyword","normalizer":"lowercase"}}}}}""");
+        assertEquals(Map.of("w.dv", "w"), m.keywordFields());
+        assertEquals(Set.of("w.lower", "w.dv", "w.num", "t.keyword"), m.multiFields());
+        assertEquals(Set.of("w.lower", "k", "t.keyword"), m.normalized());
+    }
+
     public void testAMappingWithoutTheTypeNameIsReadTheSame() {
         Mapping m = Mapping.of("{\"properties\":{\"a\":{\"type\":\"alias\",\"path\":\"b\"},\"b\":{\"type\":\"long\"}}}");
         assertEquals(Set.of("a", "b"), m.paths());
