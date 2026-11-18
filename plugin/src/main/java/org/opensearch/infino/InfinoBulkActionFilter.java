@@ -874,7 +874,9 @@ public class InfinoBulkActionFilter implements ActionFilter {
      * pipeline failed or dropped) is given that answer and not written. The
      * items are parsed, conformed and converted on the write pool, never on
      * the thread that delivered the bulk; a write pool whose queue is full
-     * refuses the bulk with 429, as a stock bulk's is.
+     * refuses the bulk with 429, as a stock bulk's is. The fields the
+     * documents add to the mapping are mapped before that, as a shard maps
+     * them ({@link InfinoDynamicMapping}).
      */
     static void serve(
         BulkRequest bulk,
@@ -886,7 +888,18 @@ public class InfinoBulkActionFilter implements ActionFilter {
         ActionListener<BulkResponse> listener
     ) {
         long start = System.nanoTime();
-        InfinoServices.fork(ThreadPool.Names.WRITE, listener::onFailure, () -> stageAndSubmit(bulk, concrete, infino, answered, writes, tables, listener, start));
+        InfinoServices.fork(ThreadPool.Names.WRITE, listener::onFailure, () -> {
+            // The fields the documents add are mapped first, as a shard maps them, so
+            // each table is declared from the mapping that holds them before its rows land.
+            BulkItemResponse[] items = answered.clone();
+            InfinoDynamicMapping.apply(
+                bulk,
+                concrete,
+                infino,
+                items,
+                ActionListener.wrap(mapped -> stageAndSubmit(bulk, concrete, mapped, items, writes, tables, listener, start), listener::onFailure)
+            );
+        });
     }
 
     private static void stageAndSubmit(
