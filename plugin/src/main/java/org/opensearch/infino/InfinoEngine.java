@@ -11,6 +11,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.search.ReferenceManager;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
@@ -29,6 +30,7 @@ import org.opensearch.index.mapper.SourceFieldMapper;
 import org.opensearch.index.seqno.ReplicationTracker;
 import org.opensearch.index.seqno.RetentionLease;
 import org.opensearch.index.seqno.SequenceNumbers;
+import org.opensearch.index.shard.RefreshListeners;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -390,6 +392,8 @@ public class InfinoEngine extends InternalEngine {
     private final Object batchLock = new Object();
     /** Serializes commits, so one batch reaches the table before the next. */
     private final Object commitLock = new Object();
+    /** Waits for hosted reads after a refresh, outside Lucene's lock, and then releases its wait_for requests. */
+    private final RefreshRelease refreshRelease;
     /**
      * Held shared from a write's apply to its record in the batch, and
      * exclusively while a commit takes its writes: a commit through a
@@ -495,15 +499,29 @@ public class InfinoEngine extends InternalEngine {
                 t instanceof Exception e ? e : new RuntimeException(t)
             );
         }
-        // The shard's refresh listeners note how far a refresh reaches before it
-        // and release the writes it covers after it. The wait for hosted reads
-        // goes between the two, ahead of the release: a write committed while a
-        // refresh waits is covered by it, and is waited for too.
+        // The shard's wait_for listeners are released by refreshRelease once a
+        // refresh has returned and every read sees what it covers, so the wait
+        // for hosted reads runs outside Lucene's refresh lock.
         ReferenceManager<OpenSearchDirectoryReader> readers = getReferenceManager(SearcherScope.EXTERNAL);
-        List<ReferenceManager.RefreshListener> configured = config.getExternalRefreshListener();
-        configured.forEach(readers::removeListener);
-        readers.addListener(new AwaitVisible());
-        configured.forEach(readers::addListener);
+        RefreshListeners waiting = null;
+        for (ReferenceManager.RefreshListener l : config.getExternalRefreshListener()) {
+            if (l instanceof RefreshListeners r) {
+                waiting = r;
+                readers.removeListener(r);
+            }
+        }
+        this.refreshRelease = new RefreshRelease(table, waiting, () -> {
+            try {
+                return translogManager().getTranslogLastWriteLocation();
+            } catch (AlreadyClosedException e) {
+                return null; // a closing shard releases its listeners as it closes
+            }
+        }, () -> {
+            if (InfinoNative.hosted()) {
+                commitBeforeLucene("refresh", appliedSoFar());
+            }
+        });
+        readers.addListener(refreshRelease);
         BY_TABLE.put(table, this);
         log.info("[infino] engine attached to table {} for {}", table, config.getShardId());
     }
@@ -1187,10 +1205,11 @@ public class InfinoEngine extends InternalEngine {
     /**
      * Commit the writes through every operation applied so far, then refresh
      * the skeleton's reader and record what it covers: every operation
-     * applied before the refresh began. On the hosted service the refresh
-     * returns once every read sees the commit ({@link AwaitVisible}), so a
-     * search after {@code refresh=true}, or one that {@code wait_for}
-     * released, finds the writes.
+     * applied before the refresh began. Once Lucene's refresh lock is
+     * released, and before the refresh is acknowledged, it waits until every
+     * read sees the commit ({@link RefreshRelease#release}), so a search after
+     * {@code refresh=true}, or one that {@code wait_for} released, finds the
+     * writes.
      */
     @Override
     public void refresh(String source) throws EngineException {
@@ -1202,28 +1221,7 @@ public class InfinoEngine extends InternalEngine {
         long covered = getProcessedLocalCheckpoint();
         super.refresh(source);
         rememberCovered(covered);
-    }
-
-    /**
-     * Wait, as a refresh ends, until every read of the table sees what this
-     * node has written to it ({@link InfinoNative#awaitVisible}). It runs
-     * ahead of the shard's refresh listeners, after they noted what the
-     * refresh covers, so the writes they release are visible when they do.
-     * A write the refresh covers may not be in the table yet, its own sync
-     * committing it only after the wait began: on the hosted service the
-     * writes applied so far are committed first, so the wait covers them.
-     */
-    private final class AwaitVisible implements ReferenceManager.RefreshListener {
-        @Override
-        public void beforeRefresh() {}
-
-        @Override
-        public void afterRefresh(boolean didRefresh) {
-            if (InfinoNative.hosted()) {
-                commitBeforeLucene("refresh", appliedSoFar());
-            }
-            InfinoNative.awaitVisible(table);
-        }
+        refreshRelease.release();
     }
 
     /**
@@ -1249,6 +1247,9 @@ public class InfinoEngine extends InternalEngine {
         long covered = getProcessedLocalCheckpoint();
         boolean refreshed = super.maybeRefresh(source);
         rememberCovered(covered);
+        if (refreshed) {
+            refreshRelease.release(); // a refresh that did not run is released by the one that did
+        }
         return refreshed;
     }
 
