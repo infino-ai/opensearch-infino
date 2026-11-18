@@ -1638,4 +1638,53 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         t = translateSaved(QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("title", "panels")).must(visualizations), new Rows(SAVED_OBJECTS));
         assertSame(InfinoQueryTranslator.Scoring.NONE, t.scoring());
     }
+
+    /** Every document has an _id, _index, _seq_no and _version; _routing is the routed ones, kept by a default-mode table only. */
+    public void testExistsOnAMetadataField() {
+        for (String field : new String[] { "_id", "_index", "_seq_no", "_version" }) {
+            assertEquals("1=1", translate(QueryBuilders.existsQuery(field)).where());
+        }
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.existsQuery("_routing")));
+        assertEquals("[infino] exists on [_routing] is not served: the table keeps no routing values", e.getMessage());
+        Map<String, Column> routed = new LinkedHashMap<>(columns());
+        routed.put("osrouting", new Column("osrouting", "str", false, false));
+        assertEquals("\"osrouting\" IS NOT NULL", InfinoQueryTranslator.translate(QueryBuilders.existsQuery("_routing"), routed, TABLE, NOW).where());
+        // _source cannot be searched, as stock says.
+        QueryShardException source = expectThrows(QueryShardException.class, () -> translate(QueryBuilders.existsQuery("_source")));
+        assertEquals("The _source field is not searchable", source.getMessage());
+    }
+
+    /** A multi_match whose last term is a prefix is refused, as match_bool_prefix is, never answered as a plain match. */
+    public void testPrefixMultiMatchIsRefused() {
+        for (MultiMatchQueryBuilder.Type type : new MultiMatchQueryBuilder.Type[] { MultiMatchQueryBuilder.Type.BOOL_PREFIX, MultiMatchQueryBuilder.Type.PHRASE_PREFIX }) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> translate(QueryBuilders.boolQuery().should(QueryBuilders.multiMatchQuery("disk fu", "message").type(type)))
+            );
+            assertEquals("[infino] multi_match of type [" + type.parseField().getPreferredName() + "] is not served", e.getMessage());
+        }
+        assertNotNull(translate(QueryBuilders.multiMatchQuery("disk full", "message").type(MultiMatchQueryBuilder.Type.BEST_FIELDS)));
+    }
+
+    /** case_insensitive compares a string field's values lowercased; on a field that is not a string it is refused. */
+    public void testCaseInsensitiveQueriesOnAStringField() {
+        assertEquals("lower(\"level\") = lower('ErRor')", translate(QueryBuilders.termQuery("level", "ErRor").caseInsensitive(true)).where());
+        assertEquals("lower(\"level\") LIKE lower('Er%')", translate(QueryBuilders.prefixQuery("level", "Er").caseInsensitive(true)).where());
+        assertEquals("lower(\"level\") LIKE lower('E_r%')", translate(QueryBuilders.wildcardQuery("level", "E?r*").caseInsensitive(true)).where());
+        assertEquals("regexp_like(\"level\", '^(?:Er.*)$', 'i')", translate(QueryBuilders.regexpQuery("level", "Er.*").caseInsensitive(true)).where());
+        assertEquals("regexp_like(\"level\", '^(?:Er.*)$')", translate(QueryBuilders.regexpQuery("level", "Er.*")).where());
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.termQuery("status", "5").caseInsensitive(true))
+        );
+        assertEquals("[infino] a case_insensitive term on [status], which is not a string field, is not served", e.getMessage());
+    }
+
+    /** A backslash in a wildcard escapes the character after it: {@code \*} is a star, not any run. */
+    public void testAnEscapedWildcardCharacterIsLiteral() {
+        assertEquals("\"level\" LIKE '*'", translate(QueryBuilders.wildcardQuery("level", "\\*")).where());
+        assertEquals("\"level\" LIKE '\\\\*'", translate(QueryBuilders.wildcardQuery("level", "\\\\\\*")).where());
+        assertEquals("\"level\" LIKE 'a\\%%'", translate(QueryBuilders.wildcardQuery("level", "a%*")).where());
+        assertEquals("a?b%", InfinoQueryTranslator.escapedWildcardToLike("a\\?b*"));
+    }
 }

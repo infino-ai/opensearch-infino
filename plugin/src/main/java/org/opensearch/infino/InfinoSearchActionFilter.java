@@ -10,6 +10,7 @@ import org.opensearch.action.ActionRequest;
 import org.opensearch.action.search.SearchAction;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
+import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.cluster.ClusterState;
@@ -161,6 +162,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
             TimeValue keepAlive = search.scroll() == null ? null : search.scroll().keepAlive();
             ActionListener<Response> answered = ActionListener.map(listener, response -> {
                 if (response instanceof SearchResponse r) {
+                    refuseIfAnyShardRefused(r);
                     InfinoSearch.handOut(r, sortValues);
                     if (search.scroll() != null) {
                         InfinoScrolls.handsOut(r.getScrollId(), sortValues, keepAlive);
@@ -208,6 +210,43 @@ public class InfinoSearchActionFilter implements ActionFilter {
         // The table is read on the search pool, never on the thread that took the request.
         InfinoServices.fork(ThreadPool.Names.SEARCH, listener::onFailure, () -> serve(search, state, names, infino, metadata, start, listener));
     }
+
+    /**
+     * Fails a default-mode search that some shard refused. A shard refuses
+     * what its table cannot answer, and some refusals turn on what that
+     * shard holds: an aggregation or sort over a field some of its rows
+     * give several values, or over a field one index maps and another does
+     * not. The search would otherwise answer, with no error, from the
+     * shards that happened to serve it. Other shard failures are left as
+     * stock leaves them: a partial result naming the failed shards.
+     */
+    static void refuseIfAnyShardRefused(SearchResponse response) {
+        for (ShardSearchFailure failure : response.getShardFailures()) {
+            Throwable refusal = refusal(failure.getCause());
+            if (refusal instanceof RuntimeException e) {
+                throw e;
+            }
+            if (refusal != null) {
+                throw new IllegalArgumentException(refusal.getMessage(), refusal);
+            }
+        }
+    }
+
+    /**
+     * The plugin's refusal ({@code [infino] ...}) among a shard failure's causes, or null when it
+     * is none; one read back from another node may carry its type's name before it.
+     */
+    static Throwable refusal(Throwable cause) {
+        for (Throwable t = cause; t != null && t.getCause() != t; t = t.getCause()) {
+            if (t.getMessage() != null && t.getMessage().contains(REFUSAL_PREFIX)) {
+                return t;
+            }
+        }
+        return null;
+    }
+
+    /** How every refusal of the plugin's starts. */
+    private static final String REFUSAL_PREFIX = "[infino] ";
 
     /**
      * Whether the shard request cache may keep a default-mode search's

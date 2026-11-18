@@ -1,0 +1,791 @@
+---
+"exists on a metadata field matches as on a Lucene twin, or is refused":
+  - do:
+      indices.create:
+        index: w56mx_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { k: { type: keyword } } }
+  - do:
+      indices.create:
+        index: w56mx_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { k: { type: keyword } } }
+  - do:
+      indices.create:
+        index: w56mx_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { k: { type: keyword } } }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: w56mx_luc
+        body:
+          - index: { _id: "1" }
+          - { k: a }
+          - index: { _id: "2" }
+          - { k: b }
+          - index: { _id: "3" }
+          - { }
+          - index: { _id: "4", routing: r1 }
+          - { k: d }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: w56mx_def
+        body:
+          - index: { _id: "1" }
+          - { k: a }
+          - index: { _id: "2" }
+          - { k: b }
+          - index: { _id: "3" }
+          - { }
+          - index: { _id: "4", routing: r1 }
+          - { k: d }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: w56mx_prx
+        body:
+          - index: { _id: "1" }
+          - { k: a }
+          - index: { _id: "2" }
+          - { k: b }
+          - index: { _id: "3" }
+          - { }
+          - index: { _id: "4", routing: r1 }
+          - { k: d }
+  - match: { errors: false }
+
+  # _id, _index, _seq_no and _version: every document has one.
+  - do:
+      search: { index: w56mx_luc, body: { query: { exists: { field: _id } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56mx_def, body: { query: { exists: { field: _id } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56mx_prx, body: { query: { exists: { field: _id } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56mx_luc, body: { query: { exists: { field: _index } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56mx_def, body: { query: { exists: { field: _index } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56mx_prx, body: { query: { exists: { field: _index } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56mx_luc, body: { query: { exists: { field: _seq_no } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56mx_def, body: { query: { exists: { field: _seq_no } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56mx_prx, body: { query: { exists: { field: _seq_no } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56mx_luc, body: { query: { exists: { field: _version } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56mx_def, body: { query: { exists: { field: _version } } } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56mx_prx, body: { query: { exists: { field: _version } } } }
+  - match: { hits.total.value: 4 }
+  # Under must_not: none.
+  - do:
+      search: { index: w56mx_luc, body: { query: { bool: { must_not: { exists: { field: _id } } } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: w56mx_def, body: { query: { bool: { must_not: { exists: { field: _id } } } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: w56mx_prx, body: { query: { bool: { must_not: { exists: { field: _id } } } } } }
+  - match: { hits.total.value: 0 }
+
+  # _routing: the documents written with a routing value. A default-mode table
+  # keeps each row's; a proxy-mode one keeps none, so it refuses.
+  - do:
+      search: { index: w56mx_luc, body: { query: { exists: { field: _routing } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - do:
+      search: { index: w56mx_def, body: { query: { exists: { field: _routing } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - do:
+      catch: /exists on \[_routing\] is not served/
+      search: { index: w56mx_prx, body: { query: { exists: { field: _routing } } } }
+
+  # _source cannot be searched: refused as stock refuses it.
+  - do:
+      catch: /query_shard_exception/
+      search: { index: w56mx_luc, body: { query: { exists: { field: _source } } } }
+  - do:
+      catch: /query_shard_exception/
+      search: { index: w56mx_def, body: { query: { exists: { field: _source } } } }
+  - do:
+      catch: /query_shard_exception/
+      search: { index: w56mx_prx, body: { query: { exists: { field: _source } } } }
+
+---
+"A sort mode other than min or max on several values is refused over every shard, never answered from some":
+  - do:
+      indices.create:
+        index: w56sx_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 3, number_of_replicas: 0 }
+          mappings: { properties: { field: { type: long } } }
+  - do:
+      indices.create:
+        index: w56sx_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 3, number_of_replicas: 0 }
+          mappings: { properties: { field: { type: long } } }
+  - do:
+      indices.create:
+        index: w56sx_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 3, number_of_replicas: 0 }
+          mappings: { properties: { field: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: w56sx_luc
+        body:
+          - index: { _id: "1" }
+          - { field: [ 10, 1 ] }
+          - index: { _id: "2" }
+          - { field: [ 8, 2 ] }
+          - index: { _id: "3" }
+          - { field: [ 7, 3, 4 ] }
+          - index: { _id: "4" }
+          - { field: [ 9, 5, -1, -2 ] }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: w56sx_def
+        body:
+          - index: { _id: "1" }
+          - { field: [ 10, 1 ] }
+          - index: { _id: "2" }
+          - { field: [ 8, 2 ] }
+          - index: { _id: "3" }
+          - { field: [ 7, 3, 4 ] }
+          - index: { _id: "4" }
+          - { field: [ 9, 5, -1, -2 ] }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: w56sx_prx
+        body:
+          - index: { _id: "1" }
+          - { field: [ 10, 1 ] }
+          - index: { _id: "2" }
+          - { field: [ 8, 2 ] }
+          - index: { _id: "3" }
+          - { field: [ 7, 3, 4 ] }
+          - index: { _id: "4" }
+          - { field: [ 9, 5, -1, -2 ] }
+  - match: { errors: false }
+
+  # min and max are served.
+  - do:
+      search: { index: w56sx_luc, body: { size: 5, sort: [ { field: { mode: max, order: desc } } ] } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.3._id: "3" }
+  - do:
+      search: { index: w56sx_def, body: { size: 5, sort: [ { field: { mode: max, order: desc } } ] } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.3._id: "3" }
+  - do:
+      search: { index: w56sx_prx, body: { size: 5, sort: [ { field: { mode: max, order: desc } } ] } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.3._id: "3" }
+
+  # median, avg and sum: stock answers; the table refuses, in both modes.
+  - do:
+      search: { index: w56sx_luc, body: { size: 5, sort: [ { field: { mode: median, order: asc } } ] } }
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - do:
+      catch: /sort mode \[median\] on \[field\].* is not served/
+      search: { index: w56sx_def, body: { size: 5, sort: [ { field: { mode: median, order: asc } } ] } }
+  - do:
+      catch: /sort mode \[median\] on \[field\].* is not served/
+      search: { index: w56sx_prx, body: { size: 5, sort: [ { field: { mode: median, order: asc } } ] } }
+  - do:
+      catch: /sort mode \[avg\] on \[field\].* is not served/
+      search: { index: w56sx_def, body: { size: 5, sort: [ { field: { mode: avg, order: desc } } ] } }
+  - do:
+      catch: /sort mode \[sum\] on \[field\].* is not served/
+      search: { index: w56sx_def, body: { size: 5, sort: [ { field: { mode: sum, order: desc } } ] } }
+
+---
+"multi_match of type bool_prefix or phrase_prefix is refused, as match_bool_prefix is":
+  - do:
+      indices.create:
+        index: w56bp_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { f1: { type: text }, f2: { type: text } } }
+  - do:
+      indices.create:
+        index: w56bp_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { f1: { type: text }, f2: { type: text } } }
+  - do:
+      indices.create:
+        index: w56bp_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { f1: { type: text }, f2: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        index: w56bp_luc
+        body:
+          - index: { _id: "1" }
+          - { f1: "brown fox jump", f2: "xylophone" }
+          - index: { _id: "2" }
+          - { f1: "brown emu jump", f2: "xylophone" }
+          - index: { _id: "3" }
+          - { f1: "jumparound", f2: "emu" }
+          - index: { _id: "4" }
+          - { f1: "dog", f2: "brown fox jump" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: w56bp_def
+        body:
+          - index: { _id: "1" }
+          - { f1: "brown fox jump", f2: "xylophone" }
+          - index: { _id: "2" }
+          - { f1: "brown emu jump", f2: "xylophone" }
+          - index: { _id: "3" }
+          - { f1: "jumparound", f2: "emu" }
+          - index: { _id: "4" }
+          - { f1: "dog", f2: "brown fox jump" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: w56bp_prx
+        body:
+          - index: { _id: "1" }
+          - { f1: "brown fox jump", f2: "xylophone" }
+          - index: { _id: "2" }
+          - { f1: "brown emu jump", f2: "xylophone" }
+          - index: { _id: "3" }
+          - { f1: "jumparound", f2: "emu" }
+          - index: { _id: "4" }
+          - { f1: "dog", f2: "brown fox jump" }
+  - match: { errors: false }
+
+  # Stock reads the last term as a prefix: "jump" also matches "jumparound".
+  - do:
+      search: { index: w56bp_luc, body: { query: { multi_match: { query: "brown fox jump", type: bool_prefix, fields: [ f1 ] } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      catch: /multi_match of type \[bool_prefix\] is not served/
+      search: { index: w56bp_def, body: { query: { multi_match: { query: "brown fox jump", type: bool_prefix, fields: [ f1 ] } } } }
+  - do:
+      catch: /multi_match of type \[bool_prefix\] is not served/
+      search: { index: w56bp_prx, body: { query: { multi_match: { query: "brown fox jump", type: bool_prefix, fields: [ f1 ] } } } }
+  - do:
+      catch: /multi_match of type \[bool_prefix\] is not served/
+      search: { index: w56bp_def, body: { query: { bool: { should: [ { multi_match: { query: "fox", type: bool_prefix, fields: [ f1, f2 ] } } ] } } } }
+
+  # phrase_prefix: the last term a prefix of the phrase's last word.
+  - do:
+      search: { index: w56bp_luc, body: { query: { multi_match: { query: "brown fox ju", type: phrase_prefix, fields: [ f1, f2 ] } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      catch: /multi_match of type \[phrase_prefix\] is not served/
+      search: { index: w56bp_def, body: { query: { multi_match: { query: "brown fox ju", type: phrase_prefix, fields: [ f1, f2 ] } } } }
+  - do:
+      catch: /multi_match of type \[phrase_prefix\] is not served/
+      search: { index: w56bp_prx, body: { query: { multi_match: { query: "brown fox ju", type: phrase_prefix, fields: [ f1, f2 ] } } } }
+
+  # The other types are still served.
+  - do:
+      search: { index: w56bp_luc, body: { query: { multi_match: { query: "brown fox jump", type: phrase, fields: [ f1, f2 ] } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: w56bp_def, body: { query: { multi_match: { query: "brown fox jump", type: phrase, fields: [ f1, f2 ] } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: w56bp_prx, body: { query: { multi_match: { query: "brown fox jump", type: phrase, fields: [ f1, f2 ] } } } }
+  - match: { hits.total.value: 2 }
+
+---
+"wildcard fields: escapes, case_insensitive and multi-fields as on a Lucene twin, a normalized one refused":
+  - do:
+      indices.create:
+        index: w56wf_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              kw: { type: keyword }
+              my_field:
+                type: wildcard
+                fields:
+                  lower: { type: wildcard, normalizer: lowercase }
+                  doc_values: { type: wildcard, doc_values: true }
+  - do:
+      indices.create:
+        index: w56wf_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              kw: { type: keyword }
+              my_field:
+                type: wildcard
+                fields:
+                  lower: { type: wildcard, normalizer: lowercase }
+                  doc_values: { type: wildcard, doc_values: true }
+  - do:
+      indices.create:
+        index: w56wf_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              kw: { type: keyword }
+              my_field:
+                type: wildcard
+                fields:
+                  lower: { type: wildcard, normalizer: lowercase }
+                  doc_values: { type: wildcard, doc_values: true }
+  - do:
+      bulk:
+        refresh: true
+        index: w56wf_luc
+        body:
+          - index: { _id: "1" }
+          - { n: 1, kw: "AbCd", my_field: "AbCd" }
+          - index: { _id: "2" }
+          - { n: 2, kw: "ABCD", my_field: "ABCD" }
+          - index: { _id: "3" }
+          - { n: 3, kw: "*", my_field: "*" }
+          - index: { _id: "4" }
+          - { n: 4, kw: "\\*", my_field: "\\*" }
+          - index: { _id: "5" }
+          - { n: 5, kw: "x", my_field: "org.opensearch.NodeDisconnectedException: disconnected" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: w56wf_def
+        body:
+          - index: { _id: "1" }
+          - { n: 1, kw: "AbCd", my_field: "AbCd" }
+          - index: { _id: "2" }
+          - { n: 2, kw: "ABCD", my_field: "ABCD" }
+          - index: { _id: "3" }
+          - { n: 3, kw: "*", my_field: "*" }
+          - index: { _id: "4" }
+          - { n: 4, kw: "\\*", my_field: "\\*" }
+          - index: { _id: "5" }
+          - { n: 5, kw: "x", my_field: "org.opensearch.NodeDisconnectedException: disconnected" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: w56wf_prx
+        body:
+          - index: { _id: "1" }
+          - { n: 1, kw: "AbCd", my_field: "AbCd" }
+          - index: { _id: "2" }
+          - { n: 2, kw: "ABCD", my_field: "ABCD" }
+          - index: { _id: "3" }
+          - { n: 3, kw: "*", my_field: "*" }
+          - index: { _id: "4" }
+          - { n: 4, kw: "\\*", my_field: "\\*" }
+          - index: { _id: "5" }
+          - { n: 5, kw: "x", my_field: "org.opensearch.NodeDisconnectedException: disconnected" }
+  - match: { errors: false }
+
+  # A term on the field, and on its multi-field without a normalizer: the exact value.
+  - do:
+      search: { index: w56wf_luc, body: { query: { term: { my_field: "AbCd" } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search: { index: w56wf_def, body: { query: { term: { my_field: "AbCd" } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search: { index: w56wf_prx, body: { query: { term: { my_field: "AbCd" } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search: { index: w56wf_luc, body: { query: { term: { my_field.doc_values: "AbCd" } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search: { index: w56wf_def, body: { query: { term: { my_field.doc_values: "AbCd" } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search: { index: w56wf_prx, body: { query: { term: { my_field.doc_values: "AbCd" } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+  # The lowercase-normalized multi-field: the table keeps no column of it.
+  - do:
+      search: { index: w56wf_luc, body: { query: { term: { my_field.lower: "ABCD" } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+  - do:
+      catch: /a query on \[my_field.lower\].* is not served/
+      search: { index: w56wf_def, body: { query: { term: { my_field.lower: "ABCD" } }, sort: [ n ] } }
+  - do:
+      catch: /a query on \[my_field.lower\].* is not served/
+      search: { index: w56wf_prx, body: { query: { wildcard: { my_field.lower: { value: "*node*" } } }, sort: [ n ] } }
+  - do:
+      catch: /a query on \[my_field.lower\].* is not served/
+      search: { index: w56wf_def, body: { query: { regexp: { my_field.lower: { value: ".*node.*" } } }, sort: [ n ] } }
+
+  # case_insensitive on term, prefix, wildcard and regexp.
+  - do:
+      search: { index: w56wf_luc, body: { query: { term: { my_field: { value: "abcd", case_insensitive: true } } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search: { index: w56wf_def, body: { query: { term: { my_field: { value: "abcd", case_insensitive: true } } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search: { index: w56wf_prx, body: { query: { term: { my_field: { value: "abcd", case_insensitive: true } } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search: { index: w56wf_luc, body: { query: { wildcard: { my_field: { value: "AbCd", case_insensitive: true } } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: w56wf_def, body: { query: { wildcard: { my_field: { value: "AbCd", case_insensitive: true } } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: w56wf_prx, body: { query: { wildcard: { my_field: { value: "AbCd", case_insensitive: true } } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: w56wf_luc, body: { query: { wildcard: { my_field: { value: "AbCd" } } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: w56wf_def, body: { query: { wildcard: { my_field: { value: "AbCd" } } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: w56wf_luc, body: { query: { regexp: { my_field: { value: "AbCd", case_insensitive: true } } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: w56wf_def, body: { query: { regexp: { my_field: { value: "AbCd", case_insensitive: true } } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: w56wf_prx, body: { query: { regexp: { my_field: { value: "AbCd", case_insensitive: true } } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: w56wf_luc, body: { query: { prefix: { kw: { value: "abc", case_insensitive: true } } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: w56wf_def, body: { query: { prefix: { kw: { value: "abc", case_insensitive: true } } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: w56wf_prx, body: { query: { prefix: { kw: { value: "abc", case_insensitive: true } } }, sort: [ n ] } }
+  - match: { hits.total.value: 2 }
+
+  # A backslash in a wildcard escapes the character after it.
+  - do:
+      search: { index: w56wf_luc, body: { query: { wildcard: { my_field: { value: "\\*" } } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - do:
+      search: { index: w56wf_def, body: { query: { wildcard: { my_field: { value: "\\*" } } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - do:
+      search: { index: w56wf_prx, body: { query: { wildcard: { my_field: { value: "\\*" } } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - do:
+      search: { index: w56wf_luc, body: { query: { wildcard: { kw: { value: "\\\\\\*" } } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - do:
+      search: { index: w56wf_def, body: { query: { wildcard: { kw: { value: "\\\\\\*" } } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - do:
+      search: { index: w56wf_prx, body: { query: { wildcard: { kw: { value: "\\\\\\*" } } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - do:
+      search: { index: w56wf_luc, body: { query: { wildcard: { my_field: { value: "*Node*Exception*" } } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "5" }
+  - do:
+      search: { index: w56wf_def, body: { query: { wildcard: { my_field: { value: "*Node*Exception*" } } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "5" }
+  - do:
+      search: { index: w56wf_prx, body: { query: { wildcard: { my_field: { value: "*Node*Exception*" } } }, sort: [ n ] } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "5" }
+
+---
+"date_range fields and dates as epoch seconds, as on a Lucene twin":
+  - do:
+      indices.create:
+        index: w56dr_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { range: { type: date_range }, date: { type: date, format: epoch_second } } }
+  - do:
+      indices.create:
+        index: w56dr_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { range: { type: date_range }, date: { type: date, format: epoch_second } } }
+  - do:
+      indices.create:
+        index: w56dr_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { range: { type: date_range }, date: { type: date, format: epoch_second } } }
+  - do:
+      bulk:
+        refresh: true
+        index: w56dr_luc
+        body:
+          - index: { _id: "1" }
+          - { range: { gte: "2016-01-01", lt: "2016-01-02" }, date: 1000 }
+          - index: { _id: "2" }
+          - { range: { gte: "2016-01-02", lt: "2016-01-03" }, date: 2000 }
+          - index: { _id: "3" }
+          - { range: { gte: "2016-02-01", lt: "2016-02-02" }, date: 3000 }
+          - index: { _id: "4" }
+          - { range: { gte: "2016-03-01", lt: "2016-03-02" }, date: "28800000" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: w56dr_def
+        body:
+          - index: { _id: "1" }
+          - { range: { gte: "2016-01-01", lt: "2016-01-02" }, date: 1000 }
+          - index: { _id: "2" }
+          - { range: { gte: "2016-01-02", lt: "2016-01-03" }, date: 2000 }
+          - index: { _id: "3" }
+          - { range: { gte: "2016-02-01", lt: "2016-02-02" }, date: 3000 }
+          - index: { _id: "4" }
+          - { range: { gte: "2016-03-01", lt: "2016-03-02" }, date: "28800000" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: w56dr_prx
+        body:
+          - index: { _id: "1" }
+          - { range: { gte: "2016-01-01", lt: "2016-01-02" }, date: 1000 }
+          - index: { _id: "2" }
+          - { range: { gte: "2016-01-02", lt: "2016-01-03" }, date: 2000 }
+          - index: { _id: "3" }
+          - { range: { gte: "2016-02-01", lt: "2016-02-02" }, date: 3000 }
+          - index: { _id: "4" }
+          - { range: { gte: "2016-03-01", lt: "2016-03-02" }, date: "28800000" }
+  - match: { errors: false }
+
+  # Every document is stored and found.
+  - do:
+      search: { index: w56dr_luc, body: { size: 0 } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56dr_def, body: { size: 0 } }
+  - match: { hits.total.value: 4 }
+  - do:
+      search: { index: w56dr_prx, body: { size: 0 } }
+  - match: { hits.total.value: 4 }
+
+  # A date_range agg's numeric bounds are read in the field's format: seconds here.
+  - do:
+      search: { index: w56dr_luc, body: { size: 0, aggs: { r: { date_range: { field: date, ranges: [ { from: 1000, to: 3000 }, { from: 3000, to: 4000 } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.0.from: 1000000 }
+  - match: { aggregations.r.buckets.1.doc_count: 1 }
+  - do:
+      search: { index: w56dr_def, body: { size: 0, aggs: { r: { date_range: { field: date, ranges: [ { from: 1000, to: 3000 }, { from: 3000, to: 4000 } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.0.from: 1000000 }
+  - match: { aggregations.r.buckets.1.doc_count: 1 }
+  - do:
+      search: { index: w56dr_prx, body: { size: 0, aggs: { r: { date_range: { field: date, ranges: [ { from: 1000, to: 3000 }, { from: 3000, to: 4000 } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.0.from: 1000000 }
+  - match: { aggregations.r.buckets.1.doc_count: 1 }
+
+  # A date_histogram on a date_range field puts each range in every bucket it overlaps.
+  - do:
+      search: { index: w56dr_luc, body: { size: 0, aggs: { h: { date_histogram: { field: range, calendar_interval: month } } } } }
+  - length: { aggregations.h.buckets: 3 }
+  - match: { aggregations.h.buckets.0.doc_count: 2 }
+  - do:
+      catch: bad_request
+      search: { index: w56dr_def, body: { size: 0, aggs: { h: { date_histogram: { field: range, calendar_interval: month } } } } }
+  - do:
+      catch: bad_request
+      search: { index: w56dr_prx, body: { size: 0, aggs: { h: { date_histogram: { field: range, calendar_interval: month } } } } }
+
+---
+"stored_fields without _source, and a docvalue_fields number format, as on a Lucene twin":
+  - do:
+      indices.create:
+        index: w56sf_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { count: { type: long }, d: { type: double } } }
+  - do:
+      indices.create:
+        index: w56sf_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { count: { type: long }, d: { type: double } } }
+  - do:
+      indices.create:
+        index: w56sf_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { count: { type: long }, d: { type: double } } }
+  - do:
+      index: { index: w56sf_luc, id: "1", refresh: true, body: { count: 1, d: 3.14159, include: { field2: v2 } } }
+  - do:
+      index: { index: w56sf_def, id: "1", refresh: true, body: { count: 1, d: 3.14159, include: { field2: v2 } } }
+  - do:
+      index: { index: w56sf_prx, id: "1", refresh: true, body: { count: 1, d: 3.14159, include: { field2: v2 } } }
+
+  - do:
+      search: { index: w56sf_luc, body: { stored_fields: [ include.field2 ] } }
+  - is_false: hits.hits.0._source
+  - do:
+      search: { index: w56sf_def, body: { stored_fields: [ include.field2 ] } }
+  - is_false: hits.hits.0._source
+  - do:
+      search: { index: w56sf_prx, body: { stored_fields: [ include.field2 ] } }
+  - is_false: hits.hits.0._source
+  - do:
+      search: { index: w56sf_luc, body: { stored_fields: [ include.field2, _source ] } }
+  - match: { hits.hits.0._source.include.field2: v2 }
+  - do:
+      search: { index: w56sf_def, body: { stored_fields: [ include.field2, _source ] } }
+  - match: { hits.hits.0._source.include.field2: v2 }
+  - do:
+      search: { index: w56sf_prx, body: { stored_fields: [ include.field2, _source ] } }
+  - match: { hits.hits.0._source.include.field2: v2 }
+
+  - do:
+      search: { index: w56sf_luc, body: { docvalue_fields: [ { field: count, format: "#.0" }, { field: d, format: "#.00" } ] } }
+  - match: { hits.hits.0.fields.count: [ "1.0" ] }
+  - match: { hits.hits.0.fields.d: [ "3.14" ] }
+  - do:
+      search: { index: w56sf_def, body: { docvalue_fields: [ { field: count, format: "#.0" }, { field: d, format: "#.00" } ] } }
+  - match: { hits.hits.0.fields.count: [ "1.0" ] }
+  - match: { hits.hits.0.fields.d: [ "3.14" ] }
+  - do:
+      search: { index: w56sf_prx, body: { docvalue_fields: [ { field: count, format: "#.0" }, { field: d, format: "#.00" } ] } }
+  - match: { hits.hits.0.fields.count: [ "1.0" ] }
+  - match: { hits.hits.0.fields.d: [ "3.14" ] }
+
+---
+"A search that one index's shards refuse is refused whole, never answered from the other indices' shards":
+  - do:
+      indices.create:
+        index: w56ra_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { date: { type: date, fields: { nanos: { type: date_nanos } } } } }
+  - do:
+      indices.create:
+        index: w56rb_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: integer } } }
+  - do:
+      indices.create:
+        index: w56ra_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { date: { type: date, fields: { nanos: { type: date_nanos } } } } }
+  - do:
+      indices.create:
+        index: w56rb_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: integer } } }
+  - do:
+      indices.create:
+        index: w56ra_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { date: { type: date, fields: { nanos: { type: date_nanos } } } } }
+  - do:
+      indices.create:
+        index: w56rb_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: integer } } }
+  - do:
+      bulk: { refresh: true, index: w56ra_luc, body: [ { index: {} }, { date: "2016-01-01" }, { index: {} }, { date: "2016-02-01" } ] }
+  - do:
+      bulk: { refresh: true, index: w56rb_luc, body: [ { index: {} }, { n: 1 } ] }
+  - do:
+      bulk: { refresh: true, index: w56ra_def, body: [ { index: {} }, { date: "2016-01-01" }, { index: {} }, { date: "2016-02-01" } ] }
+  - do:
+      bulk: { refresh: true, index: w56rb_def, body: [ { index: {} }, { n: 1 } ] }
+  - do:
+      bulk: { refresh: true, index: w56ra_prx, body: [ { index: {} }, { date: "2016-01-01" }, { index: {} }, { date: "2016-02-01" } ] }
+  - do:
+      bulk: { refresh: true, index: w56rb_prx, body: [ { index: {} }, { n: 1 } ] }
+
+  # date.nanos is a multi-field the table keeps no column of: the shards of the
+  # index mapping it refuse, the other index's serve. Stock answers from both.
+  - do:
+      search: { index: "w56ra_luc,w56rb_luc", body: { size: 0, aggs: { h: { date_histogram: { field: date.nanos, calendar_interval: month } } } } }
+  - match: { hits.total.value: 3 }
+  - match: { _shards.failed: 0 }
+  - length: { aggregations.h.buckets: 2 }
+  - do:
+      catch: bad_request
+      search: { index: "w56ra_def,w56rb_def", body: { size: 0, aggs: { h: { date_histogram: { field: date.nanos, calendar_interval: month } } } } }
+  - do:
+      catch: bad_request
+      search: { index: "w56ra_prx,w56rb_prx", body: { size: 0, aggs: { h: { date_histogram: { field: date.nanos, calendar_interval: month } } } } }
+  # A query on it too.
+  - do:
+      search: { index: "w56ra_luc,w56rb_luc", body: { query: { range: { date.nanos: { gte: "2016-01-15" } } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      catch: /a query on \[date.nanos\], a multi-field the table keeps no column of, is not served/
+      search: { index: "w56ra_def,w56rb_def", body: { query: { range: { date.nanos: { gte: "2016-01-15" } } } } }
+  - do:
+      catch: /a query on \[date.nanos\], a multi-field the table keeps no column of, is not served/
+      search: { index: "w56ra_prx,w56rb_prx", body: { query: { range: { date.nanos: { gte: "2016-01-15" } } } } }
