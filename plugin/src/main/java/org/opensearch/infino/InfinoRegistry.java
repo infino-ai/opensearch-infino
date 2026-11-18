@@ -15,9 +15,11 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.AbstractScopedSettings;
 import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.bytes.BytesReference;
@@ -98,8 +100,26 @@ final class InfinoRegistry {
     private static final Map<String, Long> recorded = new ConcurrentHashMap<>();
     /** Indices whose metadata moved and are not yet recorded, by name; the latest metadata wins. */
     private static final Map<String, IndexMetadata> pending = new ConcurrentHashMap<>();
-    /** Whether the registry table has been declared on the connection. */
+    /** How many writes of each index's row have failed in a row, for how long to wait before the next. */
+    private static final Map<String, Integer> failures = new ConcurrentHashMap<>();
+    /** When each row whose write failed may be tried again ({@link System#nanoTime}); a drain before then leaves it pending. */
+    private static final Map<String, Long> retryAt = new ConcurrentHashMap<>();
+    /** The rows with a retry scheduled: one each, however often a row fails meanwhile. */
+    private static final Set<String> scheduled = ConcurrentHashMap.newKeySet();
+    /** The wait before a failed row is written again; each further failure doubles it. */
+    static final TimeValue FIRST_RETRY_DELAY = TimeValue.timeValueSeconds(1);
+    /** The longest wait between tries of a row that keeps failing. */
+    static final TimeValue MAX_RETRY_DELAY = TimeValue.timeValueMinutes(1);
+    /**
+     * Failures in a row before one is logged as a warning: on the hosted
+     * service the first tries after the registry table is created can miss
+     * it for a moment, and the next try finds it.
+     */
+    private static final int WARN_AFTER_FAILURES = 3;
+    /** Whether the registry table has been declared on the connection; set only once a declaration succeeds. */
     private static final AtomicBoolean declared = new AtomicBoolean();
+    /** Whether a call that reads the registry back has waited out the read window since the table was declared. */
+    private static final AtomicBoolean settled = new AtomicBoolean();
     /** Whether this node has rebuilt the indices from the registry since it started. */
     private static final AtomicBoolean rebuilt = new AtomicBoolean();
 
@@ -148,28 +168,124 @@ final class InfinoRegistry {
     }
 
     /**
-     * Write every index whose metadata moved since it was last recorded.
-     * Called from the generic pool after a state applies, and by every read
-     * of the registry first, so a read sees the state the manager has seen.
+     * Write every index whose metadata moved since it was last recorded, as
+     * the cluster holds it now; a row waiting out a failed write's delay
+     * stays pending until then. Called from the generic pool after a state
+     * applies, and by every read of the registry first, so a read sees the
+     * state the manager has seen.
      */
     private static synchronized void drain() {
+        long now = System.nanoTime();
         for (String name : new ArrayList<>(pending.keySet())) {
-            IndexMetadata md = pending.remove(name);
-            if (md != null) {
-                record(md);
+            if (!electedManager()) {
+                // The elected manager records every index from its own state; what
+                // this node queued while it was the manager may be older than that.
+                // Asked before each row, as the node can lose the election mid-drain.
+                pending.clear();
+                failures.clear();
+                retryAt.clear();
+                return;
             }
+            Long at = retryAt.get(name);
+            if (at != null && at - now > 0) {
+                continue;
+            }
+            IndexMetadata md = pending.remove(name);
+            if (md == null) {
+                continue;
+            }
+            IndexMetadata current = current(md);
+            if (current == null) {
+                failures.remove(name);
+                retryAt.remove(name);
+                log.debug("[infino] index {} is gone; its registry row is not written", name);
+                continue;
+            }
+            record(current);
         }
     }
 
-    /** Write the index's row: its settings, mapping and aliases as the cluster holds them, replacing the row it had. */
+    /**
+     * Write the index's row: its settings, mapping and aliases as the cluster
+     * holds them, replacing the row it had. A write that fails is tried again
+     * later ({@link #retryDelay}) for as long as the index lives: a node that
+     * starts from the registry would otherwise come up without the index.
+     */
     static void record(IndexMetadata md) {
         String name = md.getIndex().getName();
         try {
             write(name, rowOf(md));
             recorded.put(name, md.getVersion());
+            failures.remove(name);
+            retryAt.remove(name);
         } catch (Exception e) {
-            log.warn("[infino] index {} could not be recorded in the registry", name, e);
+            int failed = failures.merge(name, 1, Integer::sum);
+            TimeValue delay = retryDelay(failed);
+            retryAt.put(name, System.nanoTime() + delay.nanos());
+            // Metadata queued since this write began is newer, and wins.
+            pending.putIfAbsent(name, md);
+            if (failed < WARN_AFTER_FAILURES) {
+                log.debug("[infino] index {} could not be recorded in the registry; trying again in {}", name, delay, e);
+            } else {
+                log.warn("[infino] index {} could not be recorded in the registry ({} tries); trying again in {}", name, failed, delay, e);
+            }
+            retryIn(name, delay);
         }
+    }
+
+    /**
+     * How long to wait before writing a row again after {@code failed}
+     * failures in a row: {@link #FIRST_RETRY_DELAY}, doubled for each failure
+     * after the first, at most {@link #MAX_RETRY_DELAY}.
+     */
+    static TimeValue retryDelay(int failed) {
+        long first = FIRST_RETRY_DELAY.millis();
+        long max = MAX_RETRY_DELAY.millis();
+        int doublings = Math.min(Math.max(failed - 1, 0), 30);
+        return TimeValue.timeValueMillis(Math.min(max, first << doublings));
+    }
+
+    /**
+     * Try {@code name}'s row again after {@code delay}, on the generic pool,
+     * unless a retry of it is already scheduled.
+     */
+    private static void retryIn(String name, TimeValue delay) {
+        ThreadPool threadPool = InfinoServices.threadPool();
+        if (threadPool == null) {
+            return; // no node: the next state applied, or the next read of the registry, writes it
+        }
+        if (scheduled.add(name)) {
+            threadPool.schedule(() -> retry(name), delay, ThreadPool.Names.GENERIC);
+        }
+    }
+
+    /** A scheduled retry of {@code name}'s row: write what is due, and schedule the row again if it is still waiting. */
+    private static void retry(String name) {
+        scheduled.remove(name);
+        drain();
+        Long at = retryAt.get(name);
+        if (at != null && pending.containsKey(name)) {
+            retryIn(name, TimeValue.timeValueNanos(Math.max(0, at - System.nanoTime())));
+        }
+    }
+
+    /** Whether this node is the elected cluster manager, the one node that writes the registry's rows; true with no node. */
+    private static boolean electedManager() {
+        ClusterService clusterService = InfinoServices.clusterService();
+        return clusterService == null || clusterService.state().nodes().isLocalNodeElectedClusterManager();
+    }
+
+    /**
+     * {@code md}'s index as the cluster holds it now, or null once it is gone
+     * (or another index has since been created under its name).
+     */
+    private static IndexMetadata current(IndexMetadata md) {
+        ClusterService clusterService = InfinoServices.clusterService();
+        if (clusterService == null) {
+            return md;
+        }
+        IndexMetadata now = clusterService.state().metadata().index(md.getIndex().getName());
+        return now != null && now.getIndexUUID().equals(md.getIndexUUID()) ? now : null;
     }
 
     /**
@@ -181,7 +297,7 @@ final class InfinoRegistry {
      * replace of one refuses: those rows go, and one is appended.
      */
     static void write(String id, String source) {
-        declare();
+        declareToRead();
         long held = heldRows(id);
         if (held > 1) {
             InfinoNative.deleteOsids(TABLE, new String[] { id }, 1);
@@ -215,7 +331,11 @@ final class InfinoRegistry {
     static void forget(String name) {
         pending.remove(name);
         recorded.remove(name);
+        failures.remove(name);
+        retryAt.remove(name);
         try {
+            // A delete reads nothing back: no wait for the read window, which
+            // would hold the cluster applier thread this runs on.
             declare();
             InfinoNative.deleteOsids(TABLE, new String[] { name }, 1);
         } catch (Exception e) {
@@ -276,7 +396,7 @@ final class InfinoRegistry {
     /** Every row of the registry table, each its id and source, after what moved is written. */
     static List<Map<String, Object>> rawRows() {
         drain();
-        declare();
+        declareToRead();
         return InfinoNative.sqlRows(
             "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM " + InfinoQueryTranslator.quoteIdent(TABLE)
         );
@@ -388,10 +508,48 @@ final class InfinoRegistry {
         }));
     }
 
+    /**
+     * Declare the registry table on the connection, unless it has been. A
+     * declaration that fails leaves it undeclared, so the next call (a
+     * write's retry, say) declares it again.
+     */
     private static void declare() {
-        if (declared.compareAndSet(false, true)) {
-            InfinoNative.ensureTable(TABLE, "{}");
+        if (declared.get()) {
+            return;
         }
+        synchronized (declared) {
+            if (!declared.get()) {
+                InfinoNative.ensureTable(TABLE, "{}");
+                declared.set(true);
+            }
+        }
+    }
+
+    /**
+     * Declare the registry table for a call that reads it back. A write
+     * reads it first (heldRows), and on the hosted service a read can miss a
+     * table this new for a moment: the first such call waits out the read
+     * window, once per node life. A write that still misses it is tried
+     * again (record).
+     */
+    private static void declareToRead() {
+        declare();
+        if (settled.get()) {
+            return;
+        }
+        // Every reader that comes meanwhile waits too: none reads before the window has passed.
+        synchronized (settled) {
+            if (!settled.get()) {
+                InfinoNative.awaitVisible(TABLE);
+                settled.set(true);
+            }
+        }
+    }
+
+    /** For tests: the next call declares the registry table again, as on a node that has just started. */
+    static void undeclare() {
+        declared.set(false);
+        settled.set(false);
     }
 
     /** One row: the index as a create request would describe it, plus its table and the metadata version it was recorded at. */

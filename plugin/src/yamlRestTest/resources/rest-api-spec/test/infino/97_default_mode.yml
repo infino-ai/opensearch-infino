@@ -255,6 +255,58 @@
         scroll_id: $scroll
 
 ---
+"Default mode: a scroll sorted on a field no document holds pages on past its first batch":
+  - do:
+      indices.create:
+        index: emn
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              n: { type: long }
+              never: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: emn, _id: "1" }
+          - { n: 1 }
+          - index: { _index: emn, _id: "2" }
+          - { n: 2 }
+          - index: { _index: emn, _id: "3" }
+          - { n: 3 }
+  - match: { errors: false }
+
+  # Every hit's sort value is missing; each round still resumes after the last one's last hit.
+  - do:
+      search:
+        index: emn
+        scroll: 1m
+        body:
+          size: 2
+          sort: [ { never: asc } ]
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 2 }
+  - set: { _scroll_id: scroll }
+  - do:
+      scroll:
+        scroll_id: $scroll
+        scroll: 1m
+  - length: { hits.hits: 1 }
+  - do:
+      scroll:
+        scroll_id: $scroll
+        scroll: 1m
+  - length: { hits.hits: 0 }
+  - do:
+      clear_scroll:
+        scroll_id: $scroll
+
+---
 "Default mode: terms over two shards ranks from more than each shard's top":
   # Routed so the overall top term is neither shard's top: shard 0 holds
   # a x3 and b x2, shard 1 holds c x3 and b x2, so b leads with 4. A shard

@@ -12,8 +12,10 @@ import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.search.ReferenceManager;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
@@ -29,6 +31,7 @@ import org.opensearch.index.mapper.SourceFieldMapper;
 import org.opensearch.index.seqno.ReplicationTracker;
 import org.opensearch.index.seqno.RetentionLease;
 import org.opensearch.index.seqno.SequenceNumbers;
+import org.opensearch.index.shard.RefreshListeners;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -390,6 +393,8 @@ public class InfinoEngine extends InternalEngine {
     private final Object batchLock = new Object();
     /** Serializes commits, so one batch reaches the table before the next. */
     private final Object commitLock = new Object();
+    /** Waits for hosted reads after a refresh, outside Lucene's lock, and then releases its wait_for requests. */
+    private final RefreshRelease refreshRelease;
     /**
      * Held shared from a write's apply to its record in the batch, and
      * exclusively while a commit takes its writes: a commit through a
@@ -520,6 +525,29 @@ public class InfinoEngine extends InternalEngine {
         CoverRecorder<?> covers = new CoverRecorder<>(getReferenceManager(SearcherScope.INTERNAL), this::getProcessedLocalCheckpoint, coveredByReader);
         getReferenceManager(SearcherScope.INTERNAL).addListener(covers.opening());
         getReferenceManager(SearcherScope.EXTERNAL).addListener(covers.publishing());
+        // The shard's wait_for listeners are released by refreshRelease once a
+        // refresh has returned and every read sees what it covers, so the wait
+        // for hosted reads runs outside Lucene's refresh lock.
+        ReferenceManager<OpenSearchDirectoryReader> readers = getReferenceManager(SearcherScope.EXTERNAL);
+        RefreshListeners waiting = null;
+        for (ReferenceManager.RefreshListener l : config.getExternalRefreshListener()) {
+            if (l instanceof RefreshListeners r) {
+                waiting = r;
+                readers.removeListener(r);
+            }
+        }
+        this.refreshRelease = new RefreshRelease(table, waiting, () -> {
+            try {
+                return translogManager().getTranslogLastWriteLocation();
+            } catch (AlreadyClosedException e) {
+                return null; // a closing shard releases its listeners as it closes
+            }
+        }, () -> {
+            if (InfinoNative.hosted()) {
+                commitBeforeLucene("refresh", appliedSoFar());
+            }
+        });
+        readers.addListener(refreshRelease);
         BY_TABLE.put(table, this);
         log.info("[infino] engine attached to table {} for {}", table, config.getShardId());
     }
@@ -1294,7 +1322,11 @@ public class InfinoEngine extends InternalEngine {
     /**
      * Commit the writes through every operation applied so far, then refresh
      * the skeleton's reader and record what it covers: every operation
-     * applied before the refresh began.
+     * applied before the refresh began. Once Lucene's refresh lock is
+     * released, and before the refresh is acknowledged, it waits until every
+     * read sees the commit ({@link RefreshRelease#release}), so a search after
+     * {@code refresh=true}, or one that {@code wait_for} released, finds the
+     * writes.
      */
     @Override
     public void refresh(String source) throws EngineException {
@@ -1306,6 +1338,21 @@ public class InfinoEngine extends InternalEngine {
         long covered = getProcessedLocalCheckpoint();
         super.refresh(source);
         rememberCovered(covered);
+        refreshRelease.release();
+    }
+
+    /**
+     * The local checkpoint once every write under way is recorded: it
+     * reaches each operation applied before the call, as a write holds
+     * {@link #recordLock} from its apply to its record.
+     */
+    private long appliedSoFar() {
+        recordLock.writeLock().lock();
+        try {
+            return getProcessedLocalCheckpoint();
+        } finally {
+            recordLock.writeLock().unlock();
+        }
     }
 
     @Override
@@ -1317,6 +1364,9 @@ public class InfinoEngine extends InternalEngine {
         long covered = getProcessedLocalCheckpoint();
         boolean refreshed = super.maybeRefresh(source);
         rememberCovered(covered);
+        if (refreshed) {
+            refreshRelease.release(); // a refresh that did not run is released by the one that did
+        }
         return refreshed;
     }
 

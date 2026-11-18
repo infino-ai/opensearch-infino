@@ -696,12 +696,6 @@ public final class InfinoSearch {
     // ---- one index ----
 
     /**
-     * The hits of one index for the request's window, each carrying its
-     * source, with the total. With {@code count} false an exact total is left
-     * for the caller, which reads it beside the aggregations (the page's total
-     * is then 0 until replaced).
-     */
-    /**
      * The total: what the query and post_filter keep, before any collapse
      * and regardless of where the page starts.
      */
@@ -736,8 +730,20 @@ public final class InfinoSearch {
         return new CountedRows(counted == 0 ? List.of() : hits.get(), counted);
     }
 
-    /** The page's rows from its hit statement, with their sources when they are read by id. */
-    private static List<Map<String, Object>> hitRows(Plan plan, SearchSourceBuilder source, int fetch, boolean seqNoAndPrimaryTerm) {
+    /**
+     * The page's rows from its hit statement, with their sources when they
+     * are read by id; {@code resumed} as {@link #page} takes it.
+     */
+    private static List<Map<String, Object>> hitRows(
+        Plan plan,
+        SearchSourceBuilder source,
+        int fetch,
+        boolean seqNoAndPrimaryTerm,
+        boolean resumed
+    ) {
+        if (readsUnsorted(plan, resumed)) {
+            return InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm, wantsSource(source)));
+        }
         List<Map<String, Object>> rows;
         if (splitsMissingTail(plan)) {
             // The rows past a present first sort value come first; the
@@ -750,6 +756,18 @@ public final class InfinoSearch {
             }
         } else {
             rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+            if (rows.size() < fetch && rankedInWindow(plan)) {
+                // The rows removed after the ranking may have used up the window
+                // while matches remain past it (a minimum_should_match count, a
+                // text clause on another column): rank every candidate then, so
+                // the page holds what the total counts.
+                TextClause text = plan.query().principal();
+                long candidates = InfinoNative.count(plan.table(), text.column(), text.query(), text.mode());
+                if (candidates > RANK_WINDOW) {
+                    int window = (int) Math.min(Integer.MAX_VALUE, candidates);
+                    rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.WHOLE, window));
+                }
+            }
         }
         if (sourcesById(plan) && wantsSource(source)) {
             rows = withSources(plan.table(), rows, fetch);
@@ -757,7 +775,24 @@ public final class InfinoSearch {
         return rows;
     }
 
+    /**
+     * The hits of one index for the request's window, each carrying its
+     * source, with the total. With {@code count} false an exact total is left
+     * for the caller, which reads it beside the aggregations (the page's total
+     * is then 0 until replaced).
+     */
     static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count) {
+        return page(index, plan, source, count, false);
+    }
+
+    /**
+     * As {@link #page(Index, Plan, SearchSourceBuilder, boolean)}, and with
+     * {@code resumed} when a later page resumes after this page's last hit
+     * from its sort values (a scroll's): those must then carry the row id
+     * the sort is broken by, so the page is read in its sort's order even
+     * when that sort orders nothing ({@link #sortsNothing}).
+     */
+    static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count, boolean resumed) {
         final int from = Math.max(0, source.from());
         final int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
         final int fetch = from + size;
@@ -817,7 +852,7 @@ public final class InfinoSearch {
             CountedRows read = countedRows(
                 countsFirst(source, count, scoredPage(plan)),
                 () -> total(plan),
-                () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm)
+                () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed)
             );
             rows = read.rows();
             counted = read.total();
@@ -937,6 +972,21 @@ public final class InfinoSearch {
     }
 
     /**
+     * Whether the page's hits are the principal's BM25 ranking cut to
+     * {@link #RANK_WINDOW} candidates before a step removes rows
+     * ({@link #hitStatement}), so a page that step leaves short may have
+     * matches past the window.
+     */
+    static boolean rankedInWindow(Plan plan) {
+        String where = plan.hitWhere();
+        return plan.searchAfter() == null
+            && plan.sorts().isEmpty()
+            && !scoredPage(plan)
+            && plan.query().principal() != null
+            && (InfinoQueryTranslator.joinsAfterRanking(where) || (!InfinoQueryTranslator.ALL.equals(where) && plan.collapse() != null));
+    }
+
+    /**
      * Whether a page the hit statement could not fill holds every row its
      * predicate keeps, and that predicate is the total's, so its length is
      * the total: no keyset, collapse or ranked window narrows it. An
@@ -1036,6 +1086,63 @@ public final class InfinoSearch {
     }
 
     /**
+     * Whether the page is read as the unsorted search reads it: its sort
+     * orders nothing ({@link #sortsNothing}), so every hit's sort value is
+     * missing and the page is the predicate's rows in no order, as stock
+     * reads a sort on a field no document has. The hits still carry the
+     * sort. Not when a later page resumes from the hits' sort values
+     * ({@code resumed}, a scroll): the unsorted read selects no row id, so
+     * every value would be missing and the keyset past them would keep no
+     * row; that page is read in the sort's order, the row id's.
+     */
+    static boolean readsUnsorted(Plan plan, boolean resumed) {
+        return !resumed && sortsNothing(plan);
+    }
+
+    /**
+     * The statement {@link #readsUnsorted} reads a page with: the sorted
+     * statement's rows ({@link #hitStatement}, unranked, as a field sort
+     * selects them) in row id order, the order the sort's tiebreak gives
+     * them, each with its source when {@code withSource} (the hit returns it
+     * or reads requested fields from it). A text query is neither ranked by
+     * BM25 nor scored, so the page is the rows the sorted read would select,
+     * not the best-scoring ones. With no order, a read can start from any
+     * file, so two pages of one search could skip rows between them.
+     */
+    static String unsortedStatement(Plan plan, int fetch, boolean withSeq, boolean withSource) {
+        String hit = InfinoQueryTranslator.OSID
+            + (withSource ? ", " + InfinoQueryTranslator.SOURCE : "")
+            + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "");
+        return "SELECT " + hit + " FROM " + plan.query().from() + " WHERE " + plan.hitWhere()
+            + " ORDER BY " + InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID) + " LIMIT " + fetch;
+    }
+
+    /**
+     * Whether the page's sort orders nothing: one field's own column, then
+     * the row id, from the page's start, over a column no row of the table
+     * holds a value in (where every value is missing, missing first or last
+     * and either direction order the same). The column's presence is counted
+     * from the superfiles' statistics, with no row read.
+     */
+    static boolean sortsNothing(Plan plan) {
+        List<SortSpec> sorts = plan.sorts();
+        if (plan.vector() != null || plan.collapse() != null || plan.searchAfter() != null || !plan.scriptFields().isEmpty() || sorts.size() != 2) {
+            return false;
+        }
+        SortSpec first = sorts.get(0);
+        SortSpec tie = sorts.get(1);
+        if (!tie.name().equals(InfinoSql.ROW_ID)
+            || tie.desc()
+            || first.name().equals(InfinoSql.ROW_ID)
+            || first.name().equals(InfinoQueryTranslator.OSID)
+            || !first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()))) {
+            return false;
+        }
+        long[] present = InfinoNative.countWhere(plan.table(), List.of(first.expr() + " IS NOT NULL"));
+        return present.length == 1 && present[0] == 0;
+    }
+
+    /**
      * Whether a search_after page is read in two parts: the rows past a
      * present first sort value, then, only when those leave the page short,
      * the rows missing that value. Missing values sort last, so the second
@@ -1081,6 +1188,14 @@ public final class InfinoSearch {
     }
 
     static String hitStatement(Plan plan, int fetch, boolean withSeq, Keyset part) {
+        return hitStatement(plan, fetch, withSeq, part, RANK_WINDOW);
+    }
+
+    /**
+     * As {@link #hitStatement(Plan, int, boolean, Keyset)}, ranking
+     * {@code window} candidates where a step removes rows after the ranking.
+     */
+    static String hitStatement(Plan plan, int fetch, boolean withSeq, Keyset part, int window) {
         Translation q = plan.query();
         StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID);
         if (!sourcesById(plan)) {
@@ -1125,7 +1240,7 @@ public final class InfinoSearch {
             // ranking needs more candidates to choose from.
             boolean filtered = !InfinoQueryTranslator.ALL.equals(where);
             boolean narrowedAfterRanking = InfinoQueryTranslator.joinsAfterRanking(where) || (filtered && plan.collapse() != null);
-            from = q.rankedFrom(narrowedAfterRanking ? RANK_WINDOW : fetch);
+            from = q.rankedFrom(narrowedAfterRanking ? window : fetch);
             hit.append(", score");
             order = "score DESC";
         } else {
@@ -1691,7 +1806,8 @@ public final class InfinoSearch {
             // reads its total beside the aggregations rather than in a count of its own.
             boolean sharedTotal = !builders.isEmpty() && plan.vector() == null && plan.postWhere() == null && trackTotal(perIndex);
             boolean countWithAggs = sharedTotal && perIndex.size() == 0;
-            Page page = page(index, plan, perIndex, !countWithAggs);
+            // A scroll's next page resumes from this one's last hits (the cursor below).
+            Page page = page(index, plan, perIndex, !countWithAggs, after != null);
             if (!builders.isEmpty()) {
                 InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(index).evaluate(
                     builders,
