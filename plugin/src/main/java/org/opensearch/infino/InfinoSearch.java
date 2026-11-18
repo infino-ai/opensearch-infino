@@ -1149,20 +1149,20 @@ public final class InfinoSearch {
     /**
      * The statement {@link #readsUnsorted} reads a page with: the sorted
      * statement's rows ({@link #hitStatement}, unranked, as a field sort
-     * selects them) in row id order, the order the sort's tiebreak gives
-     * them, each with its source when {@code withSource} (the hit returns it
-     * or reads requested fields from it). A text query is neither ranked by
-     * BM25 nor scored, so the page is the rows the sorted read would select,
-     * not the best-scoring ones. With no order, a read can start from any
-     * file, so two pages of one search could skip rows between them.
+     * selects them) with no order, each with its source when
+     * {@code withSource} (the hit returns it or reads requested fields from
+     * it). A text query is neither ranked by BM25 nor scored, so the page is
+     * the rows the sorted read would select, not the best-scoring ones. With
+     * no order the read stops at its LIMIT; ordering by the row id would read
+     * the id of every row the filter keeps. Two pages of one search can then
+     * start from different files (#107).
      */
     static String unsortedStatement(Plan plan, int fetch, boolean withSeq, boolean withSource) {
         String hit = InfinoQueryTranslator.OSID
             + (withSource ? ", " + InfinoQueryTranslator.SOURCE : "")
             + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "");
         Unranked read = unranked(plan.query(), plan.hitWhere());
-        return "SELECT " + hit + " FROM " + read.from() + " WHERE " + read.where()
-            + " ORDER BY " + InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID) + " LIMIT " + fetch;
+        return "SELECT " + hit + " FROM " + read.from() + " WHERE " + read.where() + " LIMIT " + fetch;
     }
 
     /** The relation and predicate a page with no score reads its rows from. */
