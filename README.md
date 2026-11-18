@@ -1,5 +1,7 @@
 # Infino for OpenSearch
 
+![Status: experimental](https://img.shields.io/badge/status-experimental-orange) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 An OpenSearch plugin that stores your indices in [Infino](https://github.com/infino-ai/infino) tables instead of Lucene. Infino is an Apache-2.0 retrieval engine, written in Rust, that keeps its tables on object storage and runs SQL, full-text and vector search over them. The documents live on storage you choose (a local disk, an S3, GCS or Azure bucket, or a hosted Infino account), and OpenSearch's REST API, Dashboards, security plugin and cluster management work unchanged.
 
 - **The same APIs.** Index, bulk, get, search, aggregations, scroll and Dashboards work unchanged. An index keeps its name, mapping, settings and aliases.
@@ -7,9 +9,9 @@ An OpenSearch plugin that stores your indices in [Infino](https://github.com/inf
 - **Stateless nodes.** A node with an empty data directory brings every index back from storage, with its mapping and aliases.
 - **Not a fork.** The plugin installs into a released OpenSearch: 2.19.6, 3.0.0, 3.3.2, 3.6.0 or 3.9.0.
 
-**Status: early.** The plugin is tested on the releases above with local storage and Dashboards; cloud buckets are not tested yet. Some of OpenSearch's own REST tests still fail with it, and known gaps are tracked in [the issues](https://github.com/infino-ai/opensearch-infino/issues). Among them: in default mode, an acknowledged write that the table refuses can be dropped ([#54](https://github.com/infino-ai/opensearch-infino/issues/54)). Try it on data you can rebuild before relying on it.
+**Status: experimental.** Not ready for production data, and settings and behaviour may change between versions without a migration path. The plugin is tested on the releases above with local storage and Dashboards; cloud buckets are not tested yet. Some of OpenSearch's own REST tests still fail with it, and known gaps are tracked in [the issues](https://github.com/infino-ai/opensearch-infino/issues). Among them: in default mode, an acknowledged write that the table refuses can be dropped ([#54](https://github.com/infino-ai/opensearch-infino/issues/54)). Try it on data you can rebuild before relying on it.
 
-**Contents:** [Quick start](#quick-start) · [How it works](#how-it-works) · [Install on a cluster](#install-on-a-cluster) · [Hosted account and stateless nodes](#hosted-account-and-stateless-nodes) · [Settings](#settings) · [SQL](#sql) · [What is supported](#what-is-supported) · [Writes](#writes) · [Build and test](#build-and-test) · [Repository layout](#repository-layout) · [License](#license)
+**Contents:** [Quick start](#quick-start) · [How it works](#how-it-works) · [Install on a cluster](#install-on-a-cluster) · [Hosted account and stateless nodes](#hosted-account-and-stateless-nodes) · [Settings](#settings) · [SQL](#sql) · [What is supported](#what-is-supported) · [Writes](#writes) · [Build and test](#build-and-test) · [Repository layout](#repository-layout) · [License](#license) · [Contributing and security](#contributing-and-security)
 
 ## Quick start
 
@@ -345,4 +347,4 @@ Apache-2.0; see [LICENSE](LICENSE). The bridge and the plugin use only the publi
 
 ## Contributing and security
 
-Bugs and feature requests go in [the issues](https://github.com/infino-ai/opensearch-infino/issues); pull requests are welcome, and `gradle check` (see [Build and test](#build-and-test)) should pass before you open one. Report a security problem privately, through [a security advisory](https://github.com/infino-ai/opensearch-infino/security/advisories/new), not in a public issue.
+Bugs and feature requests go in [the issues](https://github.com/infino-ai/opensearch-infino/issues), and pull requests are welcome: [CONTRIBUTING.md](CONTRIBUTING.md) covers the build, the checks a pull request must pass, and the sign-off each commit needs. Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md). Report a security problem privately, as [SECURITY.md](SECURITY.md) describes, not in a public issue.
