@@ -7,11 +7,13 @@ package org.opensearch.infino;
 import org.opensearch.common.inject.Binding;
 import org.opensearch.common.inject.Injector;
 import org.opensearch.common.inject.TypeLiteral;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,6 +42,11 @@ final class InfinoSecurityCalls {
     static final String FILTER_LEVEL_DLS_DONE = "_opendistro_security_filter_level_dls_done";
     /** The request a search filter asks access for; the only kind with a query the document rule can be folded into. */
     static final String SEARCH = "search";
+    /** The security plugin's plugin class, as the node lists it when installed. */
+    static final String SECURITY_PLUGIN = "org.opensearch.security.OpenSearchSecurityPlugin";
+    /** The security plugin's settings that leave its rules off on a node where it is installed. */
+    static final String SECURITY_DISABLED = "plugins.security.disabled";
+    static final String SECURITY_SSL_ONLY = "plugins.security.ssl_only";
 
     /** Public methods by class, name and argument classes, looked up once. */
     private static final Map<String, Method> METHODS = new ConcurrentHashMap<>();
@@ -63,6 +70,31 @@ final class InfinoSecurityCalls {
             return null;
         }
         return user;
+    }
+
+    /**
+     * Whether the security plugin runs its rules on this node, as it decides
+     * whether to wrap an index's reader: installed (among the node's
+     * {@code pluginClasses}), and neither disabled nor in SSL-only mode.
+     */
+    static boolean runs(Settings settings, Collection<String> pluginClasses) {
+        return pluginClasses.contains(SECURITY_PLUGIN)
+            && !settings.getAsBoolean(SECURITY_DISABLED, false)
+            && !settings.getAsBoolean(SECURITY_SSL_ONLY, false);
+    }
+
+    /**
+     * Whether the request reads the security plugin's own index, as that
+     * plugin's reader lets it: one of its configuration reads, or a user with
+     * an admin certificate. A request with no user or from a plugin user
+     * reads it as empty there, and so here.
+     */
+    static boolean readsSecurityIndex(ThreadContext context, Object adminDns) throws ReflectiveOperationException {
+        if ("true".equals(context.getHeader(CONF_REQUEST_HEADER))) {
+            return true;
+        }
+        Object user = context.getTransient(USER);
+        return user != null && adminDns != null && (Boolean) call(adminDns, "isAdmin", user);
     }
 
     /**

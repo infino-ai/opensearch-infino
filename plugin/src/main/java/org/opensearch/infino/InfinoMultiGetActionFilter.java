@@ -99,7 +99,7 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             // as a write its shard has not committed yet counts.
             Map<String, InfinoAccess> accessOf = new HashMap<>();
             for (Map.Entry<String, IndexMetadata> e : indices.entrySet()) {
-                accessOf.put(e.getKey(), InfinoSecurity.access(e.getValue().getIndex().getName(), "mget"));
+                accessOf.put(e.getKey(), InfinoAccess.reading(e.getValue().getIndex().getName(), "mget"));
             }
             String[] tableOfItem = new String[mget.getItems().size()];
             Map<String, List<String>> idsByTable = new HashMap<>();

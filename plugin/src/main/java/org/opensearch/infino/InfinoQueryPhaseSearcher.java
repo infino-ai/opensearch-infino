@@ -173,7 +173,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         // it for this shard, as it does for a stock shard (null: the index whole).
         // The coordinating node checked the table answers it (InfinoAliasFilter).
         AliasFilter aliases = context.request().getAliasFilter();
-        InfinoAccess access = InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH)
+        InfinoAccess access = InfinoAccess.searching(index.getName())
             .filteredBy(aliases == null ? null : aliases.getQueryBuilder());
 
         ScrollContext scroll = context.scrollContext();
