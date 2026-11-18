@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.ActionListenerResponseHandler;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.DocWriteRequest;
@@ -212,6 +213,18 @@ public class InfinoBulkActionFilter implements ActionFilter {
      * the bulk goes on as it came.
      */
     static void route(BulkRequest bulk, ClusterService clusters, InfinoWriter writes, InfinoTables tables, ActionListener<BulkResponse> listener, Runnable stock) {
+        String attached = attachedTarget(clusters.state(), bulk);
+        if (attached != null) {
+            listener.onFailure(
+                new OpenSearchStatusException(
+                    "[infino] index [{}] is attached to a table it reads and never writes ([{}]); no document is indexed, updated or deleted through it",
+                    RestStatus.FORBIDDEN,
+                    attached,
+                    InfinoPlugin.INFINO_ATTACHED.getKey()
+                )
+            );
+            return;
+        }
         if (forwards() > 0) {
             // Its pipelines ran on the node it arrived at, which marked each document
             // resolved; they never run again here, whatever the documents carry.
@@ -800,6 +813,24 @@ public class InfinoBulkActionFilter implements ActionFilter {
             out.add(name);
         }
         return out;
+    }
+
+    /**
+     * The first index a bulk's items write to that is attached to a table
+     * made outside the plugin ({@link InfinoPlugin#INFINO_ATTACHED}), which
+     * it reads and never writes; null when none is. Every write to an
+     * index comes as a bulk (a single index, update or delete, and each
+     * batch of a write by query, among them), so a bulk refused here is
+     * every write refused.
+     */
+    static String attachedTarget(ClusterState state, BulkRequest bulk) {
+        for (String name : concreteIndices(state, bulk)) {
+            IndexMetadata md = name == null ? null : state.metadata().index(name);
+            if (md != null && InfinoPlugin.INFINO_ENABLED.get(md.getSettings()) && InfinoPlugin.INFINO_ATTACHED.get(md.getSettings())) {
+                return name;
+            }
+        }
+        return null;
     }
 
     /**

@@ -617,11 +617,21 @@ public final class InfinoNative {
      * default BM25 ({@link Mapping}).
      */
     public static void ensureTable(String name, String mappingJson, boolean defaultBm25) {
+        ensureTable(name, mappingJson, defaultBm25, false);
+    }
+
+    /**
+     * As {@link #ensureTable(String, String, boolean)}, or for an
+     * {@code attached} index ({@link InfinoPlugin#INFINO_ATTACHED}) declare
+     * the table it reads without creating or changing it: a missing table,
+     * or a mapped field the table has no column for, is refused.
+     */
+    public static void ensureTable(String name, String mappingJson, boolean defaultBm25, boolean attached) {
         init();
         COLUMNS.remove(name);
         InfinoRequestCache.changed(name);
         try {
-            takeOrThrow(lib.infino_ensure_table(conn, name, mappingJson));
+            takeOrThrow(attached ? lib.infino_attach_table(conn, name, mappingJson) : lib.infino_ensure_table(conn, name, mappingJson));
         } finally {
             InfinoRequestCache.changed(name);
             wrote(name);
@@ -901,6 +911,10 @@ public final class InfinoNative {
      * also build the adjacency index the engine's graph walks read over its rows.
      */
     public static int optimize(String name, Settings indexSettings) {
+        if (InfinoPlugin.INFINO_ATTACHED.get(indexSettings)) {
+            // An attached index reads a table it does not own: compacting it is its owner's to do.
+            return 0;
+        }
         init();
         boolean edges = InfinoPlugin.INFINO_EDGES.get(indexSettings);
         InfinoRequestCache.changed(name);

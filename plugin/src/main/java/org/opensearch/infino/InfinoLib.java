@@ -37,6 +37,8 @@ public interface InfinoLib extends Library {
 
     Pointer infino_ensure_table(Pointer h, String name, String mappingJson);
 
+    Pointer infino_attach_table(Pointer h, String name, String mappingJson);
+
     Pointer infino_columns(Pointer h, String name);
 
     Pointer infino_check_doc(Pointer h, String name, String source);

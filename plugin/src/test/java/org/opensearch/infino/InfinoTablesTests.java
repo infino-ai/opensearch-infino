@@ -8,6 +8,12 @@ import org.opensearch.Version;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.rollover.RolloverRequest;
 import org.opensearch.action.admin.indices.shrink.ResizeRequest;
+import org.opensearch.action.bulk.BulkRequest;
+import org.opensearch.action.delete.DeleteRequest;
+import org.opensearch.action.index.IndexRequest;
+import org.opensearch.action.update.UpdateRequest;
+import org.opensearch.cluster.ClusterName;
+import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.common.settings.Settings;
@@ -195,5 +201,62 @@ public class InfinoTablesTests extends OpenSearchTestCase {
         // An index created before the setting carries none and keeps the table as it always did.
         tables.observe(Metadata.builder().put(owner, false).put(older, false).build());
         assertTrue(tables.keptAfterDelete("os_logs_app", owner.getIndex()));
+    }
+
+    /** The settings of a request for an index attached to {@code table} (none when null), with {@code extra}. */
+    private static Settings attaching(String table, Settings extra) {
+        Settings.Builder out = Settings.builder().put(InfinoPlugin.INFINO_ATTACHED.getKey(), true).put(extra);
+        if (table != null) {
+            out.put(InfinoPlugin.INFINO_TABLE.getKey(), table);
+        }
+        return out.build();
+    }
+
+    public void testAnAttachedIndexNamesItsTableAndIsServedInProxyMode() {
+        Settings proxy = Settings.builder().put(InfinoPlugin.INFINO_MODE.getKey(), InfinoPlugin.MODE_PROXY).build();
+        Settings inDefaultMode = Settings.builder().put(InfinoPlugin.INFINO_MODE.getKey(), InfinoPlugin.MODE_DEFAULT).build();
+        assertNull(InfinoExplicitTableActionFilter.attachRefusal(attaching("pageviews", Settings.EMPTY), "pageviews"));
+        assertNull(InfinoExplicitTableActionFilter.attachRefusal(attaching("pageviews", proxy), "pageviews"));
+        String unnamed = InfinoExplicitTableActionFilter.attachRefusal(attaching(null, Settings.EMPTY), null);
+        assertTrue(unnamed, unnamed.contains("needs [index.infino.table]"));
+        String shards = InfinoExplicitTableActionFilter.attachRefusal(attaching("pageviews", inDefaultMode), "pageviews");
+        assertTrue(shards, shards.contains("to be [proxy]"));
+        // A request that asks for no attached index is none of this check's.
+        assertNull(InfinoExplicitTableActionFilter.attachRefusal(Settings.EMPTY, null));
+        assertNull(InfinoExplicitTableActionFilter.attachRefusal(inDefaultMode, "os_logs"));
+    }
+
+    public void testEveryWriteToAnAttachedIndexIsRefusedAndNoneToAnyOther() {
+        IndexMetadata attached = index("pageviews-ui", "u1", 1, attaching("pageviews", Settings.EMPTY));
+        IndexMetadata owned = index("logs", "u2", 2);
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(attached, false).put(owned, false))
+            .build();
+        Map<String, Object> doc = Map.of("title", "x");
+        assertEquals(
+            "pageviews-ui",
+            InfinoBulkActionFilter.attachedTarget(state, new BulkRequest().add(new IndexRequest("pageviews-ui").id("1").source(doc)))
+        );
+        assertEquals("pageviews-ui", InfinoBulkActionFilter.attachedTarget(state, new BulkRequest().add(new DeleteRequest("pageviews-ui", "1"))));
+        assertEquals(
+            "pageviews-ui",
+            InfinoBulkActionFilter.attachedTarget(state, new BulkRequest().add(new UpdateRequest("pageviews-ui", "1").doc(doc)))
+        );
+        // One item to an attached index refuses the bulk it came in.
+        assertEquals(
+            "pageviews-ui",
+            InfinoBulkActionFilter.attachedTarget(
+                state,
+                new BulkRequest().add(new IndexRequest("logs").id("1").source(doc)).add(new DeleteRequest("pageviews-ui", "2"))
+            )
+        );
+        assertNull(InfinoBulkActionFilter.attachedTarget(state, new BulkRequest().add(new IndexRequest("logs").id("1").source(doc))));
+        // An index the cluster does not hold yet is the bulk's to create, as before.
+        assertNull(InfinoBulkActionFilter.attachedTarget(state, new BulkRequest().add(new IndexRequest("fresh").id("1").source(doc))));
+    }
+
+    public void testAnAttachedTableIsNeverCompacted() {
+        // Answered before the bridge is loaded: the table is its owner's to compact.
+        assertEquals(0, InfinoNative.optimize("pageviews", attaching("pageviews", Settings.EMPTY)));
     }
 }

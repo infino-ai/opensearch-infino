@@ -72,6 +72,11 @@ public class InfinoExplicitTableActionFilter implements ActionFilter {
             return;
         }
         String table = namedTable(settings);
+        String refused = attachRefusal(settings, table);
+        if (refused != null) {
+            listener.onFailure(new IllegalArgumentException(refused));
+            return;
+        }
         if (table == null) {
             chain.proceed(task, action, request, listener);
             return;
@@ -89,6 +94,26 @@ public class InfinoExplicitTableActionFilter implements ActionFilter {
             return;
         }
         InfinoClient.requireClusterManagement(ActionListener.wrap(allowed -> chain.proceed(task, action, request, listener), listener::onFailure));
+    }
+
+    /**
+     * Why the settings of a request that asks for an attached index
+     * ({@link InfinoPlugin#INFINO_ATTACHED}) cannot be served, or null when
+     * they can or ask for none: an attached index names the table it reads
+     * and is served in proxy mode.
+     */
+    static String attachRefusal(Settings requested, String table) {
+        if (!InfinoPlugin.INFINO_ATTACHED.get(requested)) {
+            return null;
+        }
+        String attached = InfinoPlugin.INFINO_ATTACHED.getKey();
+        if (table == null) {
+            return "[infino] [" + attached + "] needs [" + InfinoPlugin.INFINO_TABLE.getKey() + "] to name the table the index is attached to";
+        }
+        if (requested.hasValue(InfinoPlugin.INFINO_MODE.getKey()) && !InfinoPlugin.MODE_PROXY.equals(InfinoPlugin.INFINO_MODE.get(requested))) {
+            return "[infino] [" + attached + "] needs [" + InfinoPlugin.INFINO_MODE.getKey() + "] to be [" + InfinoPlugin.MODE_PROXY + "]";
+        }
+        return null;
     }
 
     /** The table a create, resize, rollover or template request names in {@code index.infino.table}; null when it names none. */

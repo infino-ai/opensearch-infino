@@ -162,6 +162,23 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     );
 
     /**
+     * Whether the index is attached to a table that existed before it,
+     * named in {@link #INFINO_TABLE}: one made and filled outside the
+     * plugin, which holds none of the columns the plugin writes beside a
+     * document. Such a table is read as it is and never changed: nothing is
+     * added to it when the index is created or its mapping moves, a mapped
+     * field it has no column for is refused, and so is every write to the
+     * index. An attached index is served in proxy mode, and its table stays
+     * when the index is deleted, as any named table does.
+     */
+    public static final Setting<Boolean> INFINO_ATTACHED = Setting.boolSetting(
+        "index.infino.attached",
+        false,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
+    /**
      * Whether the index was free to take its table when it was created: set
      * by the cluster at creation ({@link #getAdditionalIndexSettingProviders}),
      * false when a live index the table could back already named it. An
@@ -605,7 +622,9 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
                     }
                 }
                 if (enabled && !templateAndRequestSettings.hasValue(INFINO_MODE.getKey())) {
-                    out.put(INFINO_MODE.getKey(), defaultModeEnabled ? MODE_DEFAULT : MODE_PROXY);
+                    // An attached index has no shard writes to keep a Lucene skeleton of: it is served before any shard.
+                    boolean attached = templateAndRequestSettings.getAsBoolean(INFINO_ATTACHED.getKey(), false);
+                    out.put(INFINO_MODE.getKey(), defaultModeEnabled && !attached ? MODE_DEFAULT : MODE_PROXY);
                 }
                 if (enabled) {
                     // The index's tables as it will hold them: the request and its templates over the defaults above.
@@ -627,6 +646,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             INFINO_REBUILT,
             INFINO_EDGES,
             INFINO_TABLE,
+            INFINO_ATTACHED,
             INFINO_TABLE_CLAIMED,
             OPTIMIZE_INTERVAL,
             PLATFORM_URL,

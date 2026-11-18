@@ -300,7 +300,7 @@ public final class InfinoTables {
             if (last != null && last == version) {
                 return table;
             }
-            InfinoNative.ensureTable(table, tableMapping(md), defaultBm25(md.getSettings()));
+            InfinoNative.ensureTable(table, tableMapping(md), defaultBm25(md.getSettings()), InfinoPlugin.INFINO_ATTACHED.get(md.getSettings()));
             declared.put(table, version);
             log.info("[infino] table {} declared from mapping version {} of {}", table, version, md.getIndex().getName());
         }
