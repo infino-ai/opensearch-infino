@@ -451,6 +451,46 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(InfinoSearch.splitsMissingTail(afterPlan(null, null)));
     }
 
+    public void testAScrollPageIsReadInItsSortsOrder() {
+        // A page a later page resumes from (a scroll's) is read in its sort's
+        // order even when the sort orders nothing, so each hit carries the row
+        // id the next page resumes after: the column's presence is not counted.
+        InfinoSearch.Plan plan = afterPlan(null, null);
+        assertFalse(InfinoSearch.readsUnsorted(plan, true));
+        String hits = InfinoSearch.hitStatement(plan, 10, false);
+        assertTrue(hits, hits.contains("\"_id\" AS \"_id\""));
+        assertTrue(hits, hits.endsWith("ORDER BY \"status\" DESC NULLS LAST, \"_id\" ASC NULLS LAST LIMIT 10"));
+    }
+
+    public void testAnUnsortedPageKeepsTheSortsUnrankedRows() {
+        // A text query sorted on a field no row holds is read with no order,
+        // from the same unranked relation the sorted read selects from: not
+        // BM25's best, and with no score.
+        InfinoSearch.Plan plan = new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(QueryBuilders.matchQuery("message", "disk")),
+            java.util.List.of(InfinoSearch.SortSpec.of(columns().get("status"), true), InfinoSearch.SortSpec.rowId()),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        String sorted = InfinoSearch.hitStatement(plan, 1, false);
+        String unsorted = InfinoSearch.unsortedStatement(plan, 1, false, true);
+        assertEquals("SELECT osid, source FROM token_match('os_logs_0', 'message', 'disk', 'or') WHERE 1=1 ORDER BY \"_id\" LIMIT 1", unsorted);
+        assertTrue(sorted, sorted.contains(" FROM token_match('os_logs_0', 'message', 'disk', 'or') WHERE 1=1 ORDER BY "));
+        assertEquals(
+            "SELECT osid, source, osseq FROM \"os_logs_0\" WHERE 1=1 ORDER BY \"_id\" LIMIT 5",
+            InfinoSearch.unsortedStatement(afterPlan(null, null), 5, true, true)
+        );
+        // A hit that neither returns its source nor reads fields from it does not read it.
+        assertEquals("SELECT osid, osseq FROM \"os_logs_0\" WHERE 1=1 ORDER BY \"_id\" LIMIT 5", InfinoSearch.unsortedStatement(afterPlan(null, null), 5, true, false));
+    }
+
     public void testTiesBreakByTheEngineRowId() {
         // Rows sharing the sort value are ordered by the engine's row id, which
         // the engine answers from its range index; a page continuing from a row
