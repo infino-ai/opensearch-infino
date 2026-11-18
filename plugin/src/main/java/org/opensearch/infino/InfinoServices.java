@@ -5,6 +5,7 @@
 package org.opensearch.infino;
 
 import org.opensearch.action.support.AutoCreateIndex;
+import org.opensearch.cluster.action.index.MappingUpdatedAction;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
@@ -52,6 +53,7 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     private static volatile IndexScopedSettings indexScopedSettings;
     private static volatile TransportService transportService;
     private static volatile IndicesService indicesService;
+    private static volatile MappingUpdatedAction mappingUpdatedAction;
 
     @Inject
     public InfinoServices(
@@ -80,6 +82,8 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         InfinoServices.transportService = injector.getInstance(TransportService.class);
         // The shards on this node, whose shard request cache an account switch clears (see InfinoRequestCache).
         InfinoServices.indicesService = injector.getInstance(IndicesService.class);
+        // How a shard sends the mapping its dynamic fields add, which a proxy-mode write sends too (see InfinoDynamicMapping).
+        InfinoServices.mappingUpdatedAction = injector.getInstance(MappingUpdatedAction.class);
         InfinoClient.bind(injector);
         // The security plugin's components, when it runs, come from the same injector.
         InfinoSecurity.bind(injector);
@@ -120,6 +124,11 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     /** The node's indices, or null before the services are injected. */
     static IndicesService indicesService() {
         return indicesService;
+    }
+
+    /** The node's sender of dynamic mapping updates, or null before the services are injected. */
+    static MappingUpdatedAction mappingUpdatedAction() {
+        return mappingUpdatedAction;
     }
 
     /** For tests that drive the registry without a node: the cluster it reads and the pool it retries on (null for none). */
