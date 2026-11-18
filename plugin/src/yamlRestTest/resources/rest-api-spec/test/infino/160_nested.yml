@@ -489,3 +489,398 @@
   - match: { hits.total.value: 2 }
   - match: { hits.hits.0._id: d1 }
   - match: { hits.hits.1._id: d2 }
+---
+"A nested query scores its matching entries by its score_mode, added to a match's BM25, as a Lucene twin scores them":
+  # An entry scores as its query does on it (a term 1.0, a bool the sum of
+  # its must and matching should clauses, a filter nothing), and the nested
+  # query reads its matching entries' scores by score_mode (avg by default)
+  # times its boost. In should or in must, that adds to the BM25 of a match
+  # beside it. Every query must give the Infino index and its Lucene twin the
+  # same hits in the same order and the same scores, within 1e-3. Before, a
+  # should holding a nested clause scored every hit 1.0, and in must it added nothing.
+  - do:
+      indices.create:
+        index: nsc_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { t: { type: text }, refs: { type: nested, properties: { id: { type: keyword }, type: { type: keyword } } } } }
+  - do:
+      indices.create:
+        index: nsc_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { t: { type: text }, refs: { type: nested, properties: { id: { type: keyword }, type: { type: keyword } } } } }
+  - do:
+      bulk:
+        refresh: true
+        index: nsc_inf
+        body:
+          - index: { _id: "d1" }
+          - {"t": "a warm coat", "refs": [{"id": "x", "type": "v"}, {"id": "y", "type": "v"}]}
+          - index: { _id: "d2" }
+          - {"t": "the coat on the long rack beside the other coat and a hat", "refs": [{"id": "x", "type": "w"}]}
+          - index: { _id: "d3" }
+          - {"t": "coat", "refs": [{"id": "x", "type": "v"}]}
+          - index: { _id: "d4" }
+          - {"t": "a red shoe", "refs": []}
+          - index: { _id: "d5" }
+          - {"t": "a blue hat", "refs": [{"id": "z", "type": "v"}]}
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: nsc_luc
+        body:
+          - index: { _id: "d1" }
+          - {"t": "a warm coat", "refs": [{"id": "x", "type": "v"}, {"id": "y", "type": "v"}]}
+          - index: { _id: "d2" }
+          - {"t": "the coat on the long rack beside the other coat and a hat", "refs": [{"id": "x", "type": "w"}]}
+          - index: { _id: "d3" }
+          - {"t": "coat", "refs": [{"id": "x", "type": "v"}]}
+          - index: { _id: "d4" }
+          - {"t": "a red shoe", "refs": []}
+          - index: { _id: "d5" }
+          - {"t": "a blue hat", "refs": [{"id": "z", "type": "v"}]}
+  - match: { errors: false }
+
+  # A should nested clause beside a match: the average of its matching entries' scores (score_mode avg, the default), added to the match's BM25.
+  - do:
+      search:
+        index: nsc_luc
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "query": {"term": {"refs.type": "v"}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 1.359375 }
+  - lt: { hits.hits.0._score: 1.361375 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 1.284643 }
+  - lt: { hits.hits.1._score: 1.286643 }
+  - match: { hits.hits.2._id: d5 }
+  - gt: { hits.hits.2._score: 0.999000 }
+  - lt: { hits.hits.2._score: 1.001000 }
+  - match: { hits.hits.3._id: d2 }
+  - gt: { hits.hits.3._score: 0.221566 }
+  - lt: { hits.hits.3._score: 0.223566 }
+  - do:
+      search:
+        index: nsc_inf
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "query": {"term": {"refs.type": "v"}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 1.359375 }
+  - lt: { hits.hits.0._score: 1.361375 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 1.284643 }
+  - lt: { hits.hits.1._score: 1.286643 }
+  - match: { hits.hits.2._id: d5 }
+  - gt: { hits.hits.2._score: 0.999000 }
+  - lt: { hits.hits.2._score: 1.001000 }
+  - match: { hits.hits.3._id: d2 }
+  - gt: { hits.hits.3._score: 0.221566 }
+  - lt: { hits.hits.3._score: 0.223566 }
+
+  # score_mode sum adds the scores of every matching entry: d1 has two.
+  - do:
+      search:
+        index: nsc_luc
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "score_mode": "sum", "query": {"term": {"refs.type": "v"}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d1 }
+  - gt: { hits.hits.0._score: 2.284643 }
+  - lt: { hits.hits.0._score: 2.286643 }
+  - match: { hits.hits.1._id: d3 }
+  - gt: { hits.hits.1._score: 1.359375 }
+  - lt: { hits.hits.1._score: 1.361375 }
+  - match: { hits.hits.2._id: d5 }
+  - gt: { hits.hits.2._score: 0.999000 }
+  - lt: { hits.hits.2._score: 1.001000 }
+  - match: { hits.hits.3._id: d2 }
+  - gt: { hits.hits.3._score: 0.221566 }
+  - lt: { hits.hits.3._score: 0.223566 }
+  - do:
+      search:
+        index: nsc_inf
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "score_mode": "sum", "query": {"term": {"refs.type": "v"}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d1 }
+  - gt: { hits.hits.0._score: 2.284643 }
+  - lt: { hits.hits.0._score: 2.286643 }
+  - match: { hits.hits.1._id: d3 }
+  - gt: { hits.hits.1._score: 1.359375 }
+  - lt: { hits.hits.1._score: 1.361375 }
+  - match: { hits.hits.2._id: d5 }
+  - gt: { hits.hits.2._score: 0.999000 }
+  - lt: { hits.hits.2._score: 1.001000 }
+  - match: { hits.hits.3._id: d2 }
+  - gt: { hits.hits.3._score: 0.221566 }
+  - lt: { hits.hits.3._score: 0.223566 }
+
+  # score_mode none scores the nested clause 0.
+  - do:
+      search:
+        index: nsc_luc
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "score_mode": "none", "query": {"term": {"refs.type": "v"}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 0.359376 }
+  - lt: { hits.hits.0._score: 0.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 0.284643 }
+  - lt: { hits.hits.1._score: 0.286643 }
+  - match: { hits.hits.2._id: d2 }
+  - gt: { hits.hits.2._score: 0.221566 }
+  - lt: { hits.hits.2._score: 0.223566 }
+  - match: { hits.hits.3._id: d5 }
+  - gt: { hits.hits.3._score: -0.001000 }
+  - lt: { hits.hits.3._score: 0.001000 }
+  - do:
+      search:
+        index: nsc_inf
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "score_mode": "none", "query": {"term": {"refs.type": "v"}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 0.359376 }
+  - lt: { hits.hits.0._score: 0.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 0.284643 }
+  - lt: { hits.hits.1._score: 0.286643 }
+  - match: { hits.hits.2._id: d2 }
+  - gt: { hits.hits.2._score: 0.221566 }
+  - lt: { hits.hits.2._score: 0.223566 }
+  - match: { hits.hits.3._id: d5 }
+  - gt: { hits.hits.3._score: -0.001000 }
+  - lt: { hits.hits.3._score: 0.001000 }
+
+  # An entry scores its bool's must and matching should clauses: d1's entries score 2 and 1, d3's 2; avg, max and min read them.
+  - do:
+      search:
+        index: nsc_luc
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "query": {"bool": {"must": [{"term": {"refs.type": "v"}}], "should": [{"term": {"refs.id": "x"}}]}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 2.359376 }
+  - lt: { hits.hits.0._score: 2.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 1.784643 }
+  - lt: { hits.hits.1._score: 1.786643 }
+  - match: { hits.hits.2._id: d5 }
+  - gt: { hits.hits.2._score: 0.999000 }
+  - lt: { hits.hits.2._score: 1.001000 }
+  - match: { hits.hits.3._id: d2 }
+  - gt: { hits.hits.3._score: 0.221566 }
+  - lt: { hits.hits.3._score: 0.223566 }
+  - do:
+      search:
+        index: nsc_inf
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "query": {"bool": {"must": [{"term": {"refs.type": "v"}}], "should": [{"term": {"refs.id": "x"}}]}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 2.359376 }
+  - lt: { hits.hits.0._score: 2.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 1.784643 }
+  - lt: { hits.hits.1._score: 1.786643 }
+  - match: { hits.hits.2._id: d5 }
+  - gt: { hits.hits.2._score: 0.999000 }
+  - lt: { hits.hits.2._score: 1.001000 }
+  - match: { hits.hits.3._id: d2 }
+  - gt: { hits.hits.3._score: 0.221566 }
+  - lt: { hits.hits.3._score: 0.223566 }
+
+  # score_mode max.
+  - do:
+      search:
+        index: nsc_luc
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "score_mode": "max", "query": {"bool": {"must": [{"term": {"refs.type": "v"}}], "should": [{"term": {"refs.id": "x"}}]}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 2.359376 }
+  - lt: { hits.hits.0._score: 2.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 2.284643 }
+  - lt: { hits.hits.1._score: 2.286643 }
+  - match: { hits.hits.2._id: d5 }
+  - gt: { hits.hits.2._score: 0.999000 }
+  - lt: { hits.hits.2._score: 1.001000 }
+  - match: { hits.hits.3._id: d2 }
+  - gt: { hits.hits.3._score: 0.221566 }
+  - lt: { hits.hits.3._score: 0.223566 }
+  - do:
+      search:
+        index: nsc_inf
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "score_mode": "max", "query": {"bool": {"must": [{"term": {"refs.type": "v"}}], "should": [{"term": {"refs.id": "x"}}]}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 2.359376 }
+  - lt: { hits.hits.0._score: 2.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 2.284643 }
+  - lt: { hits.hits.1._score: 2.286643 }
+  - match: { hits.hits.2._id: d5 }
+  - gt: { hits.hits.2._score: 0.999000 }
+  - lt: { hits.hits.2._score: 1.001000 }
+  - match: { hits.hits.3._id: d2 }
+  - gt: { hits.hits.3._score: 0.221566 }
+  - lt: { hits.hits.3._score: 0.223566 }
+
+  # score_mode min.
+  - do:
+      search:
+        index: nsc_luc
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "score_mode": "min", "query": {"bool": {"must": [{"term": {"refs.type": "v"}}], "should": [{"term": {"refs.id": "x"}}]}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 2.359376 }
+  - lt: { hits.hits.0._score: 2.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 1.284643 }
+  - lt: { hits.hits.1._score: 1.286643 }
+  - match: { hits.hits.2._id: d5 }
+  - gt: { hits.hits.2._score: 0.999000 }
+  - lt: { hits.hits.2._score: 1.001000 }
+  - match: { hits.hits.3._id: d2 }
+  - gt: { hits.hits.3._score: 0.221566 }
+  - lt: { hits.hits.3._score: 0.223566 }
+  - do:
+      search:
+        index: nsc_inf
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "score_mode": "min", "query": {"bool": {"must": [{"term": {"refs.type": "v"}}], "should": [{"term": {"refs.id": "x"}}]}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 2.359376 }
+  - lt: { hits.hits.0._score: 2.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 1.284643 }
+  - lt: { hits.hits.1._score: 1.286643 }
+  - match: { hits.hits.2._id: d5 }
+  - gt: { hits.hits.2._score: 0.999000 }
+  - lt: { hits.hits.2._score: 1.001000 }
+  - match: { hits.hits.3._id: d2 }
+  - gt: { hits.hits.3._score: 0.221566 }
+  - lt: { hits.hits.3._score: 0.223566 }
+
+  # A filter inside the nested query scores nothing.
+  - do:
+      search:
+        index: nsc_luc
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "query": {"bool": {"filter": [{"term": {"refs.type": "v"}}]}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 0.359376 }
+  - lt: { hits.hits.0._score: 0.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 0.284643 }
+  - lt: { hits.hits.1._score: 0.286643 }
+  - match: { hits.hits.2._id: d2 }
+  - gt: { hits.hits.2._score: 0.221566 }
+  - lt: { hits.hits.2._score: 0.223566 }
+  - match: { hits.hits.3._id: d5 }
+  - gt: { hits.hits.3._score: -0.001000 }
+  - lt: { hits.hits.3._score: 0.001000 }
+  - do:
+      search:
+        index: nsc_inf
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "query": {"bool": {"filter": [{"term": {"refs.type": "v"}}]}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 0.359376 }
+  - lt: { hits.hits.0._score: 0.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 0.284643 }
+  - lt: { hits.hits.1._score: 0.286643 }
+  - match: { hits.hits.2._id: d2 }
+  - gt: { hits.hits.2._score: 0.221566 }
+  - lt: { hits.hits.2._score: 0.223566 }
+  - match: { hits.hits.3._id: d5 }
+  - gt: { hits.hits.3._score: -0.001000 }
+  - lt: { hits.hits.3._score: 0.001000 }
+
+  # A bool with no clause inside the nested query is a match_all: each entry scores 1.0.
+  - do:
+      search:
+        index: nsc_luc
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "query": {"bool": {}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 1.359376 }
+  - lt: { hits.hits.0._score: 1.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 1.284643 }
+  - lt: { hits.hits.1._score: 1.286643 }
+  - match: { hits.hits.2._id: d2 }
+  - gt: { hits.hits.2._score: 1.221566 }
+  - lt: { hits.hits.2._score: 1.223566 }
+  - match: { hits.hits.3._id: d5 }
+  - gt: { hits.hits.3._score: 0.999000 }
+  - lt: { hits.hits.3._score: 1.001000 }
+  - do:
+      search:
+        index: nsc_inf
+        body: { query: {"bool": {"should": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "query": {"bool": {}}}}]}} }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 1.359376 }
+  - lt: { hits.hits.0._score: 1.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 1.284643 }
+  - lt: { hits.hits.1._score: 1.286643 }
+  - match: { hits.hits.2._id: d2 }
+  - gt: { hits.hits.2._score: 1.221566 }
+  - lt: { hits.hits.2._score: 1.223566 }
+  - match: { hits.hits.3._id: d5 }
+  - gt: { hits.hits.3._score: 0.999000 }
+  - lt: { hits.hits.3._score: 1.001000 }
+
+  # In must, the nested clause adds its score to every hit: a pair of terms on one entry scores 2.0.
+  - do:
+      search:
+        index: nsc_luc
+        body: { query: {"bool": {"must": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "query": {"bool": {"must": [{"term": {"refs.type": "v"}}, {"term": {"refs.id": "x"}}]}}}}]}} }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 2.359376 }
+  - lt: { hits.hits.0._score: 2.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 2.284643 }
+  - lt: { hits.hits.1._score: 2.286643 }
+  - do:
+      search:
+        index: nsc_inf
+        body: { query: {"bool": {"must": [{"match": {"t": "coat"}}, {"nested": {"path": "refs", "query": {"bool": {"must": [{"term": {"refs.type": "v"}}, {"term": {"refs.id": "x"}}]}}}}]}} }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d3 }
+  - gt: { hits.hits.0._score: 2.359376 }
+  - lt: { hits.hits.0._score: 2.361376 }
+  - match: { hits.hits.1._id: d1 }
+  - gt: { hits.hits.1._score: 2.284643 }
+  - lt: { hits.hits.1._score: 2.286643 }
+
+  # A nested query alone scores its entries, times its boost.
+  - do:
+      search:
+        index: nsc_luc
+        body: { query: {"nested": {"path": "refs", "score_mode": "sum", "boost": 2, "query": {"term": {"refs.type": "v"}}}} }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d1 }
+  - gt: { hits.hits.0._score: 3.999000 }
+  - lt: { hits.hits.0._score: 4.001000 }
+  - match: { hits.hits.1._id: d3 }
+  - gt: { hits.hits.1._score: 1.999000 }
+  - lt: { hits.hits.1._score: 2.001000 }
+  - match: { hits.hits.2._id: d5 }
+  - gt: { hits.hits.2._score: 1.999000 }
+  - lt: { hits.hits.2._score: 2.001000 }
+  - do:
+      search:
+        index: nsc_inf
+        body: { query: {"nested": {"path": "refs", "score_mode": "sum", "boost": 2, "query": {"term": {"refs.type": "v"}}}} }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d1 }
+  - gt: { hits.hits.0._score: 3.999000 }
+  - lt: { hits.hits.0._score: 4.001000 }
+  - match: { hits.hits.1._id: d3 }
+  - gt: { hits.hits.1._score: 1.999000 }
+  - lt: { hits.hits.1._score: 2.001000 }
+  - match: { hits.hits.2._id: d5 }
+  - gt: { hits.hits.2._score: 1.999000 }
+  - lt: { hits.hits.2._score: 2.001000 }

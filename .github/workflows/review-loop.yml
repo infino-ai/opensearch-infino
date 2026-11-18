@@ -118,12 +118,14 @@ jobs:
           case "$pr" in ''|*[!0-9]*) echo "::error::bad PR number"; exit 1;; esac
           case "$iter" in ''|*[!0-9]*) echo "::error::bad max_iterations"; exit 1;; esac
           meta=$(gh api "repos/$REPO/pulls/$pr")
-          # A fork's branch takes the App's push only when its author allows edits by maintainers;
-          # without that, the loop can review but has nowhere to put fixes.
+          # Only branches of this repository: the loop builds and runs the PR's code with the
+          # agents' keys in its environment, and a fork's code is not ours to run with them. A PR
+          # whose fork was deleted has no head repository and is refused too.
           fork=$(jq -r '.head.repo.full_name != .base.repo.full_name' <<<"$meta")
-          if [ "$fork" = true ] && [ "$(jq -r .maintainer_can_modify <<<"$meta")" != true ] && [ "$mode" = autofix ]; then
-            echo "::notice::the fork does not allow edits by maintainers; reviewing only"
-            mode=review
+          if [ "$fork" = true ]; then
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::PR #$pr comes from a fork; the loop runs only on this repository's branches"
+            exit 0
           fi
           # The commit the maintainer read when they asked, checked out by SHA: the run starts later
           # (and may wait behind another run), and a push in between is code nobody approved. The
