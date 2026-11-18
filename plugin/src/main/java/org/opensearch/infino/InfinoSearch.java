@@ -789,7 +789,7 @@ public final class InfinoSearch {
                 }
             }
         }
-        if (sourcesById(plan) && wantsSource(source)) {
+        if ((sourcesById(plan) || ranksAcross(plan)) && wantsSource(source)) {
             rows = withSources(plan.table(), rows, fetch);
         }
         return rows;
@@ -1266,6 +1266,9 @@ public final class InfinoSearch {
             where = "(" + where + ") AND " + keysetPredicate(plan, part);
         }
         boolean sorted = !plan.sorts().isEmpty();
+        if (ranksAcross(plan)) {
+            return acrossStatement(plan, fetch, withSeq);
+        }
         if (scoredPage(plan)) {
             return scoredStatement(plan, hit.toString(), where, fetch, withSeq);
         }
@@ -1299,6 +1302,73 @@ public final class InfinoSearch {
         return "SELECT " + hit + " FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY " + within
             + ") AS " + rank + " FROM " + from + " t WHERE " + where + ") WHERE " + rank + " = 1"
             + (order == null ? "" : " ORDER BY " + order) + " LIMIT " + fetch;
+    }
+
+    /**
+     * Whether the page is a query string's BM25 across several text columns
+     * ({@link InfinoQueryTranslator.Across}), in no other order, read by
+     * {@link #acrossStatement}: no sort, collapse, search_after or scripted
+     * field, and every other predicate one the ranked searches take as their
+     * filter (none joined by id after the ranking).
+     */
+    static boolean ranksAcross(Plan plan) {
+        InfinoQueryTranslator.Across across = plan.query().scoring().across();
+        if (across == null
+            || plan.query().principal() != null
+            || !plan.sorts().isEmpty()
+            || plan.collapse() != null
+            || plan.searchAfter() != null
+            || !plan.scriptFields().isEmpty()) {
+            return false;
+        }
+        String where = plan.hitWhere();
+        return where.contains(across.match()) && !InfinoQueryTranslator.joinsAfterRanking(acrossFilter(plan));
+    }
+
+    /** The hits' predicate without the query string's own: the filter each ranked search takes. */
+    private static String acrossFilter(Plan plan) {
+        return plan.hitWhere().replace(plan.query().scoring().across().match(), InfinoQueryTranslator.ALL);
+    }
+
+    /**
+     * The page of a query string ranked across several text columns, as
+     * stock scores it: one BM25 search per clause and column, each within
+     * the rows the other predicates keep; per document, each clause's best
+     * column (dis_max), then the sum over its clauses. Ties go in the order
+     * the documents were written. The sources are read by id after.
+     *
+     * <p>With one clause the page is exact from {@code fetch} candidates per
+     * column: a hit among the best by its best column is among that column's
+     * best. With several, each search ranks {@link #RANK_WINDOW} candidates,
+     * which is exact while each clause matches no more rows than that on each
+     * column; past it, a document missing from one search's window adds
+     * nothing for that clause there.
+     */
+    static String acrossStatement(Plan plan, int fetch, boolean withSeq) {
+        Translation q = plan.query();
+        InfinoQueryTranslator.Across across = q.scoring().across();
+        String filter = acrossFilter(plan);
+        String rowId = InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID);
+        String seq = InfinoQueryTranslator.SEQ;
+        int k = across.clauses().size() == 1 ? fetch : Math.max(fetch, RANK_WINDOW);
+        List<String> perClause = new ArrayList<>();
+        for (int i = 0; i < across.clauses().size(); i++) {
+            List<String> searches = new ArrayList<>();
+            for (TextClause text : across.clauses().get(i)) {
+                searches.add(
+                    "SELECT " + InfinoQueryTranslator.OSID + ", score AS infino_bm25, " + rowId + " AS infino_row" + (withSeq ? ", " + seq : "")
+                        + " FROM " + q.rankedFrom(text, k) + (InfinoQueryTranslator.ALL.equals(filter) ? "" : " WHERE " + filter)
+                );
+            }
+            perClause.add(
+                "SELECT " + InfinoQueryTranslator.OSID + ", MAX(infino_bm25) AS infino_best, MIN(infino_row) AS infino_row"
+                    + (withSeq ? ", MAX(" + seq + ") AS " + seq : "") + " FROM (" + String.join(" UNION ALL ", searches) + ") AS infino_fields" + i
+                    + " GROUP BY " + InfinoQueryTranslator.OSID
+            );
+        }
+        return "SELECT " + InfinoQueryTranslator.OSID + ", SUM(infino_best) AS score, MIN(infino_row) AS infino_row"
+            + (withSeq ? ", MAX(" + seq + ") AS " + seq : "") + " FROM (" + String.join(" UNION ALL ", perClause) + ") AS infino_clauses GROUP BY "
+            + InfinoQueryTranslator.OSID + " ORDER BY score DESC, infino_row ASC LIMIT " + fetch;
     }
 
     /**

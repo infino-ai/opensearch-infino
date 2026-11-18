@@ -10,12 +10,14 @@ import org.opensearch.index.query.MultiMatchQueryBuilder;
 import org.opensearch.index.query.Operator;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.QueryShardException;
+import org.opensearch.index.query.QueryStringQueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /** The SQL a query-DSL tree translates to, over a log table's columns. */
@@ -580,6 +582,70 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertTrue(hits(translate(QueryBuilders.matchQuery("message", "disk")), level, 10).contains(", 10, 'or')"));
         // A plain filter has no subquery.
         assertFalse(InfinoQueryTranslator.joinsAfterRanking("\"level\" = 'error'"));
+    }
+
+    public void testQueryStringOverSeveralTextColumnsRanksAcrossThem() {
+        // Stock: message:monkey is one clause, the run "jackal bear" one dis_max over the default fields; summed.
+        Map<String, Column> cols = columns();
+        cols.put("title", new Column("title", "str", true, false));
+        Translation t = InfinoQueryTranslator.translate(
+            QueryBuilders.queryStringQuery("message: monkey jackal bear").field("message").field("title"),
+            cols,
+            TABLE,
+            NOW
+        );
+        assertNull(t.principal());
+        InfinoQueryTranslator.Across across = t.scoring().across();
+        assertNotNull(across);
+        assertEquals(
+            List.of(
+                List.of(new InfinoQueryTranslator.TextClause("message", "monkey", "or")),
+                List.of(new InfinoQueryTranslator.TextClause("message", "jackal bear", "or"), new InfinoQueryTranslator.TextClause("title", "jackal bear", "or"))
+            ),
+            across.clauses()
+        );
+        assertEquals(t.where(), across.match());
+        String sql = hits(t, null, 10);
+        // Each search ranks the window (several clauses are summed), by itself: the match is no filter of theirs.
+        assertTrue(sql, sql.contains("FROM bm25_search('os_logs_0', 'title', 'jackal bear', 10000, 'or')"));
+        assertFalse(sql, sql.contains("token_match"));
+        assertTrue(sql, sql.contains("MAX(infino_bm25)") && sql.contains("SUM(infino_best) AS score") && sql.endsWith("ORDER BY score DESC, infino_row ASC LIMIT 10"));
+
+        // One run alone: the best column, exact from the page's candidates per column.
+        Translation one = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").field("message").field("title"), cols, TABLE, NOW);
+        assertEquals(1, one.scoring().across().clauses().size());
+        assertTrue(hits(one, null, 10).contains("bm25_search('os_logs_0', 'message', 'jackal bear', 10, 'or')"));
+
+        // A must range beside it adds its constant and filters each search.
+        BoolQueryBuilder b = QueryBuilders.boolQuery()
+            .must(QueryBuilders.rangeQuery("status").gte(500))
+            .must(QueryBuilders.queryStringQuery("jackal bear").field("message").field("title"));
+        Translation filtered = InfinoQueryTranslator.translate(b, cols, TABLE, NOW);
+        assertNotNull(filtered.scoring().across());
+        assertEquals(1.0, filtered.scoring().offset(), 0);
+        String filteredSql = hits(filtered, null, 10);
+        assertTrue(filteredSql, filteredSql.contains("bm25_search('os_logs_0', 'title', 'jackal bear', 10, 'or') WHERE ((\"status\" >= 500) AND 1=1)"));
+
+        // Forms read otherwise are left unranked, as before.
+        for (QueryStringQueryBuilder qs : List.of(
+            QueryBuilders.queryStringQuery("jackal AND bear").field("message").field("title"),
+            QueryBuilders.queryStringQuery("\"jackal bear\"").field("message").field("title"),
+            QueryBuilders.queryStringQuery("jack*").field("message").field("title"),
+            QueryBuilders.queryStringQuery("jackal bear").field("message").field("title").defaultOperator(Operator.AND),
+            QueryBuilders.queryStringQuery("jackal bear").field("message", 2f).field("title"),
+            QueryBuilders.queryStringQuery("jackal bear").field("message").field("level"),
+            QueryBuilders.queryStringQuery("jackal jackal").field("message").field("title")
+        )) {
+            assertNull(qs.toString(), InfinoQueryTranslator.translate(qs, cols, TABLE, NOW).scoring().across());
+        }
+        // Beside another scoring text clause, or on one column, it is not ranked across.
+        BoolQueryBuilder two = QueryBuilders.boolQuery()
+            .must(QueryBuilders.queryStringQuery("jackal bear").field("message").field("title"))
+            .should(QueryBuilders.matchQuery("title", "owl"));
+        assertNull(InfinoQueryTranslator.translate(two, cols, TABLE, NOW).scoring().across());
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").defaultField("message"), cols, TABLE, NOW).scoring().across());
+        // An ascending score sort reads it unscored.
+        assertNull(one.ascending().scoring().across());
     }
 
     public void testTextUnderShouldIsASubquery() {

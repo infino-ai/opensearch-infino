@@ -1,0 +1,303 @@
+---
+"A query string over several text columns ranks as a Lucene twin ranks it":
+  # Stock reads a run of words with no operator between them as one
+  # clause, a dis_max (tie_breaker 0) over the fields of each field's BM25
+  # for the run; a field:word, or a word split off by OR, is a clause of its
+  # own; a hit scores the sum over its clauses. Proxy and default mode rank
+  # the same way across the columns. Every document is under 16 tokens, so
+  # the engine keeps the same lengths as Lucene and the order is the same.
+  # d03 and d07 have no title.
+  - do:
+      indices.create:
+        index: qa_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text }
+              title: { type: text }
+              k: { type: keyword }
+              n: { type: integer }
+  - do:
+      indices.create:
+        index: qa_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text }
+              title: { type: text }
+              k: { type: keyword }
+              n: { type: integer }
+  - do:
+      indices.create:
+        index: qa_default
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text }
+              title: { type: text }
+              k: { type: keyword }
+              n: { type: integer }
+  - do:
+      bulk:
+        refresh: true
+        index: qa_luc
+        body:
+          - index: { _id: "d01" }
+          - {"k": "d01", "n": 1, "message": "monkey", "title": "jackal"}
+          - index: { _id: "d02" }
+          - {"k": "d02", "n": 2, "message": "monkey monkey jackal", "title": "bear owl"}
+          - index: { _id: "d03" }
+          - {"k": "d03", "n": 3, "message": "bear cat dog emu fox"}
+          - index: { _id: "d04" }
+          - {"k": "d04", "n": 4, "message": "monkey jackal bear", "title": "cat"}
+          - index: { _id: "d05" }
+          - {"k": "d05", "n": 5, "message": "jackal jackal jackal owl", "title": "jackal bear bear"}
+          - index: { _id: "d06" }
+          - {"k": "d06", "n": 6, "message": "owl bat", "title": "monkey"}
+          - index: { _id: "d07" }
+          - {"k": "d07", "n": 7, "message": "bear bear owl bat cat dog"}
+          - index: { _id: "d08" }
+          - {"k": "d08", "n": 8, "message": "monkey owl bat cat dog emu fox gnu", "title": "owl bat cat"}
+          - index: { _id: "d09" }
+          - {"k": "d09", "n": 9, "message": "jackal owl", "title": "jackal jackal"}
+          - index: { _id: "d10" }
+          - {"k": "d10", "n": 10, "message": "cat dog", "title": "bear"}
+          - index: { _id: "d11" }
+          - {"k": "d11", "n": 11, "message": "monkey bear owl bat cat dog emu fox gnu hen ant", "title": "emu"}
+          - index: { _id: "d12" }
+          - {"k": "d12", "n": 12, "message": "emu fox", "title": "fox jackal monkey bear"}
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: qa_proxy
+        body:
+          - index: { _id: "d01" }
+          - {"k": "d01", "n": 1, "message": "monkey", "title": "jackal"}
+          - index: { _id: "d02" }
+          - {"k": "d02", "n": 2, "message": "monkey monkey jackal", "title": "bear owl"}
+          - index: { _id: "d03" }
+          - {"k": "d03", "n": 3, "message": "bear cat dog emu fox"}
+          - index: { _id: "d04" }
+          - {"k": "d04", "n": 4, "message": "monkey jackal bear", "title": "cat"}
+          - index: { _id: "d05" }
+          - {"k": "d05", "n": 5, "message": "jackal jackal jackal owl", "title": "jackal bear bear"}
+          - index: { _id: "d06" }
+          - {"k": "d06", "n": 6, "message": "owl bat", "title": "monkey"}
+          - index: { _id: "d07" }
+          - {"k": "d07", "n": 7, "message": "bear bear owl bat cat dog"}
+          - index: { _id: "d08" }
+          - {"k": "d08", "n": 8, "message": "monkey owl bat cat dog emu fox gnu", "title": "owl bat cat"}
+          - index: { _id: "d09" }
+          - {"k": "d09", "n": 9, "message": "jackal owl", "title": "jackal jackal"}
+          - index: { _id: "d10" }
+          - {"k": "d10", "n": 10, "message": "cat dog", "title": "bear"}
+          - index: { _id: "d11" }
+          - {"k": "d11", "n": 11, "message": "monkey bear owl bat cat dog emu fox gnu hen ant", "title": "emu"}
+          - index: { _id: "d12" }
+          - {"k": "d12", "n": 12, "message": "emu fox", "title": "fox jackal monkey bear"}
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: qa_default
+        body:
+          - index: { _id: "d01" }
+          - {"k": "d01", "n": 1, "message": "monkey", "title": "jackal"}
+          - index: { _id: "d02" }
+          - {"k": "d02", "n": 2, "message": "monkey monkey jackal", "title": "bear owl"}
+          - index: { _id: "d03" }
+          - {"k": "d03", "n": 3, "message": "bear cat dog emu fox"}
+          - index: { _id: "d04" }
+          - {"k": "d04", "n": 4, "message": "monkey jackal bear", "title": "cat"}
+          - index: { _id: "d05" }
+          - {"k": "d05", "n": 5, "message": "jackal jackal jackal owl", "title": "jackal bear bear"}
+          - index: { _id: "d06" }
+          - {"k": "d06", "n": 6, "message": "owl bat", "title": "monkey"}
+          - index: { _id: "d07" }
+          - {"k": "d07", "n": 7, "message": "bear bear owl bat cat dog"}
+          - index: { _id: "d08" }
+          - {"k": "d08", "n": 8, "message": "monkey owl bat cat dog emu fox gnu", "title": "owl bat cat"}
+          - index: { _id: "d09" }
+          - {"k": "d09", "n": 9, "message": "jackal owl", "title": "jackal jackal"}
+          - index: { _id: "d10" }
+          - {"k": "d10", "n": 10, "message": "cat dog", "title": "bear"}
+          - index: { _id: "d11" }
+          - {"k": "d11", "n": 11, "message": "monkey bear owl bat cat dog emu fox gnu hen ant", "title": "emu"}
+          - index: { _id: "d12" }
+          - {"k": "d12", "n": 12, "message": "emu fox", "title": "fox jackal monkey bear"}
+  - match: { errors: false }
+
+  # A run of words is one clause: each document's best field for the run.
+  - do:
+      search:
+        index: qa_luc
+        body:
+          size: 5
+          query: { query_string: { query: "monkey jackal bear" } }
+  - match: { hits.total.value: 12 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d12" }
+  - match: { hits.hits.3._id: "d06" }
+  - match: { hits.hits.4._id: "d05" }
+  - do:
+      search:
+        index: qa_proxy
+        body:
+          size: 5
+          query: { query_string: { query: "monkey jackal bear" } }
+  - match: { hits.total.value: 12 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d12" }
+  - match: { hits.hits.3._id: "d06" }
+  - match: { hits.hits.4._id: "d05" }
+  - do:
+      search:
+        index: qa_default
+        body:
+          size: 5
+          query: { query_string: { query: "monkey jackal bear" } }
+  - match: { hits.total.value: 12 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d12" }
+  - match: { hits.hits.3._id: "d06" }
+  - match: { hits.hits.4._id: "d05" }
+
+  # A field's word is a clause of its own, summed with the run after it.
+  - do:
+      search:
+        index: qa_luc
+        body:
+          size: 5
+          query: { query_string: { query: "message: monkey jackal bear" } }
+  - match: { hits.total.value: 11 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d01" }
+  - match: { hits.hits.3._id: "d05" }
+  - match: { hits.hits.4._id: "d09" }
+  - do:
+      search:
+        index: qa_proxy
+        body:
+          size: 5
+          query: { query_string: { query: "message: monkey jackal bear" } }
+  - match: { hits.total.value: 11 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d01" }
+  - match: { hits.hits.3._id: "d05" }
+  - match: { hits.hits.4._id: "d09" }
+  - do:
+      search:
+        index: qa_default
+        body:
+          size: 5
+          query: { query_string: { query: "message: monkey jackal bear" } }
+  - match: { hits.total.value: 11 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d01" }
+  - match: { hits.hits.3._id: "d05" }
+  - match: { hits.hits.4._id: "d09" }
+
+  # Words split by OR are clauses each, summed.
+  - do:
+      search:
+        index: qa_luc
+        body:
+          size: 5
+          query: { query_string: { query: "jackal OR bear", fields: [ message, title ] } }
+  - match: { hits.total.value: 10 }
+  - match: { hits.hits.0._id: "d05" }
+  - match: { hits.hits.1._id: "d04" }
+  - match: { hits.hits.2._id: "d02" }
+  - match: { hits.hits.3._id: "d09" }
+  - match: { hits.hits.4._id: "d07" }
+  - do:
+      search:
+        index: qa_proxy
+        body:
+          size: 5
+          query: { query_string: { query: "jackal OR bear", fields: [ message, title ] } }
+  - match: { hits.total.value: 10 }
+  - match: { hits.hits.0._id: "d05" }
+  - match: { hits.hits.1._id: "d04" }
+  - match: { hits.hits.2._id: "d02" }
+  - match: { hits.hits.3._id: "d09" }
+  - match: { hits.hits.4._id: "d07" }
+  - do:
+      search:
+        index: qa_default
+        body:
+          size: 5
+          query: { query_string: { query: "jackal OR bear", fields: [ message, title ] } }
+  - match: { hits.total.value: 10 }
+  - match: { hits.hits.0._id: "d05" }
+  - match: { hits.hits.1._id: "d04" }
+  - match: { hits.hits.2._id: "d02" }
+  - match: { hits.hits.3._id: "d09" }
+  - match: { hits.hits.4._id: "d07" }
+
+  # A range beside it filters the ranking and adds its constant.
+  - do:
+      search:
+        index: qa_luc
+        body:
+          size: 5
+          query: { bool: { must: [ { range: { n: { gte: 4 } } }, { query_string: { query: "jackal bear", fields: [ message, title ] } } ] } }
+  - match: { hits.total.value: 7 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d05" }
+  - match: { hits.hits.2._id: "d09" }
+  - match: { hits.hits.3._id: "d07" }
+  - match: { hits.hits.4._id: "d12" }
+  - do:
+      search:
+        index: qa_proxy
+        body:
+          size: 5
+          query: { bool: { must: [ { range: { n: { gte: 4 } } }, { query_string: { query: "jackal bear", fields: [ message, title ] } } ] } }
+  - match: { hits.total.value: 7 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d05" }
+  - match: { hits.hits.2._id: "d09" }
+  - match: { hits.hits.3._id: "d07" }
+  - match: { hits.hits.4._id: "d12" }
+  - do:
+      search:
+        index: qa_default
+        body:
+          size: 5
+          query: { bool: { must: [ { range: { n: { gte: 4 } } }, { query_string: { query: "jackal bear", fields: [ message, title ] } } ] } }
+  - match: { hits.total.value: 7 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d05" }
+  - match: { hits.hits.2._id: "d09" }
+  - match: { hits.hits.3._id: "d07" }
+  - match: { hits.hits.4._id: "d12" }
+
+  # Ranked pages score by BM25, not the constant of an unranked read.
+  - do:
+      search:
+        index: qa_default
+        body:
+          size: 1
+          query: { query_string: { query: "monkey jackal bear" } }
+  - gt: { hits.hits.0._score: 1.5 }
+  - lt: { hits.hits.0._score: 1.55 }
+  - do:
+      indices.delete:
+        index: qa_luc
+  - do:
+      indices.delete:
+        index: qa_proxy
+  - do:
+      indices.delete:
+        index: qa_default
