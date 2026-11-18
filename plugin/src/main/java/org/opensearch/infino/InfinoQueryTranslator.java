@@ -149,6 +149,14 @@ final class InfinoQueryTranslator {
     private static final String ID_SUBQUERY = " IN (SELECT ";
     /** How a text clause that is not the FROM source reads the token index: a subquery over its ids. */
     private static final String TEXT_SUBQUERY = OSID + ID_SUBQUERY + OSID + " FROM token_match(";
+    /**
+     * How a text clause of plain terms that is not the FROM source reads the
+     * token index: the engine's row predicate, which the scan answers from
+     * the term dictionary and the postings of a {@code standard} column (as
+     * the bridge declares every text column), so the clause neither collects
+     * every matching id before the outer query starts nor joins on them.
+     */
+    private static final String TEXT_PREDICATE = "text_match(";
     /** Predicate that keeps every row. */
     static final String ALL = "1=1";
     /** Predicate that keeps no row. */
@@ -276,14 +284,26 @@ final class InfinoQueryTranslator {
                 + ")";
         }
 
-        /** The predicate {@code text} is as a clause other than the ranked one: the ids its token match holds. */
+        /**
+         * The predicate {@code text} is as a clause other than the ranked one,
+         * exactly as the translator wrote it into {@link #where} (see
+         * {@link #textPredicate}).
+         */
         String textMatch(TextClause text) {
-            return textSubquery(table, text);
+            return textPredicate(table, text);
         }
     }
 
-    /** The ids a text clause matches, as a subquery over the token index of {@code table}. */
-    private static String textSubquery(String table, TextClause text) {
+    /**
+     * The predicate a text clause other than the ranked one is: the engine's
+     * {@code text_match} on the column for plain words ({@link #plainQuery}),
+     * otherwise the ids its token match holds, as a subquery over the token
+     * index of {@code table}.
+     */
+    private static String textPredicate(String table, TextClause text) {
+        if (plainQuery(text.query())) {
+            return TEXT_PREDICATE + quoteIdent(text.column()) + ", " + literal(text.query()) + ", " + literal(text.mode()) + ")";
+        }
         return TEXT_SUBQUERY + literal(table) + ", " + literal(text.column()) + ", " + literal(text.query()) + ", " + literal(text.mode()) + "))";
     }
 
@@ -839,13 +859,13 @@ final class InfinoQueryTranslator {
 
     /**
      * Whether a predicate holds a subquery by id (a text clause on a column
-     * other than the ranked one, or a field's list values): one the engine
-     * joins above a ranked search, so the rows it removes go after the
-     * ranking. A string literal that happens to hold the same text only
-     * costs that search a wider candidate window.
+     * other than the ranked one, or a field's list values) or a text_match
+     * on such a column: one the engine applies above a ranked search, so the
+     * rows it removes go after the ranking. A string literal that happens to
+     * hold the same text only costs that search a wider candidate window.
      */
     static boolean joinsAfterRanking(String predicate) {
-        return predicate.contains(ID_SUBQUERY);
+        return predicate.contains(ID_SUBQUERY) || predicate.contains(TEXT_PREDICATE);
     }
 
     static String quoteIdent(String name) {
@@ -1665,7 +1685,25 @@ final class InfinoQueryTranslator {
             principal = new TextClause(column, principal.query() + " " + query, mode);
             return ALL;
         }
-        return textSubquery(table, new TextClause(column, query, mode));
+        return textPredicate(table, new TextClause(column, query, mode));
+    }
+
+    /**
+     * Whether {@code query} is plain words, which {@code text_match} takes: no
+     * phrase (a double quote) and no run the engine reads as a required or an
+     * excluded clause (a leading {@code +} or {@code -}). Those keep the
+     * {@code token_match} subquery, which reads them.
+     */
+    static boolean plainQuery(String query) {
+        if (query.indexOf('"') >= 0) {
+            return false;
+        }
+        for (String run : QUERY_WHITESPACE.split(query)) {
+            if (!run.isEmpty() && (run.charAt(0) == '+' || run.charAt(0) == '-')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -1674,7 +1712,9 @@ final class InfinoQueryTranslator {
      * expression.
      */
     static boolean readsTextIndex(String predicate) {
-        return predicate.contains(TEXT_SUBQUERY);
+        // text_match is a predicate the scan answers from the index; inside an
+        // aggregate's expression it would be evaluated row by row instead.
+        return predicate.contains(TEXT_SUBQUERY) || predicate.contains(TEXT_PREDICATE);
     }
 
     /**
@@ -2098,6 +2138,85 @@ final class InfinoQueryTranslator {
         return "(" + String.join(" AND ", and) + ")";
     }
 
+    /**
+     * {@code clauses}, optional clauses of one group, as one text clause
+     * matching any of their words, when each is a single plain word that is
+     * one analyzed token (no phrase, wildcard, fuzziness, proximity or
+     * {@code disk-full}, see {@link #oneToken}) and all reach the same one
+     * text column: a field clause naming it, or a bare word whose default
+     * fields hold that text column and no other field the word could match.
+     * Null otherwise, and the clauses are read one by one.
+     */
+    private String oneColumnAnyWord(List<Node> clauses, List<String> targets, boolean positive) {
+        String column = null;
+        List<String> words = new ArrayList<>();
+        for (Node n : clauses) {
+            if (!(n instanceof Term t) || t.quoted() || t.fuzzy() > 0 || t.slop() > 0) {
+                return null;
+            }
+            String word = plainTerms(t.text());
+            if (!oneToken(word)) {
+                return null;
+            }
+            String reached = t.field() == null ? onlyTextColumn(targets) : onlyTextColumn(List.of(t.field()));
+            if (reached == null || (column != null && !column.equals(reached))) {
+                return null;
+            }
+            column = reached;
+            words.add(word);
+        }
+        return column == null ? null : textClause(column, String.join(" ", words), "or", positive);
+    }
+
+    /**
+     * The longest token both {@code standard} analyzers keep whole: Lucene's
+     * counts UTF-16 units and the engine's code points, and a longer word is
+     * split into pieces. For the ASCII words {@link #oneToken} takes, the two
+     * counts are the same.
+     */
+    static final int MAX_TOKEN_CHARS = 255;
+
+    /**
+     * Whether the engine's {@code standard} analyzer surely reads {@code word}
+     * as one token: ASCII letters and digits only, and no longer than
+     * {@link #MAX_TOKEN_CHARS}. Any other word may be several tokens, which its
+     * own clause requires together and an any-word clause would not:
+     * {@code disk-full} and {@code a*} split at the punctuation, a longer word
+     * into pieces, and the engine's UAX #29 segmenter gives a token per
+     * character to Han, Hiragana and the scripts Lucene reads as one
+     * South-East Asian run ({@code ไทย} is three). An allow-list rather than a
+     * list of the scripts it splits, so a script left off keeps its own clause,
+     * which is always right, only not merged.
+     */
+    static boolean oneToken(String word) {
+        if (word.isEmpty() || word.length() > MAX_TOKEN_CHARS) {
+            return false;
+        }
+        for (int i = 0; i < word.length(); i++) {
+            char c = word.charAt(i);
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The one text column {@code fields} name, when they name exactly one field the table has and it is a text column. */
+    private String onlyTextColumn(List<String> fields) {
+        String only = null;
+        for (String f : fields) {
+            Column c = column(f);
+            if (c == null) {
+                continue;
+            }
+            if (!c.fts() || (only != null && !only.equals(c.name()))) {
+                return null;
+            }
+            only = c.name();
+        }
+        return only;
+    }
+
     /** The predicate of one node of a query string's tree, or null when the table cannot take it; {@code op} reads a bare term's words. */
     private String node(Node n, List<String> targets, boolean positive, String query, Operator op) {
         if (n instanceof All) {
@@ -2107,6 +2226,16 @@ final class InfinoQueryTranslator {
             String engine = engineQuery(b);
             if (engine != null) {
                 return textOnFields(targets, engine, Operator.OR, positive, false, false, true);
+            }
+            // Optional clauses alone that are each one plain word on the same
+            // text column (`message:a b c` over a single text column) are that
+            // column matching any of the words: one text clause, which can be
+            // the query's ranked source, rather than one clause per word.
+            if (b.must().isEmpty() && b.mustNot().isEmpty()) {
+                String one = oneColumnAnyWord(b.should(), targets, positive);
+                if (one != null) {
+                    return one;
+                }
             }
             // Lucene's clause list: the required clauses match on their own, the
             // optional ones only when nothing is required, the prohibited never.

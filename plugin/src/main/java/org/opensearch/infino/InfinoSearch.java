@@ -700,11 +700,12 @@ public final class InfinoSearch {
 
     /**
      * The total: what the query and post_filter keep, before any collapse
-     * and regardless of where the page starts.
+     * and regardless of where the page starts, counted up to {@code cap}
+     * (see {@link #count(String, Translation, long)}).
      */
-    private static long total(Plan plan) {
+    private static long total(Plan plan, long cap) {
         Translation q = plan.query();
-        return plan.postWhere() == null ? count(plan.table(), q) : count(plan.table(), q.withWhere(plan.hitWhere()));
+        return plan.postWhere() == null ? count(plan.table(), q, cap) : count(plan.table(), q.withWhere(plan.hitWhere()), cap);
     }
 
     /** A page's rows, and its exact total when it was counted before them (null otherwise). */
@@ -804,17 +805,20 @@ public final class InfinoSearch {
      * is then 0 until replaced).
      */
     static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count) {
-        return page(index, plan, source, count, false);
+        return page(index, plan, source, count, false, false);
     }
 
     /**
-     * As {@link #page(Index, Plan, SearchSourceBuilder, boolean)}, and with
-     * {@code resumed} when a later page resumes after this page's last hit
-     * from its sort values (a scroll's): those must then carry the row id
+     * As {@link #page(Index, Plan, SearchSourceBuilder, boolean)}. With
+     * {@code capTotal} the total is counted only as far as the request's
+     * {@code track_total_hits} limit needs (see {@link #countCap}), which a
+     * scroll, whose later rounds carry the first round's total, does not ask
+     * for. With {@code resumed} a later page resumes after this page's last
+     * hit from its sort values (a scroll's): those must then carry the row id
      * the sort is broken by, so the page is read in its sort's order even
      * when that sort orders nothing ({@link #sortsNothing}).
      */
-    static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count, boolean resumed) {
+    static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count, boolean capTotal, boolean resumed) {
         final int from = Math.max(0, source.from());
         final int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
         final int fetch = from + size;
@@ -831,6 +835,8 @@ public final class InfinoSearch {
         // vector entry points return ids and scores only.
         Map<String, Long> vectorSeqs = Map.of();
         boolean exact = trackTotal(source);
+        // Every count of this page's total stops where track_total_hits needs it to (see countCap).
+        long cap = capTotal ? countCap(source) : Long.MAX_VALUE;
         // A scored page counts its exact total before its rows (see countsFirst):
         // a total of 0 plans no page at all.
         boolean firstCount = plan.vector() == null
@@ -841,7 +847,7 @@ public final class InfinoSearch {
         // and the page are separate engine calls, neither waiting on the other:
         // the total is counted on another thread while the page is read.
         CompletableFuture<Long> beside = countsBeside(plan, exact, count, size, firstCount)
-            ? InfinoServices.beside(() -> total(plan))
+            ? InfinoServices.beside(() -> total(plan, cap))
             : null;
         // The exact total, when it is read before the page.
         Long counted = null;
@@ -886,7 +892,7 @@ public final class InfinoSearch {
             } else {
                 CountedRows read = countedRows(
                     firstCount,
-                    () -> total(plan),
+                    () -> total(plan, cap),
                     () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed)
                 );
                 rows = read.rows();
@@ -912,7 +918,7 @@ public final class InfinoSearch {
         } else if (exact && shortPage) {
             total = rows.size();
         } else if (exact) {
-            total = total(plan);
+            total = total(plan, cap);
         } else {
             total = rows.size();
         }
@@ -1747,6 +1753,40 @@ public final class InfinoSearch {
 
     /** The exact number of rows the request matches. */
     static long count(String table, Translation q) {
+        return count(table, q, Long.MAX_VALUE);
+    }
+
+    /**
+     * How far a total needs counting for the request's {@code track_total_hits}:
+     * one past its limit (the stock default when it names none), since
+     * {@link #reported} turns any count past the limit into the limit, as a
+     * lower bound. A default-mode shard's total reaches its coordinator the
+     * same way: one past the limit stays past it when shards' totals add up.
+     * Unlimited when the request tracks every hit or none.
+     */
+    static long countCap(SearchSourceBuilder source) {
+        Integer upTo = source.trackTotalHitsUpTo();
+        int limit = upTo == null ? SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO : upTo;
+        if (limit == SearchContext.TRACK_TOTAL_HITS_DISABLED || limit == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
+            return Long.MAX_VALUE;
+        }
+        return (long) limit + 1;
+    }
+
+    /**
+     * The number of rows the request matches, or {@code cap} when it matches at
+     * least that many. A predicate that reads the token index is counted under
+     * a LIMIT, so the scan stops at the cap instead of matching every row; any
+     * other keeps the engine's count, which a range answers from its index.
+     */
+    static long count(String table, Translation q, long cap) {
+        if (cap != Long.MAX_VALUE && q.principal() == null && InfinoQueryTranslator.readsTextIndex(q.where())) {
+            List<Map<String, Object>> rows = InfinoNative.sqlRows(
+                "SELECT COUNT(*) AS c FROM (SELECT 1 AS one FROM " + q.from() + " WHERE " + q.where() + " LIMIT " + cap + ") capped"
+            );
+            Object c = rows.isEmpty() ? null : rows.get(0).get("c");
+            return c instanceof Number n ? n.longValue() : 0;
+        }
         if (q.principal() != null && InfinoQueryTranslator.ALL.equals(q.where())) {
             // A bare text query: the engine counts its matches without materializing them.
             return InfinoNative.count(table, q.principal().column(), q.principal().query(), q.principal().mode());
@@ -1872,8 +1912,11 @@ public final class InfinoSearch {
             // reads its total beside the aggregations rather than in a count of its own.
             boolean sharedTotal = !builders.isEmpty() && plan.vector() == null && plan.postWhere() == null && trackTotal(perIndex);
             boolean countWithAggs = sharedTotal && perIndex.size() == 0;
-            // A scroll's next page resumes from this one's last hits (the cursor below).
-            Page page = page(index, plan, perIndex, !countWithAggs, after != null);
+            // A total the aggregations take as their population is counted in
+            // full: a capped one would undercount it (top_hits' total, a
+            // significant_terms subset size). A scroll's next page resumes
+            // from this one's last hits (the cursor below).
+            Page page = page(index, plan, perIndex, !countWithAggs, scrollId == null && !sharedTotal, after != null);
             if (!builders.isEmpty()) {
                 InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(index).evaluate(
                     builders,

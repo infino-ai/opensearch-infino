@@ -1,0 +1,227 @@
+---
+"Optional words on one text column rank as a Lucene twin ranks them":
+  # message: monkey jackal bear over a single text column is one ranked
+  # any-word clause. The engine scores it with Lucene's BM25 (k1 1.2, b 0.75,
+  # the same idf and average length), and both keep a document's length in
+  # one byte. The encodings differ past 15 tokens: Lucene keeps lengths
+  # below 24 exact and rounds the rest after subtracting 24, the engine
+  # keeps lengths below 16 exact and rounds the rest as they are (21 reads
+  # as 20). So documents under 16 tokens score and rank the same, and a
+  # longer one (d13, 21 tokens) may score slightly higher than stock's.
+  - do:
+      indices.create:
+        index: rw_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: rw_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: rw_default
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text }
+              k: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: rw_luc
+        body:
+          - index: { _id: "d01" }
+          - { k: "d01", message: "monkey" }
+          - index: { _id: "d02" }
+          - { k: "d02", message: "monkey monkey jackal" }
+          - index: { _id: "d03" }
+          - { k: "d03", message: "bear cat dog emu fox" }
+          - index: { _id: "d04" }
+          - { k: "d04", message: "monkey jackal bear" }
+          - index: { _id: "d05" }
+          - { k: "d05", message: "jackal jackal jackal owl" }
+          - index: { _id: "d06" }
+          - { k: "d06", message: "owl bat" }
+          - index: { _id: "d07" }
+          - { k: "d07", message: "bear bear owl bat cat dog" }
+          - index: { _id: "d08" }
+          - { k: "d08", message: "monkey owl bat cat dog emu fox gnu" }
+          - index: { _id: "d09" }
+          - { k: "d09", message: "jackal owl" }
+          - index: { _id: "d10" }
+          - { k: "d10", message: "cat dog" }
+          - index: { _id: "d11" }
+          - { k: "d11", message: "monkey bear owl bat cat dog emu fox gnu hen ant" }
+          - index: { _id: "d12" }
+          - { k: "d12", message: "emu fox" }
+          - index: { _id: "d13" }
+          - { k: "d13", message: "bear owl bat cat dog emu fox gnu hen ant yak owl bat cat dog emu fox gnu hen ant yak" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: rw_proxy
+        body:
+          - index: { _id: "d01" }
+          - { k: "d01", message: "monkey" }
+          - index: { _id: "d02" }
+          - { k: "d02", message: "monkey monkey jackal" }
+          - index: { _id: "d03" }
+          - { k: "d03", message: "bear cat dog emu fox" }
+          - index: { _id: "d04" }
+          - { k: "d04", message: "monkey jackal bear" }
+          - index: { _id: "d05" }
+          - { k: "d05", message: "jackal jackal jackal owl" }
+          - index: { _id: "d06" }
+          - { k: "d06", message: "owl bat" }
+          - index: { _id: "d07" }
+          - { k: "d07", message: "bear bear owl bat cat dog" }
+          - index: { _id: "d08" }
+          - { k: "d08", message: "monkey owl bat cat dog emu fox gnu" }
+          - index: { _id: "d09" }
+          - { k: "d09", message: "jackal owl" }
+          - index: { _id: "d10" }
+          - { k: "d10", message: "cat dog" }
+          - index: { _id: "d11" }
+          - { k: "d11", message: "monkey bear owl bat cat dog emu fox gnu hen ant" }
+          - index: { _id: "d12" }
+          - { k: "d12", message: "emu fox" }
+          - index: { _id: "d13" }
+          - { k: "d13", message: "bear owl bat cat dog emu fox gnu hen ant yak owl bat cat dog emu fox gnu hen ant yak" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: rw_default
+        body:
+          - index: { _id: "d01" }
+          - { k: "d01", message: "monkey" }
+          - index: { _id: "d02" }
+          - { k: "d02", message: "monkey monkey jackal" }
+          - index: { _id: "d03" }
+          - { k: "d03", message: "bear cat dog emu fox" }
+          - index: { _id: "d04" }
+          - { k: "d04", message: "monkey jackal bear" }
+          - index: { _id: "d05" }
+          - { k: "d05", message: "jackal jackal jackal owl" }
+          - index: { _id: "d06" }
+          - { k: "d06", message: "owl bat" }
+          - index: { _id: "d07" }
+          - { k: "d07", message: "bear bear owl bat cat dog" }
+          - index: { _id: "d08" }
+          - { k: "d08", message: "monkey owl bat cat dog emu fox gnu" }
+          - index: { _id: "d09" }
+          - { k: "d09", message: "jackal owl" }
+          - index: { _id: "d10" }
+          - { k: "d10", message: "cat dog" }
+          - index: { _id: "d11" }
+          - { k: "d11", message: "monkey bear owl bat cat dog emu fox gnu hen ant" }
+          - index: { _id: "d12" }
+          - { k: "d12", message: "emu fox" }
+          - index: { _id: "d13" }
+          - { k: "d13", message: "bear owl bat cat dog emu fox gnu hen ant yak owl bat cat dog emu fox gnu hen ant yak" }
+  - match: { errors: false }
+
+  # The best five are all under 16 tokens: the same hits in the same order.
+  - do:
+      search:
+        index: rw_luc
+        body:
+          size: 5
+          query: { query_string: { query: "monkey jackal bear", default_field: message } }
+  - match: { hits.total.value: 10 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d05" }
+  - match: { hits.hits.3._id: "d09" }
+  - match: { hits.hits.4._id: "d01" }
+  - do:
+      search:
+        index: rw_proxy
+        body:
+          size: 5
+          query: { query_string: { query: "monkey jackal bear", default_field: message } }
+  - match: { hits.total.value: 10 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d05" }
+  - match: { hits.hits.3._id: "d09" }
+  - match: { hits.hits.4._id: "d01" }
+  - do:
+      search:
+        index: rw_default
+        body:
+          size: 5
+          query: { query_string: { query: "monkey jackal bear", default_field: message } }
+  - match: { hits.total.value: 10 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d05" }
+  - match: { hits.hits.3._id: "d09" }
+  - match: { hits.hits.4._id: "d01" }
+
+  # Every match, d13 among them, in key order: the same hits whatever the scores.
+  - do:
+      search:
+        index: rw_luc
+        body:
+          size: 20
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "message:bear message:owl" } }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 9 }
+  - match: { hits.hits.0._id: "d03" }
+  - match: { hits.hits.1._id: "d04" }
+  - match: { hits.hits.2._id: "d05" }
+  - match: { hits.hits.3._id: "d06" }
+  - match: { hits.hits.4._id: "d07" }
+  - match: { hits.hits.5._id: "d08" }
+  - match: { hits.hits.6._id: "d09" }
+  - match: { hits.hits.7._id: "d11" }
+  - match: { hits.hits.8._id: "d13" }
+  - do:
+      search:
+        index: rw_proxy
+        body:
+          size: 20
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "message:bear message:owl" } }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 9 }
+  - match: { hits.hits.0._id: "d03" }
+  - match: { hits.hits.1._id: "d04" }
+  - match: { hits.hits.2._id: "d05" }
+  - match: { hits.hits.3._id: "d06" }
+  - match: { hits.hits.4._id: "d07" }
+  - match: { hits.hits.5._id: "d08" }
+  - match: { hits.hits.6._id: "d09" }
+  - match: { hits.hits.7._id: "d11" }
+  - match: { hits.hits.8._id: "d13" }
+  - do:
+      search:
+        index: rw_default
+        body:
+          size: 20
+          sort: [ { k: asc } ]
+          query: { query_string: { query: "message:bear message:owl" } }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 9 }
+  - match: { hits.hits.0._id: "d03" }
+  - match: { hits.hits.1._id: "d04" }
+  - match: { hits.hits.2._id: "d05" }
+  - match: { hits.hits.3._id: "d06" }
+  - match: { hits.hits.4._id: "d07" }
+  - match: { hits.hits.5._id: "d08" }
+  - match: { hits.hits.6._id: "d09" }
+  - match: { hits.hits.7._id: "d11" }
+  - match: { hits.hits.8._id: "d13" }
