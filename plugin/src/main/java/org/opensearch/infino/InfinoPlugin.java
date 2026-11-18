@@ -24,6 +24,7 @@ import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.common.unit.ByteSizeValue;
+import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.env.Environment;
 import org.opensearch.http.HttpTransportSettings;
@@ -42,15 +43,12 @@ import org.opensearch.rest.RestHandler;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.fetch.FetchSubPhase;
 import org.opensearch.search.query.QueryPhaseSearcher;
-import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.nio.file.Files;
 import java.util.Collection;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 /**
@@ -251,7 +249,9 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     static final String SECURITY_INDEX_SETTING = "plugins.security.config_index_name";
 
     private static final InfinoTables TABLES = new InfinoTables();
-    private final Map<ShardId, Scheduler.Cancellable> optimizers = new ConcurrentHashMap<>();
+    private final InfinoOptimizer optimizer = new InfinoOptimizer(
+        (run, interval) -> InfinoServices.threadPool().scheduleWithFixedDelay(run, interval, ThreadPool.Names.GENERIC)
+    );
     private final boolean defaultEnabled;
     private final boolean defaultModeEnabled;
     private final InfinoAccount account;
@@ -438,6 +438,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         if (!indexModule.getSettings().getAsBoolean(INFINO_ENABLED.getKey(), false)) {
             return;
         }
+        Index index = indexModule.getIndex();
+        indexModule.addSettingsUpdateConsumer(OPTIMIZE_INTERVAL, interval -> optimizer.intervalChanged(index, interval));
         indexModule.addIndexEventListener(new IndexEventListener() {
             // Which copy of a shard this node holds, for the engine (see InfinoEngine#writesTable).
             @Override
@@ -477,10 +479,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
 
             @Override
             public void beforeIndexShardClosed(ShardId shardId, IndexShard indexShard, Settings indexSettings) {
-                Scheduler.Cancellable task = optimizers.remove(shardId);
-                if (task != null) {
-                    task.cancel();
-                }
+                optimizer.stop(shardId);
             }
 
             @Override
@@ -522,8 +521,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     }
 
     private void scheduleOptimize(IndexShard shard, String table) {
-        ThreadPool threadPool = InfinoServices.threadPool();
-        if (threadPool == null) {
+        if (InfinoServices.threadPool() == null) {
             return;
         }
         // A hosted table is compacted by the service's own optimizer; the node has no say.
@@ -532,8 +530,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         }
         TimeValue interval = shard.indexSettings().getValue(OPTIMIZE_INTERVAL);
         Settings indexSettings = shard.indexSettings().getSettings();
-        ShardId shardId = shard.shardId();
-        Scheduler.Cancellable task = threadPool.scheduleWithFixedDelay(() -> {
+        optimizer.start(shard.shardId(), () -> {
             try {
                 long start = System.nanoTime();
                 int rc = InfinoNative.optimize(table, indexSettings);
@@ -546,11 +543,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             } catch (Throwable t) {
                 log.warn("[infino] scheduled optimize of {} failed", table, t);
             }
-        }, interval, ThreadPool.Names.GENERIC);
-        Scheduler.Cancellable previous = optimizers.put(shardId, task);
-        if (previous != null) {
-            previous.cancel();
-        }
+        }, interval);
     }
 
     /**
