@@ -4,6 +4,7 @@
 
 package org.opensearch.infino;
 
+import com.sun.jna.Library;
 import com.sun.jna.Native;
 import com.sun.jna.Pointer;
 
@@ -299,7 +300,10 @@ public final class InfinoNative {
             synchronized (InfinoNative.class) {
                 loaded = lib;
                 if (loaded == null) {
-                    loaded = Native.load(LIB, InfinoLib.class);
+                    // Strings go to the engine as UTF-8 whatever the node's locale: JNA's
+                    // default is the platform encoding, which under LANG=C turns every
+                    // non-ASCII character of a statement into '?'.
+                    loaded = Native.load(LIB, InfinoLib.class, Map.of(Library.OPTION_STRING_ENCODING, StandardCharsets.UTF_8.name()));
                     lib = loaded;
                 }
             }
