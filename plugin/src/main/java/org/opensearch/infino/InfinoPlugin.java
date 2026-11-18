@@ -229,6 +229,20 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     public static final Setting<String> CACHE_DIR = Setting.simpleString("infino.cache.dir", Setting.Property.NodeScope);
 
     /**
+     * How long a read on the hosted service may be answered from a snapshot
+     * taken before a write. A refresh waits this long after the last write it
+     * covers before it returns, so the search after it sees the writes, as
+     * {@code refresh=true} and {@code wait_for} promise. Zero waits for
+     * nothing. The node's own storage reads every write at once and never waits.
+     */
+    public static final Setting<TimeValue> PLATFORM_READ_WINDOW = Setting.timeSetting(
+        "infino.platform.read_window",
+        TimeValue.timeValueSeconds(1),
+        TimeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * The most a SQL result may hold, as the JSON the route answers with (see
      * {@link InfinoSql}). The engine's memory budget bounds a statement while
      * it runs, not the answer handed to the node: a statement whose result
@@ -272,6 +286,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         InfinoNative.cacheDir(cacheDir(settings));
         InfinoRequestCache.configure(settings);
         InfinoSql.configure(settings);
+        InfinoNative.readWindow(PLATFORM_READ_WINDOW.get(settings));
         String url = PLATFORM_URL.get(settings);
         if (url.isEmpty()) {
             return;
@@ -610,6 +625,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             PLATFORM_API_KEY,
             PLATFORM_DEFAULT_URL,
             CACHE_DIR,
+            PLATFORM_READ_WINDOW,
             SQL_MAX_RESULT_SIZE
         );
     }
