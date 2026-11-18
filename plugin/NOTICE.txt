@@ -1,2 +1,8 @@
-OpenSearch (https://opensearch.org/)
-Copyright OpenSearch Contributors
+Infino for OpenSearch
+Copyright 2026 Infino AI Inc.
+
+This product includes software developed by OpenSearch Contributors
+(https://opensearch.org/), licensed under the Apache License, Version 2.0:
+the test suites use the OpenSearch security plugin's demo certificates
+(plugin/src/yamlRestTest/resources/security/certs/) and its demo admin
+password hash.
