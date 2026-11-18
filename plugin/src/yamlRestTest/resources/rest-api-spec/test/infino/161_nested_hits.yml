@@ -1,0 +1,119 @@
+---
+"A top-level hit of a document with nested entries carries no _nested, as on a Lucene twin":
+  # Stock sets _nested only on an inner hit: a top-level hit names the root
+  # document, whatever query found it and however many entries it holds.
+  # The same mapping and documents go to an Infino-backed index and to a
+  # Lucene twin. c1 holds one entry, c2 three, c3 none.
+  - do:
+      indices.create:
+        index: nh_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              t: { type: text }
+              rank: { type: long }
+              items:
+                type: nested
+                properties:
+                  sku: { type: keyword }
+                  color: { type: keyword }
+  - do:
+      indices.create:
+        index: nh_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              t: { type: text }
+              rank: { type: long }
+              items:
+                type: nested
+                properties:
+                  sku: { type: keyword }
+                  color: { type: keyword }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: nh_inf
+        body:
+          - index: { _id: "c1" }
+          - { t: "red coat", rank: 1, items: [ { sku: a, color: red } ] }
+          - index: { _id: "c2" }
+          - { t: "blue coat", rank: 2, items: [ { sku: b, color: blue }, { sku: c, color: red }, { sku: d, color: green } ] }
+          - index: { _id: "c3" }
+          - { t: "plain coat", rank: 3 }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: nh_luc
+        body:
+          - index: { _id: "c1" }
+          - { t: "red coat", rank: 1, items: [ { sku: a, color: red } ] }
+          - index: { _id: "c2" }
+          - { t: "blue coat", rank: 2, items: [ { sku: b, color: blue }, { sku: c, color: red }, { sku: d, color: green } ] }
+          - index: { _id: "c3" }
+          - { t: "plain coat", rank: 3 }
+  - match: { errors: false }
+
+  # A text query and nothing else.
+  - do: { search: { index: nh_luc, body: { query: { match: { t: red } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: c1 }
+  - is_false: hits.hits.0._nested
+  - match: { hits.hits.0._source.items.0.sku: a }
+  - do: { search: { index: nh_inf, body: { query: { match: { t: red } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: c1 }
+  - is_false: hits.hits.0._nested
+  - match: { hits.hits.0._source.items.0.sku: a }
+
+  # A text query over every document, sorted: one hit per document, none of them an entry.
+  - do: { search: { index: nh_luc, body: { sort: [ { rank: asc } ], query: { match: { t: coat } } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: c1 }
+  - match: { hits.hits.1._id: c2 }
+  - match: { hits.hits.2._id: c3 }
+  - is_false: hits.hits.0._nested
+  - is_false: hits.hits.1._nested
+  - is_false: hits.hits.2._nested
+  - do: { search: { index: nh_inf, body: { sort: [ { rank: asc } ], query: { match: { t: coat } } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: c1 }
+  - match: { hits.hits.1._id: c2 }
+  - match: { hits.hits.2._id: c3 }
+  - is_false: hits.hits.0._nested
+  - is_false: hits.hits.1._nested
+  - is_false: hits.hits.2._nested
+  - match: { hits.hits.1._source.items.2.sku: d }
+
+  # Every document.
+  - do: { search: { index: nh_luc, body: { sort: [ { rank: asc } ], query: { match_all: {} } } } }
+  - match: { hits.total.value: 3 }
+  - is_false: hits.hits.0._nested
+  - is_false: hits.hits.1._nested
+  - is_false: hits.hits.2._nested
+  - do: { search: { index: nh_inf, body: { sort: [ { rank: asc } ], query: { match_all: {} } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: c1 }
+  - match: { hits.hits.1._id: c2 }
+  - match: { hits.hits.2._id: c3 }
+  - is_false: hits.hits.0._nested
+  - is_false: hits.hits.1._nested
+  - is_false: hits.hits.2._nested
+
+  # A nested query: its hits are still the root documents.
+  - do: { search: { index: nh_luc, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { term: { items.color: red } } } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: c1 }
+  - match: { hits.hits.1._id: c2 }
+  - is_false: hits.hits.0._nested
+  - is_false: hits.hits.1._nested
+  - do: { search: { index: nh_inf, body: { sort: [ { rank: asc } ], query: { nested: { path: items, query: { term: { items.color: red } } } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: c1 }
+  - match: { hits.hits.1._id: c2 }
+  - is_false: hits.hits.0._nested
+  - is_false: hits.hits.1._nested

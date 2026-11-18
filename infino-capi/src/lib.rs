@@ -46,6 +46,7 @@ use std::time::Duration;
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::common::tree_node::TreeNode;
 use datafusion::common::DFSchema;
+use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::prelude::{col, lit, Expr, SessionContext};
 use infino::arrow_array::{
     new_null_array, Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int64Array,
@@ -2681,6 +2682,61 @@ pub unsafe extern "C" fn infino_get(
     .unwrap_or(ptr::null_mut())
 }
 
+/// Most lookups [`infino_get_many`] runs at once.
+const GET_MANY_THREADS: usize = 16;
+
+/// The raw `_source` JSON of several osids, as one JSON object from each id
+/// the table holds to its source; an id it does not hold is absent.
+///
+/// Each id is looked up as [`infino_get`] looks it up, through the id
+/// column's index. A page of a sorted search reads its sources this way once
+/// its ids are chosen, and the lookups ran one call after another; here they
+/// run side by side, at most [`GET_MANY_THREADS`] at once, so a page costs
+/// about what its slowest lookup does.
+#[no_mangle]
+pub unsafe extern "C" fn infino_get_many(
+    h: *mut Bridge,
+    name: *const c_char,
+    osids: *const *const c_char,
+    count: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
+            return ptr::null_mut();
+        };
+        let ids: Vec<&str> = if osids.is_null() || count <= 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(osids, count as usize) }
+                .iter()
+                .filter_map(|p| unsafe { cstr(*p) })
+                .collect()
+        };
+        let mut found = serde_json::Map::new();
+        for chunk in ids.chunks(GET_MANY_THREADS) {
+            let sources: Vec<Option<String>> = std::thread::scope(|scope| {
+                let lookups: Vec<_> = chunk
+                    .iter()
+                    .map(|id| {
+                        scope.spawn(move || get_row(conn, name, id).map(|(source, _)| source))
+                    })
+                    .collect();
+                lookups
+                    .into_iter()
+                    .map(|lookup| lookup.join().ok().flatten())
+                    .collect()
+            });
+            for (id, source) in chunk.iter().zip(sources) {
+                if let Some(source) = source.filter(|s| !s.is_empty()) {
+                    found.insert((*id).to_owned(), Value::String(source));
+                }
+            }
+        }
+        out_json(Value::Object(found))
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// One osid's document as `{"source": .., "seq": n}`, its sequence number
 /// what a conditional write on it is checked against; "" if absent.
 #[no_mangle]
@@ -3091,9 +3147,17 @@ pub unsafe extern "C" fn infino_count_where(
         // this table's columns alone, and the parser plans its subquery
         // against its own context, not the table's: such counts run as one
         // statement.
+        // Each predicate as a statement would read it: coerced to the
+        // columns' types, so a date compared with a string literal is a
+        // comparison with a timestamp, which the table counts from its range
+        // index rather than by reading every row.
         let Ok(exprs) = predicates
             .iter()
-            .map(|p| predicate_parser().parse_sql_expr(p, &schema))
+            .map(|p| {
+                let expr = predicate_parser().parse_sql_expr(p, &schema)?;
+                expr.rewrite(&mut TypeCoercionRewriter::new(&schema))
+                    .map(|t| t.data)
+            })
             .collect::<Result<Vec<_>, _>>()
         else {
             return count_where_by_sql(&conn.conn, name, &predicates);
@@ -3509,6 +3573,15 @@ mod tests {
         take(unsafe { infino_get(h, c("logs").as_ptr(), c(osid).as_ptr()) })
     }
 
+    fn get_many(h: *mut Bridge, osids: &[&str]) -> Value {
+        let ids: Vec<CString> = osids.iter().map(|x| c(x)).collect();
+        let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+        let out = take(unsafe {
+            infino_get_many(h, c("logs").as_ptr(), idp.as_ptr(), osids.len() as c_int)
+        });
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
     fn delete(h: *mut Bridge, osids: &[&str]) -> c_int {
         let ids: Vec<CString> = osids.iter().map(|x| c(x)).collect();
         let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
@@ -3716,20 +3789,33 @@ mod tests {
         index(
             h,
             &[
-                ("a", r#"{"status":200,"took":1.5,"level":"info"}"#),
-                ("b", r#"{"status":404,"took":30.0,"level":"warn"}"#),
-                ("c", r#"{"status":500,"took":2.5,"level":"error"}"#),
+                (
+                    "a",
+                    r#"{"@timestamp":"2026-10-24T10:00:00Z","status":200,"took":1.5,"level":"info"}"#,
+                ),
+                (
+                    "b",
+                    r#"{"@timestamp":"2026-10-24T10:01:00Z","status":404,"took":30.0,"level":"warn"}"#,
+                ),
+                (
+                    "c",
+                    r#"{"@timestamp":"2026-10-24T10:02:00Z","status":500,"took":2.5,"level":"error"}"#,
+                ),
                 ("d", r#"{"message":"no status"}"#),
             ],
         );
-        // Every row, ranges the index counts, and two shapes it leaves to the
-        // aggregate: a keyword column and an OR.
+        // Every row, ranges the index counts, two shapes it leaves to the
+        // aggregate (a keyword column and an OR), and a date compared with a
+        // string literal, which the count coerces to a timestamp as a
+        // statement does.
         let predicates = [
             "1=1",
             r#"(1=1 AND ("status" >= 400))"#,
             r#"("took") < 10"#,
             r#""level" = 'info'"#,
             r#""status" < 300 OR "took" > 20"#,
+            r#""@timestamp" >= '2026-10-24T10:01:00Z'"#,
+            r#"("@timestamp" >= '2026-10-24T10:00:00Z' AND "@timestamp" < '2026-10-24T10:02:00Z')"#,
         ];
         let filtered: Vec<String> = predicates
             .iter()
@@ -3749,7 +3835,7 @@ mod tests {
         });
         let counts: Vec<u64> = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
         assert_eq!(counts, expected);
-        assert_eq!(counts, [4, 2, 2, 1, 2]);
+        assert_eq!(counts, [4, 2, 2, 1, 2, 2, 2]);
         // A text clause joined by id, which reads the token index through a
         // subquery, beside the whole table.
         let joined = [
@@ -3912,6 +3998,13 @@ mod tests {
         // Fetch returns the document as sent.
         let src = get(h, "a");
         assert!(src.contains("\"tags\":[\"x\",\"y\"]"), "{src}");
+        // Several at once: each id the table holds, as one get returns it;
+        // an id it does not hold, absent.
+        let many = get_many(h, &["a", "b", "no-such-id"]);
+        assert_eq!(many["a"].as_str(), Some(src.as_str()), "{many}");
+        assert_eq!(many["b"].as_str(), Some(get(h, "b").as_str()), "{many}");
+        assert_eq!(many.as_object().map(|o| o.len()), Some(2), "{many}");
+        assert_eq!(get_many(h, &[]), json!({}));
         close(h);
     }
 
