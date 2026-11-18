@@ -689,7 +689,7 @@ final class InfinoQueryTranslator {
     static Long dateMathMillis(String text, String format, boolean roundUp, ZoneId zone, long nowMillis) {
         DateMathParser parser = DateFormatter.forPattern(format == null ? DEFAULT_DATE_FORMAT : format).toDateMathParser();
         try {
-            return parser.parse(text, () -> nowMillis, roundUp, zone).toEpochMilli();
+            return parser.parse(text, InfinoClock.of(nowMillis), roundUp, zone).toEpochMilli();
         } catch (RuntimeException e) {
             return null;
         }
@@ -2578,7 +2578,7 @@ final class InfinoQueryTranslator {
         } else {
             DateMathParser parser = DateFormatter.forPattern(format == null ? DEFAULT_DATE_FORMAT : format).toDateMathParser();
             try {
-                at = parser.parse(value.toString(), () -> nowMillis, roundUp, zone);
+                at = parser.parse(value.toString(), InfinoClock.of(nowMillis), roundUp, zone);
             } catch (RuntimeException e) {
                 return null;
             }

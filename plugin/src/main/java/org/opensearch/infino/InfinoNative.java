@@ -342,11 +342,15 @@ public final class InfinoNative {
             } else {
                 log.info("[infino] tables are served from {}", target.name());
             }
+            boolean switched = conn != null;
             COLUMNS.clear();
             SOURCES.invalidateAll();
             InfinoRequestCache.changedAll();
             conn = p;
             opened = target;
+            if (switched) {
+                InfinoRequestCache.clearShardCaches();
+            }
         }
     }
 

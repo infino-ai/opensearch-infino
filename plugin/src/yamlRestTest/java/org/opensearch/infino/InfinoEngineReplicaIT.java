@@ -90,6 +90,50 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
     }
 
     /**
+     * Only the primary keeps a search in the shard request cache: a
+     * replica reads a table another node writes, which it may see late
+     * while its reader stays the same, so it answers without keeping.
+     */
+    public void testOnlyThePrimaryFillsTheShardRequestCache() throws Exception {
+        String index = "eng_rep_cache";
+        createIndex(index, 1, "");
+        assertGreen(index);
+        write(index, 0, DOCS);
+        call("POST", "/" + index + "/_refresh", null);
+        for (String preference : new String[] { "_primary", "_replica" }) {
+            for (int i = 0; i < 3; i++) {
+                assertEquals(preference, DOCS, total(index, preference));
+            }
+        }
+        assertEquals("the primary: one miss, two hits", List.of(1, 2), requestCache(index, true));
+        assertEquals("the replica: never kept", List.of(0, 0), requestCache(index, false));
+        call("DELETE", "/" + index, null);
+    }
+
+    /** A {@code size: 0} search's total, on the copy {@code preference} names. */
+    @SuppressWarnings("unchecked")
+    private int total(String index, String preference) throws IOException {
+        Map<String, Object> hits = (Map<String, Object>) call("POST", "/" + index + "/_search?preference=" + preference, "{\"size\":0}")
+            .get("hits");
+        return ((Number) ((Map<String, Object>) hits.get("total")).get("value")).intValue();
+    }
+
+    /** The shard request cache's misses and hits on the primary copy of shard 0, or on its replica. */
+    @SuppressWarnings("unchecked")
+    private List<Integer> requestCache(String index, boolean primary) throws IOException {
+        Map<String, Object> indices = (Map<String, Object>) call("GET", "/" + index + "/_stats/request_cache?level=shards", null).get("indices");
+        Map<String, Object> shards = (Map<String, Object>) ((Map<String, Object>) indices.get(index)).get("shards");
+        for (Object c : (List<?>) shards.get("0")) {
+            Map<String, Object> copy = (Map<String, Object>) c;
+            if (primary == (Boolean) ((Map<String, Object>) copy.get("routing")).get("primary")) {
+                Map<String, Object> cache = (Map<String, Object>) copy.get("request_cache");
+                return List.of(((Number) cache.get("miss_count")).intValue(), ((Number) cache.get("hit_count")).intValue());
+            }
+        }
+        throw new AssertionError("no " + (primary ? "primary" : "replica") + " copy of " + index);
+    }
+
+    /**
      * The table holds the shard's history from the first write it lacks: a
      * retention lease, moved forward as commits land, which the replica is
      * given too, so a promoted copy keeps every write it has to put in the
