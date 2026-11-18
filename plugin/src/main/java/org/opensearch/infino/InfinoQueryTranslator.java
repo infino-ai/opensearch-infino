@@ -193,6 +193,16 @@ final class InfinoQueryTranslator {
     }
 
     /**
+     * A query string's BM25 over several text columns, as stock scores it:
+     * each of {@code clauses} scores the best of its columns' BM25 (a
+     * {@code dis_max} with tie_breaker 0, one {@link TextClause} per column),
+     * and a hit scores the sum over the clauses it matches (a bool's should
+     * clauses). {@code match} is the predicate the query string translated
+     * to, every row any clause matches; the ranked clauses read the same rows.
+     */
+    record Across(List<List<TextClause>> clauses, String match) {}
+
+    /**
      * How a hit scores, as Lucene sums a bool's scoring clauses: the BM25 of
      * a text clause, {@code offset} from the clauses every hit matches with
      * one score (a term, terms, range or exists in must scores its boost),
@@ -203,11 +213,15 @@ final class InfinoQueryTranslator {
      * {@code ascending} when the request sorts by the score ascending: the
      * least sums come first.
      */
-    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending) {
+    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, Across across) {
         static final Scoring NONE = new Scoring(null, 0, List.of());
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses) {
             this(text, offset, bonuses, false);
+        }
+
+        Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending) {
+            this(text, offset, bonuses, ascending, null);
         }
 
         /** Whether hits rank by more than the principal's BM25 alone: then {@code offset} only shifts every score alike. */
@@ -242,7 +256,7 @@ final class InfinoQueryTranslator {
          * clause's BM25 ranks its best hits only, so such a query is unscored.
          */
         Translation ascending() {
-            if (principal != null || scoring.text() != null) {
+            if (principal != null || scoring.text() != null || scoring.across() != null) {
                 return unscored();
             }
             return new Translation(table, where, principal, new Scoring(null, scoring.offset(), scoring.bonuses(), true), span);
@@ -337,6 +351,8 @@ final class InfinoQueryTranslator {
     /** How the translator reads rows of the table: a nested query's candidates, with their sources. */
     private final Function<String, List<Map<String, Object>>> rows;
     private TextClause principal;
+    /** A required query string's ranking across its columns ({@link #across(QueryStringQueryBuilder)}), found while scoring. */
+    private Across across;
     /** Each nested clause's matching documents with their scores, read once whether it filters, scores or both. */
     private final Map<NestedQueryBuilder, Map<String, Double>> nestedScores = new java.util.IdentityHashMap<>();
     /** Each BM25-scored term clause's score ({@link #bm25TermScore}), read once per clause. */
@@ -394,6 +410,14 @@ final class InfinoQueryTranslator {
         List<TextClause> texts = new ArrayList<>();
         boolean[] unscored = { false };
         required(root, offset, bonuses, texts, unscored);
+        if (across != null) {
+            if (principal == null && !unscored[0] && texts.isEmpty() && bonuses.isEmpty()) {
+                // The query string's BM25 across its columns is the only score beside the offset.
+                return new Scoring(null, offset[0], List.of(), false, across);
+            }
+            // Beside another scoring clause the sum is no longer the query string's alone.
+            unscored[0] = true;
+        }
         if (principal == null && (unscored[0] || texts.size() > 1)) {
             // A should clause the table cannot score (or a second text clause,
             // which would add its BM25 beside the first) would leave some of the
@@ -436,9 +460,169 @@ final class InfinoQueryTranslator {
             // several, a script) scores nothing here, where stock scores it.
             TextClause t = textOnly(qb);
             if (t == null || !t.equals(principal)) {
-                unscored[0] = true;
+                // A query string over several columns ranks across them when it is the one text clause.
+                Across a = principal == null && across == null && qb instanceof QueryStringQueryBuilder qs ? across(qs) : null;
+                if (a != null) {
+                    across = a;
+                } else {
+                    unscored[0] = true;
+                }
             }
         }
+    }
+
+    /** How a query string's JSON names its default type, best_fields: the builder has no getter for it. */
+    private static final Pattern BEST_FIELDS = Pattern.compile("\"type\"\\s*:\\s*\"best_fields\"");
+
+    /** The most BM25 searches (clauses times columns) a query string ranks across before it is left unranked. */
+    static final int MAX_ACROSS_SEARCHES = 64;
+
+    /**
+     * How stock ranks {@code qs} across its text columns ({@link Across}), or
+     * null when the plugin does not rank it that way: it is on one column
+     * (then it is the principal), or its form is outside what is read here.
+     *
+     * <p>Stock's parser (Lucene's, not splitting on whitespace) makes a
+     * clause of each {@code field:word}, and one clause of each run of words
+     * with no operator between them, on the default fields; a word before a
+     * {@code field:} or an {@code OR} ends the run. Over several fields a
+     * clause is a {@code dis_max} of each field's BM25 for its words
+     * (best_fields, tie_breaker 0), and the clauses are summed. Read here:
+     * plain words (one token each, no word twice in a run), {@code field:word}
+     * on a text column and {@code OR}, under the default operator OR, every
+     * field a text column with boost 1, and no option that changes the
+     * scoring.
+     */
+    private Across across(QueryStringQueryBuilder qs) {
+        if (qs.defaultOperator() != Operator.OR
+            || qs.minimumShouldMatch() != null
+            || !BEST_FIELDS.matcher(qs.toString()).find()
+            || (qs.tieBreaker() != null && qs.tieBreaker() != 0f)
+            || qs.analyzer() != null
+            || qs.boost() != 1f
+            || qs.queryString() == null) {
+            return null;
+        }
+        for (float b : qs.fields().values()) {
+            if (b != 1f) {
+                return null;
+            }
+        }
+        // The predicate the query string is; one that set a principal is ranked by it.
+        InfinoQueryTranslator alone = new InfinoQueryTranslator(cols, table, nowMillis, trusted, columnValuesOnly, rows);
+        String match;
+        try {
+            match = alone.predicate(qs, true);
+        } catch (IllegalArgumentException | OpenSearchSecurityException e) {
+            return null;
+        }
+        if (match == null || alone.principal != null || ALL.equals(match) || NONE.equals(match)) {
+            return null;
+        }
+        List<String> defaults = new ArrayList<>();
+        for (String f : queryTargets(new ArrayList<>(qs.fields().keySet()), qs.defaultField())) {
+            Column c = column(f);
+            if (c == null || !c.fts()) {
+                return null;
+            }
+            if (!defaults.contains(c.name())) {
+                defaults.add(c.name());
+            }
+        }
+        List<String> tokens = new ArrayList<>();
+        for (String piece : QUERY_WHITESPACE.split(qs.queryString().trim())) {
+            // A colon is a token of its own, with or without spaces around it.
+            int start = 0;
+            for (int i = 0; i < piece.length(); i++) {
+                if (piece.charAt(i) == ':') {
+                    if (i > start) {
+                        tokens.add(piece.substring(start, i));
+                    }
+                    tokens.add(":");
+                    start = i + 1;
+                }
+            }
+            if (start < piece.length()) {
+                tokens.add(piece.substring(start));
+            }
+        }
+        List<List<TextClause>> clauses = new ArrayList<>();
+        int searches = 0;
+        boolean afterOr = true; // nothing may start or follow an OR but a clause
+        for (int i = 0; i < tokens.size();) {
+            String t = tokens.get(i);
+            if ("OR".equals(t)) {
+                if (afterOr) {
+                    return null;
+                }
+                afterOr = true;
+                i++;
+                continue;
+            }
+            afterOr = false;
+            if (i + 1 < tokens.size() && ":".equals(tokens.get(i + 1))) {
+                // field:word, one clause on that field's column.
+                if (!fieldName(t) || i + 2 >= tokens.size() || !plainWord(tokens.get(i + 2))
+                    || (i + 3 < tokens.size() && ":".equals(tokens.get(i + 3)))) {
+                    return null;
+                }
+                Column c = column(t);
+                if (c == null || !c.fts() || (!trusted && c.masked())) {
+                    return null;
+                }
+                clauses.add(List.of(new TextClause(c.name(), tokens.get(i + 2), "or")));
+                searches++;
+                i += 3;
+                continue;
+            }
+            if (!plainWord(t)) {
+                return null;
+            }
+            // A run: the words that follow while the word after each is no field's colon or OR.
+            List<String> run = new ArrayList<>(List.of(t));
+            int j = i + 1;
+            while (j < tokens.size() && plainWord(tokens.get(j))
+                && (j + 1 >= tokens.size() || !(":".equals(tokens.get(j + 1)) || "OR".equals(tokens.get(j + 1))))) {
+                run.add(tokens.get(j));
+                j++;
+            }
+            if (run.stream().map(w -> w.toLowerCase(Locale.ROOT)).distinct().count() < run.size() || defaults.isEmpty()) {
+                return null;
+            }
+            List<TextClause> perColumn = new ArrayList<>();
+            for (String c : defaults) {
+                perColumn.add(new TextClause(c, String.join(" ", run), "or"));
+            }
+            clauses.add(List.copyOf(perColumn));
+            searches += perColumn.size();
+            i = j;
+        }
+        if (afterOr || clauses.isEmpty() || searches < 2 || searches > MAX_ACROSS_SEARCHES) {
+            // One search alone is a principal's ranking, which the translation would have set.
+            return null;
+        }
+        return new Across(List.copyOf(clauses), match);
+    }
+
+    /**
+     * A word both analyzers keep as one token and the query syntax reads as a
+     * word: ASCII letters and digits only (the engine's segmenter splits some
+     * other scripts where Lucene's does not), and no operator.
+     */
+    private static boolean plainWord(String w) {
+        String lower = w.toLowerCase(Locale.ROOT);
+        return !w.isEmpty()
+            && w.length() <= 255
+            && w.chars().allMatch(c -> (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+            && !lower.equals("and")
+            && !lower.equals("or")
+            && !lower.equals("not")
+            && !lower.equals("to");
+    }
+
+    /** A field name as a query string names one: no pattern, no escape. */
+    private static boolean fieldName(String f) {
+        return !f.isEmpty() && f.codePoints().allMatch(c -> Character.isLetterOrDigit(c) || c == '.' || c == '_' || c == '-');
     }
 
     /**
@@ -1853,23 +2037,7 @@ final class InfinoQueryTranslator {
         if (q.isEmpty() || "*".equals(q) || "*:*".equals(q)) {
             return ALL;
         }
-        List<String> targets = new ArrayList<>(fields);
-        if (targets.isEmpty() && defaultField != null && !"*".equals(defaultField)) {
-            targets.add(defaultField);
-        }
-        if (targets.isEmpty() || targets.contains("*")) {
-            targets.clear();
-            // Every text field once: an alias names a column already here. The id
-            // column carries a term index but is no field of the documents, and a
-            // field masked for the user is left out rather than matched by its
-            // clear values.
-            for (Map.Entry<String, Column> entry : cols.entrySet()) {
-                Column c = entry.getValue();
-                if (c.fts() && !InfinoNative.isAlias(entry.getKey(), c) && !c.name().equals(OSID) && (trusted || !c.masked())) {
-                    targets.add(c.name());
-                }
-            }
-        }
+        List<String> targets = queryTargets(fields, defaultField);
         InfinoLuceneQuery.Parsed top = InfinoLuceneQuery.parseTop(q, op);
         Node parsed = top.node();
         if (minimumShouldMatch == null) {
@@ -1906,6 +2074,28 @@ final class InfinoQueryTranslator {
             return atLeastOptional(b, required, targets, positive, q, op);
         }
         return node(parsed, targets, positive, q, op);
+    }
+
+    /** The fields a query string's clauses without a field search: those named, the default field, or every text field. */
+    private List<String> queryTargets(List<String> fields, String defaultField) {
+        List<String> targets = new ArrayList<>(fields);
+        if (targets.isEmpty() && defaultField != null && !"*".equals(defaultField)) {
+            targets.add(defaultField);
+        }
+        if (targets.isEmpty() || targets.contains("*")) {
+            targets.clear();
+            // Every text field once: an alias names a column already here. The id
+            // column carries a term index but is no field of the documents, and a
+            // field masked for the user is left out rather than matched by its
+            // clear values.
+            for (Map.Entry<String, Column> entry : cols.entrySet()) {
+                Column c = entry.getValue();
+                if (c.fts() && !InfinoNative.isAlias(entry.getKey(), c) && !c.name().equals(OSID) && (trusted || !c.masked())) {
+                    targets.add(c.name());
+                }
+            }
+        }
+        return targets;
     }
 
     /** Whether stock reads a query string over exactly one field: one named, with no pattern. */
