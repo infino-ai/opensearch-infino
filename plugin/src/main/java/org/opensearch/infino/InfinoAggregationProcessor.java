@@ -182,8 +182,6 @@ public class InfinoAggregationProcessor {
     private static final long DATE_BIN_MAX_MILLIS = Long.MAX_VALUE / 1_000_000L;
     /** The Arrow type of a date in UTC epoch milliseconds, as a cast names it: what a date key is computed in. */
     private static final String UTC_MILLIS = "'Timestamp(Millisecond, Some(\"UTC\"))'";
-    /** The Arrow type of a local wall-clock date in milliseconds, with no zone: what a zoned date key is binned in. */
-    private static final String LOCAL_MILLIS = "'Timestamp(Millisecond, None)'";
     /** The Arrow type a mapped date's column holds, which a date the index does not map is read as. */
     private static final String UNMAPPED_DATE_TYPE = "Timestamp(ms, \"UTC\")";
     /** How bucket keys are printed when the request names no format. */
@@ -1838,21 +1836,41 @@ public class InfinoAggregationProcessor {
         /**
          * The bucket of {@code source}, already read in the request's
          * {@code zone}, at a fixed interval of {@code ms} counted from the
-         * epoch shifted by {@code offset}, with its boundaries on local time.
-         * date_bin counts from the epoch in UTC whatever the zone, so the
-         * local wall-clock time is binned (to_local_time gives it with no
-         * zone) and the start read back in the zone as local time, where the
-         * request (and the empty-bucket rounding) puts the boundaries.
+         * epoch shifted by {@code offset}, with its boundaries on local time,
+         * as stock's rounding puts them.
          *
-         * <p>As in {@link #utcBin}, a date outside date_bin's nanosecond range
-         * is floored in milliseconds instead; here those are the local
-         * wall-clock milliseconds, the same ones date_bin would bin, not the
-         * UTC instant's, whose floor would put the boundary off local time by
-         * the zone's offset.
+         * <p>All in epoch milliseconds (Int64), so no date is out of range as
+         * date_bin's nanoseconds can be. As stock's offset rounding, the
+         * instant is moved back by the offset, its local time floored to the
+         * interval, and the offset added back to the bucket's start. The
+         * floored local time is turned back into an instant with the offset
+         * the date itself has, unless the start falls before that offset
+         * began; then with the offset at that earlier instant. A local time
+         * that happens twice (clocks go back) thus starts two buckets, one
+         * per offset, and a day that starts before the change keeps the
+         * offset it started with, as stock's buckets do. Reading the floored
+         * local time back with a cast from wall-clock time fails for a time
+         * that happens twice.
+         *
+         * <p>With {@code v} the date less the offset, {@code L} its local
+         * time and {@code m} how far {@code L} is past its floor, the start
+         * read with the date's own offset is {@code c = v - m}, and the key is
+         * the floor {@code L - m} less the offset at {@code c}:
+         * {@code (L - m) - (local(c) - c)}, plus the offset.
          */
         static String zonedBin(String source, String zone, long ms, long offset) {
-            String local = "arrow_cast(to_local_time(" + source + "), " + LOCAL_MILLIS + ")";
-            return "arrow_cast(" + guardedBin(local, LOCAL_MILLIS, ms, offset) + ", " + zone + ")";
+            String epoch = "arrow_cast(arrow_cast(date_trunc('millisecond', " + source + "), " + UTC_MILLIS + "), 'Int64')";
+            String shifted = "(" + epoch + " - (" + offset + "))";
+            String local = localMillis(shifted, zone);
+            String past = "(((" + local + " % " + ms + ") + " + ms + ") % " + ms + ")";
+            String start = "(" + shifted + " - " + past + ")";
+            String key = start + " + (" + local + " - " + past + ") - " + localMillis(start, zone) + " + (" + offset + ")";
+            return "arrow_cast(" + key + ", " + zone + ")";
+        }
+
+        /** The local wall-clock time in {@code zone} of {@code epoch}, an Int64 of UTC milliseconds, as an Int64 of milliseconds. */
+        private static String localMillis(String epoch, String zone) {
+            return "arrow_cast(to_local_time(arrow_cast(" + epoch + ", " + zone + ")), 'Int64')";
         }
 
         /**

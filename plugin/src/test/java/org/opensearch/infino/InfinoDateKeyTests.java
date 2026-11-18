@@ -5,9 +5,12 @@
 package org.opensearch.infino;
 
 import org.opensearch.infino.InfinoScriptTranslator.SqlType;
+import org.opensearch.common.Rounding;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
+import org.opensearch.search.aggregations.bucket.histogram.DateIntervalWrapper;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.time.Instant;
 import java.time.ZoneId;
 
 public class InfinoDateKeyTests extends OpenSearchTestCase {
@@ -15,8 +18,6 @@ public class InfinoDateKeyTests extends OpenSearchTestCase {
     private static final long HOUR = 3_600_000L;
     /** The source as UTC milliseconds, floored, which both branches read. */
     private static final String MILLIS = "arrow_cast(date_trunc('millisecond', (ts)), 'Timestamp(Millisecond, Some(\"UTC\"))')";
-    /** The local wall-clock time of the source in the zone, in milliseconds with no zone, which both zoned branches read. */
-    private static final String LOCAL = "arrow_cast(to_local_time((ts)), 'Timestamp(Millisecond, None)')";
     private static final String KOLKATA = "'Timestamp(Millisecond, Some(\"Asia/Kolkata\"))'";
 
     /**
@@ -68,67 +69,109 @@ public class InfinoDateKeyTests extends OpenSearchTestCase {
     }
 
     /**
-     * A zoned key is guarded like a UTC one: date_bin where nanoseconds hold
-     * the date, else a floor in milliseconds, and the result is read back in
-     * the zone.
+     * A zoned key is worked out in epoch milliseconds: the date's local
+     * time is floored, and the floor read back as an instant with the
+     * offset the zone has at the start the date's own offset gives. No
+     * date_bin, so no date is out of its range, and no cast from wall-clock
+     * time, which fails for a local time that happens twice.
      */
-    public void testZonedDateBinOnlyWhereNanosecondsHoldTheDate() {
+    public void testZonedKeyIsWorkedOutInEpochMilliseconds() {
         String key = InfinoAggregationProcessor.Grouped.zonedBin("(ts)", KOLKATA, HOUR, 0);
-        long lo = Long.MIN_VALUE / 1_000_000L + HOUR;
-        long hi = Long.MAX_VALUE / 1_000_000L - HOUR;
-        String epoch = "arrow_cast(" + LOCAL + ", 'Int64')";
-        assertEquals(
-            "arrow_cast(CASE WHEN " + epoch + " BETWEEN " + lo + " AND " + hi
-                + " THEN date_bin(INTERVAL '3600000 milliseconds', " + LOCAL + ")"
-                + " ELSE arrow_cast((" + epoch + " - (0)) - (((" + epoch + " - (0)) % 3600000) + 3600000) % 3600000 + (0),"
-                + " 'Timestamp(Millisecond, None)') END, " + KOLKATA + ")",
-            key
-        );
+        String epoch = "arrow_cast(" + MILLIS + ", 'Int64')";
+        String shifted = "(" + epoch + " - (0))";
+        String local = "arrow_cast(to_local_time(arrow_cast(" + shifted + ", " + KOLKATA + ")), 'Int64')";
+        String past = "(((" + local + " % 3600000) + 3600000) % 3600000)";
+        String start = "(" + shifted + " - " + past + ")";
+        String startLocal = "arrow_cast(to_local_time(arrow_cast(" + start + ", " + KOLKATA + ")), 'Int64')";
+        assertEquals("arrow_cast(" + start + " + (" + local + " - " + past + ") - " + startLocal + " + (0), " + KOLKATA + ")", key);
+        assertFalse(key, key.contains("date_bin"));
+        assertFalse(key, key.contains("Timestamp(Millisecond, None)"));
     }
 
-    /**
-     * The zoned fallback floors the local wall-clock milliseconds, the ones
-     * date_bin bins, and keeps them local until the cast back to the zone;
-     * flooring the UTC instant would put the boundary off local time by the
-     * zone's offset.
-     */
-    public void testZonedFallbackFloorsLocalTimeNotTheInstant() {
-        String key = InfinoAggregationProcessor.Grouped.zonedBin("(ts)", KOLKATA, 2 * HOUR, 0);
-        assertTrue(key, key.contains("ELSE arrow_cast((arrow_cast(" + LOCAL + ", 'Int64') - (0))"));
-        assertTrue(key, key.contains("+ (0), 'Timestamp(Millisecond, None)') END"));
-        assertFalse(key, key.contains("arrow_cast((ts), 'Int64')"));
-        assertFalse(key, key.contains("Some(\"UTC\")"));
-        assertTrue(key, key.startsWith("arrow_cast(CASE WHEN "));
-        assertTrue(key, key.endsWith(" END, " + KOLKATA + ")"));
-    }
-
-    /** An offset moves the origin of both zoned branches, and narrows date_bin's range by its size. */
-    public void testZonedOffsetShiftsBothBranches() {
+    /** As stock's offset rounding, an offset moves the instant before it is floored, and is added back to the start. */
+    public void testZonedOffsetMovesTheInstant() {
         long offset = 6 * HOUR;
         String key = InfinoAggregationProcessor.Grouped.zonedBin("(ts)", KOLKATA, 24 * HOUR, offset);
-        assertTrue(key, key.contains("date_bin(INTERVAL '86400000 milliseconds', " + LOCAL + ", TIMESTAMP '1970-01-01T00:00:00Z' + INTERVAL '21600000 milliseconds')"));
-        assertTrue(key, key.contains("BETWEEN " + (Long.MIN_VALUE / 1_000_000L + 30 * HOUR) + " AND " + (Long.MAX_VALUE / 1_000_000L - 30 * HOUR) + " "));
-        assertTrue(key, key.contains("(arrow_cast(" + LOCAL + ", 'Int64') - (21600000))"));
-        assertTrue(key, key.contains(" + (21600000), 'Timestamp(Millisecond, None)')"));
+        assertTrue(key, key.contains("(arrow_cast(" + MILLIS + ", 'Int64') - (21600000))"));
+        assertTrue(key, key.contains("% 86400000) + 86400000) % 86400000)"));
+        assertTrue(key, key.endsWith(" + (21600000), " + KOLKATA + ")"));
     }
 
-    /** A zoned interval too long for any date_bin range is floored in local milliseconds alone. */
-    public void testZonedIntervalPastTheRangeIsFlooredAlone() {
-        long ms = Long.MAX_VALUE / 1_000_000L + 1;
-        String key = InfinoAggregationProcessor.Grouped.zonedBin("(ts)", KOLKATA, ms, 0);
-        assertFalse(key, key.contains("date_bin"));
-        assertFalse(key, key.contains("CASE"));
-        assertTrue(key, key.startsWith("arrow_cast(arrow_cast((arrow_cast(" + LOCAL + ", 'Int64') - (0))"));
-        assertTrue(key, key.endsWith(", 'Timestamp(Millisecond, None)'), " + KOLKATA + ")"));
-    }
-
-    /** dateExpr sends a zoned fixed interval through the guard, reading the source in the zone first. */
-    public void testDateExprGuardsAZonedFixedInterval() {
+    /** dateExpr sends a zoned fixed interval through zonedBin, reading the source in the zone first. */
+    public void testDateExprSendsAZonedFixedIntervalThroughZonedBin() {
         InfinoAggregationProcessor.Source ts = new InfinoAggregationProcessor.Source("ts", SqlType.DATE, "[ts]", null);
         ZoneId tz = ZoneId.of("Asia/Kolkata");
         String key = InfinoAggregationProcessor.Grouped.dateExpr("h", ts, tz, new DateHistogramInterval("2h"), null, 0).keyExpr();
         String expected = InfinoAggregationProcessor.Grouped.zonedBin("arrow_cast((ts), " + KOLKATA + ")", KOLKATA, 2 * HOUR, 0);
-        assertTrue(expected, expected.contains("CASE WHEN"));
         assertEquals(expected, key);
+    }
+
+    /**
+     * In Europe/London on 2026-10-25 01:00-02:00 local happens twice: an
+     * hour's bucket starts at both 00:00Z (BST) and 01:00Z (GMT), as stock's;
+     * the day's bucket starts at its BST midnight on both sides of the
+     * change. On 2026-03-29 01:00-02:00 local does not happen: the hour after
+     * 00:00Z starts at 01:00Z (02:00 BST).
+     */
+    public void testZonedKeysAcrossLondonsChanges() {
+        ZoneId london = ZoneId.of("Europe/London");
+        assertEquals(Instant.parse("2026-10-25T00:00:00Z").toEpochMilli(), key(london, "2026-10-25T00:40:00Z", HOUR, 0));
+        assertEquals(Instant.parse("2026-10-25T01:00:00Z").toEpochMilli(), key(london, "2026-10-25T01:20:00Z", HOUR, 0));
+        assertEquals(Instant.parse("2026-10-25T01:30:00Z").toEpochMilli(), key(london, "2026-10-25T01:50:00Z", HOUR / 2, 0));
+        assertEquals(Instant.parse("2026-10-24T23:00:00Z").toEpochMilli(), key(london, "2026-10-25T00:10:00Z", 24 * HOUR, 0));
+        assertEquals(Instant.parse("2026-10-24T23:00:00Z").toEpochMilli(), key(london, "2026-10-25T12:00:00Z", 24 * HOUR, 0));
+        assertEquals(Instant.parse("2026-03-29T00:00:00Z").toEpochMilli(), key(london, "2026-03-29T00:50:00Z", HOUR, 0));
+        assertEquals(Instant.parse("2026-03-29T01:00:00Z").toEpochMilli(), key(london, "2026-03-29T01:10:00Z", HOUR, 0));
+        assertEquals(Instant.parse("2026-03-29T00:00:00Z").toEpochMilli(), key(london, "2026-03-29T12:00:00Z", 24 * HOUR, 0));
+    }
+
+    /**
+     * The key's arithmetic, minute by minute for two days around each
+     * change of 2026, gives stock's rounding's key: in zones whose clocks
+     * move an hour at 01:00 or 02:00 local, by half an hour (Lord Howe), and
+     * by an hour at midnight (Santiago), for intervals from 30m to a day,
+     * with and without an offset.
+     */
+    public void testZonedKeysMatchStockAcrossChanges() {
+        String[][] changes = {
+            { "Europe/London", "2026-03-29T01:00:00Z", "2026-10-25T01:00:00Z" },
+            { "America/New_York", "2026-03-08T07:00:00Z", "2026-11-01T06:00:00Z" },
+            { "Australia/Lord_Howe", "2026-04-04T15:00:00Z", "2026-10-03T15:30:00Z" },
+            { "America/Santiago", "2026-04-05T03:00:00Z", "2026-09-06T04:00:00Z" } };
+        long[] intervals = { HOUR / 2, HOUR, 3 * HOUR, 24 * HOUR };
+        long[] offsets = { 0, HOUR / 2, -2 * HOUR };
+        for (String[] change : changes) {
+            ZoneId tz = ZoneId.of(change[0]);
+            for (int c = 1; c < change.length; c++) {
+                long at = Instant.parse(change[c]).toEpochMilli();
+                for (long ms : intervals) {
+                    for (long offset : offsets) {
+                        DateIntervalWrapper wrapper = new DateIntervalWrapper();
+                        wrapper.fixedInterval(new DateHistogramInterval(ms + "ms"));
+                        Rounding.Prepared stock = wrapper.createRounding(tz, offset).prepare(at - 50 * HOUR, at + 50 * HOUR);
+                        for (long u = at - 48 * HOUR; u <= at + 48 * HOUR; u += 60_000L) {
+                            assertEquals(change[0] + " " + Instant.ofEpochMilli(u) + " every " + ms + " offset " + offset, stock.round(u), key(tz, u, ms, offset));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static long key(ZoneId tz, String at, long ms, long offset) {
+        return key(tz, Instant.parse(at).toEpochMilli(), ms, offset);
+    }
+
+    /** {@link InfinoAggregationProcessor.Grouped#zonedBin}'s arithmetic, step by step, in Java. */
+    private static long key(ZoneId tz, long epoch, long ms, long offset) {
+        long shifted = epoch - offset;
+        long local = localMillis(tz, shifted);
+        long past = ((local % ms) + ms) % ms;
+        long start = shifted - past;
+        return start + (local - past) - localMillis(tz, start) + offset;
+    }
+
+    private static long localMillis(ZoneId tz, long epoch) {
+        return epoch + tz.getRules().getOffset(Instant.ofEpochMilli(epoch)).getTotalSeconds() * 1000L;
     }
 }
