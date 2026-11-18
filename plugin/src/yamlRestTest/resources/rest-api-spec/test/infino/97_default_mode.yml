@@ -829,6 +829,23 @@
         index: rc_default
         body: { size: 0, aggs: { recent: { filter: { query_string: { query: "at:[now-1d TO now]" } } } } }
   - match: { aggregations.recent.doc_count: 0 }
+  # A range from now back past 2020 holds every row only when now is the real time,
+  # not 0, and repeating it still counts them all.
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, query: { query_string: { query: "at:[now-10000d TO now]" } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, query: { query_string: { query: "at:[now-10000d TO now]" } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search:
+        index: rc_default
+        body: { size: 0, aggs: { recent: { filter: { query_string: { query: "at:[now-10000d TO now]" } } } } }
+  - match: { aggregations.recent.doc_count: 3 }
   - do:
       indices.stats:
         index: rc_default
