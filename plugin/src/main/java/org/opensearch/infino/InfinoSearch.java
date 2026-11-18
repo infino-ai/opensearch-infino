@@ -572,6 +572,25 @@ public final class InfinoSearch {
         return new CountedRows(counted == 0 ? List.of() : hits.get(), counted);
     }
 
+    /**
+     * Whether a page's exact total is counted beside its rows: an exact
+     * total the request counts, not counted first, for a page whose short
+     * read cannot be the total ({@link #shortPageIsTotal}). Where it can, the
+     * total is counted after the rows, and only when the page is full.
+     */
+    static boolean countsBeside(Plan plan, boolean exact, boolean count, int size, boolean firstCount) {
+        return plan.vector() == null && exact && count && size > 0 && !firstCount && !shortPageIsTotal(plan);
+    }
+
+    /**
+     * A total counted beside the page, never below the page's own rows: the
+     * count and the hit read are separate snapshots, so an append between
+     * them can show a row the count did not see.
+     */
+    static long besideTotal(long counted, int rows) {
+        return Math.max(counted, rows);
+    }
+
     /** The page's rows from its hit statement, with their sources when they are read by id. */
     private static List<Map<String, Object>> hitRows(Plan plan, SearchSourceBuilder source, int fetch, boolean seqNoAndPrimaryTerm) {
         List<Map<String, Object>> rows;
@@ -616,10 +635,10 @@ public final class InfinoSearch {
             && size > 0
             && !(bareRanked(plan) && !seqNoAndPrimaryTerm)
             && countsFirst(source, count, scoredPage(plan));
-        // Otherwise the exact total and the page are separate engine calls,
-        // neither waiting on the other: the total is counted on another
-        // thread while the page is read.
-        CompletableFuture<Long> beside = plan.vector() == null && exact && count && size > 0 && !firstCount
+        // Otherwise, when a short page cannot be its own total, the exact total
+        // and the page are separate engine calls, neither waiting on the other:
+        // the total is counted on another thread while the page is read.
+        CompletableFuture<Long> beside = countsBeside(plan, exact, count, size, firstCount)
             ? InfinoServices.beside(() -> total(plan))
             : null;
         // The exact total, when it is read before the page.
@@ -686,8 +705,8 @@ public final class InfinoSearch {
         } else if (exact && counted != null) {
             total = counted;
         } else if (exact && beside != null) {
-            // Already counting: its answer is exact, and it is not left running past the request.
-            total = InfinoServices.await(beside);
+            // Already counting: it is not left running past the request.
+            total = besideTotal(InfinoServices.await(beside), rows.size());
         } else if (exact && shortPage) {
             total = rows.size();
         } else if (exact) {
