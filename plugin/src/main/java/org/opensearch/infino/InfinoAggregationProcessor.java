@@ -182,6 +182,8 @@ public class InfinoAggregationProcessor {
     private static final long DATE_BIN_MAX_MILLIS = Long.MAX_VALUE / 1_000_000L;
     /** The Arrow type of a date in UTC epoch milliseconds, as a cast names it: what a date key is computed in. */
     private static final String UTC_MILLIS = "'Timestamp(Millisecond, Some(\"UTC\"))'";
+    /** The Arrow type of a local wall-clock date in milliseconds, with no zone: what a zoned date key is binned in. */
+    private static final String LOCAL_MILLIS = "'Timestamp(Millisecond, None)'";
     /** The Arrow type a mapped date's column holds, which a date the index does not map is read as. */
     private static final String UNMAPPED_DATE_TYPE = "Timestamp(ms, \"UTC\")";
     /** How bucket keys are printed when the request names no format. */
@@ -1782,13 +1784,8 @@ public class InfinoAggregationProcessor {
                 if (ms <= 0) {
                     throw new Unsupported("aggregation [" + agg + "] has an interval of no length");
                 }
-                String origin = offset == 0 ? "" : ", TIMESTAMP '1970-01-01T00:00:00Z' + INTERVAL '" + offset + " milliseconds'";
                 if (zoned) {
-                    // date_bin counts from the epoch in UTC whatever the zone; binning the
-                    // wall-clock time and reading the result back in the zone puts the
-                    // boundaries on local time, where the request (and the empty-bucket
-                    // rounding) puts them.
-                    keyExpr = "arrow_cast(date_bin(INTERVAL '" + ms + " milliseconds', to_local_time(" + source + ")" + origin + "), " + zone + ")";
+                    keyExpr = zonedBin(source, zone, ms, offset);
                 } else {
                     keyExpr = utcBin(source, ms, offset);
                 }
@@ -1835,6 +1832,38 @@ public class InfinoAggregationProcessor {
          */
         static String utcBin(String source, long ms, long offset) {
             String millis = "arrow_cast(date_trunc('millisecond', " + source + "), " + UTC_MILLIS + ")";
+            return guardedBin(millis, UTC_MILLIS, ms, offset);
+        }
+
+        /**
+         * The bucket of {@code source}, already read in the request's
+         * {@code zone}, at a fixed interval of {@code ms} counted from the
+         * epoch shifted by {@code offset}, with its boundaries on local time.
+         * date_bin counts from the epoch in UTC whatever the zone, so the
+         * local wall-clock time is binned (to_local_time gives it with no
+         * zone) and the start read back in the zone as local time, where the
+         * request (and the empty-bucket rounding) puts the boundaries.
+         *
+         * <p>As in {@link #utcBin}, a date outside date_bin's nanosecond range
+         * is floored in milliseconds instead; here those are the local
+         * wall-clock milliseconds, the same ones date_bin would bin, not the
+         * UTC instant's, whose floor would put the boundary off local time by
+         * the zone's offset.
+         */
+        static String zonedBin(String source, String zone, long ms, long offset) {
+            String local = "arrow_cast(to_local_time(" + source + "), " + LOCAL_MILLIS + ")";
+            return "arrow_cast(" + guardedBin(local, LOCAL_MILLIS, ms, offset) + ", " + zone + ")";
+        }
+
+        /**
+         * The bucket of {@code millis}, a date in milliseconds of Arrow type
+         * {@code type}, at a fixed interval of {@code ms} counted from the
+         * epoch shifted by {@code offset}, in that same type: date_bin where
+         * an i64 of nanoseconds holds the date (less an interval and the
+         * offset at each end, which the bucket's start may reach), else a
+         * floor of its Int64 milliseconds.
+         */
+        private static String guardedBin(String millis, String type, long ms, long offset) {
             String origin = offset == 0 ? "" : ", TIMESTAMP '1970-01-01T00:00:00Z' + INTERVAL '" + offset + " milliseconds'";
             String binned = "date_bin(INTERVAL '" + ms + " milliseconds', " + millis + origin + ")";
             long margin = ms + (offset < 0 ? -offset : offset);
@@ -1843,7 +1872,7 @@ public class InfinoAggregationProcessor {
             String epoch = "arrow_cast(" + millis + ", 'Int64')";
             String shifted = "(" + epoch + " - (" + offset + "))";
             String floored = "arrow_cast(" + shifted + " - ((" + shifted + " % " + ms + ") + " + ms + ") % " + ms + " + (" + offset + "), "
-                + UTC_MILLIS + ")";
+                + type + ")";
             if (lo > hi) {
                 return floored;
             }

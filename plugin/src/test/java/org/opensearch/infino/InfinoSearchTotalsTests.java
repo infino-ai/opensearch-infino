@@ -87,4 +87,15 @@ public class InfinoSearchTotalsTests extends OpenSearchTestCase {
         assertEquals(ONE_ROW, read.rows());
         assertNull(read.total());
     }
+
+    /**
+     * A total counted beside the page is never below the hits it returns:
+     * an append between the count and the hit read cannot report one hit
+     * with a total of 0.
+     */
+    public void testATotalCountedBesideThePageIsNeverBelowItsHits() {
+        assertEquals(1, InfinoSearch.besideTotal(0, 1));
+        assertEquals(7, InfinoSearch.besideTotal(7, 3));
+        assertEquals(0, InfinoSearch.besideTotal(0, 0));
+    }
 }
