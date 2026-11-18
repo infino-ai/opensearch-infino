@@ -1285,6 +1285,22 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(InfinoSearch.shortPageIsTotal(plan(t)));
     }
 
+    /**
+     * A page whose short read is its total counts no total beside it: a
+     * short page answers with its rows and starts no count; a ranked page
+     * still counts beside its rows.
+     */
+    public void testAPageCountsBesideOnlyWhenAShortPageCannotBeItsTotal() {
+        InfinoSearch.Plan filtered = plan(translate(QueryBuilders.termQuery("level", "error")));
+        assertFalse(InfinoSearch.countsBeside(filtered, true, true, 10, false));
+        InfinoSearch.Plan ranked = plan(translate(QueryBuilders.matchQuery("message", "disk")));
+        assertTrue(InfinoSearch.countsBeside(ranked, true, true, 10, false));
+        assertFalse(InfinoSearch.countsBeside(ranked, true, true, 10, true));
+        assertFalse(InfinoSearch.countsBeside(ranked, false, true, 10, false));
+        assertFalse(InfinoSearch.countsBeside(ranked, true, false, 10, false));
+        assertFalse(InfinoSearch.countsBeside(ranked, true, true, 0, false));
+    }
+
     // ---- nested ----
 
     private static final String KIBANA = "os_kibana_0";
