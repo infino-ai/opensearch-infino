@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""Load big5 documents into the nodes bench/local-nodes.sh starts, then time
+big5's searches (bench/big5-searches.json, from Elastic's big5 track) on each
+and record how far each one raises the node's resident memory.
+
+    python3 bench/big5.py --nodes ./nodes load --data '~/.rally/benchmarks/data/big5_1m/logs-[0-9].ndjson'
+    python3 bench/big5.py --nodes ./nodes run --calls 20 --out result.json [--searches term,range]
+
+`load` creates the index `big5` (bench/big5-index.json) on each node and bulk
+loads every line of the data files. `run` sends each search once as a
+warmup, then `--calls` times, sampling the node's RSS every 20 ms while a call
+runs. A node that dies mid-search is reported as such and left out of the
+searches after it. Each answer is compared with stock's: hits.total, the
+set of top hit ids (scored searches may order ties differently), or for a
+sorted search the hits' sort values in order with the ids tied on each, and
+the aggregations as JSON.
+
+Linux only: a node's resident memory is read from /proc.
+"""
+
+import argparse
+import glob
+import json
+import os
+import statistics
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+INDEX = "big5"
+# Each search's body and its URL parameters (pre_filter_shard_size, ...).
+SEARCHES = {s["name"]: (s["body"], s.get("params", {})) for s in json.load(open(os.path.join(HERE, "big5-searches.json")))}
+PORTS = {"default": 0, "stock": 1, "proxy": 2}
+# Tries of one _bulk batch while the node answers 429, a second apart.
+BULK_TRIES = 20
+
+
+def call(port, method, path, body=None, timeout=600, ndjson=False):
+    data = None
+    headers = {}
+    if body is not None:
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        headers["content-type"] = "application/x-ndjson" if ndjson else "application/json"
+    req = urllib.request.Request(f"http://localhost:{port}{path}", data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}")
+
+
+def top_hits(body, hits):
+    """The top hits to compare with stock's: their ids as a set, or, for a
+    search with a sort, each run of equal sort values in order with the ids
+    of that run as a set, so the order counts and only ties may differ."""
+    if "sort" not in body:
+        return sorted(h["_id"] for h in hits)
+    runs = []
+    for h in hits:
+        if runs and runs[-1][0] == h.get("sort"):
+            runs[-1][1].append(h["_id"])
+        else:
+            runs.append((h.get("sort"), [h["_id"]]))
+    return [[values, sorted(ids)] for values, ids in runs]
+
+
+def nodes(args):
+    out = {}
+    for name, off in PORTS.items():
+        pidfile = os.path.join(args.nodes, name, "pid")
+        if os.path.exists(pidfile):
+            out[name] = (args.base_port + off, int(open(pidfile).read().strip()))
+    return out
+
+
+def rss_kb(pid):
+    try:
+        for line in open(f"/proc/{pid}/status"):
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1])
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def load(args):
+    files = sorted(glob.glob(os.path.expanduser(args.data)))
+    if not files:
+        sys.exit(f"no data files match {args.data}")
+    mapping = json.load(open(os.path.join(HERE, "big5-index.json")))
+    for name, (port, _) in nodes(args).items():
+        if args.only and name not in args.only.split(","):
+            continue
+        call(port, "DELETE", f"/{INDEX}")
+        status, body = call(port, "PUT", f"/{INDEX}", mapping)
+        if status != 200:
+            sys.exit(f"{name}: create {INDEX} returned {status}: {body}")
+
+        def batches():
+            buf, n = [], 0
+            for f in files:
+                with open(f, "rb") as fh:
+                    for line in fh:
+                        # The document's place in the input as its id, the same on every node.
+                        buf.append(b'{"index":{"_id":"%d"}}\n' % n + line.rstrip(b"\n") + b"\n")
+                        n += 1
+                        if len(buf) == args.batch:
+                            yield b"".join(buf)
+                            buf = []
+                        if args.docs and n >= args.docs:
+                            if buf:
+                                yield b"".join(buf)
+                            return
+            if buf:
+                yield b"".join(buf)
+
+        lock = threading.Lock()
+        it = batches()
+        errors = [0]
+        # A batch that never loaded, or input that could not be read: the node
+        # would hold a different document set from the others, so the load
+        # stops and fails instead.
+        failures = []
+        start = time.time()
+
+        def send(b):
+            """Bulk-load one batch, retrying while the node pushes back; the
+            reason it failed, or None."""
+            for _ in range(BULK_TRIES):
+                try:
+                    status, body = call(port, "POST", f"/{INDEX}/_bulk", b, ndjson=True)
+                except Exception as e:  # no answer, or one that is not JSON
+                    return repr(e)
+                if status == 429:
+                    time.sleep(1)
+                    continue
+                if status != 200:
+                    return f"HTTP {status}: {json.dumps(body)[:500]}"
+                if body.get("errors"):
+                    with lock:
+                        errors[0] += sum(1 for i in body["items"] if i["index"].get("error"))
+                return None
+            return f"HTTP 429 on all {BULK_TRIES} tries"
+
+        def worker():
+            while True:
+                with lock:
+                    try:
+                        b = None if failures else next(it, None)
+                    except Exception as e:  # an input file that cannot be read
+                        failures.append(f"reading the input: {e!r}")
+                        b = None
+                if b is None:
+                    return
+                failure = send(b)
+                if failure:
+                    with lock:
+                        failures.append(failure)
+                    return
+
+        threads = [threading.Thread(target=worker) for _ in range(args.clients)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if failures:
+            sys.exit(f"{name}: load stopped: {failures[0]}")
+        call(port, "POST", f"/{INDEX}/_refresh")
+        _, count = call(port, "GET", f"/{INDEX}/_count")
+        print(f"{name}: {count.get('count')} docs in {time.time() - start:.0f} s, {errors[0]} item errors", flush=True)
+
+
+def run(args):
+    ns = nodes(args)
+    dead = set()
+    results = {}
+    stock_ids = {}
+    answers = {}
+    order = ["stock"] + [n for n in ns if n != "stock"]
+    wanted = args.searches.split(",") if args.searches else [s for s in SEARCHES if s not in args.skip.split(",")]
+    for search in wanted:
+        body, params = SEARCHES[search]
+        query = urllib.parse.urlencode({"request_cache": "false", **params})
+        for name in order:
+            if name not in ns or name in dead:
+                continue
+            port, pid = ns[name]
+            base = rss_kb(pid)
+            if base is None:
+                dead.add(name)
+                continue
+            times, peak = [], base
+            status, res = None, {}
+            for i in range(args.calls + 1):
+                stop = threading.Event()
+                peak_box = [base]
+
+                def sample():
+                    while not stop.is_set():
+                        r = rss_kb(pid)
+                        if r is None:
+                            return
+                        peak_box[0] = max(peak_box[0], r)
+                        time.sleep(0.02)
+
+                t = threading.Thread(target=sample)
+                t.start()
+                t0 = time.perf_counter()
+                try:
+                    status, res = call(port, "POST", f"/{INDEX}/_search?{query}", body, timeout=args.timeout)
+                except Exception as e:  # the node died or stopped answering
+                    status, res = None, {"error": repr(e)}
+                elapsed = (time.perf_counter() - t0) * 1000
+                stop.set()
+                t.join()
+                peak = max(peak, peak_box[0])
+                if status != 200:
+                    break
+                if i > 0:
+                    times.append(elapsed)
+            alive = rss_kb(pid) is not None
+            if not alive:
+                dead.add(name)
+            ids = top_hits(body, res.get("hits", {}).get("hits", [])) if status == 200 else None
+            total = res.get("hits", {}).get("total") if status == 200 else None
+            aggs = json.dumps(res.get("aggregations"), sort_keys=True) if status == 200 else None
+            answer = (ids, json.dumps(total, sort_keys=True), aggs)
+            if name == "stock":
+                stock_ids[search] = answer
+            row = {
+                "status": status if alive else "node died",
+                "p50_ms": round(statistics.median(times), 1) if times else None,
+                "rss_before_gb": round(base / 1048576, 2),
+                "rss_peak_gb": round(peak / 1048576, 2),
+                "rss_rise_gb": round((peak - base) / 1048576, 2),
+                "hits_total": total,
+                "same_as_stock": None if name == "stock" or ids is None else {
+                    k: a == b for k, a, b in zip(("top_ids", "total", "aggs"), answer, stock_ids.get(search, (None,) * 3))
+                },
+                "error": None if status == 200 else str(res)[:300],
+            }
+            results.setdefault(search, {})[name] = row
+            if args.answers and status == 200:
+                res.pop("took", None)
+                answers.setdefault(search, {})[name] = res
+            print(f"{search:45s} {name:8s} status={row['status']} p50={row['p50_ms']} ms "
+                  f"rss {row['rss_before_gb']}->{row['rss_peak_gb']} GB (+{row['rss_rise_gb']}) "
+                  f"same_as_stock={row['same_as_stock']}", flush=True)
+    if args.out:
+        json.dump(results, open(args.out, "w"), indent=1)
+    if args.answers:
+        json.dump(answers, open(args.answers, "w"), indent=1, sort_keys=True)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--nodes", default="./nodes")
+    p.add_argument("--base-port", type=int, default=9250)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    lo = sub.add_parser("load")
+    lo.add_argument("--data", required=True)
+    lo.add_argument("--docs", type=int, default=0, help="stop after this many documents (0: all)")
+    lo.add_argument("--batch", type=int, default=5000)
+    lo.add_argument("--clients", type=int, default=4)
+    lo.add_argument("--only", help="comma-separated node names to load (default: every node)")
+    ru = sub.add_parser("run")
+    ru.add_argument("--calls", type=int, default=20)
+    ru.add_argument("--timeout", type=int, default=300)
+    ru.add_argument("--out")
+    ru.add_argument("--answers", help="write each node's last response per search here, to diff two builds")
+    ru.add_argument("--searches", help="comma-separated search names (default: all)")
+    ru.add_argument("--skip", default="scroll", help="comma-separated search names to leave out (default: scroll)")
+    args = p.parse_args()
+    args.nodes = os.path.abspath(args.nodes)
+    {"load": load, "run": run}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

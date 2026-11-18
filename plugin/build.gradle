@@ -123,6 +123,12 @@ def defaultLib = file("${projectDir}/../infino-capi/target/release/libinfino_cap
 def defaultData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog"
 def defaultUri = "file://${defaultData}"
 
+// The unit tests that read through the engine load the same bridge; their
+// tables stay in memory (memory://, the default catalog).
+test {
+    systemProperty 'infino.lib', System.getProperty('infino.lib', defaultLib)
+}
+
 // The stock knn suites need the k-NN plugin, which owns the knn_vector mapping
 // and the knn query and extends lang-painless (and transport-grpc on 3.x):
 // modules only the full archive distribution carries. So those suites run in

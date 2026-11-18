@@ -9,6 +9,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
+import org.apache.lucene.util.BytesRef;
 import org.opensearch.action.OriginalIndices;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchResponseSections;
@@ -22,9 +23,7 @@ import org.opensearch.common.regex.Regex;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateFormatters;
 import org.opensearch.common.util.BigArrays;
-import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
-import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.common.bytes.BytesArray;
@@ -32,11 +31,12 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
-import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
+import org.opensearch.infino.InfinoQueryTranslator.Bonus;
+import org.opensearch.infino.InfinoQueryTranslator.Scoring;
 import org.opensearch.infino.InfinoQueryTranslator.TextClause;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
 import org.opensearch.infino.InfinoScriptTranslator.Sql;
@@ -64,8 +64,6 @@ import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.search.sort.SortMode;
 import org.opensearch.search.sort.SortOrder;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -80,6 +78,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 /**
  * Answers one {@code _search} for one Infino-backed index from its table,
@@ -112,6 +112,12 @@ public final class InfinoSearch {
      * filter while it collects), so such a page asks for the page alone.
      */
     private static final int RANK_WINDOW = 10_000;
+    /**
+     * The most score bands a scored statement ranks apart ({@link #scoredStatement}):
+     * past this the text clause's candidates are ranked once, over
+     * {@link #RANK_WINDOW} of them, and scored after.
+     */
+    private static final int MAX_SCORE_BANDS = 64;
     /** OpenSearch's page size when the request names none. */
     static final int DEFAULT_SIZE = 10;
     /** The node name a hit's shard target carries; it only names the index in the response. */
@@ -126,6 +132,10 @@ public final class InfinoSearch {
     private static final int ROW_ID_DIGITS = 38;
     /** The sort a scroll without one pages by: the document id, which {@link #columnFor} resolves to the id column. */
     private static final String ID_SORT_FIELD = "_id";
+    /** The alias the hit statement selects a collapsed hit's own value under, unless the plan has a name of that kind ({@link #freeAlias}). */
+    private static final String COLLAPSE_KEY = "collapse_key";
+    /** The alias of a collapse's window rank, likewise. */
+    private static final String COLLAPSE_RANK = "collapse_rank";
 
     private InfinoSearch() {}
 
@@ -165,7 +175,7 @@ public final class InfinoSearch {
         /** This plan with {@code predicate} required of every row, the hits', the total's and the aggregations' alike. */
         Plan requiring(String predicate) {
             String where = InfinoQueryTranslator.ALL.equals(query.where()) ? predicate : "(" + query.where() + ") AND " + predicate;
-            Translation narrowed = new Translation(query.table(), where, query.principal());
+            Translation narrowed = query.withWhere(where);
             return new Plan(table, cols, narrowed, sorts, vector, postWhere, collapse, searchAfter, scriptFields, access, nowMillis);
         }
     }
@@ -175,8 +185,152 @@ public final class InfinoSearch {
      * {@code expr} is what the statement orders by and selects, {@code name}
      * the alias its value comes back under (the column's name, or one made
      * for a script), {@code type} how a search_after value for it is written.
+     * {@code nullsFirst} puts the rows missing the value before the others
+     * (the request's {@code missing: _first}); by default they come last,
+     * in either direction, as stock's {@code _last}. {@code noneMissing}
+     * marks a sort whose expression gives every row a value (the request's
+     * {@code missing} value stands in), so no search_after value for it
+     * stands for a missing one.
      */
-    record SortSpec(String expr, String name, SqlType type, boolean desc) {
+    record SortSpec(String expr, String name, SqlType type, boolean desc, boolean nullsFirst, boolean noneMissing) {
+        SortSpec(String expr, String name, SqlType type, boolean desc) {
+            this(expr, name, type, desc, false, false);
+        }
+
+        /** {@link #withMissing(Object, boolean, long)} on a field not mapped {@code float} or {@code half_float}. */
+        SortSpec withMissing(Object missing, long nowMillis) {
+            return withMissing(missing, false, nowMillis);
+        }
+
+        /**
+         * This sort under the request's {@code missing}: {@code _last} (or
+         * none) as it is, {@code _first} with the missing rows first, and any
+         * other value standing in for a missing one, as stock sorts such a
+         * row by that value and hands it back as the hit's sort value.
+         * {@code asFloat} marks a field mapped {@code float} or
+         * {@code half_float}, whose value stock's comparator reads as a
+         * 32-bit float. A boolean's value is a long, as stock's comparator
+         * reads it (a present value is 0 or 1), so the sort becomes one on
+         * longs. An infinite floating-point value (or NaN, which stock's
+         * comparator orders past every other) puts the missing rows past
+         * every present value on its side, as {@code _first} or
+         * {@code _last} does: no present value is one, since stock refuses
+         * a non-finite value for a floating-point field.
+         */
+        SortSpec withMissing(Object missing, boolean asFloat, long nowMillis) {
+            if (missing == null) {
+                return this;
+            }
+            String text = missing instanceof BytesRef b ? b.utf8ToString() : missing.toString();
+            if ("_last".equals(text)) {
+                return this;
+            }
+            if ("_first".equals(text)) {
+                return new SortSpec(expr, name, type, desc, true, false);
+            }
+            Object value = missing instanceof BytesRef ? text : missing;
+            if (type == SqlType.FLOAT) {
+                Double d = floating(value, asFloat);
+                if (d == null) {
+                    throw notA(text, "float");
+                }
+                if (!Double.isFinite(d)) {
+                    boolean greatest = d != Double.NEGATIVE_INFINITY;
+                    return new SortSpec(expr, name, type, desc, greatest == desc, false);
+                }
+                return new SortSpec("COALESCE(" + expr + ", " + Double.toString(d) + ")", name, type, desc, false, true);
+            }
+            if (type == SqlType.BOOL) {
+                Long l = integral(value);
+                if (l == null) {
+                    throw notA(text, "long");
+                }
+                return new SortSpec("COALESCE(CAST(" + expr + " AS BIGINT), " + l + ")", name, SqlType.INT, desc, false, true);
+            }
+            String lit = replacement(value, nowMillis);
+            if (lit == null) {
+                throw notA(text, type.name().toLowerCase(Locale.ROOT));
+            }
+            return new SortSpec("COALESCE(" + expr + ", " + lit + ")", name, type, desc, false, true);
+        }
+
+        private IllegalArgumentException notA(String text, String what) {
+            return new IllegalArgumentException("[infino] sort missing value [" + text + "] on [" + name + "] is not a " + what);
+        }
+
+        /**
+         * The request's {@code missing} value as a literal of this sort's
+         * type, read as stock's comparator reads it: a number as a long for
+         * an integer or a date (3.5 is 3, a date's number its epoch
+         * milliseconds), and text parsed as one; null when it is not one.
+         */
+        private String replacement(Object missing, long nowMillis) {
+            return switch (type) {
+                case INT -> {
+                    Long l = integral(missing);
+                    yield l == null ? null : Long.toString(l);
+                }
+                case DATE -> {
+                    Long l = integral(missing);
+                    yield l == null ? null : "arrow_cast(" + l + ", 'Timestamp(Millisecond, Some(\"UTC\"))')";
+                }
+                default -> {
+                    try {
+                        yield InfinoQueryTranslator.literalForType(type, missing, nowMillis);
+                    } catch (NumberFormatException e) {
+                        yield null;
+                    }
+                }
+            };
+        }
+
+        /** {@code missing} as stock's long comparator reads it: a number cut to a long, text parsed as one; null when it is not one. */
+        private static Long integral(Object missing) {
+            try {
+                return missing instanceof Number n ? n.longValue() : Long.parseLong(missing.toString());
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+
+        /**
+         * {@code missing} as stock's floating-point comparator reads it: a
+         * 32-bit float when {@code asFloat}, else a double, from a number or
+         * parsed text; null when it is not one.
+         */
+        private static Double floating(Object missing, boolean asFloat) {
+            try {
+                if (asFloat) {
+                    return (double) (missing instanceof Number n ? n.floatValue() : Float.parseFloat(missing.toString()));
+                }
+                return missing instanceof Number n ? n.doubleValue() : Double.parseDouble(missing.toString());
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+
+        /**
+         * Whether {@code value}, a search_after value for this sort, is the
+         * stand-in a default-mode hit hands back for a row missing the value
+         * (the least or greatest long, or an infinity, whichever sorts on the
+         * missing rows' side): the client sends back what the hit gave it, and
+         * the page continues among the missing rows, as stock compares them.
+         */
+        boolean missingStandIn(Object value) {
+            if (noneMissing) {
+                return false;
+            }
+            boolean least = desc != nullsFirst;
+            return switch (type) {
+                case INT, DATE -> value instanceof Number n
+                    && !(value instanceof Double || value instanceof Float)
+                    && n.longValue() == (least ? Long.MIN_VALUE : Long.MAX_VALUE)
+                    || value instanceof String t && t.equals(Long.toString(least ? Long.MIN_VALUE : Long.MAX_VALUE));
+                case FLOAT -> value instanceof Number n && n.doubleValue() == (least ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY)
+                    || value instanceof String t && t.equals(least ? "-Infinity" : "Infinity");
+                default -> false;
+            };
+        }
         static SortSpec of(Column c, boolean desc) {
             return new SortSpec(InfinoQueryTranslator.quoteIdent(c.name()), c.name(), InfinoScriptTranslator.typeOf(c), desc);
         }
@@ -293,10 +447,17 @@ public final class InfinoSearch {
                 throw InfinoAccess.refused("a vector query under document-level security is not served; the engine's vector search takes no predicate");
             }
             String where = InfinoQueryTranslator.ALL.equals(query.where()) ? rule : "(" + query.where() + ") AND " + rule;
-            query = new Translation(query.table(), where, query.principal());
+            query = query.withWhere(where);
         }
         log.debug("[infino] query {} -> FROM {} WHERE {}", qb, query.from(), query.where());
-        List<SortSpec> sorts = sorts(source.sorts(), cols, nowMillis);
+        List<SortSpec> sorts = sorts(source.sorts(), cols, InfinoNative.floatFields(table), nowMillis);
+        if (sorts.isEmpty() && sortsByDocFirst(source)) {
+            // Stock orders such a page by the index and scores nothing, so
+            // the clauses' scores never reorder it.
+            query = query.unscored();
+        } else if (sorts.isEmpty() && sortsByScoreAscending(source)) {
+            query = query.ascending();
+        }
         String postWhere = null;
         if (source.postFilter() != null) {
             if (vector != null) {
@@ -357,6 +518,12 @@ public final class InfinoSearch {
             }
             if (vector != null) {
                 throw new IllegalArgumentException("[infino] search_after is not served with a vector query");
+            }
+            searchAfter = searchAfter.clone();
+            for (int i = 0; i < searchAfter.length; i++) {
+                if (searchAfter[i] != null && sorts.get(i).missingStandIn(searchAfter[i])) {
+                    searchAfter[i] = null;
+                }
             }
         }
         Plan plan = new Plan(table, cols, query, sorts, vector, postWhere, collapse, searchAfter, scriptFields, access, nowMillis);
@@ -437,6 +604,15 @@ public final class InfinoSearch {
      * has no column for. {@code nowMillis} is what a script's clock reads.
      */
     static List<SortSpec> sorts(List<SortBuilder<?>> sorts, Map<String, Column> cols, long nowMillis) {
+        return sorts(sorts, cols, Set.of(), nowMillis);
+    }
+
+    /**
+     * {@link #sorts(List, Map, long)}, where {@code floatFields} are the
+     * fields mapped {@code float} or {@code half_float}, whose sort's
+     * {@code missing} value stock reads as a 32-bit float.
+     */
+    static List<SortSpec> sorts(List<SortBuilder<?>> sorts, Map<String, Column> cols, Set<String> floatFields, long nowMillis) {
         List<SortSpec> out = new ArrayList<>();
         if (sorts == null) {
             return out;
@@ -471,9 +647,10 @@ public final class InfinoSearch {
                 throw InfinoAccess.refused("sort on [" + fs.getFieldName() + "], a field masked for this user, is not served");
             }
             boolean desc = fs.order() == SortOrder.DESC;
+            boolean asFloat = floatFields.contains(InfinoQueryTranslator.fieldOf(c.name()));
             Column values = c.isList() ? c : InfinoQueryTranslator.listOf(cols, c);
             if (values == null) {
-                out.add(SortSpec.of(c, desc));
+                out.add(SortSpec.of(c, desc).withMissing(fs.missing(), asFloat, nowMillis));
                 continue;
             }
             SortMode mode = fs.sortMode();
@@ -483,16 +660,16 @@ public final class InfinoSearch {
             // Stock's default mode is the least value ascending and the greatest
             // descending; an explicit min or max picks that value either way.
             boolean greatest = mode == null ? desc : mode == SortMode.MAX;
-            out.add(SortSpec.ofValues(c, values, greatest, desc));
+            out.add(SortSpec.ofValues(c, values, greatest, desc).withMissing(fs.missing(), asFloat, nowMillis));
         }
         return out;
     }
 
-    /** ORDER BY terms for the sorts: each expression in its direction, missing values last. */
+    /** ORDER BY terms for the sorts: each expression in its direction, missing values where the sort puts them. */
     static List<String> orderBy(List<SortSpec> sorts) {
         List<String> out = new ArrayList<>(sorts.size());
         for (SortSpec s : sorts) {
-            out.add(s.expr() + (s.desc() ? " DESC" : " ASC") + " NULLS LAST");
+            out.add(s.expr() + (s.desc() ? " DESC" : " ASC") + (s.nullsFirst() ? " NULLS FIRST" : " NULLS LAST"));
         }
         return out;
     }
@@ -519,22 +696,107 @@ public final class InfinoSearch {
     // ---- one index ----
 
     /**
+     * The total: what the query and post_filter keep, before any collapse
+     * and regardless of where the page starts, counted up to {@code cap}
+     * (see {@link #count(String, Translation, long)}).
+     */
+    private static long total(Plan plan, long cap) {
+        Translation q = plan.query();
+        return plan.postWhere() == null ? count(plan.table(), q, cap) : count(plan.table(), q.withWhere(plan.hitWhere()), cap);
+    }
+
+    /** A page's rows, and its exact total when it was counted before them (null otherwise). */
+    record CountedRows(List<Map<String, Object>> rows, Long total) {}
+
+    /**
+     * Whether a page's exact total is counted before its rows: a scored page
+     * ({@link #scoredPage}), the costliest statement to plan, when the
+     * request counts an exact total anyway ({@code count} and its
+     * {@code track_total_hits}).
+     */
+    static boolean countsFirst(SearchSourceBuilder source, boolean count, boolean scored) {
+        return scored && count && trackTotal(source);
+    }
+
+    /**
+     * A page's rows from {@code hits}, its total from {@code total} first
+     * when {@code countFirst}: a total of 0 leaves no hit to read, and the
+     * hit statement is not planned at all.
+     */
+    static CountedRows countedRows(boolean countFirst, LongSupplier total, Supplier<List<Map<String, Object>>> hits) {
+        if (!countFirst) {
+            return new CountedRows(hits.get(), null);
+        }
+        long counted = total.getAsLong();
+        return new CountedRows(counted == 0 ? List.of() : hits.get(), counted);
+    }
+
+    /**
+     * The page's rows from its hit statement, with their sources when they
+     * are read by id; {@code resumed} as {@link #page} takes it.
+     */
+    private static List<Map<String, Object>> hitRows(
+        Plan plan,
+        SearchSourceBuilder source,
+        int fetch,
+        boolean seqNoAndPrimaryTerm,
+        boolean resumed
+    ) {
+        if (readsUnsorted(plan, resumed)) {
+            return InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm, wantsSource(source)));
+        }
+        List<Map<String, Object>> rows;
+        if (splitsMissingTail(plan)) {
+            // The rows past a present first sort value come first; the
+            // rows missing it follow them all, so they are read only
+            // when the first part leaves the page short.
+            rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
+            if (rows.size() < fetch) {
+                rows = new ArrayList<>(rows);
+                rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
+            }
+        } else {
+            rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
+            if (rows.size() < fetch && rankedInWindow(plan)) {
+                // The rows removed after the ranking may have used up the window
+                // while matches remain past it (a minimum_should_match count, a
+                // text clause on another column): rank every candidate then, so
+                // the page holds what the total counts.
+                TextClause text = plan.query().principal();
+                long candidates = InfinoNative.count(plan.table(), text.column(), text.query(), text.mode());
+                if (candidates > RANK_WINDOW) {
+                    int window = (int) Math.min(Integer.MAX_VALUE, candidates);
+                    rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.WHOLE, window));
+                }
+            }
+        }
+        if (sourcesById(plan) && wantsSource(source)) {
+            rows = withSources(plan.table(), rows, fetch);
+        }
+        return rows;
+    }
+
+    /**
      * The hits of one index for the request's window, each carrying its
      * source, with the total. With {@code count} false an exact total is left
      * for the caller, which reads it beside the aggregations (the page's total
      * is then 0 until replaced).
      */
     static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count) {
-        return page(index, plan, source, count, false);
+        return page(index, plan, source, count, false, false);
     }
 
     /**
-     * As {@link #page(Index, Plan, SearchSourceBuilder, boolean)}; with
+     * As {@link #page(Index, Plan, SearchSourceBuilder, boolean)}. With
      * {@code capTotal} the total is counted only as far as the request's
      * {@code track_total_hits} limit needs (see {@link #countCap}), which a
-     * scroll, whose later rounds carry the first round's total, does not ask for.
+     * scroll, whose later rounds carry the first round's total, does not ask
+     * for. With {@code resumed} a later page resumes after this page's last
+     * hit from its sort values (a scroll's): those must then carry the row id
+     * the sort is broken by, so the page is read in its sort's order even
+     * when that sort orders nothing ({@link #sortsNothing}).
      */
-    static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count, boolean capTotal) {
+    static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count, boolean capTotal, boolean resumed) {
         final int from = Math.max(0, source.from());
         final int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
         final int fetch = from + size;
@@ -550,6 +812,11 @@ public final class InfinoSearch {
         // A vector hit's sequence number, by id, when the request asks for it: the
         // vector entry points return ids and scores only.
         Map<String, Long> vectorSeqs = Map.of();
+        boolean exact = trackTotal(source);
+        long cap = capTotal ? countCap(source) : Long.MAX_VALUE;
+        // The exact total, when it is read before the page: see the scored page below.
+        Long counted = null;
+        boolean shortPage = false;
         if (size == 0 && !stockKnn) {
             rows = List.of();
         } else if (plan.vector() != null) {
@@ -587,36 +854,41 @@ public final class InfinoSearch {
             TextClause text = q.principal();
             rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
         } else {
-            rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
-            if (sourcesById(plan) && wantsSource(source)) {
-                rows = withSources(plan.table(), rows, fetch);
-            }
+            CountedRows read = countedRows(
+                countsFirst(source, count, scoredPage(plan)),
+                () -> total(plan, cap),
+                () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed)
+            );
+            rows = read.rows();
+            counted = read.total();
+            shortPage = rows.size() < fetch && shortPageIsTotal(plan);
         }
 
-        boolean exact = trackTotal(source);
         long total;
         if (plan.vector() != null) {
             total = rows.size(); // kNN is inherently top-k
         } else if (exact && !count) {
             total = 0;
+        } else if (exact && counted != null) {
+            total = counted;
+        } else if (exact && shortPage) {
+            total = rows.size();
         } else if (exact) {
-            // The total counts what the query and post_filter keep, before
-            // any collapse and regardless of where the page starts.
-            long cap = capTotal ? countCap(source) : Long.MAX_VALUE;
-            total = plan.postWhere() == null
-                ? count(plan.table(), q, cap)
-                : count(plan.table(), new Translation(q.table(), plan.hitWhere(), q.principal()), cap);
+            total = total(plan, cap);
         } else {
             total = rows.size();
         }
 
-        FetchSourceContext sourceFilter = sourceFilter(source.fetchSource());
         boolean withSource = returnsSource(source);
-        List<FieldAndFormat> fields = requestedFields(source.docValueFields(), source.fetchFields());
+        // What the mapping's _source keeps of each document: the table keeps it whole.
+        List<FieldAndFormat> docValueFields = requestedFields(source.docValueFields(), null);
+        List<FieldAndFormat> fetchFields = requestedFields(null, source.fetchFields());
+        InfinoMappingSource stored = withSource || !fetchFields.isEmpty() ? InfinoMappingSource.of(mapping(index)) : InfinoMappingSource.WHOLE;
         boolean version = Boolean.TRUE.equals(source.version());
         SearchShardTarget target = target(index);
         List<SearchHit> hits = new ArrayList<>();
         float maxScore = Float.NaN;
+        String collapseKey = plan.collapse() == null ? null : freeAlias(plan, COLLAPSE_KEY);
         // Every row up to the window's end: the window itself is applied once,
         // over the merged pages, as a coordinator applies it over its shards.
         int end = Math.min(rows.size(), fetch);
@@ -630,15 +902,21 @@ public final class InfinoSearch {
             h.shard(target);
             float score = Float.NaN;
             Object s = row.get("score");
+            // What the clauses every hit matches add to each hit's score alike.
+            double offset = q.scoring().offset();
             if (s instanceof Number n) {
                 score = n.floatValue();
                 if (stockKnn) {
                     score = InfinoStockKnn.score(space, score);
                 } else if (knnDistance) {
                     score = 1.0f / (1.0f + score);
+                } else if (plan.vector() == null) {
+                    score = (float) (n.doubleValue() + offset);
                 }
             } else if (plan.sorts().isEmpty()) {
-                score = 1.0f; // a filter-only request scores every hit alike, as Lucene does
+                // A filter-only request scores every hit alike, as Lucene does: by
+                // what its scoring clauses add (a must term 1.0), else 1.0.
+                score = offset > 0 ? (float) offset : 1.0f;
             }
             h.score(score);
             if (!Float.isNaN(score)) {
@@ -657,15 +935,20 @@ public final class InfinoSearch {
                 );
                 h.setPrimaryTerm(InfinoDocumentVersion.PRIMARY_TERM);
             }
-            if (withSource || !fields.isEmpty()) {
+            if (withSource || !docValueFields.isEmpty() || !fetchFields.isEmpty()) {
                 String src = String.valueOf(row.get(InfinoQueryTranslator.SOURCE));
                 // The source as the user may see it: hidden fields gone, masked values hashed.
                 src = plan.access().read(id.toString(), src);
                 if (src != null && !src.isEmpty()) {
+                    // A disabled source is refused on the hits a response carries,
+                    // not here: the page holds every row up to the window's end.
                     if (withSource) {
-                        h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
+                        BytesReference shown = stored.shown(src, source.fetchSource());
+                        if (shown != null) {
+                            h.sourceRef(shown);
+                        }
                     }
-                    fillFields(h, src, fields, plan.cols());
+                    fillRequested(h, src, stored, docValueFields, fetchFields, plan.cols());
                 }
             }
             if (!plan.sorts().isEmpty()) {
@@ -680,7 +963,7 @@ public final class InfinoSearch {
             if (plan.collapse() != null) {
                 // A collapsed hit carries its collapse value, as stock does.
                 String field = plan.collapse().name();
-                Object value = row.get(field);
+                Object value = row.get(collapseKey);
                 h.setDocumentField(field, new DocumentField(field, value == null ? List.of() : List.of(value)));
             }
             for (ScriptedField sf : plan.scriptFields()) {
@@ -694,6 +977,35 @@ public final class InfinoSearch {
     }
 
     /**
+     * Whether the page's hits are the principal's BM25 ranking cut to
+     * {@link #RANK_WINDOW} candidates before a step removes rows
+     * ({@link #hitStatement}), so a page that step leaves short may have
+     * matches past the window.
+     */
+    static boolean rankedInWindow(Plan plan) {
+        String where = plan.hitWhere();
+        return plan.searchAfter() == null
+            && plan.sorts().isEmpty()
+            && !scoredPage(plan)
+            && plan.query().principal() != null
+            && (InfinoQueryTranslator.joinsAfterRanking(where) || (!InfinoQueryTranslator.ALL.equals(where) && plan.collapse() != null));
+    }
+
+    /**
+     * Whether a page the hit statement could not fill holds every row its
+     * predicate keeps, and that predicate is the total's, so its length is
+     * the total: no keyset, collapse or ranked window narrows it. An
+     * optional text clause ranks its matches in a window too
+     * ({@link #scoredStatement}), though the plan has no principal.
+     */
+    static boolean shortPageIsTotal(Plan plan) {
+        return plan.query().principal() == null
+            && plan.query().scoring().text() == null
+            && plan.searchAfter() == null
+            && plan.collapse() == null;
+    }
+
+    /**
      * Whether the page's hits are the BM25 ranking of the request's text
      * clause and nothing more: no other predicate (a filter, a post_filter, a
      * security rule), no sort, no search_after, no collapse and no scripted
@@ -702,6 +1014,7 @@ public final class InfinoSearch {
      */
     static boolean bareRanked(Plan plan) {
         return plan.query().principal() != null
+            && !plan.query().scoring().reorders()
             && InfinoQueryTranslator.ALL.equals(plan.hitWhere())
             && plan.sorts().isEmpty()
             && plan.searchAfter() == null
@@ -764,6 +1077,130 @@ public final class InfinoSearch {
      * row of each collapse value in the request's order, through a window.
      */
     static String hitStatement(Plan plan, int fetch, boolean withSeq) {
+        return hitStatement(plan, fetch, withSeq, Keyset.WHOLE);
+    }
+
+    /** Which of a search_after's rows a hit statement reads (see {@link #splitsMissingTail}). */
+    enum Keyset {
+        /** Every row past the search_after values. */
+        WHOLE,
+        /** The rows past them whose first sort value is present. */
+        PRESENT,
+        /** The rows missing the first sort value, which sort after every present one. */
+        MISSING
+    }
+
+    /**
+     * Whether the page is read as the unsorted search reads it: its sort
+     * orders nothing ({@link #sortsNothing}), so every hit's sort value is
+     * missing and the page is the predicate's rows in no order, as stock
+     * reads a sort on a field no document has. The hits still carry the
+     * sort. Not when a later page resumes from the hits' sort values
+     * ({@code resumed}, a scroll): the unsorted read selects no row id, so
+     * every value would be missing and the keyset past them would keep no
+     * row; that page is read in the sort's order, the row id's.
+     */
+    static boolean readsUnsorted(Plan plan, boolean resumed) {
+        return !resumed && sortsNothing(plan);
+    }
+
+    /**
+     * The statement {@link #readsUnsorted} reads a page with: the sorted
+     * statement's rows ({@link #hitStatement}, unranked, as a field sort
+     * selects them) in row id order, the order the sort's tiebreak gives
+     * them, each with its source when {@code withSource} (the hit returns it
+     * or reads requested fields from it). A text query is neither ranked by
+     * BM25 nor scored, so the page is the rows the sorted read would select,
+     * not the best-scoring ones. With no order, a read can start from any
+     * file, so two pages of one search could skip rows between them.
+     */
+    static String unsortedStatement(Plan plan, int fetch, boolean withSeq, boolean withSource) {
+        String hit = InfinoQueryTranslator.OSID
+            + (withSource ? ", " + InfinoQueryTranslator.SOURCE : "")
+            + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "");
+        return "SELECT " + hit + " FROM " + plan.query().from() + " WHERE " + plan.hitWhere()
+            + " ORDER BY " + InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID) + " LIMIT " + fetch;
+    }
+
+    /**
+     * Whether the page's sort orders nothing: one field's own column, then
+     * the row id, from the page's start, over a column no row of the table
+     * holds a value in (where every value is missing, missing first or last
+     * and either direction order the same). The column's presence is counted
+     * from the superfiles' statistics, with no row read.
+     */
+    static boolean sortsNothing(Plan plan) {
+        List<SortSpec> sorts = plan.sorts();
+        if (plan.vector() != null || plan.collapse() != null || plan.searchAfter() != null || !plan.scriptFields().isEmpty() || sorts.size() != 2) {
+            return false;
+        }
+        SortSpec first = sorts.get(0);
+        SortSpec tie = sorts.get(1);
+        if (!tie.name().equals(InfinoSql.ROW_ID)
+            || tie.desc()
+            || first.name().equals(InfinoSql.ROW_ID)
+            || first.name().equals(InfinoQueryTranslator.OSID)
+            || !first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()))) {
+            return false;
+        }
+        long[] present = InfinoNative.countWhere(plan.table(), List.of(first.expr() + " IS NOT NULL"));
+        return present.length == 1 && present[0] == 0;
+    }
+
+    /**
+     * Whether a search_after page is read in two parts: the rows past a
+     * present first sort value, then, only when those leave the page short,
+     * the rows missing that value. Missing values sort last, so the second
+     * part follows the first whole, and the first part is a plain range on
+     * the sort column, which the engine answers from its range index; one
+     * statement holding both would weigh {@code s < v OR s IS NULL} on every
+     * row. Not under a collapse, whose window ranks a value's rows across
+     * both parts; not under {@code missing: _first}, whose missing rows
+     * come before every present one; and not under a {@code missing}
+     * value, which leaves no row missing the sort's value.
+     */
+    static boolean splitsMissingTail(Plan plan) {
+        Object[] after = plan.searchAfter();
+        if (after == null || after.length == 0 || after[0] == null || plan.collapse() != null) {
+            return false;
+        }
+        SortSpec first = plan.sorts().get(0);
+        return !first.name().equals(InfinoSql.ROW_ID) && !first.nullsFirst() && !first.noneMissing();
+    }
+
+    /**
+     * {@code base}, or that with as many leading underscores as it takes to
+     * be a name no column, sort or scripted field of the plan selects or
+     * reads: an alias of the hit statement's own, which a field of the same
+     * name would make ambiguous.
+     */
+    static String freeAlias(Plan plan, String base) {
+        Set<String> taken = new HashSet<>(plan.cols().keySet());
+        taken.add(InfinoQueryTranslator.OSID);
+        taken.add(InfinoQueryTranslator.SOURCE);
+        taken.add(InfinoQueryTranslator.SEQ);
+        for (SortSpec s : plan.sorts()) {
+            taken.add(s.name());
+        }
+        for (ScriptedField sf : plan.scriptFields()) {
+            taken.add(sf.alias());
+        }
+        String alias = base;
+        while (taken.contains(alias)) {
+            alias = "_" + alias;
+        }
+        return alias;
+    }
+
+    static String hitStatement(Plan plan, int fetch, boolean withSeq, Keyset part) {
+        return hitStatement(plan, fetch, withSeq, part, RANK_WINDOW);
+    }
+
+    /**
+     * As {@link #hitStatement(Plan, int, boolean, Keyset)}, ranking
+     * {@code window} candidates where a step removes rows after the ranking.
+     */
+    static String hitStatement(Plan plan, int fetch, boolean withSeq, Keyset part, int window) {
         Translation q = plan.query();
         StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID);
         if (!sourcesById(plan)) {
@@ -778,17 +1215,24 @@ public final class InfinoSearch {
             }
             hit.append(", ").append(s.expr()).append(" AS ").append(InfinoQueryTranslator.quoteIdent(s.name()));
         }
-        if (plan.collapse() != null && plan.sorts().stream().noneMatch(s -> s.name().equals(plan.collapse().name()))) {
-            hit.append(", ").append(InfinoQueryTranslator.quoteIdent(plan.collapse().name()));
+        if (plan.collapse() != null) {
+            // Under its own alias: a sort on the column under a missing value selects the stand-in under the column's name.
+            hit.append(", ")
+                .append(InfinoQueryTranslator.quoteIdent(plan.collapse().name()))
+                .append(" AS ")
+                .append(InfinoQueryTranslator.quoteIdent(freeAlias(plan, COLLAPSE_KEY)));
         }
         for (ScriptedField sf : plan.scriptFields()) {
             hit.append(", ").append(sf.expr()).append(" AS ").append(sf.alias());
         }
         String where = plan.hitWhere();
         if (plan.searchAfter() != null) {
-            where = "(" + where + ") AND " + keysetPredicate(plan);
+            where = "(" + where + ") AND " + keysetPredicate(plan, part);
         }
         boolean sorted = !plan.sorts().isEmpty();
+        if (scoredPage(plan)) {
+            return scoredStatement(plan, hit.toString(), where, fetch, withSeq);
+        }
         boolean ranked = !sorted && q.principal() != null;
         String from;
         String order;
@@ -811,7 +1255,7 @@ public final class InfinoSearch {
             // ranking needs more candidates to choose from.
             boolean filtered = !InfinoQueryTranslator.ALL.equals(where);
             boolean narrowedAfterRanking = InfinoQueryTranslator.joinsAfterRanking(where) || (filtered && plan.collapse() != null);
-            from = q.rankedFrom(narrowedAfterRanking ? RANK_WINDOW : fetch);
+            from = q.rankedFrom(narrowedAfterRanking ? window : fetch);
             hit.append(", score");
             order = "score DESC";
         } else {
@@ -825,20 +1269,152 @@ public final class InfinoSearch {
         // id's order when the request names none, so the page is stable).
         String within = order == null ? InfinoQueryTranslator.OSID + " ASC" : order;
         String partition = InfinoQueryTranslator.quoteIdent(plan.collapse().name());
+        String rank = InfinoQueryTranslator.quoteIdent(freeAlias(plan, COLLAPSE_RANK));
         return "SELECT " + hit + " FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY " + within
-            + ") AS collapse_rank FROM " + from + " t WHERE " + where + ") WHERE collapse_rank = 1"
+            + ") AS " + rank + " FROM " + from + " t WHERE " + where + ") WHERE " + rank + " = 1"
             + (order == null ? "" : " ORDER BY " + order) + " LIMIT " + fetch;
+    }
+
+    /**
+     * Whether the page is ranked by more than the principal's BM25
+     * ({@link Scoring#reorders}), in no other order, and read by
+     * {@link #scoredStatement}.
+     */
+    static boolean scoredPage(Plan plan) {
+        return plan.sorts().isEmpty() && plan.collapse() == null && plan.searchAfter() == null && plan.query().scoring().reorders();
+    }
+
+    /**
+     * The statement for a page ranked by more than one clause's BM25
+     * ({@link Scoring#reorders}): each hit scores the BM25 of the text clause
+     * where it matches, plus what each other scoring clause adds where it
+     * matches ({@code infino_bonus}, a SQL number per row), as Lucene sums a
+     * bool's clauses; the page is the hits with the greatest sums. The
+     * engine ranks by BM25 alone, so the hits are cut into bands that share
+     * one bonus (the bonus takes few values: the sums of its clauses'
+     * scores) and each band's best by BM25 is ranked within it, the band's
+     * bounds riding with the ranked search as its filter; the page is the
+     * best of those. When the text clause is optional (a should beside no
+     * ranked clause), the hits it does not match score their bonus alone,
+     * the best of them read by it. With no text clause at all, the bonus is
+     * the score.
+     */
+    static String scoredStatement(Plan plan, String hit, String where, int fetch, boolean withSeq) {
+        Translation q = plan.query();
+        Scoring scoring = q.scoring();
+        String rowId = InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID);
+        List<String> names = new ArrayList<>();
+        names.add(InfinoQueryTranslator.OSID);
+        names.add(InfinoQueryTranslator.SOURCE);
+        if (withSeq) {
+            names.add(InfinoQueryTranslator.SEQ);
+        }
+        for (ScriptedField sf : plan.scriptFields()) {
+            names.add(sf.alias());
+        }
+        List<String> parts = new ArrayList<>();
+        // The relations the bonuses read, joined to each branch's rows by id.
+        StringBuilder joins = new StringBuilder();
+        for (Bonus b : scoring.bonuses()) {
+            parts.add("(" + b.expr() + ")");
+            if (b.join() != null) {
+                joins.append(b.join());
+            }
+        }
+        String bonus = parts.isEmpty() ? "0.0" : String.join(" + ", parts);
+        TextClause text = q.principal() != null ? q.principal() : scoring.text();
+        List<String> branches = new ArrayList<>();
+        if (text == null) {
+            branches.add("SELECT " + hit + ", 0.0 AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.from() + joins + " WHERE " + where);
+        } else {
+            // An optional text clause is a subquery in the predicate: true of every
+            // row its ranked search returns, false of every other.
+            String match = q.principal() != null ? null : q.textMatch(text);
+            String ranked = match == null ? where : where.replace(match, InfinoQueryTranslator.ALL);
+            List<Double> sums = bonusSums(scoring.bonuses());
+            if (sums == null) {
+                branches.add(
+                    "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.rankedFrom(text, RANK_WINDOW) + joins + " WHERE " + ranked
+                );
+            } else {
+                // A band's bounds on a joined bonus are no filter the ranked search takes.
+                boolean afterRanking = InfinoQueryTranslator.joinsAfterRanking(ranked) || InfinoQueryTranslator.joinsAfterRanking(bonus) || joins.length() > 0;
+                int k = afterRanking ? RANK_WINDOW : fetch;
+                for (int i = 0; i < sums.size(); i++) {
+                    // The band around this sum: from halfway to the one below, to halfway to the one above.
+                    List<String> band = new ArrayList<>();
+                    if (!InfinoQueryTranslator.ALL.equals(ranked)) {
+                        band.add("(" + ranked + ")");
+                    }
+                    if (i > 0) {
+                        band.add("(" + bonus + ") >= " + InfinoQueryTranslator.scoreLiteral((sums.get(i - 1) + sums.get(i)) / 2));
+                    }
+                    if (i < sums.size() - 1) {
+                        band.add("(" + bonus + ") < " + InfinoQueryTranslator.scoreLiteral((sums.get(i) + sums.get(i + 1)) / 2));
+                    }
+                    branches.add(
+                        "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.rankedFrom(text, k) + joins
+                            + (band.isEmpty() ? "" : " WHERE " + String.join(" AND ", band))
+                    );
+                }
+            }
+            if (match != null) {
+                String rest = "(" + where.replace(match, InfinoQueryTranslator.NONE) + ") AND " + InfinoQueryTranslator.not(match);
+                branches.add(
+                    "SELECT * FROM (SELECT " + hit + ", 0.0 AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row FROM " + q.from() + joins + " WHERE " + rest
+                        + " ORDER BY infino_bonus DESC, infino_row ASC LIMIT " + fetch + ") AS infino_rest"
+                );
+            }
+        }
+        // Hits that tie on score come in the order they were written, as stock orders them by their place in the index.
+        return "SELECT " + String.join(", ", names) + ", infino_bm25 + infino_bonus AS score FROM (" + String.join(" UNION ALL ", branches)
+            + ") AS infino_scored ORDER BY score " + (scoring.ascending() ? "ASC" : "DESC") + ", infino_row ASC LIMIT " + fetch;
+    }
+
+    /**
+     * Every sum the bonuses can take on a row, ascending: 0, and each sum of
+     * one score from any of them. Null past {@link #MAX_SCORE_BANDS}.
+     */
+    static List<Double> bonusSums(List<Bonus> bonuses) {
+        java.util.TreeSet<Double> sums = new java.util.TreeSet<>(List.of(0.0));
+        for (Bonus b : bonuses) {
+            java.util.TreeSet<Double> next = new java.util.TreeSet<>(sums);
+            for (double s : sums) {
+                for (double v : b.values()) {
+                    next.add(s + v);
+                }
+            }
+            sums = next;
+            if (sums.size() > MAX_SCORE_BANDS) {
+                return null;
+            }
+        }
+        // Sums that differ only by rounding are one band.
+        List<Double> out = new ArrayList<>();
+        for (double s : sums) {
+            if (out.isEmpty() || s - out.get(out.size() - 1) > 1e-9) {
+                out.add(s);
+            }
+        }
+        return out;
     }
 
     /**
      * The rows after the search_after values in the request's sort order:
      * {@code (s1 > v1) OR (s1 = v1 AND s2 > v2) OR ...}, each comparison
-     * turned for a descending sort. The order puts missing values last, so
-     * after a present value the missing rows still follow ({@code OR s IS
-     * NULL}), after a missing one only the deeper sorts decide, and a
-     * missing value compares equal to itself.
+     * turned for a descending sort. By default the order puts missing values
+     * last, so after a present value the missing rows still follow ({@code
+     * OR s IS NULL}), and after a missing one only the deeper sorts decide.
+     * Under {@code missing: _first} the missing rows come before every
+     * present one, so after a missing value every present row follows ({@code
+     * s IS NOT NULL}), and after a present one the missing rows are behind.
+     * A missing value compares equal to itself. {@code part} keeps the rows
+     * whose first sort value is present, or only those missing it.
      */
-    private static String keysetPredicate(Plan plan) {
+    private static String keysetPredicate(Plan plan, Keyset part) {
+        if (part == Keyset.MISSING) {
+            return plan.sorts().get(0).expr() + " IS NULL";
+        }
         List<String> alternatives = new ArrayList<>();
         List<String> equal = new ArrayList<>();
         long now = plan.nowMillis();
@@ -849,7 +1425,7 @@ public final class InfinoSearch {
             String strict;
             String same;
             if (value == null) {
-                strict = InfinoQueryTranslator.NONE;
+                strict = s.nullsFirst() ? col + " IS NOT NULL" : InfinoQueryTranslator.NONE;
                 same = col + " IS NULL";
             } else {
                 // A date sort's value as text is read by its field's own format, as stock reads it.
@@ -860,7 +1436,8 @@ public final class InfinoSearch {
                 if (lit == null) {
                     throw new IllegalArgumentException("[infino] search_after value [" + value + "] is not a " + s.type().name().toLowerCase(Locale.ROOT));
                 }
-                strict = "(" + col + (s.desc() ? " < " : " > ") + lit + " OR " + col + " IS NULL)";
+                String past = col + (s.desc() ? " < " : " > ") + lit;
+                strict = s.nullsFirst() || i == 0 && part == Keyset.PRESENT ? past : "(" + past + " OR " + col + " IS NULL)";
                 same = col + " = " + lit;
             }
             List<String> conj = new ArrayList<>(equal);
@@ -890,16 +1467,6 @@ public final class InfinoSearch {
         return upTo == null || upTo != SearchContext.TRACK_TOTAL_HITS_DISABLED;
     }
 
-    /** The source includes/excludes of {@code ctx}, or null when the source is returned whole (or not at all). */
-    private static FetchSourceContext sourceFilter(FetchSourceContext ctx) {
-        if (ctx == null || !ctx.fetchSource()) {
-            return null;
-        }
-        boolean includes = ctx.includes() != null && ctx.includes().length > 0;
-        boolean excludes = ctx.excludes() != null && ctx.excludes().length > 0;
-        return includes || excludes ? ctx : null;
-    }
-
     /** The index's mapping from the cluster state, or null when it cannot be read there. */
     private static MappingMetadata mapping(Index index) {
         ClusterService clusters = InfinoServices.clusterService();
@@ -925,15 +1492,18 @@ public final class InfinoSearch {
         int size,
         List<SortSpec> sorts,
         FetchSourceContext fetchSource,
-        List<FieldAndFormat> fields,
+        List<FieldAndFormat> docValueFields,
+        List<FieldAndFormat> fetchFields,
         Map<String, Column> cols,
         InfinoAccess access,
         List<Map<String, Object>> rows,
         long bucketCount,
         Index index
     ) {
-        FetchSourceContext sourceFilter = sourceFilter(fetchSource);
         boolean withSource = fetchSource == null || fetchSource.fetchSource();
+        InfinoMappingSource stored = (withSource || !fetchFields.isEmpty()) && index != null
+            ? InfinoMappingSource.of(mapping(index))
+            : InfinoMappingSource.WHOLE;
         float score = sorts.isEmpty() ? 1.0f : Float.NaN;
         SearchShardTarget target = index == null ? null : target(index);
         List<SearchHit> hits = new ArrayList<>();
@@ -947,13 +1517,18 @@ public final class InfinoSearch {
                 h.shard(target);
             }
             h.score(score);
-            if (withSource || !fields.isEmpty()) {
+            if (withSource || !docValueFields.isEmpty() || !fetchFields.isEmpty()) {
                 String src = access.read(id.toString(), String.valueOf(row.get(InfinoQueryTranslator.SOURCE)));
                 if (!src.isEmpty()) {
+                    // Stock's top_hits fetches each of its from + size hits on the shard.
+                    stored.refuse(index == null ? null : index.getName(), fetchSource, fetchFields);
                     if (withSource) {
-                        h.sourceRef(sourceFilter == null ? new BytesArray(src) : filtered(src, sourceFilter));
+                        BytesReference shown = stored.shown(src, fetchSource);
+                        if (shown != null) {
+                            h.sourceRef(shown);
+                        }
                     }
-                    fillFields(h, src, fields, cols);
+                    fillRequested(h, src, stored, docValueFields, fetchFields, cols);
                 }
             }
             if (!sorts.isEmpty()) {
@@ -996,19 +1571,42 @@ public final class InfinoSearch {
     }
 
     /**
-     * Each requested field on the hit under {@code fields}, read from the
-     * hit's source (the table holds what was sent, so a field's value is the
-     * source's value at that path): a date column in the requested format,
-     * else its mapping's, everything else as it is. A field alias carries the
-     * values of the field it names, as stock reads it. A missing path is left
-     * out, as stock does.
+     * The requested fields on the hit, as stock's fetch phase reads them:
+     * {@code docvalue_fields} from the document as it was indexed (the doc
+     * values hold every field, whatever the mapping's {@code _source}
+     * keeps), then {@code fields} from the source as the mapping keeps it,
+     * none when the mapping disables {@code _source} (the hits a response
+     * carries are refused then, see {@link InfinoMappingSource#refuse}). A
+     * field asked for both ways takes the {@code fields} value when the
+     * source holds it, as stock's fields phase runs after its doc values
+     * phase. A mapping that keeps the source whole reads it once for both.
      */
-    static void fillFields(SearchHit h, String src, List<FieldAndFormat> fields, Map<String, Column> cols) {
-        if (fields.isEmpty()) {
-            return;
+    static void fillRequested(
+        SearchHit h,
+        String src,
+        InfinoMappingSource stored,
+        List<FieldAndFormat> docValueFields,
+        List<FieldAndFormat> fetchFields,
+        Map<String, Column> cols
+    ) {
+        Map<String, Object> flat = docValueFields.isEmpty() ? null : flat(src);
+        if (flat != null) {
+            fillFields(h, flat, docValueFields, cols);
         }
-        Map<String, Object> flat = new LinkedHashMap<>();
-        flatten("", XContentHelper.convertToMap(new BytesArray(src), true, MediaTypeRegistry.JSON).v2(), flat);
+        if (!fetchFields.isEmpty() && stored.enabled()) {
+            fillFields(h, flat != null && stored.whole() ? flat : flat(stored.kept(src)), fetchFields, cols);
+        }
+    }
+
+    /**
+     * Each requested field on the hit under {@code fields}, read from the
+     * hit's source, given as its leaves by dotted path ({@link #flat}; the
+     * table holds what was sent, so a field's value is the source's value at
+     * that path): a date column in the requested format, else its mapping's,
+     * everything else as it is. A field alias carries the values of the field
+     * it names, as stock reads it. A missing path is left out, as stock does.
+     */
+    private static void fillFields(SearchHit h, Map<String, Object> flat, List<FieldAndFormat> fields, Map<String, Column> cols) {
         for (FieldAndFormat f : fields) {
             for (Map.Entry<String, Object> e : flat.entrySet()) {
                 if (Regex.simpleMatch(f.field, e.getKey())) {
@@ -1043,6 +1641,13 @@ public final class InfinoSearch {
             out.add(value);
         }
         return out;
+    }
+
+    /** The leaves of the source {@code src} by dotted path ({@link #flatten}). */
+    private static Map<String, Object> flat(String src) {
+        Map<String, Object> flat = new LinkedHashMap<>();
+        flatten("", XContentHelper.convertToMap(new BytesArray(src), true, MediaTypeRegistry.JSON).v2(), flat);
+        return flat;
     }
 
     /** The source's leaves by dotted path; a list of scalars stays one value. */
@@ -1086,16 +1691,6 @@ public final class InfinoSearch {
             return printer.format(at.atZone(ZoneOffset.UTC));
         } catch (RuntimeException e) {
             return v;
-        }
-    }
-
-    static BytesReference filtered(String src, FetchSourceContext filter) {
-        Map<String, Object> map = XContentHelper.convertToMap(new BytesArray(src), true, MediaTypeRegistry.JSON).v2();
-        try (XContentBuilder b = XContentFactory.jsonBuilder()) {
-            b.map(XContentMapValues.filter(map, filter.includes(), filter.excludes()));
-            return BytesReference.bytes(b);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
         }
     }
 
@@ -1262,8 +1857,9 @@ public final class InfinoSearch {
             boolean countWithAggs = sharedTotal && perIndex.size() == 0;
             // A total the aggregations take as their population is counted in
             // full: a capped one would undercount it (top_hits' total, a
-            // significant_terms subset size).
-            Page page = page(index, plan, perIndex, !countWithAggs, scrollId == null && !sharedTotal);
+            // significant_terms subset size). A scroll's next page resumes
+            // from this one's last hits (the cursor below).
+            Page page = page(index, plan, perIndex, !countWithAggs, scrollId == null && !sharedTotal, after != null);
             if (!builders.isEmpty()) {
                 InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(index).evaluate(
                     builders,
@@ -1278,6 +1874,7 @@ public final class InfinoSearch {
             pages.add(page);
         }
         SearchHits hits = merge(pages, source, sorts, total);
+        refuse(indices, hits, source);
         Map<Index, Object[]> cursor = null;
         if (after != null) {
             // Where each index stopped: the sort values of its last hit on this
@@ -1317,6 +1914,23 @@ public final class InfinoSearch {
             SearchResponse.Clusters.EMPTY
         );
         return new Searched(response, cursor);
+    }
+
+    /**
+     * Refuses the response when one of its {@code hits} is of an index whose
+     * mapping disables {@code _source} and {@code source} filters the source
+     * or asks for {@code fields} ({@link InfinoMappingSource#refuse}): only
+     * the hits the window keeps, as stock's fetch phase fetches only those.
+     */
+    private static void refuse(List<Index> indices, SearchHits hits, SearchSourceBuilder source) {
+        List<FieldAndFormat> fetchFields = requestedFields(null, source.fetchFields());
+        for (SearchHit h : hits.getHits()) {
+            for (Index index : indices) {
+                if (index.getName().equals(h.getIndex())) {
+                    InfinoMappingSource.of(mapping(index)).refuse(index.getName(), source.fetchSource(), fetchFields);
+                }
+            }
+        }
     }
 
     /**
@@ -1371,6 +1985,22 @@ public final class InfinoSearch {
      */
     static boolean scrollsById(SearchSourceBuilder source) {
         return source.sorts() == null || source.sorts().stream().allMatch(InfinoSearch::ordersNothing);
+    }
+
+    /** Whether the first sort {@code source} names is {@code _doc}. */
+    static boolean sortsByDocFirst(SearchSourceBuilder source) {
+        return source.sorts() != null
+            && !source.sorts().isEmpty()
+            && source.sorts().get(0) instanceof FieldSortBuilder fs
+            && FieldSortBuilder.DOC_FIELD_NAME.equals(fs.getFieldName());
+    }
+
+    /** Whether the first sort {@code source} names is the score, ascending. */
+    static boolean sortsByScoreAscending(SearchSourceBuilder source) {
+        return source.sorts() != null
+            && !source.sorts().isEmpty()
+            && source.sorts().get(0) instanceof ScoreSortBuilder ss
+            && ss.order() == SortOrder.ASC;
     }
 
     /** A sort a scroll pages past in the id's order: {@code _doc}, or the score. */
@@ -1453,7 +2083,10 @@ public final class InfinoSearch {
         }
         if (pages.size() > 1) {
             boolean sorted = all.stream().anyMatch(h -> h.getSortValues().length > 0);
-            all.sort(sorted ? bySortValues(sorts) : Comparator.comparing(SearchHit::getScore, Comparator.reverseOrder()));
+            Comparator<SearchHit> byScore = sortsByScoreAscending(source)
+                ? Comparator.comparing(SearchHit::getScore)
+                : Comparator.comparing(SearchHit::getScore, Comparator.reverseOrder());
+            all.sort(sorted ? bySortValues(sorts) : byScore);
         }
         int from = Math.max(0, source.from());
         int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
@@ -1484,17 +2117,23 @@ public final class InfinoSearch {
     @SuppressWarnings({ "unchecked", "rawtypes" })
     private static Comparator<SearchHit> bySortValues(List<SortSpec> sorts) {
         List<Boolean> desc = new ArrayList<>();
+        List<Boolean> nullsFirst = new ArrayList<>();
         for (SortSpec s : sorts) {
             desc.add(s.desc());
+            nullsFirst.add(s.nullsFirst());
         }
         return (a, b) -> {
             Object[] va = a.getSortValues();
             Object[] vb = b.getSortValues();
             for (int i = 0; i < Math.min(va.length, vb.length); i++) {
                 if (va[i] == null || vb[i] == null) {
-                    // Missing values last in both directions, as each index's own
-                    // statement orders them (NULLS LAST): never turned by a descending sort.
+                    // Missing values where each index's own statement orders them
+                    // (NULLS LAST, or NULLS FIRST under missing: _first): never turned
+                    // by a descending sort.
                     int nulls = va[i] == null ? (vb[i] == null ? 0 : 1) : -1;
+                    if (i < nullsFirst.size() && nullsFirst.get(i)) {
+                        nulls = -nulls;
+                    }
                     if (nulls != 0) {
                         return nulls;
                     }
