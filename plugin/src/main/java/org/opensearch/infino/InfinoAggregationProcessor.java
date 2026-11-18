@@ -72,6 +72,7 @@ import org.opensearch.search.aggregations.bucket.terms.StringTerms;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregator;
 import org.opensearch.search.aggregations.bucket.terms.heuristic.JLHScore;
+import org.opensearch.search.aggregations.bucket.terms.heuristic.ScriptHeuristic;
 import org.opensearch.search.aggregations.bucket.terms.heuristic.SignificanceHeuristic;
 import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.CardinalityAggregationBuilder;
@@ -173,8 +174,8 @@ public class InfinoAggregationProcessor {
     private static final int MAX_PARENT_TUPLES = 1_000;
     /**
      * Rows the batched significant_terms foreground ({@link #prefetchSignificant})
-     * may return, parent buckets times candidates: the most one bucket's own
-     * statement returns. It also bounds the terms its background reads in one IN list.
+     * may return, every term of every parent bucket; past it each bucket reads
+     * its own. It also bounds the terms a background reads in one IN list.
      */
     private static final int MAX_PREFETCHED_ROWS = MAX_TERMS_SIZE;
     /** The earliest and latest epoch milliseconds date_bin can take: it works in nanoseconds, in an i64. */
@@ -2299,6 +2300,8 @@ public class InfinoAggregationProcessor {
         final String backgroundWhere;
         final int candidates;
         final long minDocCount;
+        /** The count a term the shard keeps needs in its bucket; {@link #minDocCount} is the reduction's. */
+        final long shardMinDocCount;
         final SignificanceHeuristic heuristic;
         final TermsAggregator.BucketCountThresholds thresholds;
 
@@ -2322,6 +2325,7 @@ public class InfinoAggregationProcessor {
             this.backgroundWhere = backgroundWhere;
             this.candidates = candidates;
             this.minDocCount = minDocCount;
+            this.shardMinDocCount = thresholds.getShardMinDocCount();
             this.heuristic = heuristic;
             this.thresholds = thresholds;
         }
@@ -2373,6 +2377,63 @@ public class InfinoAggregationProcessor {
 
         /** One candidate term with both of its counts. */
         record Candidate(Object key, long subsetDf, long supersetDf, Map<String, Object> row) {}
+
+        /**
+         * The {@code keep} best of a bucket's terms by score, as a stock
+         * shard keeps them: every term is scored by {@code heuristic} from
+         * its four counts, the highest first, and among equal scores the
+         * term that sorts first (a shard visits terms in order and keeps
+         * the one it met first). Then, as a stock shard under concurrent
+         * segment search (the default) does, a kept term with fewer than
+         * {@code shardMinDocCount} documents is dropped; it still took its
+         * slot. A script heuristic cannot be run here, so every term goes
+         * on to the reduction, which scores them all.
+         */
+        static List<Candidate> bestByScore(
+            List<Candidate> terms,
+            int keep,
+            long shardMinDocCount,
+            long subsetSize,
+            long supersetSize,
+            SignificanceHeuristic heuristic
+        ) {
+            if (heuristic instanceof ScriptHeuristic) {
+                List<Candidate> out = new ArrayList<>(terms);
+                out.removeIf(c -> c.subsetDf() < shardMinDocCount);
+                return out;
+            }
+            List<Map.Entry<Double, Candidate>> scored = new ArrayList<>(terms.size());
+            for (Candidate c : terms) {
+                scored.add(Map.entry(heuristic.getScore(c.subsetDf(), subsetSize, c.supersetDf(), supersetSize), c));
+            }
+            scored.sort((a, b) -> {
+                int byScore = Double.compare(b.getKey(), a.getKey());
+                return byScore != 0 ? byScore : compareKeys(a.getValue().key(), b.getValue().key());
+            });
+            List<Candidate> out = new ArrayList<>(Math.min(keep, scored.size()));
+            for (int i = 0; i < scored.size() && i < keep; i++) {
+                Candidate c = scored.get(i).getValue();
+                if (c.subsetDf() >= shardMinDocCount) {
+                    out.add(c);
+                }
+            }
+            return out;
+        }
+
+        /** Two term keys in the shard's order: numbers by value, any other key by its UTF-8 bytes. */
+        static int compareKeys(Object a, Object b) {
+            if (a instanceof Number x && b instanceof Number y) {
+                if (isIntegral(x) && isIntegral(y)) {
+                    return Long.compare(x.longValue(), y.longValue());
+                }
+                return Double.compare(x.doubleValue(), y.doubleValue());
+            }
+            return new BytesRef(String.valueOf(a)).compareTo(new BytesRef(String.valueOf(b)));
+        }
+
+        private static boolean isIntegral(Number n) {
+            return n instanceof Long || n instanceof Integer || n instanceof Short || n instanceof Byte;
+        }
 
         /** Build from the candidates, each with its top hits and nested aggregations, and the two population sizes. */
         InternalAggregation build(
@@ -2876,20 +2937,21 @@ public class InfinoAggregationProcessor {
 
     /**
      * {@code significant_terms}: the foreground counts are a terms GROUP BY
-     * over the query relation, the most frequent terms first; the background
+     * over the query relation, every term of the bucket; the background
      * counts of those terms are a second GROUP BY over the background rows
      * (see {@link #backgroundRows}), and their number is the superset size.
+     * Every term is scored and the best {@code shard_size} by score are
+     * kept ({@link Significant#bestByScore}), as a stock shard keeps them:
+     * the most significant terms are seldom the most frequent.
      */
     private InternalAggregation evalSignificant(Significant s, String from, String where, long subsetSize) {
         String key = s.keyExpr();
         String select = key + " AS k0, COUNT(*) AS doc_count" + (s.metrics.isEmpty() ? "" : ", " + metricColumns(s.metrics));
-        String having = s.minDocCount > 1 ? " HAVING COUNT(*) >= " + s.minDocCount : "";
         Map<String, List<Map<String, Object>>> prefetched = foregrounds.get(s);
         List<Map<String, Object>> foreground = prefetched == null ? null : prefetched.get(where);
         if (foreground == null) {
             foreground = InfinoNative.sqlRows(
-                "SELECT * FROM (SELECT " + select + " FROM " + from + " WHERE (" + where + ") AND " + key + " IS NOT NULL GROUP BY 1" + having
-                    + ") t ORDER BY doc_count DESC, k0 ASC LIMIT " + s.candidates
+                "SELECT " + select + " FROM " + from + " WHERE (" + where + ") AND " + key + " IS NOT NULL GROUP BY 1"
             );
         }
         // The background does not depend on the bucket this level sits under:
@@ -2898,14 +2960,19 @@ public class InfinoAggregationProcessor {
         Background bg = background(s, foreground);
         long supersetSize = bg.size;
         Map<String, Long> background = bg.counts;
-        List<Significant.Candidate> candidates = new ArrayList<>();
-        List<List<InternalAggregation>> topHits = new ArrayList<>();
-        List<List<InternalAggregation>> nested = new ArrayList<>();
+        List<Significant.Candidate> scored = new ArrayList<>(foreground.size());
         for (Map<String, Object> row : foreground) {
             Object k = row.get("k0");
             long subsetDf = asLong(row.get("doc_count"));
             long supersetDf = background.getOrDefault(keyString(k), 0L);
-            candidates.add(new Significant.Candidate(k, subsetDf, Math.max(subsetDf, supersetDf), row));
+            scored.add(new Significant.Candidate(k, subsetDf, Math.max(subsetDf, supersetDf), row));
+        }
+        List<Significant.Candidate> candidates = Significant.bestByScore(scored, s.candidates, s.shardMinDocCount, subsetSize, supersetSize, s.heuristic);
+        List<List<InternalAggregation>> topHits = new ArrayList<>();
+        List<List<InternalAggregation>> nested = new ArrayList<>();
+        for (Significant.Candidate c : candidates) {
+            Object k = c.key();
+            long subsetDf = c.subsetDf();
             String w = "(" + where + ") AND " + key + " = " + Grouped.keyLiteral(s.keyKind, k);
             topHits.add(bucketHits(s, from, w, subsetDf));
             nested.add(evalChildren(s.child, from, w, subsetDf));
@@ -2941,10 +3008,15 @@ public class InfinoAggregationProcessor {
             }
         }
         if (!literals.isEmpty()) {
-            for (Map<String, Object> row : InfinoNative.sqlRows(
-                "SELECT k0, COUNT(*) AS bg FROM " + backgroundRows + " WHERE k0 IN (" + String.join(", ", literals) + ") GROUP BY 1"
-            )) {
-                background.put(keyString(row.get("k0")), asLong(row.get("bg")));
+            // Every term of a bucket is scored, so there may be many: at most
+            // MAX_PREFETCHED_ROWS of them go in one IN list.
+            for (int from = 0; from < literals.size(); from += MAX_PREFETCHED_ROWS) {
+                List<String> part = literals.subList(from, Math.min(literals.size(), from + MAX_PREFETCHED_ROWS));
+                for (Map<String, Object> row : InfinoNative.sqlRows(
+                    "SELECT k0, COUNT(*) AS bg FROM " + backgroundRows + " WHERE k0 IN (" + String.join(", ", part) + ") GROUP BY 1"
+                )) {
+                    background.put(keyString(row.get("k0")), asLong(row.get("bg")));
+                }
             }
             // A term no background row holds counts 0; remember that too.
             for (String term : unread) {
@@ -3282,12 +3354,13 @@ public class InfinoAggregationProcessor {
      * Read the foreground of each significant_terms level directly under the
      * chain's leaf for every leaf bucket in {@code kept} in one statement,
      * rather than one per bucket: the same GROUP BY, also grouped by the
-     * chain's keys, ranked within each bucket as {@link #evalSignificant}
-     * orders and cuts it. Only when that is the same rows: every chain level
-     * a terms level on a field each document gives one value (so a
-     * document's keys are its buckets), and the significant level carries
-     * no metric. Otherwise, or past {@link #MAX_PARENT_TUPLES} buckets, the
-     * level reads each bucket on its own as before.
+     * chain's keys, every term of every bucket, which {@link #evalSignificant}
+     * then scores and cuts per bucket. Only when that is the same rows:
+     * every chain level a terms level on a field each document gives one
+     * value (so a document's keys are its buckets), and the significant
+     * level carries no metric. Otherwise, past {@link #MAX_PARENT_TUPLES}
+     * buckets, or past {@link #MAX_PREFETCHED_ROWS} rows, the level reads
+     * each bucket on its own as before.
      */
     private void prefetchSignificant(List<Grouped> chain, List<List<Object>> kept, BucketSpec leafChild, String from, String where) {
         if (kept == null || kept.size() > MAX_PARENT_TUPLES) {
@@ -3301,12 +3374,9 @@ public class InfinoAggregationProcessor {
         List<BucketSpec> leaves = leafChild instanceof Siblings sib ? sib.children : leafChild == null ? List.of() : List.of(leafChild);
         int n = chain.size();
         List<String> parents = new ArrayList<>();
-        List<String> parentCols = new ArrayList<>();
         for (int j = 0; j < n; j++) {
             parents.add(chain.get(j).keyExpr + " AS p" + j);
-            parentCols.add("p" + j);
         }
-        String partition = String.join(", ", parentCols);
         // By SELECT position, as groupStatement groups: a field named p0 or k0
         // would take the alias's place in a GROUP BY by name.
         StringBuilder positions = new StringBuilder();
@@ -3317,21 +3387,19 @@ public class InfinoAggregationProcessor {
             if (!(leaf instanceof Significant s) || !s.metrics.isEmpty()) {
                 continue;
             }
-            if ((long) kept.size() * s.candidates > MAX_PREFETCHED_ROWS) {
-                // Past the rows one bucket's own statement may return, and past
-                // that many terms in the background's IN list: read each bucket
+            String key = s.keyExpr();
+            // Every term of every bucket: the cut to shard_size is by score
+            // (see evalSignificant), which needs each term's background count.
+            List<Map<String, Object>> rows = InfinoNative.sqlRows(
+                "SELECT " + String.join(", ", parents) + ", " + key + " AS k0, COUNT(*) AS doc_count FROM " + from + " WHERE (" + where
+                    + ") AND " + tupleRestriction(chain, kept, n, false) + " AND " + key + " IS NOT NULL GROUP BY " + positions + " LIMIT "
+                    + (MAX_PREFETCHED_ROWS + 1)
+            );
+            if (rows.size() > MAX_PREFETCHED_ROWS) {
+                // Past the rows one statement is let return: read each bucket
                 // on its own.
                 continue;
             }
-            String key = s.keyExpr();
-            String having = s.minDocCount > 1 ? " HAVING COUNT(*) >= " + s.minDocCount : "";
-            String inner = "SELECT " + String.join(", ", parents) + ", " + key + " AS k0, COUNT(*) AS doc_count FROM " + from
-                + " WHERE (" + where + ") AND " + tupleRestriction(chain, kept, n, false) + " AND " + key + " IS NOT NULL GROUP BY "
-                + positions + having;
-            List<Map<String, Object>> rows = InfinoNative.sqlRows(
-                "SELECT * FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY doc_count DESC, k0 ASC) AS rn FROM ("
-                    + inner + ") t) WHERE rn <= " + s.candidates + " ORDER BY " + partition + ", rn"
-            );
             Map<List<String>, List<Map<String, Object>>> byTuple = new HashMap<>();
             for (Map<String, Object> row : rows) {
                 List<Object> tuple = new ArrayList<>();

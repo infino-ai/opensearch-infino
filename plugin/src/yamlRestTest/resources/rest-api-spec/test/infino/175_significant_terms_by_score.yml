@@ -1,0 +1,488 @@
+---
+"significant_terms keeps a bucket's best terms by score, not by count, as a Lucene twin does":
+  # In group a (10 documents, 31 in all) the frequent terms c (4) and m (3)
+  # are less common here than overall and score 0. The rare r2 (1, only in
+  # a) scores highest, then r1 (2 of 4). With shard_size 2 a cut by count
+  # would keep c and m and return nothing; stock scores every term and keeps
+  # r2 and r1. The same documents go to a Lucene twin, a default-mode and a
+  # proxy-mode index.
+  - do:
+      indices.create:
+        index: sbs_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              group: { type: keyword }
+              tag: { type: keyword }
+  - do:
+      indices.create:
+        index: sbs_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              group: { type: keyword }
+              tag: { type: keyword }
+  - do:
+      indices.create:
+        index: sbs_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              group: { type: keyword }
+              tag: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: sbs_luc
+        body:
+          - index: { _id: "d0" }
+          - { group: a, tag: c }
+          - index: { _id: "d1" }
+          - { group: a, tag: c }
+          - index: { _id: "d2" }
+          - { group: a, tag: c }
+          - index: { _id: "d3" }
+          - { group: a, tag: c }
+          - index: { _id: "d4" }
+          - { group: a, tag: m }
+          - index: { _id: "d5" }
+          - { group: a, tag: m }
+          - index: { _id: "d6" }
+          - { group: a, tag: m }
+          - index: { _id: "d7" }
+          - { group: a, tag: r1 }
+          - index: { _id: "d8" }
+          - { group: a, tag: r1 }
+          - index: { _id: "d9" }
+          - { group: a, tag: r2 }
+          - index: { _id: "d10" }
+          - { group: b, tag: c }
+          - index: { _id: "d11" }
+          - { group: b, tag: c }
+          - index: { _id: "d12" }
+          - { group: b, tag: c }
+          - index: { _id: "d13" }
+          - { group: b, tag: c }
+          - index: { _id: "d14" }
+          - { group: b, tag: c }
+          - index: { _id: "d15" }
+          - { group: b, tag: c }
+          - index: { _id: "d16" }
+          - { group: b, tag: c }
+          - index: { _id: "d17" }
+          - { group: b, tag: c }
+          - index: { _id: "d18" }
+          - { group: b, tag: c }
+          - index: { _id: "d19" }
+          - { group: b, tag: c }
+          - index: { _id: "d20" }
+          - { group: b, tag: c }
+          - index: { _id: "d21" }
+          - { group: b, tag: c }
+          - index: { _id: "d22" }
+          - { group: b, tag: m }
+          - index: { _id: "d23" }
+          - { group: b, tag: m }
+          - index: { _id: "d24" }
+          - { group: b, tag: m }
+          - index: { _id: "d25" }
+          - { group: b, tag: m }
+          - index: { _id: "d26" }
+          - { group: b, tag: m }
+          - index: { _id: "d27" }
+          - { group: b, tag: m }
+          - index: { _id: "d28" }
+          - { group: b, tag: m }
+          - index: { _id: "d29" }
+          - { group: b, tag: r1 }
+          - index: { _id: "d30" }
+          - { group: b, tag: r1 }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sbs_def
+        body:
+          - index: { _id: "d0" }
+          - { group: a, tag: c }
+          - index: { _id: "d1" }
+          - { group: a, tag: c }
+          - index: { _id: "d2" }
+          - { group: a, tag: c }
+          - index: { _id: "d3" }
+          - { group: a, tag: c }
+          - index: { _id: "d4" }
+          - { group: a, tag: m }
+          - index: { _id: "d5" }
+          - { group: a, tag: m }
+          - index: { _id: "d6" }
+          - { group: a, tag: m }
+          - index: { _id: "d7" }
+          - { group: a, tag: r1 }
+          - index: { _id: "d8" }
+          - { group: a, tag: r1 }
+          - index: { _id: "d9" }
+          - { group: a, tag: r2 }
+          - index: { _id: "d10" }
+          - { group: b, tag: c }
+          - index: { _id: "d11" }
+          - { group: b, tag: c }
+          - index: { _id: "d12" }
+          - { group: b, tag: c }
+          - index: { _id: "d13" }
+          - { group: b, tag: c }
+          - index: { _id: "d14" }
+          - { group: b, tag: c }
+          - index: { _id: "d15" }
+          - { group: b, tag: c }
+          - index: { _id: "d16" }
+          - { group: b, tag: c }
+          - index: { _id: "d17" }
+          - { group: b, tag: c }
+          - index: { _id: "d18" }
+          - { group: b, tag: c }
+          - index: { _id: "d19" }
+          - { group: b, tag: c }
+          - index: { _id: "d20" }
+          - { group: b, tag: c }
+          - index: { _id: "d21" }
+          - { group: b, tag: c }
+          - index: { _id: "d22" }
+          - { group: b, tag: m }
+          - index: { _id: "d23" }
+          - { group: b, tag: m }
+          - index: { _id: "d24" }
+          - { group: b, tag: m }
+          - index: { _id: "d25" }
+          - { group: b, tag: m }
+          - index: { _id: "d26" }
+          - { group: b, tag: m }
+          - index: { _id: "d27" }
+          - { group: b, tag: m }
+          - index: { _id: "d28" }
+          - { group: b, tag: m }
+          - index: { _id: "d29" }
+          - { group: b, tag: r1 }
+          - index: { _id: "d30" }
+          - { group: b, tag: r1 }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sbs_prx
+        body:
+          - index: { _id: "d0" }
+          - { group: a, tag: c }
+          - index: { _id: "d1" }
+          - { group: a, tag: c }
+          - index: { _id: "d2" }
+          - { group: a, tag: c }
+          - index: { _id: "d3" }
+          - { group: a, tag: c }
+          - index: { _id: "d4" }
+          - { group: a, tag: m }
+          - index: { _id: "d5" }
+          - { group: a, tag: m }
+          - index: { _id: "d6" }
+          - { group: a, tag: m }
+          - index: { _id: "d7" }
+          - { group: a, tag: r1 }
+          - index: { _id: "d8" }
+          - { group: a, tag: r1 }
+          - index: { _id: "d9" }
+          - { group: a, tag: r2 }
+          - index: { _id: "d10" }
+          - { group: b, tag: c }
+          - index: { _id: "d11" }
+          - { group: b, tag: c }
+          - index: { _id: "d12" }
+          - { group: b, tag: c }
+          - index: { _id: "d13" }
+          - { group: b, tag: c }
+          - index: { _id: "d14" }
+          - { group: b, tag: c }
+          - index: { _id: "d15" }
+          - { group: b, tag: c }
+          - index: { _id: "d16" }
+          - { group: b, tag: c }
+          - index: { _id: "d17" }
+          - { group: b, tag: c }
+          - index: { _id: "d18" }
+          - { group: b, tag: c }
+          - index: { _id: "d19" }
+          - { group: b, tag: c }
+          - index: { _id: "d20" }
+          - { group: b, tag: c }
+          - index: { _id: "d21" }
+          - { group: b, tag: c }
+          - index: { _id: "d22" }
+          - { group: b, tag: m }
+          - index: { _id: "d23" }
+          - { group: b, tag: m }
+          - index: { _id: "d24" }
+          - { group: b, tag: m }
+          - index: { _id: "d25" }
+          - { group: b, tag: m }
+          - index: { _id: "d26" }
+          - { group: b, tag: m }
+          - index: { _id: "d27" }
+          - { group: b, tag: m }
+          - index: { _id: "d28" }
+          - { group: b, tag: m }
+          - index: { _id: "d29" }
+          - { group: b, tag: r1 }
+          - index: { _id: "d30" }
+          - { group: b, tag: r1 }
+  - match: { errors: false }
+
+  # A query's own foreground, read in one statement of its own.
+  - do:
+      search:
+        index: sbs_luc
+        body:
+          size: 0
+          query: { term: { group: a } }
+          aggs:
+            sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - match: { aggregations.sig.doc_count: 10 }
+  - match: { aggregations.sig.bg_count: 31 }
+  - length: { aggregations.sig.buckets: 2 }
+  - match: { aggregations.sig.buckets.0.key: r2 }
+  - match: { aggregations.sig.buckets.0.doc_count: 1 }
+  - match: { aggregations.sig.buckets.0.bg_count: 1 }
+  - match: { aggregations.sig.buckets.1.key: r1 }
+  - match: { aggregations.sig.buckets.1.doc_count: 2 }
+  - match: { aggregations.sig.buckets.1.bg_count: 4 }
+  - set: { aggregations.sig.buckets.0.score: score_r2 }
+  - set: { aggregations.sig.buckets.1.score: score_r1 }
+
+  # Under a terms level both groups' foregrounds are one statement. In b
+  # the frequent terms are also the significant ones.
+  - do:
+      search:
+        index: sbs_luc
+        body:
+          size: 0
+          aggs:
+            groups:
+              terms: { field: group }
+              aggs:
+                sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - length: { aggregations.groups.buckets: 2 }
+  - match: { aggregations.groups.buckets.0.key: b }
+  - length: { aggregations.groups.buckets.0.sig.buckets: 2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.key: c }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.key: m }
+  - match: { aggregations.groups.buckets.1.key: a }
+  - length: { aggregations.groups.buckets.1.sig.buckets: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.key: r2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.doc_count: 1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.key: r1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.doc_count: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.score: $score_r2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.score: $score_r1 }
+
+  # min_doc_count is the reduction's: the shard's one slot goes to r2, the
+  # best score, which has 1 document and is then dropped. r1 (2 documents)
+  # never had the slot, so nothing is returned.
+  - do:
+      search:
+        index: sbs_luc
+        body:
+          size: 0
+          query: { term: { group: a } }
+          aggs:
+            sig: { significant_terms: { field: tag, size: 1, shard_size: 1, min_doc_count: 2 } }
+  - length: { aggregations.sig.buckets: 0 }
+
+  # shard_min_doc_count 2 applies after the cut, as on a stock shard under
+  # concurrent segment search: r2 still takes the one slot and is dropped,
+  # so again nothing is returned. With two slots r1 is kept.
+  - do:
+      search:
+        index: sbs_luc
+        body:
+          size: 0
+          query: { term: { group: a } }
+          aggs:
+            sig: { significant_terms: { field: tag, size: 1, shard_size: 1, min_doc_count: 2, shard_min_doc_count: 2 } }
+  - length: { aggregations.sig.buckets: 0 }
+  - do:
+      search:
+        index: sbs_luc
+        body:
+          size: 0
+          query: { term: { group: a } }
+          aggs:
+            sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1, shard_min_doc_count: 2 } }
+  - length: { aggregations.sig.buckets: 1 }
+  - match: { aggregations.sig.buckets.0.key: r1 }
+
+  # A query's own foreground, read in one statement of its own.
+  - do:
+      search:
+        index: sbs_def
+        body:
+          size: 0
+          query: { term: { group: a } }
+          aggs:
+            sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - match: { aggregations.sig.doc_count: 10 }
+  - match: { aggregations.sig.bg_count: 31 }
+  - length: { aggregations.sig.buckets: 2 }
+  - match: { aggregations.sig.buckets.0.key: r2 }
+  - match: { aggregations.sig.buckets.0.doc_count: 1 }
+  - match: { aggregations.sig.buckets.0.bg_count: 1 }
+  - match: { aggregations.sig.buckets.1.key: r1 }
+  - match: { aggregations.sig.buckets.1.doc_count: 2 }
+  - match: { aggregations.sig.buckets.1.bg_count: 4 }
+  - match: { aggregations.sig.buckets.0.score: $score_r2 }
+  - match: { aggregations.sig.buckets.1.score: $score_r1 }
+
+  # Under a terms level both groups' foregrounds are one statement. In b
+  # the frequent terms are also the significant ones.
+  - do:
+      search:
+        index: sbs_def
+        body:
+          size: 0
+          aggs:
+            groups:
+              terms: { field: group }
+              aggs:
+                sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - length: { aggregations.groups.buckets: 2 }
+  - match: { aggregations.groups.buckets.0.key: b }
+  - length: { aggregations.groups.buckets.0.sig.buckets: 2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.key: c }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.key: m }
+  - match: { aggregations.groups.buckets.1.key: a }
+  - length: { aggregations.groups.buckets.1.sig.buckets: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.key: r2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.doc_count: 1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.key: r1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.doc_count: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.score: $score_r2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.score: $score_r1 }
+
+  # min_doc_count is the reduction's: the shard's one slot goes to r2, the
+  # best score, which has 1 document and is then dropped. r1 (2 documents)
+  # never had the slot, so nothing is returned.
+  - do:
+      search:
+        index: sbs_def
+        body:
+          size: 0
+          query: { term: { group: a } }
+          aggs:
+            sig: { significant_terms: { field: tag, size: 1, shard_size: 1, min_doc_count: 2 } }
+  - length: { aggregations.sig.buckets: 0 }
+
+  # shard_min_doc_count 2 applies after the cut, as on a stock shard under
+  # concurrent segment search: r2 still takes the one slot and is dropped,
+  # so again nothing is returned. With two slots r1 is kept.
+  - do:
+      search:
+        index: sbs_def
+        body:
+          size: 0
+          query: { term: { group: a } }
+          aggs:
+            sig: { significant_terms: { field: tag, size: 1, shard_size: 1, min_doc_count: 2, shard_min_doc_count: 2 } }
+  - length: { aggregations.sig.buckets: 0 }
+  - do:
+      search:
+        index: sbs_def
+        body:
+          size: 0
+          query: { term: { group: a } }
+          aggs:
+            sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1, shard_min_doc_count: 2 } }
+  - length: { aggregations.sig.buckets: 1 }
+  - match: { aggregations.sig.buckets.0.key: r1 }
+
+  # A query's own foreground, read in one statement of its own.
+  - do:
+      search:
+        index: sbs_prx
+        body:
+          size: 0
+          query: { term: { group: a } }
+          aggs:
+            sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - match: { aggregations.sig.doc_count: 10 }
+  - match: { aggregations.sig.bg_count: 31 }
+  - length: { aggregations.sig.buckets: 2 }
+  - match: { aggregations.sig.buckets.0.key: r2 }
+  - match: { aggregations.sig.buckets.0.doc_count: 1 }
+  - match: { aggregations.sig.buckets.0.bg_count: 1 }
+  - match: { aggregations.sig.buckets.1.key: r1 }
+  - match: { aggregations.sig.buckets.1.doc_count: 2 }
+  - match: { aggregations.sig.buckets.1.bg_count: 4 }
+  - match: { aggregations.sig.buckets.0.score: $score_r2 }
+  - match: { aggregations.sig.buckets.1.score: $score_r1 }
+
+  # Under a terms level both groups' foregrounds are one statement. In b
+  # the frequent terms are also the significant ones.
+  - do:
+      search:
+        index: sbs_prx
+        body:
+          size: 0
+          aggs:
+            groups:
+              terms: { field: group }
+              aggs:
+                sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - length: { aggregations.groups.buckets: 2 }
+  - match: { aggregations.groups.buckets.0.key: b }
+  - length: { aggregations.groups.buckets.0.sig.buckets: 2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.key: c }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.key: m }
+  - match: { aggregations.groups.buckets.1.key: a }
+  - length: { aggregations.groups.buckets.1.sig.buckets: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.key: r2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.doc_count: 1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.key: r1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.doc_count: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.score: $score_r2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.score: $score_r1 }
+
+  # min_doc_count is the reduction's: the shard's one slot goes to r2, the
+  # best score, which has 1 document and is then dropped. r1 (2 documents)
+  # never had the slot, so nothing is returned.
+  - do:
+      search:
+        index: sbs_prx
+        body:
+          size: 0
+          query: { term: { group: a } }
+          aggs:
+            sig: { significant_terms: { field: tag, size: 1, shard_size: 1, min_doc_count: 2 } }
+  - length: { aggregations.sig.buckets: 0 }
+
+  # shard_min_doc_count 2 applies after the cut, as on a stock shard under
+  # concurrent segment search: r2 still takes the one slot and is dropped,
+  # so again nothing is returned. With two slots r1 is kept.
+  - do:
+      search:
+        index: sbs_prx
+        body:
+          size: 0
+          query: { term: { group: a } }
+          aggs:
+            sig: { significant_terms: { field: tag, size: 1, shard_size: 1, min_doc_count: 2, shard_min_doc_count: 2 } }
+  - length: { aggregations.sig.buckets: 0 }
+  - do:
+      search:
+        index: sbs_prx
+        body:
+          size: 0
+          query: { term: { group: a } }
+          aggs:
+            sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1, shard_min_doc_count: 2 } }
+  - length: { aggregations.sig.buckets: 1 }
+  - match: { aggregations.sig.buckets.0.key: r1 }
