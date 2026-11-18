@@ -182,7 +182,7 @@ jobs:
       # What the README's local build needs: a JDK 21, Gradle 9.4.1 or later for OpenSearch 3.9.0 (the
       # repository has no wrapper), and Rust for the bridge.
       - name: Set up JDK 21
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: "21"
