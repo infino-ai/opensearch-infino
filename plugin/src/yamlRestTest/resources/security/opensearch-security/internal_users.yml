@@ -16,6 +16,11 @@ plain_user:
   reserved: false
   description: "Reads sec* unrestricted"
 
+star_user:
+  hash: "$2a$12$VcCDgh2NDk07JGN0rjGbM.Ad41qVR/YFJcgHp0UGns5JDymv..TOG"
+  reserved: false
+  description: "Reads every index"
+
 dls_user:
   hash: "$2a$12$VcCDgh2NDk07JGN0rjGbM.Ad41qVR/YFJcgHp0UGns5JDymv..TOG"
   reserved: false

@@ -84,7 +84,7 @@ public class InfinoGetActionFilter implements ActionFilter {
                 // The document as the security plugin lets this user see it: under a
                 // document rule it is looked up through the rule, and its source is
                 // cut to the fields the user may read.
-                InfinoAccess access = InfinoSecurity.access(index.getIndex().getName(), "get");
+                InfinoAccess access = InfinoAccess.reading(index.getIndex().getName(), "get");
                 String table = tables.ensureForDocument(index, get.id(), get.routing());
                 InfinoNative.Doc doc = access.restrictsDocuments()
                     ? restrictedDocs(table, List.of(get.id()), access).get(get.id())

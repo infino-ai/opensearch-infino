@@ -171,7 +171,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
             if (exactAtCoordinator) {
                 Map<String, InfinoAccess> access = new HashMap<>();
                 for (String name : concrete) {
-                    access.put(name, InfinoSecurity.access(name, InfinoSecurityCalls.SEARCH).filteredBy(filters.get(name)));
+                    access.put(name, InfinoAccess.searching(name).filteredBy(filters.get(name)));
                 }
                 InfinoExactAggregation.record(id, written, now, access);
                 // Its final reduce runs before the search answers, so the record
@@ -242,7 +242,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
         }
         try {
             for (String name : concrete) {
-                if (!InfinoSecurity.access(name, InfinoSecurityCalls.SEARCH).unrestricted()) {
+                if (!InfinoAccess.searching(name).unrestricted()) {
                     return false;
                 }
             }
@@ -276,7 +276,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
             List<QueryBuilder> filters = new ArrayList<>();
             for (int i = 0; i < infino.size(); i++) {
                 Index index = infino.get(i);
-                InfinoAccess own = InfinoSecurity.access(index.getName(), InfinoSecurityCalls.SEARCH);
+                InfinoAccess own = InfinoAccess.searching(index.getName());
                 QueryBuilder filter = InfinoAliasFilter.of(state, names, metadata.get(i), search.indices(), tableOf.apply(index), now);
                 rules.add(own);
                 filters.add(filter);

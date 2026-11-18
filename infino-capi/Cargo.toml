@@ -15,9 +15,11 @@ crate-type = ["cdylib", "rlib"]
 # node whose account is set up holds no table data of its own.
 # `graph-index` serves the graph walks (`graph_walk`, `graph_rank`) to SQL and
 # builds an edge table's adjacency index on optimize.
-# Pinned exactly: 0.11.25 bounds the hosted client's waits, and 0.11.26 writes
-# the manifest list format 4.0, which earlier builds cannot read.
-infino = { version = "=0.11.25", features = ["remote", "graph-index"] }
+# Pinned exactly: 0.11.31 is the first release with the `text_match` SQL
+# function that the query translation turns text clauses into. Since 0.11.26
+# the engine writes the manifest list format 4.0, which builds before 0.11.26
+# cannot read.
+infino = { version = "=0.11.31", features = ["remote", "graph-index"] }
 # serde_json comes re-exported from infino, so the two never disagree.
 # Same major as infino so the delete-predicate Expr is the same type infino expects.
 datafusion = "54"

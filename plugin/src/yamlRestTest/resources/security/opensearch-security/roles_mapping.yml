@@ -18,6 +18,11 @@ sec_read:
   users:
     - "plain_user"
 
+star_read:
+  reserved: false
+  users:
+    - "star_user"
+
 sec_dls:
   reserved: false
   users:
