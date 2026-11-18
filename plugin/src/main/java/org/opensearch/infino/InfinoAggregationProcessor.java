@@ -2195,8 +2195,15 @@ public class InfinoAggregationProcessor {
             return new Explicit(r, leaves, child, ExplicitKind.DATE_RANGE, buckets, r.keyed(), format);
         }
 
-        /** A date-range bound as epoch milliseconds: the string with date math when given, else the number, else open. */
+        /**
+         * A date-range bound as epoch milliseconds: the string with date math when given, else the
+         * number read in the field's format as stock reads it (an {@code epoch_second} field's
+         * {@code 1000} is a thousand seconds), else open.
+         */
         private static double bound(String asString, double asNumber, String format, boolean roundUp, ZoneId tz, long now, String agg) {
+            if (asString == null && Double.isFinite(asNumber)) {
+                asString = Long.toString((long) asNumber);
+            }
             if (asString != null) {
                 Long ms = InfinoQueryTranslator.dateMathMillis(asString, format, roundUp, tz, now);
                 if (ms == null) {

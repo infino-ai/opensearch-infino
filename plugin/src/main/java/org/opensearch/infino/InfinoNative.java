@@ -113,6 +113,10 @@ public final class InfinoNative {
     private static final Set<String> FLOAT_TYPES = Set.of("float", "half_float");
     /** The type of a multi-field that holds its field's value whole, the exact form of a text field. */
     private static final String KEYWORD_TYPE = "keyword";
+    /** The other type that holds a value whole: a wildcard field compares the value as a keyword one does. */
+    private static final String WILDCARD_TYPE = "wildcard";
+    /** A keyword or wildcard field's normalizer, applied to its values and to the terms a query compares them with. */
+    private static final String NORMALIZER = "normalizer";
     private static final String USE_SIMILARITY = "use_similarity";
     /** A field's own similarity, which overrides the index's default. */
     private static final String SIMILARITY = "similarity";
@@ -633,6 +637,10 @@ public final class InfinoNative {
      * {@code request.raw} under the text field {@code request}, as a dynamic
      * mapping's {@code name.keyword}); each date field's declared format;
      * and each {@code float} or {@code half_float} field ({@code floatFields}).
+     * A wildcard multi-field reads as a keyword one. {@code multiFields} are
+     * every multi-field's path, and {@code normalized} the keyword and
+     * wildcard fields with a normalizer, whose values the table keeps as
+     * written: a query on either is refused ({@link #unservedField}).
      */
     record Mapping(
         Set<String> paths,
@@ -642,6 +650,8 @@ public final class InfinoNative {
         Set<String> similarityFields,
         Set<String> otherSimilarityFields,
         Set<String> floatFields,
+        Set<String> multiFields,
+        Set<String> normalized,
         boolean defaultBm25
     ) {
         /** {@link #of(String, boolean)} under the default BM25 similarity. */
@@ -662,6 +672,8 @@ public final class InfinoNative {
                 new LinkedHashMap<>(),
                 new LinkedHashMap<>(),
                 new LinkedHashMap<>(),
+                new HashSet<>(),
+                new HashSet<>(),
                 new HashSet<>(),
                 new HashSet<>(),
                 new HashSet<>(),
@@ -702,11 +714,18 @@ public final class InfinoNative {
                 if (scoresByOtherSimilarity(field)) {
                     otherSimilarityFields.add(path);
                 }
+                if (normalizes(field)) {
+                    normalized.add(path);
+                }
                 if (field.get(MULTI_FIELDS) instanceof Map<?, ?> multi) {
                     for (Map.Entry<?, ?> sub : multi.entrySet()) {
                         String subPath = path + "." + sub.getKey();
                         paths.add(subPath);
-                        if (sub.getValue() instanceof Map<?, ?> subField && KEYWORD_TYPE.equals(subField.get(TYPE))) {
+                        multiFields.add(subPath);
+                        if (sub.getValue() instanceof Map<?, ?> subField && normalizes(subField)) {
+                            normalized.add(subPath);
+                        } else if (sub.getValue() instanceof Map<?, ?> subField
+                            && (KEYWORD_TYPE.equals(subField.get(TYPE)) || WILDCARD_TYPE.equals(subField.get(TYPE)))) {
                             keywordFields.put(subPath, path);
                             if (scoresBySimilarity(subField)) {
                                 similarityFields.add(subPath);
@@ -735,6 +754,12 @@ public final class InfinoNative {
             return named == null ? !defaultBm25 : !BM25.equals(String.valueOf(named));
         }
 
+        /** Whether {@code field} is a keyword or wildcard field with a normalizer. */
+        private static boolean normalizes(Map<?, ?> field) {
+            Object type = field.get(TYPE);
+            return (KEYWORD_TYPE.equals(type) || WILDCARD_TYPE.equals(type)) && field.get(NORMALIZER) != null;
+        }
+
         /** Whether {@code field} is a keyword field with {@code use_similarity}, as the mapping keeps it (a boolean or its string). */
         private static boolean scoresBySimilarity(Map<?, ?> field) {
             return KEYWORD_TYPE.equals(field.get(TYPE)) && "true".equals(String.valueOf(field.get(USE_SIMILARITY)));
@@ -750,6 +775,29 @@ public final class InfinoNative {
     static boolean maps(String table, String field) {
         Mapping mapping = MAPPINGS.get(table);
         return mapping == null || mapping.paths().contains(field);
+    }
+
+    /**
+     * Why a query on {@code field} of {@code table} cannot be answered from
+     * its columns, or null when it can: a keyword or wildcard field with a
+     * normalizer, whose column holds the values as written, not as the
+     * normalizer leaves them, or a multi-field the table keeps no column of
+     * (one of another type than keyword or wildcard, or under a field that
+     * is not a string). Either, answered from the columns, would be a wrong
+     * answer: unnormalized values, or none at all.
+     */
+    static String unservedField(String table, String field) {
+        Mapping mapping = MAPPINGS.get(table);
+        if (mapping == null || field == null) {
+            return null;
+        }
+        if (mapping.normalized().contains(field)) {
+            return "whose values its normalizer changes";
+        }
+        if (mapping.multiFields().contains(field) && !columns(table).containsKey(field)) {
+            return "a multi-field the table keeps no column of";
+        }
+        return null;
     }
 
     /**
