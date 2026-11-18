@@ -20,7 +20,6 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.document.DocumentField;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
-import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.index.get.GetResult;
 import org.opensearch.index.mapper.RoutingFieldMapper;
@@ -92,7 +91,15 @@ public class InfinoGetActionFilter implements ActionFilter {
                     : docOf(index, table, get.id());
                 @SuppressWarnings("unchecked")
                 Response response = (Response) new GetResponse(
-                    result(index.getIndex().getName(), get.id(), doc, access, get.fetchSourceContext(), routingOf(index, table, get.id(), doc))
+                    result(
+                        index.getIndex().getName(),
+                        get.id(),
+                        doc,
+                        access,
+                        InfinoMappingSource.of(index.mapping()),
+                        get.fetchSourceContext(),
+                        routingOf(index, table, get.id(), doc)
+                    )
                 );
                 listener.onResponse(response);
             } catch (Exception e) {
@@ -158,14 +165,20 @@ public class InfinoGetActionFilter implements ActionFilter {
      * sequence number it was written under, and {@code routing} (null for
      * none) as its {@code _routing}.
      */
-    static GetResult result(String index, String id, InfinoNative.Doc doc, InfinoAccess access, FetchSourceContext fetch, String routing) {
+    static GetResult result(
+        String index,
+        String id,
+        InfinoNative.Doc doc,
+        InfinoAccess access,
+        InfinoMappingSource stored,
+        FetchSourceContext fetch,
+        String routing
+    ) {
         String source = doc == null ? null : access.read(id, doc.source());
         boolean exists = source != null && !source.isEmpty();
         BytesReference bytes = null;
         if (exists && (fetch == null || fetch.fetchSource())) {
-            boolean includes = fetch != null && fetch.includes() != null && fetch.includes().length > 0;
-            boolean excludes = fetch != null && fetch.excludes() != null && fetch.excludes().length > 0;
-            bytes = includes || excludes ? InfinoSearch.filtered(source, fetch) : new BytesArray(source);
+            bytes = stored.shown(source, fetch);
         }
         // A found document carries its sequence number, and the version and primary term the table reports (see InfinoDocumentVersion).
         return new GetResult(
