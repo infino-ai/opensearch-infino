@@ -213,16 +213,10 @@ public class InfinoBulkActionFilter implements ActionFilter {
      * the bulk goes on as it came.
      */
     static void route(BulkRequest bulk, ClusterService clusters, InfinoWriter writes, InfinoTables tables, ActionListener<BulkResponse> listener, Runnable stock) {
-        String attached = attachedTarget(clusters.state(), bulk);
-        if (attached != null) {
-            listener.onFailure(
-                new OpenSearchStatusException(
-                    "[infino] index [{}] is attached to a table it reads and never writes ([{}]); no document is indexed, updated or deleted through it",
-                    RestStatus.FORBIDDEN,
-                    attached,
-                    InfinoPlugin.INFINO_ATTACHED.getKey()
-                )
-            );
+        // As the bulk arrives: a bulk that names an attached index runs no pipeline and creates no index.
+        Exception refused = attachedRefusal(clusters.state(), concreteIndices(clusters.state(), bulk));
+        if (refused != null) {
+            listener.onFailure(refused);
             return;
         }
         if (forwards() > 0) {
@@ -355,6 +349,13 @@ public class InfinoBulkActionFilter implements ActionFilter {
     ) {
         int forwards = forwards();
         ClusterState state = clusters.state();
+        // Again where every bulk is served from, past its pipelines: one of them may have sent a
+        // document on to an attached index that the bulk did not name when it arrived.
+        Exception refused = attachedRefusal(state, concrete);
+        if (refused != null) {
+            listener.onFailure(refused);
+            return;
+        }
         String local = state.nodes().getLocalNodeId();
         long start = System.nanoTime();
         BulkItemResponse[] items = new BulkItemResponse[bulk.requests().size()];
@@ -821,16 +822,32 @@ public class InfinoBulkActionFilter implements ActionFilter {
      * it reads and never writes; null when none is. Every write to an
      * index comes as a bulk (a single index, update or delete, and each
      * batch of a write by query, among them), so a bulk refused here is
-     * every write refused.
+     * every write refused. {@code concrete} is the index of each item as it
+     * now stands: read before the bulk's pipelines run it is what the bulk
+     * named, and after them what they sent each document to.
      */
-    static String attachedTarget(ClusterState state, BulkRequest bulk) {
-        for (String name : concreteIndices(state, bulk)) {
+    static String attachedTarget(ClusterState state, List<String> concrete) {
+        for (String name : concrete) {
             IndexMetadata md = name == null ? null : state.metadata().index(name);
             if (md != null && InfinoPlugin.INFINO_ENABLED.get(md.getSettings()) && InfinoPlugin.INFINO_ATTACHED.get(md.getSettings())) {
                 return name;
             }
         }
         return null;
+    }
+
+    /** The failure a bulk is answered with when one of {@code concrete} is attached ({@link #attachedTarget}); null when none is. */
+    static OpenSearchStatusException attachedRefusal(ClusterState state, List<String> concrete) {
+        String attached = attachedTarget(state, concrete);
+        if (attached == null) {
+            return null;
+        }
+        return new OpenSearchStatusException(
+            "[infino] index [{}] is attached to a table it reads and never writes ([{}]); no document is indexed, updated or deleted through it",
+            RestStatus.FORBIDDEN,
+            attached,
+            InfinoPlugin.INFINO_ATTACHED.getKey()
+        );
     }
 
     /**

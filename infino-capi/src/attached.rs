@@ -21,18 +21,58 @@ use datafusion::sql::sqlparser::ast::{
     TableFactor, Value, VisitMut, VisitorMut,
 };
 use infino::arrow_array::{
-    Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, LargeStringArray, RecordBatch, StringArray, StringViewArray,
-    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray, RecordBatch, StringArray,
+    StringViewArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
+use infino::arrow_schema::Schema;
 
 use crate::{json_str, OSID, SEQ, SOURCE};
 
 /// The engine's row id, a column of every table.
 pub(crate) const ROW_ID: &str = "_id";
-/// The column a ranked search scores its rows in.
-const SCORE: &str = "score";
+/// The column a ranked search scores its rows in. A table that holds a
+/// column of its own by this name is not attached to.
+pub(crate) const SCORE: &str = "score";
+
+/// The columns of a table a document read from it is made of: every one but
+/// the row id.
+pub(crate) fn columns_of(schema: &Schema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .filter(|c| c != ROW_ID)
+        .collect()
+}
+
+/// One value of a column of a type only a table made outside the plugin
+/// holds, as a sort value, an aggregation key or a field gives it: a narrow
+/// integer as a number, a string view as a string, a date as milliseconds
+/// since the epoch, as a time is given. None for any other type.
+pub(crate) fn narrow_cell_json(col: &dyn Array, r: usize) -> Option<String> {
+    let any = col.as_any();
+    macro_rules! number {
+        ($($array:ty),*) => {$(
+            if let Some(a) = any.downcast_ref::<$array>() {
+                return Some(a.value(r).to_string());
+            }
+        )*};
+    }
+    number!(Int32Array, UInt32Array, Int16Array, UInt16Array, Int8Array, UInt8Array);
+    if let Some(a) = any.downcast_ref::<StringViewArray>() {
+        return Some(json_str(a.value(r)));
+    }
+    if let Some(a) = any.downcast_ref::<Date32Array>() {
+        return Some((i64::from(a.value(r)) * 86_400_000).to_string());
+    }
+    if let Some(a) = any.downcast_ref::<Date64Array>() {
+        return Some(a.value(r).to_string());
+    }
+    None
+}
 /// The name a search over an attached table is read under where the
 /// statement gave it none.
 const SEARCHED: &str = "infino_attached";
@@ -231,11 +271,14 @@ fn value_json(col: &dyn Array, r: usize) -> Option<String> {
             }
         )*};
     }
+    // A date is the instant its day starts at, as a time is given.
     instant!(
         TimestampSecondArray,
         TimestampMillisecondArray,
         TimestampMicrosecondArray,
-        TimestampNanosecondArray
+        TimestampNanosecondArray,
+        Date32Array,
+        Date64Array
     );
     if let Some(a) = any.downcast_ref::<Decimal128Array>() {
         return Some(json_str(&a.value_as_string(r)));
@@ -423,6 +466,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sql.matches("named_struct(").count(), 2, "{sql}");
+    }
+
+    #[test]
+    fn the_types_only_an_outside_table_holds_are_read_back() {
+        // As a sort value or an aggregation key: a number, a string, a
+        // date as milliseconds.
+        assert_eq!(narrow_cell_json(&Int32Array::from(vec![-7]), 0).as_deref(), Some("-7"));
+        assert_eq!(narrow_cell_json(&UInt8Array::from(vec![7u8]), 0).as_deref(), Some("7"));
+        assert_eq!(
+            narrow_cell_json(&StringViewArray::from(vec!["a\"b"]), 0).as_deref(),
+            Some(r#""a\"b""#)
+        );
+        assert_eq!(
+            narrow_cell_json(&Date32Array::from(vec![20_216]), 0).as_deref(),
+            Some("1746662400000")
+        );
+        assert_eq!(
+            narrow_cell_json(&Date64Array::from(vec![1_746_662_400_000i64]), 0).as_deref(),
+            Some("1746662400000")
+        );
+        assert_eq!(narrow_cell_json(&Int64Array::from(vec![1]), 0), None);
+
+        // In a document's source: a date as the instant its day starts at.
+        assert_eq!(
+            value_json(&Date32Array::from(vec![20_216]), 0).as_deref(),
+            Some(r#""2025-05-08T00:00:00.000Z""#)
+        );
+        assert_eq!(
+            value_json(&Date64Array::from(vec![1_746_662_400_000i64]), 0).as_deref(),
+            Some(r#""2025-05-08T00:00:00.000Z""#)
+        );
+        assert_eq!(value_json(&Int16Array::from(vec![3i16]), 0).as_deref(), Some("3"));
     }
 
     #[test]

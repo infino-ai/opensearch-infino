@@ -89,6 +89,8 @@ public final class InfinoNative {
     /** Where the engine caches what it reads from the node's own storage (see {@link InfinoPlugin#CACHE_DIR}); null for none. */
     private static volatile String cacheDir;
     private static volatile Pointer conn;
+    /** See {@link #opens()}; written under the class lock that opens a connection. */
+    private static volatile long opens;
     /** The target {@link #conn} was opened to. */
     private static volatile Target opened;
     /** The target the node is configured for: its own URI until the settings or the account route say otherwise. */
@@ -351,6 +353,7 @@ public final class InfinoNative {
                 log.info("[infino] tables are served from {}", target.name());
             }
             boolean switched = conn != null;
+            opens++;
             COLUMNS.clear();
             SOURCES.invalidateAll();
             InfinoRequestCache.changedAll();
@@ -360,6 +363,17 @@ public final class InfinoNative {
                 InfinoRequestCache.clearShardCaches();
             }
         }
+    }
+
+    /**
+     * How many connections the node has opened. A connection holds what
+     * each table was declared with (how its fields keep their values, and
+     * for an attached table that it is one and what it is read with), and a
+     * new one holds none of it: whoever remembers that a table is declared
+     * ({@link InfinoTables}) declares it again when this has moved.
+     */
+    static long opens() {
+        return opens;
     }
 
     /** Why an open returned null, as the exception the caller gets. */

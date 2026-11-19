@@ -240,11 +240,14 @@ curl -sk -u "admin:$OPENSEARCH_ADMIN_PASSWORD" -X PUT https://localhost:9200/pag
 
 The mapping names the table's columns and the field type each is read as. It is checked against the table: a field the table has no column for, or a column of another type, is refused.
 
-- **The table is never changed.** Nothing is added to it when the index is created or its mapping moves, it is not compacted, and it stays when the index is deleted.
-- **Every write is refused** with a 403: index, update, delete, and a write by query.
-- **A document is a row.** Its `_id` is the engine's row id, and its `_source` is the row's columns; a null column is left out.
-- **The index is served in proxy mode.** A request that asks for default mode is refused.
-- **A `text` field needs a full-text index on its column.** One without positions matches and ranks terms; a phrase query needs positions.
+- **The table is never changed.** Nothing is added to it when the index is created, it is not compacted, and it stays when the index is deleted.
+- **Every write is refused** with a 403: index, update, delete, a write by query, and a document an ingest pipeline sends to the index from another one.
+- **The mapping is fixed when the index is created.** A mapping update is refused with a 400. For a different mapping, delete the index and create it again: it holds no data of its own.
+- **A document is a row.** Its `_id` is the engine's row id, and its `_source` is the row's columns; a null column is left out. A date column is read as the instant its day starts at.
+- **The index is served in proxy mode.** A request or a template that asks for default mode is refused.
+- **A `text` field needs a full-text index on its column.** One without positions matches and ranks terms; a phrase query needs positions. A column with a full-text index is searched as text only when its field is mapped as `text`: mapped as `keyword`, or left out of the mapping, it is compared whole.
+- **A table with a column named `score`, `osid`, `source` or `osseq` is not attached to.** A search gives each row's score under the first, and the plugin reads a document through the others.
+- **A column the table's owner removes later** is noticed by a statement that fails on it, which then runs again over the columns the table holds now. A ranked search (`match`, k-NN, hybrid) does not: create the index again after such a change.
 - A table the plugin wrote is not attached to. Name it in `index.infino.table` without this setting.
 
 **Node settings** (`opensearch.yml`)

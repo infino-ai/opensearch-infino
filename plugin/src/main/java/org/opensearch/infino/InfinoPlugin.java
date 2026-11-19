@@ -166,10 +166,11 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      * named in {@link #INFINO_TABLE}: one made and filled outside the
      * plugin, which holds none of the columns the plugin writes beside a
      * document. Such a table is read as it is and never changed: nothing is
-     * added to it when the index is created or its mapping moves, a mapped
-     * field it has no column for is refused, and so is every write to the
-     * index. An attached index is served in proxy mode, and its table stays
-     * when the index is deleted, as any named table does.
+     * added to it when the index is created, a mapped field it has no column
+     * for is refused, and so are every write to the index and every update
+     * of its mapping ({@link InfinoAttachedMappingActionFilter}). An
+     * attached index is served in proxy mode, and its table stays when the
+     * index is deleted, as any named table does.
      */
     public static final Setting<Boolean> INFINO_ATTACHED = Setting.boolSetting(
         "index.infino.attached",
@@ -456,7 +457,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             new InfinoGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES),
             new InfinoMultiGetActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver, TABLES),
             new InfinoStatsActionFilter(InfinoServices::clusterService, TABLES),
-            new InfinoExplicitTableActionFilter()
+            new InfinoExplicitTableActionFilter(),
+            new InfinoAttachedMappingActionFilter(InfinoServices::clusterService, InfinoServices::indexNameExpressionResolver)
         );
     }
 
@@ -606,11 +608,29 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      * as it creates the index; a resized index is created without providers
      * and so carries none.
      */
+    /**
+     * Refuse the settings an index is created with when they ask for an
+     * attached index that cannot be served
+     * ({@link InfinoExplicitTableActionFilter#attachRefusal}). These are
+     * the index's templates' merged with the request's, so a template that
+     * gives the mode or leaves out the table is seen here, which the create
+     * request alone does not show: an attached index in default mode would
+     * be served by a shard's engine, which writes to its table.
+     */
+    static void checkAttach(Settings templateAndRequestSettings) {
+        String table = INFINO_TABLE.get(templateAndRequestSettings);
+        String refused = InfinoExplicitTableActionFilter.attachRefusal(templateAndRequestSettings, table.isEmpty() ? null : table);
+        if (refused != null) {
+            throw new IllegalArgumentException(refused);
+        }
+    }
+
     @Override
     public Collection<IndexSettingProvider> getAdditionalIndexSettingProviders() {
         return List.of(new IndexSettingProvider() {
             @Override
             public Settings getAdditionalIndexSettings(String indexName, boolean isDataStreamIndex, Settings templateAndRequestSettings) {
+                checkAttach(templateAndRequestSettings);
                 Settings.Builder out = Settings.builder();
                 boolean enabled;
                 if (templateAndRequestSettings.hasValue(INFINO_ENABLED.getKey())) {

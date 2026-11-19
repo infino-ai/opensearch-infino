@@ -4,8 +4,10 @@
 
 package org.opensearch.infino;
 
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.Version;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
+import org.opensearch.action.admin.indices.mapping.put.PutMappingRequest;
 import org.opensearch.action.admin.indices.rollover.RolloverRequest;
 import org.opensearch.action.admin.indices.shrink.ResizeRequest;
 import org.opensearch.action.bulk.BulkRequest;
@@ -17,6 +19,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;
@@ -233,26 +236,91 @@ public class InfinoTablesTests extends OpenSearchTestCase {
             .metadata(Metadata.builder().put(attached, false).put(owned, false))
             .build();
         Map<String, Object> doc = Map.of("title", "x");
-        assertEquals(
-            "pageviews-ui",
-            InfinoBulkActionFilter.attachedTarget(state, new BulkRequest().add(new IndexRequest("pageviews-ui").id("1").source(doc)))
-        );
-        assertEquals("pageviews-ui", InfinoBulkActionFilter.attachedTarget(state, new BulkRequest().add(new DeleteRequest("pageviews-ui", "1"))));
-        assertEquals(
-            "pageviews-ui",
-            InfinoBulkActionFilter.attachedTarget(state, new BulkRequest().add(new UpdateRequest("pageviews-ui", "1").doc(doc)))
-        );
+        assertEquals("pageviews-ui", attachedTarget(state, new BulkRequest().add(new IndexRequest("pageviews-ui").id("1").source(doc))));
+        assertEquals("pageviews-ui", attachedTarget(state, new BulkRequest().add(new DeleteRequest("pageviews-ui", "1"))));
+        assertEquals("pageviews-ui", attachedTarget(state, new BulkRequest().add(new UpdateRequest("pageviews-ui", "1").doc(doc))));
         // One item to an attached index refuses the bulk it came in.
         assertEquals(
             "pageviews-ui",
-            InfinoBulkActionFilter.attachedTarget(
-                state,
-                new BulkRequest().add(new IndexRequest("logs").id("1").source(doc)).add(new DeleteRequest("pageviews-ui", "2"))
-            )
+            attachedTarget(state, new BulkRequest().add(new IndexRequest("logs").id("1").source(doc)).add(new DeleteRequest("pageviews-ui", "2")))
         );
-        assertNull(InfinoBulkActionFilter.attachedTarget(state, new BulkRequest().add(new IndexRequest("logs").id("1").source(doc))));
+        assertNull(attachedTarget(state, new BulkRequest().add(new IndexRequest("logs").id("1").source(doc))));
         // An index the cluster does not hold yet is the bulk's to create, as before.
-        assertNull(InfinoBulkActionFilter.attachedTarget(state, new BulkRequest().add(new IndexRequest("fresh").id("1").source(doc))));
+        assertNull(attachedTarget(state, new BulkRequest().add(new IndexRequest("fresh").id("1").source(doc))));
+    }
+
+    /** The attached index a bulk writes to as it now stands, as the filter reads it before and after the bulk's pipelines. */
+    private static String attachedTarget(ClusterState state, BulkRequest bulk) {
+        return InfinoBulkActionFilter.attachedTarget(state, InfinoBulkActionFilter.concreteIndices(state, bulk));
+    }
+
+    public void testADocumentAPipelineSendsToAnAttachedIndexIsRefusedThere() {
+        IndexMetadata attached = index("pageviews-ui", "u1", 1, attaching("pageviews", Settings.EMPTY));
+        IndexMetadata owned = index("logs", "u2", 2);
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(attached, false).put(owned, false))
+            .build();
+        // The bulk names an index of the plugin's own, and is let through as it arrives.
+        IndexRequest item = new IndexRequest("logs").id("1").source(Map.of("title", "x"));
+        BulkRequest bulk = new BulkRequest().add(item);
+        assertNull(InfinoBulkActionFilter.attachedRefusal(state, InfinoBulkActionFilter.concreteIndices(state, bulk)));
+        // Its pipeline then sets the document's index, as a script setting ctx._index does. The
+        // check made again where the bulk is served from sees where the document now goes.
+        item.index("pageviews-ui");
+        OpenSearchStatusException refused = InfinoBulkActionFilter.attachedRefusal(state, InfinoBulkActionFilter.concreteIndices(state, bulk));
+        assertNotNull(refused);
+        assertEquals(RestStatus.FORBIDDEN, refused.status());
+        assertTrue(refused.getMessage(), refused.getMessage().contains("[pageviews-ui] is attached to a table it reads and never writes"));
+    }
+
+    public void testATemplateCannotPutAnAttachedIndexInDefaultMode() {
+        // The settings the cluster creates the index with: the request asks to attach, and a
+        // template that matches its name gave the mode. Neither alone is refused.
+        Settings merged = Settings.builder()
+            .put(InfinoPlugin.INFINO_ENABLED.getKey(), true)
+            .put(InfinoPlugin.INFINO_MODE.getKey(), InfinoPlugin.MODE_DEFAULT)
+            .put(attaching("pageviews", Settings.EMPTY))
+            .build();
+        IllegalArgumentException mode = expectThrows(IllegalArgumentException.class, () -> InfinoPlugin.checkAttach(merged));
+        assertTrue(mode.getMessage(), mode.getMessage().contains("to be [proxy]"));
+        // A template that gives the attaching without the table is refused the same way.
+        Settings unnamed = Settings.builder().put(InfinoPlugin.INFINO_ENABLED.getKey(), true).put(attaching(null, Settings.EMPTY)).build();
+        IllegalArgumentException table = expectThrows(IllegalArgumentException.class, () -> InfinoPlugin.checkAttach(unnamed));
+        assertTrue(table.getMessage(), table.getMessage().contains("needs [index.infino.table]"));
+        // Settings that attach nothing, or attach as they should, pass.
+        InfinoPlugin.checkAttach(Settings.builder().put(InfinoPlugin.INFINO_MODE.getKey(), InfinoPlugin.MODE_DEFAULT).build());
+        InfinoPlugin.checkAttach(attaching("pageviews", Settings.EMPTY));
+    }
+
+    public void testAMappingUpdateOnAnAttachedIndexIsRefused() {
+        IndexMetadata attached = index("pageviews-ui", "u1", 1, attaching("pageviews", Settings.EMPTY));
+        IndexMetadata owned = index("logs", "u2", 2);
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(attached, false).put(owned, false))
+            .build();
+        assertEquals("pageviews-ui", InfinoAttachedMappingActionFilter.attachedTarget(state, null, new PutMappingRequest("pageviews-ui")));
+        assertEquals("pageviews-ui", InfinoAttachedMappingActionFilter.attachedTarget(state, null, new PutMappingRequest("logs", "pageviews-ui")));
+        // A dynamic update names its one index outright.
+        assertEquals(
+            "pageviews-ui",
+            InfinoAttachedMappingActionFilter.attachedTarget(state, null, new PutMappingRequest().setConcreteIndex(attached.getIndex()))
+        );
+        // An index of the plugin's own takes mapping updates as before, and one the cluster does not hold is the cluster's to report.
+        assertNull(InfinoAttachedMappingActionFilter.attachedTarget(state, null, new PutMappingRequest("logs")));
+        assertNull(InfinoAttachedMappingActionFilter.attachedTarget(state, null, new PutMappingRequest("absent")));
+    }
+
+    public void testATableIsDeclaredAgainOverANewConnection() {
+        InfinoTables tables = new InfinoTables();
+        tables.forgetOver(1);
+        tables.declaredForTest("pageviews", 3);
+        assertTrue(tables.declaredAt("pageviews", 3));
+        // The same connection keeps what was declared over it.
+        tables.forgetOver(1);
+        assertTrue(tables.declaredAt("pageviews", 3));
+        // A new one holds no declaration, an attached table's view among them: each is made again.
+        tables.forgetOver(2);
+        assertFalse(tables.declaredAt("pageviews", 3));
     }
 
     public void testAnAttachedTableIsNeverCompacted() {
