@@ -48,6 +48,29 @@ pub(crate) fn columns_of(schema: &Schema) -> Vec<String> {
         .collect()
 }
 
+/// Whether `sql` may read a column only an attached table's view gives: it
+/// names a document's id, source or sequence number, or selects every
+/// column with a `*`. A statement that does neither (a count, a grouped
+/// aggregate, a sum over a time range) reads the table's own columns alone
+/// and runs on the table as written: through the view, a count of every row
+/// is no longer answered from the table's statistics, and on a table of a
+/// trillion rows that is the difference between a lookup and reading it
+/// all. Read from the statement's words, so a string or an alias that
+/// happens to hold one of the names sends the statement through the view,
+/// which is always right, only slower.
+pub(crate) fn reads_view_columns(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    let names_one = lower
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word == OSID || word == SOURCE || word == SEQ);
+    if names_one {
+        return true;
+    }
+    // A `*` that is not the one inside `count(*)`.
+    let spaceless: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    spaceless.replace("count(*)", "").contains('*')
+}
+
 /// One value of a column of a type only a table made outside the plugin
 /// holds, as a sort value, an aggregation key or a field gives it: a narrow
 /// integer as a number, a string view as a string, a date as milliseconds
@@ -466,6 +489,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sql.matches("named_struct(").count(), 2, "{sql}");
+    }
+
+    #[test]
+    fn only_a_statement_that_may_read_the_views_columns_goes_through_the_view() {
+        // A count, a grouped aggregate and a sum read the table's own columns.
+        for own in [
+            r#"SELECT COUNT(*) AS c FROM "plain" WHERE 1=1"#,
+            r#"SELECT count( * ) AS c FROM "plain" WHERE "time" >= '2025-05-08T18:00:00Z'"#,
+            r#"SELECT "lang" AS k0, COUNT(*) AS doc_count, SUM(("hits")) AS m0_s FROM "plain" WHERE ("lang") IS NOT NULL GROUP BY 1"#,
+            r#"SELECT max("hits") AS top FROM "plain""#,
+        ] {
+            assert!(!reads_view_columns(own), "{own}");
+        }
+        // A document's id, source or sequence number, in any case or quoting, and a `*`.
+        for viewed in [
+            r#"SELECT osid, "hits" AS "hits", "_id" AS "_id" FROM "plain" WHERE 1=1 ORDER BY "hits" DESC LIMIT 3"#,
+            r#"SELECT "OSID" FROM "plain""#,
+            r#"SELECT COUNT(*) AS c FROM "plain" WHERE osid IN (SELECT osid FROM token_match('plain', 'title', 'india', 'or'))"#,
+            r#"SELECT source FROM "plain" WHERE "hits" = 9"#,
+            r#"SELECT max(osseq) FROM "plain""#,
+            r#"SELECT * FROM "plain" LIMIT 2"#,
+            r#"SELECT COUNT(*), t.* FROM "plain" t"#,
+        ] {
+            assert!(reads_view_columns(viewed), "{viewed}");
+        }
+        // A column that only holds one of the names inside its own is the table's.
+        assert!(!reads_view_columns(r#"SELECT "resource", "sources_n" FROM "plain""#));
     }
 
     #[test]

@@ -561,6 +561,11 @@ impl Bridge {
         if self.attached.read().map_or(true, |all| all.is_empty()) {
             return None;
         }
+        // A statement over the table's own columns alone needs no view, and
+        // keeps the plan the table gives it (see `reads_view_columns`).
+        if !attached::reads_view_columns(sql) {
+            return None;
+        }
         attached::rewrite(sql, &|table| {
             self.attached_columns(table).map(|c| c.as_ref().clone())
         })
