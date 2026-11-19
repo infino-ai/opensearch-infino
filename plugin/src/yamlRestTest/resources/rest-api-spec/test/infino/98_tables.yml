@@ -57,25 +57,30 @@
         index: reg1
         body:
           settings: { index.infino.enabled: true, index.infino.mode: proxy, index.infino.table: os_index, number_of_shards: 1, number_of_replicas: 0 }
+  # An index named "index" would be served from os_index: refused at create, in either mode.
   - do:
+      catch: bad_request
       indices.create:
         index: index
         body:
           settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - match: { error.type: illegal_argument_exception }
+  - match:
+      error.reason: /index\s\[index\]\swould\sbe\sserved\sfrom\stable\s\[os_index\].*holds\sthe\sregistry/
   - do:
-      catch: /holds\sthe\sregistry/
-      search:
+      catch: bad_request
+      indices.create:
         index: index
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+  - match: { error.type: illegal_argument_exception }
+  - match:
+      error.reason: /index\s\[index\]\swould\sbe\sserved\sfrom\stable\s\[os_index\].*holds\sthe\sregistry/
   - do:
-      catch: /holds\sthe\sregistry/
-      index:
+      indices.exists:
         index: index
-        id: "_cluster/state"
-        body: { items: [] }
-  - do:
-      indices.delete:
-        index: index
-  # The registry still answers: deleting that index left its table.
+  - is_false: ''
+  # The registry still answers.
   - do:
       infino.account_indices:
         name: own.a

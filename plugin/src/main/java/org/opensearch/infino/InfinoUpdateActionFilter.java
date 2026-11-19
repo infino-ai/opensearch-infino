@@ -7,6 +7,7 @@ package org.opensearch.infino;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
+import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
@@ -19,6 +20,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
+import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.tasks.Task;
 
 import java.util.List;
@@ -72,6 +74,16 @@ public class InfinoUpdateActionFilter implements ActionFilter {
         InfinoWriter writes = writer.get();
         if (clusters == null || writes == null) {
             chain.proceed(task, action, request, listener);
+            return;
+        }
+        // As the stock update checks it before anything is created or read.
+        if (update.isRequireAlias() && !clusters.state().metadata().hasAlias(update.index())) {
+            listener.onFailure(
+                new IndexNotFoundException(
+                    "[" + DocWriteRequest.REQUIRE_ALIAS + "] request flag is [true] and [" + update.index() + "] is not an alias",
+                    update.index()
+                )
+            );
             return;
         }
         BulkRequest bulk = new BulkRequest().add(update).setRefreshPolicy(update.getRefreshPolicy());

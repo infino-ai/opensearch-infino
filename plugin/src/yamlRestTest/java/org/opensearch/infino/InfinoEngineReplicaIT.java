@@ -11,7 +11,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.IntStream;
 
 /**
@@ -160,6 +162,70 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
         assertGreen(index);
         call("POST", "/" + index + "/_refresh", null);
         assertServesEvery(index, DOCS + LATER);
+        call("DELETE", "/" + index, null);
+    }
+
+    /**
+     * #137: a lease renewal changes only the leases in memory, which reach
+     * disk on the lease sync, while a flush records the history it keeps
+     * from them. A flush between two syncs, then a store recovery, must not
+     * load the table's lease behind that history: the shard recovers with
+     * every acknowledged write. Writes run across a lease sync (every 30s,
+     * a setting a node does not take), so it can save the table's lease
+     * while a commit is in flight; the flush and the recovery follow at
+     * once, before the next sync.
+     */
+    public void testAShardFlushedBetweenLeaseSyncsRecoversWithEveryWrite() throws Exception {
+        String index = "eng_rep_lease_flush";
+        createIndex(index, 0, "");
+        assertGreen(index);
+        Set<String> acked = ConcurrentHashMap.newKeySet();
+        AtomicBoolean stop = new AtomicBoolean();
+        Thread writer = new Thread(() -> {
+            for (int i = 0; !stop.get(); i++) {
+                try {
+                    call("PUT", "/" + index + "/_doc/w" + i, "{\"n\":" + i + "}");
+                    acked.add("w" + i);
+                } catch (IOException e) {
+                    return;
+                }
+            }
+        });
+        writer.start();
+        Thread.sleep(35_000);
+        stop.set(true);
+        writer.join();
+        call("POST", "/" + index + "/_flush?force=true", null);
+        call("POST", "/" + index + "/_close", null);
+        call("POST", "/" + index + "/_open", null);
+        assertGreen(index);
+        assertFalse("the writer acknowledged writes", acked.isEmpty());
+        call("POST", "/" + index + "/_refresh", null);
+        assertBusy(() -> {
+            try {
+                int served = count(index);
+                assertTrue("served " + served + " of " + acked.size() + " acknowledged writes", served >= acked.size());
+            } catch (ResponseException e) {
+                throw new AssertionError(e);
+            }
+        }, STALENESS_WAIT_SECONDS, TimeUnit.SECONDS);
+        call("DELETE", "/" + index, null);
+    }
+
+    /**
+     * OpenSearch expires a lease not renewed within the lease period, and a
+     * commit renews the table's lease only when it moves. The engine renews
+     * it where it is, so a shard idle for several periods keeps it.
+     */
+    public void testTheTablesLeaseOutlivesTheLeasePeriodOnAnIdleShard() throws Exception {
+        String index = "eng_rep_lease_idle";
+        createIndex(index, 0, ",\"index.soft_deletes.retention_lease.period\":\"5s\"");
+        assertGreen(index);
+        write(index, 0, DOCS);
+        call("POST", "/" + index + "/_refresh", null);
+        assertEquals(Long.valueOf(DOCS), tableLease(index, true));
+        Thread.sleep(40_000); // past the 5s period with no commit, and past a lease sync (every 30s), which expires stale leases
+        assertEquals("the table's lease is kept, where it was", Long.valueOf(DOCS), tableLease(index, true));
         call("DELETE", "/" + index, null);
     }
 

@@ -7,3 +7,7 @@
 # Blank lines and lines starting with # are ignored. Give each entry a comment
 # saying why it is skipped: a bug to fix, unsupported by design, or a test of
 # Lucene internals.
+
+# Creates an index named "index", whose table would be the registry's (os_index):
+# refused at create until the registry table is renamed (#58).
+search/260_sort_geopoint/*

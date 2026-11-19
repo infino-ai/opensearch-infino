@@ -21,6 +21,8 @@ import org.opensearch.common.document.DocumentField;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.get.GetResult;
 import org.opensearch.index.mapper.RoutingFieldMapper;
 import org.opensearch.index.seqno.SequenceNumbers;
@@ -92,6 +94,20 @@ public class InfinoGetActionFilter implements ActionFilter {
                 InfinoNative.Doc doc = access.restrictsDocuments()
                     ? restrictedDocs(table, List.of(get.id()), access).get(get.id())
                     : docOf(index, table, get.id(), get.realtime());
+                // In proxy mode a found document is at the version its writes report for every
+                // document; a default-mode write reports the shard's version, which is not known here.
+                if (doc != null
+                    && InfinoPlugin.inProxyMode(index.getSettings())
+                    && get.versionType().isVersionConflictForReads(InfinoDocumentVersion.VERSION, get.version())) {
+                    listener.onFailure(
+                        new VersionConflictEngineException(
+                            new ShardId(index.getIndex(), 0),
+                            get.id(),
+                            get.versionType().explainConflictForReads(InfinoDocumentVersion.VERSION, get.version())
+                        )
+                    );
+                    return;
+                }
                 @SuppressWarnings("unchecked")
                 Response response = (Response) new GetResponse(
                     result(
