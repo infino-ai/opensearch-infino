@@ -17,7 +17,6 @@ import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.delete.DeleteRequest;
 import org.opensearch.action.index.IndexRequest;
-import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.support.AutoCreateIndex;
 import org.opensearch.action.support.ContextPreservingActionListener;
@@ -106,7 +105,7 @@ import java.util.function.Supplier;
  * ({@link #dispatch}). A bulk mixing Infino-backed and other indices sends
  * the others' items to the stock bulk, and answers every item in its slot.
  */
-public class InfinoBulkActionFilter implements ActionFilter {
+public class InfinoBulkActionFilter extends InfinoActionFilter {
 
     private static final Logger log = LogManager.getLogger(InfinoBulkActionFilter.class);
     /**
@@ -146,7 +145,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
     }
 
     @Override
-    public <Request extends ActionRequest, Response extends ActionResponse> void apply(
+    protected <Request extends ActionRequest, Response extends ActionResponse> void filter(
         Task task,
         String action,
         Request request,
