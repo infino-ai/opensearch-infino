@@ -34,6 +34,9 @@ README's [Build and test](README.md#build-and-test) section describes both.
 
 - `gradle check` passes in `plugin/`. CI runs the same check on every pull
   request.
+- For a change to how documents are written or searched, the
+  `coreYamlRestTest*` tasks report 0 failures, and `core-denylist.txt` drops
+  the entries the change fixes. CI does not run these tasks.
 - If the change touches the security integration, or anything that differs
   between OpenSearch releases, `./scripts/check-all.sh` passes too.
 - New behaviour comes with tests. A query the plugin cannot answer the way

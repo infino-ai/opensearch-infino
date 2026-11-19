@@ -182,9 +182,42 @@ def coreTask = 'coreYamlRestTest'
 def coreProxyTask = 'coreYamlRestTestProxy'
 def coreLuceneTask = 'coreYamlRestTestLucene'
 def coreTests = 'org.opensearch.infino.InfinoCoreYamlTestSuiteIT'
-def coreDenylist = file("${projectDir}/src/yamlRestTest/core-denylist.txt").readLines()
+// Each core-denylist.txt entry is `pattern  # [tag] reason`; the file's header
+// says what the tags mean. -Dinfino.core.skip chooses how much each task skips:
+// all (the default), gaps (gaps and cluster failures, so the known bugs run),
+// or none.
+def coreSkip = System.getProperty('infino.core.skip', 'all')
+// Read and checked when a core task runs, so a malformed line or a wrong
+// infino.core.skip fails that run alone, not every build.
+def coreDenylistFile = file("${projectDir}/src/yamlRestTest/core-denylist.txt")
+def coreDenylist = { -> coreDenylistFile.readLines()
     .collect { it.trim() }
     .findAll { it && !it.startsWith('#') }
+    .collect { line ->
+        def m = line =~ /^(.+?)\s+#\s*\[(gap|bug|cluster)(?::(default|proxy))?\]\s*\S.*$/
+        if (!m.matches() || (m.group(2) == 'cluster' && m.group(3))) {
+            throw new GradleException("core-denylist.txt: no [tag] and reason: ${line}")
+        }
+        [pattern: m.group(1), kind: m.group(2), mode: m.group(3)]
+    }
+}
+// The entries a task in this mode skips, as tests.rest.denylist takes them: the
+// runner reads each pattern as a regular expression (with * for any run within
+// one path segment) and splits the list on unescaped commas, while test names
+// hold dots, parentheses and commas meant literally.
+def coreDenylistFor = { String mode ->
+    if (!(coreSkip in ['all', 'gaps', 'none'])) {
+        throw new GradleException("infino.core.skip is all, gaps or none, not ${coreSkip}")
+    }
+    coreDenylist().findAll { e ->
+        if (e.kind == 'cluster') {
+            return coreSkip != 'none'
+        }
+        mode != 'lucene' && (e.mode == null || e.mode == mode) && (coreSkip == 'all' || (coreSkip == 'gaps' && e.kind == 'gap'))
+    }.collect { e ->
+        e.pattern.replaceAll('[\\\\^$.|?+()\\[\\]{},]') { '\\' + it }
+    }.unique()
+}
 
 // The rule-framework module as the distribution lays it out: its jars and a
 // descriptor, zipped the way the test cluster installs a module.
@@ -314,13 +347,16 @@ testClusters.matching { it.name == multiNodeTask }.all {
         testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
         classpath = sourceSets.yamlRestTest.runtimeClasspath
         systemProperty 'tests.rest.suite', coreSuites.join(',')
-        if (coreDenylist) {
-            systemProperty 'tests.rest.denylist', coreDenylist.join(',')
-        }
+        inputs.file(coreDenylistFile)
+        inputs.property('infino.core.skip', coreSkip)
         filter {
             includeTestsMatching coreTests
         }
         doFirst {
+            def denylist = coreDenylistFor(mode)
+            if (denylist) {
+                systemProperty 'tests.rest.denylist', denylist.join(',')
+            }
             delete data
         }
     }
