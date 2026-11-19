@@ -762,6 +762,31 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /**
+     * {@code id}'s document as the latest refresh left it, which a get with
+     * {@code realtime=false} sees: the table's, unless the id was created
+     * since that refresh. A pending write is not seen.
+     */
+    static InfinoNative.Doc refreshedDoc(String table, String id) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine != null) {
+            synchronized (engine.batchLock) {
+                if (engine.unrefreshed.containsKey(id)) {
+                    return null;
+                }
+            }
+        }
+        return InfinoNative.getDoc(table, id);
+    }
+
+    /** Refresh the copy of {@code table}'s shard this node holds, as a get with {@code refresh=true} does; none, nothing to do. */
+    static void refreshFor(String table, String source) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine != null) {
+            engine.refresh(source);
+        }
+    }
+
+    /**
      * The routing value {@code id} was last written with, as a read sees it
      * now: a pending write's, else the table's; null when it was written with
      * none.

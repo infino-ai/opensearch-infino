@@ -21,6 +21,7 @@ import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.support.AutoCreateIndex;
 import org.opensearch.action.support.ContextPreservingActionListener;
+import org.opensearch.action.support.WriteRequest;
 import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.action.update.UpdateResponse;
 import org.opensearch.cluster.ClusterState;
@@ -65,6 +66,7 @@ import org.opensearch.transport.TransportService;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -495,6 +497,7 @@ public class InfinoBulkActionFilter implements ActionFilter {
         }
         DocWriteResponse w = r.getResponse();
         UpdateResponse update = new UpdateResponse(w.getShardInfo(), w.getShardId(), w.getId(), w.getSeqNo(), w.getPrimaryTerm(), w.getVersion(), w.getResult());
+        update.setForcedRefresh(w.forcedRefresh());
         return new BulkItemResponse(slot, DocWriteRequest.OpType.UPDATE, update);
     }
 
@@ -885,9 +888,10 @@ public class InfinoBulkActionFilter implements ActionFilter {
         BulkItemResponse[] answered,
         InfinoWriter writes,
         InfinoTables tables,
-        ActionListener<BulkResponse> listener
+        ActionListener<BulkResponse> client
     ) {
         long start = System.nanoTime();
+        ActionListener<BulkResponse> listener = refreshing(bulk.getRefreshPolicy(), answered, infino.values(), tables, client);
         InfinoServices.fork(ThreadPool.Names.WRITE, listener::onFailure, () -> {
             // The fields the documents add are mapped first, as a shard maps them, so
             // each table is declared from the mapping that holds them before its rows land.
@@ -900,6 +904,47 @@ public class InfinoBulkActionFilter implements ActionFilter {
                 ActionListener.wrap(mapped -> stageAndSubmit(bulk, concrete, mapped, items, writes, tables, listener, start), listener::onFailure)
             );
         });
+    }
+
+    /**
+     * The listener of a bulk served here under {@code policy}: when it asks
+     * for a refresh, the bulk is answered once every read of its tables sees
+     * the writes, and with {@code refresh=true} each item it wrote says it
+     * forced a refresh, as a stock shard's does. {@code answered} holds the
+     * items answered before any write.
+     */
+    static ActionListener<BulkResponse> refreshing(
+        WriteRequest.RefreshPolicy policy,
+        BulkItemResponse[] answered,
+        Collection<IndexMetadata> indices,
+        InfinoTables tables,
+        ActionListener<BulkResponse> listener
+    ) {
+        if (policy == WriteRequest.RefreshPolicy.NONE) {
+            return listener;
+        }
+        List<IndexMetadata> written = List.copyOf(indices);
+        return ActionListener.wrap(response -> {
+            if (policy == WriteRequest.RefreshPolicy.IMMEDIATE) {
+                BulkItemResponse[] items = response.getItems();
+                for (int slot = 0; slot < items.length; slot++) {
+                    if (answered[slot] == null && items[slot] != null && !items[slot].isFailed()) {
+                        items[slot].getResponse().setForcedRefresh(true);
+                    }
+                }
+            }
+            if (!InfinoNative.hosted()) {
+                listener.onResponse(response);
+                return;
+            }
+            // The wait for hosted reads may last the read window: not on the writer's thread.
+            InfinoServices.fork(ThreadPool.Names.GENERIC, listener::onFailure, () -> {
+                for (IndexMetadata md : written) {
+                    InfinoNative.awaitVisible(tables.ensure(md));
+                }
+                listener.onResponse(response);
+            });
+        }, listener::onFailure);
     }
 
     private static void stageAndSubmit(

@@ -1,0 +1,102 @@
+# The refresh parameter on single-document writes, and realtime=false gets,
+# as stock answers them (issue #55). The indices never refresh on their own,
+# so the only refresh is the one a request asks for.
+---
+"Proxy mode: refresh=true and refresh='' say they forced a refresh, and the next search finds the write":
+  - do:
+      indices.create:
+        index: rf_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0, refresh_interval: -1 }
+  - do: { index: { index: rf_px, id: "1", refresh: true, body: { foo: bar } } }
+  - is_true: forced_refresh
+  - do: { search: { index: rf_px, rest_total_hits_as_int: true, body: { query: { term: { _id: "1" } } } } }
+  - match: { hits.total: 1 }
+  - do: { create: { index: rf_px, id: "2", refresh: "", body: { foo: bar } } }
+  - is_true: forced_refresh
+  - do: { search: { index: rf_px, rest_total_hits_as_int: true, body: { query: { term: { _id: "2" } } } } }
+  - match: { hits.total: 1 }
+  - do: { update: { index: rf_px, id: "1", refresh: true, body: { doc: { foo: baz } } } }
+  - is_true: forced_refresh
+  - do: { search: { index: rf_px, rest_total_hits_as_int: true, body: { query: { term: { foo: baz } } } } }
+  - match: { hits.total: 1 }
+  - do: { index: { index: rf_px, id: "3", refresh: wait_for, body: { foo: bar } } }
+  - is_false: forced_refresh
+  - do: { search: { index: rf_px, rest_total_hits_as_int: true, body: { query: { term: { _id: "3" } } } } }
+  - match: { hits.total: 1 }
+  - do: { delete: { index: rf_px, id: "1", refresh: true } }
+  - is_true: forced_refresh
+  - do: { search: { index: rf_px, rest_total_hits_as_int: true, body: { query: { term: { _id: "1" } } } } }
+  - match: { hits.total: 0 }
+  - do: { index: { index: rf_px, id: "4", body: { foo: bar } } }
+  - is_false: forced_refresh
+
+---
+"Default mode: a write with refresh=true is in the next search, with refresh_interval -1":
+  - do:
+      indices.create:
+        index: rf_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0, refresh_interval: -1 }
+  - do: { index: { index: rf_def, id: "1", refresh: true, body: { foo: bar } } }
+  - is_true: forced_refresh
+  - do: { search: { index: rf_def, rest_total_hits_as_int: true, body: { query: { term: { _id: "1" } } } } }
+  - match: { hits.total: 1 }
+  - do: { create: { index: rf_def, id: "2", refresh: "", body: { foo: bar } } }
+  - is_true: forced_refresh
+  - do: { search: { index: rf_def, rest_total_hits_as_int: true, body: { query: { term: { _id: "2" } } } } }
+  - match: { hits.total: 1 }
+  - do: { update: { index: rf_def, id: "1", refresh: true, body: { doc: { foo: baz } } } }
+  - is_true: forced_refresh
+  - do: { search: { index: rf_def, rest_total_hits_as_int: true, body: { query: { term: { foo: baz } } } } }
+  - match: { hits.total: 1 }
+  - do: { delete: { index: rf_def, id: "1", refresh: true } }
+  - is_true: forced_refresh
+  - do: { search: { index: rf_def, rest_total_hits_as_int: true, body: { query: { term: { _id: "1" } } } } }
+  - match: { hits.total: 0 }
+
+---
+"Default mode: a write with refresh=wait_for is in the next search":
+  - do:
+      indices.create:
+        index: rf_def_wait
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+  - do: { index: { index: rf_def_wait, id: "1", refresh: wait_for, body: { foo: bar } } }
+  - is_false: forced_refresh
+  - do: { search: { index: rf_def_wait, rest_total_hits_as_int: true, body: { query: { term: { _id: "1" } } } } }
+  - match: { hits.total: 1 }
+
+---
+"Default mode: realtime=false gets see only what a refresh made visible":
+  - do:
+      indices.create:
+        index: rt_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0, refresh_interval: -1 }
+  - do: { index: { index: rt_def, id: "1", body: { foo: bar } } }
+  - do:
+      catch: missing
+      get: { index: rt_def, id: "1", realtime: false }
+  - do: { exists: { index: rt_def, id: "1", realtime: false } }
+  - is_false: ''
+  - do: { mget: { index: rt_def, realtime: false, body: { ids: ["1"] } } }
+  - is_false: docs.0.found
+  - do: { get: { index: rt_def, id: "1", realtime: true } }
+  - is_true: found
+  - do: { mget: { index: rt_def, realtime: true, body: { ids: ["1"] } } }
+  - is_true: docs.0.found
+  # A get that asks for a refresh refreshes the shard first.
+  - do: { get: { index: rt_def, id: "1", realtime: false, refresh: true } }
+  - is_true: found
+  - match: { _source.foo: bar }
+  - do: { get_source: { index: rt_def, id: "1", realtime: false } }
+  - match: { foo: bar }
+  - do: { exists: { index: rt_def, id: "1", realtime: false } }
+  - is_true: ''
+  # An update not yet refreshed: realtime=false still sees the refreshed version.
+  - do: { index: { index: rt_def, id: "1", body: { foo: baz } } }
+  - do: { get: { index: rt_def, id: "1", realtime: false } }
+  - match: { _source.foo: bar }
+  - do: { get: { index: rt_def, id: "1" } }
+  - match: { _source.foo: baz }

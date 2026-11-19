@@ -86,9 +86,12 @@ public class InfinoGetActionFilter implements ActionFilter {
                 // cut to the fields the user may read.
                 InfinoAccess access = InfinoAccess.reading(index.getIndex().getName(), "get");
                 String table = tables.ensureForDocument(index, get.id(), get.routing());
+                if (get.refresh()) {
+                    refresh(index, table);
+                }
                 InfinoNative.Doc doc = access.restrictsDocuments()
                     ? restrictedDocs(table, List.of(get.id()), access).get(get.id())
-                    : docOf(index, table, get.id());
+                    : docOf(index, table, get.id(), get.realtime());
                 @SuppressWarnings("unchecked")
                 Response response = (Response) new GetResponse(
                     result(
@@ -98,7 +101,7 @@ public class InfinoGetActionFilter implements ActionFilter {
                         access,
                         InfinoMappingSource.of(index.mapping()),
                         get.fetchSourceContext(),
-                        routingOf(index, table, get.id(), doc)
+                        routingOf(index, table, get.id(), doc, get.realtime())
                     )
                 );
                 listener.onResponse(response);
@@ -119,14 +122,25 @@ public class InfinoGetActionFilter implements ActionFilter {
     }
 
     /**
-     * A document as a read sees it now, with the sequence number it was
-     * written under: in default mode a write its shard has acknowledged and
-     * not yet committed counts, as a stock get reads the translog; in proxy
-     * mode an acknowledged write is in the table already. Null when it is
-     * missing or deleted.
+     * A document as a read sees it, with the sequence number it was written
+     * under: in default mode a write its shard has acknowledged and not yet
+     * committed counts when {@code realtime}, as a stock get reads the
+     * translog, and otherwise only what the latest refresh made visible; in
+     * proxy mode an acknowledged write is in the table, visible to searches,
+     * already. Null when it is missing or deleted.
      */
-    static InfinoNative.Doc docOf(IndexMetadata index, String table, String id) {
-        return InfinoPlugin.inDefaultMode(index.getSettings()) ? InfinoEngine.currentDoc(table, id) : InfinoNative.getDoc(table, id);
+    static InfinoNative.Doc docOf(IndexMetadata index, String table, String id, boolean realtime) {
+        if (!InfinoPlugin.inDefaultMode(index.getSettings())) {
+            return InfinoNative.getDoc(table, id);
+        }
+        return realtime ? InfinoEngine.currentDoc(table, id) : InfinoEngine.refreshedDoc(table, id);
+    }
+
+    /** Refresh the shard behind {@code table} before a get that asks for it; proxy mode has nothing to refresh. */
+    static void refresh(IndexMetadata index, String table) {
+        if (InfinoPlugin.inDefaultMode(index.getSettings())) {
+            InfinoEngine.refreshFor(table, "refresh_flag_get");
+        }
     }
 
     /** The Infino-backed index a request names, directly or through an alias; null when it names something else. */
@@ -151,11 +165,11 @@ public class InfinoGetActionFilter implements ActionFilter {
      * a stock get reports as {@code _routing}; null when it was written with
      * none, when it was not found, or in proxy mode, which routes nothing.
      */
-    static String routingOf(IndexMetadata index, String table, String id, InfinoNative.Doc doc) {
+    static String routingOf(IndexMetadata index, String table, String id, InfinoNative.Doc doc, boolean realtime) {
         if (doc == null || !InfinoPlugin.inDefaultMode(index.getSettings())) {
             return null;
         }
-        return InfinoEngine.currentRouting(table, id);
+        return realtime ? InfinoEngine.currentRouting(table, id) : InfinoNative.routingOf(table, id);
     }
 
     /**

@@ -25,8 +25,10 @@ import org.opensearch.threadpool.ThreadPool;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -104,10 +106,14 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             String[] tableOfItem = new String[mget.getItems().size()];
             Map<String, List<String>> idsByTable = new HashMap<>();
             Map<String, String> indexOfTable = new HashMap<>();
+            Set<String> refreshed = new HashSet<>();
             for (int i = 0; i < tableOfItem.length; i++) {
                 MultiGetRequest.Item item = mget.getItems().get(i);
                 String table = tables.ensureForDocument(indices.get(item.index()), item.id(), item.routing());
                 tableOfItem[i] = table;
+                if (mget.refresh() && refreshed.add(table)) {
+                    InfinoGetActionFilter.refresh(indices.get(item.index()), table);
+                }
                 idsByTable.computeIfAbsent(table, k -> new ArrayList<>()).add(item.id());
                 indexOfTable.put(table, item.index());
             }
@@ -129,8 +135,8 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                 MultiGetRequest.Item item = mget.getItems().get(i);
                 IndexMetadata md = indices.get(item.index());
                 Map<String, InfinoNative.Doc> byId = docsOf.get(tableOfItem[i]);
-                InfinoNative.Doc doc = byId != null ? byId.get(item.id()) : InfinoGetActionFilter.docOf(md, tableOfItem[i], item.id());
-                String routing = InfinoGetActionFilter.routingOf(md, tableOfItem[i], item.id(), doc);
+                InfinoNative.Doc doc = byId != null ? byId.get(item.id()) : InfinoGetActionFilter.docOf(md, tableOfItem[i], item.id(), mget.realtime());
+                String routing = InfinoGetActionFilter.routingOf(md, tableOfItem[i], item.id(), doc, mget.realtime());
                 GetResponse get = new GetResponse(
                     InfinoGetActionFilter.result(
                         md.getIndex().getName(),
