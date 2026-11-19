@@ -926,17 +926,17 @@ public final class InfinoNative {
     /**
      * The reason one document would be refused by the declared columns, or
      * null if it conforms. Throws {@link InfinoException} (503 unless the
-     * error carries its own status) when the document could not be checked
-     * (the table could not be opened): that says nothing about the document,
-     * so the write may be tried again. A document the bridge fails on while
-     * checking it is refused: it would fail the same way on every try, and
-     * at the commit.
+     * error carries its own status) when the document could not be checked,
+     * because the table could not be opened or the bridge failed while
+     * checking it: that says nothing about the document, so the write may be
+     * tried again, and an acknowledged document the commit checks is kept
+     * for the next commit rather than dropped.
      */
     public static String checkDoc(String name, String source) {
         init();
         Pointer p = lib.infino_check_doc(conn, name, source);
         if (p == null) {
-            return "the bridge failed while checking the document";
+            throw new InfinoException("the bridge failed while checking the document", RestStatus.SERVICE_UNAVAILABLE);
         }
         String why = takeOrThrow(p, RestStatus.SERVICE_UNAVAILABLE);
         return why.isEmpty() ? null : why;

@@ -1072,6 +1072,21 @@
   - match: { items.2.index.status: 400 }
   - match: { items.3.index.status: 201 }
 
+  # The committed write gave where and attrs.tags the list columns the table
+  # types from their values, which hold no array of arrays either: the same
+  # refusals hold in a later request.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: aa, _id: points2 }
+          - { status: 5, where: [ [ 1.0, 2.0 ], [ 3.0, 4.0 ] ] }
+          - index: { _index: aa, _id: nested2 }
+          - { status: 6, attrs: { tags: [ [ x ], [ y ] ] } }
+  - match: { errors: true }
+  - match: { items.0.index.status: 400 }
+  - match: { items.1.index.status: 400 }
+
   - do:
       search:
         index: aa
@@ -1213,6 +1228,17 @@
   - match: { items.0.index.status: 201 }
   - match: { items.1.index.status: 400 }
   - match: { items.2.index.status: 400 }
+
+  # The committed point gave shape.coordinates a list column; a line in a
+  # later request is still refused.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: gs, _id: line2 }
+          - { status: 4, shape: { type: linestring, coordinates: [ [ 1.0, 2.0 ], [ 3.0, 4.0 ] ] } }
+  - match: { errors: true }
+  - match: { items.0.index.status: 400 }
 
   - do:
       search:
