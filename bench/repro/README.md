@@ -9,7 +9,7 @@ These numbers are from `ekechi-dev-cpu` (GCE us-east1-b, 16 vCPU, 32 GB, 1.9 TB 
 `bench/race-big.sh` made 30 alternating calls per search with `request_cache=false`, ran two rounds after a warmup, and reported the median in ms. Round 2 ran 2026-11-17 00:07–00:12 UTC:
 
 - `sort_keyword_can_match_shortcut` and `sort_keyword_no_can_match_shortcut` were 8.57× and 8.40× stock.
-- Every other search was 2.07× stock or less. 14 of the 36 that answered were faster than stock. Round 1 was the same within a few percent.
+- Every other search was 2.07× stock or less. 14 of the 36 that answered were faster than stock. In round 1 the same two searches were 8.86× and 8.77×, and every other one was 2.08× or less.
 - `range-auto-date-histo`, `range-auto-date-histo-with-metrics` and `multi_terms-keyword` returned errors on the proxy.
 
 Full tables: [round 1](big5-100m-2026-11-17.round1.txt), [round 2](big5-100m-2026-11-17.round2.txt).
