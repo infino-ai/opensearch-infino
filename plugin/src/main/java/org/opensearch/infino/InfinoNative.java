@@ -502,9 +502,14 @@ public final class InfinoNative {
 
     /** The HTTP status an error object carries, else an internal error. */
     private static RestStatus statusOf(Map<String, Object> error) {
+        return statusOf(error, RestStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    /** The status an error object carries, else {@code fallback}. */
+    private static RestStatus statusOf(Map<String, Object> error, RestStatus fallback) {
         Object status = error.get("status");
         RestStatus known = status instanceof Number n ? RestStatus.fromCode(n.intValue()) : null;
-        return known == null ? RestStatus.INTERNAL_SERVER_ERROR : known;
+        return known == null ? fallback : known;
     }
 
     /**
@@ -559,14 +564,19 @@ public final class InfinoNative {
     }
 
     private static String takeOrThrow(Pointer p) {
+        return takeOrThrow(p, RestStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    /** The bridge's answer; an error object is thrown with its status, else {@code fallback}. */
+    private static String takeOrThrow(Pointer p, RestStatus fallback) {
         String s = take(p);
         if (s == null) {
-            throw new InfinoException("the bridge returned null");
+            throw new InfinoException("the bridge returned null", fallback);
         }
         if (s.startsWith("{\"error\"")) {
             Map<String, Object> error = object(s);
             Object message = error.get("error");
-            throw new InfinoException(message == null ? s : message.toString(), statusOf(error));
+            throw new InfinoException(message == null ? s : message.toString(), statusOf(error, fallback));
         }
         return s;
     }
@@ -913,11 +923,23 @@ public final class InfinoNative {
 
     // ---- documents ----
 
-    /** The reason one document would be refused by the declared columns, or null if it conforms. */
+    /**
+     * The reason one document would be refused by the declared columns, or
+     * null if it conforms. Throws {@link InfinoException} (503 unless the
+     * error carries its own status) when the document could not be checked,
+     * because the table could not be opened or the bridge failed while
+     * checking it: that says nothing about the document, so the write may be
+     * tried again, and an acknowledged document the commit checks is kept
+     * for the next commit rather than dropped.
+     */
     public static String checkDoc(String name, String source) {
         init();
-        String why = take(lib.infino_check_doc(conn, name, source));
-        return why == null || why.isEmpty() ? null : why;
+        Pointer p = lib.infino_check_doc(conn, name, source);
+        if (p == null) {
+            throw new InfinoException("the bridge failed while checking the document", RestStatus.SERVICE_UNAVAILABLE);
+        }
+        String why = takeOrThrow(p, RestStatus.SERVICE_UNAVAILABLE);
+        return why.isEmpty() ? null : why;
     }
 
     /**

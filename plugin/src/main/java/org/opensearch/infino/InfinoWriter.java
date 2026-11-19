@@ -562,13 +562,20 @@ public final class InfinoWriter {
                             // append writes its id.
                             String base = documents.containsKey(w.id()) ? documents.get(w.id()) : current == null ? null : InfinoNative.getSourceFresh(table, w.id());
                             String document = InfinoBulkActionFilter.merge(base, w.update());
-                            String why = document == null ? null : InfinoNative.checkDoc(table, document);
                             if (document == null) {
                                 rejection = new DocumentMissingException(shardId, w.id());
-                            } else if (why != null) {
-                                rejection = refused(why);
                             } else {
-                                merged.put(o, document);
+                                try {
+                                    String why = InfinoNative.checkDoc(table, document);
+                                    if (why != null) {
+                                        rejection = refused(why);
+                                    } else {
+                                        merged.put(o, document);
+                                    }
+                                } catch (InfinoNative.InfinoException e) {
+                                    // Not checked: this update alone fails, with a status that says it may be tried again.
+                                    rejection = e;
+                                }
                             }
                         }
                         if (rejection != null) {
