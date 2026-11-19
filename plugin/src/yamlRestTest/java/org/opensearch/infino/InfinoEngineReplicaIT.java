@@ -170,39 +170,35 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
      * disk on the lease sync, while a flush records the history it keeps
      * from them. A flush between two syncs, then a store recovery, must not
      * load the table's lease behind that history: the shard recovers with
-     * every acknowledged write. Writes run while the leases sync often, so a
-     * sync can save the table's lease while a commit is in flight.
+     * every acknowledged write. Writes run across a lease sync (every 30s,
+     * a setting a node does not take), so it can save the table's lease
+     * while a commit is in flight; the flush and the recovery follow at
+     * once, before the next sync.
      */
     public void testAShardFlushedBetweenLeaseSyncsRecoversWithEveryWrite() throws Exception {
         String index = "eng_rep_lease_flush";
-        createIndex(index, 0, ",\"index.soft_deletes.retention_lease.sync_interval\":\"200ms\"");
+        createIndex(index, 0, "");
         assertGreen(index);
         Set<String> acked = ConcurrentHashMap.newKeySet();
-        for (int round = 0; round < 3; round++) {
-            call("PUT", "/" + index + "/_settings", "{\"index.soft_deletes.retention_lease.sync_interval\":\"200ms\"}");
-            AtomicBoolean stop = new AtomicBoolean();
-            int base = round * 1_000_000;
-            Thread writer = new Thread(() -> {
-                for (int i = base; !stop.get(); i++) {
-                    try {
-                        call("PUT", "/" + index + "/_doc/w" + i, "{\"n\":" + i + "}");
-                        acked.add("w" + i);
-                    } catch (IOException e) {
-                        return;
-                    }
+        AtomicBoolean stop = new AtomicBoolean();
+        Thread writer = new Thread(() -> {
+            for (int i = 0; !stop.get(); i++) {
+                try {
+                    call("PUT", "/" + index + "/_doc/w" + i, "{\"n\":" + i + "}");
+                    acked.add("w" + i);
+                } catch (IOException e) {
+                    return;
                 }
-            });
-            writer.start();
-            Thread.sleep(1_500);
-            call("PUT", "/" + index + "/_settings", "{\"index.soft_deletes.retention_lease.sync_interval\":\"1h\"}");
-            Thread.sleep(300);
-            stop.set(true);
-            writer.join();
-            call("POST", "/" + index + "/_flush?force=true", null);
-            call("POST", "/" + index + "/_close", null);
-            call("POST", "/" + index + "/_open", null);
-            assertGreen(index);
-        }
+            }
+        });
+        writer.start();
+        Thread.sleep(35_000);
+        stop.set(true);
+        writer.join();
+        call("POST", "/" + index + "/_flush?force=true", null);
+        call("POST", "/" + index + "/_close", null);
+        call("POST", "/" + index + "/_open", null);
+        assertGreen(index);
         assertFalse("the writer acknowledged writes", acked.isEmpty());
         call("POST", "/" + index + "/_refresh", null);
         assertBusy(() -> {
@@ -223,16 +219,12 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
      */
     public void testTheTablesLeaseOutlivesTheLeasePeriodOnAnIdleShard() throws Exception {
         String index = "eng_rep_lease_idle";
-        createIndex(
-            index,
-            0,
-            ",\"index.soft_deletes.retention_lease.period\":\"5s\",\"index.soft_deletes.retention_lease.sync_interval\":\"1s\""
-        );
+        createIndex(index, 0, ",\"index.soft_deletes.retention_lease.period\":\"5s\"");
         assertGreen(index);
         write(index, 0, DOCS);
         call("POST", "/" + index + "/_refresh", null);
         assertEquals(Long.valueOf(DOCS), tableLease(index, true));
-        Thread.sleep(15_000); // three lease periods with no commit; a lease sync runs every second
+        Thread.sleep(40_000); // past the 5s period with no commit, and past a lease sync (every 30s), which expires stale leases
         assertEquals("the table's lease is kept, where it was", Long.valueOf(DOCS), tableLease(index, true));
         call("DELETE", "/" + index, null);
     }
