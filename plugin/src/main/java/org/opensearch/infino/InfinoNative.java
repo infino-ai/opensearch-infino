@@ -1311,6 +1311,18 @@ public final class InfinoNative {
     }
 
     /**
+     * The rows of {@code q}, a scan selecting every column ({@code SELECT *}),
+     * each as its bookkeeping columns ({@link InfinoQueryTranslator#OSID},
+     * {@link InfinoQueryTranslator#ROUTING}, ...) and its document under
+     * {@link InfinoQueryTranslator#SOURCE}, rebuilt from the row's own
+     * columns: a whole table's documents, a page at a statement.
+     */
+    public static List<Map<String, Object>> sqlRebuilt(String q) {
+        init();
+        return rows(takeOrThrow(lib.infino_sql_rebuilt(conn, q)));
+    }
+
+    /**
      * The top {@code k} rows of a full-text query ({@code mode} "and" / "or")
      * by BM25, best first, each with its id, source and score: a page of hits
      * in one engine call, with no statement to plan.

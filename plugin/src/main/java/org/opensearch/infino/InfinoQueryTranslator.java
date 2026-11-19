@@ -134,6 +134,14 @@ final class InfinoQueryTranslator {
      * arrays of objects from it; it is no field of its own.
      */
     static final String OBJECTS_SUFFIX = "{}";
+
+    /**
+     * Whether a column holds documents' values as written ({@link #OBJECTS_SUFFIX}),
+     * or is named like the source: it may hold any field, a hidden or masked one too.
+     */
+    static boolean holdsWritten(String column) {
+        return column.equals(SOURCE) || column.endsWith(OBJECTS_SUFFIX);
+    }
     /**
      * The names a list's subquery gives a document's id and each of its
      * values, and the aliases of the table it reads and of its rows. The

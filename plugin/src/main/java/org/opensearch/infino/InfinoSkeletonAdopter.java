@@ -108,7 +108,7 @@ final class InfinoSkeletonAdopter {
         long unroutable = 0;
         String after = null;
         while (true) {
-            List<Map<String, Object>> page = InfinoNative.sqlDocs(table, pageSql(table, after, routed), InfinoNative.ALL_ROWS);
+            List<Map<String, Object>> page = InfinoNative.sqlRebuilt(pageSql(table, after));
             Map<String, Row> missing = new LinkedHashMap<>();
             try (Engine.Searcher searcher = shard.acquireSearcher("infino_skeleton")) {
                 for (Map<String, Object> row : page) {
@@ -154,13 +154,10 @@ final class InfinoSkeletonAdopter {
         return out.isEmpty() ? 0 : InfinoAggregationProcessor.asLong(out.get(0).get(COUNT_ALIAS));
     }
 
-    /** One page of the table's ids and (when {@code routed}) routing values in id order, after {@code after} (null for the first); {@link InfinoNative#sqlDocs} adds their documents. */
-    private static String pageSql(String table, String after, boolean routed) {
+    /** One page of the table's rows in id order, after {@code after} (null for the first), every column, for {@link InfinoNative#sqlRebuilt}. */
+    private static String pageSql(String table, String after) {
         String osid = InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.OSID);
-        return "SELECT "
-            + osid
-            + (routed ? ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING) : "")
-            + " FROM "
+        return "SELECT * FROM "
             + InfinoQueryTranslator.quoteIdent(table)
             + (after == null ? "" : " WHERE " + osid + " > " + InfinoQueryTranslator.literal(after))
             + " ORDER BY "

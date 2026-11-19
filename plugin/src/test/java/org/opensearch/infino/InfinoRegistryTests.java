@@ -327,6 +327,7 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
                     return string("{}");
                 case "infino_sql":
                 case "infino_sql_docs":
+                case "infino_sql_rebuilt":
                     // The registry counts a row's copies before every write, and reads its rows with their documents.
                     if (declared == false) {
                         return string("{\"error\":\"table os_index not found\"}");

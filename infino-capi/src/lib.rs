@@ -103,8 +103,10 @@ const LIST_SUFFIX: &str = "[]";
 /// the value's path: `<path>{}`, for the values the rebuilt `_source` cannot
 /// take from their columns. An array of objects: flattening keeps each
 /// member path's values (`a.b[]`) but not which of them shared an entry, and
-/// a nested query reads its entries as they were written. A vector: the
-/// engine keeps it in its vector index, which no projection reads back.
+/// a nested query reads its entries as they were written. An array holding
+/// arrays: flattening joins them into one list. An empty object or array:
+/// flattening keeps nothing of it. A vector: the engine keeps it in its
+/// vector index, which no projection reads back.
 const OBJECTS_SUFFIX: &str = "{}";
 /// The name Arrow gives a list column's element.
 const LIST_ITEM: &str = "item";
@@ -1483,10 +1485,11 @@ fn flatten(obj: &Map<String, Value>, prefix: &str, out: &mut Map<String, Value>)
     }
 }
 
-/// Each array of objects in a document, as the document wrote it, under
-/// `<path>{}` ([`OBJECTS_SUFFIX`]), beside the member paths [`flatten`]
-/// gives it. An array inside one of those objects is part of that array's
-/// text, so the walk does not go into it.
+/// Each value of a document that its columns cannot spell back, as the
+/// document wrote it, under `<path>{}` ([`OBJECTS_SUFFIX`]), beside what
+/// [`flatten`] gives it: an array of objects or of arrays, and an empty object
+/// or array. Whatever is inside one of those is part of its text, so the walk
+/// does not go into it.
 fn keep_object_arrays(obj: &Map<String, Value>, prefix: &str, out: &mut Map<String, Value>) {
     for (k, v) in obj {
         let path = if prefix.is_empty() {
@@ -1495,8 +1498,16 @@ fn keep_object_arrays(obj: &Map<String, Value>, prefix: &str, out: &mut Map<Stri
             format!("{prefix}.{k}")
         };
         match v {
-            Value::Object(inner) => keep_object_arrays(inner, &path, out),
-            Value::Array(items) if items.iter().any(Value::is_object) => {
+            Value::Object(inner) if !inner.is_empty() => keep_object_arrays(inner, &path, out),
+            Value::Object(_) => {
+                out.insert(
+                    format!("{path}{OBJECTS_SUFFIX}"),
+                    Value::String(v.to_string()),
+                );
+            }
+            Value::Array(items)
+                if items.is_empty() || items.iter().any(|i| i.is_object() || i.is_array()) =>
+            {
                 out.insert(
                     format!("{path}{OBJECTS_SUFFIX}"),
                     Value::String(v.to_string()),
@@ -3371,6 +3382,39 @@ pub unsafe extern "C" fn infino_sql_docs(
     .unwrap_or(ptr::null_mut())
 }
 
+/// Run `sql`, a scan that selects every column of the rows it reads (`SELECT
+/// *`), and give each row its bookkeeping columns (`osid`, `osrouting`, ...)
+/// and its document under `source`, rebuilt from the row's own columns: a
+/// whole table's documents, page by page, at a statement per page.
+#[no_mangle]
+pub unsafe extern "C" fn infino_sql_rebuilt(h: *mut Bridge, sql: *const c_char) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(sql)) = (bridge_ref(h), unsafe { cstr(sql) }) else {
+            return ptr::null_mut();
+        };
+        let batches = match conn.conn.query_sql(sql) {
+            Ok(b) => b,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let mut rows = Vec::new();
+        for b in &batches {
+            let schema = b.schema();
+            for r in 0..b.num_rows() {
+                let mut row = Map::new();
+                for (c, field) in schema.fields().iter().enumerate() {
+                    if bookkeeping(field.name()) && !field.name().starts_with('_') {
+                        row.insert(field.name().clone(), cell_value(b.column(c).as_ref(), r));
+                    }
+                }
+                row.insert(SOURCE.to_owned(), Value::String(rebuild_source(b, r)));
+                rows.push(Value::Object(row));
+            }
+        }
+        out_json(Value::Array(rows))
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// The indices a caller's read-only statement reads, as
 /// `{"indices": [..]}`, for the plugin to have the caller authorized for
 /// before it runs ([`infino_sql_read`]); a statement the route does not
@@ -4758,21 +4802,23 @@ mod tests {
     }
 
     /// A document comes back from its columns: nested objects, a field given
-    /// several values, and an array of objects with each entry's members
-    /// together, as the document wrote them.
+    /// several values, an array of objects with each entry's members together,
+    /// an empty object and an array of arrays, as the document wrote them.
     #[test]
     fn a_document_is_rebuilt_from_its_columns() {
         let h = open_logs();
         ensure(
             h,
-            r#"{"properties":{"level":{"type":"keyword"},"status":{"type":"long"}}}"#,
+            r#"{"properties":{"level":{"type":"keyword"},"status":{"type":"long"},"pairs":{"type":"keyword"}}}"#,
         );
         let sent = json!({
             "level": "info",
             "status": 7,
             "host": {"name": "n1", "ip": "10.0.0.1"},
             "tags": ["x", "y"],
-            "users": [{"name": "a", "age": 1}, {"name": "b"}]
+            "users": [{"name": "a", "age": 1}, {"name": "b"}],
+            "aliases": {"read": {}, "write": {"is_write_index": true}},
+            "pairs": [["a", "b"], ["c"]]
         });
         let text = sent.to_string();
         index(h, &[("d1", text.as_str())]);
@@ -4807,6 +4853,39 @@ mod tests {
         let first: Value = serde_json::from_str(rows[0]["source"].as_str().unwrap()).unwrap();
         assert_eq!(first, json!({"level": "info", "n": 1}), "{rows}");
         assert!(rows[1].get("source").is_none(), "{rows}");
+        close(h);
+    }
+
+    /// A whole table's documents, a page at a statement: each row's
+    /// bookkeeping columns and its document, rebuilt from the row's own.
+    #[test]
+    fn a_scan_rebuilds_each_row_from_its_own_columns() {
+        let h = open_logs();
+        ensure(h, r#"{"properties":{"level":{"type":"keyword"}}}"#);
+        index(
+            h,
+            &[
+                ("q1", r#"{"level":"info","host":{"name":"n1"}}"#),
+                ("q2", r#"{"level":"warn","tags":["x","y"]}"#),
+            ],
+        );
+        let out =
+            take(unsafe { infino_sql_rebuilt(h, c("SELECT * FROM logs ORDER BY osid").as_ptr()) });
+        let rows: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert_eq!(rows[0]["osid"], "q1", "{rows}");
+        assert!(rows[0].get("level").is_none(), "{rows}");
+        let first: Value = serde_json::from_str(rows[0]["source"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            first,
+            json!({"level": "info", "host": {"name": "n1"}}),
+            "{rows}"
+        );
+        let second: Value = serde_json::from_str(rows[1]["source"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            second,
+            json!({"level": "warn", "tags": ["x", "y"]}),
+            "{rows}"
+        );
         close(h);
     }
 

@@ -104,6 +104,9 @@ public interface InfinoLib extends Library {
      */
     Pointer infino_sql_docs(Pointer h, String names, String sql, int limit);
 
+    /** A scan's rows ({@code SELECT *}), each its bookkeeping columns and its document rebuilt from its own columns, under "source". */
+    Pointer infino_sql_rebuilt(Pointer h, String sql);
+
     /** The indices a caller's read-only statement reads, as {@code {"indices": [..]}}, or an error with its status. */
     Pointer infino_sql_indices(String sql);
 

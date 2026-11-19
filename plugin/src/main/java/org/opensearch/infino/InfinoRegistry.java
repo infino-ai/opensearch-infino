@@ -397,11 +397,7 @@ final class InfinoRegistry {
     static List<Map<String, Object>> rawRows() {
         drain();
         declareToRead();
-        return InfinoNative.sqlDocs(
-            TABLE,
-            "SELECT " + InfinoQueryTranslator.OSID + " FROM " + InfinoQueryTranslator.quoteIdent(TABLE),
-            InfinoNative.ALL_ROWS
-        );
+        return InfinoNative.sqlRebuilt("SELECT * FROM " + InfinoQueryTranslator.quoteIdent(TABLE));
     }
 
     /** What became of a registered index when the registry was restored. */
