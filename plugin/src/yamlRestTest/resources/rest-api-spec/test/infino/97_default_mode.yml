@@ -909,7 +909,7 @@
         index: rc_default
 
 ---
-"Default mode: a document the table refuses is refused on its own, and the writes after it land":
+"Default mode: a document the table refuses at commit is dropped, not retried, and the writes after it land":
   - do:
       indices.create:
         index: ep
@@ -927,9 +927,10 @@
               labels: { type: flat_object }
 
   # The mapper takes both bad documents (a malformed date it ignores, an
-  # array of arrays in a flat_object), and the table refuses each: each is
-  # refused as its own bulk item when it is written, and the writes after it
-  # land.
+  # array of arrays in a flat_object). The array of arrays is refused as its
+  # own bulk item when it is written. The malformed date passes that check
+  # and the table refuses it at commit; retried, it would hold every later
+  # write to the shard behind it, so it is dropped.
   - do:
       bulk:
         body:
@@ -943,7 +944,7 @@
           - { when: "2026-10-24T10:03:00Z", status: 4 }
   - match: { errors: true }
   - match: { items.0.index.status: 201 }
-  - match: { items.1.index.status: 400 }
+  - match: { items.1.index.status: 201 }
   - match: { items.2.index.status: 400 }
   - match: { items.3.index.status: 201 }
 
@@ -1084,3 +1085,143 @@
   - do:
       indices.delete:
         index: aa
+
+---
+"Default mode: a field mapped since the shard opened is checked by its column when it is written":
+  - do:
+      indices.create:
+        index: lm
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+            refresh_interval: -1
+          mappings:
+            properties:
+              status: { type: long }
+
+  # A field added by a put-mapping: a fractional number for it is refused as
+  # it would be for a field mapped at create.
+  - do:
+      indices.put_mapping:
+        index: lm
+        body:
+          properties:
+            n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: lm, _id: put_ok }
+          - { status: 1, n: 2 }
+          - index: { _index: lm, _id: put_frac }
+          - { status: 2, n: 2.5 }
+  - match: { errors: true }
+  - match: { items.0.index.status: 201 }
+  - match: { items.1.index.status: 400 }
+
+  # A field mapped dynamically by the first write of a bulk: the second write
+  # is checked by the column the first one's mapping declared.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: lm, _id: dyn_ok }
+          - { status: 3, d: 1 }
+          - index: { _index: lm, _id: dyn_frac }
+          - { status: 4, d: 2.5 }
+  - match: { errors: true }
+  - match: { items.0.index.status: 201 }
+  - match: { items.1.index.status: 400 }
+
+  # An array of arrays in a field mapped dynamically by that same document
+  # is read through by the field's column, as OpenSearch reads it, whether
+  # or not anything has declared the column before; the same document is
+  # taken the second time too.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: lm, _id: grid1 }
+          - { status: 5, grid: [ [ 1, 2 ], [ 3 ] ] }
+  - match: { errors: false }
+  - match: { items.0.index.status: 201 }
+  - do:
+      search:
+        index: lm
+        body:
+          size: 0
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: lm, _id: grid2 }
+          - { status: 6, grid: [ [ 1, 2 ], [ 3 ] ] }
+  - match: { errors: false }
+  - match: { items.0.index.status: 201 }
+
+  - do:
+      search:
+        index: lm
+        body:
+          track_total_hits: true
+          sort: [ { status: asc } ]
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: put_ok }
+  - match: { hits.hits.1._id: dyn_ok }
+  - match: { hits.hits.2._id: grid1 }
+  - match: { hits.hits.3._id: grid2 }
+
+  - do:
+      indices.delete:
+        index: lm
+
+---
+"Default mode: a geo_shape whose coordinates are an array of arrays is refused when it is written":
+  - do:
+      indices.create:
+        index: gs
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+            refresh_interval: -1
+          mappings:
+            properties:
+              status: { type: long }
+              shape: { type: geo_shape }
+
+  # A geo_shape has no column; a point's coordinates are one array and are
+  # taken, but a line's or a polygon's are an array of arrays, which the
+  # table cannot hold, so each is refused as its own bulk item rather than
+  # acknowledged and then dropped.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: gs, _id: point }
+          - { status: 1, shape: { type: point, coordinates: [ 1.0, 2.0 ] } }
+          - index: { _index: gs, _id: line }
+          - { status: 2, shape: { type: linestring, coordinates: [ [ 1.0, 2.0 ], [ 3.0, 4.0 ] ] } }
+          - index: { _index: gs, _id: polygon }
+          - { status: 3, shape: { type: polygon, coordinates: [ [ [ 0.0, 0.0 ], [ 1.0, 0.0 ], [ 1.0, 1.0 ], [ 0.0, 0.0 ] ] ] } }
+  - match: { errors: true }
+  - match: { items.0.index.status: 201 }
+  - match: { items.1.index.status: 400 }
+  - match: { items.2.index.status: 400 }
+
+  - do:
+      search:
+        index: gs
+        body:
+          track_total_hits: true
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: point }
+
+  - do:
+      indices.delete:
+        index: gs

@@ -1724,7 +1724,8 @@ fn unify_new_paths(rows: &mut [Map<String, Value>], schema: &Schema) {
 /// `""` when it conforms, else the reason it would fail. The engine returns
 /// the same verdict `infino_index_batch` would report for the document, so a
 /// caller can refuse it synchronously (an OpenSearch bulk item error) rather
-/// than learn after the batch commits.
+/// than learn after the batch commits. A failure to check at all (the table
+/// cannot be opened) is an error object, not a verdict on the document.
 #[no_mangle]
 pub unsafe extern "C" fn infino_check_doc(
     h: *mut Bridge,
@@ -1737,11 +1738,11 @@ pub unsafe extern "C" fn infino_check_doc(
                 cstr(source)
             })
         else {
-            return out_string("null argument".into());
+            return err_json("null argument");
         };
         let table = match conn.table(name) {
             Ok(t) => t,
-            Err(e) => return out_string(e.to_string()),
+            Err(e) => return err_json(&e.to_string()),
         };
         let schema = table.schema();
         let stamp = conn.stamp(name);
@@ -3829,6 +3830,24 @@ mod tests {
             let out = index(h, &[("y", doc)]);
             assert_eq!(out["ok"], 1, "{doc}: {out}");
         }
+        close(h);
+    }
+
+    /// A table that cannot be opened is no verdict on the document: the
+    /// check answers an error object, which the plugin fails the write with
+    /// (one the client may try again), not a reason the document is refused.
+    #[test]
+    fn a_table_that_cannot_be_opened_is_an_error_not_a_refusal() {
+        let h = open_logs();
+        let out = take(unsafe {
+            infino_check_doc(
+                h,
+                c("no_such_table").as_ptr(),
+                c(r#"{"level":"info"}"#).as_ptr(),
+            )
+        });
+        let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert!(v["error"].is_string(), "{out}");
         close(h);
     }
 

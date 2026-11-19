@@ -20,6 +20,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.engine.DocumentIndexWriter;
 import org.opensearch.index.engine.EngineConfig;
@@ -857,8 +858,25 @@ public class InfinoEngine extends InternalEngine {
         // but a column cannot hold (an unsigned_long past the largest signed
         // 64-bit integer, a fractional number for an integer field, an edge's
         // end that is no row id). A replay carries writes already acknowledged.
+        // The table is declared from the current mapping first, as the commit
+        // declares it: a field mapped since (dynamically, by this very document,
+        // or by a put-mapping) has its column, so the check reads the document
+        // as the commit will. A failure to declare or check is no verdict on the
+        // document: this write alone fails, and the bridge's failures answer 503,
+        // so it may be tried again.
         if (source != null && !index.origin().isRecovery()) {
-            String why = InfinoNative.checkDoc(table, source);
+            String why;
+            try {
+                InfinoPlugin.tables().ensure(config().getIndexSettings().getIndexMetadata(), config().getShardId().id());
+                why = InfinoNative.checkDoc(table, source);
+            } catch (InfinoNative.InfinoException e) {
+                return new IndexResult(
+                    e.status() == RestStatus.INTERNAL_SERVER_ERROR ? new InfinoNative.InfinoException(e.getMessage(), RestStatus.SERVICE_UNAVAILABLE) : e,
+                    index.version()
+                );
+            } catch (RuntimeException e) {
+                return new IndexResult(e, index.version());
+            }
             if (why != null) {
                 return new IndexResult(new MapperParsingException("[infino] " + why), index.version());
             }
@@ -1367,16 +1385,27 @@ public class InfinoEngine extends InternalEngine {
      * and the table's columns are checked again for any other. Retrying it
      * would hold every later write to the shard behind it. Any other failed
      * for a reason of the moment (the engine's schema moved under the write,
-     * storage failed); it is put back for the next commit, and the table's
+     * storage failed), as does one the table could not be checked against
+     * (once a check fails, the rest are not tried); it is put back for the
+     * next commit, and the table's
      * hold on the shard's history stays below it until a commit takes it
      * (see {@link #holdHistoryThrough}), so a new primary writes it too.
      */
     private Batch notTaken(List<InfinoNative.PreparedFailure> failed, List<String> ids, List<Version> written) {
         Batch retry = new Batch();
+        boolean checkable = true;
         for (InfinoNative.PreparedFailure f : failed) {
             String id = ids.get(f.index());
             Version v = written.get(f.index());
-            String refused = f.permanent() ? f.reason() : InfinoNative.checkDoc(table, v.source());
+            String refused = f.permanent() ? f.reason() : null;
+            if (refused == null && checkable) {
+                try {
+                    refused = InfinoNative.checkDoc(table, v.source());
+                } catch (InfinoNative.InfinoException e) {
+                    // No verdict on this document or the ones after it: each is tried again.
+                    checkable = false;
+                }
+            }
             if (refused != null) {
                 log.error(
                     "[infino] table {} refuses document {} (operation {}) after OpenSearch acknowledged it; the table does not hold this version, keeps any version it held before, and no commit tries it again: {}",
