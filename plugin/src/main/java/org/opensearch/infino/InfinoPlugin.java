@@ -610,6 +610,8 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
                 if (enabled) {
                     // The index's tables as it will hold them: the request and its templates over the defaults above.
                     Settings index = Settings.builder().put(out.build()).put(templateAndRequestSettings).build();
+                    // Fails the create (400) rather than leaving an index whose shard never starts.
+                    InfinoTables.refuseRegistryTable(indexName, index);
                     out.put(INFINO_TABLE_CLAIMED.getKey(), TABLES.claimable(indexName, index));
                 }
                 return out.build();

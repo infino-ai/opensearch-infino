@@ -81,6 +81,20 @@ public class InfinoTablesTests extends OpenSearchTestCase {
         assertTrue(e.getMessage(), e.getMessage().contains("holds the registry"));
     }
 
+    public void testAnIndexWhoseTableWouldBeTheRegistrysIsRefusedAtCreate() {
+        for (String mode : List.of(InfinoPlugin.MODE_PROXY, InfinoPlugin.MODE_DEFAULT)) {
+            Settings settings = Settings.builder().put(InfinoPlugin.INFINO_MODE.getKey(), mode).build();
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> InfinoTables.refuseRegistryTable("index", settings)
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("index [index] would be served from table [os_index]"));
+            InfinoTables.refuseRegistryTable("logs", settings);
+        }
+        Settings named = Settings.builder().put(InfinoPlugin.INFINO_TABLE.getKey(), "os_other").build();
+        InfinoTables.refuseRegistryTable("index", named);
+    }
+
     public void testADefaultModeShardTableIsTakenAgainstAnotherIndexsName() {
         IndexMetadata sharded = index(
             "foo",
