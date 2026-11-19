@@ -4,12 +4,12 @@
 
 An OpenSearch plugin that stores your indices in [Infino](https://github.com/infino-ai/infino) tables instead of Lucene. Infino is an Apache-2.0 retrieval engine, written in Rust, that keeps its tables on object storage and runs SQL, full-text and vector search over them. The documents live on storage you choose (a local disk, an S3 or GCS bucket, or a hosted Infino account), and OpenSearch's REST API, Dashboards, security plugin and cluster management work unchanged.
 
-- **The same APIs.** Index, bulk, get, search, aggregations, scroll and Dashboards work unchanged. An index keeps its name, mapping, settings and aliases.
+- **The same APIs.** Clients and Dashboards talk to the node through OpenSearch's own REST API. An index keeps its name, mapping, settings and aliases.
 - **One engine for every query.** Full-text search (BM25), vector search (kNN and hybrid) and SQL run on the same tables.
 - **Stateless nodes.** A node with an empty data directory brings every index back from storage, with its mapping and aliases.
 - **Not a fork.** The plugin installs into a released OpenSearch: 2.19.6, 3.0.0, 3.3.2, 3.6.0 or 3.9.0.
 
-**Status: experimental.** Not ready for production data, and settings and behaviour may change between versions without a migration path. The plugin is tested on the releases above with local storage and Dashboards; cloud buckets are not tested yet. CI runs `gradle check` on 3.9.0 only; the other releases are checked by running `check-all.sh` by hand. Many of OpenSearch's own YAML REST tests still fail with it ([#51](https://github.com/infino-ai/opensearch-infino/issues/51)), and known gaps are tracked in [the issues](https://github.com/infino-ai/opensearch-infino/issues). Among them: in default mode, an acknowledged write that the table refuses can be dropped ([#54](https://github.com/infino-ai/opensearch-infino/issues/54)), and some searches return wrong results with no error ([#56](https://github.com/infino-ai/opensearch-infino/issues/56)). Try it on data you can rebuild before relying on it.
+**Status: experimental.** Not ready for production data, and settings and behaviour may change between versions without a migration path. Of the 895 tests in OpenSearch's own YAML REST suite, 421 pass in default mode and 378 in proxy mode ([#51](https://github.com/infino-ai/opensearch-infino/issues/51)). Most of the rest use features the table does not serve yet, which it refuses with an error; about 120 in default mode and 145 in proxy mode return a different answer from stock OpenSearch with no error ([#56](https://github.com/infino-ai/opensearch-infino/issues/56)). The plugin is tested on the releases above with local storage and Dashboards; cloud buckets are not tested yet. CI runs `gradle check` on 3.9.0 only; the other releases are checked by running `check-all.sh` by hand. Known gaps are tracked in [the issues](https://github.com/infino-ai/opensearch-infino/issues). Try it on data you can rebuild before relying on it.
 
 **Contents:** [Quick start](#quick-start) · [How it works](#how-it-works) · [Install on a cluster](#install-on-a-cluster) · [Hosted account and stateless nodes](#hosted-account-and-stateless-nodes) · [Settings](#settings) · [SQL](#sql) · [What is supported](#what-is-supported) · [Writes](#writes) · [Build and test](#build-and-test) · [Repository layout](#repository-layout) · [License](#license) · [Contributing and security](#contributing-and-security)
 
@@ -100,7 +100,7 @@ The plugin has two parts: a Java plugin (`plugin/`) and a native bridge (`infino
 
 The document id is a column too, with a term index.
 
-A document that the declared columns cannot hold is refused as its own bulk item, with the reason. In default mode, OpenSearch's mapper checks the document first; one the mapper takes but the columns refuse is logged as an error and left out of the table, although the bulk acknowledged it ([#54](https://github.com/infino-ai/opensearch-infino/issues/54)).
+A document that the declared columns cannot hold is refused as its own bulk item, with the reason.
 
 An index is served in one of two modes, fixed when it is created:
 
@@ -141,7 +141,7 @@ bin/opensearch-plugin install -b file:///path/infino-engine.zip
 |---|---|---|
 | In memory | nothing to set | Lost on restart; for trying things out. |
 | On local disk | `-Dinfino.uri=file:///abs/path` | The node that owns the path serves the tables. |
-| In your bucket | `-Dinfino.uri=s3://bucket/prefix` or `gs://bucket/prefix` | Every node pointed at it serves the same tables. The node uses the machine's own identity: an EC2 instance role for S3, with the bucket in `us-east-1`, or the GCE service account (or the node user's gcloud application-default credentials) for GCS. Keys in environment variables are not read, and `az://` is not supported yet. |
+| In your bucket | `-Dinfino.uri=s3://bucket/prefix` or `gs://bucket/prefix` | Every node pointed at it serves the same tables. The node uses the machine's own identity: an EC2 instance role for S3, with the bucket in `us-east-1`, or the GCE service account (or the node user's gcloud application-default credentials) for GCS. Keys in environment variables are not read, and `az://` is not supported by the plugin yet. |
 | On an Infino account | `infino.platform.url` in `opensearch.yml`, the key in the keystore | The hosted service runs the engine and manages the tables. See [Hosted account](#hosted-account-and-stateless-nodes). |
 
 When both a URI and an account are set, the account is used. A key belongs to one platform: set `infino.platform.url` to the one that issued it.
@@ -301,7 +301,7 @@ A `nested` query (Dashboards' `has_reference` on saved objects' `references` is 
 
 ## Writes
 
-**Default mode.** Writes take OpenSearch's own path: each primary shard indexes the document, writes it to the translog and replicates it as usual, and adds it to the shard's batch. The batch is committed to the table when the translog syncs, on a refresh or a flush, or when it reaches `infino.engine.batch.docs` or `infino.engine.batch.bytes`, after the shard's in-sync copies hold the operations it covers. Until a commit takes them, the translog keeps the writes, so a node that stops replays them. A document the table refuses at commit is the exception ([#54](https://github.com/infino-ai/opensearch-infino/issues/54)).
+**Default mode.** Writes take OpenSearch's own path: each primary shard indexes the document, writes it to the translog and replicates it as usual, and adds it to the shard's batch. The batch is committed to the table when the translog syncs, on a refresh or a flush, or when it reaches `infino.engine.batch.docs` or `infino.engine.batch.bytes`, after the shard's in-sync copies hold the operations it covers. Until a commit takes them, the translog keeps the writes, so a node that stops replays them.
 
 **Proxy mode.** Each engine append is a commit, and a bulk is acknowledged only after the append carrying its writes, so an acknowledged write is durable.
 
