@@ -211,13 +211,14 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
 
     public void testASortedPageReadsItsSourcesAfterTheSort() {
         // The sort weighs every row it keeps; its statement selects ids and sort
-        // values only, and the page's sources are read by id afterwards.
+        // values only, and the page's documents are read for its rows alone, in the same call.
         String sorted = sortedHits(null);
         assertTrue(sorted, sorted.startsWith("SELECT osid, \"status\" AS \"status\" FROM \"os_logs_0\" WHERE 1=1 ORDER BY "));
         assertFalse(sorted, sorted.contains("source"));
-        // A collapse keeps the first row of each value through a window, whose rows carry their sources.
+        // A collapse keeps the first row of each value through a window; its documents are read with the page too.
         String collapsed = sortedHits(columns().get("level"));
-        assertTrue(collapsed, collapsed.startsWith("SELECT osid, source, "));
+        assertTrue(collapsed, collapsed.startsWith("SELECT osid, "));
+        assertFalse(collapsed, collapsed.contains("source"));
     }
 
     /** The sorts of a request sorted on {@code status} in {@code order}, with {@code missing} (null for none). */
@@ -514,16 +515,12 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             NOW
         );
         String sorted = InfinoSearch.hitStatement(plan, 1, false);
-        String unsorted = InfinoSearch.unsortedStatement(plan, 1, false, true);
+        String unsorted = InfinoSearch.unsortedStatement(plan, 1, false);
         // Plain words are a text_match on the table in both: rows in the page's order, each checked.
-        assertEquals("SELECT osid, source FROM \"os_logs_0\" WHERE (1=1) AND text_match(\"message\", 'disk', 'or') LIMIT 1", unsorted);
+        assertEquals("SELECT osid FROM \"os_logs_0\" WHERE (1=1) AND text_match(\"message\", 'disk', 'or') LIMIT 1", unsorted);
         assertTrue(sorted, sorted.contains(" FROM \"os_logs_0\" WHERE (1=1) AND text_match(\"message\", 'disk', 'or') ORDER BY "));
-        assertEquals(
-            "SELECT osid, source, osseq FROM \"os_logs_0\" WHERE 1=1 LIMIT 5",
-            InfinoSearch.unsortedStatement(afterPlan(null, null), 5, true, true)
-        );
-        // A hit that neither returns its source nor reads fields from it does not read it.
-        assertEquals("SELECT osid, osseq FROM \"os_logs_0\" WHERE 1=1 LIMIT 5", InfinoSearch.unsortedStatement(afterPlan(null, null), 5, true, false));
+        // The statement selects no document: the page's documents are read with it, in the same call.
+        assertEquals("SELECT osid, osseq FROM \"os_logs_0\" WHERE 1=1 LIMIT 5", InfinoSearch.unsortedStatement(afterPlan(null, null), 5, true));
     }
 
     public void testTiesBreakByTheEngineRowId() {
@@ -561,13 +558,13 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             .filter(QueryBuilders.termQuery("level", "error"))
             .filter(QueryBuilders.rangeQuery("status").gte(500));
         assertEquals(
-            "SELECT osid, source, score FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') "
+            "SELECT osid, score FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') "
                 + "WHERE (1=1 AND \"level\" = 'error' AND (\"status\" >= 500)) ORDER BY score DESC LIMIT 10",
             hits(translate(b), null, 10)
         );
         // No filter: the page, as before.
         assertEquals(
-            "SELECT osid, source, score FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') WHERE 1=1 ORDER BY score DESC LIMIT 10",
+            "SELECT osid, score FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') WHERE 1=1 ORDER BY score DESC LIMIT 10",
             hits(translate(QueryBuilders.matchQuery("message", "disk")), null, 10)
         );
         // Every filter shape the translator writes over the table's columns (a
@@ -1054,7 +1051,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertTrue(sql, sql.contains("FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') WHERE (((1=1 OR \"level\" = 'error'))) AND " + bonus + " >= 0.5"));
         // The hits the match misses, by the term's share.
         assertTrue(sql, sql.contains("WHERE (((1=0 OR \"level\" = 'error'))) AND NOT COALESCE((" + match + "), FALSE) ORDER BY infino_bonus DESC, infino_row ASC LIMIT 10"));
-        assertTrue(sql, sql.startsWith("SELECT osid, source, infino_bm25 + infino_bonus AS score FROM ("));
+        assertTrue(sql, sql.startsWith("SELECT osid, infino_bm25 + infino_bonus AS score FROM ("));
         assertTrue(sql, sql.endsWith(") AS infino_scored ORDER BY score DESC, infino_row ASC LIMIT 10"));
     }
 
@@ -1541,7 +1538,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         // The columns narrow the candidates to documents holding both values anywhere under references.
         assertEquals(1, rows.statements.size());
         assertEquals(
-            "SELECT osid, source FROM \"os_kibana_0\" WHERE ((\"references.name\" IS NOT NULL OR \"references.type\" IS NOT NULL OR \"references.id\" IS NOT NULL"
+            "SELECT osid FROM \"os_kibana_0\" WHERE ((\"references.name\" IS NOT NULL OR \"references.type\" IS NOT NULL OR \"references.id\" IS NOT NULL"
                 + " OR \"references.weight\" IS NOT NULL OR \"references.note\" IS NOT NULL OR \"references.name[]\" IS NOT NULL OR \"references.type[]\" IS NOT NULL"
                 + " OR \"references.id[]\" IS NOT NULL OR \"references.weight[]\" IS NOT NULL) AND (((\"references.id[]\" IS NULL AND \"references.id\" = 'mig-header')"
                 + " OR osid IN (SELECT list_rows.list_id FROM (SELECT list_source.osid AS list_id, unnest(list_source.\"references.id[]\") AS list_value"

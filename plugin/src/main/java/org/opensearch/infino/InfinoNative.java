@@ -1189,8 +1189,8 @@ public final class InfinoNative {
         if (osids.isEmpty()) {
             return out;
         }
-        String columns = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + ", " + InfinoQueryTranslator.SEQ;
-        for (Map<String, Object> row : sqlRows(byIds(name, columns, osids, where))) {
+        String columns = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SEQ;
+        for (Map<String, Object> row : sqlDocs(name, byIds(name, columns, osids, where), ALL_ROWS)) {
             Object id = row.get(InfinoQueryTranslator.OSID);
             Object source = row.get(InfinoQueryTranslator.SOURCE);
             if (id != null && source != null) {
@@ -1293,6 +1293,23 @@ public final class InfinoNative {
         return rows(sql(q));
     }
 
+    /** The {@code limit} of {@link #sqlDocs} that gives every row its document. */
+    public static final int ALL_ROWS = -1;
+
+    /**
+     * The rows of {@code q}, each of the first {@code limit} ({@link #ALL_ROWS}
+     * for every row) with its document under {@link InfinoQueryTranslator#SOURCE},
+     * rebuilt from its columns: a page's statement and its documents in one
+     * call. The statement selects ids, scores and sort values only, so a sort
+     * or a ranking reads no document column of the rows it passes over.
+     * {@code tables} is the table the statement reads, or the tables,
+     * comma-separated: an id takes its document from the first that holds it.
+     */
+    public static List<Map<String, Object>> sqlDocs(String tables, String q, int limit) {
+        init();
+        return rows(takeOrThrow(lib.infino_sql_docs(conn, tables, q, limit)));
+    }
+
     /**
      * The top {@code k} rows of a full-text query ({@code mode} "and" / "or")
      * by BM25, best first, each with its id, source and score: a page of hits
@@ -1360,17 +1377,17 @@ public final class InfinoNative {
     }
 
     /**
-     * Sources for one page of ids in one statement, kept for the fetch phase
-     * that follows the query phase. The table has no index on ids, so this
-     * scans the id column; the SQL hit paths carry the source in the hit
-     * statement instead and call {@link #keepSources}. Used by the vector
-     * paths, whose entry points return ids and scores only.
+     * Sources for one page of ids, kept for the fetch phase that follows the
+     * query phase, each rebuilt from its row's columns. The SQL hit paths
+     * read their documents with the page ({@link #sqlDocs}) and call
+     * {@link #keepSources}. Used by the vector paths, whose entry points
+     * return ids and scores only.
      */
     public static void prefetchSources(String name, List<String> osids) {
         if (osids.isEmpty()) {
             return;
         }
-        keepSources(name, sqlRows(byIds(name, InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE, osids, null)));
+        keepSources(name, sqlDocs(name, byIds(name, InfinoQueryTranslator.OSID, osids, null), ALL_ROWS));
     }
 
     /** The statement selecting {@code columns} of the rows under these ids, narrowed by {@code where} (null for none). */

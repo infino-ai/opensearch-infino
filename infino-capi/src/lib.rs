@@ -64,8 +64,12 @@ use rayon::prelude::*;
 
 /// The OpenSearch `_id` of a row.
 const OSID: &str = "osid";
-/// The raw `_source` JSON of a row, served back by the fetch phase.
+/// The key a hit's or a lookup's document goes under when it is handed to
+/// the plugin: its `_source`, rebuilt from the row's columns
+/// ([`rebuild_source`]). No column holds it.
 const SOURCE: &str = "source";
+/// The column a search table function scores its hits under.
+const HIT_SCORE: &str = "score";
 /// The routing value a row was written with, when it was written with one:
 /// what rebuilding a shard's documents from its table routes them by. The
 /// column appears with the first routed write.
@@ -94,6 +98,12 @@ const MULTI_VALUE_SEPARATOR: &str = " ";
 /// field's own column is null for that document, except a string field's,
 /// which keeps the values joined so its text index sees every token.
 const LIST_SUFFIX: &str = "[]";
+/// What the column holding an array of objects, as the document wrote it,
+/// is named after the array's path: `<path>{}`. Flattening keeps each member
+/// path's values (`a.b[]`) but not which of them shared an entry; the
+/// rebuilt `_source` takes the array from here, so a nested query's entries
+/// read as they were written.
+const OBJECTS_SUFFIX: &str = "{}";
 /// The name Arrow gives a list column's element.
 const LIST_ITEM: &str = "item";
 /// A float of this magnitude or more is past the whole numbers a float holds
@@ -1160,9 +1170,9 @@ fn mapped_fields(mapping: &Value) -> Vec<MappedField> {
 /// it is not.
 fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, String> {
     let mut mapped = mapped_fields(mapping);
-    // A field named like a reserved column is served from the document's
-    // source, not given a column of its own.
-    mapped.retain(|f| !matches!(f.path.as_str(), OSID | SOURCE | SEQ));
+    // A field named like one of the plugin's own columns gets no column of
+    // its own.
+    mapped.retain(|f| !matches!(f.path.as_str(), OSID | SEQ));
     bridge.keep_rules(name, &mapped);
     bridge.stamp_rule(name, mapping);
     let conn = &bridge.conn;
@@ -1290,7 +1300,6 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
         Err(InfinoError::NotFound(_)) => {
             let mut fields = vec![
                 Field::new(OSID, DataType::LargeUtf8, false),
-                Field::new(SOURCE, DataType::LargeUtf8, true),
                 Field::new(SEQ, DataType::Int64, true),
             ];
             // The id column carries an FTS index: a GET by id is then a term
@@ -1468,6 +1477,30 @@ fn flatten(obj: &Map<String, Value>, prefix: &str, out: &mut Map<String, Value>)
             other => {
                 out.insert(path, other.clone());
             }
+        }
+    }
+}
+
+/// Each array of objects in a document, as the document wrote it, under
+/// `<path>{}` ([`OBJECTS_SUFFIX`]), beside the member paths [`flatten`]
+/// gives it. An array inside one of those objects is part of that array's
+/// text, so the walk does not go into it.
+fn keep_object_arrays(obj: &Map<String, Value>, prefix: &str, out: &mut Map<String, Value>) {
+    for (k, v) in obj {
+        let path = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        match v {
+            Value::Object(inner) => keep_object_arrays(inner, &path, out),
+            Value::Array(items) if items.iter().any(Value::is_object) => {
+                out.insert(
+                    format!("{path}{OBJECTS_SUFFIX}"),
+                    Value::String(v.to_string()),
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -1778,6 +1811,7 @@ fn conform_doc(
         .ok_or_else(|| "the document is not an object".to_string())?;
     let mut flat = Map::new();
     flatten(obj, "", &mut flat);
+    keep_object_arrays(obj, "", &mut flat);
     if let Some(field) = stamp {
         let values = match flat.get(field) {
             None | Some(Value::Null) => 0,
@@ -2202,7 +2236,6 @@ pub unsafe extern "C" fn infino_index_batch(
                 }
             };
             flat.insert(OSID.into(), Value::String(osid.to_string()));
-            flat.insert(SOURCE.into(), Value::String(source.to_string()));
             rows.push((i, flat));
         }
 
@@ -2370,7 +2403,6 @@ unsafe fn prepare(
         .map(|(id, src, routing, seq, op)| {
             conform_doc(src, &schema, &kept, stamp.as_deref()).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
-                flat.insert(SOURCE.into(), Value::String((*src).to_string()));
                 if !routing.is_empty() {
                     flat.insert(ROUTING.into(), Value::String((*routing).to_string()));
                 }
@@ -2921,20 +2953,128 @@ pub unsafe extern "C" fn infino_delete_osids(
     .unwrap_or(-99)
 }
 
-/// The source of the row under `osid` and the sequence number it was
-/// written under (0 for a row written without one), or None when the table
-/// holds no such row.
+/// The columns a row's document is rebuilt from: every column of the table
+/// but the plugin's own bookkeeping.
+fn document_columns(schema: &Schema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .filter(|name| !bookkeeping(name))
+        .collect()
+}
+
+/// Whether a column is the plugin's or the engine's own rather than one a
+/// document's field is stored in.
+fn bookkeeping(name: &str) -> bool {
+    matches!(name, OSID | SEQ | ROUTING | OP | GEN | HIT_SCORE) || name.starts_with('_')
+}
+
+/// One cell as a JSON value, as [`batches_to_json`] renders it.
+fn cell_value(col: &dyn Array, r: usize) -> Value {
+    serde_json::from_str(&cell_json(col, r)).unwrap_or(Value::Null)
+}
+
+/// Row `r`'s `_source`, rebuilt from its columns. Each field's value is its
+/// list column's (`<path>[]`) when the document gave it several, else its
+/// own column's; a dotted path becomes nested objects. An array of objects
+/// is taken whole from its `<path>{}` column ([`OBJECTS_SUFFIX`]), and the
+/// member paths flattened out of it are left to it. A null is a field the
+/// document did not give, and is left out.
+fn rebuild_source(batch: &RecordBatch, r: usize) -> String {
+    let schema = batch.schema();
+    let mut objects: Vec<(String, Value)> = Vec::new();
+    let mut lists: Vec<(String, Value)> = Vec::new();
+    let mut scalars: Vec<(String, Value)> = Vec::new();
+    for (c, field) in schema.fields().iter().enumerate() {
+        let name = field.name().as_str();
+        if bookkeeping(name) {
+            continue;
+        }
+        let value = cell_value(batch.column(c).as_ref(), r);
+        if value.is_null() {
+            continue;
+        }
+        if let Some(path) = name.strip_suffix(OBJECTS_SUFFIX) {
+            let array = value
+                .as_str()
+                .and_then(|text| serde_json::from_str(text).ok())
+                .unwrap_or(value);
+            objects.push((path.to_owned(), array));
+        } else if let Some(path) = name.strip_suffix(LIST_SUFFIX) {
+            lists.push((path.to_owned(), value));
+        } else {
+            scalars.push((name.to_owned(), value));
+        }
+    }
+    let under_objects = |path: &str| {
+        objects.iter().any(|(array, _)| {
+            path == array
+                || path
+                    .strip_prefix(array.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
+    };
+    let mut doc = Map::new();
+    for (path, value) in &lists {
+        if !under_objects(path) {
+            insert_path(&mut doc, path, value.clone());
+        }
+    }
+    for (path, value) in scalars {
+        if !under_objects(&path) && !lists.iter().any(|(list, _)| *list == path) {
+            insert_path(&mut doc, &path, value);
+        }
+    }
+    for (path, array) in objects {
+        insert_path(&mut doc, &path, array);
+    }
+    Value::Object(doc).to_string()
+}
+
+/// Put `value` at the dotted `path` of `obj`, making the objects on the way.
+/// Where a step of the path already holds something other than an object,
+/// the rest of the path stays one dotted key there.
+fn insert_path(obj: &mut Map<String, Value>, path: &str, value: Value) {
+    match path.split_once('.') {
+        None => {
+            obj.insert(path.to_owned(), value);
+        }
+        Some((head, rest)) => match obj.get_mut(head) {
+            Some(Value::Object(inner)) => insert_path(inner, rest, value),
+            Some(_) => {
+                obj.insert(path.to_owned(), value);
+            }
+            None => {
+                let mut inner = Map::new();
+                insert_path(&mut inner, rest, value);
+                obj.insert(head.to_owned(), Value::Object(inner));
+            }
+        },
+    }
+}
+
+/// The document of the row under `osid`, rebuilt from its columns, and the
+/// sequence number it was written under (0 for a row written without one),
+/// or None when the table holds no such row.
 fn get_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
     let table = conn.table(name).ok()?;
-    // A term lookup through the id column's FTS index, projected to the
-    // source and the sequence number. A table declared before the id column
-    // carried that index refuses the lookup; it falls back to an equality on
-    // the column.
-    let batches = match table.exact_match(OSID, osid, Some(&[SOURCE, SEQ])) {
+    let mut columns = document_columns(&table.schema());
+    columns.push(SEQ.to_owned());
+    let projection: Vec<&str> = columns.iter().map(String::as_str).collect();
+    // A term lookup through the id column's FTS index. A table declared
+    // before the id column carried that index refuses the lookup; it falls
+    // back to an equality on the column.
+    let batches = match table.exact_match(OSID, osid, Some(&projection)) {
         Ok(batches) => batches,
         Err(_) => {
             let esc = osid.replace('\'', "''");
-            let sql = format!("SELECT {SOURCE}, {SEQ} FROM {name} WHERE {OSID} = '{esc}' LIMIT 1");
+            let selected = columns
+                .iter()
+                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("SELECT {selected} FROM {name} WHERE {OSID} = '{esc}' LIMIT 1");
             match conn.conn.query_sql(&sql) {
                 Ok(batches) => batches,
                 Err(e) => {
@@ -2944,30 +3084,38 @@ fn get_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
             }
         }
     };
-    for b in &batches {
-        if b.num_rows() == 0 {
-            continue;
-        }
-        let Some(source) = b
-            .column_by_name(SOURCE)
-            .and_then(|c| c.as_any().downcast_ref::<LargeStringArray>())
-        else {
-            continue;
-        };
-        if source.is_null(0) {
-            continue;
-        }
-        let seq = b
-            .column_by_name(SEQ)
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-            .filter(|a| !a.is_null(0))
-            .map_or(0, |a| a.value(0));
-        return Some((source.value(0).to_string(), seq));
-    }
-    None
+    let b = batches.iter().find(|b| b.num_rows() > 0)?;
+    let seq = b
+        .column_by_name(SEQ)
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+        .filter(|a| !a.is_null(0))
+        .map_or(0, |a| a.value(0));
+    Some((rebuild_source(b, 0), seq))
 }
 
-/// The raw `_source` JSON for one osid, or "" if absent.
+/// The documents of several ids, each looked up as [`get_row`] looks it up,
+/// in `ids`' order; None for an id the table does not hold. The lookups run
+/// side by side, at most [`GET_MANY_THREADS`] at once, so a page costs about
+/// what its slowest lookup does.
+fn documents(conn: &Bridge, name: &str, ids: &[&str]) -> Vec<Option<String>> {
+    let mut out = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(GET_MANY_THREADS) {
+        let found: Vec<Option<String>> = std::thread::scope(|scope| {
+            let lookups: Vec<_> = chunk
+                .iter()
+                .map(|id| scope.spawn(move || get_row(conn, name, id).map(|(source, _)| source)))
+                .collect();
+            lookups
+                .into_iter()
+                .map(|lookup| lookup.join().ok().flatten())
+                .collect()
+        });
+        out.extend(found);
+    }
+    out
+}
+
+/// The document of one osid, rebuilt from its columns, or "" if absent.
 #[no_mangle]
 pub unsafe extern "C" fn infino_get(
     h: *mut Bridge,
@@ -2988,14 +3136,9 @@ pub unsafe extern "C" fn infino_get(
 /// Most lookups [`infino_get_many`] runs at once.
 const GET_MANY_THREADS: usize = 16;
 
-/// The raw `_source` JSON of several osids, as one JSON object from each id
-/// the table holds to its source; an id it does not hold is absent.
-///
-/// Each id is looked up as [`infino_get`] looks it up, through the id
-/// column's index. A page of a sorted search reads its sources this way once
-/// its ids are chosen, and the lookups ran one call after another; here they
-/// run side by side, at most [`GET_MANY_THREADS`] at once, so a page costs
-/// about what its slowest lookup does.
+/// The documents of several osids, rebuilt from their columns, as one JSON
+/// object from each id the table holds to its document; an id it does not
+/// hold is absent. The ids are looked up as [`documents`] looks them up.
 #[no_mangle]
 pub unsafe extern "C" fn infino_get_many(
     h: *mut Bridge,
@@ -3016,23 +3159,9 @@ pub unsafe extern "C" fn infino_get_many(
                 .collect()
         };
         let mut found = serde_json::Map::new();
-        for chunk in ids.chunks(GET_MANY_THREADS) {
-            let sources: Vec<Option<String>> = std::thread::scope(|scope| {
-                let lookups: Vec<_> = chunk
-                    .iter()
-                    .map(|id| {
-                        scope.spawn(move || get_row(conn, name, id).map(|(source, _)| source))
-                    })
-                    .collect();
-                lookups
-                    .into_iter()
-                    .map(|lookup| lookup.join().ok().flatten())
-                    .collect()
-            });
-            for (id, source) in chunk.iter().zip(sources) {
-                if let Some(source) = source.filter(|s| !s.is_empty()) {
-                    found.insert((*id).to_owned(), Value::String(source));
-                }
+        for (id, source) in ids.iter().zip(documents(conn, name, &ids)) {
+            if let Some(source) = source {
+                found.insert((*id).to_owned(), Value::String(source));
             }
         }
         out_json(Value::Object(found))
@@ -3135,6 +3264,76 @@ pub unsafe extern "C" fn infino_sql(h: *mut Bridge, sql: *const c_char) -> *mut 
             Ok(b) => out_string(batches_to_json(&b)),
             Err(e) => err_json(&e.to_string()),
         }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Run `sql` and give each of its first `limit` rows (every row when
+/// `limit` is negative) that carries an `osid` that row's document, rebuilt
+/// from its columns, under `source`: a page's hit statement and its
+/// documents in one call. `names` is the table the statement reads, or the
+/// tables, comma-separated (no index name holds a comma), an id taking its
+/// document from the first that holds it. The statement selects the ids, scores and
+/// sort values only, so a sort or a ranking weighs no document column of the
+/// rows it passes over; the documents are read for the page's rows alone,
+/// each through the id column's index ([`documents`]).
+#[no_mangle]
+pub unsafe extern "C" fn infino_sql_docs(
+    h: *mut Bridge,
+    name: *const c_char,
+    sql: *const c_char,
+    limit: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(sql)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(sql) })
+        else {
+            return ptr::null_mut();
+        };
+        let batches = match conn.conn.query_sql(sql) {
+            Ok(b) => b,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let mut rows = match serde_json::from_str(&batches_to_json(&batches)) {
+            Ok(Value::Array(rows)) => rows,
+            _ => Vec::new(),
+        };
+        let page = usize::try_from(limit).map_or(rows.len(), |l| l.min(rows.len()));
+        let ids: Vec<String> = rows[..page]
+            .iter()
+            .filter_map(|row| row.get(OSID).and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        let mut found: HashMap<&str, String> = HashMap::new();
+        for table in name.split(',') {
+            let missing: Vec<&str> = ids
+                .iter()
+                .map(String::as_str)
+                .filter(|id| !found.contains_key(id))
+                .collect();
+            if missing.is_empty() {
+                break;
+            }
+            let docs = documents(conn, table, &missing);
+            for (id, doc) in missing.into_iter().zip(docs) {
+                if let Some(doc) = doc {
+                    found.insert(id, doc);
+                }
+            }
+        }
+        for row in rows[..page].iter_mut() {
+            let Some(obj) = row.as_object_mut() else {
+                continue;
+            };
+            let doc = obj
+                .get(OSID)
+                .and_then(Value::as_str)
+                .and_then(|id| found.get(id))
+                .cloned();
+            if let Some(doc) = doc {
+                obj.insert(SOURCE.to_owned(), Value::String(doc));
+            }
+        }
+        out_json(Value::Array(rows))
     }))
     .unwrap_or(ptr::null_mut())
 }
@@ -3365,14 +3564,16 @@ pub unsafe extern "C" fn infino_bm25(
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
+        let columns = hit_projection(&table.schema());
+        let projection: Vec<&str> = columns.iter().map(String::as_str).collect();
         match table.bm25_search(
             column,
             query,
             k.max(0) as usize,
             Bm25SearchOptions::new().with_mode(mode),
-            Some(&[OSID, SOURCE, "score"]),
+            Some(&projection),
         ) {
-            Ok(b) => out_string(batches_to_json(&b)),
+            Ok(b) => out_string(hits_json(&b)),
             Err(e) => err_json(&e.to_string()),
         }
     }))
@@ -3609,14 +3810,10 @@ pub unsafe extern "C" fn infino_knn(
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
-        match table.vector_search(
-            column,
-            &emb,
-            k.max(0) as usize,
-            None,
-            Some(&[OSID, SOURCE, "score"]),
-        ) {
-            Ok(b) => out_string(batches_to_json(&b)),
+        let columns = hit_projection(&table.schema());
+        let projection: Vec<&str> = columns.iter().map(String::as_str).collect();
+        match table.vector_search(column, &emb, k.max(0) as usize, None, Some(&projection)) {
+            Ok(b) => out_string(hits_json(&b)),
             Err(e) => err_json(&e.to_string()),
         }
     }))
@@ -3652,6 +3849,8 @@ pub unsafe extern "C" fn infino_hybrid(
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
+        let columns = hit_projection(&table.schema());
+        let projection: Vec<&str> = columns.iter().map(String::as_str).collect();
         match table.hybrid_search(
             tcol,
             tq,
@@ -3659,13 +3858,41 @@ pub unsafe extern "C" fn infino_hybrid(
             vcol,
             &emb,
             k.max(0) as usize,
-            Some(&[OSID, SOURCE, "score"]),
+            Some(&projection),
         ) {
-            Ok(b) => out_string(batches_to_json(&b)),
+            Ok(b) => out_string(hits_json(&b)),
             Err(e) => err_json(&e.to_string()),
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// What a search table function projects for its hits: the id, the columns
+/// each hit's document is rebuilt from, and the score.
+fn hit_projection(schema: &Schema) -> Vec<String> {
+    let mut columns = vec![OSID.to_owned()];
+    columns.extend(document_columns(schema));
+    columns.push(HIT_SCORE.to_owned());
+    columns
+}
+
+/// Hits as a JSON array of `{osid, score, source}`, each `source` rebuilt
+/// from the hit's columns.
+fn hits_json(batches: &[RecordBatch]) -> String {
+    let mut hits = Vec::new();
+    for b in batches {
+        for r in 0..b.num_rows() {
+            let mut hit = Map::new();
+            for name in [OSID, HIT_SCORE] {
+                if let Some(c) = b.column_by_name(name) {
+                    hit.insert(name.to_owned(), cell_value(c.as_ref(), r));
+                }
+            }
+            hit.insert(SOURCE.to_owned(), Value::String(rebuild_source(b, r)));
+            hits.push(Value::Object(hit));
+        }
+    }
+    Value::Array(hits).to_string()
 }
 
 /// Parse `"[f32,...]"`; the engine checks the width against the column.
@@ -4368,7 +4595,7 @@ mod tests {
         assert_eq!(buckets.as_array().unwrap().len(), 2, "{buckets}");
         assert!(buckets[0]["key"].is_number(), "{buckets}");
 
-        // Fetch returns the document as sent.
+        // Fetch returns the document, rebuilt from its columns.
         let src = get(h, "a");
         assert!(src.contains("\"tags\":[\"x\",\"y\"]"), "{src}");
         // Several at once: each id the table holds, as one get returns it;
@@ -4497,8 +4724,63 @@ mod tests {
         close(h);
     }
 
-    /// A field named like a reserved column, added after the table exists,
-    /// leaves the column alone, as it does at creation (#23).
+    /// A document comes back from its columns: nested objects, a field given
+    /// several values, and an array of objects with each entry's members
+    /// together, as the document wrote them.
+    #[test]
+    fn a_document_is_rebuilt_from_its_columns() {
+        let h = open_logs();
+        ensure(
+            h,
+            r#"{"properties":{"level":{"type":"keyword"},"status":{"type":"long"}}}"#,
+        );
+        let sent = json!({
+            "level": "info",
+            "status": 7,
+            "host": {"name": "n1", "ip": "10.0.0.1"},
+            "tags": ["x", "y"],
+            "users": [{"name": "a", "age": 1}, {"name": "b"}]
+        });
+        let text = sent.to_string();
+        index(h, &[("d1", text.as_str())]);
+        let doc: Value = serde_json::from_str(&get(h, "d1")).unwrap();
+        assert_eq!(doc, sent, "{doc}");
+        close(h);
+    }
+
+    /// A page's statement and its documents in one call: the rows the
+    /// statement returns, the first `limit` of them each with its document.
+    #[test]
+    fn a_page_reads_its_documents_in_the_same_call() {
+        let h = open_logs();
+        ensure(h, r#"{"properties":{"level":{"type":"keyword"}}}"#);
+        index(
+            h,
+            &[
+                ("p1", r#"{"level":"info","n":1}"#),
+                ("p2", r#"{"level":"warn","n":2}"#),
+            ],
+        );
+        let out = take(unsafe {
+            infino_sql_docs(
+                h,
+                c("logs").as_ptr(),
+                c("SELECT osid FROM logs ORDER BY osid").as_ptr(),
+                1,
+            )
+        });
+        let rows: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert_eq!(rows.as_array().map(Vec::len), Some(2), "{rows}");
+        let first: Value = serde_json::from_str(rows[0]["source"].as_str().unwrap()).unwrap();
+        assert_eq!(first, json!({"level": "info", "n": 1}), "{rows}");
+        assert!(rows[1].get("source").is_none(), "{rows}");
+        close(h);
+    }
+
+    /// A field named like one of the plugin's own columns, added after the
+    /// table exists, leaves that column alone, as it does at creation (#23).
+    /// No column holds a document, so a field named `source` is a field like
+    /// any other.
     #[test]
     fn a_late_field_named_like_a_reserved_column_leaves_it_alone() {
         let h = open_logs();
@@ -4730,7 +5012,6 @@ mod tests {
                 // The same columns, declared directly, with no term index on the id column.
                 let fields = vec![
                     Field::new(OSID, DataType::LargeUtf8, false),
-                    Field::new(SOURCE, DataType::LargeUtf8, true),
                     Field::new("category", DataType::LargeUtf8, true),
                     Field::new("price", DataType::Float64, true),
                     Field::new("text", DataType::LargeUtf8, true),
@@ -4778,7 +5059,6 @@ mod tests {
                         let mut flat =
                             conform_doc(src, &schema, &conn.kept("bench"), None).unwrap();
                         flat.insert(OSID.into(), Value::String(id.clone()));
-                        flat.insert(SOURCE.into(), Value::String(src.clone()));
                         flat
                     })
                     .collect();

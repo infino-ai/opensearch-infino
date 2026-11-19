@@ -83,7 +83,7 @@ public interface InfinoLib extends Library {
 
     Pointer infino_get(Pointer h, String name, String osid);
 
-    /** The sources of several osids at once, as a JSON object from each id the table holds to its source. */
+    /** The documents of several osids at once, rebuilt from their columns, as a JSON object from each id the table holds to its document. */
     Pointer infino_get_many(Pointer h, String name, String[] osids, int count);
 
     /** One id's document as {@code {"source", "seq"}}; "" when the table holds no such id. */
@@ -96,6 +96,13 @@ public interface InfinoLib extends Library {
     int infino_optimize_edges(Pointer h, String name);
 
     Pointer infino_sql(Pointer h, String sql);
+
+    /**
+     * A statement's rows, each of the first {@code limit} (every row when negative) carrying its
+     * document, rebuilt from its columns, under "source": a page and its documents in one call.
+     * {@code names} is the table the statement reads, or the tables, comma-separated.
+     */
+    Pointer infino_sql_docs(Pointer h, String names, String sql, int limit);
 
     /** The indices a caller's read-only statement reads, as {@code {"indices": [..]}}, or an error with its status. */
     Pointer infino_sql_indices(String sql);
