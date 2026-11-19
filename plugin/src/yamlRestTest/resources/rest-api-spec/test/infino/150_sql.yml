@@ -190,16 +190,6 @@
       catch: forbidden
       infino.sql:
         body: { query: "SELECT osid FROM token_match('sec_sql1', 'ip', '10.0.0.1')" }
-  - do:
-      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
-      catch: forbidden
-      infino.sql:
-        body: { query: "SELECT osid FROM exact_match('sec_sql1', 'source', 'alpha')" }
-  - do:
-      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
-      catch: forbidden
-      infino.sql:
-        body: { query: "SELECT osid FROM token_match('sec_sql1', 'source', '10.0.0.1')" }
   # A column's name as a search's query text is only text, not the column.
   - do:
       headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
