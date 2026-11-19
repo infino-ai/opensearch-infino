@@ -393,8 +393,6 @@ public class InfinoEngine extends InternalEngine {
     private final long generation;
     /** Whether the skeleton started empty over a table holding rows (see the class comment). */
     private final boolean rebuilt;
-    /** Whether the index holds a graph's edges ({@link InfinoPlugin#INFINO_EDGES}), whose columns no mapping type checks. */
-    private final boolean edges;
     private final Object batchLock = new Object();
     /** Serializes commits, so one batch reaches the table before the next. */
     private final Object commitLock = new Object();
@@ -515,7 +513,6 @@ public class InfinoEngine extends InternalEngine {
         this.shardId = config.getShardId();
         this.generation = generation(config.getIndexSettings().getUUID());
         this.rebuilt = InfinoPlugin.INFINO_REBUILT.get(config.getIndexSettings().getSettings());
-        this.edges = InfinoPlugin.INFINO_EDGES.get(config.getIndexSettings().getSettings());
         for (int i = 0; i < idLocks.length; i++) {
             idLocks[i] = new Object();
         }
@@ -855,10 +852,12 @@ public class InfinoEngine extends InternalEngine {
         String source = !toTable || index.source() == null
             ? null
             : InfinoBulkActionFilter.sourceAsJson(index.source(), index.parsedDoc() == null ? null : index.parsedDoc().getMediaType());
-        // An edge's ends are row ids, which no mapping type holds, so the mapper
-        // cannot refuse an end that is none: the table's columns refuse it here,
-        // before the write is applied, as the mapper refuses what it cannot hold.
-        if (edges && source != null && !index.origin().isRecovery()) {
+        // The table's columns refuse here, before the write is applied and
+        // acknowledged, a document the commit would refuse: one the mapper takes
+        // but a column cannot hold (an unsigned_long past the largest signed
+        // 64-bit integer, a fractional number for an integer field, an edge's
+        // end that is no row id). A replay carries writes already acknowledged.
+        if (source != null && !index.origin().isRecovery()) {
             String why = InfinoNative.checkDoc(table, source);
             if (why != null) {
                 return new IndexResult(new MapperParsingException("[infino] " + why), index.version());

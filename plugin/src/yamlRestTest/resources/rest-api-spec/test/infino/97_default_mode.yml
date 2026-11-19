@@ -909,7 +909,7 @@
         index: rc_default
 
 ---
-"Default mode: a document the table refuses at commit is dropped, not retried, and the writes after it land":
+"Default mode: a document the table refuses is refused on its own, and the writes after it land":
   - do:
       indices.create:
         index: ep
@@ -927,8 +927,9 @@
               labels: { type: flat_object }
 
   # The mapper takes both bad documents (a malformed date it ignores, an
-  # array of arrays in a flat_object), and the table refuses each at commit.
-  # Retried, either would hold every later write to the shard behind it.
+  # array of arrays in a flat_object), and the table refuses each: each is
+  # refused as its own bulk item when it is written, and the writes after it
+  # land.
   - do:
       bulk:
         body:
@@ -940,7 +941,11 @@
           - { status: 3, labels: { comment: [ [ "Doe", "Shipped" ], [ "John", "Approved" ] ] } }
           - index: { _index: ep, _id: b }
           - { when: "2026-10-24T10:03:00Z", status: 4 }
-  - match: { errors: false }
+  - match: { errors: true }
+  - match: { items.0.index.status: 201 }
+  - match: { items.1.index.status: 400 }
+  - match: { items.2.index.status: 400 }
+  - match: { items.3.index.status: 201 }
 
   - do:
       indices.refresh:
@@ -967,3 +972,61 @@
   - do:
       indices.delete:
         index: ep
+
+---
+"Default mode: a document the table cannot hold is refused when it is written, never acknowledged and lost":
+  - do:
+      indices.create:
+        index: er
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+            refresh_interval: -1
+          mappings:
+            properties:
+              status: { type: long }
+              counter: { type: unsigned_long }
+
+  # The mapper takes a fractional number for a long and an unsigned_long past
+  # the largest signed 64-bit integer; the table's columns cannot hold either,
+  # so each is refused as its own bulk item, and the writes beside it land.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: er, _id: a }
+          - { status: 200, counter: 1 }
+          - index: { _index: er, _id: frac }
+          - { status: 200.7, counter: 2 }
+          - index: { _index: er, _id: big }
+          - { status: 201, counter: 10223372036854775807 }
+          - index: { _index: er, _id: b }
+          - { status: 204, counter: 3 }
+  - match: { errors: true }
+  - match: { items.0.index.status: 201 }
+  - match: { items.1.index.status: 400 }
+  - match: { items.2.index.status: 400 }
+  - match: { items.3.index.status: 201 }
+
+  - do:
+      search:
+        index: er
+        body:
+          track_total_hits: true
+          sort: [ { status: asc } ]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: a }
+  - match: { hits.hits.1._id: b }
+
+  - do:
+      get:
+        index: er
+        id: frac
+      catch: missing
+  - match: { found: false }
+  - do:
+      indices.delete:
+        index: er
