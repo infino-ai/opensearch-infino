@@ -2461,6 +2461,9 @@ final class InfinoQueryTranslator {
     // ---- scalars ----
 
     private String equality(String field, Object value) {
+        if ("_id".equals(field)) {
+            return value == null ? NONE : OSID + " = " + literal(String.valueOf(value));
+        }
         Column c = column(field);
         if (c == null || value == null) {
             return c == null ? NONE : null;
@@ -2470,6 +2473,13 @@ final class InfinoQueryTranslator {
     }
 
     private String inList(String field, List<Object> values) {
+        if ("_id".equals(field) && values != null && !values.isEmpty()) {
+            List<String> ids = new ArrayList<>();
+            for (Object v : values) {
+                ids.add(literal(String.valueOf(v)));
+            }
+            return OSID + " IN (" + String.join(", ", ids) + ")";
+        }
         Column c = column(field);
         if (c == null) {
             return NONE;
