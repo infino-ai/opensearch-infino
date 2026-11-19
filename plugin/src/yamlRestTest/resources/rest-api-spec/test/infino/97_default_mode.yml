@@ -907,3 +907,63 @@
   - do:
       indices.delete:
         index: rc_default
+
+---
+"Default mode: a document the table refuses at commit is dropped, not retried, and the writes after it land":
+  - do:
+      indices.create:
+        index: ep
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+            refresh_interval: -1
+          mappings:
+            properties:
+              when: { type: date, ignore_malformed: true }
+              status: { type: long }
+              labels: { type: flat_object }
+
+  # The mapper takes both bad documents (a malformed date it ignores, an
+  # array of arrays in a flat_object), and the table refuses each at commit.
+  # Retried, either would hold every later write to the shard behind it.
+  - do:
+      bulk:
+        body:
+          - index: { _index: ep, _id: a }
+          - { when: "2026-10-24T10:00:00Z", status: 1 }
+          - index: { _index: ep, _id: bad_date }
+          - { when: "bar", status: 2 }
+          - index: { _index: ep, _id: bad_flat }
+          - { status: 3, labels: { comment: [ [ "Doe", "Shipped" ], [ "John", "Approved" ] ] } }
+          - index: { _index: ep, _id: b }
+          - { when: "2026-10-24T10:03:00Z", status: 4 }
+  - match: { errors: false }
+
+  - do:
+      indices.refresh:
+        index: ep
+
+  - do:
+      index:
+        index: ep
+        id: c
+        refresh: true
+        body: { when: "2026-10-24T10:04:00Z", status: 5 }
+
+  - do:
+      search:
+        index: ep
+        body:
+          track_total_hits: true
+          sort: [ { status: asc } ]
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: a }
+  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.2._id: c }
+
+  - do:
+      indices.delete:
+        index: ep
