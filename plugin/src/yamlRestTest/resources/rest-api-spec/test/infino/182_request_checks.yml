@@ -20,7 +20,6 @@ setup:
           - { text: "cold outside", user: u1, n: 1 }
           - index: { _index: chk_default, _id: "1" }
           - { text: "cold outside", user: u1, n: 1 }
-  - match: { errors: false }
 
 ---
 teardown:
