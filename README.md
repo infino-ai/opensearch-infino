@@ -1,15 +1,17 @@
 # Infino for OpenSearch
 
-An OpenSearch plugin that stores your indices in [Infino](https://github.com/infino-ai/infino) tables instead of Lucene. Infino is an Apache-2.0 retrieval engine, written in Rust, that keeps its tables on object storage and runs SQL, full-text and vector search over them. The documents live on storage you choose (a local disk, an S3, GCS or Azure bucket, or a hosted Infino account), and OpenSearch's REST API, Dashboards, security plugin and cluster management work unchanged.
+![Status: experimental](https://img.shields.io/badge/status-experimental-orange) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-- **The same APIs.** Index, bulk, get, search, aggregations, scroll and Dashboards work unchanged. An index keeps its name, mapping, settings and aliases.
+An OpenSearch plugin that stores your indices in [Infino](https://github.com/infino-ai/infino) tables instead of Lucene. Infino is an Apache-2.0 retrieval engine, written in Rust, that keeps its tables on object storage and runs SQL, full-text and vector search over them. The documents live on storage you choose (a local disk, an S3 or GCS bucket, or a hosted Infino account), and OpenSearch's REST API, Dashboards, security plugin and cluster management work unchanged.
+
+- **The same APIs.** Clients and Dashboards talk to the node through OpenSearch's own REST API. An index keeps its name, mapping, settings and aliases.
 - **One engine for every query.** Full-text search (BM25), vector search (kNN and hybrid) and SQL run on the same tables.
 - **Stateless nodes.** A node with an empty data directory brings every index back from storage, with its mapping and aliases.
 - **Not a fork.** The plugin installs into a released OpenSearch: 2.19.6, 3.0.0, 3.3.2, 3.6.0 or 3.9.0.
 
-**Status: early.** The plugin is tested on the releases above with local storage and Dashboards; cloud buckets are not tested yet. Some of OpenSearch's own REST tests still fail with it, and known gaps are tracked in [the issues](https://github.com/infino-ai/opensearch-infino/issues). Among them: in default mode, an acknowledged write that the table refuses can be dropped ([#54](https://github.com/infino-ai/opensearch-infino/issues/54)). Try it on data you can rebuild before relying on it.
+**Status: experimental.** Not ready for production data, and settings and behaviour may change between versions without a migration path. Of the 895 tests in OpenSearch's own YAML REST suite, 421 pass in default mode and 378 in proxy mode ([#51](https://github.com/infino-ai/opensearch-infino/issues/51)). Most of the rest use features the table does not serve yet, which it refuses with an error; about 120 in default mode and 145 in proxy mode return a different answer from stock OpenSearch with no error ([#56](https://github.com/infino-ai/opensearch-infino/issues/56)). The plugin is tested on the releases above with local storage and Dashboards; cloud buckets are not tested yet. CI runs `gradle check` on 3.9.0 only; the other releases are checked by running `check-all.sh` by hand. Known gaps are tracked in [the issues](https://github.com/infino-ai/opensearch-infino/issues). Try it on data you can rebuild before relying on it.
 
-**Contents:** [Quick start](#quick-start) · [How it works](#how-it-works) · [Install on a cluster](#install-on-a-cluster) · [Hosted account and stateless nodes](#hosted-account-and-stateless-nodes) · [Settings](#settings) · [SQL](#sql) · [What is supported](#what-is-supported) · [Writes](#writes) · [Build and test](#build-and-test) · [Repository layout](#repository-layout) · [License](#license)
+**Contents:** [Quick start](#quick-start) · [How it works](#how-it-works) · [Install on a cluster](#install-on-a-cluster) · [Hosted account and stateless nodes](#hosted-account-and-stateless-nodes) · [Settings](#settings) · [SQL](#sql) · [What is supported](#what-is-supported) · [Writes](#writes) · [Build and test](#build-and-test) · [Repository layout](#repository-layout) · [License](#license) · [Contributing and security](#contributing-and-security)
 
 ## Quick start
 
@@ -139,7 +141,7 @@ bin/opensearch-plugin install -b file:///path/infino-engine.zip
 |---|---|---|
 | In memory | nothing to set | Lost on restart; for trying things out. |
 | On local disk | `-Dinfino.uri=file:///abs/path` | The node that owns the path serves the tables. |
-| In your bucket | `-Dinfino.uri=s3://bucket/prefix` or `gs://bucket/prefix` | Every node pointed at it serves the same tables. The node uses the machine's own identity: an EC2 instance role for S3, with the bucket in `us-east-1`, or the GCE service account (or the node user's gcloud application-default credentials) for GCS. Keys in environment variables are not read, and `az://` is not supported yet. |
+| In your bucket | `-Dinfino.uri=s3://bucket/prefix` or `gs://bucket/prefix` | Every node pointed at it serves the same tables. The node uses the machine's own identity: an EC2 instance role for S3, with the bucket in `us-east-1`, or the GCE service account (or the node user's gcloud application-default credentials) for GCS. Keys in environment variables are not read, and `az://` is not supported by the plugin yet. |
 | On an Infino account | `infino.platform.url` in `opensearch.yml`, the key in the keystore | The hosted service runs the engine and manages the tables. See [Hosted account](#hosted-account-and-stateless-nodes). |
 
 When both a URI and an account are set, the account is used. A key belongs to one platform: set `infino.platform.url` to the one that issued it.
@@ -197,10 +199,10 @@ An account is created only when the request says `"accept": true`. The trial cre
 |---|---|
 | `GET /_plugins/_infino/account` | What the tables are served from |
 | `POST /_plugins/_infino/account/trial` | Create a free account (`{"accept": true}`) |
-| `PUT /_plugins/_infino/account` | Use an account you have: `{"platform": "https://host", "api_key": "..."}`. The key is tried once first, so a wrong key fails here. |
+| `PUT /_plugins/_infino/account` | Use an account you have: `{"api_key": "..."}`, with optional `platform` (`infino.platform.default_url` when unset) and `database` (the cluster's name when unset). The key is tried once first, so a wrong key fails here. |
 | `DELETE /_plugins/_infino/account` | Stop using the account on this node; the tables stay on the service |
 | `GET /_plugins/_infino/account/indices` | What would come back on a fresh cluster (`?name=<index>` for one) |
-| `POST /_plugins/_infino/account/indices` | Bring it back now: the cluster state a loader registered (templates, pipelines, scripts, settings, users and roles), then every index the cluster lacks |
+| `POST /_plugins/_infino/account/indices` | Bring it back now: the cluster state a loader registered (templates, pipelines, scripts, settings, users and roles), then every index the cluster lacks (`?name=<index>` for one) |
 
 **Limits.** The service enforces the account's limits. At a ceiling or out of credit, it refuses a write with a message naming the console where billing is added, and the bulk fails with that status and message.
 
@@ -231,7 +233,8 @@ A table backs one live index. If two indices name the same table (explicitly, or
 | `infino.platform.url` | none | The hosted service the tables live on. |
 | `infino.platform.database` | the cluster's name | The account's database. |
 | `infino.platform.api_key` | none | The account's key, in the keystore. `INFINO_API_KEY` in the environment is read when it is unset. |
-| `infino.platform.default_url` | `https://api.platform.infino.ws` | The service a trial is asked from when the request names none. |
+| `infino.platform.default_url` | `https://api.platform.infino.ws` | The service a trial or a `PUT` of the account is sent to when the request names none. |
+| `infino.platform.read_window` | `1s` | How long a read on the hosted service may be answered from a snapshot taken before a write. A refresh waits this long after the last write it covers, so the search after it sees the writes. `0` waits for nothing. Not used with the node's own storage. |
 | `infino.cache.dir` | `infino-cache` under the node's first data path | Where the engine keeps a local copy of what it reads from the node's storage. Not used with a hosted account. |
 | `infino.sql.max_result_size` | `http.max_content_length` | The largest SQL result, as JSON; a statement whose result is larger is refused with a 400. |
 
@@ -239,11 +242,15 @@ A table backs one live index. If two indices name the same table (explicitly, or
 
 | Property | Default | |
 |---|---|---|
-| `infino.lib` | `libinfino_capi.so` on the library path | The native bridge. |
-| `infino.uri` | `memory://` | Where the tables live without an account: `file://`, `s3://`, `gs://` or `az://`. |
-| `infino.batch.docs` | `50000` | The most documents one write batch holds. |
-| `infino.batch.bytes` | 64 MiB | The most bytes one write batch holds. |
-| `infino.batch.concurrency` | half the `write` pool | The most appends to one table that run at once. Appends that name the same document id never run at once. |
+| `infino.lib` | `libinfino_capi.so` on the library path | The native bridge. On macOS, name the `.dylib`. |
+| `infino.uri` | `memory://` | Where the tables live without an account: `file://`, `s3://` or `gs://`. |
+| `infino.engine.batch.docs` | `50000` | Default mode: the most documents a shard's batch holds before it commits on its own, between refreshes. |
+| `infino.engine.batch.bytes` | 64 MiB | Default mode: the most source bytes a shard's batch holds before it commits on its own. |
+| `infino.engine.copies.wait.ms` | `60000` | Default mode: how long a refresh, flush or hand-off waits for the shard's copies to hold the operations it covers. |
+| `infino.batch.docs` | `50000` | Proxy mode: the most documents one write batch holds. |
+| `infino.batch.bytes` | 64 MiB | Proxy mode: the most bytes one write batch holds. |
+| `infino.batch.concurrency` | half the `write` pool | Proxy mode: the most appends to one table that run at once. Appends that name the same document id never run at once. |
+| `infino.nested.candidates.max` | `10000` | The most documents a `nested` query may leave to check entry by entry; past it the query is refused. |
 
 ## SQL
 
@@ -290,18 +297,20 @@ A `nested` query (Dashboards' `has_reference` on saved objects' `references` is 
 - **Where `knn` goes.** `knn` is the whole query, not a clause inside `bool`.
 - **Refused, with the parameter named:** radial search (`max_distance`, `min_score`), `method_parameters`, `rescore`, `expand_nested_docs`, `ignore_unmapped`, a boost or query name. With a `knn` query, aggregations, field sorts, `post_filter`, `collapse`, `search_after` and scroll are refused too.
 
-**Not supported:** HDR percentiles; `fuzzy`, `function_score` and geo queries; `suggest`; sliced search (sliced scroll, reindex or update by query); and a search across Infino-backed and other indices together. A request using any of these fails with a 400 that names the clause (`[infino] query not served by the table: ...`); it never returns an empty answer instead.
+**Not supported:** HDR percentiles; `fuzzy`, `function_score` and geo queries; `suggest`; sliced search (sliced scroll, reindex or update by query); and a search across Infino-backed and other indices together. A request using any of these fails with a 400 that names the clause (`[infino] query not served by the table: ...`); it does not return an empty answer instead. Some searches the plugin does serve still answer differently from stock with no error ([#56](https://github.com/infino-ai/opensearch-infino/issues/56)).
 
 ## Writes
 
-Each engine append is a commit, and a bulk is acknowledged only after the append carrying its writes, so an acknowledged write is durable.
+**Default mode.** Writes take OpenSearch's own path: each primary shard indexes the document, writes it to the translog and replicates it as usual, and adds it to the shard's batch. The batch is committed to the table when the translog syncs, on a refresh or a flush, or when it reaches `infino.engine.batch.docs` or `infino.engine.batch.bytes`, after the shard's in-sync copies hold the operations it covers. Until a commit takes them, the translog keeps the writes, so a node that stops replays them.
+
+**Proxy mode.** Each engine append is a commit, and a bulk is acknowledged only after the append carrying its writes, so an acknowledged write is durable.
 
 - **Grouped commits.** A bulk that arrives while no append is running starts one at once. Bulks that arrive during an append go into the next one.
 - **Replace, delete, update.** Indexing an existing id replaces it, and a delete removes it. An update merges into the document (partial `doc`, `doc_as_upsert`, `upsert`); update scripts are refused. Updates apply in order, including two updates of one document in the same bulk.
 - **No lookup for new ids.** Which ids exist is answered by the id column's term index, so a stream of new documents pays no lookup.
 - **Several indices.** A bulk over several indices is applied index by index, and its items are answered in order.
 
-A batch's writes and deletes are two mutations, with the deletes after the append. If a node stops between them, the batch is not acknowledged; the client's retry applies both again, and both are idempotent. If a delete fails after its append committed, only the delete items fail (500).
+In proxy mode, a batch's writes and deletes are two mutations, with the deletes after the append. If a node stops between them, the batch is not acknowledged; the client's retry applies both again, and both are idempotent. If a delete fails after its append committed, only the delete items fail (500).
 
 ## Build and test
 
@@ -310,6 +319,8 @@ A batch's writes and deletes are two mutations, with the deletes after the appen
 cd plugin && gradle check   # precommit, unit tests, and the REST suites on a test cluster with the bridge
 ./scripts/check-all.sh      # the same check on every supported release
 ```
+
+`gradle check` loads the bridge as `libinfino_capi.so`; on macOS pass `-Dinfino.lib=$PWD/../infino-capi/target/release/libinfino_capi.dylib`. `check-all.sh` reads the bridge from `INFINO_LIB` and the releases from `RELEASES` (default `3.9.0 3.6.0 3.3.2 3.0.0 2.19.6`).
 
 OpenSearch's own YAML REST suites (index, get, bulk, update, delete, search, aggregations, scroll and the rest of the document and search APIs, from the release's `rest-api-spec` artifact) run in tasks of their own, outside `check`:
 
@@ -345,4 +356,4 @@ Apache-2.0; see [LICENSE](LICENSE). The bridge and the plugin use only the publi
 
 ## Contributing and security
 
-Bugs and feature requests go in [the issues](https://github.com/infino-ai/opensearch-infino/issues); pull requests are welcome, and `gradle check` (see [Build and test](#build-and-test)) should pass before you open one. Report a security problem privately, through [a security advisory](https://github.com/infino-ai/opensearch-infino/security/advisories/new), not in a public issue.
+Bugs and feature requests go in [the issues](https://github.com/infino-ai/opensearch-infino/issues), and pull requests are welcome: [CONTRIBUTING.md](CONTRIBUTING.md) covers the build, the checks a pull request must pass, and the sign-off each commit needs. Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md). Report a security problem privately, as [SECURITY.md](SECURITY.md) describes, not in a public issue.
