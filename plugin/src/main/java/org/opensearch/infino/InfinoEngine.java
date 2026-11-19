@@ -52,6 +52,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 /**
  * The engine of an index in default mode ({@code index.infino.mode: default}):
@@ -1456,7 +1457,24 @@ public class InfinoEngine extends InternalEngine {
      * lease (its table has not committed under this engine since it was
      * given one) starts past the highest operation a row records, as far as
      * its history reaches.
+     * <p>
+     * The lease loaded on restart can lag the commit (leases reach disk only
+     * on the sync interval; a flush uses the ones in memory). When a row
+     * records an operation up to where the history starts, fill from there.
      */
+    /**
+     * Whether a lease loaded at {@code leased} only lags the commit, whose
+     * history starts at {@code retained}: the table records an operation
+     * ({@code highest}, asked only then) up to where that history starts.
+     */
+    static boolean tableLeaseLagsCommit(long leased, long retained, long to, Supplier<Long> highest) {
+        if (leased > to || leased >= retained) {
+            return false;
+        }
+        Long h = highest.get();
+        return h != null && h + 1 >= retained;
+    }
+
     private void fillTable() throws IOException {
         long retained = getMinRetainedSeqNo();
         long to = getSeqNoStats(SequenceNumbers.UNASSIGNED_SEQ_NO).getMaxSeqNo();
@@ -1464,6 +1482,17 @@ public class InfinoEngine extends InternalEngine {
         long from;
         if (lease != null) {
             from = lease.retainingSequenceNumber();
+            if (tableLeaseLagsCommit(from, retained, to, () -> InfinoNative.highestOp(table, generation))) {
+                log.info(
+                    "[infino] {} loaded its table's lease at {}, behind the history it keeps from {}; {} holds up to there, so it fills from {}",
+                    shardId,
+                    from,
+                    retained,
+                    table,
+                    retained
+                );
+                from = retained;
+            }
             if (from <= to && from < retained) {
                 throw new IllegalStateException(
                     "[infino] "
