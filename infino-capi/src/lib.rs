@@ -98,11 +98,12 @@ const MULTI_VALUE_SEPARATOR: &str = " ";
 /// field's own column is null for that document, except a string field's,
 /// which keeps the values joined so its text index sees every token.
 const LIST_SUFFIX: &str = "[]";
-/// What the column holding an array of objects, as the document wrote it,
-/// is named after the array's path: `<path>{}`. Flattening keeps each member
-/// path's values (`a.b[]`) but not which of them shared an entry; the
-/// rebuilt `_source` takes the array from here, so a nested query's entries
-/// read as they were written.
+/// What the column holding a value as the document wrote it is named after
+/// the value's path: `<path>{}`, for the values the rebuilt `_source` cannot
+/// take from their columns. An array of objects: flattening keeps each
+/// member path's values (`a.b[]`) but not which of them shared an entry, and
+/// a nested query reads its entries as they were written. A vector: the
+/// engine keeps it in its vector index, which no projection reads back.
 const OBJECTS_SUFFIX: &str = "{}";
 /// The name Arrow gives a list column's element.
 const LIST_ITEM: &str = "item";
@@ -1823,6 +1824,7 @@ fn conform_doc(
         }
     }
     let mut lists: Vec<(String, Value)> = Vec::new();
+    let mut kept_as_written: Vec<(String, Value)> = Vec::new();
     for (path, value) in flat.iter_mut() {
         let field = schema.field_with_name(path).ok();
         // A field the mapping declares with a scalar or string column reads
@@ -1849,6 +1851,12 @@ fn conform_doc(
             continue;
         };
         let dt = field.data_type();
+        if vector_type(dt) {
+            kept_as_written.push((
+                format!("{path}{OBJECTS_SUFFIX}"),
+                Value::String(value.to_string()),
+            ));
+        }
         let rule = kept.get(path);
         let fit = |v: Value| match rule {
             Some(Kept::Date(formats)) if matches!(dt, DataType::Timestamp(..)) => {
@@ -1891,7 +1899,7 @@ fn conform_doc(
             other => fit(other).map_err(why)?,
         };
     }
-    for (path, values) in lists {
+    for (path, values) in lists.into_iter().chain(kept_as_written) {
         flat.insert(path, values);
     }
     Ok(flat)
@@ -2954,14 +2962,22 @@ pub unsafe extern "C" fn infino_delete_osids(
 }
 
 /// The columns a row's document is rebuilt from: every column of the table
-/// but the plugin's own bookkeeping.
+/// but the plugin's own bookkeeping and the vectors, which the engine keeps
+/// in its vector index and no projection reads; a vector comes back from
+/// its `<path>{}` column ([`OBJECTS_SUFFIX`]).
 fn document_columns(schema: &Schema) -> Vec<String> {
     schema
         .fields()
         .iter()
+        .filter(|f| !bookkeeping(f.name()) && !vector_type(f.data_type()))
         .map(|f| f.name().clone())
-        .filter(|name| !bookkeeping(name))
         .collect()
+}
+
+/// Whether a column holds a vector: a fixed-size list, as the engine
+/// declares a vector field.
+fn vector_type(dt: &DataType) -> bool {
+    matches!(dt, DataType::FixedSizeList(..))
 }
 
 /// Whether a column is the plugin's or the engine's own rather than one a
