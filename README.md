@@ -33,7 +33,7 @@ curl -sk -u "admin:<password>" https://localhost:9200/_plugins/_infino/account
 
 The node answers `OpenSearch Security not initialized` for its first seconds, while the security plugin reads its configuration from the table; the loop waits that out.
 
-`INFINO_STORAGE` in `.env` picks where the tables live: `local` (the default, a Docker volume, or a bucket named by `INFINO_URI`), `cloud` (an [Infino account](#hosted-account-and-stateless-nodes), with `INFINO_API_KEY`) or `memory`. `OPENSEARCH_VERSION` picks the release; `env.example` lists every option. The node serves HTTPS with the security plugin's demo certificates, hence `-k`. `docker compose --profile dashboards up` adds Dashboards on port 5601.
+`INFINO_STORAGE` in `.env` picks where the tables live: `local` (the default, a Docker volume, or a bucket named by `INFINO_URI`), `cloud` (an [Infino account](#hosted-account-and-stateless-nodes), with `INFINO_API_KEY`) or `memory`. `OPENSEARCH_VERSION` picks the release; `env.example` lists every option. The node serves HTTPS with the security plugin's demo certificates, hence `-k`; set `TLS_CERT` and `TLS_KEY` in `.env` to serve your own certificate instead, on both OpenSearch and Dashboards. `docker compose --profile dashboards up` adds Dashboards on port 5601.
 
 The node's data volume belongs to the storage it was first started with, so to change `INFINO_STORAGE` (or the account, database or URI), run `docker compose down -v` first. This deletes the local volumes, including tables kept on `infino-data`. Use it between `memory` runs too.
 
