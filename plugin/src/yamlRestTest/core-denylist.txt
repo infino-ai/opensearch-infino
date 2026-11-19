@@ -145,7 +145,7 @@ mget/14_alias_to_multiple_indices/*  # [bug:proxy] an mget through an alias of s
 field_caps/40_disable_objects/*  # [bug:proxy] field_caps with disable_objects (2 of the 3 tests fail; narrow after the next run) (https://github.com/infino-ai/opensearch-infino/issues/57)
 
 # --- An index named "index" never starts
-search/260_sort_geopoint/*  # [bug] the index name index collides with the registry table (https://github.com/infino-ai/opensearch-infino/issues/58)
+search/260_sort_geopoint/*  # [gap] an index named index is refused at create, its table would be the registry's (https://github.com/infino-ai/opensearch-infino/issues/58)
 
 # --- Gaps: requests the plugin refuses with a clear "not served" error. Remove the entry when the feature lands.
 # Derived from the stock tests' own requests, checked against what the query and aggregation translators serve;

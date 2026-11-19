@@ -26,6 +26,7 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.script.ScriptService;
+import org.opensearch.search.SearchService;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
@@ -99,6 +100,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
         }
         List<Index> infino = new ArrayList<>();
         List<IndexMetadata> metadata = new ArrayList<>();
+        List<IndexMetadata> served = new ArrayList<>();
         int engine = 0;
         for (String name : concrete) {
             IndexMetadata md = state.metadata().index(name);
@@ -110,12 +112,22 @@ public class InfinoSearchActionFilter implements ActionFilter {
                 metadata.add(md);
             } else if (InfinoPlugin.inDefaultMode(md.getSettings())) {
                 engine++;
+            } else {
+                continue;
             }
+            served.add(md);
         }
         if ((engine > 0 || !infino.isEmpty()) && search.source() != null && search.source().slice() != null) {
             // The table answers a search whole, never a slice of it: each slice of a
             // sliced scroll (a sliced reindex or update by query) would get every document.
             listener.onFailure(new IllegalArgumentException("[infino] a sliced search is not served by the table; send it as one slice"));
+            return;
+        }
+        // The shards never see the search as written, so they cannot make their checks of it.
+        try {
+            InfinoSearchChecks.check(search.source(), served, clusters.getClusterSettings().get(SearchService.ALLOW_EXPENSIVE_QUERIES));
+        } catch (IllegalArgumentException e) {
+            listener.onFailure(e);
             return;
         }
         if (engine > 0) {

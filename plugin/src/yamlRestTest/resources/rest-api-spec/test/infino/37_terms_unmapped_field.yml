@@ -1,0 +1,77 @@
+---
+"Terms over indices where one does not map the field: the unmapped index reduces with any type":
+  - do:
+      indices.create:
+        index: tu_long
+        body:
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      indices.create:
+        index: tu_double
+        body:
+          mappings:
+            properties:
+              n: { type: double }
+  - do:
+      indices.create:
+        index: tu_none
+        body:
+          mappings:
+            properties:
+              tag: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: tu_long, _id: "1" }
+          - { n: 1 }
+          - index: { _index: tu_long, _id: "2" }
+          - { n: 1 }
+          - index: { _index: tu_long, _id: "3" }
+          - { n: 2 }
+          - index: { _index: tu_double, _id: "1" }
+          - { n: 1.5 }
+          - index: { _index: tu_none, _id: "1" }
+          - { tag: a }
+          - index: { _index: tu_none, _id: "2" }
+          - { tag: b }
+
+  - do:
+      search:
+        index: tu_long,tu_none
+        typed_keys: true
+        body:
+          size: 0
+          aggs:
+            t: { terms: { field: n } }
+  - length: { aggregations.lterms#t.buckets: 2 }
+  - match: { aggregations.lterms#t.buckets.0.key: 1 }
+  - match: { aggregations.lterms#t.buckets.0.doc_count: 2 }
+  - match: { aggregations.lterms#t.buckets.1.key: 2 }
+  - match: { aggregations.lterms#t.buckets.1.doc_count: 1 }
+
+  # Over the unmapped index alone: no buckets, keyed as stock keys an unmapped field.
+  - do:
+      search:
+        index: tu_none
+        typed_keys: true
+        body:
+          size: 0
+          aggs:
+            t: { terms: { field: n } }
+  - length: { aggregations.sterms#t.buckets: 0 }
+
+  # A long and a double index, and one that maps neither: the keys read as doubles.
+  - do:
+      search:
+        index: tu_long,tu_double,tu_none
+        typed_keys: true
+        body:
+          size: 0
+          aggs:
+            t: { terms: { field: n } }
+  - length: { aggregations.dterms#t.buckets: 3 }
+  - match: { aggregations.dterms#t.buckets.0.key: 1.0 }
+  - match: { aggregations.dterms#t.buckets.0.doc_count: 2 }

@@ -172,6 +172,21 @@ public final class InfinoTables {
         return oldest == null ? null : oldest.getIndex();
     }
 
+    /** Refuse an index of this name and these settings when one of its tables would be the registry's. */
+    static void refuseRegistryTable(String name, Settings settings) {
+        for (String table : tablesOf(name, settings)) {
+            if (InfinoRegistry.TABLE.equals(table)) {
+                throw registryTable(name, table);
+            }
+        }
+    }
+
+    private static IllegalArgumentException registryTable(String name, String table) {
+        return new IllegalArgumentException(
+            "[infino] index [" + name + "] would be served from table [" + table + "], which holds the registry of the cluster's indices"
+        );
+    }
+
     /**
      * Refuse to serve {@code md} from {@code table} when the table is not
      * its own: the registry's, one an older live index of {@code naming}
@@ -181,9 +196,7 @@ public final class InfinoTables {
     static void claim(String table, IndexMetadata md, Map<String, List<IndexMetadata>> naming) {
         String name = md.getIndex().getName();
         if (InfinoRegistry.TABLE.equals(table)) {
-            throw new IllegalArgumentException(
-                "[infino] index [" + name + "] would be served from table [" + table + "], which holds the registry of the cluster's indices"
-            );
+            throw registryTable(name, table);
         }
         Index owner = owner(naming.getOrDefault(table, List.of()));
         if (owner != null && !owner.equals(md.getIndex())) {
