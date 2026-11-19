@@ -71,6 +71,8 @@ import org.opensearch.search.aggregations.bucket.terms.SignificantTermsAggregati
 import org.opensearch.search.aggregations.bucket.terms.StringTerms;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregator;
+import org.opensearch.search.aggregations.bucket.terms.UnmappedSignificantTerms;
+import org.opensearch.search.aggregations.bucket.terms.UnmappedTerms;
 import org.opensearch.search.aggregations.bucket.terms.heuristic.JLHScore;
 import org.opensearch.search.aggregations.bucket.terms.heuristic.ScriptHeuristic;
 import org.opensearch.search.aggregations.bucket.terms.heuristic.SignificanceHeuristic;
@@ -931,7 +933,14 @@ public class InfinoAggregationProcessor {
                 case INT -> "CAST(NULL AS BIGINT)";
                 default -> "CAST(NULL AS DOUBLE)";
             };
-            return new Source(nothing, type, "[" + field + "] (unmapped)", null);
+            return new Source(nothing, type, "[" + field + "]" + UNMAPPED, null);
+        }
+
+        private static final String UNMAPPED = " (unmapped)";
+
+        /** Whether this is a field the index does not map, with no {@code missing} value standing in. */
+        boolean unmappedField() {
+            return label.endsWith(UNMAPPED) && expr.startsWith("COALESCE(") == false;
         }
 
         /** This source where {@code predicate} holds and no value elsewhere: what a metric under a filter reads. */
@@ -2075,6 +2084,10 @@ public class InfinoAggregationProcessor {
             // size (see shardSize): the reduce reads a result with fewer buckets
             // than this as holding every group, so with no error in its counts.
             TermsAggregator.BucketCountThresholds thresholds = new TermsAggregator.BucketCountThresholds(t.minDocCount(), t.shardMinDocCount(), t.size(), size);
+            if (source.unmappedField()) {
+                // As stock: an unmapped result, which reduces with any other index's key type.
+                return new UnmappedTerms(t.getName(), t.order(), thresholds, metadataOf(t));
+            }
             if (booleanKeys) {
                 return new LongTerms(t.getName(), t.order(), t.order(), metadataOf(t), DocValueFormat.BOOLEAN, size, false, otherDocCount, lBuckets, 0L, thresholds);
             }
@@ -2470,6 +2483,9 @@ public class InfinoAggregationProcessor {
         ) {
             String name = builder.getName();
             Map<String, Object> meta = metadataOf(builder);
+            if (source.unmappedField()) {
+                return new UnmappedSignificantTerms(name, thresholds, meta);
+            }
             // The score is left for the reduction, which computes it from the four counts.
             if (keyKind == KeyKind.STR || keyKind == KeyKind.BOOL) {
                 List<SignificantStringTerms.Bucket> out = new ArrayList<>();
