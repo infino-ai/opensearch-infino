@@ -17,8 +17,8 @@ use std::ops::ControlFlow;
 
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, Ident, ObjectNamePart, Query, Statement, TableAlias,
-    TableFactor, Value, VisitMut, VisitorMut,
+    Expr, FunctionArg, FunctionArgExpr, Ident, ObjectNamePart, Query, SetExpr, Statement,
+    TableAlias, TableFactor, Value, VisitMut, VisitorMut,
 };
 use infino::arrow_array::{
     Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
@@ -161,6 +161,8 @@ fn searched(args: &[FunctionArg]) -> Option<&str> {
 struct Walk<'a> {
     columns_of: &'a dyn Fn(&str) -> Option<Vec<String>>,
     replaced: bool,
+    /// Whether the statement also reads a table that is not attached.
+    owned: bool,
 }
 
 impl Walk<'_> {
@@ -199,6 +201,7 @@ impl VisitorMut for Walk<'_> {
             },
         };
         let Some(columns) = (self.columns_of)(&table) else {
+            self.owned = true;
             return ControlFlow::Continue(());
         };
         let alias = alias.take().unwrap_or(TableAlias {
@@ -224,6 +227,111 @@ impl VisitorMut for Walk<'_> {
     }
 }
 
+/// The row id column a reference to a document's id stands for: the same
+/// reference, qualified as it was, naming [`ROW_ID`]. None for anything but
+/// a reference to [`OSID`].
+fn row_id_for(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) if ident.value == OSID => Some(quoted(ROW_ID)),
+        Expr::CompoundIdentifier(parts) => {
+            let (last, qualifier) = parts.split_last()?;
+            if last.value != OSID {
+                return None;
+            }
+            let mut names: Vec<String> = qualifier.iter().map(|p| quoted(&p.value)).collect();
+            names.push(quoted(ROW_ID));
+            Some(names.join("."))
+        }
+        _ => None,
+    }
+}
+
+/// The text of a string literal, or none for any other expression.
+fn string_of(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) => Some(s),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A comparison of a document's id with ids given as strings, as the same
+/// comparison of the row id with those ids as numbers; an id that is no row
+/// id names no row and is left out. None for any other expression.
+///
+/// The view gives a document's id as the row id's text, and a comparison
+/// with that text is worked out for every row of the table: nothing about a
+/// row's text is known before the row is read. The row id itself is what the
+/// table finds a row by, so the same question asked of it reads only the
+/// rows named.
+fn by_row_id(expr: &Expr) -> Option<String> {
+    use datafusion::sql::sqlparser::ast::BinaryOperator;
+    match expr {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let column = row_id_for(expr)?;
+            let ids: Vec<&str> = list.iter().map(string_of).collect::<Option<_>>()?;
+            let ids: Vec<&str> = ids.into_iter().filter(|id| is_row_id(id)).collect();
+            Some(match (ids.is_empty(), negated) {
+                (true, false) => "FALSE".to_string(),
+                (true, true) => "TRUE".to_string(),
+                (false, false) => format!("{column} IN ({})", ids.join(", ")),
+                (false, true) => format!("{column} NOT IN ({})", ids.join(", ")),
+            })
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let equal = match op {
+                BinaryOperator::Eq => true,
+                BinaryOperator::NotEq => false,
+                _ => return None,
+            };
+            let (column, id) = match (row_id_for(left), row_id_for(right)) {
+                (Some(column), None) => (column, string_of(right)?),
+                (None, Some(column)) => (column, string_of(left)?),
+                _ => return None,
+            };
+            Some(match (is_row_id(id), equal) {
+                (true, true) => format!("{column} = {id}"),
+                (true, false) => format!("{column} <> {id}"),
+                (false, true) => "FALSE".to_string(),
+                (false, false) => "TRUE".to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The walk that asks for documents by row id wherever a statement asks for
+/// them by id, see [`by_row_id`].
+struct ByRowId;
+
+impl VisitorMut for ByRowId {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        let Some(predicate) = by_row_id(expr) else {
+            return ControlFlow::Continue(());
+        };
+        let parsed = parse(&format!("SELECT 1 WHERE {predicate}"));
+        let selection = parsed.and_then(|query| match *query.body {
+            SetExpr::Select(select) => select.selection,
+            _ => None,
+        });
+        match selection {
+            Some(selection) => {
+                *expr = selection;
+                ControlFlow::Continue(())
+            }
+            None => ControlFlow::Break(()),
+        }
+    }
+}
+
 /// `sql` with a view in place of each attached table it reads, as a table or
 /// through a search: the table's own columns, and the plugin's beside them.
 /// `columns_of` gives the columns of an attached table, and none for any
@@ -237,8 +345,14 @@ pub(crate) fn rewrite(
     let mut walk = Walk {
         columns_of,
         replaced: false,
+        owned: false,
     };
     if VisitMut::visit(&mut query, &mut walk).is_break() || !walk.replaced {
+        return None;
+    }
+    // Only where every table read is attached: a table the plugin owns holds
+    // ids of its own under the same name, and they are no row ids.
+    if !walk.owned && VisitMut::visit(&mut query, &mut ByRowId).is_break() {
         return None;
     }
     Some(Statement::Query(Box::new(query)).to_string())
@@ -489,6 +603,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sql.matches("named_struct(").count(), 2, "{sql}");
+    }
+
+    #[test]
+    fn documents_asked_for_by_id_are_asked_of_the_table_by_row_id() {
+        let rewritten = |sql: &str| rewrite(sql, &columns_of).unwrap();
+        let listed = rewritten(r#"SELECT osid, source FROM "plain" WHERE osid IN ('12', '34', 'x') LIMIT 10"#);
+        assert!(listed.contains(r#""_id" IN (12, 34)"#), "{listed}");
+        assert!(!listed.contains("'12'"), "{listed}");
+        let one = rewritten(r#"SELECT osid FROM "plain" AS p WHERE p."osid" = '7' AND "hits" > 1"#);
+        assert!(one.contains(r#""p"."_id" = 7"#), "{one}");
+        // An id that is no row id names no row, and is never compared as text.
+        let none = rewritten(r#"SELECT osid FROM "plain" WHERE osid IN ('abc')"#);
+        assert!(none.to_lowercase().ends_with("where false"), "{none}");
+        let never = rewritten(r#"SELECT osid FROM "plain" WHERE osid = 'abc'"#);
+        assert!(never.to_lowercase().ends_with("where false"), "{never}");
+        let all_but = rewritten(r#"SELECT osid FROM "plain" WHERE osid NOT IN ('5')"#);
+        assert!(all_but.contains(r#""_id" NOT IN (5)"#), "{all_but}");
+        // Beside a table the plugin owns, whose ids are its own, nothing is changed.
+        let mixed = rewritten(r#"SELECT p.osid FROM "plain" AS p JOIN "owned" AS o ON p.title = o.title WHERE o.osid = '9'"#);
+        assert!(mixed.contains("'9'"), "{mixed}");
     }
 
     #[test]
