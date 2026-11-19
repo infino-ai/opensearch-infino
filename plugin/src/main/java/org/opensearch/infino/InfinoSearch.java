@@ -1171,7 +1171,24 @@ public final class InfinoSearch {
         String hit = InfinoQueryTranslator.OSID
             + (withSource ? ", " + InfinoQueryTranslator.SOURCE : "")
             + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "");
-        return "SELECT " + hit + " FROM " + plan.query().from() + " WHERE " + plan.hitWhere() + " LIMIT " + fetch;
+        Unranked read = unranked(plan.query(), plan.hitWhere());
+        return "SELECT " + hit + " FROM " + read.from() + " WHERE " + read.where() + " LIMIT " + fetch;
+    }
+
+    /** The relation and predicate a page with no score reads its rows from. */
+    record Unranked(String from, String where) {}
+
+    /**
+     * What a page with no score (a sorted or an unsorted one) reads: a
+     * plain-words text clause is a predicate on the table's rows
+     * ({@code text_match}), so the engine reads rows in the page's order and
+     * checks it on each, and a LIMIT stops the read, rather than collecting
+     * every row the token index matches first. Any other text clause keeps
+     * its token index relation.
+     */
+    static Unranked unranked(Translation q, String where) {
+        String text = q.principalPredicate();
+        return text == null ? new Unranked(q.from(), where) : new Unranked(InfinoQueryTranslator.quoteIdent(q.table()), "(" + where + ") AND " + text);
     }
 
     /**
@@ -1289,7 +1306,11 @@ public final class InfinoSearch {
         String from;
         String order;
         if (sorted) {
-            from = q.from();
+            // A sorted page has no score to rank by: the engine's top-k reads rows
+            // in the sort column's order (see unranked).
+            Unranked read = unranked(q, where);
+            from = read.from();
+            where = read.where();
             order = String.join(", ", plan.orderBy());
         } else if (ranked) {
             // The engine ranks within the rows the predicate keeps, so the page

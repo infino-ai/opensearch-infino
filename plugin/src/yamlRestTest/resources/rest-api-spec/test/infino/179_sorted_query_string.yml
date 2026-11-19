@@ -1,0 +1,411 @@
+---
+"A sorted page with plain query_string words returns a Lucene twin's hits, filtered and paged with search_after":
+  # A sorted page has no score, so its plain-words text clause is a
+  # text_match on the table's rows, read in the sort's order, rather than
+  # the token index's matches sorted afterwards. The hits, beside a range
+  # filter and across search_after pages, are stock's, in stock's order.
+  - do:
+      indices.create:
+        index: st_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              message: { type: text }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: st_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              message: { type: text }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: st_default
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              message: { type: text }
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        index: st_luc
+        body:
+          - index: { _id: "s01" }
+          - { "@timestamp": "2026-01-01T00:00:00Z", n: 1, message: "jackal bat" }
+          - index: { _id: "s02" }
+          - { "@timestamp": "2026-01-02T00:00:00Z", n: 2, message: "cat dog" }
+          - index: { _id: "s03" }
+          - { "@timestamp": "2026-01-03T00:00:00Z", n: 3, message: "monkey owl" }
+          - index: { _id: "s04" }
+          - { "@timestamp": "2026-01-04T00:00:00Z", n: 4, message: "jackal bat" }
+          - index: { _id: "s05" }
+          - { "@timestamp": "2026-01-05T00:00:00Z", n: 5, message: "cat dog monkey" }
+          - index: { _id: "s06" }
+          - { "@timestamp": "2026-01-06T00:00:00Z", n: 6, message: "monkey owl" }
+          - index: { _id: "s07" }
+          - { "@timestamp": "2026-01-07T00:00:00Z", n: 7, message: "jackal bat" }
+          - index: { _id: "s08" }
+          - { "@timestamp": "2026-01-08T00:00:00Z", n: 8, message: "cat dog" }
+          - index: { _id: "s09" }
+          - { "@timestamp": "2026-01-09T00:00:00Z", n: 9, message: "monkey owl" }
+          - index: { _id: "s10" }
+          - { "@timestamp": "2026-01-10T00:00:00Z", n: 10, message: "jackal bat monkey" }
+          - index: { _id: "s11" }
+          - { "@timestamp": "2026-01-11T00:00:00Z", n: 11, message: "cat dog" }
+          - index: { _id: "s12" }
+          - { "@timestamp": "2026-01-12T00:00:00Z", n: 12, message: "monkey owl" }
+          - index: { _id: "s13" }
+          - { "@timestamp": "2026-01-13T00:00:00Z", n: 13, message: "jackal bat" }
+          - index: { _id: "s14" }
+          - { "@timestamp": "2026-01-14T00:00:00Z", n: 14, message: "cat dog" }
+          - index: { _id: "s15" }
+          - { "@timestamp": "2026-01-15T00:00:00Z", n: 15, message: "monkey owl monkey" }
+          - index: { _id: "s16" }
+          - { "@timestamp": "2026-01-16T00:00:00Z", n: 16, message: "jackal bat" }
+          - index: { _id: "s17" }
+          - { "@timestamp": "2026-01-17T00:00:00Z", n: 17, message: "cat dog" }
+          - index: { _id: "s18" }
+          - { "@timestamp": "2026-01-18T00:00:00Z", n: 18, message: "monkey owl" }
+          - index: { _id: "s19" }
+          - { "@timestamp": "2026-01-19T00:00:00Z", n: 19, message: "jackal bat" }
+          - index: { _id: "s20" }
+          - { "@timestamp": "2026-01-20T00:00:00Z", n: 20, message: "cat dog monkey" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: st_proxy
+        body:
+          - index: { _id: "s01" }
+          - { "@timestamp": "2026-01-01T00:00:00Z", n: 1, message: "jackal bat" }
+          - index: { _id: "s02" }
+          - { "@timestamp": "2026-01-02T00:00:00Z", n: 2, message: "cat dog" }
+          - index: { _id: "s03" }
+          - { "@timestamp": "2026-01-03T00:00:00Z", n: 3, message: "monkey owl" }
+          - index: { _id: "s04" }
+          - { "@timestamp": "2026-01-04T00:00:00Z", n: 4, message: "jackal bat" }
+          - index: { _id: "s05" }
+          - { "@timestamp": "2026-01-05T00:00:00Z", n: 5, message: "cat dog monkey" }
+          - index: { _id: "s06" }
+          - { "@timestamp": "2026-01-06T00:00:00Z", n: 6, message: "monkey owl" }
+          - index: { _id: "s07" }
+          - { "@timestamp": "2026-01-07T00:00:00Z", n: 7, message: "jackal bat" }
+          - index: { _id: "s08" }
+          - { "@timestamp": "2026-01-08T00:00:00Z", n: 8, message: "cat dog" }
+          - index: { _id: "s09" }
+          - { "@timestamp": "2026-01-09T00:00:00Z", n: 9, message: "monkey owl" }
+          - index: { _id: "s10" }
+          - { "@timestamp": "2026-01-10T00:00:00Z", n: 10, message: "jackal bat monkey" }
+          - index: { _id: "s11" }
+          - { "@timestamp": "2026-01-11T00:00:00Z", n: 11, message: "cat dog" }
+          - index: { _id: "s12" }
+          - { "@timestamp": "2026-01-12T00:00:00Z", n: 12, message: "monkey owl" }
+          - index: { _id: "s13" }
+          - { "@timestamp": "2026-01-13T00:00:00Z", n: 13, message: "jackal bat" }
+          - index: { _id: "s14" }
+          - { "@timestamp": "2026-01-14T00:00:00Z", n: 14, message: "cat dog" }
+          - index: { _id: "s15" }
+          - { "@timestamp": "2026-01-15T00:00:00Z", n: 15, message: "monkey owl monkey" }
+          - index: { _id: "s16" }
+          - { "@timestamp": "2026-01-16T00:00:00Z", n: 16, message: "jackal bat" }
+          - index: { _id: "s17" }
+          - { "@timestamp": "2026-01-17T00:00:00Z", n: 17, message: "cat dog" }
+          - index: { _id: "s18" }
+          - { "@timestamp": "2026-01-18T00:00:00Z", n: 18, message: "monkey owl" }
+          - index: { _id: "s19" }
+          - { "@timestamp": "2026-01-19T00:00:00Z", n: 19, message: "jackal bat" }
+          - index: { _id: "s20" }
+          - { "@timestamp": "2026-01-20T00:00:00Z", n: 20, message: "cat dog monkey" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: st_default
+        body:
+          - index: { _id: "s01" }
+          - { "@timestamp": "2026-01-01T00:00:00Z", n: 1, message: "jackal bat" }
+          - index: { _id: "s02" }
+          - { "@timestamp": "2026-01-02T00:00:00Z", n: 2, message: "cat dog" }
+          - index: { _id: "s03" }
+          - { "@timestamp": "2026-01-03T00:00:00Z", n: 3, message: "monkey owl" }
+          - index: { _id: "s04" }
+          - { "@timestamp": "2026-01-04T00:00:00Z", n: 4, message: "jackal bat" }
+          - index: { _id: "s05" }
+          - { "@timestamp": "2026-01-05T00:00:00Z", n: 5, message: "cat dog monkey" }
+          - index: { _id: "s06" }
+          - { "@timestamp": "2026-01-06T00:00:00Z", n: 6, message: "monkey owl" }
+          - index: { _id: "s07" }
+          - { "@timestamp": "2026-01-07T00:00:00Z", n: 7, message: "jackal bat" }
+          - index: { _id: "s08" }
+          - { "@timestamp": "2026-01-08T00:00:00Z", n: 8, message: "cat dog" }
+          - index: { _id: "s09" }
+          - { "@timestamp": "2026-01-09T00:00:00Z", n: 9, message: "monkey owl" }
+          - index: { _id: "s10" }
+          - { "@timestamp": "2026-01-10T00:00:00Z", n: 10, message: "jackal bat monkey" }
+          - index: { _id: "s11" }
+          - { "@timestamp": "2026-01-11T00:00:00Z", n: 11, message: "cat dog" }
+          - index: { _id: "s12" }
+          - { "@timestamp": "2026-01-12T00:00:00Z", n: 12, message: "monkey owl" }
+          - index: { _id: "s13" }
+          - { "@timestamp": "2026-01-13T00:00:00Z", n: 13, message: "jackal bat" }
+          - index: { _id: "s14" }
+          - { "@timestamp": "2026-01-14T00:00:00Z", n: 14, message: "cat dog" }
+          - index: { _id: "s15" }
+          - { "@timestamp": "2026-01-15T00:00:00Z", n: 15, message: "monkey owl monkey" }
+          - index: { _id: "s16" }
+          - { "@timestamp": "2026-01-16T00:00:00Z", n: 16, message: "jackal bat" }
+          - index: { _id: "s17" }
+          - { "@timestamp": "2026-01-17T00:00:00Z", n: 17, message: "cat dog" }
+          - index: { _id: "s18" }
+          - { "@timestamp": "2026-01-18T00:00:00Z", n: 18, message: "monkey owl" }
+          - index: { _id: "s19" }
+          - { "@timestamp": "2026-01-19T00:00:00Z", n: 19, message: "jackal bat" }
+          - index: { _id: "s20" }
+          - { "@timestamp": "2026-01-20T00:00:00Z", n: 20, message: "cat dog monkey" }
+  - match: { errors: false }
+
+  # st_luc: a range filter, sorted on a number.
+  - do:
+      search:
+        index: st_luc
+        body:
+          size: 20
+          sort: [ { n: asc } ]
+          query:
+            bool:
+              must: { query_string: { query: "monkey jackal", default_field: message } }
+              filter: { range: { n: { gte: 5, lte: 15 } } }
+  - match: { hits.total.value: 8 }
+  - length: { hits.hits: 8 }
+  - match: { hits.hits.0._id: "s05" }
+  - match: { hits.hits.1._id: "s06" }
+  - match: { hits.hits.2._id: "s07" }
+  - match: { hits.hits.3._id: "s09" }
+  - match: { hits.hits.4._id: "s10" }
+  - match: { hits.hits.5._id: "s12" }
+  - match: { hits.hits.6._id: "s13" }
+  - match: { hits.hits.7._id: "s15" }
+  # st_luc: three pages on @timestamp descending, each after the last.
+  - do:
+      search:
+        index: st_luc
+        body:
+          size: 5
+          sort: [ { "@timestamp": desc } ]
+          query: { query_string: { query: "monkey jackal", default_field: message } }
+  - match: { hits.total.value: 15 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "s20" }
+  - match: { hits.hits.1._id: "s19" }
+  - match: { hits.hits.2._id: "s18" }
+  - match: { hits.hits.3._id: "s16" }
+  - match: { hits.hits.4._id: "s15" }
+  - set: { hits.hits.4.sort.0: after }
+  - do:
+      search:
+        index: st_luc
+        body:
+          size: 5
+          sort: [ { "@timestamp": desc } ]
+          search_after: [ $after ]
+          query: { query_string: { query: "monkey jackal", default_field: message } }
+  - match: { hits.total.value: 15 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "s13" }
+  - match: { hits.hits.1._id: "s12" }
+  - match: { hits.hits.2._id: "s10" }
+  - match: { hits.hits.3._id: "s09" }
+  - match: { hits.hits.4._id: "s07" }
+  - set: { hits.hits.4.sort.0: after }
+  - do:
+      search:
+        index: st_luc
+        body:
+          size: 5
+          sort: [ { "@timestamp": desc } ]
+          search_after: [ $after ]
+          query: { query_string: { query: "monkey jackal", default_field: message } }
+  - match: { hits.total.value: 15 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "s06" }
+  - match: { hits.hits.1._id: "s05" }
+  - match: { hits.hits.2._id: "s04" }
+  - match: { hits.hits.3._id: "s03" }
+  - match: { hits.hits.4._id: "s01" }
+  - set: { hits.hits.4.sort.0: after }
+  - do:
+      search:
+        index: st_luc
+        body:
+          size: 5
+          sort: [ { "@timestamp": desc } ]
+          search_after: [ $after ]
+          query: { query_string: { query: "monkey jackal", default_field: message } }
+  - length: { hits.hits: 0 }
+
+  # st_proxy: a range filter, sorted on a number.
+  - do:
+      search:
+        index: st_proxy
+        body:
+          size: 20
+          sort: [ { n: asc } ]
+          query:
+            bool:
+              must: { query_string: { query: "monkey jackal", default_field: message } }
+              filter: { range: { n: { gte: 5, lte: 15 } } }
+  - match: { hits.total.value: 8 }
+  - length: { hits.hits: 8 }
+  - match: { hits.hits.0._id: "s05" }
+  - match: { hits.hits.1._id: "s06" }
+  - match: { hits.hits.2._id: "s07" }
+  - match: { hits.hits.3._id: "s09" }
+  - match: { hits.hits.4._id: "s10" }
+  - match: { hits.hits.5._id: "s12" }
+  - match: { hits.hits.6._id: "s13" }
+  - match: { hits.hits.7._id: "s15" }
+  # st_proxy: three pages on @timestamp descending, each after the last.
+  - do:
+      search:
+        index: st_proxy
+        body:
+          size: 5
+          sort: [ { "@timestamp": desc } ]
+          query: { query_string: { query: "monkey jackal", default_field: message } }
+  - match: { hits.total.value: 15 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "s20" }
+  - match: { hits.hits.1._id: "s19" }
+  - match: { hits.hits.2._id: "s18" }
+  - match: { hits.hits.3._id: "s16" }
+  - match: { hits.hits.4._id: "s15" }
+  - set: { hits.hits.4.sort.0: after }
+  - do:
+      search:
+        index: st_proxy
+        body:
+          size: 5
+          sort: [ { "@timestamp": desc } ]
+          search_after: [ $after ]
+          query: { query_string: { query: "monkey jackal", default_field: message } }
+  - match: { hits.total.value: 15 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "s13" }
+  - match: { hits.hits.1._id: "s12" }
+  - match: { hits.hits.2._id: "s10" }
+  - match: { hits.hits.3._id: "s09" }
+  - match: { hits.hits.4._id: "s07" }
+  - set: { hits.hits.4.sort.0: after }
+  - do:
+      search:
+        index: st_proxy
+        body:
+          size: 5
+          sort: [ { "@timestamp": desc } ]
+          search_after: [ $after ]
+          query: { query_string: { query: "monkey jackal", default_field: message } }
+  - match: { hits.total.value: 15 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "s06" }
+  - match: { hits.hits.1._id: "s05" }
+  - match: { hits.hits.2._id: "s04" }
+  - match: { hits.hits.3._id: "s03" }
+  - match: { hits.hits.4._id: "s01" }
+  - set: { hits.hits.4.sort.0: after }
+  - do:
+      search:
+        index: st_proxy
+        body:
+          size: 5
+          sort: [ { "@timestamp": desc } ]
+          search_after: [ $after ]
+          query: { query_string: { query: "monkey jackal", default_field: message } }
+  - length: { hits.hits: 0 }
+
+  # st_default: a range filter, sorted on a number.
+  - do:
+      search:
+        index: st_default
+        body:
+          size: 20
+          sort: [ { n: asc } ]
+          query:
+            bool:
+              must: { query_string: { query: "monkey jackal", default_field: message } }
+              filter: { range: { n: { gte: 5, lte: 15 } } }
+  - match: { hits.total.value: 8 }
+  - length: { hits.hits: 8 }
+  - match: { hits.hits.0._id: "s05" }
+  - match: { hits.hits.1._id: "s06" }
+  - match: { hits.hits.2._id: "s07" }
+  - match: { hits.hits.3._id: "s09" }
+  - match: { hits.hits.4._id: "s10" }
+  - match: { hits.hits.5._id: "s12" }
+  - match: { hits.hits.6._id: "s13" }
+  - match: { hits.hits.7._id: "s15" }
+  # st_default: three pages on @timestamp descending, each after the last.
+  - do:
+      search:
+        index: st_default
+        body:
+          size: 5
+          sort: [ { "@timestamp": desc } ]
+          query: { query_string: { query: "monkey jackal", default_field: message } }
+  - match: { hits.total.value: 15 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "s20" }
+  - match: { hits.hits.1._id: "s19" }
+  - match: { hits.hits.2._id: "s18" }
+  - match: { hits.hits.3._id: "s16" }
+  - match: { hits.hits.4._id: "s15" }
+  - set: { hits.hits.4.sort.0: after }
+  - do:
+      search:
+        index: st_default
+        body:
+          size: 5
+          sort: [ { "@timestamp": desc } ]
+          search_after: [ $after ]
+          query: { query_string: { query: "monkey jackal", default_field: message } }
+  - match: { hits.total.value: 15 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "s13" }
+  - match: { hits.hits.1._id: "s12" }
+  - match: { hits.hits.2._id: "s10" }
+  - match: { hits.hits.3._id: "s09" }
+  - match: { hits.hits.4._id: "s07" }
+  - set: { hits.hits.4.sort.0: after }
+  - do:
+      search:
+        index: st_default
+        body:
+          size: 5
+          sort: [ { "@timestamp": desc } ]
+          search_after: [ $after ]
+          query: { query_string: { query: "monkey jackal", default_field: message } }
+  - match: { hits.total.value: 15 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "s06" }
+  - match: { hits.hits.1._id: "s05" }
+  - match: { hits.hits.2._id: "s04" }
+  - match: { hits.hits.3._id: "s03" }
+  - match: { hits.hits.4._id: "s01" }
+  - set: { hits.hits.4.sort.0: after }
+  - do:
+      search:
+        index: st_default
+        body:
+          size: 5
+          sort: [ { "@timestamp": desc } ]
+          search_after: [ $after ]
+          query: { query_string: { query: "monkey jackal", default_field: message } }
+  - length: { hits.hits: 0 }

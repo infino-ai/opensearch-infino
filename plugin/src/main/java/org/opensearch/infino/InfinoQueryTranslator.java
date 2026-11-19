@@ -264,6 +264,16 @@ final class InfinoQueryTranslator {
                 + ")";
         }
 
+        /**
+         * The principal clause as a predicate on the table's rows, for a page
+         * that needs no score: {@code text_match} on its column when it is plain
+         * words ({@link #plainQuery}), null when there is none or it needs the
+         * token index (a phrase, a required or an excluded word).
+         */
+        String principalPredicate() {
+            return principal == null || !plainQuery(principal.query()) ? null : textPredicate(table, principal);
+        }
+
         /** The ranked relation for hits: BM25 over the principal clause, {@code k} candidates. */
         String rankedFrom(int k) {
             return rankedFrom(principal, k);
