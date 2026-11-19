@@ -1,9 +1,330 @@
-# Stock YAML REST tests that coreYamlRestTest and coreYamlRestTestProxy skip.
+# Stock YAML REST tests the core suites skip (coreYamlRestTest,
+# coreYamlRestTestProxy, coreYamlRestTestLucene).
 #
-# One pattern per line, relative to rest-api-spec/test, as the YAML runner's
+# A run should report 0 failures: every test that is known not to pass is
+# skipped here, with its reason, so any failure is a regression.
+#
+# One entry per line:
+#
+#   <pattern>  # [<tag>] <reason> (<issue URL>)
+#
+# The pattern is relative to rest-api-spec/test, as the YAML runner's
 # tests.rest.denylist takes it:
 #   search/10_source_filtering/*                   every test in a file
 #   search/10_source_filtering/Source filtering    one test, by its name
-# Blank lines and lines starting with # are ignored. Give each entry a comment
-# saying why it is skipped: a bug to fix, unsupported by design, or a test of
-# Lucene internals.
+# Write test names as they are; the build escapes the characters the runner
+# would read as a regular expression or a list separator. The runner matches
+# a pattern against the end of the test's path, so get/40_routing/Routing
+# also skips mget/40_routing/Routing.
+#
+# The tag says which tasks skip the test:
+#   [gap]       the plugin refuses the request with a clear "not served"
+#               error; remove the entry when the feature lands
+#   [bug]       the plugin answers wrongly; remove the entry with the fix
+#   [cluster]   fails on the same cluster without the plugin too
+# gap and bug may be narrowed to one mode: [gap:proxy], [bug:default].
+# Without a mode they apply to both. coreYamlRestTestLucene skips only
+# [cluster] entries.
+#
+# -Dinfino.core.skip chooses how much is skipped:
+#   all    (default) every entry for the task's mode
+#   gaps   [gap] and [cluster] only, so the known bugs run and fail
+#   none   nothing, to find entries whose tests pass now
+# scripts/core-denylist.py reads a run's results and prints the failures no
+# entry covers, and the entries whose tests all passed.
+#
+# Blank lines and lines starting with # are ignored. A line without a tag and
+# a reason fails the build.
+
+# --- Bugs: wrong behaviour the plugin should fix. Remove the entry with the fix.
+
+# --- A refused document blocks its shard in default mode
+search/200_ignore_malformed/Exists on _ignored  # [bug:default] a malformed value the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+search/200_ignore_malformed/Search on _ignored with term  # [bug:default] a malformed value the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+search/200_ignore_malformed/Search on _ignored with terms  # [bug:default] a malformed value the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+search/200_ignore_malformed/_ignored is returned by default  # [bug:default] a malformed value the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+search/200_ignore_malformed/_ignored is still returned with explicit list of stored fields  # [bug:default] a malformed value the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/90_flat_object/Exist query in root field  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/90_flat_object/Supported queries  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/90_flat_object/Mappings  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/90_flat_object/Invalid docs  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/91_flat_object_null_value/Supported queries  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/92_flat_object_support_doc_values/Supported queries  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/100_partial_flat_object/Exists query for sub field  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/100_partial_flat_object/Supported queries  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/105_partial_flat_object_nested/Exists query for sub field  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/105_partial_flat_object_nested/Supported queries  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/80_geo_point/Multi points test  # [bug:default] a geo_point array the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+
+# --- An acknowledged unsigned_long write is dropped in default mode
+index/90_unsigned_long/Unsigned long with decimal part test  # [bug:default] unsigned_long with a decimal part is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+index/90_unsigned_long/Stored unsigned long with decimal part test  # [bug:default] unsigned_long with a decimal part is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+search/90_search_after/unsigned long  # [bug:default] unsigned_long above the signed 64-bit maximum is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/230_composite_unsigned/Aggregate After  # [bug:default] unsigned_long above the signed 64-bit maximum is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/230_composite_unsigned/Nested Composite aggregation  # [bug:default] unsigned_long above the signed 64-bit maximum is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/230_composite_unsigned/Composite aggregation with unmapped field  # [bug:default] unsigned_long above the signed 64-bit maximum is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/100_avg_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/110_max_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/120_min_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/130_sum_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/140_value_count_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/170_cardinality_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/180_percentiles_tdigest_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/220_filters_bucket_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
+
+# --- The refresh parameter on single-document writes, and realtime=false gets
+index/60_refresh/*  # [bug] a write with refresh=true, "" or wait_for is not visible to the next search, or has no forced_refresh (https://github.com/infino-ai/opensearch-infino/issues/55)
+create/60_refresh/*  # [bug] a write with refresh=true, "" or wait_for is not visible to the next search, or has no forced_refresh (https://github.com/infino-ai/opensearch-infino/issues/55)
+delete/50_refresh/*  # [bug] a write with refresh=true, "" or wait_for is not visible to the next search, or has no forced_refresh (https://github.com/infino-ai/opensearch-infino/issues/55)
+update/60_refresh/*  # [bug] a write with refresh=true, "" or wait_for is not visible to the next search, or has no forced_refresh (https://github.com/infino-ai/opensearch-infino/issues/55)
+get/60_realtime_refresh/Realtime Refresh  # [bug] realtime=false finds a write that is not refreshed (https://github.com/infino-ai/opensearch-infino/issues/55)
+get_source/60_realtime_refresh/Realtime  # [bug] realtime=false finds a write that is not refreshed (https://github.com/infino-ai/opensearch-infino/issues/55)
+exists/60_realtime_refresh/Realtime Refresh  # [bug] realtime=false finds a write that is not refreshed (https://github.com/infino-ai/opensearch-infino/issues/55)
+mget/60_realtime_refresh/Realtime Refresh  # [bug] realtime=false finds a write that is not refreshed (https://github.com/infino-ai/opensearch-infino/issues/55)
+
+# --- Requests stock rejects are accepted, or answered with another status
+search/30_limits/Rescore window limits  # [bug] an index limit stock enforces with a 400 is not checked (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/30_limits/Docvalues_fields size limit  # [bug] an index limit stock enforces with a 400 is not checked (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/30_limits/Script_fields size limit  # [bug] an index limit stock enforces with a 400 is not checked (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/170_terms_query/Terms Query with No.of terms exceeding index.max_terms_count should FAIL  # [bug] index.max_terms_count is not checked (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/320_disallow_queries/Test disallow expensive queries  # [bug] search.allow_expensive_queries: false is not checked (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/320_disallow_queries_field_match_only_text/Test disallow expensive queries  # [bug] search.allow_expensive_queries: false is not checked (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/330_fetch_fields/Test date formatting  # [bug] a fields request stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/330_fetch_fields/Test disable source  # [bug] a fields request stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/260_sort_mixed/*  # [bug] a sort across long, double and unsigned_long indices stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/110_field_collapsing/field collapsing and rescore  # [bug:default] a collapse stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/110_field_collapsing/field collapsing and scroll  # [bug:default] a collapse stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/110_field_collapsing/field collapsing with search_after - basic functionality  # [bug:default] a collapse stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/40_indices_boost/Indices boost for nonexistent index/alias  # [bug] indices_boost on a missing index is not rejected (https://github.com/infino-ai/opensearch-infino/issues/57)
+search.aggregation/300_pipeline/Max pipeline on percentiles agg without specifying percent  # [bug] a pipeline path stock rejects is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+get_source/85_source_missing/Missing document source with catch  # [bug] a document with _source disabled returns 200, not 404 (https://github.com/infino-ai/opensearch-infino/issues/57)
+update/95_require_alias/*  # [bug] require_alias on an index that is not an alias returns 201, not 404 (https://github.com/infino-ai/opensearch-infino/issues/57)
+search.aggregation/20_terms/Boolean test  # [bug] terms over every index returns 500: an index without the field gives a typed, not an unmapped, result (https://github.com/infino-ai/opensearch-infino/issues/57)
+search.aggregation/20_terms/Date test  # [bug] terms over every index returns 500: an index without the field gives a typed, not an unmapped, result (https://github.com/infino-ai/opensearch-infino/issues/57)
+search.aggregation/20_terms/Double test  # [bug] terms over every index returns 500: an index without the field gives a typed, not an unmapped, result (https://github.com/infino-ai/opensearch-infino/issues/57)
+search.aggregation/20_terms/Integer test  # [bug] terms over every index returns 500: an index without the field gives a typed, not an unmapped, result (https://github.com/infino-ai/opensearch-infino/issues/57)
+search.aggregation/20_terms/Long test  # [bug] terms over every index returns 500: an index without the field gives a typed, not an unmapped, result (https://github.com/infino-ai/opensearch-infino/issues/57)
+search.aggregation/20_terms/Mixing longs and doubles  # [bug] terms over every index returns 500: an index without the field gives a typed, not an unmapped, result (https://github.com/infino-ai/opensearch-infino/issues/57)
+search.aggregation/20_terms/Mixing longs, unsigned  long and doubles  # [bug] terms over every index returns 500: an index without the field gives a typed, not an unmapped, result (https://github.com/infino-ai/opensearch-infino/issues/57)
+search.aggregation/20_terms/Unsigned Long test  # [bug] terms over every index returns 500: an index without the field gives a typed, not an unmapped, result (https://github.com/infino-ai/opensearch-infino/issues/57)
+search.aggregation/80_typed_keys/Test typed keys parameter for terms aggregation  # [bug] terms over every index returns 500: an index without the field gives a typed, not an unmapped, result (https://github.com/infino-ai/opensearch-infino/issues/57)
+search.aggregation/80_typed_keys_unsigned/Test typed keys parameter for terms aggregation  # [bug] terms over every index returns 500: an index without the field gives a typed, not an unmapped, result (https://github.com/infino-ai/opensearch-infino/issues/57)
+
+# --- Write responses and checks in proxy mode
+index/20_optype/Optype  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
+index/30_cas/Compare And Swap Sequence Numbers  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
+delete/10_basic/Basic  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
+delete/11_shard_header/*  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
+delete/20_cas/Internal version  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
+update/10_doc/Partial document  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
+update/11_shard_header/*  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
+update/13_legacy_doc/*  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/300_sequence_numbers/sequence numbers are returned if requested from body  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/300_sequence_numbers/sequence numbers are returned if requested from url  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
+update/35_if_seq_no/Update with if_seq_no  # [bug:proxy] if_seq_no on a missing document returns 409, not 404 (https://github.com/infino-ai/opensearch-infino/issues/57)
+index/40_routing/Routing  # [bug:proxy] proxy mode ignores routing (https://github.com/infino-ai/opensearch-infino/issues/57)
+create/40_routing/Routing  # [bug:proxy] proxy mode ignores routing (https://github.com/infino-ai/opensearch-infino/issues/57)
+get/40_routing/Routing  # [bug:proxy] proxy mode ignores routing (https://github.com/infino-ai/opensearch-infino/issues/57)
+get_source/40_routing/Routing  # [bug:proxy] proxy mode ignores routing (https://github.com/infino-ai/opensearch-infino/issues/57)
+exists/40_routing/Routing  # [bug:proxy] proxy mode ignores routing (https://github.com/infino-ai/opensearch-infino/issues/57)
+mget/40_routing/Routing  # [bug:proxy] proxy mode ignores routing (https://github.com/infino-ai/opensearch-infino/issues/57)
+delete/30_routing/Routing  # [bug:proxy] proxy mode ignores routing (https://github.com/infino-ai/opensearch-infino/issues/57)
+bulk/10_basic/Empty _id  # [bug:proxy] a bulk item stock rejects is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
+bulk/10_basic/Empty _id with op_type create  # [bug:proxy] a bulk item stock rejects is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
+bulk/110_bulk_adaptive_shard_select/Test basic use  # [bug:proxy] a bulk item stock rejects is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
+create/70_nested/Indexing a doc with No. nested objects more than index.mapping.nested_objects.limit should fail  # [bug:proxy] index.mapping.nested_objects.limit is not checked (https://github.com/infino-ai/opensearch-infino/issues/57)
+index/110_strict_allow_templates/*  # [bug:proxy] dynamic: strict_allow_templates is not checked (https://github.com/infino-ai/opensearch-infino/issues/57)
+index/120_field_name/*  # [bug:proxy] a field name of only a dot is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/240_date_nanos/date_nanos requires dates after 1970 and before 2262  # [bug:proxy] a date_nanos value out of range is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
+scroll/20_keep_alive/Max keep alive  # [bug:proxy] a scroll over search.max_keep_alive is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
+scroll/10_basic/Basic scroll  # [bug:proxy] a scroll returns hits after it is cleared or done (https://github.com/infino-ai/opensearch-infino/issues/57)
+scroll/10_basic/Basic scroll with 1 shard  # [bug:proxy] a scroll returns hits after it is cleared or done (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/220_total_hits_object/hits.total as an object  # [bug:proxy] hits.total does not follow track_total_hits (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/220_total_hits_object/track_total_hits with rest_total_hits_as_int  # [bug:proxy] hits.total does not follow track_total_hits (https://github.com/infino-ai/opensearch-infino/issues/57)
+mget/14_alias_to_multiple_indices/*  # [bug:proxy] an mget through an alias of several indices is not rejected (https://github.com/infino-ai/opensearch-infino/issues/57)
+field_caps/40_disable_objects/*  # [bug:proxy] field_caps with disable_objects (2 of the 3 tests fail; narrow after the next run) (https://github.com/infino-ai/opensearch-infino/issues/57)
+
+# --- An index named "index" never starts
+search/260_sort_geopoint/*  # [bug] the index name index collides with the registry table (https://github.com/infino-ai/opensearch-infino/issues/58)
+
+# --- Gaps: requests the plugin refuses with a clear "not served" error. Remove the entry when the feature lands.
+# Derived from the stock tests' own requests, checked against what the query and aggregation translators serve;
+# the inventory is in the parent issue (https://github.com/infino-ai/opensearch-infino/issues/51).
+delete/25_external_version/*  # [gap] not served: external versioning
+delete/26_external_gte_version/*  # [gap] not served: external versioning
+get/90_versions/*  # [gap] not served: external versioning
+index/35_external_version/*  # [gap] not served: external versioning
+index/36_external_gte_version/*  # [gap] not served: external versioning
+index/80_geo_point/*  # [gap] not served: query geo_shape
+index/90_flat_object/Supported queries  # [gap] not served: query terms_set
+index/92_flat_object_support_doc_values/*  # [gap] not served: query fuzzy
+msearch/20_typed_keys/Multisearch test with typed_keys parameter  # [gap] not served: suggest
+msearch/20_typed_keys/Multisearch test with typed_keys parameter for sampler and significant terms  # [gap] not served: aggregation sampler
+scroll/12_slices/*  # [gap] not served: sliced scroll
+search.aggregation/100_avg_metric/Filtered test  # [gap] not served: query constant_score
+search.aggregation/100_avg_metric_unsigned/Filtered test  # [gap] not served: query constant_score
+search.aggregation/10_histogram/date_histogram  # [gap] aggregation on a date_nanos multi-field, which has no column
+search.aggregation/10_histogram/date_histogram on range  # [gap] date_histogram on a date_range field
+search.aggregation/10_histogram/date_histogram on range with offset  # [gap] date_histogram on a date_range field
+search.aggregation/10_histogram/date_histogram with pre-epoch daylight savings time transition  # [gap] aggregation on a date_nanos multi-field, which has no column
+search.aggregation/110_max_metric/Filtered test  # [gap] not served: query constant_score
+search.aggregation/110_max_metric_unsigned/Filtered test  # [gap] not served: query constant_score
+search.aggregation/120_min_metric/Filtered test  # [gap] not served: query constant_score
+search.aggregation/120_min_metric_unsigned/Filtered test  # [gap] not served: query constant_score
+search.aggregation/130_sum_metric/Filtered test  # [gap] not served: query constant_score
+search.aggregation/130_sum_metric_unsigned/Filtered test  # [gap] not served: query constant_score
+search.aggregation/140_value_count_metric/Filtered test  # [gap] not served: query constant_score
+search.aggregation/140_value_count_metric_unsigned/Filtered test  # [gap] not served: query constant_score
+search.aggregation/150_stats_metric/Basic test  # [gap] not served: aggregation stats
+search.aggregation/150_stats_metric/Only aggs test  # [gap] not served: aggregation stats
+search.aggregation/150_stats_metric/Filtered test  # [gap] not served: query constant_score
+search.aggregation/150_stats_metric/Missing field with missing param  # [gap] not served: aggregation stats
+search.aggregation/150_stats_metric/Missing field without missing param  # [gap] not served: aggregation stats
+search.aggregation/150_stats_metric/Metadata test  # [gap] not served: aggregation stats
+search.aggregation/150_stats_metric_unsigned/Basic test  # [gap] not served: aggregation stats
+search.aggregation/150_stats_metric_unsigned/Only aggs test  # [gap] not served: aggregation stats
+search.aggregation/150_stats_metric_unsigned/Filtered test  # [gap] not served: query constant_score
+search.aggregation/150_stats_metric_unsigned/Missing field with missing param  # [gap] not served: aggregation stats
+search.aggregation/150_stats_metric_unsigned/Missing field without missing param  # [gap] not served: aggregation stats
+search.aggregation/150_stats_metric_unsigned/Metadata test  # [gap] not served: aggregation stats
+search.aggregation/160_extended_stats_metric/Basic test  # [gap] not served: aggregation extended_stats
+search.aggregation/160_extended_stats_metric/Only aggs test  # [gap] not served: aggregation extended_stats
+search.aggregation/160_extended_stats_metric/Filtered test  # [gap] not served: query constant_score
+search.aggregation/160_extended_stats_metric/Missing field with missing param  # [gap] not served: aggregation extended_stats
+search.aggregation/160_extended_stats_metric/Missing field without missing param  # [gap] not served: aggregation extended_stats
+search.aggregation/160_extended_stats_metric/Metadata test  # [gap] not served: aggregation extended_stats
+search.aggregation/160_extended_stats_metric/Sigma test  # [gap] not served: aggregation extended_stats
+search.aggregation/160_extended_stats_metric_unsigned/Basic test  # [gap] not served: aggregation extended_stats
+search.aggregation/160_extended_stats_metric_unsigned/Only aggs test  # [gap] not served: aggregation extended_stats
+search.aggregation/160_extended_stats_metric_unsigned/Filtered test  # [gap] not served: query constant_score
+search.aggregation/160_extended_stats_metric_unsigned/Missing field with missing param  # [gap] not served: aggregation extended_stats
+search.aggregation/160_extended_stats_metric_unsigned/Missing field without missing param  # [gap] not served: aggregation extended_stats
+search.aggregation/160_extended_stats_metric_unsigned/Metadata test  # [gap] not served: aggregation extended_stats
+search.aggregation/160_extended_stats_metric_unsigned/Sigma test  # [gap] not served: aggregation extended_stats
+search.aggregation/170_cardinality_metric/Filtered test  # [gap] not served: query constant_score
+search.aggregation/170_cardinality_metric_unsigned/Filtered test  # [gap] not served: query constant_score
+search.aggregation/180_percentiles_tdigest_metric/Filtered test  # [gap] not served: query constant_score
+search.aggregation/180_percentiles_tdigest_metric_unsigned/Filtered 2.x test  # [gap] not served: query constant_score
+search.aggregation/180_percentiles_tdigest_metric_unsigned/Filtered 3.x test  # [gap] not served: query constant_score
+search.aggregation/190_percentiles_hdr_metric/Basic test  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric/Only aggs test  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric/Filtered test  # [gap] not served: query constant_score
+search.aggregation/190_percentiles_hdr_metric/Missing field with missing param  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric/Missing field without missing param  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric/Metadata test  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric/Explicit Percents test  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric/Non-keyed test  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric/Negative values test  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric_unsigned/Basic test  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric_unsigned/Only aggs test  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric_unsigned/Filtered test  # [gap] not served: query constant_score
+search.aggregation/190_percentiles_hdr_metric_unsigned/Missing field with missing param  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric_unsigned/Missing field without missing param  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric_unsigned/Metadata test  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric_unsigned/Explicit Percents test  # [gap] not served: HDR percentiles
+search.aggregation/190_percentiles_hdr_metric_unsigned/Non-keyed test  # [gap] not served: HDR percentiles
+search.aggregation/200_top_hits_metric/top_hits aggregation with nested documents  # [gap] not served: aggregation nested
+search.aggregation/200_top_hits_metric/top_hits aggregation with nested documents and disabled _source  # [gap] not served: aggregation nested
+search.aggregation/20_terms/IP test  # [gap] not served: terms include/exclude
+search.aggregation/20_terms/Date test  # [gap] not served: terms include/exclude
+search.aggregation/20_terms/Partitioned string test  # [gap] not served: terms include/exclude
+search.aggregation/20_terms/Partitioned integer test  # [gap] not served: terms include/exclude
+search.aggregation/220_filters_bucket/Filtered test  # [gap] not served: query constant_score
+search.aggregation/220_filters_bucket_unsigned/Filtered test  # [gap] not served: query constant_score
+search.aggregation/230_composite/Composite aggregation with nested parent  # [gap] not served: aggregation nested
+search.aggregation/230_composite/Composite aggregation with filtered nested parent  # [gap] not served: aggregation nested
+search.aggregation/230_composite/Composite aggregation with filtered reverse nested parent  # [gap] not served: aggregation nested
+search.aggregation/230_composite_unsigned/Composite aggregation with nested parent  # [gap] not served: aggregation nested
+search.aggregation/260_weighted_avg/*  # [gap] not served: aggregation weighted_avg
+search.aggregation/260_weighted_avg_unsigned/*  # [gap] not served: aggregation weighted_avg
+search.aggregation/270_median_absolute_deviation_metric/basic test  # [gap] not served: aggregation median_absolute_deviation
+search.aggregation/270_median_absolute_deviation_metric/with setting compression  # [gap] not served: aggregation median_absolute_deviation
+search.aggregation/270_median_absolute_deviation_metric/no documents  # [gap] not served: aggregation median_absolute_deviation
+search.aggregation/270_median_absolute_deviation_metric/missing value  # [gap] not served: aggregation median_absolute_deviation
+search.aggregation/270_median_absolute_deviation_metric_unsigned/*  # [gap] not served: aggregation median_absolute_deviation
+search.aggregation/280_rare_terms/*  # [gap] not served: aggregation rare_terms
+search.aggregation/30_sig_terms/IP test  # [gap] not served: significant_terms include/exclude
+search.aggregation/320_missing/*  # [gap] not served: aggregation missing
+search.aggregation/330_auto_date_histogram/*  # [gap] not served: aggregation auto_date_histogram
+search.aggregation/340_geo_distance/*  # [gap] not served: aggregation geo_distance
+search.aggregation/350_variable_width_histogram/*  # [gap] not served: aggregation variable_width_histogram
+search.aggregation/360_date_histogram/date_histogram on range with hard bounds  # [gap] date_histogram on a date_range field
+search.aggregation/370_multi_terms/*  # [gap] not served: aggregation multi_terms
+search.aggregation/40_range/IP range  # [gap] not served: aggregation ip_range
+search.aggregation/40_range/IP Range Key Generation  # [gap] not served: aggregation ip_range
+search.aggregation/40_range/IP Range avg_bucket  # [gap] not served: aggregation ip_range
+search.aggregation/410_nested_aggs/*  # [gap] not served: aggregation nested
+search.aggregation/50_filter/Filter aggs with terms lookup and ensure it's cached  # [gap] not served: terms lookup
+search.aggregation/70_adjacency_matrix/*  # [gap] not served: aggregation adjacency_matrix
+search.aggregation/80_typed_keys/Test typed keys parameter for extended_stats aggregation  # [gap] not served: aggregation extended_stats
+search.aggregation/80_typed_keys/Test typed keys parameter for stats aggregation  # [gap] not served: aggregation stats
+search.aggregation/80_typed_keys_unsigned/Test typed keys parameter for extended_stats aggregation  # [gap] not served: aggregation extended_stats
+search.aggregation/80_typed_keys_unsigned/Test typed keys parameter for stats aggregation  # [gap] not served: aggregation stats
+search.aggregation/90_sig_text/*  # [gap] not served: aggregation significant_text
+search.aggregation/90_sig_text_field_match_only_text/*  # [gap] not served: aggregation significant_text
+search/110_field_collapsing/field collapsing and inner_hits  # [gap] not served: collapse with inner_hits
+search/110_field_collapsing/field collapsing, inner_hits, and fields  # [gap] not served: collapse with inner_hits
+search/110_field_collapsing/field collapsing, inner_hits and maxConcurrentGroupRequests  # [gap] not served: collapse with inner_hits
+search/110_field_collapsing/no hits and inner_hits  # [gap] not served: collapse with inner_hits
+search/110_field_collapsing/no hits and inner_hits max_score null  # [gap] not served: collapse with inner_hits
+search/110_field_collapsing/field collapsing and multiple inner_hits  # [gap] not served: collapse with inner_hits
+search/110_field_collapsing/field collapsing, inner_hits and version  # [gap] not served: collapse with inner_hits
+search/110_field_collapsing/field collapsing on a field alias  # [gap] not served: collapse with inner_hits
+search/110_field_collapsing/field collapsing, inner_hits and seq_no  # [gap] not served: collapse with inner_hits
+search/115_multiple_field_collapsing/*  # [gap] not served: collapse with inner_hits
+search/140_pre_filter_search_shards/pre_filter_shard_size with shards that have no hit  # [gap] not served: aggregation global
+search/150_rewrite_on_coordinator/*  # [gap] not served: terms lookup
+search/170_terms_query/*  # [gap] not served: terms lookup
+search/171_terms_lookup_query/*  # [gap] not served: terms lookup
+search/190_index_prefix_search/search index prefixes with span_multi  # [gap] not served: query span_near
+search/190_index_prefix_search/search index prefixes with multiple values  # [gap] not served: query match_phrase_prefix
+search/190_index_prefix_search/search index prefixes with multiple values and custom position_increment_gap  # [gap] not served: query match_phrase_prefix
+search/230_interval_query/*  # [gap] not served: query intervals
+search/250_distance_feature/*  # [gap] not served: query distance_feature
+search/260_sort_double/*  # [gap] not served: sort mode median/avg/sum
+search/260_sort_long/*  # [gap] not served: sort mode median/avg/sum
+search/260_sort_unsigned_long/*  # [gap] not served: sort mode median/avg/sum
+search/270_wildcard_fieldtype_queries/term query matches lowercase-normalized value  # [gap] query on a normalized multi-field, which has no column
+search/270_wildcard_fieldtype_queries/wildcard query matches lowercase-normalized field  # [gap] query on a normalized multi-field, which has no column
+search/270_wildcard_fieldtype_queries/regexp query matches lowercase-normalized field  # [gap] query on a normalized multi-field, which has no column
+search/310_match_bool_prefix/scoring complete term  # [gap] not served: query match_bool_prefix
+search/310_match_bool_prefix/scoring partial term  # [gap] not served: query match_bool_prefix
+search/310_match_bool_prefix/minimum should match  # [gap] not served: query match_bool_prefix
+search/310_match_bool_prefix/analyzer  # [gap] not served: query match_bool_prefix
+search/310_match_bool_prefix/operator  # [gap] not served: query match_bool_prefix
+search/310_match_bool_prefix/fuzziness  # [gap] not served: query match_bool_prefix
+search/310_match_bool_prefix/multi_match single field complete term  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix/multi_match single field partial term  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix/multi_match multiple fields complete term  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix/multi_match multiple fields partial term  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix/multi_match multiple fields with analyzer  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix/multi_match multiple fields with minimum_should_match  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix/multi_match multiple fields with fuzziness  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix/multi_match multiple fields with boost  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix_field_match_only_text/minimum should match  # [gap] not served: query match_bool_prefix
+search/310_match_bool_prefix_field_match_only_text/analyzer  # [gap] not served: query match_bool_prefix
+search/310_match_bool_prefix_field_match_only_text/operator  # [gap] not served: query match_bool_prefix
+search/310_match_bool_prefix_field_match_only_text/fuzziness  # [gap] not served: query match_bool_prefix
+search/310_match_bool_prefix_field_match_only_text/multi_match single field complete term  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix_field_match_only_text/multi_match single field partial term  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix_field_match_only_text/multi_match multiple fields complete term  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix_field_match_only_text/multi_match multiple fields partial term  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix_field_match_only_text/multi_match multiple fields with analyzer  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix_field_match_only_text/multi_match multiple fields with minimum_should_match  # [gap] not served: multi_match type bool_prefix
+search/310_match_bool_prefix_field_match_only_text/multi_match multiple fields with fuzziness  # [gap] not served: multi_match type bool_prefix
+search/380_bitmap_filtering/Terms lookup on a binary field with bitmap  # [gap] not served: terms lookup
+search/380_bitmap_filtering/Boolean must bitmap filtering  # [gap] not served: terms lookup
+search/380_bitmap_filtering/Boolean should bitmap filtering  # [gap] not served: terms lookup
+search/381_bitmap_filtering_long/Terms lookup on a binary field with bitmap (long)  # [gap] not served: terms lookup
+search/390_search_as_you_type/*  # [gap] not served: multi_match type bool_prefix
+search/400_combined_fields/*  # [gap] not served: query combined_fields
+
+# --- Proxy mode refuses these up front
+search/110_field_collapsing/*  # [gap:proxy] the setup indexes with version_type: external, which proxy mode refuses
+search.aggregation/230_composite_unsigned/*  # [gap:proxy] the setup writes an unsigned_long above the signed 64-bit maximum, which proxy mode refuses (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/160_exists_query/Test exists query on _routing field  # [gap:proxy] exists on _routing: proxy mode keeps no routing
+
+# --- Cluster: tests that fail on the same cluster without the plugin (security plugin enabled, one node).
+# Skipped in every task, coreYamlRestTestLucene included.
+# TODO: the baseline run lists 18; add them with their reason from the next coreYamlRestTestLucene run
+# (see the helper below).

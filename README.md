@@ -320,7 +320,17 @@ gradle coreYamlRestTestProxy    # every index in proxy mode
 gradle coreYamlRestTestLucene   # the same cluster without the plugin: the baseline
 ```
 
-A test that fails on the baseline fails because of the test cluster (the security plugin, the single node), not because of Infino. Tests to skip go in `plugin/src/yamlRestTest/core-denylist.txt`, one per line, each with the reason.
+A test that fails on the baseline fails because of the test cluster (the security plugin, the single node), not because of Infino.
+
+Tests known not to pass are skipped, so a run reports 0 failures and any failure is a regression. They are listed in `plugin/src/yamlRestTest/core-denylist.txt`, one per line, each tagged and with its reason: `[gap]` for a request the plugin refuses as not served, `[bug]` for a wrong answer (both narrowed to one mode as `[gap:proxy]` or `[bug:default]`), and `[cluster]` for a test that fails on the baseline too. `-Dinfino.core.skip` chooses how much is skipped:
+
+```bash
+gradle coreYamlRestTest -Dinfino.core.skip=all    # the default: every entry for the mode
+gradle coreYamlRestTest -Dinfino.core.skip=gaps   # gaps and cluster failures only: the known bugs run and fail
+gradle coreYamlRestTest -Dinfino.core.skip=none   # nothing: shows which entries pass now
+```
+
+`scripts/core-denylist.py default|proxy|lucene` reads a run's results and prints the failures no entry covers, as lines to tag and add, and the entries whose tests all passed, which can go.
 
 No OpenSearch checkout is needed: the plugin builds against the release named by `OPENSEARCH_VERSION`, pulled from Maven. `gradle check` builds against one release. The security integration takes a different path on 2.x, on 3.0 to 3.5, and on 3.6 and later, so run `check-all.sh` before relying on any release but the default. Each release's build tools want their own Gradle:
 
