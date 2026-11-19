@@ -217,6 +217,27 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
     }
 
     /**
+     * OpenSearch expires a lease not renewed within the lease period, and a
+     * commit renews the table's lease only when it moves. The engine renews
+     * it where it is, so a shard idle for several periods keeps it.
+     */
+    public void testTheTablesLeaseOutlivesTheLeasePeriodOnAnIdleShard() throws Exception {
+        String index = "eng_rep_lease_idle";
+        createIndex(
+            index,
+            0,
+            ",\"index.soft_deletes.retention_lease.period\":\"5s\",\"index.soft_deletes.retention_lease.sync_interval\":\"1s\""
+        );
+        assertGreen(index);
+        write(index, 0, DOCS);
+        call("POST", "/" + index + "/_refresh", null);
+        assertEquals(Long.valueOf(DOCS), tableLease(index, true));
+        Thread.sleep(15_000); // three lease periods with no commit; a lease sync runs every second
+        assertEquals("the table's lease is kept, where it was", Long.valueOf(DOCS), tableLease(index, true));
+        call("DELETE", "/" + index, null);
+    }
+
+    /**
      * An index whose two shards are on different nodes: a cardinality and a
      * count over it are the whole index's, answered once by the coordinating
      * node over both shards' tables, each read at its own shard's cut, so a
