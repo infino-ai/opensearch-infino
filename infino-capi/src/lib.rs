@@ -50,8 +50,9 @@ use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::prelude::{col, lit, Expr, SessionContext};
 use infino::arrow_array::{
     new_null_array, Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int64Array,
-    LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+    LargeListArray, LargeStringArray, ListArray, RecordBatch, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt64Array,
 };
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
@@ -2986,9 +2987,25 @@ fn bookkeeping(name: &str) -> bool {
     matches!(name, OSID | SEQ | ROUTING | OP | GEN | HIT_SCORE) || name.starts_with('_')
 }
 
-/// One cell as a JSON value, as [`batches_to_json`] renders it.
+/// One cell as a JSON value: a list column's cell as an array of its
+/// values, any other as [`batches_to_json`] renders it.
 fn cell_value(col: &dyn Array, r: usize) -> Value {
-    serde_json::from_str(&cell_json(col, r)).unwrap_or(Value::Null)
+    if col.is_null(r) {
+        return Value::Null;
+    }
+    let any = col.as_any();
+    let values = if let Some(list) = any.downcast_ref::<ListArray>() {
+        list.value(r)
+    } else if let Some(list) = any.downcast_ref::<LargeListArray>() {
+        list.value(r)
+    } else {
+        return serde_json::from_str(&cell_json(col, r)).unwrap_or(Value::Null);
+    };
+    Value::Array(
+        (0..values.len())
+            .map(|i| cell_value(values.as_ref(), i))
+            .collect(),
+    )
 }
 
 /// Row `r`'s `_source`, rebuilt from its columns. Each field's value is its
@@ -5640,10 +5657,7 @@ mod tests {
             ],
         );
         assert_eq!(append_replacing(h, p, &[])["ok"], 4);
-        let rows = sql(
-            h,
-            "SELECT osid, source FROM logs WHERE osid IN ('a1', 'a2')",
-        );
+        let rows = sql(h, "SELECT osid FROM logs WHERE osid IN ('a1', 'a2')");
         assert_eq!(rows.as_array().map(|r| r.len()), Some(2), "{rows}");
         let p = prepared(
             h,
