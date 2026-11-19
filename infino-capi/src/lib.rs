@@ -1724,7 +1724,8 @@ fn unify_new_paths(rows: &mut [Map<String, Value>], schema: &Schema) {
 /// `""` when it conforms, else the reason it would fail. The engine returns
 /// the same verdict `infino_index_batch` would report for the document, so a
 /// caller can refuse it synchronously (an OpenSearch bulk item error) rather
-/// than learn after the batch commits.
+/// than learn after the batch commits. A failure to check at all (the table
+/// cannot be opened) is an error object, not a verdict on the document.
 #[no_mangle]
 pub unsafe extern "C" fn infino_check_doc(
     h: *mut Bridge,
@@ -1737,11 +1738,11 @@ pub unsafe extern "C" fn infino_check_doc(
                 cstr(source)
             })
         else {
-            return out_string("null argument".into());
+            return err_json("null argument");
         };
         let table = match conn.table(name) {
             Ok(t) => t,
-            Err(e) => return out_string(e.to_string()),
+            Err(e) => return err_json(&e.to_string()),
         };
         let schema = table.schema();
         let stamp = conn.stamp(name);
@@ -1762,7 +1763,9 @@ pub unsafe extern "C" fn infino_check_doc(
 /// that value, as OpenSearch reads it. A field `kept` names holds each value
 /// as OpenSearch keeps it ([`Kept`]): a float at its precision, a date read
 /// by its own format. With `stamp`, the document must hold exactly one
-/// non-null value at that field, as a data stream's documents must.
+/// non-null value at that field, as a data stream's documents must. An array
+/// of arrays at a field without a scalar or string column the mapping
+/// declares is refused, as the engine would refuse it.
 fn conform_doc(
     source: &str,
     schema: &Schema,
@@ -1787,7 +1790,28 @@ fn conform_doc(
     }
     let mut lists: Vec<(String, Value)> = Vec::new();
     for (path, value) in flat.iter_mut() {
-        let Ok(field) = schema.field_with_name(path) else {
+        let field = schema.field_with_name(path).ok();
+        // A field the mapping declares with a scalar or string column reads
+        // through an array of arrays as OpenSearch does. Any other path (a
+        // geo_point, a flat_object's member, a field not yet declared) is
+        // typed by the engine from its values, with no column yet or with the
+        // list column its first values gave it, and the engine takes no array
+        // holding an array there: every commit would refuse the document.
+        let reads_through = field.is_some_and(|f| {
+            list_type(f.data_type()).is_some()
+                || matches!(
+                    f.data_type(),
+                    DataType::FixedSizeList(..) | DataType::Decimal128(..)
+                )
+        });
+        if !reads_through
+            && matches!(value, Value::Array(items) if items.iter().any(Value::is_array))
+        {
+            return Err(format!(
+                "field [{path}]: an array of arrays is not supported for a field without a column the mapping declares"
+            ));
+        }
+        let Some(field) = field else {
             continue;
         };
         let dt = field.data_type();
@@ -3783,6 +3807,76 @@ mod tests {
         let out = ensure(h, MAPPING);
         assert!(out.contains("\"created\":true"), "{out}");
         h
+    }
+
+    /// An array of arrays at a path without a column (a geo_point given
+    /// several points, a flat_object's member, a field not yet declared) is
+    /// refused by the check that runs before a write is acknowledged, as the
+    /// commit would refuse it, and still once an earlier document has given
+    /// the path the list column the engine types from its values; one at a
+    /// declared field is read through, and a mixed array at a path without a
+    /// column is no refusal.
+    #[test]
+    fn an_array_of_arrays_without_a_column_is_refused_before_acknowledgement() {
+        let h = open_logs();
+        let out = ensure(h, r#"{"properties":{"fo":{"type":"flat_object"}}}"#);
+        assert!(!out.contains("error"), "{out}");
+        let refused = [
+            (r#"{"level":"info","geo":[[1.0,2.0],[3.0,4.0]]}"#, "geo"),
+            (r#"{"level":"info","fo":{"a":[[1,2],[3]]}}"#, "fo.a"),
+            (r#"{"level":"info","un":[{"x":[1]},{"x":[[2]]}]}"#, "un.x"),
+            (r#"{"level":"info","un":[null,[1]]}"#, "un"),
+        ];
+        let refuses = |doc: &str, path: &str| {
+            let why = check(h, doc);
+            assert!(why.contains(&format!("field [{path}]")), "{doc}: {why:?}");
+            assert!(why.contains("array of arrays"), "{doc}: {why:?}");
+            let out = index(h, &[("x", doc)]);
+            assert_eq!(out["ok"], 0, "{doc}: {out}");
+        };
+        for (doc, path) in refused {
+            refuses(doc, path);
+        }
+        for doc in [
+            r#"{"level":"info","status":[[1,2],[3]]}"#,
+            r#"{"level":"info","un":[1,"a"]}"#,
+            r#"{"level":"info","geo":[1.0,2.0]}"#,
+            r#"{"level":"info","fo":{"a":[1,2]}}"#,
+        ] {
+            assert_eq!(check(h, doc), "", "{doc}");
+            let out = index(h, &[("y", doc)]);
+            assert_eq!(out["ok"], 1, "{doc}: {out}");
+        }
+        // Those writes gave geo and fo.a list columns typed from their values.
+        let cols = take(unsafe { infino_columns(h, c("logs").as_ptr()) });
+        for path in ["geo", "fo.a"] {
+            assert!(
+                cols.contains(&format!("\"name\":\"{path}\",\"type\":\"list\"")),
+                "{path}: {cols}"
+            );
+        }
+        for (doc, path) in &refused[..2] {
+            refuses(doc, path);
+        }
+        close(h);
+    }
+
+    /// A table that cannot be opened is no verdict on the document: the
+    /// check answers an error object, which the plugin fails the write with
+    /// (one the client may try again), not a reason the document is refused.
+    #[test]
+    fn a_table_that_cannot_be_opened_is_an_error_not_a_refusal() {
+        let h = open_logs();
+        let out = take(unsafe {
+            infino_check_doc(
+                h,
+                c("no_such_table").as_ptr(),
+                c(r#"{"level":"info"}"#).as_ptr(),
+            )
+        });
+        let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert!(v["error"].is_string(), "{out}");
+        close(h);
     }
 
     fn close(h: *mut Bridge) {
