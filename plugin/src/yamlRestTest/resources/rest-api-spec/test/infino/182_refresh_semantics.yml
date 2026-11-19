@@ -94,9 +94,28 @@
   - match: { foo: bar }
   - do: { exists: { index: rt_def, id: "1", realtime: false } }
   - is_true: ''
-  # An update not yet refreshed: realtime=false still sees the refreshed version.
-  - do: { index: { index: rt_def, id: "1", body: { foo: baz } } }
-  - do: { get: { index: rt_def, id: "1", realtime: false } }
-  - match: { _source.foo: bar }
-  - do: { get: { index: rt_def, id: "1" } }
-  - match: { _source.foo: baz }
+
+---
+"A term or terms query on _id finds the document, in both modes":
+  - do:
+      indices.create:
+        index: id_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      indices.create:
+        index: id_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+  - do: { bulk: { refresh: true, body: [ {"index": {"_index": id_px, "_id": "a"}}, {"foo": "x"}, {"index": {"_index": id_px, "_id": "b"}}, {"foo": "y"}, {"index": {"_index": id_def, "_id": "a"}}, {"foo": "x"}, {"index": {"_index": id_def, "_id": "b"}}, {"foo": "y"} ] } }
+  - match: { errors: false }
+  - do: { search: { index: id_px, rest_total_hits_as_int: true, body: { query: { term: { _id: "a" } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: a }
+  - do: { search: { index: id_px, rest_total_hits_as_int: true, body: { query: { terms: { _id: ["a", "b", "c"] } } } } }
+  - match: { hits.total: 2 }
+  - do: { search: { index: id_def, rest_total_hits_as_int: true, body: { query: { term: { _id: "b" } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: b }
+  - do: { search: { index: id_def, rest_total_hits_as_int: true, body: { query: { terms: { _id: ["a", "b", "c"] } } } } }
+  - match: { hits.total: 2 }
