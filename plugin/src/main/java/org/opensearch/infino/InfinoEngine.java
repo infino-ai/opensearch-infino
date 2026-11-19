@@ -209,7 +209,7 @@ public class InfinoEngine extends InternalEngine {
     /** What the lease names as the one holding it. */
     private static final String TABLE_LEASE_SOURCE = "infino table";
     /** Shortest wait between renewals of the table's lease where it is (see {@link #refreshTableLease}). */
-    private static final long LEASE_REFRESH_MIN_MILLIS = 100;
+    private static final long LEASE_REFRESH_MIN_MILLIS = 1_000;
 
     /**
      * One write of an id waiting for its commit: its source (null for a
@@ -1171,7 +1171,12 @@ public class InfinoEngine extends InternalEngine {
         }
         long delay = Math.max(LEASE_REFRESH_MIN_MILLIS, config().getIndexSettings().getRetentionLeaseMillis() / 4);
         try {
-            leaseRefresh = config().getThreadPool().schedule(this::refreshTableLease, TimeValue.timeValueMillis(delay), ThreadPool.Names.GENERIC);
+            Scheduler.ScheduledCancellable next = config().getThreadPool()
+                .schedule(this::refreshTableLease, TimeValue.timeValueMillis(delay), ThreadPool.Names.GENERIC);
+            leaseRefresh = next;
+            if (leaseRefreshStopped) {
+                next.cancel(); // close() ran between the check above and this schedule, and cancelled the one before
+            }
         } catch (OpenSearchRejectedExecutionException e) {
             log.debug("[infino] the renewal of the table lease of {} was not scheduled", shardId, e);
         }
