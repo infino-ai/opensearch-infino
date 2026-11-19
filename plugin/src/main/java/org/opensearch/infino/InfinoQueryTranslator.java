@@ -129,6 +129,20 @@ final class InfinoQueryTranslator {
      */
     static final String LIST_SUFFIX = "[]";
     /**
+     * What the column holding an array of objects as a document wrote it is
+     * named after its path: {@code <path>{}}. The bridge rebuilds a document's
+     * arrays of objects from it; it is no field of its own.
+     */
+    static final String OBJECTS_SUFFIX = "{}";
+
+    /**
+     * Whether a column holds documents' values as written ({@link #OBJECTS_SUFFIX}),
+     * or is named like the source: it may hold any field, a hidden or masked one too.
+     */
+    static boolean holdsWritten(String column) {
+        return column.equals(SOURCE) || column.endsWith(OBJECTS_SUFFIX);
+    }
+    /**
      * The names a list's subquery gives a document's id and each of its
      * values, and the aliases of the table it reads and of its rows. The
      * engine plans the subquery only with both relations aliased.
@@ -364,6 +378,21 @@ final class InfinoQueryTranslator {
         this.trusted = trusted;
         this.columnValuesOnly = columnValuesOnly;
         this.rows = rows;
+    }
+
+    /**
+     * The documents of the candidate rows that came without one, by id, each
+     * rebuilt from its row's columns, in one call for them all.
+     */
+    private Map<String, String> documentsOf(List<Map<String, Object>> candidates) {
+        List<String> ids = new ArrayList<>();
+        for (Map<String, Object> row : candidates) {
+            Object id = row.get(OSID);
+            if (id != null && !row.containsKey(SOURCE)) {
+                ids.add(id.toString());
+            }
+        }
+        return ids.isEmpty() ? Map.of() : InfinoNative.sources(table, ids);
     }
 
     /** Translate, or {@code null} when the query is not answerable over the table's columns. */
@@ -733,7 +762,7 @@ final class InfinoQueryTranslator {
      * "Pre-Sales Ops").
      */
     Column resolve(String field) {
-        if (field == null || field.endsWith(LIST_SUFFIX)) {
+        if (field == null || field.endsWith(LIST_SUFFIX) || field.endsWith(OBJECTS_SUFFIX)) {
             return null;
         }
         Column c = cols.get(field);
@@ -1171,7 +1200,7 @@ final class InfinoQueryTranslator {
         InfinoQueryTranslator wide = columnValuesOnly ? new InfinoQueryTranslator(cols, table, nowMillis, trusted, false, rows) : this;
         String narrowed = emptyEntryMatches ? ALL : and(List.of(present, wide.mayMatch(n.query())));
         List<Map<String, Object>> candidates = rows.apply(
-            "SELECT " + OSID + ", " + SOURCE + " FROM " + quoteIdent(table) + " WHERE " + narrowed + " LIMIT " + (NESTED_CANDIDATES_MAX + 1)
+            "SELECT " + OSID + " FROM " + quoteIdent(table) + " WHERE " + narrowed + " LIMIT " + (NESTED_CANDIDATES_MAX + 1)
         );
         if (candidates.size() > NESTED_CANDIDATES_MAX) {
             throw new IllegalArgumentException(
@@ -1183,9 +1212,10 @@ final class InfinoQueryTranslator {
                     + n.query()
             );
         }
+        Map<String, String> documents = documentsOf(candidates);
         for (Map<String, Object> row : candidates) {
             Object id = row.get(OSID);
-            Object source = row.get(SOURCE);
+            Object source = row.containsKey(SOURCE) ? row.get(SOURCE) : id == null ? null : documents.get(id.toString());
             List<Map<String, Object>> entries = source == null
                 ? List.of()
                 : entries(XContentHelper.convertToMap(new BytesArray(source.toString()), false, MediaTypeRegistry.JSON).v2(), path);

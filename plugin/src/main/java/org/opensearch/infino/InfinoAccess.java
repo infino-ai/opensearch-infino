@@ -227,9 +227,10 @@ record InfinoAccess(
      * query, sort, aggregation or script naming a hidden field then finds no
      * column, as it would for an unmapped field. A field alias goes with
      * the field it names: hidden, masked or visible as that field is, and so
-     * does the list column holding a field's several values. The column of
-     * raw sources goes too: it holds every field, the hidden and masked ones
-     * among them, so a query, aggregation or script over it would read them.
+     * does the list column holding a field's several values. The columns of
+     * values as written go too ({@link InfinoQueryTranslator#holdsWritten}): they
+     * may hold any field, the hidden and masked ones among them, so a query,
+     * aggregation or script over them would read them.
      * A hit's source is read by the planner itself and cut by
      * {@link #source}, never through a column the request names.
      */
@@ -241,7 +242,7 @@ record InfinoAccess(
         for (Map.Entry<String, Column> entry : cols.entrySet()) {
             Column c = entry.getValue();
             String name = c.name();
-            if (name.equals(InfinoQueryTranslator.SOURCE)) {
+            if (InfinoQueryTranslator.holdsWritten(name)) {
                 continue;
             }
             boolean reserved = name.equals(InfinoQueryTranslator.OSID) || name.equals(InfinoQueryTranslator.SEQ);

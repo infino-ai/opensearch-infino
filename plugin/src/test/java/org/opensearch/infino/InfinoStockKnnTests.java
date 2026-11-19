@@ -210,7 +210,7 @@ public class InfinoStockKnnTests extends OpenSearchTestCase {
     public void testFilteredStatementRanksAmongTheKeptRows() {
         VectorRequest v = new VectorRequest(false, null, null, "emb", new float[] { 1f, 0.5f }, 3, true, "\"tag\" = 'x'");
         assertEquals(
-            "SELECT osid, source, score FROM vector_search('os_items', 'emb', '1.0,0.5', 3) WHERE \"tag\" = 'x' ORDER BY score ASC LIMIT 3",
+            "SELECT osid, score FROM vector_search('os_items', 'emb', '1.0,0.5', 3) WHERE \"tag\" = 'x' ORDER BY score ASC LIMIT 3",
             InfinoSearch.filteredKnnStatement(TABLE, v)
         );
     }
