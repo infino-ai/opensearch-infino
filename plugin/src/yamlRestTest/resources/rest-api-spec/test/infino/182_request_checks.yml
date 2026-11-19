@@ -1,0 +1,214 @@
+# Requests a stock shard refuses are refused for Infino-backed indices too (#57).
+setup:
+  - do:
+      indices.create:
+        index: chk_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0, index.max_terms_count: 2, index.max_docvalue_fields_search: 2, index.max_script_fields: 2 }
+          mappings: { properties: { text: { type: text, fields: { raw: { type: keyword } } }, user: { type: keyword }, n: { type: long } } }
+  - do:
+      indices.create:
+        index: chk_default
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0, index.max_terms_count: 2, index.max_docvalue_fields_search: 2, index.max_script_fields: 2 }
+          mappings: { properties: { text: { type: text, fields: { raw: { type: keyword } } }, user: { type: keyword }, n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: chk_proxy, _id: "1" }
+          - { text: "cold outside", user: u1, n: 1 }
+          - index: { _index: chk_default, _id: "1" }
+          - { text: "cold outside", user: u1, n: 1 }
+  - match: { errors: false }
+
+---
+teardown:
+  - do:
+      cluster.put_settings:
+        body:
+          transient:
+            search.allow_expensive_queries: null
+  - do:
+      indices.delete:
+        index: chk_proxy,chk_default,chk_no_such
+        ignore_unavailable: true
+
+---
+"A terms query over index.max_terms_count is refused":
+  - do:
+      search:
+        index: chk_proxy
+        body: { query: { terms: { user: [ u1, u2 ] } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      catch: bad_request
+      search:
+        index: chk_proxy
+        body: { query: { terms: { user: [ u1, u2, u3 ] } } }
+  - do:
+      catch: bad_request
+      search:
+        index: chk_default
+        body: { query: { bool: { filter: [ { terms: { user: [ u1, u2, u3 ] } } ] } } }
+
+---
+"A rescore window over index.max_rescore_window is refused":
+  - do:
+      catch: /Rescore window \[10001\] is too large\. It must be less than \[10000\]\./
+      search:
+        index: chk_proxy
+        body:
+          query: { match_all: {} }
+          rescore: [ { window_size: 10001, query: { rescore_query: { match_all: {} } } } ]
+  - match: { status: 400 }
+  - do:
+      catch: bad_request
+      search:
+        index: chk_default
+        body:
+          query: { match_all: {} }
+          rescore: [ { window_size: 10001, query: { rescore_query: { match_all: {} } } } ]
+
+---
+"docvalue_fields over index.max_docvalue_fields_search are refused":
+  - do:
+      catch: /Trying to retrieve too many docvalue_fields\. Must be less than or equal to[:] \[2\] but was \[3\]\./
+      search:
+        index: chk_proxy
+        body: { query: { match_all: {} }, docvalue_fields: [ user, n, text.raw ] }
+  - match: { status: 400 }
+  - do:
+      catch: bad_request
+      search:
+        index: chk_default
+        body: { query: { match_all: {} }, docvalue_fields: [ user, n, text.raw ] }
+
+---
+"script_fields over index.max_script_fields are refused":
+  - do:
+      catch: /Trying to retrieve too many script_fields\. Must be less than or equal to[:] \[2\] but was \[3\]\./
+      search:
+        index: chk_proxy
+        body:
+          query: { match_all: {} }
+          script_fields:
+            a: { script: { lang: painless, source: "1;" } }
+            b: { script: { lang: painless, source: "1;" } }
+            c: { script: { lang: painless, source: "1;" } }
+  - match: { status: 400 }
+  - do:
+      catch: bad_request
+      search:
+        index: chk_default
+        body:
+          query: { match_all: {} }
+          script_fields:
+            a: { script: { lang: painless, source: "1;" } }
+            b: { script: { lang: painless, source: "1;" } }
+            c: { script: { lang: painless, source: "1;" } }
+
+---
+"Expensive queries are refused when search.allow_expensive_queries is false":
+  - do:
+      cluster.put_settings:
+        body:
+          transient:
+            search.allow_expensive_queries: "false"
+  - do:
+      catch: /\[prefix\] queries cannot be executed when 'search.allow_expensive_queries' is set to false/
+      search:
+        index: chk_proxy
+        body: { query: { prefix: { text: { value: out } } } }
+  - match: { status: 400 }
+  - do:
+      catch: bad_request
+      search:
+        index: chk_default
+        body: { query: { prefix: { text: { value: out } } } }
+  - do:
+      catch: /\[wildcard\] queries cannot be executed/
+      search:
+        index: chk_proxy
+        body: { query: { wildcard: { user: { value: "u*" } } } }
+  - do:
+      catch: /\[regexp\] queries cannot be executed/
+      search:
+        index: chk_default
+        body: { query: { regexp: { user: { value: "u.*" } } } }
+  - do:
+      catch: /\[range\] queries on \[text\] or \[keyword\] fields cannot be executed/
+      search:
+        index: chk_proxy
+        body: { query: { bool: { must: [ { range: { text.raw: { gte: "a" } } } ] } } }
+  - do:
+      catch: /\[script\] queries cannot be executed/
+      search:
+        index: chk_default
+        body: { query: { script: { script: { lang: painless, source: "true" } } } }
+  - do:
+      catch: /\[joining\] queries cannot be executed/
+      search:
+        index: chk_proxy
+        body: { query: { nested: { path: obj, query: { match_all: {} } } } }
+  # A range on a numeric field is not expensive.
+  - do:
+      search:
+        index: chk_proxy
+        body: { query: { range: { n: { gte: 1 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: chk_default
+        body: { query: { range: { n: { gte: 1 } } } }
+  - match: { hits.total.value: 1 }
+
+---
+"A get with a version the document is not at is a conflict":
+  - do:
+      get:
+        index: chk_proxy
+        id: "1"
+        version: 1
+  - match: { _id: "1" }
+  - do:
+      catch: conflict
+      get:
+        index: chk_proxy
+        id: "1"
+        version: 5
+  - do:
+      catch: conflict
+      get:
+        index: chk_proxy
+        id: "1"
+        version: 5
+        version_type: external
+
+---
+"An update with require_alias to a name that is not an alias is missing":
+  - do:
+      catch: missing
+      update:
+        index: chk_no_such
+        id: "1"
+        require_alias: true
+        body: { doc: { foo: bar }, doc_as_upsert: true }
+  - do:
+      catch: missing
+      indices.get:
+        index: chk_no_such
+  - do:
+      catch: missing
+      update:
+        index: chk_proxy
+        id: "1"
+        require_alias: true
+        body: { doc: { foo: bar } }
+  - do:
+      catch: missing
+      update:
+        index: chk_default
+        id: "1"
+        require_alias: true
+        body: { doc: { foo: bar } }
