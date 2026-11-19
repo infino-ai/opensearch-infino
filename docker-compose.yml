@@ -45,7 +45,7 @@ services:
       infino.default_mode.enabled: ${INFINO_DEFAULT_MODE_ENABLED:-}
       infino.sql.max_result_size: ${INFINO_SQL_MAX_RESULT_SIZE:-}
 
-      # Bucket credentials for INFINO_URI=s3://... (unused otherwise).
+      # Not read yet: S3 uses the EC2 instance role only. Passed through for when keys are read.
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}

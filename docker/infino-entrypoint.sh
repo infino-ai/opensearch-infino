@@ -10,7 +10,7 @@
 #                        in local/memory, where a trial account is asked from
 #   INFINO_DATABASE      cloud: the account's database (default: the cluster name)
 #   INFINO_URI           local: catalog URI (default file:///usr/share/opensearch/infino/data;
-#                        s3://, gs:// or az:// also work)
+#                        s3:// or gs:// also work; az:// is not supported yet)
 #   INFINO_LOG_LEVEL     optional: logger level for org.opensearch.infino (e.g. DEBUG)
 set -euo pipefail
 

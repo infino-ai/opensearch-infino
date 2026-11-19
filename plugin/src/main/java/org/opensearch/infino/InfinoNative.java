@@ -969,8 +969,13 @@ public final class InfinoNative {
         }
     }
 
-    /** One refused document of a prepared batch: which batch, which document, why. */
-    public record PreparedFailure(int batch, int index, String reason) {}
+    /**
+     * One refused document of a prepared batch: which batch, which document,
+     * why, and whether the table refuses what it carries ({@code permanent}),
+     * so every later try is refused the same way. One not permanent failed
+     * for a reason of the moment and a later try may take it.
+     */
+    public record PreparedFailure(int batch, int index, String reason, boolean permanent) {}
 
     /** Outcome of appending prepared batches. */
     public record PreparedResult(int ok, List<PreparedFailure> failed) {}
@@ -1064,7 +1069,14 @@ public final class InfinoNative {
         }
         List<PreparedFailure> failed = new ArrayList<>();
         for (Map<String, Object> f : (List<Map<String, Object>>) out.get("failed")) {
-            failed.add(new PreparedFailure(((Number) f.get("b")).intValue(), ((Number) f.get("i")).intValue(), (String) f.get("reason")));
+            failed.add(
+                new PreparedFailure(
+                    ((Number) f.get("b")).intValue(),
+                    ((Number) f.get("i")).intValue(),
+                    (String) f.get("reason"),
+                    Boolean.TRUE.equals(f.get("permanent"))
+                )
+            );
         }
         return new PreparedResult(((Number) out.get("ok")).intValue(), failed);
     }

@@ -1362,23 +1362,25 @@ public class InfinoEngine extends InternalEngine {
     /**
      * Of the documents a commit's append did not take ({@code failed}, by
      * position in {@code ids} and {@code written}), the ones a later commit
-     * may: each is checked against the table's columns again. One the
-     * columns refuse is refused the same way on every try, so it is logged
-     * as lost and not retried. Any other failed for a reason of the moment
-     * (the engine refused the append or the replace, or storage failed); it
-     * is put back for the next commit, and the table's hold on the shard's
-     * history stays below it until a commit takes it (see
-     * {@link #holdHistoryThrough}), so a new primary writes it too.
+     * may. One the table refuses for what it carries is refused the same way
+     * on every try, so it is logged as lost and not retried: the engine
+     * says so of its own refusal ({@link InfinoNative.PreparedFailure#permanent}),
+     * and the table's columns are checked again for any other. Retrying it
+     * would hold every later write to the shard behind it. Any other failed
+     * for a reason of the moment (the engine's schema moved under the write,
+     * storage failed); it is put back for the next commit, and the table's
+     * hold on the shard's history stays below it until a commit takes it
+     * (see {@link #holdHistoryThrough}), so a new primary writes it too.
      */
     private Batch notTaken(List<InfinoNative.PreparedFailure> failed, List<String> ids, List<Version> written) {
         Batch retry = new Batch();
         for (InfinoNative.PreparedFailure f : failed) {
             String id = ids.get(f.index());
             Version v = written.get(f.index());
-            String refused = InfinoNative.checkDoc(table, v.source());
+            String refused = f.permanent() ? f.reason() : InfinoNative.checkDoc(table, v.source());
             if (refused != null) {
                 log.error(
-                    "[infino] table {} refuses document {} (operation {}) after OpenSearch acknowledged it, so the table does not hold it: {}",
+                    "[infino] table {} refuses document {} (operation {}) after OpenSearch acknowledged it; the table does not hold this version, keeps any version it held before, and no commit tries it again: {}",
                     table,
                     id,
                     v.seq(),
