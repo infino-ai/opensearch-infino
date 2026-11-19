@@ -38,39 +38,9 @@
 
 # --- Bugs: wrong behaviour the plugin should fix. Remove the entry with the fix.
 
-# --- A refused document blocks its shard in default mode
-search/200_ignore_malformed/Exists on _ignored  # [bug:default] a malformed value the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-search/200_ignore_malformed/Search on _ignored with term  # [bug:default] a malformed value the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-search/200_ignore_malformed/Search on _ignored with terms  # [bug:default] a malformed value the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-search/200_ignore_malformed/_ignored is returned by default  # [bug:default] a malformed value the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-search/200_ignore_malformed/_ignored is still returned with explicit list of stored fields  # [bug:default] a malformed value the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/90_flat_object/Exist query in root field  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/90_flat_object/Supported queries  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/90_flat_object/Mappings  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/90_flat_object/Invalid docs  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/91_flat_object_null_value/Supported queries  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
+# --- A refused document blocks its shard in default mode (the value itself is a gap, below)
 index/92_flat_object_support_doc_values/Supported queries  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/100_partial_flat_object/Exists query for sub field  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/100_partial_flat_object/Supported queries  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/105_partial_flat_object_nested/Exists query for sub field  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/105_partial_flat_object_nested/Supported queries  # [bug:default] a flat_object document the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
 index/80_geo_point/Multi points test  # [bug:default] a geo_point array the table refuses is retried at every commit (https://github.com/infino-ai/opensearch-infino/issues/53)
-
-# --- An acknowledged unsigned_long write is dropped in default mode
-index/90_unsigned_long/Unsigned long with decimal part test  # [bug:default] unsigned_long with a decimal part is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-index/90_unsigned_long/Stored unsigned long with decimal part test  # [bug:default] unsigned_long with a decimal part is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-search/90_search_after/unsigned long  # [bug:default] unsigned_long above the signed 64-bit maximum is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-search.aggregation/230_composite_unsigned/Aggregate After  # [bug:default] unsigned_long above the signed 64-bit maximum is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-search.aggregation/230_composite_unsigned/Nested Composite aggregation  # [bug:default] unsigned_long above the signed 64-bit maximum is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-search.aggregation/230_composite_unsigned/Composite aggregation with unmapped field  # [bug:default] unsigned_long above the signed 64-bit maximum is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-search.aggregation/100_avg_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-search.aggregation/110_max_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-search.aggregation/120_min_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-search.aggregation/130_sum_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-search.aggregation/140_value_count_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-search.aggregation/170_cardinality_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-search.aggregation/180_percentiles_tdigest_metric_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
-search.aggregation/220_filters_bucket_unsigned/*  # [bug:default] one of the four documents (unsigned_long above the signed 64-bit maximum) is dropped after it is acknowledged (https://github.com/infino-ai/opensearch-infino/issues/54)
 
 # --- The refresh parameter on single-document writes, and realtime=false gets
 index/60_refresh/*  # [bug] a write with refresh=true, "" or wait_for is not visible to the next search, or has no forced_refresh (https://github.com/infino-ai/opensearch-infino/issues/55)
@@ -143,6 +113,72 @@ search/220_total_hits_object/hits.total as an object  # [bug:proxy] hits.total d
 search/220_total_hits_object/track_total_hits with rest_total_hits_as_int  # [bug:proxy] hits.total does not follow track_total_hits (https://github.com/infino-ai/opensearch-infino/issues/57)
 mget/14_alias_to_multiple_indices/*  # [bug:proxy] an mget through an alias of several indices is not rejected (https://github.com/infino-ai/opensearch-infino/issues/57)
 field_caps/40_disable_objects/*  # [bug:proxy] field_caps with disable_objects (2 of the 3 tests fail; narrow after the next run) (https://github.com/infino-ai/opensearch-infino/issues/57)
+
+# --- Write responses
+bulk/10_basic/When setting require_alias flag  # [bug] require_alias on an index that is not an alias creates the index (https://github.com/infino-ai/opensearch-infino/issues/57)
+bulk/10_basic/When setting require_alias flag per request  # [bug] require_alias on an index that is not an alias creates the index (https://github.com/infino-ai/opensearch-infino/issues/57)
+index/70_require_alias/Set require_alias flag  # [bug] require_alias on an index that is not an alias creates the index (https://github.com/infino-ai/opensearch-infino/issues/57)
+update/12_result/Update result field  # [bug] an update reports the wrong result or _version
+update/16_noop/Noop  # [bug] an update that changes nothing is not a noop: it takes a new _seq_no
+update/40_routing/Routing  # [bug] an update with routing returns no get._source (default) or no _routing (proxy)
+update/80_source_filtering/Source filtering  # [bug] an update with _source filtering returns no get._source
+bulk/40_source/Source filtering  # [bug] an update with _source filtering returns no get._source
+
+# --- Search and get response fields
+get/20_stored_fields/Stored fields  # [bug] stored_fields returns no fields
+mget/20_stored_fields/Stored fields  # [bug] stored_fields returns no fields
+get/70_source_filtering/Source filtering  # [bug] stored_fields returns no fields
+search/100_stored_fields/Stored fields  # [bug] stored_fields: _none_ still returns _id
+search/330_fetch_fields/Test basic field retrieval  # [bug] fields returns nothing for a range field
+search/330_fetch_fields/Test disable _source loading  # [bug] fields returns nothing when _source is not loaded
+search/330_fetch_fields/Test token count  # [bug] fields returns the wrong token_count
+search/350_matched_queries/*  # [bug] matched_queries is not returned
+search/400_max_score/*  # [bug] max_score is set when the sort does not lead with _score
+search/190_index_prefix_search/search with index prefixes  # [bug] max_score differs from stock scoring
+search/210_rescore_explain/Score should match explanation in rescore  # [bug] max_score differs from stock scoring
+search/40_indices_boost/*  # [bug] indices_boost does not change the order
+search/50_multi_match/Cross fields do not return negative scores  # [bug:proxy] multi_match cross_fields orders hits differently from stock
+search/270_wildcard_fieldtype_queries/case insensitive query on wildcard field  # [bug] hits with equal scores come back in a different order from stock, so the first _id differs on some runs
+search/270_wildcard_fieldtype_queries/case insensitive regexp query on wildcard field  # [bug] hits with equal scores come back in a different order from stock, so the first _id differs on some runs
+search/240_date_nanos/*  # [bug] date_nanos loses its nanoseconds in sort values and nested _source
+search/90_search_after/date_nanos  # [bug] date_nanos loses its nanoseconds in sort values
+field_caps/30_filter/Field caps with index filter  # [bug] field_caps index_filter does not filter the indices
+
+# --- Aggregation results
+search.aggregation/10_histogram/Deprecated _time order  # [bug] histogram buckets have no key_as_string
+search.aggregation/10_histogram/Format test  # [bug] histogram buckets have no key_as_string
+search.aggregation/10_histogram/histogram profiler  # [bug] profile has no aggregation entries
+search.aggregation/10_histogram/date_histogram profiler  # [bug] profile has no aggregation entries
+search.aggregation/10_histogram/date_histogram profiler shows filter rewrite info  # [bug] profile has no aggregation entries
+search.aggregation/20_terms/numeric profiler  # [bug] profile has no aggregation entries
+search.aggregation/20_terms/string profiler via global ordinals  # [bug] profile has no aggregation entries
+search.aggregation/20_terms/string profiler via map  # [bug] profile has no aggregation entries
+search.aggregation/230_composite/composite aggregation date_histogram profile shows filter rewrite info  # [bug] profile has no aggregation debug entries
+search.aggregation/360_date_histogram/Date histogram aggregation w/ shared field range test  # [bug] profile has no aggregation debug entries
+search.aggregation/40_range/Double range profiler shows filter rewrite info  # [bug] profile has no aggregation debug entries
+search.aggregation/20_terms/Global ordinals are loaded with the global_ordinals execution hint  # [bug] terms does not load fielddata, so the fielddata stats stay 0
+search.aggregation/20_terms/Unmapped booleans  # [bug] terms on an unmapped field with value_type and missing returns a string key
+search.aggregation/20_terms/Unmapped dates  # [bug] terms on an unmapped field with value_type and missing returns a string key
+search.aggregation/20_terms/Unmapped doubles  # [bug] terms on an unmapped field with value_type and missing returns a string key
+search.aggregation/20_terms/Unmapped longs  # [bug] terms on an unmapped field with value_type and missing returns a string key
+search.aggregation/20_terms/Unmapped unsigned longs  # [bug] terms on an unmapped field with value_type and missing returns a string key
+search.aggregation/180_percentiles_tdigest_metric/Basic 3.x test  # [bug] percentiles differ from the stock t-digest
+search.aggregation/180_percentiles_tdigest_metric/Compression test  # [bug] percentiles differ from the stock t-digest
+search.aggregation/180_percentiles_tdigest_metric/Explicit Percents test  # [bug] percentiles differ from the stock t-digest
+search.aggregation/180_percentiles_tdigest_metric/Metadata test  # [bug] percentiles differ from the stock t-digest
+search.aggregation/180_percentiles_tdigest_metric/Non-keyed test  # [bug] percentiles differ from the stock t-digest
+search.aggregation/180_percentiles_tdigest_metric/Only aggs test  # [bug] percentiles differ from the stock t-digest
+search.aggregation/200_top_hits_metric/top_hits aggregation with sequence numbers  # [bug] top_hits returns the wrong hit
+search.aggregation/230_composite/date_histogram with time_zone  # [bug] composite date_histogram with time_zone splits one day into two buckets
+search.aggregation/30_sig_terms/Default index  # [bug] significant_terms on a text field returns no buckets
+search.aggregation/30_sig_terms_field_match_only_text/Default index  # [bug] significant_terms on a text field returns no buckets
+search.aggregation/40_range/Date Range Missing  # [bug] date_range with missing returns 500
+
+# --- Errors that differ from stock
+search.aggregation/230_composite/Composite aggregation and array size  # [bug] the error message differs from stock
+search.aggregation/230_composite/Invalid Composite aggregation  # [bug:proxy] a composite stock rejects is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/110_field_collapsing/field collapsing with search_after - _score and _doc sorts  # [bug:default] the error message differs from stock
+search/30_limits/Regexp length limit  # [bug] the error message differs from stock
 
 # --- An index named "index" never starts
 search/260_sort_geopoint/*  # [gap] an index named index is refused at create, its table would be the registry's (https://github.com/infino-ai/opensearch-infino/issues/58)
@@ -319,12 +355,63 @@ search/381_bitmap_filtering_long/Terms lookup on a binary field with bitmap (lon
 search/390_search_as_you_type/*  # [gap] not served: multi_match type bool_prefix
 search/400_combined_fields/*  # [gap] not served: query combined_fields
 
+# --- Values the table does not hold; the write is refused
+index/90_flat_object/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/91_flat_object_null_value/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/100_partial_flat_object/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/105_partial_flat_object_nested/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/53)
+search/200_ignore_malformed/*  # [gap] ignore_malformed is not served: the malformed value is refused; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/53)
+search/330_fetch_fields/Test ignore malformed  # [gap] ignore_malformed is not served: the malformed value is refused; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/90_unsigned_long/*  # [gap] an unsigned_long with a decimal part is refused; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/54)
+search/90_search_after/unsigned long  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/54)
+search/340_doc_values_field/*  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/230_composite_unsigned/*  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/100_avg_metric_unsigned/*  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/110_max_metric_unsigned/*  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/120_min_metric_unsigned/*  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/130_sum_metric_unsigned/*  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/140_value_count_metric_unsigned/*  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/170_cardinality_metric_unsigned/*  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/180_percentiles_tdigest_metric_unsigned/*  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/54)
+search.aggregation/220_filters_bucket_unsigned/*  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses; default mode acknowledges it and then drops it (https://github.com/infino-ai/opensearch-infino/issues/54)
+
+# --- Requests the table does not serve, found by the suite
+count/20_query_string/count with query_string parameters  # [gap] not served: query_string with default_field, analyzer or lenient
+search/60_query_string/search with query_string parameters  # [gap] not served: query_string with default_field, analyzer or lenient
+search/200_index_phrase_search/search with indexed phrases  # [gap] not served: a phrase with slop in query_string
+search/200_phrase_search_field_match_only_text/search with indexed phrases  # [gap] not served: a phrase with slop in query_string
+search/380_bitmap_filtering/Terms query accepting bitmap as value  # [gap] not served: terms with a bitmap value
+search/381_bitmap_filtering_long/Terms query accepting bitmap as value (long)  # [gap] not served: terms with a bitmap value
+search/95_search_after_shard_doc/accept _shard_doc with PIT + paginate with search_after (multi-shard)  # [gap] not served: sort on _shard_doc
+search.aggregation/400_inner_hits/Include inner hits in top hits  # [gap] not served: inner_hits on a nested query
+search.aggregation/10_histogram/histogram with hard bounds  # [gap] aggregation on a range field, which has no column
+search.aggregation/170_cardinality_metric/Missing field with missing param  # [gap] not served: missing on an unmapped field
+search.aggregation/230_composite/date_histogram on date_nanos  # [gap] not served: avg over a date field
+search.aggregation/50_filter/Sorting terms  # [gap] not served: terms ordered by a sub-aggregation path
+search.aggregation/80_typed_keys/Test typed keys parameter for terms and top_hits aggregation  # [gap:proxy] not served: top_hits sorted by a field without a column
+search.aggregation/80_typed_keys_unsigned/Test typed keys parameter for terms and top_hits aggregation  # [gap:proxy] not served: top_hits sorted by a field without a column
+
 # --- Proxy mode refuses these up front
 search/110_field_collapsing/*  # [gap:proxy] the setup indexes with version_type: external, which proxy mode refuses
-search.aggregation/230_composite_unsigned/*  # [gap:proxy] the setup writes an unsigned_long above the signed 64-bit maximum, which proxy mode refuses (https://github.com/infino-ai/opensearch-infino/issues/57)
 search/160_exists_query/Test exists query on _routing field  # [gap:proxy] exists on _routing: proxy mode keeps no routing
 
 # --- Cluster: tests that fail on the same cluster without the plugin (security plugin enabled, one node).
 # Skipped in every task, coreYamlRestTestLucene included.
-# TODO: the baseline run lists 18; add them with their reason from the next coreYamlRestTestLucene run
-# (see the helper below).
+index/90_flat_object/Unsupported  # [cluster] searching every index also searches the security plugin's index, so the expected shard failure is partial and the search returns 200
+search.aggregation/100_avg_metric/Aggregating wrong datatype test  # [cluster] searching every index also searches the security plugin's index, so the expected shard failure is partial and the search returns 200
+search.aggregation/110_max_metric/Aggregating wrong datatype test  # [cluster] searching every index also searches the security plugin's index, so the expected shard failure is partial and the search returns 200
+search.aggregation/120_min_metric/Aggregating wrong datatype test  # [cluster] searching every index also searches the security plugin's index, so the expected shard failure is partial and the search returns 200
+search.aggregation/130_sum_metric/Aggregating wrong datatype test  # [cluster] searching every index also searches the security plugin's index, so the expected shard failure is partial and the search returns 200
+search.aggregation/180_percentiles_tdigest_metric/Invalid params test  # [cluster] searching every index also searches the security plugin's index, so the expected shard failure is partial and the search returns 200
+search.aggregation/190_percentiles_hdr_metric/Invalid params test  # [cluster] searching every index also searches the security plugin's index, so the expected shard failure is partial and the search returns 200
+search.aggregation/30_sig_terms/IP test  # [cluster] searching every index also searches the security plugin's index, so the expected shard failure is partial and the search returns 200
+search/120_batch_reduce_size/batched_reduce_size 2 with 5 shards  # [cluster] searching every index also searches the security plugin's index, so num_reduce_phases is one more
+search/140_pre_filter_search_shards/pre_filter_shard_size with shards that have no hit  # [cluster] searching every index also searches the security plugin's index, so _shards.total is one more
+search/330_distributed_sort/test distributed sort can rewrite query to match no docs  # [cluster] searching every index also searches the security plugin's index, so _shards.total is one more
+search.aggregation/170_cardinality_metric/profiler string  # [cluster] searching every index also searches the security plugin's index, whose shard is profiled first and collects nothing
+search.aggregation/170_cardinality_metric_unsigned/profiler double  # [cluster] searching every index also searches the security plugin's index, whose shard is profiled first and collects nothing
+search.aggregation/170_cardinality_metric_unsigned/profiler string  # [cluster] searching every index also searches the security plugin's index, whose shard is profiled first and collects nothing
+search.aggregation/170_cardinality_metric_unsigned/profiler unsigned_long  # [cluster] searching every index also searches the security plugin's index, whose shard is profiled first and collects nothing
+search.aggregation/50_filter/Filter aggs no lookup and ensure it's cached  # [cluster] the request cache counts differ on this cluster
+search.aggregation/50_filter/Filter aggs with terms lookup and ensure it's cached  # [cluster] the request cache counts differ on this cluster
+search.aggregation/40_range/Date range  # [cluster] the date_range bucket key carries the full dates on this cluster
