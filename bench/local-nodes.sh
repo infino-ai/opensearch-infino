@@ -12,15 +12,13 @@
 #   NODES      where the nodes live (default ./nodes); wiped per node
 #   BASE_PORT  http port of the default-mode node (default 9250)
 #   HEAP       JVM heap of each node (default 2g)
-#   COLUMN_CACHE  the engine's decoded-column cache per Infino node, bytes
-#              (default 4294967296, 4 GiB)
+#   COLUMN_CACHE  the engine's decoded-column cache per Infino node, bytes,
+#              written to the node's infino.yaml; unset, the node keeps the
+#              plugin's own default (infino.column_cache.size)
 #   ONLY       space-separated subset of "stock default proxy" to start
 #   KEEP       1: keep each node's data and tables, only stop it, reinstall
 #              the plugin from ZIP and LIB, and start it again (to compare
 #              two builds over the same loaded index)
-#
-# Linux only: it uses GNU sed -i and realpath -m, and the opensearch-<V>-linux-x64
-# tarball.
 #
 # Stop them with: for p in $NODES/*/pid; do kill "$(cat "$p")"; done
 set -euo pipefail
@@ -32,7 +30,11 @@ ONLY=${ONLY:-stock default proxy}
 V=$(basename "$TARBALL" | sed -E 's/^opensearch-([0-9.]+)-.*/\1/')
 
 column_cache() {  # home: the engine reads infino.yaml from the node's home
-  printf 'memory:\n  decoded_column_cache_bytes: %s\n' "${COLUMN_CACHE:-4294967296}" > "$1/infino.yaml"
+  if [ -n "${COLUMN_CACHE:-}" ]; then
+    printf 'memory:\n  decoded_column_cache_bytes: %s\n' "$COLUMN_CACHE" > "$1/infino.yaml"
+  else
+    rm -f "$1/infino.yaml"
+  fi
 }
 
 restart() {  # name: reinstall the plugin into a node that keeps its data
@@ -71,7 +73,7 @@ YML
   if [ "$name" != stock ]; then
     "$home/bin/opensearch-plugin" remove opensearch-neural-search >/dev/null
     "$home/bin/opensearch-plugin" install --batch "file://$(realpath "$ZIP")" >/dev/null
-    printf -- '-Dinfino.lib=%s\n-Dinfino.uri=file://%s\n' "$(realpath "$LIB")" "$NODES/$name/catalog" >> "$home/config/jvm.options"
+    printf -- '-Dinfino.lib=%s\n-Dinfino.uri=%s\n' "$(realpath "$LIB")" "${CATALOG_URI:-file://$NODES/$name/catalog}" >> "$home/config/jvm.options"
     [ "$name" = proxy ] && echo "infino.default_mode.enabled: false" >> "$home/config/opensearch.yml"
   fi
   column_cache "$home"

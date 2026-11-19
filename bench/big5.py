@@ -11,11 +11,8 @@ loads every line of the data files. `run` sends each search once as a
 warmup, then `--calls` times, sampling the node's RSS every 20 ms while a call
 runs. A node that dies mid-search is reported as such and left out of the
 searches after it. Each answer is compared with stock's: hits.total, the
-set of top hit ids (scored searches may order ties differently), or for a
-sorted search the hits' sort values in order with the ids tied on each, and
-the aggregations as JSON.
-
-Linux only: a node's resident memory is read from /proc.
+set of top hit ids (scored searches may order ties differently), and the
+aggregations as JSON.
 """
 
 import argparse
@@ -27,13 +24,11 @@ import sys
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 INDEX = "big5"
-# Each search's body and its URL parameters (pre_filter_shard_size, ...).
-SEARCHES = {s["name"]: (s["body"], s.get("params", {})) for s in json.load(open(os.path.join(HERE, "big5-searches.json")))}
+SEARCHES = {s["name"]: s["body"] for s in json.load(open(os.path.join(HERE, "big5-searches.json")))}
 PORTS = {"default": 0, "stock": 1, "proxy": 2}
 
 
@@ -49,21 +44,6 @@ def call(port, method, path, body=None, timeout=600, ndjson=False):
             return r.status, json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read() or b"{}")
-
-
-def top_hits(body, hits):
-    """The top hits to compare with stock's: their ids as a set, or, for a
-    search with a sort, each run of equal sort values in order with the ids
-    of that run as a set, so the order counts and only ties may differ."""
-    if "sort" not in body:
-        return sorted(h["_id"] for h in hits)
-    runs = []
-    for h in hits:
-        if runs and runs[-1][0] == h.get("sort"):
-            runs[-1][1].append(h["_id"])
-        else:
-            runs.append((h.get("sort"), [h["_id"]]))
-    return [[values, sorted(ids)] for values, ids in runs]
 
 
 def nodes(args):
@@ -85,26 +65,81 @@ def rss_kb(pid):
     return None
 
 
+RALLY_BIG5 = "https://rally-tracks.elastic.co/big5"
+# Elastic's big5 corpus: each file's documents, from the big5 track.json.
+RALLY_BIG5_DOCS = [139000967, 157534429, 138860135, 155215122, 135967215, 142025858, 145339293, 157897411]
+
+
+def rally_batches(docs, batch, files=None, skip=0):
+    """The first `docs` documents of Elastic's big5 corpus, the same share of
+    each of its 8 files (as the track's `ingest_percentage` takes them),
+    streamed from Elastic's server and decompressed on the way: nothing is
+    written to disk. The files are read in parallel and their batches
+    interleaved. `files` (1-based numbers) limits it to those files, and
+    `skip` drops the first lines of each, so a load whose stream for a file
+    ended early can be finished: same share, starting after what it got."""
+    import queue
+    import subprocess
+
+    total = sum(RALLY_BIG5_DOCS)
+    take = [round(n * docs / total) for n in RALLY_BIG5_DOCS]
+    out = queue.Queue(maxsize=64)
+
+    def read(i, n):
+        cmd = f"curl -sfL {RALLY_BIG5}/logs-{i + 1}.ndjson.bz2 | bzip2 -dc 2>/dev/null | head -n {n} | tail -n +{skip + 1}"
+        proc = subprocess.Popen(["bash", "-o", "pipefail", "-c", cmd], stdout=subprocess.PIPE, bufsize=1 << 20)
+        buf, got = [], 0
+        for line in proc.stdout:
+            buf.append(b'{"index":{}}\n' + line.rstrip(b"\n") + b"\n")
+            got += 1
+            if len(buf) == batch:
+                out.put(b"".join(buf))
+                buf = []
+        if buf:
+            out.put(b"".join(buf))
+        proc.wait()
+        if got != n - skip:
+            print(f"logs-{i + 1}: read {got} of {n - skip} documents", file=sys.stderr, flush=True)
+        out.put(None)
+
+    picked = [(i, n) for i, n in enumerate(take) if not files or i + 1 in files]
+    readers = [threading.Thread(target=read, args=(i, n), daemon=True) for i, n in picked]
+    for t in readers:
+        t.start()
+    left = len(readers)
+    while left:
+        b = out.get()
+        if b is None:
+            left -= 1
+        else:
+            yield b
+
+
 def load(args):
-    files = sorted(glob.glob(os.path.expanduser(args.data)))
-    if not files:
+    rally = int(args.data.split(":", 1)[1]) if args.data.startswith("rally:") else 0
+    files = [] if rally else sorted(glob.glob(os.path.expanduser(args.data)))
+    if not files and not rally:
         sys.exit(f"no data files match {args.data}")
     mapping = json.load(open(os.path.join(HERE, "big5-index.json")))
     for name, (port, _) in nodes(args).items():
         if args.only and name not in args.only.split(","):
             continue
-        call(port, "DELETE", f"/{INDEX}")
-        status, body = call(port, "PUT", f"/{INDEX}", mapping)
-        if status != 200:
-            sys.exit(f"{name}: create {INDEX} returned {status}: {body}")
+        if not args.append:
+            call(port, "DELETE", f"/{INDEX}")
+            status, body = call(port, "PUT", f"/{INDEX}", mapping)
+            if status != 200:
+                sys.exit(f"{name}: create {INDEX} returned {status}: {body}")
 
         def batches():
+            if rally:
+                picked = {int(f) for f in args.rally_files.split(",")} if args.rally_files else None
+                yield from rally_batches(rally, args.batch, picked, args.rally_skip)
+                return
             buf, n = [], 0
             for f in files:
                 with open(f, "rb") as fh:
                     for line in fh:
-                        # The document's place in the input as its id, the same on every node.
-                        buf.append(b'{"index":{"_id":"%d"}}\n' % n + line.rstrip(b"\n") + b"\n")
+                        buf.append(b'{"index":{}}\n' + line.rstrip(b"\n") + b"\n")
                         n += 1
                         if len(buf) == args.batch:
                             yield b"".join(buf)
@@ -133,7 +168,9 @@ def load(args):
                         time.sleep(1)
                         continue
                     if body.get("errors"):
-                        errors[0] += sum(1 for i in body["items"] if i["index"].get("error"))
+                        failed = [i["index"]["error"] for i in body["items"] if i["index"].get("error")]
+                        errors[0] += len(failed)
+                        print(f"item error: {json.dumps(failed[0])[:500]}", file=sys.stderr, flush=True)
                     break
 
         threads = [threading.Thread(target=worker) for _ in range(args.clients)]
@@ -155,8 +192,7 @@ def run(args):
     order = ["stock"] + [n for n in ns if n != "stock"]
     wanted = args.searches.split(",") if args.searches else [s for s in SEARCHES if s not in args.skip.split(",")]
     for search in wanted:
-        body, params = SEARCHES[search]
-        query = urllib.parse.urlencode({"request_cache": "false", **params})
+        body = SEARCHES[search]
         for name in order:
             if name not in ns or name in dead:
                 continue
@@ -183,7 +219,7 @@ def run(args):
                 t.start()
                 t0 = time.perf_counter()
                 try:
-                    status, res = call(port, "POST", f"/{INDEX}/_search?{query}", body, timeout=args.timeout)
+                    status, res = call(port, "POST", f"/{INDEX}/_search?request_cache=false", body, timeout=args.timeout)
                 except Exception as e:  # the node died or stopped answering
                     status, res = None, {"error": repr(e)}
                 elapsed = (time.perf_counter() - t0) * 1000
@@ -197,7 +233,7 @@ def run(args):
             alive = rss_kb(pid) is not None
             if not alive:
                 dead.add(name)
-            ids = top_hits(body, res.get("hits", {}).get("hits", [])) if status == 200 else None
+            ids = sorted(h["_id"] for h in res.get("hits", {}).get("hits", [])) if status == 200 else None
             total = res.get("hits", {}).get("total") if status == 200 else None
             aggs = json.dumps(res.get("aggregations"), sort_keys=True) if status == 200 else None
             answer = (ids, json.dumps(total, sort_keys=True), aggs)
@@ -234,10 +270,13 @@ def main():
     p.add_argument("--base-port", type=int, default=9250)
     sub = p.add_subparsers(dest="cmd", required=True)
     lo = sub.add_parser("load")
-    lo.add_argument("--data", required=True)
+    lo.add_argument("--data", required=True, help="a glob of ndjson files, or rally:N for the first N documents of Elastic's big5 corpus, streamed")
     lo.add_argument("--docs", type=int, default=0, help="stop after this many documents (0: all)")
     lo.add_argument("--batch", type=int, default=5000)
     lo.add_argument("--clients", type=int, default=4)
+    lo.add_argument("--append", action="store_true", help="add to the index as it stands instead of recreating it")
+    lo.add_argument("--rally-files", help="with rally:N, only these of the corpus's files (1-based, comma-separated)")
+    lo.add_argument("--rally-skip", type=int, default=0, help="with rally:N, skip this many leading documents of each file read")
     lo.add_argument("--only", help="comma-separated node names to load (default: every node)")
     ru = sub.add_parser("run")
     ru.add_argument("--calls", type=int, default=20)
