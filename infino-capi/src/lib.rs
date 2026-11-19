@@ -3675,6 +3675,16 @@ pub unsafe extern "C" fn infino_count_where(
             Ok(p) => p,
             Err(e) => return err_json(&format!("predicates: {e}")),
         };
+        // An attached table is counted by statements, each predicate under
+        // its own WHERE, which lets the scan skip the files the predicate
+        // rules out. The engine's count leans on the range index the plugin
+        // gives its own tables' numbers and dates; a table made elsewhere
+        // has none, and on the hosted service that count is one aggregate
+        // with the predicate in a FILTER clause, read over every row: an
+        // hour of a trillion-row table was counted by reading all of it.
+        if conn.is_attached(name) {
+            return count_where_by_sql(conn, name, &predicates);
+        }
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
