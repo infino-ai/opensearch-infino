@@ -1762,7 +1762,9 @@ pub unsafe extern "C" fn infino_check_doc(
 /// that value, as OpenSearch reads it. A field `kept` names holds each value
 /// as OpenSearch keeps it ([`Kept`]): a float at its precision, a date read
 /// by its own format. With `stamp`, the document must hold exactly one
-/// non-null value at that field, as a data stream's documents must.
+/// non-null value at that field, as a data stream's documents must. A field
+/// without a column that holds an array of arrays is refused, as the engine
+/// would refuse it.
 fn conform_doc(
     source: &str,
     schema: &Schema,
@@ -1788,6 +1790,16 @@ fn conform_doc(
     let mut lists: Vec<(String, Value)> = Vec::new();
     for (path, value) in flat.iter_mut() {
         let Ok(field) = schema.field_with_name(path) else {
+            // A path without a column (a geo_point, a flat_object's member, a
+            // field not yet declared) is typed by the engine from its values,
+            // which takes no array holding an array: a declared field reads
+            // through one as OpenSearch does, but here every commit would
+            // refuse the document.
+            if matches!(value, Value::Array(items) if items.iter().any(Value::is_array)) {
+                return Err(format!(
+                    "field [{path}]: an array of arrays is not supported for a field without a column"
+                ));
+            }
             continue;
         };
         let dt = field.data_type();
@@ -3783,6 +3795,41 @@ mod tests {
         let out = ensure(h, MAPPING);
         assert!(out.contains("\"created\":true"), "{out}");
         h
+    }
+
+    /// An array of arrays at a path without a column (a geo_point given
+    /// several points, a flat_object's member, a field not yet declared) is
+    /// refused by the check that runs before a write is acknowledged, as the
+    /// commit would refuse it; one at a declared field is read through, and
+    /// a mixed array at a path without a column is no refusal.
+    #[test]
+    fn an_array_of_arrays_without_a_column_is_refused_before_acknowledgement() {
+        let h = open_logs();
+        let out = ensure(h, r#"{"properties":{"fo":{"type":"flat_object"}}}"#);
+        assert!(!out.contains("error"), "{out}");
+        for (doc, path) in [
+            (r#"{"level":"info","geo":[[1.0,2.0],[3.0,4.0]]}"#, "geo"),
+            (r#"{"level":"info","fo":{"a":[[1,2],[3]]}}"#, "fo.a"),
+            (r#"{"level":"info","un":[{"x":[1]},{"x":[[2]]}]}"#, "un.x"),
+            (r#"{"level":"info","un":[null,[1]]}"#, "un"),
+        ] {
+            let why = check(h, doc);
+            assert!(why.contains(&format!("field [{path}]")), "{doc}: {why:?}");
+            assert!(why.contains("array of arrays"), "{doc}: {why:?}");
+            let out = index(h, &[("x", doc)]);
+            assert_eq!(out["ok"], 0, "{doc}: {out}");
+        }
+        for doc in [
+            r#"{"level":"info","status":[[1,2],[3]]}"#,
+            r#"{"level":"info","un":[1,"a"]}"#,
+            r#"{"level":"info","geo":[1.0,2.0]}"#,
+            r#"{"level":"info","fo":{"a":[1,2]}}"#,
+        ] {
+            assert_eq!(check(h, doc), "", "{doc}");
+            let out = index(h, &[("y", doc)]);
+            assert_eq!(out["ok"], 1, "{doc}: {out}");
+        }
+        close(h);
     }
 
     fn close(h: *mut Bridge) {
