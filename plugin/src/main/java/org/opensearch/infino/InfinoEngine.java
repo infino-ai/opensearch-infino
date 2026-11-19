@@ -20,6 +20,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.index.engine.DocumentIndexWriter;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineCreationFailureException;
 import org.opensearch.index.engine.EngineException;
@@ -52,7 +53,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.LongSupplier;
-import java.util.function.Supplier;
 
 /**
  * The engine of an index in default mode ({@code index.infino.mode: default}):
@@ -403,6 +403,8 @@ public class InfinoEngine extends InternalEngine {
      * which are applied, in the batch.
      */
     private final ReentrantReadWriteLock recordLock = new ReentrantReadWriteLock();
+    /** Held exclusively from persisting the leases to the end of a Lucene commit (see {@link #commitIndexWriter}). */
+    private final ReentrantReadWriteLock leaseLock = new ReentrantReadWriteLock();
     private final Object[] idLocks = new Object[ID_LOCK_STRIPES];
     private Batch batch = new Batch();
     /** The batch being committed, until the table has it; a read still sees its writes meanwhile. */
@@ -1122,6 +1124,10 @@ public class InfinoEngine extends InternalEngine {
             return;
         }
         long retaining = covered + 1;
+        // A Lucene commit in progress records its history from the leases it persisted; the next commit moves this one.
+        if (leaseLock.isWriteLockedByCurrentThread() || !leaseLock.readLock().tryLock()) {
+            return;
+        }
         try {
             if (!tracker.isPrimaryMode()) {
                 return;
@@ -1140,6 +1146,31 @@ public class InfinoEngine extends InternalEngine {
         } catch (RuntimeException | AssertionError e) {
             // A hand-off in progress refuses lease changes; the new primary holds its own.
             log.debug("[infino] the lease on the history of {} was not moved to {}", shardId, retaining, e);
+        } finally {
+            leaseLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Persist the leases before the commit records the history it keeps from
+     * them, and let none move until it has: a renewal changes only the leases
+     * in memory, so otherwise a restart can load the table's lease behind
+     * that history and {@link #fillTable} refuses the shard (#137).
+     */
+    @Override
+    protected void commitIndexWriter(DocumentIndexWriter writer, String translogUUID) throws IOException {
+        if (leaseLock == null) {
+            super.commitIndexWriter(writer, translogUUID); // a commit from within the base engine's constructor
+            return;
+        }
+        leaseLock.writeLock().lock();
+        try {
+            if (config().getGlobalCheckpointSupplier() instanceof ReplicationTracker tracker) {
+                tracker.persistRetentionLeases(config().getStore().shardPath().getShardStatePath());
+            }
+            super.commitIndexWriter(writer, translogUUID);
+        } finally {
+            leaseLock.writeLock().unlock();
         }
     }
 
@@ -1457,24 +1488,7 @@ public class InfinoEngine extends InternalEngine {
      * lease (its table has not committed under this engine since it was
      * given one) starts past the highest operation a row records, as far as
      * its history reaches.
-     * <p>
-     * The lease loaded on restart can lag the commit (leases reach disk only
-     * on the sync interval; a flush uses the ones in memory). When a row
-     * records an operation up to where the history starts, fill from there.
      */
-    /**
-     * Whether a lease loaded at {@code leased} only lags the commit, whose
-     * history starts at {@code retained}: the table records an operation
-     * ({@code highest}, asked only then) up to where that history starts.
-     */
-    static boolean tableLeaseLagsCommit(long leased, long retained, long to, Supplier<Long> highest) {
-        if (leased > to || leased >= retained) {
-            return false;
-        }
-        Long h = highest.get();
-        return h != null && h + 1 >= retained;
-    }
-
     private void fillTable() throws IOException {
         long retained = getMinRetainedSeqNo();
         long to = getSeqNoStats(SequenceNumbers.UNASSIGNED_SEQ_NO).getMaxSeqNo();
@@ -1482,17 +1496,6 @@ public class InfinoEngine extends InternalEngine {
         long from;
         if (lease != null) {
             from = lease.retainingSequenceNumber();
-            if (tableLeaseLagsCommit(from, retained, to, () -> InfinoNative.highestOp(table, generation))) {
-                log.info(
-                    "[infino] {} loaded its table's lease at {}, behind the history it keeps from {}; {} holds up to there, so it fills from {}",
-                    shardId,
-                    from,
-                    retained,
-                    table,
-                    retained
-                );
-                from = retained;
-            }
             if (from <= to && from < retained) {
                 throw new IllegalStateException(
                     "[infino] "

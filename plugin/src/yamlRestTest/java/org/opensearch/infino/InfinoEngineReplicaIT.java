@@ -11,7 +11,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.IntStream;
 
 /**
@@ -160,6 +162,57 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
         assertGreen(index);
         call("POST", "/" + index + "/_refresh", null);
         assertServesEvery(index, DOCS + LATER);
+        call("DELETE", "/" + index, null);
+    }
+
+    /**
+     * #137: a lease renewal changes only the leases in memory, which reach
+     * disk on the lease sync, while a flush records the history it keeps
+     * from them. A flush between two syncs, then a store recovery, must not
+     * load the table's lease behind that history: the shard recovers with
+     * every acknowledged write. Writes run while the leases sync often, so a
+     * sync can save the table's lease while a commit is in flight.
+     */
+    public void testAShardFlushedBetweenLeaseSyncsRecoversWithEveryWrite() throws Exception {
+        String index = "eng_rep_lease_flush";
+        createIndex(index, 0, ",\"index.soft_deletes.retention_lease.sync_interval\":\"200ms\"");
+        assertGreen(index);
+        Set<String> acked = ConcurrentHashMap.newKeySet();
+        for (int round = 0; round < 3; round++) {
+            call("PUT", "/" + index + "/_settings", "{\"index.soft_deletes.retention_lease.sync_interval\":\"200ms\"}");
+            AtomicBoolean stop = new AtomicBoolean();
+            int base = round * 1_000_000;
+            Thread writer = new Thread(() -> {
+                for (int i = base; !stop.get(); i++) {
+                    try {
+                        call("PUT", "/" + index + "/_doc/w" + i, "{\"n\":" + i + "}");
+                        acked.add("w" + i);
+                    } catch (IOException e) {
+                        return;
+                    }
+                }
+            });
+            writer.start();
+            Thread.sleep(1_500);
+            call("PUT", "/" + index + "/_settings", "{\"index.soft_deletes.retention_lease.sync_interval\":\"1h\"}");
+            Thread.sleep(300);
+            stop.set(true);
+            writer.join();
+            call("POST", "/" + index + "/_flush?force=true", null);
+            call("POST", "/" + index + "/_close", null);
+            call("POST", "/" + index + "/_open", null);
+            assertGreen(index);
+        }
+        assertFalse("the writer acknowledged writes", acked.isEmpty());
+        call("POST", "/" + index + "/_refresh", null);
+        assertBusy(() -> {
+            try {
+                int served = count(index);
+                assertTrue("served " + served + " of " + acked.size() + " acknowledged writes", served >= acked.size());
+            } catch (ResponseException e) {
+                throw new AssertionError(e);
+            }
+        }, STALENESS_WAIT_SECONDS, TimeUnit.SECONDS);
         call("DELETE", "/" + index, null);
     }
 

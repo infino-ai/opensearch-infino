@@ -192,30 +192,4 @@ public class InfinoEngineTests extends OpenSearchTestCase {
             }
         }
     }
-
-    /** #137: the lease on disk (76467) lags the commit's history (76471), and the table holds up to it. */
-    public void testALeaseThatLagsTheCommitIsStaleWhenTheTableHoldsUpToTheHistory() {
-        assertTrue(InfinoEngine.tableLeaseLagsCommit(76467, 76471, 76607, () -> 76470L));
-        assertTrue(InfinoEngine.tableLeaseLagsCommit(76467, 76471, 76607, () -> 76600L));
-    }
-
-    /** A table that stops short of the history, or has no rows, may really miss writes: the fill still fails. */
-    public void testALeaseThatLagsATableMissingWritesIsNotStale() {
-        assertFalse(InfinoEngine.tableLeaseLagsCommit(76467, 76471, 76607, () -> 76469L));
-        assertFalse(InfinoEngine.tableLeaseLagsCommit(76467, 76471, 76607, () -> null));
-    }
-
-    /** A lease inside the history, or past every operation, needs no table lookup. */
-    public void testALeaseInsideTheHistoryNeverAsksTheTable() {
-        AtomicBoolean asked = new AtomicBoolean();
-        assertFalse(InfinoEngine.tableLeaseLagsCommit(76471, 76471, 76607, () -> {
-            asked.set(true);
-            return 76470L;
-        }));
-        assertFalse(InfinoEngine.tableLeaseLagsCommit(76608, 76700, 76607, () -> {
-            asked.set(true);
-            return 76699L;
-        }));
-        assertFalse("the table is not asked", asked.get());
-    }
 }
