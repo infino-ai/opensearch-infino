@@ -38,6 +38,12 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     private static final String ROUTED_TABLE = "emr2_rows";
     private static final int ROUTED_ROWS = 40;
     private static final int ROUTED_SHARDS = 2;
+    /** The table of the held-rebuild test's indices, its rows, and the id it deletes. */
+    private static final String HELD_TABLE = "emr3_rows";
+    private static final int HELD_ROWS = 20;
+    private static final String HELD_DELETED = "h1";
+    /** The cluster setting that holds skeleton rebuilds. */
+    private static final String PAUSED = "infino.skeleton_rebuild.paused";
 
     @SuppressWarnings("unchecked")
     public void testARebuiltIndexGetsItsRowsBackAndKeepsThemOnce() throws Exception {
@@ -110,6 +116,55 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
             assertEquals(routing(i), doc.get("_routing"));
         }
         call("DELETE", "/emr2", null);
+    }
+
+    /**
+     * A bulk delete of an id the table holds and a held rebuild has not put
+     * in the skeleton yet: the table alone deletes the row, and the delete is
+     * acknowledged as found. A bulk requires a translog location of every
+     * write it applied; a result without one fails an assertion that takes
+     * the node down where assertions run.
+     */
+    @SuppressWarnings("unchecked")
+    public void testABulkDeleteWhileTheSkeletonIsHeldDeletesTheRow() throws Exception {
+        createIndex("emr3_old", false, HELD_TABLE, 1);
+        StringBuilder rows = new StringBuilder();
+        for (int i = 0; i < HELD_ROWS; i++) {
+            rows.append("{\"index\":{\"_index\":\"emr3_old\",\"_id\":\"h").append(i).append("\"}}\n");
+            rows.append("{\"n\":").append(i).append("}\n");
+        }
+        assertEquals(false, call("POST", "/_bulk?refresh=true", rows.toString()).get("errors"));
+        call("DELETE", "/emr3_old", null);
+
+        call("PUT", "/_cluster/settings", "{\"persistent\":{\"" + PAUSED + "\":true}}");
+        try {
+            createIndex("emr3", true, HELD_TABLE, 1);
+            // The rebuild is held: the skeleton has no document yet.
+            assertEquals("the rebuild is held", 0, heldHits().size());
+
+            String delete = "{\"delete\":{\"_index\":\"emr3\",\"_id\":\"" + HELD_DELETED + "\"}}\n";
+            Map<String, Object> bulk = call("POST", "/_bulk?refresh=true", delete);
+            assertEquals(false, bulk.get("errors"));
+            Map<String, Object> item = (Map<String, Object>) ((Map<String, Object>) ((List<?>) bulk.get("items")).get(0)).get("delete");
+            assertEquals("the delete finds the row", "deleted", item.get("result"));
+            assertEquals(200, ((Number) item.get("status")).intValue());
+        } finally {
+            call("PUT", "/_cluster/settings", "{\"persistent\":{\"" + PAUSED + "\":null}}");
+        }
+
+        // Released, the rebuild brings back every row but the deleted one.
+        assertBusy(() -> assertEquals(HELD_ROWS - 1, heldHits().size()), REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertEquals(HELD_ROWS - 1, ((Number) call("GET", "/emr3/_count", null).get("count")).intValue());
+        ResponseException gone = expectThrows(ResponseException.class, () -> call("GET", "/emr3/_doc/" + HELD_DELETED, null));
+        assertEquals(404, gone.getResponse().getStatusLine().getStatusCode());
+        call("DELETE", "/emr3", null);
+    }
+
+    /** The hits of a search of the held-rebuild test's index, room left for every row. */
+    @SuppressWarnings("unchecked")
+    private List<?> heldHits() throws IOException {
+        Map<String, Object> hits = (Map<String, Object>) call("POST", "/emr3/_search", "{\"size\":" + (HELD_ROWS + 1) + "}").get("hits");
+        return (List<?>) hits.get("hits");
     }
 
     /** The routing value document {@code i} of the routed test is written with. */

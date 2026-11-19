@@ -237,6 +237,7 @@ A table backs one live index. If two indices name the same table (explicitly, or
 | `infino.platform.read_window` | `1s` | How long a read on the hosted service may be answered from a snapshot taken before a write. A refresh waits this long after the last write it covers, so the search after it sees the writes. `0` waits for nothing. Not used with the node's own storage. |
 | `infino.cache.dir` | `infino-cache` under the node's first data path | Where the engine keeps a local copy of what it reads from the node's storage. Not used with a hosted account. |
 | `infino.sql.max_result_size` | `http.max_content_length` | The largest SQL result, as JSON; a statement whose result is larger is refused with a 400. |
+| `infino.skeleton_rebuild.paused` | `false` | Dynamic (`PUT _cluster/settings`). Holds the skeleton rebuild of an index recreated over a table that has rows, until it is cleared. Meanwhile the index's searches miss those rows, and writes look ids up in the table. |
 
 **JVM properties** (`config/jvm.options` or `OPENSEARCH_JAVA_OPTS`)
 
