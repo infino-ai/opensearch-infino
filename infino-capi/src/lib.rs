@@ -57,8 +57,8 @@ use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
 use infino::{
     connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions,
-    Connection, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaPatch,
-    Supertable,
+    Connection, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaError,
+    SchemaPatch, Supertable,
 };
 use rayon::prelude::*;
 
@@ -1197,7 +1197,13 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                 });
             // The index a keyword field added now gets: the same, without positions.
             let exact_index = text_index.clone().map(|index| match index {
-                ColumnIndex::Fts { stopwords, stemmer, stored, bm25, .. } => ColumnIndex::Fts {
+                ColumnIndex::Fts {
+                    stopwords,
+                    stemmer,
+                    stored,
+                    bm25,
+                    ..
+                } => ColumnIndex::Fts {
                     stopwords,
                     stemmer,
                     positions: false,
@@ -2001,10 +2007,81 @@ impl Drop for Pass<'_> {
     }
 }
 
-/// Append rows, isolating the ones the engine refuses: a refused batch is
-/// split in halves until each refused document stands alone and is reported
-/// with the engine's reason, while every accepted half is one append.
+/// Whether the engine refused a write for what its rows carry, so the same
+/// rows are refused on every try: a schema refusal (a value of another type
+/// than its column's, an array of arrays, a path beneath a live column),
+/// except a schema that changed under the write, a column still converting,
+/// or a field cap that raising the table's limit lifts, which a later try
+/// can pass.
+fn refuses_content(e: &InfinoError) -> bool {
+    matches!(
+        e,
+        InfinoError::Schema(s) if !matches!(
+            s,
+            SchemaError::SchemaConflict { .. }
+                | SchemaError::ConversionInProgress { .. }
+                | SchemaError::FieldCapExceeded { .. }
+        )
+    )
+}
+
+/// Write rows with `write`, isolating the ones the engine refuses: a refused
+/// write is split in halves until each refused document stands alone and is
+/// reported with the engine's reason, and as `permanent` when the engine
+/// refused what it carries ([`refuses_content`]), while every accepted half
+/// is one write.
+fn write_checked(
+    rows: &[(usize, Value)],
+    failed: &mut Vec<Value>,
+    write: &dyn Fn(&[Value]) -> Result<(), InfinoError>,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    let values: Vec<Value> = rows.iter().map(|(_, v)| v.clone()).collect();
+    match write(&values) {
+        Ok(()) => {}
+        Err(e) if rows.len() == 1 => {
+            failed.push(json!({
+                "i": rows[0].0,
+                "reason": e.to_string(),
+                "permanent": refuses_content(&e),
+            }));
+        }
+        Err(_) => {
+            let (a, b) = rows.split_at(rows.len() / 2);
+            write_checked(a, failed, write);
+            write_checked(b, failed, write);
+        }
+    }
+}
+
+/// Append rows, isolating the ones the engine refuses ([`write_checked`]).
 fn append_checked(
+    table: &Supertable,
+    gate: &Gate,
+    rows: &[(usize, Value)],
+    failed: &mut Vec<Value>,
+) {
+    write_checked(rows, failed, &|values| {
+        let _pass = gate.append();
+        waiting(|| table.append_rows(values))
+    });
+}
+
+/// Replace the rows under the ids `rows` carry with those rows, mapped by
+/// the engine, in one update. An update refused for what its rows carry
+/// ([`refuses_content`]), one whose ids match another number of rows than it
+/// brings, or one over the table's field cap, is split in halves until each refused
+/// document stands alone, so one document leaves the others replaced. A
+/// document alone whose id the table holds no row under (its earlier version
+/// was refused) is appended as new. Any other document alone that the engine
+/// refuses for its content or its count of rows is reported permanent, since
+/// every try meets the same table; a refusal of the moment (the field cap
+/// among them, which raising the limit lifts) is reported for every document
+/// its update carried. A refused document keeps whatever row the table
+/// holds.
+fn replace_rows_checked(
     table: &Supertable,
     gate: &Gate,
     rows: &[(usize, Value)],
@@ -2014,26 +2091,54 @@ fn append_checked(
         return;
     }
     let values: Vec<Value> = rows.iter().map(|(_, v)| v.clone()).collect();
-    let appended = {
-        let _pass = gate.append();
-        waiting(|| table.append_rows(&values))
+    let mut ids: Vec<&str> = values
+        .iter()
+        .filter_map(|v| v.get(OSID).and_then(Value::as_str))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let pred = col(OSID).in_list(ids.iter().map(|s| lit(s.to_string())).collect(), false);
+    let replace = {
+        let _pass = gate.whole();
+        waiting(|| table.update_rows(pred.clone(), &values))
     };
-    match appended {
-        Ok(()) => {}
-        Err(e) if rows.len() == 1 => {
-            failed.push(json!({ "i": rows[0].0, "reason": e.to_string() }));
+    let Err(e) = replace else {
+        return;
+    };
+    let miscounted = matches!(e, InfinoError::Cardinality(_));
+    let over_cap = matches!(e, InfinoError::Schema(SchemaError::FieldCapExceeded { .. }));
+    if rows.len() > 1 && (miscounted || over_cap || refuses_content(&e)) {
+        let (a, b) = rows.split_at(rows.len() / 2);
+        replace_rows_checked(table, gate, a, failed);
+        replace_rows_checked(table, gate, b, failed);
+        return;
+    }
+    // A document alone matched no row, or several: its id's earlier version
+    // was refused (the table holds none, so it is new), or the table holds
+    // the id twice. A count that fails says neither, and a later try asks
+    // again.
+    let mut permanent = rows.len() == 1 && refuses_content(&e);
+    if rows.len() == 1 && miscounted {
+        match table.count_where(std::slice::from_ref(&pred)) {
+            Ok(counts) if counts.iter().all(|&n| n == 0) => {
+                append_checked(table, gate, rows, failed);
+                return;
+            }
+            Ok(_) => permanent = true,
+            Err(_) => {}
         }
-        Err(_) => {
-            let (a, b) = rows.split_at(rows.len() / 2);
-            append_checked(table, gate, a, failed);
-            append_checked(table, gate, b, failed);
-        }
+    }
+    let reason = format!("replace: {e}");
+    for (i, _) in rows {
+        failed.push(json!({"i": i, "reason": reason, "permanent": permanent}));
     }
 }
 
 /// Index many documents in one append. `osids` and `sources` are parallel
-/// arrays of length `count`. Returns `{"ok":n,"failed":[{"i":..,"reason":..}]}`,
-/// where `i` indexes the input arrays, or `{"error":..}` when nothing ran.
+/// arrays of length `count`. Returns
+/// `{"ok":n,"failed":[{"i":..,"reason":..,"permanent":..}]}`, where `i`
+/// indexes the input arrays and `permanent` says every later try is refused
+/// the same way ([`NotTaken`]), or `{"error":..}` when nothing ran.
 #[no_mangle]
 pub unsafe extern "C" fn infino_index_batch(
     h: *mut Bridge,
@@ -2068,7 +2173,7 @@ pub unsafe extern "C" fn infino_index_batch(
             let mut flat = match conform_doc(source, &schema, &kept, stamp.as_deref()) {
                 Ok(flat) => flat,
                 Err(why) => {
-                    failed.push(json!({ "i": i, "reason": why }));
+                    failed.push(json!({ "i": i, "reason": why, "permanent": true }));
                     continue;
                 }
             };
@@ -2150,7 +2255,9 @@ pub unsafe extern "C" fn infino_index_batch_buf(
         let failed = append_prepared(&table, &conn.gate(name), vec![prepared], &[], &[]);
         let failed: Vec<Value> = failed
             .into_iter()
-            .map(|(_, i, reason)| json!({ "i": i, "reason": reason }))
+            .map(|(_, i, reason, permanent)| {
+                json!({ "i": i, "reason": reason, "permanent": permanent })
+            })
             .collect();
         let ok = n - failed.len();
         out_json(json!({ "ok": ok, "failed": failed }))
@@ -2358,39 +2465,29 @@ fn join_over_union(batches: &[&RecordBatch]) -> Result<Option<RecordBatch>, Stri
         .map_err(|e| e.to_string())
 }
 
-/// The `osid` of every row of `batch`, in order; empty when it has no
+/// The distinct `osid`s of the rows of `batch`; empty when it has no
 /// readable id column.
 fn osids_of(batch: &RecordBatch) -> Vec<String> {
     let Some(column) = batch.column_by_name(OSID) else {
         return Vec::new();
     };
-    if let Some(a) = column.as_any().downcast_ref::<LargeStringArray>() {
+    let mut ids: Vec<String> = if let Some(a) = column.as_any().downcast_ref::<LargeStringArray>() {
         a.iter().flatten().map(str::to_owned).collect()
     } else if let Some(a) = column.as_any().downcast_ref::<StringArray>() {
         a.iter().flatten().map(str::to_owned).collect()
     } else {
         Vec::new()
-    }
+    };
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
-/// The documents of the converted batches of `prepared` whose id is among
-/// `replaced`, as (batch index, document index). A batch that could not be
-/// converted reports its own documents on the row path.
-fn replaced_rows(prepared: &[Prepared], replaced: &[String]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    for (b, p) in prepared.iter().enumerate() {
-        if p.batch.is_none() {
-            continue;
-        }
-        for (j, v) in p.values.iter().enumerate() {
-            let id = v.get(OSID).and_then(Value::as_str).unwrap_or("");
-            if replaced.iter().any(|r| r == id) {
-                out.push((b, p.index_of[j]));
-            }
-        }
-    }
-    out
-}
+/// A document an append did not take: (batch index, document index, reason,
+/// permanent). It is permanent when the table refuses what the document
+/// carries, so every later try is refused the same way; otherwise it failed
+/// for a reason of the moment and a later try may take it.
+type NotTaken = (usize, usize, String, bool);
 
 /// Stamp each document of a prepared batch with its sequence number,
 /// `seqs[i]` for document `i` of the batch: in the row it falls back to, and
@@ -2431,30 +2528,30 @@ fn stamp_seqs(p: &mut Prepared, seqs: &[i64]) -> Result<(), String> {
 /// tombstones (the engine's update), whatever shape the batches take: they
 /// are joined over the union of their schemas first, so a batch that added
 /// a path does not push the write onto a path that tombstones ahead of an
-/// append. A replace that fails leaves the old rows and reports every
-/// document it carried; an append the engine refuses falls back to the
-/// halving append that names each refused document, over the documents
-/// that replace nothing. A document whose batch could not be converted and
-/// whose id is replaced is refused rather than appended beside the row it
-/// was to replace. `seqs[b]`, when given, holds the sequence number of each
-/// document of batch `b` ([`stamp_seqs`]). Returns every refused document as
-/// (batch index, document index, reason).
+/// append. Whatever the engine refuses as Arrow, the append of the rows that
+/// replace nothing or the replace of those that do, goes a document at a
+/// time, as do the rows of a batch that could not be converted: appends
+/// through [`append_checked`], replaces through [`replace_rows_checked`],
+/// each naming the documents the engine refuses. `seqs[b]`, when given,
+/// holds the sequence number of each document of batch `b`
+/// ([`stamp_seqs`]). Returns every refused document ([`NotTaken`]).
 fn append_prepared(
     table: &Supertable,
     gate: &Gate,
     mut prepared: Vec<Prepared>,
     replaced: &[String],
     seqs: &[Vec<i64>],
-) -> Vec<(usize, usize, String)> {
-    let mut failed: Vec<(usize, usize, String)> = Vec::new();
+) -> Vec<NotTaken> {
+    let mut failed: Vec<NotTaken> = Vec::new();
     for (b, p) in prepared.iter_mut().enumerate() {
+        // Refused by the columns before conversion, as every try would be.
         for (i, why) in &p.failed {
-            failed.push((b, *i, why.clone()));
+            failed.push((b, *i, why.clone(), true));
         }
         if let Some(seqs) = seqs.get(b) {
             if let Err(why) = stamp_seqs(p, seqs) {
                 for i in &p.index_of {
-                    failed.push((b, *i, format!("sequence number: {why}")));
+                    failed.push((b, *i, format!("sequence number: {why}"), false));
                 }
                 p.batch = None;
                 p.values.clear();
@@ -2469,42 +2566,35 @@ fn append_prepared(
             for (b, p) in prepared.iter().enumerate() {
                 if p.batch.is_some() {
                     for i in &p.index_of {
-                        failed.push((b, *i, why.clone()));
+                        failed.push((b, *i, why.clone(), false));
                     }
                 }
             }
             None
         }
     };
-    // Whether the joined batch's rows that replace nothing landed as Arrow;
-    // the rows that replace are either in by the update or reported by it.
+    // Whether the joined batch's rows that replace nothing, and those that
+    // replace, landed as Arrow.
     let mut fresh_landed = joined.is_none();
+    let mut replaced_landed = joined.is_none();
     if let Some(batch) = &joined {
         if replaced.is_empty() {
             let _pass = gate.append();
             fresh_landed = waiting(|| table.append(batch)).is_ok();
+            replaced_landed = true;
         } else {
             match split_by_osid(batch, replaced) {
                 Some((replacing, fresh)) => {
-                    if replacing.num_rows() > 0 {
-                        // The replace names the ids this commit carries a row for. An
-                        // id in `replaced` whose document was refused keeps its old
-                        // row, and naming it would make the replace match more rows
-                        // than it brings, which the engine refuses whole.
-                        let carried = osids_of(&replacing);
-                        let pred = col(OSID)
-                            .in_list(carried.iter().map(|s| lit(s.clone())).collect(), false);
-                        let replace = {
-                            let _pass = gate.whole();
-                            waiting(|| table.update(pred.clone(), &replacing))
-                        };
-                        if let Err(e) = replace {
-                            let why = format!("replace: {e}");
-                            for (b, i) in replaced_rows(&prepared, &carried) {
-                                failed.push((b, i, why.clone()));
-                            }
-                        }
-                    }
+                    // The replace names the ids this commit carries a row for. An
+                    // id in `replaced` whose document was refused keeps its old
+                    // row, and naming it would make the replace match more rows
+                    // than it brings, which the engine refuses whole.
+                    replaced_landed = replacing.num_rows() == 0 || {
+                        let ids = osids_of(&replacing);
+                        let pred = col(OSID).in_list(ids.into_iter().map(lit).collect(), false);
+                        let _pass = gate.whole();
+                        waiting(|| table.update(pred.clone(), &replacing)).is_ok()
+                    };
                     fresh_landed = fresh.num_rows() == 0 || {
                         let _pass = gate.append();
                         waiting(|| table.append(&fresh)).is_ok()
@@ -2515,52 +2605,56 @@ fn append_prepared(
                     for (b, p) in prepared.iter().enumerate() {
                         if p.batch.is_some() {
                             for i in &p.index_of {
-                                failed.push((b, *i, why.clone()));
+                                failed.push((b, *i, why.clone(), false));
                             }
                         }
                     }
                     fresh_landed = true;
+                    replaced_landed = true;
                 }
             }
         }
     }
     let joined_batches = joined.is_some();
+    let replaced: HashSet<&str> = replaced.iter().map(String::as_str).collect();
     // What did not land as Arrow goes a document at a time: the rows of a
-    // batch that could not be converted, and the fresh rows of the joined
-    // batch when the engine refused the append. A document that replaces a
-    // row is never appended this way: with its replace failed (reported
-    // above) or its batch unconverted, appending it would put a second row
-    // beside the one it was to replace.
+    // batch that could not be converted, and the rows of the joined batch
+    // whose append or replace the engine refused. A document that replaces a
+    // row goes through the engine's replace ([`replace_rows_checked`]), never
+    // an append that would put a second row beside the one it replaces.
     for (b, p) in prepared.into_iter().enumerate() {
         let converted = p.batch.is_some();
-        if converted && joined_batches && fresh_landed {
-            continue;
-        }
         if converted && !joined_batches {
             continue; // reported as untyped above
         }
+        let fresh_here = !converted || !fresh_landed;
+        let replacing_here = !converted || !replaced_landed;
+        if !fresh_here && !replacing_here {
+            continue;
+        }
         let mut indexed: Vec<(usize, Value)> = Vec::new();
+        let mut replacing: Vec<(usize, Value)> = Vec::new();
         for (j, v) in p.values.into_iter().enumerate() {
             let id = v.get(OSID).and_then(Value::as_str).unwrap_or("");
-            let replaces = replaced.iter().any(|r| r == id);
-            if replaces {
-                if !converted {
-                    failed.push((
-                        b,
-                        p.index_of[j],
-                        "replace: the batch could not be converted".to_string(),
-                    ));
+            if replaced.contains(id) {
+                if replacing_here {
+                    replacing.push((p.index_of[j], v));
                 }
-                // converted and replacing: landed, or reported by the replace.
-                continue;
+            } else if fresh_here {
+                indexed.push((p.index_of[j], v));
             }
-            indexed.push((p.index_of[j], v));
         }
         let mut refused: Vec<Value> = Vec::new();
+        replace_rows_checked(table, gate, &replacing, &mut refused);
         append_checked(table, gate, &indexed, &mut refused);
         for r in refused {
             let i = r["i"].as_u64().unwrap_or(0) as usize;
-            failed.push((b, i, r["reason"].as_str().unwrap_or("refused").to_string()));
+            failed.push((
+                b,
+                i,
+                r["reason"].as_str().unwrap_or("refused").to_string(),
+                r["permanent"].as_bool().unwrap_or(false),
+            ));
         }
     }
     failed
@@ -2678,9 +2772,10 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
 /// in the same mutation. `seqs` (null for none) holds `seqs_count` sequence
 /// numbers, one per document of every batch, batch after batch in order: the
 /// number each document is written under. Returns
-/// `{"ok":n,"failed":[{"b":batch,"i":doc,"reason":..}]}`, where `b` indexes
-/// `prepared` and `i` the documents of that batch, or `{"error":..}` when
-/// nothing ran (the handles are released either way).
+/// `{"ok":n,"failed":[{"b":batch,"i":doc,"reason":..,"permanent":..}]}`,
+/// where `b` indexes `prepared`, `i` the documents of that batch and
+/// `permanent` says every later try is refused the same way ([`NotTaken`]),
+/// or `{"error":..}` when nothing ran (the handles are released either way).
 #[no_mangle]
 pub unsafe extern "C" fn infino_append_prepared(
     h: *mut Bridge,
@@ -2739,7 +2834,9 @@ pub unsafe extern "C" fn infino_append_prepared(
         let ok = n.saturating_sub(failed.len());
         let failed: Vec<Value> = failed
             .into_iter()
-            .map(|(b, i, reason)| json!({ "b": b, "i": i, "reason": reason }))
+            .map(|(b, i, reason, permanent)| {
+                json!({ "b": b, "i": i, "reason": reason, "permanent": permanent })
+            })
             .collect();
         out_json(json!({ "ok": ok, "failed": failed }))
     }))
@@ -4221,21 +4318,50 @@ mod tests {
         let index_of = |name: &str| {
             let bridge = unsafe { &*h };
             let schema = bridge.conn.schema("logs").unwrap();
-            schema.fields().iter().find(|f| f.name == name).map(|f| f.index.clone()).unwrap()
+            schema
+                .fields()
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.index.clone())
+                .unwrap()
         };
         for name in ["level", "host"] {
             assert!(
-                matches!(index_of(name), Some(ColumnIndex::Fts { positions: false, .. })),
+                matches!(
+                    index_of(name),
+                    Some(ColumnIndex::Fts {
+                        positions: false,
+                        ..
+                    })
+                ),
                 "{name}: {:?}",
                 index_of(name)
             );
         }
         assert!(index_of("tag").is_none(), "{:?}", index_of("tag"));
-        assert!(matches!(index_of("message"), Some(ColumnIndex::Fts { positions: true, .. })));
+        assert!(matches!(
+            index_of("message"),
+            Some(ColumnIndex::Fts {
+                positions: true,
+                ..
+            })
+        ));
         let cols = columns(h);
-        let fts_of = |n: &str| cols.as_array().unwrap().iter().find(|c| c["name"] == n).unwrap()["fts"].clone();
+        let fts_of = |n: &str| {
+            cols.as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == n)
+                .unwrap()["fts"]
+                .clone()
+        };
         assert_eq!(
-            (fts_of("level"), fts_of("host"), fts_of("message"), fts_of("osid")),
+            (
+                fts_of("level"),
+                fts_of("host"),
+                fts_of("message"),
+                fts_of("osid")
+            ),
             (json!(false), json!(false), json!(true), json!(true))
         );
 
@@ -4258,10 +4384,22 @@ mod tests {
             v
         };
         assert_eq!(ids("SELECT osid FROM logs WHERE level = 'disk'"), ["k2"]);
-        assert_eq!(ids("SELECT osid FROM logs WHERE level = 'full'"), Vec::<String>::new());
-        assert_eq!(ids("SELECT osid FROM logs WHERE level = 'Disk Full'"), ["k1"]);
-        assert_eq!(ids("SELECT osid FROM logs WHERE level IN ('DISK', 'disk')"), ["k2", "k3"]);
-        assert_eq!(ids("SELECT osid FROM logs WHERE host = 'a' AND level <> 'disk'"), ["k1", "k3"]);
+        assert_eq!(
+            ids("SELECT osid FROM logs WHERE level = 'full'"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ids("SELECT osid FROM logs WHERE level = 'Disk Full'"),
+            ["k1"]
+        );
+        assert_eq!(
+            ids("SELECT osid FROM logs WHERE level IN ('DISK', 'disk')"),
+            ["k2", "k3"]
+        );
+        assert_eq!(
+            ids("SELECT osid FROM logs WHERE host = 'a' AND level <> 'disk'"),
+            ["k1", "k3"]
+        );
         close(h);
     }
 
@@ -4669,6 +4807,7 @@ mod tests {
         let failed = out["failed"].as_array().cloned().unwrap_or_default();
         assert_eq!(failed.len(), 1, "{out}");
         assert_eq!(failed[0]["i"], 0, "{out}");
+        assert_eq!(failed[0]["permanent"], true, "{out}");
         assert!(
             get(h, "r1").contains("\"level\":\"info\""),
             "{}",
@@ -4676,6 +4815,102 @@ mod tests {
         );
         assert!(get(h, "r2").contains("\"status\":22"), "{}", get(h, "r2"));
         for id in ["r1", "r2"] {
+            let rows = sql(h, &format!("SELECT osid FROM logs WHERE osid = '{id}'"));
+            assert_eq!(rows.as_array().map(|r| r.len()), Some(1), "{rows}");
+        }
+        close(h);
+    }
+
+    /// A document the engine refuses for what it carries (here a path
+    /// beneath a live column, which the columns' check does not see) is
+    /// reported as permanent, so the plugin drops it rather than trying it
+    /// at every commit; the rest of its batch lands.
+    #[test]
+    fn a_document_the_engine_refuses_for_its_content_is_reported_permanent() {
+        let h = open_logs();
+        let out = index(h, &[("s1", r#"{"level":"info","status":1,"rec":"x"}"#)]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let p = prepared(
+            h,
+            &[
+                ("s2", r#"{"level":"info","status":2}"#),
+                ("s3", r#"{"level":"info","status":3,"rec":{"n":1}}"#),
+            ],
+        );
+        let out = append_replacing(h, p, &[]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let failed = out["failed"].as_array().cloned().unwrap_or_default();
+        assert_eq!(failed.len(), 1, "{out}");
+        assert_eq!(failed[0]["i"], 1, "{out}");
+        assert_eq!(failed[0]["permanent"], true, "{out}");
+        assert!(get(h, "s2").contains("\"status\":2"), "{}", get(h, "s2"));
+        assert!(get(h, "s3").is_empty(), "{}", get(h, "s3"));
+        close(h);
+    }
+
+    /// A replace the engine refuses for one document's content is split by
+    /// id until that document stands alone: it is reported as permanent
+    /// and keeps its old row, and the other ids of the replace are replaced.
+    #[test]
+    fn a_replace_refused_for_one_document_replaces_the_others() {
+        let h = open_logs();
+        let out = index(
+            h,
+            &[
+                ("t1", r#"{"level":"info","status":1,"rec":"x"}"#),
+                ("t2", r#"{"level":"info","status":2}"#),
+                ("t3", r#"{"level":"info","status":3}"#),
+            ],
+        );
+        assert_eq!(out["ok"], 3, "{out}");
+        let p = prepared(
+            h,
+            &[
+                ("t1", r#"{"level":"warn","status":11}"#),
+                ("t2", r#"{"level":"warn","status":22,"rec":{"n":1}}"#),
+                ("t3", r#"{"level":"warn","status":33}"#),
+            ],
+        );
+        let out = append_replacing(h, p, &["t1", "t2", "t3"]);
+        assert_eq!(out["ok"], 2, "{out}");
+        let failed = out["failed"].as_array().cloned().unwrap_or_default();
+        assert_eq!(failed.len(), 1, "{out}");
+        assert_eq!(failed[0]["i"], 1, "{out}");
+        assert_eq!(failed[0]["permanent"], true, "{out}");
+        assert!(get(h, "t1").contains("\"status\":11"), "{}", get(h, "t1"));
+        assert!(get(h, "t2").contains("\"status\":2"), "{}", get(h, "t2"));
+        assert!(get(h, "t3").contains("\"status\":33"), "{}", get(h, "t3"));
+        for id in ["t1", "t2", "t3"] {
+            let rows = sql(h, &format!("SELECT osid FROM logs WHERE osid = '{id}'"));
+            assert_eq!(rows.as_array().map(|r| r.len()), Some(1), "{rows}");
+        }
+        close(h);
+    }
+
+    /// A write of an id whose earlier version the table refused replaces a
+    /// row the table does not hold; it is added as new, beside the replace
+    /// of the ids the table does hold, and no id ends up with two rows.
+    #[test]
+    fn a_write_of_an_id_whose_earlier_version_was_refused_lands_as_new() {
+        let h = open_logs();
+        let out = index(h, &[("t1", r#"{"level":"info","status":1,"rec":"x"}"#)]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let out = index(h, &[("t2", r#"{"level":"info","status":2,"rec":{"n":1}}"#)]);
+        assert_eq!(out["ok"], 0, "{out}");
+        assert_eq!(out["failed"][0]["permanent"], true, "{out}");
+        let p = prepared(
+            h,
+            &[
+                ("t1", r#"{"level":"warn","status":11}"#),
+                ("t2", r#"{"level":"warn","status":22}"#),
+            ],
+        );
+        let out = append_replacing(h, p, &["t1", "t2"]);
+        assert_eq!(out["ok"], 2, "{out}");
+        assert!(out["failed"].as_array().is_none_or(Vec::is_empty), "{out}");
+        assert!(get(h, "t1").contains("\"status\":11"), "{}", get(h, "t1"));
+        assert!(get(h, "t2").contains("\"status\":22"), "{}", get(h, "t2"));
+        for id in ["t1", "t2"] {
             let rows = sql(h, &format!("SELECT osid FROM logs WHERE osid = '{id}'"));
             assert_eq!(rows.as_array().map(|r| r.len()), Some(1), "{rows}");
         }
@@ -4982,6 +5217,8 @@ mod tests {
                 .contains("typed differently"),
             "{out}"
         );
+        // Another commit may join them: the reason is of this commit's making.
+        assert_eq!(failed[0]["permanent"], false, "{out}");
         assert!(get(h, "c1").contains("\"status\":1"), "{}", get(h, "c1"));
         assert!(get(h, "c2").is_empty(), "{}", get(h, "c2"));
         close(h);
