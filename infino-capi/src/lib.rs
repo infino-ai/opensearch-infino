@@ -67,6 +67,8 @@ use rayon::prelude::*;
 const OSID: &str = "osid";
 /// The raw `_source` JSON of a row, served back by the fetch phase.
 const SOURCE: &str = "source";
+/// The row id column the engine keeps beside every row.
+const ROW_ID: &str = "_id";
 /// The routing value a row was written with, when it was written with one:
 /// what rebuilding a shard's documents from its table routes them by. The
 /// column appears with the first routed write.
@@ -3931,6 +3933,68 @@ pub unsafe extern "C" fn infino_bm25(
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// The table's first `k` rows by `column`, ascending or (`descending`
+/// non-zero) descending, rows sharing a value in row id order and rows
+/// without one last, each carrying `osid`, `_id`, the column and, when
+/// `with_source` is non-zero, `source`: the page a search that keeps every
+/// row asks for when it sorts on one field, in one call. The sources are
+/// read by row id along with the page, not looked up by `osid` afterwards.
+/// The engine reads it from the column's range index with no statement
+/// planned. `null` when the column has no range index: the caller plans its
+/// own statement then.
+#[no_mangle]
+pub unsafe extern "C" fn infino_sorted(
+    h: *mut Bridge,
+    name: *const c_char,
+    column: *const c_char,
+    descending: c_int,
+    k: c_int,
+    with_source: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(column)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(column) })
+        else {
+            return ptr::null_mut();
+        };
+        let range_indexed = match conn.conn.schema(name) {
+            Ok(schema) => schema
+                .fields()
+                .iter()
+                .any(|f| f.name == column && matches!(f.index, Some(ColumnIndex::Range))),
+            Err(e) => return err_json(&e.to_string()),
+        };
+        if !range_indexed {
+            return out_string("null".to_string());
+        }
+        let table = match conn.table(name) {
+            Ok(t) => t,
+            Err(e) => return err_json(&e.to_string()),
+        };
+        let with = [OSID, ROW_ID, column, SOURCE];
+        let projection = if with_source != 0 { &with[..] } else { &with[..3] };
+        match table.sorted_search(column, descending != 0, k.max(0) as usize, Some(projection)) {
+            // The engine fixes every row's `score` at zero; a sorted hit has none.
+            Ok(b) => out_string(batches_to_json(&without_column(&b, "score"))),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// `batches` without their column `name`, when they have one.
+fn without_column(batches: &[RecordBatch], name: &str) -> Vec<RecordBatch> {
+    batches
+        .iter()
+        .map(|b| {
+            let keep: Vec<usize> = (0..b.num_columns())
+                .filter(|&i| b.schema().field(i).name() != name)
+                .collect();
+            b.project(&keep).unwrap_or_else(|_| b.clone())
+        })
+        .collect()
 }
 
 /// Number of rows matching a token query on one text column (`mode` is
