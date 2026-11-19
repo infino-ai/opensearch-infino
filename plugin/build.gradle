@@ -187,10 +187,10 @@ def coreTests = 'org.opensearch.infino.InfinoCoreYamlTestSuiteIT'
 // all (the default), gaps (gaps and cluster failures, so the known bugs run),
 // or none.
 def coreSkip = System.getProperty('infino.core.skip', 'all')
-if (!(coreSkip in ['all', 'gaps', 'none'])) {
-    throw new GradleException("infino.core.skip is all, gaps or none, not ${coreSkip}")
-}
-def coreDenylist = file("${projectDir}/src/yamlRestTest/core-denylist.txt").readLines()
+// Read and checked when a core task runs, so a malformed line or a wrong
+// infino.core.skip fails that run alone, not every build.
+def coreDenylistFile = file("${projectDir}/src/yamlRestTest/core-denylist.txt")
+def coreDenylist = { -> coreDenylistFile.readLines()
     .collect { it.trim() }
     .findAll { it && !it.startsWith('#') }
     .collect { line ->
@@ -200,12 +200,16 @@ def coreDenylist = file("${projectDir}/src/yamlRestTest/core-denylist.txt").read
         }
         [pattern: m.group(1), kind: m.group(2), mode: m.group(3)]
     }
+}
 // The entries a task in this mode skips, as tests.rest.denylist takes them: the
 // runner reads each pattern as a regular expression (with * for any run within
 // one path segment) and splits the list on unescaped commas, while test names
 // hold dots, parentheses and commas meant literally.
 def coreDenylistFor = { String mode ->
-    coreDenylist.findAll { e ->
+    if (!(coreSkip in ['all', 'gaps', 'none'])) {
+        throw new GradleException("infino.core.skip is all, gaps or none, not ${coreSkip}")
+    }
+    coreDenylist().findAll { e ->
         if (e.kind == 'cluster') {
             return coreSkip != 'none'
         }
@@ -343,14 +347,16 @@ testClusters.matching { it.name == multiNodeTask }.all {
         testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
         classpath = sourceSets.yamlRestTest.runtimeClasspath
         systemProperty 'tests.rest.suite', coreSuites.join(',')
-        def denylist = coreDenylistFor(mode)
-        if (denylist) {
-            systemProperty 'tests.rest.denylist', denylist.join(',')
-        }
+        inputs.file(coreDenylistFile)
+        inputs.property('infino.core.skip', coreSkip)
         filter {
             includeTestsMatching coreTests
         }
         doFirst {
+            def denylist = coreDenylistFor(mode)
+            if (denylist) {
+                systemProperty 'tests.rest.denylist', denylist.join(',')
+            }
             delete data
         }
     }

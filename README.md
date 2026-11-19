@@ -322,7 +322,7 @@ cd plugin && gradle check   # precommit, unit tests, and the REST suites on a te
 
 `gradle check` loads the bridge as `libinfino_capi.so`; on macOS pass `-Dinfino.lib=$PWD/../infino-capi/target/release/libinfino_capi.dylib`. `check-all.sh` reads the bridge from `INFINO_LIB` and the releases from `RELEASES` (default `3.9.0 3.6.0 3.3.2 3.0.0 2.19.6`).
 
-OpenSearch's own YAML REST suites (index, get, bulk, update, delete, search, aggregations, scroll and the rest of the document and search APIs, from the release's `rest-api-spec` artifact) run in tasks of their own, outside `check`:
+OpenSearch's own YAML REST suites (index, get, bulk, update, delete, search, aggregations, scroll and the rest of the document and search APIs, from the release's `rest-api-spec` artifact) run in tasks of their own, outside `check`. CI does not run them, so run them before a change to how documents are written or searched:
 
 ```bash
 cd plugin
@@ -333,7 +333,7 @@ gradle coreYamlRestTestLucene   # the same cluster without the plugin: the basel
 
 A test that fails on the baseline fails because of the test cluster (the security plugin, the single node), not because of Infino.
 
-Tests known not to pass are skipped, so a run reports 0 failures and any failure is a regression. They are listed in `plugin/src/yamlRestTest/core-denylist.txt`, one per line, each tagged and with its reason: `[gap]` for a request the plugin refuses as not served, `[bug]` for a wrong answer (both narrowed to one mode as `[gap:proxy]` or `[bug:default]`), and `[cluster]` for a test that fails on the baseline too. `-Dinfino.core.skip` chooses how much is skipped:
+Tests known not to pass are skipped, so a run reports 0 failures and any failure is a regression. They are listed in `plugin/src/yamlRestTest/core-denylist.txt`, one per line, each tagged and with its reason: `[gap]` for a test that needs a feature Infino does not have yet, `[bug]` for any other failure (a wrong answer, a 500, or a refusal of what an existing feature should handle; both narrowed to one mode as `[gap:proxy]` or `[bug:default]`), and `[cluster]` for a test that fails on the baseline too. `-Dinfino.core.skip` chooses how much is skipped:
 
 ```bash
 gradle coreYamlRestTest -Dinfino.core.skip=all    # the default: every entry for the mode
@@ -341,7 +341,7 @@ gradle coreYamlRestTest -Dinfino.core.skip=gaps   # gaps and cluster failures on
 gradle coreYamlRestTest -Dinfino.core.skip=none   # nothing: shows which entries pass now
 ```
 
-`scripts/core-denylist.py default|proxy|lucene` reads a run's results and prints the failures no entry covers, as lines to tag and add, and the entries whose tests all passed, which can go.
+`scripts/core-denylist.py default|proxy|lucene` reads a run's results and prints the failures no entry covers, as lines to tag and add; the entries whose tests that ran all passed, which can go; and the `[bug]` entries a wider `[gap]` or `[cluster]` entry already skips, which `skip=gaps` cannot run. It exits 1 when a failure is not covered, including one outside any YAML test, such as a suite whose cluster failed during setup. It reads the XML the task left, so check the task itself ran.
 
 No OpenSearch checkout is needed: the plugin builds against the release named by `OPENSEARCH_VERSION`, pulled from Maven. `gradle check` builds against one release. The security integration takes a different path on 2.x, on 3.0 to 3.5, and on 3.6 and later, so run `check-all.sh` before relying on any release but the default. Each release's build tools want their own Gradle:
 
