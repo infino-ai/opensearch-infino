@@ -16,10 +16,12 @@ import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.index.engine.DocumentIndexWriter;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineCreationFailureException;
 import org.opensearch.index.engine.EngineException;
@@ -33,6 +35,7 @@ import org.opensearch.index.seqno.RetentionLease;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.shard.RefreshListeners;
 import org.opensearch.index.translog.Translog;
+import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
@@ -205,6 +208,8 @@ public class InfinoEngine extends InternalEngine {
     static final String TABLE_LEASE = "infino_table";
     /** What the lease names as the one holding it. */
     private static final String TABLE_LEASE_SOURCE = "infino table";
+    /** Shortest wait between renewals of the table's lease where it is (see {@link #refreshTableLease}). */
+    private static final long LEASE_REFRESH_MIN_MILLIS = 1_000;
 
     /**
      * One write of an id waiting for its commit: its source (null for a
@@ -402,6 +407,11 @@ public class InfinoEngine extends InternalEngine {
      * which are applied, in the batch.
      */
     private final ReentrantReadWriteLock recordLock = new ReentrantReadWriteLock();
+    /** Held exclusively from persisting the leases to the end of a Lucene commit (see {@link #commitIndexWriter}). */
+    private final ReentrantReadWriteLock leaseLock = new ReentrantReadWriteLock();
+    /** The next renewal of the table's lease where it is, until the engine closes. */
+    private volatile Scheduler.ScheduledCancellable leaseRefresh;
+    private volatile boolean leaseRefreshStopped;
     private final Object[] idLocks = new Object[ID_LOCK_STRIPES];
     private Batch batch = new Batch();
     /** The batch being committed, until the table has it; a read still sees its writes meanwhile. */
@@ -549,6 +559,7 @@ public class InfinoEngine extends InternalEngine {
         });
         readers.addListener(refreshRelease);
         BY_TABLE.put(table, this);
+        scheduleLeaseRefresh();
         log.info("[infino] engine attached to table {} for {}", table, config.getShardId());
     }
 
@@ -776,6 +787,11 @@ public class InfinoEngine extends InternalEngine {
 
     @Override
     public void close() throws IOException {
+        leaseRefreshStopped = true;
+        Scheduler.ScheduledCancellable next = leaseRefresh;
+        if (next != null) {
+            next.cancel();
+        }
         BY_TABLE.remove(table, this);
         super.close();
     }
@@ -1121,6 +1137,10 @@ public class InfinoEngine extends InternalEngine {
             return;
         }
         long retaining = covered + 1;
+        // A Lucene commit in progress records its history from the leases it persisted; the next commit moves this one.
+        if (leaseLock.isWriteLockedByCurrentThread() || !leaseLock.readLock().tryLock()) {
+            return;
+        }
         try {
             if (!tracker.isPrimaryMode()) {
                 return;
@@ -1139,6 +1159,75 @@ public class InfinoEngine extends InternalEngine {
         } catch (RuntimeException | AssertionError e) {
             // A hand-off in progress refuses lease changes; the new primary holds its own.
             log.debug("[infino] the lease on the history of {} was not moved to {}", shardId, retaining, e);
+        } finally {
+            leaseLock.readLock().unlock();
+        }
+    }
+
+    /** Renew the table's lease where it is after a quarter of the lease period, read again each time. */
+    private void scheduleLeaseRefresh() {
+        if (leaseRefreshStopped) {
+            return;
+        }
+        long delay = Math.max(LEASE_REFRESH_MIN_MILLIS, config().getIndexSettings().getRetentionLeaseMillis() / 4);
+        try {
+            Scheduler.ScheduledCancellable next = config().getThreadPool()
+                .schedule(this::refreshTableLease, TimeValue.timeValueMillis(delay), ThreadPool.Names.GENERIC);
+            leaseRefresh = next;
+            if (leaseRefreshStopped) {
+                next.cancel(); // close() ran between the check above and this schedule, and cancelled the one before
+            }
+        } catch (OpenSearchRejectedExecutionException e) {
+            log.debug("[infino] the renewal of the table lease of {} was not scheduled", shardId, e);
+        }
+    }
+
+    /**
+     * Renew the table's lease where it is: OpenSearch expires a lease not
+     * renewed within {@code index.soft_deletes.retention_lease.period}, and
+     * {@link #holdHistoryThrough} renews only when it moves, so an idle
+     * shard, or one whose commits fail, would lose the history it holds.
+     */
+    private void refreshTableLease() {
+        try {
+            if (config().getGlobalCheckpointSupplier() instanceof ReplicationTracker tracker && leaseLock.readLock().tryLock()) {
+                try {
+                    RetentionLease held = tracker.isPrimaryMode() ? tracker.getRetentionLeases().get(TABLE_LEASE) : null;
+                    if (held != null) {
+                        tracker.renewRetentionLease(TABLE_LEASE, held.retainingSequenceNumber(), TABLE_LEASE_SOURCE);
+                    }
+                } finally {
+                    leaseLock.readLock().unlock();
+                }
+            }
+        } catch (RuntimeException | AssertionError e) {
+            // A commit moved the lease meanwhile, or a hand-off refuses lease changes.
+            log.debug("[infino] the table lease of {} was not renewed", shardId, e);
+        } finally {
+            scheduleLeaseRefresh();
+        }
+    }
+
+    /**
+     * Persist the leases before the commit records the history it keeps from
+     * them, and let none move until it has: a renewal changes only the leases
+     * in memory, so otherwise a restart can load the table's lease behind
+     * that history and {@link #fillTable} refuses the shard (#137).
+     */
+    @Override
+    protected void commitIndexWriter(DocumentIndexWriter writer, String translogUUID) throws IOException {
+        if (leaseLock == null) {
+            super.commitIndexWriter(writer, translogUUID); // a commit from within the base engine's constructor
+            return;
+        }
+        leaseLock.writeLock().lock();
+        try {
+            if (config().getGlobalCheckpointSupplier() instanceof ReplicationTracker tracker) {
+                tracker.persistRetentionLeases(config().getStore().shardPath().getShardStatePath());
+            }
+            super.commitIndexWriter(writer, translogUUID);
+        } finally {
+            leaseLock.writeLock().unlock();
         }
     }
 
