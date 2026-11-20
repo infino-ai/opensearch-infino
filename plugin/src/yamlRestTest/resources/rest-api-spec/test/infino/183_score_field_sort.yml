@@ -1,0 +1,527 @@
+# A sort mixing _score with a field orders a scored query's hits by score,
+# best first, the field ordering hits that tie on it, each carrying its score
+# on the hit and among its sort values, as stock does (#133). A query whose hits all score
+# alike is ordered by the field, the one score among the sort values. Mixed
+# sorts the table cannot order as stock does are refused.
+setup:
+  - do:
+      indices.create:
+        index: ssort_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, seq: { type: long }, status: { type: keyword } } }
+  - do:
+      indices.create:
+        index: ssort_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, seq: { type: long }, status: { type: keyword } } }
+  - do:
+      indices.create:
+        index: ssort_default
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, seq: { type: long }, status: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ssort_luc, _id: "d01" }
+          - { seq: 9, status: ok, message: "disk disk" }
+          - index: { _index: ssort_luc, _id: "d02" }
+          - { seq: 3, status: bad, message: "disk disk" }
+          - index: { _index: ssort_luc, _id: "d03" }
+          - { seq: 7, status: ok, message: "disk full" }
+          - index: { _index: ssort_luc, _id: "d04" }
+          - { seq: 1, status: bad, message: "disk full" }
+          - index: { _index: ssort_luc, _id: "d05" }
+          - { seq: 5, status: ok, message: "disk full" }
+          - index: { _index: ssort_luc, _id: "d06" }
+          - { seq: 2, status: bad, message: "memory full" }
+          - index: { _index: ssort_luc, _id: "d07" }
+          - { seq: 8, status: ok, message: "disk disk" }
+          - index: { _index: ssort_luc, _id: "d08" }
+          - { seq: 4, status: bad, message: "net down" }
+          - index: { _index: ssort_proxy, _id: "d01" }
+          - { seq: 9, status: ok, message: "disk disk" }
+          - index: { _index: ssort_proxy, _id: "d02" }
+          - { seq: 3, status: bad, message: "disk disk" }
+          - index: { _index: ssort_proxy, _id: "d03" }
+          - { seq: 7, status: ok, message: "disk full" }
+          - index: { _index: ssort_proxy, _id: "d04" }
+          - { seq: 1, status: bad, message: "disk full" }
+          - index: { _index: ssort_proxy, _id: "d05" }
+          - { seq: 5, status: ok, message: "disk full" }
+          - index: { _index: ssort_proxy, _id: "d06" }
+          - { seq: 2, status: bad, message: "memory full" }
+          - index: { _index: ssort_proxy, _id: "d07" }
+          - { seq: 8, status: ok, message: "disk disk" }
+          - index: { _index: ssort_proxy, _id: "d08" }
+          - { seq: 4, status: bad, message: "net down" }
+          - index: { _index: ssort_default, _id: "d01" }
+          - { seq: 9, status: ok, message: "disk disk" }
+          - index: { _index: ssort_default, _id: "d02" }
+          - { seq: 3, status: bad, message: "disk disk" }
+          - index: { _index: ssort_default, _id: "d03" }
+          - { seq: 7, status: ok, message: "disk full" }
+          - index: { _index: ssort_default, _id: "d04" }
+          - { seq: 1, status: bad, message: "disk full" }
+          - index: { _index: ssort_default, _id: "d05" }
+          - { seq: 5, status: ok, message: "disk full" }
+          - index: { _index: ssort_default, _id: "d06" }
+          - { seq: 2, status: bad, message: "memory full" }
+          - index: { _index: ssort_default, _id: "d07" }
+          - { seq: 8, status: ok, message: "disk disk" }
+          - index: { _index: ssort_default, _id: "d08" }
+          - { seq: 4, status: bad, message: "net down" }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: ssort_luc,ssort_proxy,ssort_default
+        ignore_unavailable: true
+
+---
+"A scored query sorted by _score then a field is ordered by score, the field breaking ties":
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: desc }, { seq: asc }]
+          size: 4
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: d02 }
+  - match: { hits.hits.1._id: d07 }
+  - match: { hits.hits.2._id: d01 }
+  - match: { hits.hits.3._id: d04 }
+  - gt: { hits.hits.0._score: 0.2024 }
+  - lt: { hits.hits.0._score: 0.2044 }
+  - gt: { hits.hits.3._score: 0.1469 }
+  - lt: { hits.hits.3._score: 0.1489 }
+  - length: { hits.hits.0.sort: 2 }
+  - gt: { hits.hits.0.sort.0: 0.2024 }
+  - lt: { hits.hits.0.sort.0: 0.2044 }
+  - match: { hits.hits.0.sort.1: 3 }
+  - gt: { hits.hits.2.sort.0: 0.2024 }
+  - lt: { hits.hits.2.sort.0: 0.2044 }
+  - match: { hits.hits.2.sort.1: 9 }
+  - gt: { hits.hits.3.sort.0: 0.1469 }
+  - lt: { hits.hits.3.sort.0: 0.1489 }
+  - match: { hits.hits.3.sort.1: 1 }
+  - gt: { hits.max_score: 0.2024 }
+  - lt: { hits.max_score: 0.2044 }
+
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: desc }, { seq: asc }]
+          from: 2
+          size: 3
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: d01 }
+  - match: { hits.hits.1._id: d04 }
+  - match: { hits.hits.2._id: d05 }
+
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: desc }, { seq: asc }]
+          size: 4
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: d02 }
+  - match: { hits.hits.1._id: d07 }
+  - match: { hits.hits.2._id: d01 }
+  - match: { hits.hits.3._id: d04 }
+  - gt: { hits.hits.0._score: 0.2024 }
+  - lt: { hits.hits.0._score: 0.2044 }
+  - gt: { hits.hits.3._score: 0.1469 }
+  - lt: { hits.hits.3._score: 0.1489 }
+  - length: { hits.hits.0.sort: 2 }
+  - gt: { hits.hits.0.sort.0: 0.2024 }
+  - lt: { hits.hits.0.sort.0: 0.2044 }
+  - match: { hits.hits.0.sort.1: 3 }
+  - gt: { hits.hits.2.sort.0: 0.2024 }
+  - lt: { hits.hits.2.sort.0: 0.2044 }
+  - match: { hits.hits.2.sort.1: 9 }
+  - gt: { hits.hits.3.sort.0: 0.1469 }
+  - lt: { hits.hits.3.sort.0: 0.1489 }
+  - match: { hits.hits.3.sort.1: 1 }
+  - gt: { hits.max_score: 0.2024 }
+  - lt: { hits.max_score: 0.2044 }
+
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: desc }, { seq: asc }]
+          from: 2
+          size: 3
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: d01 }
+  - match: { hits.hits.1._id: d04 }
+  - match: { hits.hits.2._id: d05 }
+
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: desc }, { seq: asc }]
+          size: 4
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: d02 }
+  - match: { hits.hits.1._id: d07 }
+  - match: { hits.hits.2._id: d01 }
+  - match: { hits.hits.3._id: d04 }
+  - gt: { hits.hits.0._score: 0.2024 }
+  - lt: { hits.hits.0._score: 0.2044 }
+  - gt: { hits.hits.3._score: 0.1469 }
+  - lt: { hits.hits.3._score: 0.1489 }
+  - length: { hits.hits.0.sort: 2 }
+  - gt: { hits.hits.0.sort.0: 0.2024 }
+  - lt: { hits.hits.0.sort.0: 0.2044 }
+  - match: { hits.hits.0.sort.1: 3 }
+  - gt: { hits.hits.2.sort.0: 0.2024 }
+  - lt: { hits.hits.2.sort.0: 0.2044 }
+  - match: { hits.hits.2.sort.1: 9 }
+  - gt: { hits.hits.3.sort.0: 0.1469 }
+  - lt: { hits.hits.3.sort.0: 0.1489 }
+  - match: { hits.hits.3.sort.1: 1 }
+  - gt: { hits.max_score: 0.2024 }
+  - lt: { hits.max_score: 0.2044 }
+
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: desc }, { seq: asc }]
+          from: 2
+          size: 3
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: d01 }
+  - match: { hits.hits.1._id: d04 }
+  - match: { hits.hits.2._id: d05 }
+
+---
+"_score beside fields under track_scores carries the score on the hits and among the sort values":
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { match: { message: disk } }
+          sort: [ "_score", { status: desc }, { seq: desc } ]
+          track_scores: true
+          size: 4
+  - match: { hits.hits.0._id: d01 }
+  - match: { hits.hits.1._id: d07 }
+  - match: { hits.hits.2._id: d02 }
+  - match: { hits.hits.3._id: d03 }
+  - gt: { hits.hits.0._score: 0.2024 }
+  - lt: { hits.hits.0._score: 0.2044 }
+  - gt: { hits.hits.3._score: 0.1469 }
+  - lt: { hits.hits.3._score: 0.1489 }
+  - length: { hits.hits.3.sort: 3 }
+  - gt: { hits.hits.3.sort.0: 0.1469 }
+  - lt: { hits.hits.3.sort.0: 0.1489 }
+  - match: { hits.hits.3.sort.1: ok }
+  - match: { hits.hits.3.sort.2: 7 }
+  - gt: { hits.max_score: 0.2024 }
+  - lt: { hits.max_score: 0.2044 }
+
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { match: { message: disk } }
+          sort: [ "_score", { status: desc }, { seq: desc } ]
+          track_scores: true
+          size: 4
+  - match: { hits.hits.0._id: d01 }
+  - match: { hits.hits.1._id: d07 }
+  - match: { hits.hits.2._id: d02 }
+  - match: { hits.hits.3._id: d03 }
+  - gt: { hits.hits.0._score: 0.2024 }
+  - lt: { hits.hits.0._score: 0.2044 }
+  - gt: { hits.hits.3._score: 0.1469 }
+  - lt: { hits.hits.3._score: 0.1489 }
+  - length: { hits.hits.3.sort: 3 }
+  - gt: { hits.hits.3.sort.0: 0.1469 }
+  - lt: { hits.hits.3.sort.0: 0.1489 }
+  - match: { hits.hits.3.sort.1: ok }
+  - match: { hits.hits.3.sort.2: 7 }
+  - gt: { hits.max_score: 0.2024 }
+  - lt: { hits.max_score: 0.2044 }
+
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { match: { message: disk } }
+          sort: [ "_score", { status: desc }, { seq: desc } ]
+          track_scores: true
+          size: 4
+  - match: { hits.hits.0._id: d01 }
+  - match: { hits.hits.1._id: d07 }
+  - match: { hits.hits.2._id: d02 }
+  - match: { hits.hits.3._id: d03 }
+  - gt: { hits.hits.0._score: 0.2024 }
+  - lt: { hits.hits.0._score: 0.2044 }
+  - gt: { hits.hits.3._score: 0.1469 }
+  - lt: { hits.hits.3._score: 0.1489 }
+  - length: { hits.hits.3.sort: 3 }
+  - gt: { hits.hits.3.sort.0: 0.1469 }
+  - lt: { hits.hits.3.sort.0: 0.1489 }
+  - match: { hits.hits.3.sort.1: ok }
+  - match: { hits.hits.3.sort.2: 7 }
+  - gt: { hits.max_score: 0.2024 }
+  - lt: { hits.max_score: 0.2044 }
+
+---
+"A query whose hits all score alike is ordered by the field, the one score among the sort values":
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { match_all: {} }
+          sort: [ "_score", { seq: asc } ]
+          size: 3
+  - match: { hits.total.value: 8 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.1._id: d06 }
+  - match: { hits.hits.2._id: d02 }
+  - match: { hits.hits.0._score: 1.0 }
+  - match: { hits.hits.0.sort.0: 1.0 }
+  - match: { hits.hits.0.sort.1: 1 }
+  - match: { hits.hits.2.sort.0: 1.0 }
+  - match: { hits.hits.2.sort.1: 3 }
+  - match: { hits.max_score: 1.0 }
+
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { match_all: {} }
+          sort: [ { seq: asc }, "_score" ]
+          size: 3
+          search_after: [2, 1.0]
+  - match: { hits.hits.0._id: d02 }
+  - match: { hits.hits.0.sort.0: 3 }
+  - match: { hits.hits.0.sort.1: 1.0 }
+  - match: { hits.hits.0._score: 1.0 }
+  - match: { hits.hits.2._id: d05 }
+  - match: { hits.max_score: null }
+
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { match_all: {} }
+          sort: [ { _score: asc }, { seq: desc } ]
+          size: 2
+  - match: { hits.hits.0._id: d01 }
+  - match: { hits.hits.1._id: d07 }
+  - match: { hits.hits.0.sort.0: 1.0 }
+  - match: { hits.hits.0.sort.1: 9 }
+  - match: { hits.hits.0._score: 1.0 }
+  - match: { hits.max_score: null }
+
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { match_all: {} }
+          sort: [ "_score", { seq: asc } ]
+          size: 3
+  - match: { hits.total.value: 8 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.1._id: d06 }
+  - match: { hits.hits.2._id: d02 }
+  - match: { hits.hits.0._score: 1.0 }
+  - match: { hits.hits.0.sort.0: 1.0 }
+  - match: { hits.hits.0.sort.1: 1 }
+  - match: { hits.hits.2.sort.0: 1.0 }
+  - match: { hits.hits.2.sort.1: 3 }
+  - match: { hits.max_score: 1.0 }
+
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { match_all: {} }
+          sort: [ { seq: asc }, "_score" ]
+          size: 3
+          search_after: [2, 1.0]
+  - match: { hits.hits.0._id: d02 }
+  - match: { hits.hits.0.sort.0: 3 }
+  - match: { hits.hits.0.sort.1: 1.0 }
+  - match: { hits.hits.0._score: 1.0 }
+  - match: { hits.hits.2._id: d05 }
+  - match: { hits.max_score: null }
+
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { match_all: {} }
+          sort: [ { _score: asc }, { seq: desc } ]
+          size: 2
+  - match: { hits.hits.0._id: d01 }
+  - match: { hits.hits.1._id: d07 }
+  - match: { hits.hits.0.sort.0: 1.0 }
+  - match: { hits.hits.0.sort.1: 9 }
+  - match: { hits.hits.0._score: 1.0 }
+  - match: { hits.max_score: null }
+
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { match_all: {} }
+          sort: [ "_score", { seq: asc } ]
+          size: 3
+  - match: { hits.total.value: 8 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.1._id: d06 }
+  - match: { hits.hits.2._id: d02 }
+  - match: { hits.hits.0._score: 1.0 }
+  - match: { hits.hits.0.sort.0: 1.0 }
+  - match: { hits.hits.0.sort.1: 1 }
+  - match: { hits.hits.2.sort.0: 1.0 }
+  - match: { hits.hits.2.sort.1: 3 }
+  - match: { hits.max_score: 1.0 }
+
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { match_all: {} }
+          sort: [ { seq: asc }, "_score" ]
+          size: 3
+          search_after: [2, 1.0]
+  - match: { hits.hits.0._id: d02 }
+  - match: { hits.hits.0.sort.0: 3 }
+  - match: { hits.hits.0.sort.1: 1.0 }
+  - match: { hits.hits.0._score: 1.0 }
+  - match: { hits.hits.2._id: d05 }
+  - match: { hits.max_score: null }
+
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { match_all: {} }
+          sort: [ { _score: asc }, { seq: desc } ]
+          size: 2
+  - match: { hits.hits.0._id: d01 }
+  - match: { hits.hits.1._id: d07 }
+  - match: { hits.hits.0.sort.0: 1.0 }
+  - match: { hits.hits.0.sort.1: 9 }
+  - match: { hits.hits.0._score: 1.0 }
+  - match: { hits.max_score: null }
+
+---
+"A mixed sort the table cannot order as stock does is refused":
+  - do:
+      catch: bad_request
+      search:
+        index: ssort_proxy
+        body:
+          query: { match: { message: disk } }
+          sort: [{ status: desc }, { _score: desc }]
+  - match: { error.root_cause.0.reason: "/.*a.sort.mixing._score.with.a.field.is.not.served.unless._score.is.the.first.sort.*/" }
+  - do:
+      catch: bad_request
+      search:
+        index: ssort_proxy
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: asc }, { seq: asc }]
+  - match: { error.root_cause.0.reason: "/.*a.sort.mixing._score.with.a.field.is.not.served.with._score.ascending.*/" }
+  - do:
+      catch: bad_request
+      search:
+        index: ssort_proxy
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: desc }, { seq: asc }]
+          collapse: { field: status }
+  - match: { error.root_cause.0.reason: "/.*a.sort.mixing._score.with.a.field.is.not.served.with.collapse.*/" }
+  - do:
+      catch: bad_request
+      search:
+        index: ssort_proxy
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: desc }, { seq: asc }]
+          search_after: [1.0, 3]
+  - match: { error.root_cause.0.reason: "/.*a.sort.mixing._score.with.a.field.is.not.served.with.search_after.*/" }
+  - do:
+      catch: bad_request
+      search:
+        index: ssort_proxy
+        scroll: 1m
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: desc }, { seq: asc }]
+  - match: { error.root_cause.0.reason: "/.*a.sort.mixing._score.with.a.field.is.not.served.with.scroll.*/" }
+  - do:
+      catch: bad_request
+      search:
+        index: ssort_default
+        body:
+          query: { match: { message: disk } }
+          sort: [{ status: desc }, { _score: desc }]
+  - match: { error.root_cause.0.reason: "/.*a.sort.mixing._score.with.a.field.is.not.served.unless._score.is.the.first.sort.*/" }
+  - do:
+      catch: bad_request
+      search:
+        index: ssort_default
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: asc }, { seq: asc }]
+  - match: { error.root_cause.0.reason: "/.*a.sort.mixing._score.with.a.field.is.not.served.with._score.ascending.*/" }
+  - do:
+      catch: bad_request
+      search:
+        index: ssort_default
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: desc }, { seq: asc }]
+          collapse: { field: status }
+  - match: { error.root_cause.0.reason: "/.*a.sort.mixing._score.with.a.field.is.not.served.with.collapse.*/" }
+  - do:
+      catch: bad_request
+      search:
+        index: ssort_default
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: desc }, { seq: asc }]
+          search_after: [1.0, 3]
+  - match: { error.root_cause.0.reason: "/.*a.sort.mixing._score.with.a.field.is.not.served.with.search_after.*/" }
+  - do:
+      catch: bad_request
+      search:
+        index: ssort_default
+        scroll: 1m
+        body:
+          query: { match: { message: disk } }
+          sort: [{ _score: desc }, { seq: asc }]
+  - match: { error.root_cause.0.reason: "/.*a.sort.mixing._score.with.a.field.is.not.served.with.scroll.*/" }
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { match: { message: disk } }
+          sort: [{ status: desc }, { _score: desc }]
+  - match: { hits.total.value: 6 }

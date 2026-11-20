@@ -272,6 +272,9 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         Long cut = InfinoEngine.visibleSeqNo(table, readerVersion(searcher));
         long generation = InfinoEngine.generation(context.indexShard().indexSettings().getUUID());
         InfinoSearch.Plan plan = visibleTo(InfinoSearch.plan(table, source, now, access), cut, generation);
+        if (scroll != null && plan.ranksByScore()) {
+            throw new IllegalArgumentException(InfinoSearch.SCORE_SORT_SCROLL);
+        }
 
         Collection<AggregationBuilder> builders = InfinoSearch.builders(source);
         // A cardinality or percentiles result is built from the engine's exact
@@ -537,6 +540,11 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         SortField[] out = new SortField[sorts.size()];
         for (int i = 0; i < out.length; i++) {
             SortSpec s = sorts.get(i);
+            if (s.isScore()) {
+                // As stock sorts by the score: greatest first unless reversed; every hit has one.
+                out[i] = new SortField(null, SortField.Type.SCORE, !s.desc());
+                continue;
+            }
             SortField.Type type = sortType(s.type());
             SortField f = new SortField(s.name(), type, s.desc());
             f.setMissingValue(missing(type, s));
@@ -573,6 +581,11 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         for (int i = 0; i < out.length; i++) {
             Object v = values != null && i < values.length ? values[i] : null;
             SortSpec s = sorts.get(i);
+            if (s.isScore()) {
+                // The score's comparator reads a float.
+                out[i] = v instanceof Number n ? n.floatValue() : v == null ? Float.NaN : Float.parseFloat(v.toString());
+                continue;
+            }
             SortField.Type type = sortType(s.type());
             if (v == null) {
                 out[i] = type == SortField.Type.STRING ? null : missing(type, s);

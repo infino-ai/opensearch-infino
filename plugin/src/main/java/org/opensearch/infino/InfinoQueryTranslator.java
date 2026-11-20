@@ -201,13 +201,20 @@ final class InfinoQueryTranslator {
      * clause is the principal when there is one; otherwise {@code text}, a
      * text clause in should, whose BM25 counts where it matches.
      * {@code ascending} when the request sorts by the score ascending: the
-     * least sums come first.
+     * least sums come first. {@code unrankable} when the query scores its
+     * hits apart in stock but no one ranked read here can: a should clause
+     * the table cannot score, or several text clauses with no principal. Its
+     * hits then all carry {@code offset}.
      */
-    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending) {
+    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable) {
         static final Scoring NONE = new Scoring(null, 0, List.of());
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses) {
-            this(text, offset, bonuses, false);
+            this(text, offset, bonuses, false, false);
+        }
+
+        Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending) {
+            this(text, offset, bonuses, ascending, false);
         }
 
         /** Whether hits rank by more than the principal's BM25 alone: then {@code offset} only shifts every score alike. */
@@ -399,7 +406,7 @@ final class InfinoQueryTranslator {
             // which would add its BM25 beside the first) would leave some of the
             // hits it matches at 0, under hits it outscores in stock: with no
             // ranked clause, the hits keep the one score they all had.
-            return offset[0] == 0 ? Scoring.NONE : new Scoring(null, offset[0], List.of());
+            return new Scoring(null, offset[0], List.of(), false, true);
         }
         // Beside a ranked clause a should clause the table cannot score adds
         // nothing, as before; the others add theirs.

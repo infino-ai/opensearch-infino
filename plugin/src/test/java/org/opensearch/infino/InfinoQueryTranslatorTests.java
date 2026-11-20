@@ -1138,9 +1138,9 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             .should(QueryBuilders.matchQuery("message", "disk"))
             .should(QueryBuilders.matchQuery("message", "full"))
             .should(QueryBuilders.termQuery("level", "error"));
-        assertSame(InfinoQueryTranslator.Scoring.NONE, translate(b).scoring());
+        assertAlikeUnrankable(translate(b).scoring());
         b = QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.queryStringQuery("level:error OR status:500"));
-        assertSame(InfinoQueryTranslator.Scoring.NONE, translate(b).scoring());
+        assertAlikeUnrankable(translate(b).scoring());
         b = QueryBuilders.boolQuery()
             .must(QueryBuilders.matchQuery("message", "disk"))
             .should(QueryBuilders.queryStringQuery("level:error OR status:500"))
@@ -1338,17 +1338,21 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         Map<String, Column> cols = bm25TermColumns();
         cols.put("flag[]", Column.list("flag[]", "bool"));
         BoolQueryBuilder b = QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.termQuery("flag", true));
-        assertSame(InfinoQueryTranslator.Scoring.NONE, InfinoQueryTranslator.translate(b, cols, TABLE, NOW, counts(new java.util.ArrayList<>(), 5, 3)).scoring());
+        assertAlikeUnrankable(InfinoQueryTranslator.translate(b, cols, TABLE, NOW, counts(new java.util.ArrayList<>(), 5, 3)).scoring());
 
         Map<String, Column> orders = orderColumns();
         orders.put("items.gift", new Column("items.gift", "bool", false, false));
         b = QueryBuilders.boolQuery()
             .should(QueryBuilders.termQuery("items.sku", "a"))
             .should(QueryBuilders.nestedQuery("items", QueryBuilders.termQuery("items.gift", true), org.apache.lucene.search.join.ScoreMode.Avg));
-        assertSame(
-            InfinoQueryTranslator.Scoring.NONE,
-            InfinoQueryTranslator.translate(b, orders, "os_orders_0", NOW, new Rows(orders(), true)).scoring()
-        );
+        assertAlikeUnrankable(InfinoQueryTranslator.translate(b, orders, "os_orders_0", NOW, new Rows(orders(), true)).scoring());
+    }
+
+    /** Hits that keep one score although stock scores them apart: nothing reorders them, and the scoring says no ranked read can. */
+    private static void assertAlikeUnrankable(InfinoQueryTranslator.Scoring scoring) {
+        assertFalse(scoring.reorders());
+        assertEquals(0, scoring.offset(), 0);
+        assertTrue(scoring.unrankable());
     }
 
     /** A request sorted by _doc first is ordered by the index, unscored, as stock orders it; one sorted by _score is not. */
@@ -1813,5 +1817,118 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("\"level\" LIKE '\\\\*'", translate(QueryBuilders.wildcardQuery("level", "\\\\\\*")).where());
         assertEquals("\"level\" LIKE 'a\\%%'", translate(QueryBuilders.wildcardQuery("level", "a%*")).where());
         assertEquals("a?b%", InfinoQueryTranslator.escapedWildcardToLike("a\\?b*"));
+    }
+
+    /** A plan of {@code t} under {@code sorts} and {@code searchAfter} (null for none). */
+    private static InfinoSearch.Plan sortedPlan(Translation t, java.util.List<InfinoSearch.SortSpec> sorts, Object[] searchAfter) {
+        return new InfinoSearch.Plan(TABLE, columns(), t, sorts, null, null, null, searchAfter, java.util.List.of(), InfinoAccess.NONE, NOW);
+    }
+
+    /** {@code _score} beside a field sort is a sort of its own, in its place; alone, or beside {@code _doc}, it orders nothing. */
+    public void testAScoreBesideAFieldIsASort() {
+        java.util.List<org.opensearch.search.sort.SortBuilder<?>> mixed = java.util.List.of(
+            new org.opensearch.search.sort.ScoreSortBuilder(),
+            org.opensearch.search.sort.SortBuilders.fieldSort("status")
+        );
+        java.util.List<InfinoSearch.SortSpec> sorts = InfinoSearch.sorts(mixed, columns(), java.util.Set.of(), NOW, true);
+        assertEquals(2, sorts.size());
+        assertTrue(sorts.get(0).isScore());
+        assertTrue(sorts.get(0).desc());
+        assertTrue(sorts.get(0).noneMissing());
+        assertEquals("status", sorts.get(1).name());
+        // Where no hit carries its score among its sort values, the score is no sort.
+        assertEquals(java.util.List.of("status"), InfinoSearch.sorts(mixed, columns(), NOW).stream().map(InfinoSearch.SortSpec::name).toList());
+        assertTrue(InfinoSearch.sorts(java.util.List.of(new org.opensearch.search.sort.ScoreSortBuilder()), columns(), java.util.Set.of(), NOW, true).isEmpty());
+        assertTrue(
+            InfinoSearch.sorts(
+                java.util.List.of(new org.opensearch.search.sort.ScoreSortBuilder(), org.opensearch.search.sort.SortBuilders.fieldSort("_doc")),
+                columns(),
+                java.util.Set.of(),
+                NOW,
+                true
+            ).isEmpty()
+        );
+        // The score orders no column: the plain sorted statement leaves it out.
+        assertEquals(java.util.List.of("\"status\" ASC NULLS LAST"), InfinoSearch.orderBy(sorts));
+    }
+
+    /** Each hit hands out a sort value for {@code _score} beside a field, as stock's does, and none for it alone. */
+    public void testTheScoreBesideAFieldIsAHandedOutSortValue() {
+        org.opensearch.search.builder.SearchSourceBuilder source = new org.opensearch.search.builder.SearchSourceBuilder();
+        assertEquals(0, InfinoSearch.requestedSortValues(source.sort(new org.opensearch.search.sort.ScoreSortBuilder())));
+        assertEquals(0, InfinoSearch.requestedSortValues(source.sort("_doc")));
+        assertEquals(2, InfinoSearch.requestedSortValues(new org.opensearch.search.builder.SearchSourceBuilder().sort(new org.opensearch.search.sort.ScoreSortBuilder()).sort("status")));
+        assertEquals(2, InfinoSearch.requestedSortValues(new org.opensearch.search.builder.SearchSourceBuilder().sort("status").sort(new org.opensearch.search.sort.ScoreSortBuilder())));
+        // A scroll's later pages keep the score beside the field, and whether the hits carry their scores.
+        org.opensearch.search.builder.SearchSourceBuilder scroll = InfinoSearch.scrollSource(
+            new org.opensearch.search.builder.SearchSourceBuilder().sort(new org.opensearch.search.sort.ScoreSortBuilder()).sort("status").trackScores(true)
+        );
+        assertEquals(2, scroll.sorts().size());
+        assertTrue(scroll.sorts().get(0) instanceof org.opensearch.search.sort.ScoreSortBuilder);
+        assertTrue(scroll.trackScores());
+    }
+
+    /**
+     * A scored query sorted by the score then a field ranks a window of
+     * candidates by its score and orders them by the score, then the field,
+     * then the id; each hit carries the score, and the least score a cut
+     * window holds.
+     */
+    public void testAScoredQuerySortedByScoreThenFieldIsRanked() {
+        java.util.List<InfinoSearch.SortSpec> sorts = java.util.List.of(
+            InfinoSearch.SortSpec.score(true),
+            InfinoSearch.SortSpec.of(columns().get("status"), false),
+            InfinoSearch.SortSpec.rowId()
+        );
+        InfinoSearch.Plan plan = sortedPlan(translate(QueryBuilders.matchQuery("message", "disk")), sorts, null);
+        assertTrue(plan.ranksByScore());
+        String sql = InfinoSearch.hitStatement(plan, 10, false);
+        assertTrue(sql, sql.startsWith("SELECT osid, \"status\", \"_id\", score, MAX(infino_band_floor) OVER () AS infino_floor FROM ("));
+        assertTrue(sql, sql.contains(", 10000, 'or')"));
+        assertTrue(sql, sql.contains(", 0 AS infino_band"));
+        assertTrue(sql, sql.contains("COUNT(*) OVER (PARTITION BY infino_band) >= 10000"));
+        assertTrue(sql, sql.endsWith(" ORDER BY score DESC, \"status\" ASC NULLS LAST, \"_id\" ASC NULLS LAST LIMIT 10"));
+        // The source is read by id once the page is chosen.
+        assertFalse(sql, sql.startsWith("SELECT osid, source"));
+        String wide = InfinoSearch.hitStatement(plan, 10, false, InfinoSearch.Keyset.WHOLE, 50_000);
+        assertTrue(wide, wide.contains(", 50000, 'or')"));
+        assertTrue(wide, wide.contains(">= 50000"));
+    }
+
+    /** A query whose hits all score alike, sorted by the score beside a field, is ordered by the field alone. */
+    public void testAnUnscoredQuerySortedByScoreAndFieldIsOrderedByTheField() {
+        java.util.List<InfinoSearch.SortSpec> sorts = java.util.List.of(
+            InfinoSearch.SortSpec.score(true),
+            InfinoSearch.SortSpec.of(columns().get("status"), false),
+            InfinoSearch.SortSpec.rowId()
+        );
+        InfinoSearch.Plan plan = sortedPlan(translate(QueryBuilders.matchAllQuery()), sorts, null);
+        assertFalse(plan.ranksByScore());
+        String sql = InfinoSearch.hitStatement(plan, 10, false);
+        assertFalse(sql, sql.contains("score"));
+        assertTrue(sql, sql.endsWith(" ORDER BY \"status\" ASC NULLS LAST, \"_id\" ASC NULLS LAST LIMIT 10"));
+    }
+
+    /**
+     * Resuming past a score every hit shares: no hit is past it in the sort's
+     * direction unless the value is beyond the constant, and every hit ties
+     * with it where it is the constant.
+     */
+    public void testASearchAfterTheConstantScoreComparesItWithTheConstant() {
+        float constant = InfinoSearch.constantScore(0);
+        java.util.List<InfinoSearch.SortSpec> asc = java.util.List.of(
+            InfinoSearch.SortSpec.score(false),
+            InfinoSearch.SortSpec.of(columns().get("status"), false),
+            InfinoSearch.SortSpec.rowId()
+        );
+        String sql = InfinoSearch.hitStatement(sortedPlan(translate(QueryBuilders.matchAllQuery()), asc, new Object[] { constant, 200, "5" }), 10, false);
+        assertTrue(sql, sql.contains("((1=0) OR (1=1 AND (\"status\" > 200 OR \"status\" IS NULL))"));
+        java.util.List<InfinoSearch.SortSpec> desc = java.util.List.of(
+            InfinoSearch.SortSpec.score(true),
+            InfinoSearch.SortSpec.of(columns().get("status"), false),
+            InfinoSearch.SortSpec.rowId()
+        );
+        sql = InfinoSearch.hitStatement(sortedPlan(translate(QueryBuilders.matchAllQuery()), desc, new Object[] { constant + 1, 200, "5" }), 10, false);
+        assertTrue(sql, sql.contains("((1=1) OR (1=0 AND "));
     }
 }
