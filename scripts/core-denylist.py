@@ -11,7 +11,7 @@ default) and prints:
     paste into the file (the build refuses an untagged line);
   - after a run with -Dinfino.core.skip=none, the entries for that mode whose
     tests that ran all passed, which can be removed;
-  - the [bug] entries a [gap] or [cluster] entry already skips in full, which
+  - the [bug] entries another entry already skips in full, which
     -Dinfino.core.skip=gaps cannot run.
 
 A failure outside any YAML test (a cluster that never started, a suite that
@@ -36,7 +36,7 @@ TASKS = {
     "proxy": "coreYamlRestTestProxy",
     "lucene": "coreYamlRestTestLucene",
 }
-LINE = re.compile(r"^(.+?)\s+#\s*\[(gap|bug|cluster)(?::(default|proxy))?\]\s*\S.*$")
+LINE = re.compile(r"^(.+?)\s+#\s*\[(gap|by-design|bug|cluster)(?::(default|proxy))?\]\s*\S.*$")
 NAME = re.compile(r"\{yaml=(.*)\}$")
 
 
@@ -147,7 +147,7 @@ def main():
         ]
         if wider:
             hidden.append((line, wider[0]))
-    print(f"\n# {len(hidden)} [bug] entries a [gap] or [cluster] entry skips in full")
+    print(f"\n# {len(hidden)} [bug] entries another entry skips in full")
     for line, wider in hidden:
         print(f"{line}\n#   skipped by: {wider}")
 
