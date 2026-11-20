@@ -145,3 +145,165 @@
         body: { sort: [ { osid.keyword: asc } ] }
   - match: { hits.hits.0._id: b }
   - match: { hits.hits.1._id: a }
+
+---
+"Fields named osrouting, osop and osgen given strings are the documents' own, and leave _routing alone":
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: rsv_engine_str, _id: "a" }
+          - { osrouting: red, osop: hello, osgen: blue }
+          - index: { _index: rsv_engine_str, _id: "b" }
+          - { osrouting: green, osop: world, osgen: gray }
+  - match: { errors: false }
+  - do:
+      search:
+        index: rsv_engine_str
+        q: "osop:hello"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: a }
+  - do:
+      search:
+        index: rsv_engine_str
+        q: "osrouting:red"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: a }
+  - do:
+      search:
+        index: rsv_engine_str
+        q: "osgen:blue"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: a }
+  - do:
+      search:
+        index: rsv_engine_str
+        body: { query: { term: { osop.keyword: world } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b }
+  - do:
+      search:
+        index: rsv_engine_str
+        body: { query: { term: { osrouting: green } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b }
+  - do:
+      search:
+        index: rsv_engine_str
+        body: { query: { match: { osgen: gray } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b }
+  - do:
+      search:
+        index: rsv_engine_str
+        body: { query: { exists: { field: _routing } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      get:
+        index: rsv_engine_str
+        id: "a"
+  - is_false: _routing
+  - match: { _source.osrouting: red }
+  - do:
+      get:
+        index: rsv_engine_str
+        id: "b"
+        realtime: false
+  - is_false: _routing
+
+---
+"Fields named osrouting, osop and osgen given numbers are the documents' own, and later writes still commit":
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: rsv_engine_num, _id: "a" }
+          - { osrouting: 5, osop: 5, osgen: 5 }
+          - index: { _index: rsv_engine_num, _id: "b" }
+          - { osrouting: 7, osop: 7, osgen: 7 }
+  - match: { errors: false }
+  - do:
+      search:
+        index: rsv_engine_num
+        q: "osop:5"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: a }
+  - do:
+      search:
+        index: rsv_engine_num
+        q: "osop:7"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b }
+  - do:
+      search:
+        index: rsv_engine_num
+        body: { query: { term: { osgen: 5 } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: a }
+  - do:
+      search:
+        index: rsv_engine_num
+        body: { query: { term: { osgen: 7 } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b }
+  - do:
+      search:
+        index: rsv_engine_num
+        body: { query: { range: { osrouting: { gte: 6 } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b }
+  - do:
+      search:
+        index: rsv_engine_num
+        body: { query: { exists: { field: _routing } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      get:
+        index: rsv_engine_num
+        id: "a"
+  - is_false: _routing
+  # A routed write keeps its own routing value; a plain one after it commits.
+  - do:
+      index:
+        index: rsv_engine_num
+        id: "c"
+        routing: r1
+        refresh: true
+        body: { osrouting: 11, osop: 11, osgen: 11 }
+  - do:
+      get:
+        index: rsv_engine_num
+        id: "c"
+        routing: r1
+  - match: { _routing: r1 }
+  - do:
+      search:
+        index: rsv_engine_num
+        body: { query: { exists: { field: _routing } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: c }
+  - match: { hits.hits.0._routing: r1 }
+  - do:
+      index:
+        index: rsv_engine_num
+        id: "d"
+        refresh: true
+        body: { message: plain }
+  - do:
+      count:
+        index: rsv_engine_num
+  - match: { count: 4 }
+  - do:
+      search:
+        index: rsv_engine_num
+        q: "message:plain"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d }
+  - do:
+      search:
+        index: rsv_engine_num
+        body: { sort: [ { osop: desc } ], query: { exists: { field: osop } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: c }
+  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.2._id: a }
