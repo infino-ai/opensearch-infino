@@ -89,6 +89,8 @@ public final class InfinoNative {
     /** Where the engine caches what it reads from the node's own storage (see {@link InfinoPlugin#CACHE_DIR}); null for none. */
     private static volatile String cacheDir;
     private static volatile Pointer conn;
+    /** See {@link #opens()}; written under the class lock that opens a connection. */
+    private static volatile long opens;
     /** The target {@link #conn} was opened to. */
     private static volatile Target opened;
     /** The target the node is configured for: its own URI until the settings or the account route say otherwise. */
@@ -351,6 +353,7 @@ public final class InfinoNative {
                 log.info("[infino] tables are served from {}", target.name());
             }
             boolean switched = conn != null;
+            opens++;
             COLUMNS.clear();
             SOURCES.invalidateAll();
             InfinoRequestCache.changedAll();
@@ -360,6 +363,17 @@ public final class InfinoNative {
                 InfinoRequestCache.clearShardCaches();
             }
         }
+    }
+
+    /**
+     * How many connections the node has opened. A connection holds what
+     * each table was declared with (how its fields keep their values, and
+     * for an attached table that it is one and what it is read with), and a
+     * new one holds none of it: whoever remembers that a table is declared
+     * ({@link InfinoTables}) declares it again when this has moved.
+     */
+    static long opens() {
+        return opens;
     }
 
     /** Why an open returned null, as the exception the caller gets. */
@@ -627,11 +641,42 @@ public final class InfinoNative {
      * default BM25 ({@link Mapping}).
      */
     public static void ensureTable(String name, String mappingJson, boolean defaultBm25) {
+        ensureTable(name, mappingJson, defaultBm25, false);
+    }
+
+    /**
+     * Why an index with this mapping cannot be attached to table
+     * {@code name} ({@link InfinoPlugin#INFINO_ATTACHED}), or null when it
+     * can: the table is missing, is one the plugin wrote, or disagrees with
+     * the mapping. Asked when the index is created, so the request is
+     * answered with the reason; nothing is declared and nothing changes.
+     * Null too when the table could not be read at all, which says nothing
+     * about it: the index's shard declares the table when it starts and
+     * reports what it finds then.
+     */
+    public static String attachRefusal(String name, String mappingJson) {
+        init();
+        try {
+            Object refused = object(takeOrThrow(lib.infino_attach_check(conn, name, mappingJson))).get("refused");
+            return refused == null ? null : refused.toString();
+        } catch (InfinoException e) {
+            log.warn("[infino] table {} could not be read to check an attach to it: {}", name, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * As {@link #ensureTable(String, String, boolean)}, or for an
+     * {@code attached} index ({@link InfinoPlugin#INFINO_ATTACHED}) declare
+     * the table it reads without creating or changing it: a missing table,
+     * or a mapped field the table has no column for, is refused.
+     */
+    public static void ensureTable(String name, String mappingJson, boolean defaultBm25, boolean attached) {
         init();
         COLUMNS.remove(name);
         InfinoRequestCache.changed(name);
         try {
-            takeOrThrow(lib.infino_ensure_table(conn, name, mappingJson));
+            takeOrThrow(attached ? lib.infino_attach_table(conn, name, mappingJson) : lib.infino_ensure_table(conn, name, mappingJson));
         } finally {
             InfinoRequestCache.changed(name);
             wrote(name);
@@ -918,6 +963,10 @@ public final class InfinoNative {
      * also build the adjacency index the engine's graph walks read over its rows.
      */
     public static int optimize(String name, Settings indexSettings) {
+        if (InfinoPlugin.INFINO_ATTACHED.get(indexSettings)) {
+            // An attached index reads a table it does not own: compacting it is its owner's to do.
+            return 0;
+        }
         init();
         boolean edges = InfinoPlugin.INFINO_EDGES.get(indexSettings);
         InfinoRequestCache.changed(name);
