@@ -3256,6 +3256,9 @@ public class InfinoAggregationProcessor {
         // bucket, an interval of the column, in one pass over each superfile's
         // range index.
         long[] counts = InfinoNative.countWhere(table, predicates);
+        if (counts.length != starts.size()) {
+            throw new IllegalStateException("[infino] count_where gave " + counts.length + " counts for " + starts.size() + " buckets of " + table);
+        }
         List<Map<String, Object>> rows = new ArrayList<>();
         for (int i = 0; i < starts.size(); i++) {
             long n = counts[i];
