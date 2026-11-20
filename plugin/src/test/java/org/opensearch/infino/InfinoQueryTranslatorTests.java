@@ -638,17 +638,22 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
         assertEquals(t.where(), across.match());
         String sql = hits(t, null, 10);
-        // Each search ranks the window (several clauses are summed), by itself: the match is no filter of theirs.
-        assertTrue(sql, sql.contains("FROM bm25_search('os_logs_0', 'title', 'jackal bear', 10000, 'or')"));
-        assertFalse(sql, sql.contains("token_match"));
-        assertTrue(sql, sql.contains("MAX(infino_bm25)") && sql.contains("SUM(infino_best) AS score") && sql.endsWith("ORDER BY score DESC, infino_row ASC LIMIT 10"));
+        // One engine search ranks every clause by its best column and sums them, for the page alone: the match is no filter of its.
+        assertEquals(
+            "SELECT osid, score, \"_id\" AS infino_row FROM bm25_search_fields('os_logs_0', "
+                + "'[{\"query\":\"monkey\",\"fields\":[\"message\"]},{\"query\":\"jackal bear\",\"fields\":[\"message\",\"title\"]}]', 10, 'or')"
+                + " ORDER BY score DESC, infino_row ASC LIMIT 10",
+            sql
+        );
 
-        // One run alone: the best column, exact from the page's candidates per column.
+        // One run alone: one clause, scored by its best column.
         Translation one = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").field("message").field("title"), cols, TABLE, NOW);
         assertEquals(1, one.scoring().across().clauses().size());
-        assertTrue(hits(one, null, 10).contains("bm25_search('os_logs_0', 'message', 'jackal bear', 10, 'or')"));
+        assertTrue(
+            hits(one, null, 10).contains("bm25_search_fields('os_logs_0', '[{\"query\":\"jackal bear\",\"fields\":[\"message\",\"title\"]}]', 10, 'or')")
+        );
 
-        // A must range beside it adds its constant and filters each search.
+        // A must range beside it adds its constant and filters the engine's ranking.
         BoolQueryBuilder b = QueryBuilders.boolQuery()
             .must(QueryBuilders.rangeQuery("status").gte(500))
             .must(QueryBuilders.queryStringQuery("jackal bear").field("message").field("title"));
@@ -656,7 +661,10 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertNotNull(filtered.scoring().across());
         assertEquals(1.0, filtered.scoring().offset(), 0);
         String filteredSql = hits(filtered, null, 10);
-        assertTrue(filteredSql, filteredSql.contains("bm25_search('os_logs_0', 'title', 'jackal bear', 10, 'or') WHERE ((\"status\" >= 500) AND 1=1)"));
+        assertTrue(
+            filteredSql,
+            filteredSql.contains("\"fields\":[\"message\",\"title\"]}]', 10, 'or') WHERE ((\"status\" >= 500) AND 1=1) ORDER BY score DESC")
+        );
 
         // Forms read otherwise are left unranked, as before.
         for (QueryStringQueryBuilder qs : List.of(

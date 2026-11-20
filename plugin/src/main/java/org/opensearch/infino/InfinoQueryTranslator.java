@@ -12,10 +12,13 @@ import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateMathParser;
+import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
@@ -200,7 +203,40 @@ final class InfinoQueryTranslator {
      * clauses). {@code match} is the predicate the query string translated
      * to, every row any clause matches; the ranked clauses read the same rows.
      */
-    record Across(List<List<TextClause>> clauses, String match) {}
+    record Across(List<List<TextClause>> clauses, String match) {
+        /** The columns of a clause share its query, and every clause matches any of its words ({@code or}). */
+        Across {
+            for (List<TextClause> clause : clauses) {
+                for (TextClause c : clause) {
+                    if (!c.query().equals(clause.get(0).query()) || !"or".equals(c.mode())) {
+                        throw new IllegalArgumentException("a ranked clause's columns differ in query or mode: " + clause);
+                    }
+                }
+            }
+        }
+
+        /**
+         * The clauses as {@code bm25_search_fields} reads them: a JSON array
+         * of {@code {"query", "fields"}}, one per clause, its columns in
+         * {@code fields}. The columns of a clause share its query.
+         */
+        String clausesJson() {
+            try (XContentBuilder b = XContentFactory.jsonBuilder()) {
+                b.startArray();
+                for (List<TextClause> clause : clauses) {
+                    b.startObject().field("query", clause.get(0).query()).startArray("fields");
+                    for (TextClause c : clause) {
+                        b.value(c.column());
+                    }
+                    b.endArray().endObject();
+                }
+                b.endArray();
+                return BytesReference.bytes(b).utf8ToString();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+    }
 
     /**
      * How a hit scores, as Lucene sums a bool's scoring clauses: the BM25 of
@@ -306,6 +342,16 @@ final class InfinoQueryTranslator {
                 + ", "
                 + literal(text.mode())
                 + ")";
+        }
+
+        /**
+         * The ranked relation for a query string across several text columns:
+         * the engine's {@code bm25_search_fields}, which scores each clause by
+         * its best column and sums the clauses a row matches, {@code k}
+         * candidates.
+         */
+        String rankedFrom(Across across, int k) {
+            return "bm25_search_fields(" + literal(table) + ", " + literal(across.clausesJson()) + ", " + k + ", 'or')";
         }
 
         /**
@@ -474,7 +520,11 @@ final class InfinoQueryTranslator {
     /** How a query string's JSON names its default type, best_fields: the builder has no getter for it. */
     private static final Pattern BEST_FIELDS = Pattern.compile("\"type\"\\s*:\\s*\"best_fields\"");
 
-    /** The most BM25 searches (clauses times columns) a query string ranks across before it is left unranked. */
+    /**
+     * The most BM25 searches (clauses times columns) a query string ranks
+     * across before it is left unranked: the engine runs one search per
+     * clause and column, so this bounds the work one query string asks for.
+     */
     static final int MAX_ACROSS_SEARCHES = 64;
 
     /**

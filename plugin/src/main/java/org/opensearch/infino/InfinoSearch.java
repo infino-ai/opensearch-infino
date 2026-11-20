@@ -1369,43 +1369,19 @@ public final class InfinoSearch {
 
     /**
      * The page of a query string ranked across several text columns, as
-     * stock scores it: one BM25 search per clause and column, each within
-     * the rows the other predicates keep; per document, each clause's best
-     * column (dis_max), then the sum over its clauses. Ties go in the order
-     * the documents were written. The sources are read by id after.
-     *
-     * <p>With one clause the page is exact from {@code fetch} candidates per
-     * column: a hit among the best by its best column is among that column's
-     * best. With several, each search ranks {@link #RANK_WINDOW} candidates,
-     * which is exact while each clause matches no more rows than that on each
-     * column; past it, a document missing from one search's window adds
-     * nothing for that clause there.
+     * stock scores it: the engine's {@code bm25_search_fields} ranks within
+     * the rows the other predicates keep, each clause by its best column
+     * (dis_max) and the sum over the clauses a document matches. The
+     * engine's top-k is exact for any number of clauses and matches, and
+     * ties go in the order the documents were written. The sources are read
+     * by id after.
      */
     static String acrossStatement(Plan plan, int fetch, boolean withSeq) {
         Translation q = plan.query();
-        InfinoQueryTranslator.Across across = q.scoring().across();
         String filter = acrossFilter(plan);
-        String rowId = InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID);
-        String seq = InfinoQueryTranslator.SEQ;
-        int k = across.clauses().size() == 1 ? fetch : Math.max(fetch, RANK_WINDOW);
-        List<String> perClause = new ArrayList<>();
-        for (int i = 0; i < across.clauses().size(); i++) {
-            List<String> searches = new ArrayList<>();
-            for (TextClause text : across.clauses().get(i)) {
-                searches.add(
-                    "SELECT " + InfinoQueryTranslator.OSID + ", score AS infino_bm25, " + rowId + " AS infino_row" + (withSeq ? ", " + seq : "")
-                        + " FROM " + q.rankedFrom(text, k) + (InfinoQueryTranslator.ALL.equals(filter) ? "" : " WHERE " + filter)
-                );
-            }
-            perClause.add(
-                "SELECT " + InfinoQueryTranslator.OSID + ", MAX(infino_bm25) AS infino_best, MIN(infino_row) AS infino_row"
-                    + (withSeq ? ", MAX(" + seq + ") AS " + seq : "") + " FROM (" + String.join(" UNION ALL ", searches) + ") AS infino_fields" + i
-                    + " GROUP BY " + InfinoQueryTranslator.OSID
-            );
-        }
-        return "SELECT " + InfinoQueryTranslator.OSID + ", SUM(infino_best) AS score, MIN(infino_row) AS infino_row"
-            + (withSeq ? ", MAX(" + seq + ") AS " + seq : "") + " FROM (" + String.join(" UNION ALL ", perClause) + ") AS infino_clauses GROUP BY "
-            + InfinoQueryTranslator.OSID + " ORDER BY score DESC, infino_row ASC LIMIT " + fetch;
+        return "SELECT " + InfinoQueryTranslator.OSID + ", score, " + InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID) + " AS infino_row"
+            + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "") + " FROM " + q.rankedFrom(q.scoring().across(), fetch)
+            + (InfinoQueryTranslator.ALL.equals(filter) ? "" : " WHERE " + filter) + " ORDER BY score DESC, infino_row ASC LIMIT " + fetch;
     }
 
     /**
