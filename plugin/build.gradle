@@ -192,7 +192,7 @@ def coreLuceneTask = 'coreYamlRestTestLucene'
 def coreTests = 'org.opensearch.infino.InfinoCoreYamlTestSuiteIT'
 // Each core-denylist.txt entry is `pattern  # [tag] reason`; the file's header
 // says what the tags mean. -Dinfino.core.skip chooses how much each task skips:
-// all (the default), gaps (gaps and cluster failures, so the known bugs run),
+// all (the default), gaps (everything but the known bugs, so those run),
 // or none.
 def coreSkip = System.getProperty('infino.core.skip', 'all')
 // Read and checked when a core task runs, so a malformed line or a wrong
@@ -202,7 +202,7 @@ def coreDenylist = { -> coreDenylistFile.readLines()
     .collect { it.trim() }
     .findAll { it && !it.startsWith('#') }
     .collect { line ->
-        def m = line =~ /^(.+?)\s+#\s*\[(gap|bug|cluster)(?::(default|proxy))?\]\s*\S.*$/
+        def m = line =~ /^(.+?)\s+#\s*\[(gap|by-design|bug|cluster)(?::(default|proxy))?\]\s*\S.*$/
         if (!m.matches() || (m.group(2) == 'cluster' && m.group(3))) {
             throw new GradleException("core-denylist.txt: no [tag] and reason: ${line}")
         }
@@ -221,7 +221,7 @@ def coreDenylistFor = { String mode ->
         if (e.kind == 'cluster') {
             return coreSkip != 'none'
         }
-        mode != 'lucene' && (e.mode == null || e.mode == mode) && (coreSkip == 'all' || (coreSkip == 'gaps' && e.kind == 'gap'))
+        mode != 'lucene' && (e.mode == null || e.mode == mode) && (coreSkip == 'all' || (coreSkip == 'gaps' && e.kind != 'bug'))
     }.collect { e ->
         e.pattern.replaceAll('[\\\\^$.|?+()\\[\\]{},]') { '\\' + it }
     }.unique()
