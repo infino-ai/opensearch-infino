@@ -229,7 +229,11 @@ public class InfinoBulkActionFilter implements ActionFilter {
             createAndServe(bulk, clusters, new BulkItemResponse[bulk.requests().size()], writes, tables, listener, stock);
             return;
         }
-        if (!infinoBound(clusters, bulk)) {
+        // A bulk bound for no table goes on as it came, its pipelines run by the stock bulk. Not while
+        // the cluster holds an attached index: a pipeline may send a document to it from an index
+        // served by its shards, and the stock bulk would write it to that index's own shard. The
+        // pipelines run here instead, and the bulk is judged again by where its documents then stand.
+        if (!infinoBound(clusters, bulk) && !anyAttached(clusters.state())) {
             stock.run();
             return;
         }
@@ -834,6 +838,16 @@ public class InfinoBulkActionFilter implements ActionFilter {
             }
         }
         return null;
+    }
+
+    /** Whether the cluster holds an index attached to a table made outside the plugin ({@link InfinoPlugin#INFINO_ATTACHED}). */
+    static boolean anyAttached(ClusterState state) {
+        for (IndexMetadata md : state.metadata()) {
+            if (InfinoPlugin.INFINO_ENABLED.get(md.getSettings()) && InfinoPlugin.INFINO_ATTACHED.get(md.getSettings())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** The failure a bulk is answered with when one of {@code concrete} is attached ({@link #attachedTarget}); null when none is. */

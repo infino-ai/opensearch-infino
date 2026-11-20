@@ -6,7 +6,7 @@
 //! nothing to attach to there. The suites' build runs this once before the
 //! node starts, over the catalog the node will open.
 //!
-//!   outside_table <catalog uri> <table>
+//!   outside_table <catalog uri> <table>...
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -37,15 +37,19 @@ fn make(uri: &str, table: &str) -> Result<(), InfinoError> {
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
-    let (Some(uri), Some(table)) = (args.next(), args.next()) else {
-        eprintln!("usage: outside_table <catalog uri> <table>");
+    let (Some(uri), tables) = (args.next(), args.collect::<Vec<_>>()) else {
+        eprintln!("usage: outside_table <catalog uri> <table>...");
         return ExitCode::from(2);
     };
-    match make(&uri, &table) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("outside_table: {e}");
-            ExitCode::FAILURE
+    if tables.is_empty() {
+        eprintln!("usage: outside_table <catalog uri> <table>...");
+        return ExitCode::from(2);
+    }
+    for table in &tables {
+        if let Err(e) = make(&uri, table) {
+            eprintln!("outside_table: {table}: {e}");
+            return ExitCode::FAILURE;
         }
     }
+    ExitCode::SUCCESS
 }

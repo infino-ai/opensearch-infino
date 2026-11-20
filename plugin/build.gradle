@@ -349,10 +349,11 @@ tasks.named('yamlRestTest').configure {
     def fixture = System.getProperty('infino.fixture', defaultFixture)
     doFirst {
         delete layout.buildDirectory.dir('infino-catalog')
-        // A table made outside the plugin, in the catalog the node will open, for the suite
-        // that attaches an index to one: the node itself only ever makes the plugin's tables.
+        // Tables made outside the plugin, in the catalog the node will open, for the suite that
+        // attaches indices to them: the node itself only ever makes the plugin's tables. One a
+        // test, so a test that fails with its index still there leaves the other's table free.
         fixtureRunner.execOps.exec {
-            commandLine fixture, catalog, 'outside_pages'
+            commandLine fixture, catalog, 'outside_pages', 'outside_pages_templated'
         }
     }
 }

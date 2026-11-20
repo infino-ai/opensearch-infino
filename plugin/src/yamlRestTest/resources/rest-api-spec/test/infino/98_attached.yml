@@ -124,7 +124,7 @@
       indices.create:
         index: attpl4
         body:
-          settings: { index.infino.table: outside_pages, number_of_shards: 1, number_of_replicas: 0 }
+          settings: { index.infino.table: outside_pages_templated, number_of_shards: 1, number_of_replicas: 0 }
           mappings: { properties: { title: { type: text } } }
   - do:
       indices.exists:
@@ -137,7 +137,7 @@
         body:
           index_patterns: [ "attpl*" ]
           template:
-            settings: { index.infino.table: outside_pages }
+            settings: { index.infino.table: outside_pages_templated }
             mappings: { properties: { title: { type: text } } }
   - do:
       indices.create:
