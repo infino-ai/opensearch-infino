@@ -82,6 +82,9 @@ public final class InfinoTables {
     /** The mapping version each table was last declared from, by table. */
     private final Map<String, Long> declared = new ConcurrentHashMap<>();
 
+    /** The connection {@link #declared} was filled over, as {@link InfinoNative#opens} counts them. */
+    private volatile long declaredOver = -1;
+
     /** The live Infino-backed indices naming each table, as one cluster metadata holds them. */
     private record Naming(Metadata metadata, Map<String, List<IndexMetadata>> byTable) {}
 
@@ -304,16 +307,20 @@ public final class InfinoTables {
         Naming known = naming;
         claim(table, md, known == null ? Map.of() : known.byTable());
         long version = md.getMappingVersion();
+        forgetOver(InfinoNative.opens());
         Long last = declared.get(table);
         if (last != null && last == version) {
             return table;
         }
         synchronized (this) {
+            // Declaring opens the connection if none is open, which counts as one more.
+            InfinoNative.init();
+            forgetOver(InfinoNative.opens());
             last = declared.get(table);
             if (last != null && last == version) {
                 return table;
             }
-            InfinoNative.ensureTable(table, tableMapping(md), defaultBm25(md.getSettings()));
+            InfinoNative.ensureTable(table, tableMapping(md), defaultBm25(md.getSettings()), InfinoPlugin.INFINO_ATTACHED.get(md.getSettings()));
             declared.put(table, version);
             log.info("[infino] table {} declared from mapping version {} of {}", table, version, md.getIndex().getName());
         }
@@ -375,6 +382,36 @@ public final class InfinoTables {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    /**
+     * Forget every declaration made over a connection other than the
+     * {@code opens}-th: the connection holds what a table was declared
+     * with, an attached table's view among it, and a new one (another
+     * account, new credentials) holds none, so each table is declared again
+     * on its next use.
+     */
+    void forgetOver(long opens) {
+        if (declaredOver == opens) {
+            return;
+        }
+        synchronized (this) {
+            if (declaredOver != opens) {
+                declared.clear();
+                declaredOver = opens;
+            }
+        }
+    }
+
+    /** Note the table as declared from mapping {@code version}, as {@link #ensure} does once it has declared it; for tests. */
+    void declaredForTest(String table, long version) {
+        declared.put(table, version);
+    }
+
+    /** Whether the table is declared from mapping {@code version} over the current connection. */
+    boolean declaredAt(String table, long version) {
+        Long last = declared.get(table);
+        return last != null && last == version;
     }
 
     /** The table is gone; a later index under the same name declares afresh. */

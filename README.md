@@ -219,10 +219,39 @@ The security plugin's index is Infino-backed too, so its roles, users and passwo
 | `index.infino.enabled` | on (`infino.index.default_enabled`) | Whether the index is Infino-backed. |
 | `index.infino.mode` | `default` | `default` or `proxy`; fixed at creation. See [How it works](#how-it-works). |
 | `index.infino.table` | derived from the index's name | The table behind the index, named explicitly, to reattach a recreated index to its rows. A named table is kept when its index is deleted. |
+| `index.infino.attached` | `false` | The table named in `index.infino.table` was made outside the plugin: it is read as it is and never changed. Fixed at creation. See [Attaching to an existing table](#attaching-to-an-existing-table). |
 | `index.infino.optimize_interval` | `60s` | How often the table is compacted (5 seconds at least; off for a hosted account, which compacts its own tables). |
 | `index.infino.edges` | `false` | The index holds a graph's edges, for `graph_walk` and `graph_rank` in [SQL](#sql). |
 
 A table backs one live index. If two indices name the same table (explicitly, or by names that map to one table, such as `logs.app` and `logs_app`), the older one is served from it and the other is refused, even after the older one is deleted. With the security plugin, setting `index.infino.table` in a create, resize, rollover or template request needs the right to manage the cluster.
+
+### Attaching to an existing table
+
+An index can read a table that was made and filled outside the plugin, such as one loaded through the engine or the hosted service:
+
+```bash
+curl -sk -u "admin:$OPENSEARCH_ADMIN_PASSWORD" -X PUT https://localhost:9200/pageviews -H 'Content-Type: application/json' -d '{
+  "settings": { "index.infino.table": "pageviews", "index.infino.attached": true },
+  "mappings": { "properties": {
+    "time":  { "type": "date" },
+    "title": { "type": "text" },
+    "hits":  { "type": "long" }
+  } }
+}'
+```
+
+The mapping names the table's columns and the field type each is read as. It is checked against the table when the index is created: a table that does not exist, a field the table has no column for, or a column of another type, is refused with a 400 and no index is created. The settings and mappings of the templates the index's name matches are judged with the request's, as the cluster merges them. A table that cannot be read at that moment is not judged: the index is created, and answers each request with the reason once its shard has read the table.
+
+- **The table is never changed.** Nothing is added to it when the index is created, it is not compacted, and it stays when the index is deleted.
+- **Every write is refused** with a 403: index, update, delete, a write by query, and a document an ingest pipeline sends to the index from another one. A bulk request with an item for an attached index is refused as a whole, its items for other indices included; send those in a bulk of their own.
+- **A template may set `index.infino.attached` and leave the table to the request** that creates the index. The two are checked together when the index is created.
+- **The mapping is fixed when the index is created.** A mapping update is refused with a 400. For a different mapping, delete the index and create it again: it holds no data of its own.
+- **A document is a row.** Its `_id` is the engine's row id, and its `_source` is the row's columns; a null column is left out. A date column is read as the instant its day starts at.
+- **The index is served in proxy mode.** A request or a template that asks for default mode is refused.
+- **A `text` field needs a full-text index on its column.** One without positions matches and ranks terms; a phrase query needs positions. A column with a full-text index is searched as text only when its field is mapped as `text`: mapped as `keyword`, or left out of the mapping, it is compared whole.
+- **A table with a column named `score`, `osid`, `source` or `osseq` is not attached to.** A search gives each row's score under the first, and the plugin reads a document through the others.
+- **A column the table's owner removes later** is noticed by a statement that fails on it, which then runs again over the columns the table holds now. A ranked search (`match`, k-NN, hybrid) does not: create the index again after such a change.
+- A table the plugin wrote is not attached to. Name it in `index.infino.table` without this setting.
 
 **Node settings** (`opensearch.yml`)
 

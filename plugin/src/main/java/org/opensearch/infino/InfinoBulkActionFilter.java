@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.ActionListenerResponseHandler;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.DocWriteRequest;
@@ -214,6 +215,12 @@ public class InfinoBulkActionFilter implements ActionFilter {
      * the bulk goes on as it came.
      */
     static void route(BulkRequest bulk, ClusterService clusters, InfinoWriter writes, InfinoTables tables, ActionListener<BulkResponse> listener, Runnable stock) {
+        // As the bulk arrives: a bulk that names an attached index runs no pipeline and creates no index.
+        Exception refused = attachedRefusal(clusters.state(), concreteIndices(clusters.state(), bulk));
+        if (refused != null) {
+            listener.onFailure(refused);
+            return;
+        }
         if (forwards() > 0) {
             // Its pipelines ran on the node it arrived at, which marked each document
             // resolved; they never run again here, whatever the documents carry.
@@ -224,7 +231,11 @@ public class InfinoBulkActionFilter implements ActionFilter {
             createAndServe(bulk, clusters, new BulkItemResponse[bulk.requests().size()], writes, tables, listener, stock);
             return;
         }
-        if (!infinoBound(clusters, bulk)) {
+        // A bulk bound for no table goes on as it came, its pipelines run by the stock bulk. Not while
+        // the cluster holds an attached index: a pipeline may send a document to it from an index
+        // served by its shards, and the stock bulk would write it to that index's own shard. The
+        // pipelines run here instead, and the bulk is judged again by where its documents then stand.
+        if (!infinoBound(clusters, bulk) && !anyAttached(clusters.state())) {
             stock.run();
             return;
         }
@@ -344,6 +355,13 @@ public class InfinoBulkActionFilter implements ActionFilter {
     ) {
         int forwards = forwards();
         ClusterState state = clusters.state();
+        // Again where every bulk is served from, past its pipelines: one of them may have sent a
+        // document on to an attached index that the bulk did not name when it arrived.
+        Exception refused = attachedRefusal(state, concrete);
+        if (refused != null) {
+            listener.onFailure(refused);
+            return;
+        }
         String local = state.nodes().getLocalNodeId();
         long start = System.nanoTime();
         BulkItemResponse[] items = new BulkItemResponse[bulk.requests().size()];
@@ -803,6 +821,50 @@ public class InfinoBulkActionFilter implements ActionFilter {
             out.add(name);
         }
         return out;
+    }
+
+    /**
+     * The first index a bulk's items write to that is attached to a table
+     * made outside the plugin ({@link InfinoPlugin#INFINO_ATTACHED}), which
+     * it reads and never writes; null when none is. Every write to an
+     * index comes as a bulk (a single index, update or delete, and each
+     * batch of a write by query, among them), so a bulk refused here is
+     * every write refused. {@code concrete} is the index of each item as it
+     * now stands: read before the bulk's pipelines run it is what the bulk
+     * named, and after them what they sent each document to.
+     */
+    static String attachedTarget(ClusterState state, List<String> concrete) {
+        for (String name : concrete) {
+            IndexMetadata md = name == null ? null : state.metadata().index(name);
+            if (md != null && InfinoPlugin.INFINO_ENABLED.get(md.getSettings()) && InfinoPlugin.INFINO_ATTACHED.get(md.getSettings())) {
+                return name;
+            }
+        }
+        return null;
+    }
+
+    /** Whether the cluster holds an index attached to a table made outside the plugin ({@link InfinoPlugin#INFINO_ATTACHED}). */
+    static boolean anyAttached(ClusterState state) {
+        for (IndexMetadata md : state.metadata()) {
+            if (InfinoPlugin.INFINO_ENABLED.get(md.getSettings()) && InfinoPlugin.INFINO_ATTACHED.get(md.getSettings())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The failure a bulk is answered with when one of {@code concrete} is attached ({@link #attachedTarget}); null when none is. */
+    static OpenSearchStatusException attachedRefusal(ClusterState state, List<String> concrete) {
+        String attached = attachedTarget(state, concrete);
+        if (attached == null) {
+            return null;
+        }
+        return new OpenSearchStatusException(
+            "[infino] index [{}] is attached to a table it reads and never writes ([{}]); no document is indexed, updated or deleted through it",
+            RestStatus.FORBIDDEN,
+            attached,
+            InfinoPlugin.INFINO_ATTACHED.getKey()
+        );
     }
 
     /**

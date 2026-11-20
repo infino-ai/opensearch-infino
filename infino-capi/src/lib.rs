@@ -31,6 +31,7 @@
 // The safety contract is the same for every entry point and stated once above.
 #![allow(clippy::missing_safety_doc)]
 
+mod attached;
 mod read_sql;
 
 use std::cell::RefCell;
@@ -50,7 +51,7 @@ use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::prelude::{col, lit, Expr, SessionContext};
 use infino::arrow_array::{
     new_null_array, Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int64Array,
-    LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+    LargeStringArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
 };
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -447,6 +448,15 @@ pub struct Bridge {
     /// one value at, from the mapping's `_data_stream_timestamp` (set with
     /// [`Bridge::kept`]).
     stamps: RwLock<HashMap<String, Arc<str>>>,
+    /// The tables an index is attached to rather than owns: tables that
+    /// existed before the index, declared through `infino_attach_table`.
+    /// Such a table is read as it is and never changed: it holds none of
+    /// the columns the plugin writes beside a document ([`OSID`],
+    /// [`SOURCE`], [`SEQ`]), and none is added to it. Each is kept with
+    /// the columns it held when it was declared, which a document read
+    /// from it is made of (see [`attached`]), and the fields its mapping
+    /// reads as text.
+    attached: RwLock<HashMap<String, Attached>>,
     /// Each table's [`Gate`], by name: the order in which this node's
     /// writes take the table's writer.
     gates: Mutex<HashMap<String, Arc<Gate>>>,
@@ -490,6 +500,118 @@ impl Bridge {
                 Some(field) => all.insert(name.to_string(), field.into()),
                 None => all.remove(name),
             };
+        }
+    }
+
+    /// Whether `name` is a table an index is attached to rather than owns.
+    fn is_attached(&self, name: &str) -> bool {
+        self.attached_columns(name).is_some()
+    }
+
+    /// The columns of `name` when an index is attached to it, none when it
+    /// is a table of the plugin's own.
+    fn attached_columns(&self, name: &str) -> Option<Arc<Vec<String>>> {
+        self.attached
+            .read()
+            .ok()
+            .and_then(|all| all.get(name).map(|a| a.columns.clone()))
+    }
+
+    /// Whether the mapping of the index attached to `name` reads `column`
+    /// as text. A full-text index the table's maker built is searched as
+    /// text only under such a field: under a `keyword` field, or under no
+    /// field, the column is compared whole.
+    fn attached_text(&self, name: &str, column: &str) -> bool {
+        self.attached
+            .read()
+            .is_ok_and(|all| all.get(name).is_some_and(|a| a.text.contains(column)))
+    }
+
+    /// Record `name` as attached with what it is read with, or as a table
+    /// of the plugin's own, from the declaration that says so.
+    fn attach_rule(&self, name: &str, attached: Option<Attached>) {
+        if let Ok(mut all) = self.attached.write() {
+            match attached {
+                Some(attached) => all.insert(name.to_string(), attached),
+                None => all.remove(name),
+            };
+        }
+    }
+
+    /// Why a write to `name` is refused: an index is attached to it, and
+    /// such a table is read and never changed. Every entry point that
+    /// appends to a table, deletes from it, adds a column to it, compacts
+    /// it or drops it asks here first, so no path the plugin has reaches
+    /// the table, whichever filter or engine it came through.
+    fn refuse_write(&self, name: &str) -> Result<(), String> {
+        if self.is_attached(name) {
+            return Err(format!(
+                "table {name} is read by an attached index and is never written through it"
+            ));
+        }
+        Ok(())
+    }
+
+    /// `sql` as it reads the attached tables it names, each through the
+    /// view that gives a document's id and source from the table's own
+    /// columns ([`attached::rewrite`]); none when it names no attached
+    /// table and runs as written, which is every statement on a node with
+    /// no attached index.
+    fn attached_sql(&self, sql: &str) -> Option<String> {
+        if self.attached.read().map_or(true, |all| all.is_empty()) {
+            return None;
+        }
+        // A statement over the table's own columns alone needs no view, and
+        // keeps the plan the table gives it (see `reads_view_columns`).
+        if !attached::reads_view_columns(sql) {
+            return None;
+        }
+        attached::rewrite(sql, &|table| {
+            self.attached_columns(table).map(|c| c.as_ref().clone())
+        })
+    }
+
+    /// Read again the columns of every attached table, which its maker may
+    /// have changed since the index was declared. Whether any differed.
+    fn refresh_attached(&self) -> bool {
+        let names: Vec<String> = match self.attached.read() {
+            Ok(all) => all.keys().cloned().collect(),
+            Err(_) => return false,
+        };
+        let mut changed = false;
+        for name in names {
+            self.forget(&name);
+            let Ok(table) = self.conn.open_table(&name) else {
+                continue;
+            };
+            let columns = attached::columns_of(&table.schema());
+            if let Ok(mut all) = self.attached.write() {
+                if let Some(held) = all.get_mut(&name) {
+                    if *held.columns != columns {
+                        held.columns = Arc::new(columns);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Run `sql` with each attached table it names read through its view
+    /// ([`Bridge::attached_sql`]). The view names the columns the table
+    /// held when its index was declared; where the statement fails and the
+    /// table's columns have changed since, it runs once more over the
+    /// columns the table holds now.
+    fn query_viewed(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
+        let Some(viewed) = self.attached_sql(sql) else {
+            return self.conn.query_sql(sql);
+        };
+        match self.conn.query_sql(&viewed) {
+            Err(_) if self.refresh_attached() => {
+                let viewed = self.attached_sql(sql);
+                self.conn.query_sql(viewed.as_deref().unwrap_or(sql))
+            }
+            other => other,
         }
     }
 
@@ -598,6 +720,7 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
         hosted,
         kept: RwLock::new(HashMap::new()),
         stamps: RwLock::new(HashMap::new()),
+        attached: RwLock::new(HashMap::new()),
         gates: Mutex::new(HashMap::new()),
     })
 }
@@ -730,6 +853,15 @@ pub unsafe extern "C" fn infino_free_string(s: *mut c_char) {
 // ---------------------------------------------------------------------------
 
 /// One field the OpenSearch mapping declares, as the table will hold it.
+/// What an attached table is read with (see [`Bridge::attached`]).
+#[derive(Clone)]
+struct Attached {
+    /// The columns the table held when it was last read, its row id aside.
+    columns: Arc<Vec<String>>,
+    /// The fields the index's mapping reads as text.
+    text: Arc<HashSet<String>>,
+}
+
 struct MappedField {
     path: String,
     data_type: DataType,
@@ -1158,16 +1290,40 @@ fn mapped_fields(mapping: &Value) -> Vec<MappedField> {
 /// mapping cannot express over this table: the call fails naming it, so the
 /// index answers with the reason instead of serving the column as something
 /// it is not.
-fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, String> {
+fn ensure_table(
+    bridge: &Bridge,
+    name: &str,
+    mapping: &Value,
+    attached: bool,
+) -> Result<Value, String> {
+    declare_table(bridge, name, mapping, attached, false)
+}
+
+/// [`ensure_table`], or with `check_only` the same judgement of an attached
+/// table and nothing else: whether it could be attached to, with no rule
+/// kept for it on the connection. An index is created from that answer
+/// before any shard of it exists to declare the table.
+fn declare_table(
+    bridge: &Bridge,
+    name: &str,
+    mapping: &Value,
+    attached: bool,
+    check_only: bool,
+) -> Result<Value, String> {
     let mut mapped = mapped_fields(mapping);
     // A field named like a reserved column is served from the document's
     // source, not given a column of its own.
     mapped.retain(|f| !matches!(f.path.as_str(), OSID | SOURCE | SEQ));
-    bridge.keep_rules(name, &mapped);
-    bridge.stamp_rule(name, mapping);
     let conn = &bridge.conn;
-    // The cached handle, if any, predates whatever this changes.
-    bridge.forget(name);
+    if !check_only {
+        bridge.keep_rules(name, &mapped);
+        bridge.stamp_rule(name, mapping);
+        if !attached {
+            bridge.attach_rule(name, None);
+        }
+        // The cached handle, if any, predates whatever this changes.
+        bridge.forget(name);
+    }
     match conn.open_table(name) {
         Ok(table) => {
             let schema = table.schema();
@@ -1215,10 +1371,15 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
             let mut conflicts: Vec<String> = Vec::new();
             for f in &mapped {
                 let present = schema.field_with_name(&f.path).is_ok();
-                let indexed = table_schema
-                    .fields()
-                    .iter()
-                    .any(|c| c.name == f.path && is_text_index(&c.name, &c.index));
+                let indexed = table_schema.fields().iter().any(|c| {
+                    c.name == f.path
+                        && (is_text_index(&c.name, &c.index)
+                                // An attached table's indexes are as its maker built
+                                // them: under a field mapped as text, a full-text
+                                // index without positions still ranks and matches
+                                // terms, and only a phrase needs more.
+                                || (attached && matches!(c.index, Some(ColumnIndex::Fts { .. }))))
+                });
                 // A column's index is fixed when the column is added, so a text field
                 // the table holds without one cannot be served as text.
                 if f.fts && present && !indexed {
@@ -1250,6 +1411,56 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
                     "the mapping of {name} cannot be applied to its table: {}; recreate the index with the mapping it needs",
                     conflicts.join("; ")
                 ));
+            }
+            if attached {
+                // The table is another's: a field it has no column for is
+                // refused, and nothing is added to it, the sequence column
+                // included.
+                // A table that holds a document's id or source as a column
+                // of its own is one the plugin wrote, or one whose columns
+                // those of its view would be taken for: neither is read
+                // through the view.
+                if let Some(own) = [OSID, SOURCE, SEQ]
+                    .into_iter()
+                    .find(|c| schema.field_with_name(c).is_ok())
+                {
+                    return Err(format!(
+                        "table {name} holds a column [{own}], which an attached index gives from the table's other columns; a table the plugin wrote is named without attaching to it"
+                    ));
+                }
+                // A ranked search gives each row's score under this name,
+                // beside the table's columns: a column of the table's own
+                // by that name would be taken for it, and left out of the
+                // document.
+                if schema.field_with_name(attached::SCORE).is_ok() {
+                    return Err(format!(
+                        "table {name} holds a column [{}], the name a search gives a row's score under; an attached index cannot tell the two apart",
+                        attached::SCORE
+                    ));
+                }
+                let missing: Vec<&str> = mapped
+                    .iter()
+                    .filter(|f| schema.field_with_name(&f.path).is_err())
+                    .map(|f| f.path.as_str())
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(format!(
+                        "the mapping of {name} names fields its table has no column for: [{}]; an attached index maps only the columns its table holds",
+                        missing.join(", ")
+                    ));
+                }
+                if !check_only {
+                    bridge.attach_rule(
+                        name,
+                        Some(Attached {
+                            columns: Arc::new(attached::columns_of(&schema)),
+                            text: Arc::new(
+                                mapped.iter().filter(|f| f.fts).map(|f| f.path.clone()).collect(),
+                            ),
+                        }),
+                    );
+                }
+                return Ok(json!({ "created": false, "added": 0 }));
             }
             let mut patches: Vec<FieldPatch> = mapped
                 .iter()
@@ -1287,6 +1498,9 @@ fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, S
             }
             Ok(json!({ "created": false, "added": added }))
         }
+        Err(InfinoError::NotFound(_)) if attached => Err(format!(
+            "table {name} does not exist; an attached index reads a table that already exists"
+        )),
         Err(InfinoError::NotFound(_)) => {
             let mut fields = vec![
                 Field::new(OSID, DataType::LargeUtf8, false),
@@ -1342,9 +1556,74 @@ pub unsafe extern "C" fn infino_ensure_table(
             return err_json("null argument");
         };
         let mapping: Value = serde_json::from_str(mapping).unwrap_or(Value::Null);
-        match ensure_table(conn, name, &mapping) {
+        match ensure_table(conn, name, &mapping, false) {
             Ok(v) => out_json(v),
             Err(e) => err_json(&e),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Declare `name` as a table an index is attached to: one that existed
+/// before the index and is read as it is. The mapping is checked against the
+/// table's columns as [`infino_ensure_table`] checks it, but nothing is
+/// created and nothing is added: a missing table, or a mapped field the
+/// table has no column for, is an error. Returns
+/// `{"created":false,"added":0}` or `{"error":..}`.
+#[no_mangle]
+pub unsafe extern "C" fn infino_attach_table(
+    h: *mut Bridge,
+    name: *const c_char,
+    mapping_json: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(mapping)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(mapping_json)
+            })
+        else {
+            return err_json("null argument");
+        };
+        let mapping: Value = serde_json::from_str(mapping).unwrap_or(Value::Null);
+        match ensure_table(conn, name, &mapping, true) {
+            Ok(v) => out_json(v),
+            Err(e) => err_json(&e),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Whether an index could be attached to table `name` under this mapping,
+/// asked when the index is created, before any shard declares the table:
+/// `{"refused":null}` when it could, `{"refused":"<why>"}` when the table
+/// is missing, is one the plugin wrote, or disagrees with the mapping (what
+/// [`infino_attach_table`] refuses), and `{"error":..}` when the table could
+/// not be read at all, which says nothing about it. Nothing is kept on the
+/// connection and nothing is changed.
+#[no_mangle]
+pub unsafe extern "C" fn infino_attach_check(
+    h: *mut Bridge,
+    name: *const c_char,
+    mapping_json: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(mapping)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(mapping_json)
+            })
+        else {
+            return err_json("null argument");
+        };
+        let mapping: Value = serde_json::from_str(mapping).unwrap_or(Value::Null);
+        // A table that cannot be opened for a reason other than its absence
+        // is not judged: the failure is the store's, not the request's.
+        match conn.conn.open_table(name) {
+            Ok(_) | Err(InfinoError::NotFound(_)) => {}
+            Err(e) => return err_json(&e.to_string()),
+        }
+        match declare_table(conn, name, &mapping, true, true) {
+            Ok(_) => out_json(json!({ "refused": null })),
+            Err(why) => out_json(json!({ "refused": why })),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -1385,9 +1664,15 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return ptr::null_mut();
         };
+        // An attached table's full-text index serves its column as text
+        // whether or not it holds positions, where the index's mapping
+        // reads the field as text (see `ensure_table`); under a `keyword`
+        // field, or none, a column whose index has no positions is a
+        // keyword, as it is in a table of the plugin's own.
+        let attached = conn.is_attached(name);
         match conn.conn.schema(name) {
             Ok(schema) => {
-                let cols: Vec<Value> = schema
+                let mut cols: Vec<Value> = schema
                     .fields()
                     .iter()
                     .map(|f| {
@@ -1402,11 +1687,29 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                             "name": f.name,
                             "type": type_name(&f.data_type),
                             "elem": elem,
-                            "fts": is_text_index(&f.name, &f.index),
+                            "fts": is_text_index(&f.name, &f.index)
+                                || (attached
+                                    && matches!(f.index, Some(ColumnIndex::Fts { .. }))
+                                    && conn.attached_text(name, &f.name)),
                             "vector": matches!(f.index, Some(ColumnIndex::Vector { .. })),
                         })
                     })
                     .collect();
+                if attached {
+                    // The columns its view adds, as a table of the plugin's
+                    // own lists them, so a sort or a filter on a document's
+                    // id or sequence number finds a column to read. The id
+                    // carries no index: it is compared, never searched.
+                    for (name, ty) in [(OSID, "str"), (SOURCE, "str"), (SEQ, "i64")] {
+                        cols.push(json!({
+                            "name": name,
+                            "type": ty,
+                            "elem": null,
+                            "fts": false,
+                            "vector": false,
+                        }));
+                    }
+                }
                 out_json(Value::Array(cols))
             }
             Err(_) => out_string(String::new()),
@@ -2175,6 +2478,9 @@ pub unsafe extern "C" fn infino_index_batch(
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return err_json("null argument");
         };
+        if let Err(refused) = conn.refuse_write(name) {
+            return err_json(&refused);
+        }
         if osids.is_null() || sources.is_null() || count <= 0 {
             return err_json("empty batch");
         }
@@ -2336,6 +2642,9 @@ unsafe fn prepare(
     let seqs = meta.map(|m| unsafe { std::slice::from_raw_parts(m.seqs, n) });
     let ops = meta.map(|m| unsafe { std::slice::from_raw_parts(m.ops, n) });
     let gen = meta.map_or(0, |m| m.gen);
+    // Preparing a batch can add a column to the table (a list field's), so
+    // it is refused as the append it prepares is.
+    conn.refuse_write(name)?;
     let table = conn.table(name).map_err(|e| e.to_string())?;
     let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
     let schema = table.schema();
@@ -2824,6 +3133,9 @@ pub unsafe extern "C" fn infino_append_prepared(
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return err_json("null argument");
         };
+        if let Err(refused) = conn.refuse_write(name) {
+            return err_json(&refused);
+        }
         let replaced: Vec<String> = if replaced.is_null() || replaced_count <= 0 {
             Vec::new()
         } else {
@@ -2889,6 +3201,10 @@ pub unsafe extern "C" fn infino_delete_osids(
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return -1;
         };
+        if let Err(refused) = conn.refuse_write(name) {
+            eprintln!("[capi] delete_osids: {refused}");
+            return -2;
+        }
         if osids.is_null() || count <= 0 {
             return 0;
         }
@@ -2921,10 +3237,94 @@ pub unsafe extern "C" fn infino_delete_osids(
     .unwrap_or(-99)
 }
 
+/// The columns a ranked search returns: a document's id, source and score,
+/// or for an attached table every column it holds, which its hits are made
+/// of ([`attached::hits_json`]).
+fn ranked_columns(conn: &Bridge, name: &str) -> Vec<String> {
+    const SCORE: &str = "score";
+    match conn.attached_columns(name) {
+        Some(columns) => columns
+            .iter()
+            .cloned()
+            .chain([attached::ROW_ID.to_string(), SCORE.to_string()])
+            .collect(),
+        None => vec![OSID.to_string(), SOURCE.to_string(), SCORE.to_string()],
+    }
+}
+
+/// The row of an attached table read under `osid`, its row id's digits, as
+/// [`get_row`] gives a row: its columns as the source, and no sequence
+/// number. None when `osid` is no row id or the table holds no such row.
+fn attached_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
+    if !attached::is_row_id(osid) {
+        return None;
+    }
+    let sql = format!(
+        "SELECT * FROM \"{}\" WHERE \"{}\" = {osid} LIMIT 1",
+        name.replace('"', "\"\""),
+        attached::ROW_ID
+    );
+    let batches = match conn.conn.query_sql(&sql) {
+        Ok(batches) => batches,
+        Err(e) => {
+            eprintln!("[capi] get: {e}");
+            return None;
+        }
+    };
+    batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .map(|b| (attached::source_json(b, 0), 0))
+}
+
+/// Most rows of an attached table one statement of [`attached_rows`] asks
+/// for by id.
+const ATTACHED_ROWS_PER_STATEMENT: usize = 500;
+
+/// The rows of an attached table read under `osids`, each id to its source
+/// as [`attached_row`] gives it; an id that is no row id, or names no row,
+/// is absent. A page of a search reads its sources this way once its ids are
+/// chosen: the table has no lookup by id but the row id itself, so the page
+/// is read in one statement over its ids rather than one a row.
+fn attached_rows(conn: &Bridge, name: &str, osids: &[&str]) -> serde_json::Map<String, Value> {
+    let mut found = serde_json::Map::new();
+    let ids: Vec<&str> = osids
+        .iter()
+        .copied()
+        .filter(|id| attached::is_row_id(id))
+        .collect();
+    for chunk in ids.chunks(ATTACHED_ROWS_PER_STATEMENT) {
+        let sql = format!(
+            "SELECT * FROM \"{}\" WHERE \"{}\" IN ({})",
+            name.replace('"', "\"\""),
+            attached::ROW_ID,
+            chunk.join(", ")
+        );
+        let batches = match conn.conn.query_sql(&sql) {
+            Ok(batches) => batches,
+            Err(e) => {
+                eprintln!("[capi] get_many: {e}");
+                continue;
+            }
+        };
+        for batch in &batches {
+            for r in 0..batch.num_rows() {
+                if let Some(id) = attached::id_of(batch, r) {
+                    found.insert(id, Value::String(attached::source_json(batch, r)));
+                }
+            }
+        }
+    }
+    found
+}
+
 /// The source of the row under `osid` and the sequence number it was
 /// written under (0 for a row written without one), or None when the table
 /// holds no such row.
 fn get_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
+    if conn.is_attached(name) {
+        return attached_row(conn, name, osid);
+    }
     let table = conn.table(name).ok()?;
     // A term lookup through the id column's FTS index, projected to the
     // source and the sequence number. A table declared before the id column
@@ -3015,6 +3415,9 @@ pub unsafe extern "C" fn infino_get_many(
                 .filter_map(|p| unsafe { cstr(*p) })
                 .collect()
         };
+        if conn.is_attached(name) {
+            return out_json(Value::Object(attached_rows(conn, name, &ids)));
+        }
         let mut found = serde_json::Map::new();
         for chunk in ids.chunks(GET_MANY_THREADS) {
             let sources: Vec<Option<String>> = std::thread::scope(|scope| {
@@ -3069,6 +3472,10 @@ pub unsafe extern "C" fn infino_drop(h: *mut Bridge, name: *const c_char) -> c_i
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return -1;
         };
+        if let Err(refused) = conn.refuse_write(name) {
+            eprintln!("[capi] drop_table: {refused}");
+            return -2;
+        }
         conn.forget(name);
         match conn.conn.drop_table(name, true) {
             Ok(_) => 0,
@@ -3106,6 +3513,10 @@ unsafe fn optimize_with(h: *mut Bridge, name: *const c_char, options: &OptimizeO
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return -1;
         };
+        // An attached table is its maker's to compact.
+        if conn.is_attached(name) {
+            return 0;
+        }
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(_) => return 0,
@@ -3131,7 +3542,7 @@ pub unsafe extern "C" fn infino_sql(h: *mut Bridge, sql: *const c_char) -> *mut 
         let (Some(conn), Some(sql)) = (bridge_ref(h), unsafe { cstr(sql) }) else {
             return ptr::null_mut();
         };
-        match conn.conn.query_sql(sql) {
+        match conn.query_viewed(sql) {
             Ok(b) => out_string(batches_to_json(&b)),
             Err(e) => err_json(&e.to_string()),
         }
@@ -3216,7 +3627,10 @@ pub unsafe extern "C" fn infino_sql_read(
             .as_u64()
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(usize::MAX);
-        match conn.conn.query_sql(&statement.sql) {
+        // An index attached to a table reads it through the table's view,
+        // as every other statement over it does: the route's own views name
+        // a document's id and source, which only that view gives.
+        match conn.query_viewed(&statement.sql) {
             Ok(batches) => {
                 let Some(rows) = batches_to_json_within(&batches, max_bytes) else {
                     return refused_json(&read_sql::Refusal {
@@ -3365,13 +3779,16 @@ pub unsafe extern "C" fn infino_bm25(
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
+        let columns = ranked_columns(conn, name);
+        let projection: Vec<&str> = columns.iter().map(String::as_str).collect();
         match table.bm25_search(
             column,
             query,
             k.max(0) as usize,
             Bm25SearchOptions::new().with_mode(mode),
-            Some(&[OSID, SOURCE, "score"]),
+            Some(&projection),
         ) {
+            Ok(b) if conn.is_attached(name) => out_string(attached::hits_json(&b, true)),
             Ok(b) => out_string(batches_to_json(&b)),
             Err(e) => err_json(&e.to_string()),
         }
@@ -3438,6 +3855,16 @@ pub unsafe extern "C" fn infino_count_where(
             Ok(p) => p,
             Err(e) => return err_json(&format!("predicates: {e}")),
         };
+        // An attached table is counted by statements, each predicate under
+        // its own WHERE, which lets the scan skip the files the predicate
+        // rules out. The engine's count leans on the range index the plugin
+        // gives its own tables' numbers and dates; a table made elsewhere
+        // has none, and on the hosted service that count is one aggregate
+        // with the predicate in a FILTER clause, read over every row: an
+        // hour of a trillion-row table was counted by reading all of it.
+        if conn.is_attached(name) {
+            return count_where_by_sql(conn, name, &predicates);
+        }
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
@@ -3463,10 +3890,10 @@ pub unsafe extern "C" fn infino_count_where(
             })
             .collect::<Result<Vec<_>, _>>()
         else {
-            return count_where_by_sql(&conn.conn, name, &predicates);
+            return count_where_by_sql(conn, name, &predicates);
         };
         if exprs.iter().any(holds_subquery) {
-            return count_where_by_sql(&conn.conn, name, &predicates);
+            return count_where_by_sql(conn, name, &predicates);
         }
         match table.count_where(&exprs) {
             Ok(counts) => out_string(json!(counts).to_string()),
@@ -3491,12 +3918,14 @@ fn holds_subquery(expr: &Expr) -> bool {
 /// [`infino_count_where`]'s counts as statements over table `name`, one
 /// `COUNT(*) ... WHERE p` per predicate: a FILTER clause cannot hold the
 /// subquery these predicates read.
-fn count_where_by_sql(conn: &Connection, name: &str, predicates: &[String]) -> *mut c_char {
+fn count_where_by_sql(conn: &Bridge, name: &str, predicates: &[String]) -> *mut c_char {
     let table = name.replace('"', "\"\"");
     let mut counts = Vec::with_capacity(predicates.len());
     for p in predicates {
         let sql = format!("SELECT COUNT(*) AS c FROM \"{table}\" WHERE {p}");
-        let batches = match conn.query_sql(&sql) {
+        // A predicate over an attached table reads a document's id, which
+        // only the table's view gives.
+        let batches = match conn.query_viewed(&sql) {
             Ok(b) => b,
             Err(e) => return err_json(&e.to_string()),
         };
@@ -3545,13 +3974,36 @@ pub unsafe extern "C" fn infino_value_counts(
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
+        let max = max_rows.max(0) as usize;
         match table.value_counts(column) {
-            Ok(b) if b.num_rows() > max_rows.max(0) as usize => out_string("null".to_string()),
+            Ok(b) if b.num_rows() > max => out_string("null".to_string()),
             Ok(b) => out_string(batches_to_json(&[b])),
-            Err(e) => err_json(&e.to_string()),
+            // Where the engine's own count fails (the hosted service's does,
+            // on a count it declares non-null and gives null), the grouped
+            // count as a statement gives the same rows.
+            Err(e) => match conn.conn.query_sql(&grouped_count(name, column, max)) {
+                Ok(b) if b.iter().map(RecordBatch::num_rows).sum::<usize>() > max => {
+                    out_string("null".to_string())
+                }
+                Ok(b) => out_string(batches_to_json(&b)),
+                Err(_) => err_json(&e.to_string()),
+            },
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// The grouped count [`infino_value_counts`] gives, as a statement: each
+/// value of `column` in `name` and its rows, under the names the engine's
+/// own count gives them. It stops one group past `max`, which is all the
+/// caller needs to know the column holds too many values to carry.
+fn grouped_count(name: &str, column: &str, max: usize) -> String {
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let (table, column) = (quote(name), quote(column));
+    let limit = max.saturating_add(1);
+    format!(
+        "SELECT {column}, count(*) AS \"count(*)\" FROM {table} GROUP BY {column} LIMIT {limit}"
+    )
 }
 
 /// Unranked full-text match set: the osids of every row matching `query` on
@@ -3576,7 +4028,15 @@ pub unsafe extern "C" fn infino_token_match(
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
-        match table.token_match(column, query, BoolMode::Or, Some(&[OSID])) {
+        // An attached table's rows are read under their row ids.
+        let attached = conn.is_attached(name);
+        let id: &[&str] = if attached {
+            &[attached::ROW_ID]
+        } else {
+            &[OSID]
+        };
+        match table.token_match(column, query, BoolMode::Or, Some(id)) {
+            Ok(b) if attached => out_string(attached::hits_json(&b, false)),
             Ok(b) => out_string(batches_to_json(&b)),
             Err(e) => err_json(&e.to_string()),
         }
@@ -3609,13 +4069,10 @@ pub unsafe extern "C" fn infino_knn(
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
-        match table.vector_search(
-            column,
-            &emb,
-            k.max(0) as usize,
-            None,
-            Some(&[OSID, SOURCE, "score"]),
-        ) {
+        let columns = ranked_columns(conn, name);
+        let projection: Vec<&str> = columns.iter().map(String::as_str).collect();
+        match table.vector_search(column, &emb, k.max(0) as usize, None, Some(&projection)) {
+            Ok(b) if conn.is_attached(name) => out_string(attached::hits_json(&b, true)),
             Ok(b) => out_string(batches_to_json(&b)),
             Err(e) => err_json(&e.to_string()),
         }
@@ -3652,6 +4109,8 @@ pub unsafe extern "C" fn infino_hybrid(
             Ok(t) => t,
             Err(e) => return err_json(&e.to_string()),
         };
+        let columns = ranked_columns(conn, name);
+        let projection: Vec<&str> = columns.iter().map(String::as_str).collect();
         match table.hybrid_search(
             tcol,
             tq,
@@ -3659,8 +4118,9 @@ pub unsafe extern "C" fn infino_hybrid(
             vcol,
             &emb,
             k.max(0) as usize,
-            Some(&[OSID, SOURCE, "score"]),
+            Some(&projection),
         ) {
+            Ok(b) if conn.is_attached(name) => out_string(attached::hits_json(&b, true)),
             Ok(b) => out_string(batches_to_json(&b)),
             Err(e) => err_json(&e.to_string()),
         }
@@ -3706,7 +4166,17 @@ fn batches_to_json_within(batches: &[RecordBatch], max_bytes: usize) -> Option<S
                 }
                 out.push_str(&json_str(field.name()));
                 out.push(':');
-                out.push_str(&cell_json(batch.column(c).as_ref(), r));
+                // An attached table's view gives a document's source as a
+                // struct of the table's columns: handed over as the JSON
+                // text a source is, as the plugin's own column holds it.
+                let source = (field.name() == SOURCE)
+                    .then(|| batch.column(c).as_any().downcast_ref::<StructArray>())
+                    .flatten();
+                match source {
+                    Some(source) if source.is_null(r) => out.push_str("null"),
+                    Some(source) => out.push_str(&json_str(&attached::object_json(source, r))),
+                    None => out.push_str(&cell_json(batch.column(c).as_ref(), r)),
+                }
             }
             out.push('}');
             if out.len() > max_bytes {
@@ -3760,6 +4230,10 @@ fn cell_json(col: &dyn Array, r: usize) -> String {
     // id is past what a JSON number holds exactly.
     if let Some(a) = any.downcast_ref::<Decimal128Array>() {
         return json_str(&a.value_as_string(r));
+    }
+    // The types only a table made outside the plugin holds.
+    if let Some(value) = attached::narrow_cell_json(col, r) {
+        return value;
     }
     "\"<unsupported>\"".into()
 }
@@ -4224,6 +4698,455 @@ mod tests {
         });
         let counts: Vec<u64> = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
         assert_eq!(counts, [1, 4]);
+        close(h);
+    }
+
+    /// A table made outside the plugin, with none of its columns, and the
+    /// result of attaching `mapping` to it.
+    fn attach_plain(h: *mut Bridge, mapping: &str) -> String {
+        take(unsafe { infino_attach_table(h, c("plain").as_ptr(), c(mapping).as_ptr()) })
+    }
+
+    #[test]
+    fn attaching_declares_an_existing_table_and_changes_nothing() {
+        let h = open_logs();
+        let bridge = bridge_ref(h).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("hits", DataType::Int64, false),
+        ]));
+        let spec = IndexSpec::new().fts(FtsField::new("title".to_string()));
+        bridge.conn.create_table("plain", schema, spec).unwrap();
+        let held = || bridge.conn.open_table("plain").unwrap().schema();
+        let before = held();
+
+        let out = attach_plain(
+            h,
+            r#"{"properties":{"title":{"type":"text"},"hits":{"type":"long"}}}"#,
+        );
+        assert!(out.contains("\"created\":false"), "{out}");
+        assert!(out.contains("\"added\":0"), "{out}");
+        assert_eq!(held(), before, "attaching added no column");
+        assert!(held().field_with_name(SEQ).is_err());
+        assert!(bridge.is_attached("plain"));
+
+        // A field the table has no column for is refused, not added.
+        let out = attach_plain(
+            h,
+            r#"{"properties":{"title":{"type":"text"},"views":{"type":"long"}}}"#,
+        );
+        assert!(out.contains("no column for: [views]"), "{out}");
+        assert_eq!(held(), before);
+
+        // A type the table does not hold the column as is refused too.
+        let out = attach_plain(h, r#"{"properties":{"hits":{"type":"keyword"}}}"#);
+        assert!(out.contains("[hits] is mapped as"), "{out}");
+        assert_eq!(held(), before);
+
+        // Attaching never creates the table.
+        let out = take(unsafe { infino_attach_table(h, c("absent").as_ptr(), c("{}").as_ptr()) });
+        assert!(out.contains("does not exist"), "{out}");
+        assert!(bridge.conn.open_table("absent").is_err());
+
+        // A table the plugin wrote is not attached to: it holds a
+        // document's id and source itself.
+        let out = take(unsafe { infino_attach_table(h, c("logs").as_ptr(), c("{}").as_ptr()) });
+        assert!(out.contains("holds a column [osid]"), "{out}");
+
+        // The plugin's own tables are declared as before.
+        assert!(!bridge.is_attached("logs"));
+        close(h);
+    }
+
+    #[test]
+    fn an_attached_table_is_read_as_documents_from_its_own_columns() {
+        let h = open_logs();
+        let bridge = bridge_ref(h).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("time", DataType::Timestamp(TimeUnit::Second, None), false),
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("hits", DataType::Int64, false),
+            Field::new("page_id", DataType::Int64, true),
+        ]));
+        let spec = IndexSpec::new().fts(FtsField::new("title".to_string()));
+        bridge.conn.create_table("plain", schema, spec).unwrap();
+        bridge
+            .conn
+            .open_table("plain")
+            .unwrap()
+            .append_rows(&[
+                json!({"time": "2025-05-08T18:00:00", "title": "Pope \"Leo\" XIV", "hits": 9, "page_id": 7}),
+                json!({"time": "2025-05-08T19:00:00", "title": "India national team", "hits": 5, "page_id": null}),
+                json!({"time": "2025-05-08T20:00:00", "title": "India", "hits": 3, "page_id": 2}),
+            ])
+            .unwrap();
+        let before = bridge.conn.open_table("plain").unwrap().schema();
+        let out = attach_plain(
+            h,
+            r#"{"properties":{"time":{"type":"date"},"title":{"type":"text"},"hits":{"type":"long"},"page_id":{"type":"long"}}}"#,
+        );
+        assert!(out.contains("\"added\":0"), "{out}");
+
+        // A sorted page, as the plugin asks for one: ids only, newest first.
+        let page = sql(
+            h,
+            r#"SELECT osid, "time" AS "time", "_id" AS "_id" FROM "plain" WHERE 1=1 ORDER BY "time" DESC NULLS LAST, "_id" ASC NULLS LAST LIMIT 2"#,
+        );
+        let ids: Vec<String> = page
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["osid"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 2, "{page}");
+        assert!(ids.iter().all(|id| attached::is_row_id(id)), "{page}");
+        // The id a row is read under is its row id.
+        assert_eq!(page[0]["osid"], page[0]["_id"], "{page}");
+
+        // Its source by id, the row's columns as one document: a null left
+        // out, a time as an instant, a quote escaped.
+        let newest: Value = serde_json::from_str(&take(unsafe {
+            infino_get(h, c("plain").as_ptr(), c(&ids[0]).as_ptr())
+        }))
+        .unwrap();
+        assert_eq!(
+            newest,
+            json!({"time": "2025-05-08T20:00:00.000Z", "title": "India", "hits": 3, "page_id": 2})
+        );
+        let second: Value = serde_json::from_str(&take(unsafe {
+            infino_get(h, c("plain").as_ptr(), c(&ids[1]).as_ptr())
+        }))
+        .unwrap();
+        assert_eq!(
+            second,
+            json!({"time": "2025-05-08T19:00:00.000Z", "title": "India national team", "hits": 5})
+        );
+        // An id that is no row id names no row.
+        assert_eq!(
+            take(unsafe { infino_get(h, c("plain").as_ptr(), c("a' OR '1'='1").as_ptr()) }),
+            ""
+        );
+
+        // The source read in a statement is the same document, as text.
+        let rows = sql(
+            h,
+            r#"SELECT osid, source, osseq FROM "plain" WHERE "hits" = 9"#,
+        );
+        let source: Value = serde_json::from_str(rows[0]["source"].as_str().unwrap()).unwrap();
+        assert_eq!(source["title"], "Pope \"Leo\" XIV", "{rows}");
+        assert_eq!(source["time"], "2025-05-08T18:00:00.000Z", "{rows}");
+        assert!(rows[0]["osseq"].is_null(), "{rows}");
+
+        // A ranked search gives hits of the same shape.
+        let hits: Value = serde_json::from_str(&take(unsafe {
+            infino_bm25(
+                h,
+                c("plain").as_ptr(),
+                c("title").as_ptr(),
+                c("india").as_ptr(),
+                c("or").as_ptr(),
+                10,
+            )
+        }))
+        .unwrap();
+        let hits = hits.as_array().unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        for hit in hits {
+            assert!(attached::is_row_id(hit["osid"].as_str().unwrap()), "{hit}");
+            assert!(hit["score"].as_f64().unwrap() > 0.0, "{hit}");
+            let source: Value = serde_json::from_str(hit["source"].as_str().unwrap()).unwrap();
+            assert!(source["title"].as_str().unwrap().contains("India"), "{hit}");
+            assert!(
+                source.get("score").is_none() && source.get("_id").is_none(),
+                "{hit}"
+            );
+        }
+
+        // A token match gives the ids, in a statement and through the bridge.
+        let matched = sql(
+            h,
+            r#"SELECT osid FROM token_match('plain', 'title', 'india', 'or') WHERE 1=1"#,
+        );
+        assert_eq!(matched.as_array().unwrap().len(), 2, "{matched}");
+        let matched: Value = serde_json::from_str(&take(unsafe {
+            infino_token_match(
+                h,
+                c("plain").as_ptr(),
+                c("title").as_ptr(),
+                c("india").as_ptr(),
+            )
+        }))
+        .unwrap();
+        assert_eq!(matched.as_array().unwrap().len(), 2, "{matched}");
+        assert!(matched[0].get("source").is_none(), "{matched}");
+
+        // A page's sources are read by their ids together; an id that names
+        // no row is absent.
+        let idp: Vec<CString> = ids.iter().map(|id| c(id)).chain([c("nope")]).collect();
+        let ptrs: Vec<*const c_char> = idp.iter().map(|x| x.as_ptr()).collect();
+        let many: Value = serde_json::from_str(&take(unsafe {
+            infino_get_many(h, c("plain").as_ptr(), ptrs.as_ptr(), ptrs.len() as c_int)
+        }))
+        .unwrap();
+        assert_eq!(many.as_object().unwrap().len(), 2, "{many}");
+        let source: Value = serde_json::from_str(many[&ids[0]].as_str().unwrap()).unwrap();
+        assert_eq!(source["title"], "India", "{many}");
+
+        // A count under a text clause, which reads ids through a subquery,
+        // and one under a plain predicate.
+        let counts = take(unsafe {
+            infino_count_where(
+                h,
+                c("plain").as_ptr(),
+                c(r#"["osid IN (SELECT osid FROM token_match('plain', 'title', 'india', 'or'))", "\"hits\" > 4"]"#).as_ptr(),
+            )
+        });
+        assert_eq!(counts, "[2,2]");
+
+        // Reading changed nothing, and the plugin's own tables read as before.
+        assert_eq!(bridge.conn.open_table("plain").unwrap().schema(), before);
+        index(h, &[("a", r#"{"message":"disk full","level":"error"}"#)]);
+        assert!(get(h, "a").contains("disk full"));
+        close(h);
+    }
+
+    /// A table made outside the plugin: a title under a full-text index
+    /// without positions, a status under one too, and a count; three rows.
+    fn plain_table(bridge: &Bridge) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("status", DataType::LargeUtf8, false),
+            Field::new("hits", DataType::Int64, false),
+        ]));
+        let spec = IndexSpec::new()
+            .fts(FtsField::new("title".to_string()))
+            .fts(FtsField::new("status".to_string()));
+        bridge.conn.create_table("plain", schema, spec).unwrap();
+        bridge
+            .conn
+            .open_table("plain")
+            .unwrap()
+            .append_rows(&[
+                json!({"title": "India national team", "status": "in progress", "hits": 9}),
+                json!({"title": "India", "status": "progress in review", "hits": 5}),
+                json!({"title": "Pope Leo XIV", "status": "done", "hits": 3}),
+            ])
+            .unwrap();
+    }
+
+    const PLAIN_MAPPING: &str = r#"{"properties":{"title":{"type":"text"},"status":{"type":"keyword"},"hits":{"type":"long"}}}"#;
+
+    #[test]
+    fn nothing_is_written_to_an_attached_table_through_the_bridge() {
+        let h = open_logs();
+        let bridge = bridge_ref(h).unwrap();
+        plain_table(bridge);
+        assert!(attach_plain(h, PLAIN_MAPPING).contains("\"added\":0"));
+        let before = bridge.conn.open_table("plain").unwrap().schema();
+        let rows = || sql(h, r#"SELECT count(*) AS c FROM "plain""#)[0]["c"].clone();
+        assert_eq!(rows(), 3);
+        let refused = "is never written through it";
+
+        // An append of documents, as a shard's engine sends one.
+        let (id, src) = (c("a"), c(r#"{"title":"x","hits":1,"tags":["t"]}"#));
+        let out = take(unsafe {
+            infino_index_batch(h, c("plain").as_ptr(), [id.as_ptr()].as_ptr(), [src.as_ptr()].as_ptr(), 1)
+        });
+        assert!(out.contains(refused), "{out}");
+
+        // A batch prepared for it, which could add a list field's column.
+        let doc = br#"a{"title":"x","hits":1,"tags":["t"]}"#;
+        let p = unsafe {
+            infino_prepare_batch(
+                h,
+                c("plain").as_ptr(),
+                doc.as_ptr(),
+                doc.len(),
+                [1u32].as_ptr(),
+                [doc.len() as u32].as_ptr(),
+                1,
+            )
+        };
+        assert!(p.is_null(), "no batch is prepared for an attached table");
+
+        // A batch prepared for another table, appended to this one.
+        let p = prepared(h, &[("a", r#"{"level":"info"}"#)]);
+        let out = take(unsafe {
+            infino_append_prepared(
+                h,
+                c("plain").as_ptr(),
+                [p].as_ptr(),
+                1,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+            )
+        });
+        assert!(out.contains(refused), "{out}");
+
+        // A delete by id, as an update and a delete by query send one: the
+        // ids are the table's own row ids, which would name real rows.
+        let ids = sql(h, r#"SELECT osid FROM "plain""#);
+        let ids: Vec<CString> = ids
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| c(r["osid"].as_str().unwrap()))
+            .collect();
+        let idp: Vec<*const c_char> = ids.iter().map(|x| x.as_ptr()).collect();
+        let rc = unsafe { infino_delete_osids(h, c("plain").as_ptr(), idp.as_ptr(), idp.len() as c_int) };
+        assert_eq!(rc, -2);
+
+        // Neither compacted nor dropped.
+        assert_eq!(unsafe { infino_optimize(h, c("plain").as_ptr()) }, 0);
+        assert_eq!(unsafe { infino_drop(h, c("plain").as_ptr()) }, -2);
+
+        assert_eq!(rows(), 3, "every row is still there");
+        assert_eq!(bridge.conn.open_table("plain").unwrap().schema(), before);
+        // A table of the plugin's own is written as before.
+        assert_eq!(index(h, &[("a", r#"{"level":"info"}"#)])["ok"], 1);
+        close(h);
+    }
+
+    #[test]
+    fn the_sql_route_reads_an_attached_table_through_its_view() {
+        let h = open_logs();
+        plain_table(bridge_ref(h).unwrap());
+        assert!(attach_plain(h, PLAIN_MAPPING).contains("\"added\":0"));
+        // The view the route gives an index: the columns `infino_columns`
+        // lists for its table, a document's id and source among them.
+        let listed: Value =
+            serde_json::from_str(&take(unsafe { infino_columns(h, c("plain").as_ptr()) })).unwrap();
+        let listed: Vec<String> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|col| col["name"].as_str().unwrap().to_string())
+            .filter(|name| name != SEQ)
+            .collect();
+        assert!(listed.iter().any(|name| name == OSID), "{listed:?}");
+        let view = format!(
+            "SELECT {} FROM \"plain\"",
+            listed.iter().map(|name| format!("\"{name}\"")).collect::<Vec<_>>().join(", ")
+        );
+        let views = json!({
+            "relations": {"pages": view},
+            "searches": {},
+            "unsearchable": {},
+            "output_only": [],
+            "whole": {},
+            "max_result_bytes": 1_000_000,
+        })
+        .to_string();
+        let read = |statement: &str| -> Value {
+            let out = take(unsafe { infino_sql_read(h, c(statement).as_ptr(), c(&views).as_ptr()) });
+            serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+        };
+
+        let all = read("SELECT * FROM pages ORDER BY hits DESC");
+        assert!(all.get("error").is_none(), "{all}");
+        let rows = all["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{all}");
+        assert_eq!(rows[0]["title"], "India national team", "{all}");
+        assert!(attached::is_row_id(rows[0]["osid"].as_str().unwrap()), "{all}");
+        let source: Value = serde_json::from_str(rows[0]["source"].as_str().unwrap()).unwrap();
+        assert_eq!(source["hits"], 9, "{all}");
+
+        let summed = read("SELECT sum(hits) AS total FROM pages WHERE hits > 3");
+        assert_eq!(summed["rows"][0]["total"], 14, "{summed}");
+        close(h);
+    }
+
+    #[test]
+    fn an_attached_column_is_text_only_where_its_mapping_says_so() {
+        let h = open_logs();
+        let bridge = bridge_ref(h).unwrap();
+        plain_table(bridge);
+        assert!(attach_plain(h, PLAIN_MAPPING).contains("\"added\":0"));
+        let fts = |h: *mut Bridge, column: &str| -> bool {
+            let listed: Value =
+                serde_json::from_str(&take(unsafe { infino_columns(h, c("plain").as_ptr()) })).unwrap();
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|col| col["name"] == column)
+                .unwrap()["fts"]
+                .as_bool()
+                .unwrap()
+        };
+        // Both columns hold a full-text index without positions. The one
+        // mapped as text is searched as text; the one mapped as a keyword is
+        // compared whole, so "in progress" is not also "progress in review".
+        assert!(fts(h, "title"));
+        assert!(!fts(h, "status"));
+        let exact = sql(h, r#"SELECT osid FROM "plain" WHERE "status" = 'in progress'"#);
+        assert_eq!(exact.as_array().unwrap().len(), 1, "{exact}");
+
+        // Mapped the other way round, each is read the other way.
+        let swapped = r#"{"properties":{"title":{"type":"keyword"},"status":{"type":"text"}}}"#;
+        assert!(attach_plain(h, swapped).contains("\"added\":0"));
+        assert!(!fts(h, "title"));
+        assert!(fts(h, "status"));
+        close(h);
+    }
+
+    #[test]
+    fn a_table_with_a_score_column_of_its_own_is_not_attached_to() {
+        let h = open_logs();
+        let bridge = bridge_ref(h).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("score", DataType::Int64, false),
+        ]));
+        bridge
+            .conn
+            .create_table("rated", schema, IndexSpec::new().fts(FtsField::new("title".to_string())))
+            .unwrap();
+        let out = take(unsafe { infino_attach_table(h, c("rated").as_ptr(), c("{}").as_ptr()) });
+        assert!(out.contains("holds a column [score]"), "{out}");
+        assert!(!bridge.is_attached("rated"));
+        close(h);
+    }
+
+    #[test]
+    fn whether_a_table_could_be_attached_to_is_answered_without_attaching() {
+        let h = open_logs();
+        let bridge = bridge_ref(h).unwrap();
+        plain_table(bridge);
+        let check = |table: &str, mapping: &str| -> Value {
+            let out = take(unsafe { infino_attach_check(h, c(table).as_ptr(), c(mapping).as_ptr()) });
+            serde_json::from_str(&out).unwrap()
+        };
+        // A table that is there and holds what the mapping names.
+        let fits = check("plain", r#"{"properties":{"title":{"type":"text"}}}"#);
+        assert!(fits["refused"].is_null(), "{fits}");
+        // Asking attaches nothing: the table is still written as any other.
+        assert!(!bridge.is_attached("plain"));
+        assert!(bridge.refuse_write("plain").is_ok());
+        // A table that is not there.
+        let missing = check("nowhere", "{}");
+        assert!(missing["refused"].as_str().unwrap().contains("does not exist"), "{missing}");
+        // A field the table has no column for.
+        let unknown = check("plain", r#"{"properties":{"absent":{"type":"keyword"}}}"#);
+        assert!(unknown["refused"].as_str().unwrap().contains("no column for"), "{unknown}");
+        // A table the plugin wrote.
+        let own = check("logs", "{}");
+        assert!(own["refused"].as_str().unwrap().contains("holds a column [osid]"), "{own}");
+        close(h);
+    }
+
+    #[test]
+    fn the_grouped_count_stops_one_group_past_what_the_caller_carries() {
+        assert_eq!(
+            grouped_count("t", "a\"b", 10),
+            "SELECT \"a\"\"b\", count(*) AS \"count(*)\" FROM \"t\" GROUP BY \"a\"\"b\" LIMIT 11"
+        );
+        let h = open_logs();
+        plain_table(bridge_ref(h).unwrap());
+        let groups = sql(h, &grouped_count("plain", "status", 1));
+        assert_eq!(groups.as_array().unwrap().len(), 2, "one past the two a caller of 1 carries");
         close(h);
     }
 
