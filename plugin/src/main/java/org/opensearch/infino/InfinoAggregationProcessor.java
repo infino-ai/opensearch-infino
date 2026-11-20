@@ -740,7 +740,7 @@ public class InfinoAggregationProcessor {
                 // Otherwise the filter is a level of its own, its predicate a WHERE.
             }
             if (b instanceof TopHitsAggregationBuilder th) {
-                return TopHits.of(th, cols, access, now);
+                return TopHits.of(th, cols, table, access, now);
             }
             List<Metric> metrics = new ArrayList<>();
             List<TopHits> hits = new ArrayList<>();
@@ -1453,7 +1453,7 @@ public class InfinoAggregationProcessor {
             this.access = access;
         }
 
-        static TopHits of(TopHitsAggregationBuilder b, Map<String, Column> cols, InfinoAccess access, long now) {
+        static TopHits of(TopHitsAggregationBuilder b, Map<String, Column> cols, String table, InfinoAccess access, long now) {
             if (b.size() > MAX_TOP_HITS) {
                 throw new Unsupported("aggregation [" + b.getName() + "] asks for " + b.size() + " hits per bucket; at most " + MAX_TOP_HITS + " are served");
             }
@@ -1464,7 +1464,8 @@ public class InfinoAggregationProcessor {
             }
             List<SortSpec> sorts;
             try {
-                sorts = InfinoSearch.sorts(b.sorts(), cols, now);
+                // An integer, short or byte field's missing value stands in as a 32-bit int, as on the page.
+                sorts = InfinoSearch.sorts(b.sorts(), cols, Set.of(), InfinoNative.intFields(table), now, false);
             } catch (IllegalArgumentException e) {
                 throw new Unsupported("aggregation [" + b.getName() + "] " + e.getMessage());
             }

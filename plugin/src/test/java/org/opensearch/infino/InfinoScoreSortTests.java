@@ -4,7 +4,10 @@
 
 package org.opensearch.infino;
 
+import org.opensearch.core.index.Index;
 import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.infino.InfinoScriptTranslator.SqlType;
+import org.opensearch.search.SearchHit;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.collapse.CollapseBuilder;
@@ -14,6 +17,7 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -303,6 +307,123 @@ public class InfinoScoreSortTests extends OpenSearchTestCase {
         // The score alone, or beside _doc, is no sort beside a field.
         assertFalse(plan(disk().sort(new ScoreSortBuilder().order(SortOrder.ASC))).ranksByScore());
         assertTrue(plan(disk().sort(new ScoreSortBuilder()).sort("_doc")).sorts().isEmpty());
+    }
+
+    /**
+     * Under track_scores, a scored query sorted by a field alone is ordered
+     * by the field, each hit carrying the score its unsorted page gives it,
+     * and max_score the best score of every match, not of the page alone:
+     * from the first hit and past it, with a bonus clause and with a filter
+     * applied after the ranking.
+     */
+    public void testTrackScoresBesideAFieldSortScoresEachHitAsUnsorted() {
+        List<SearchSourceBuilder> queries = List.of(
+            disk(),
+            new SearchSourceBuilder().query(
+                QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.termQuery("status", "ok"))
+            ),
+            new SearchSourceBuilder().query(
+                QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).filter(QueryBuilders.termQuery("tags", "keep"))
+            )
+        );
+        for (SearchSourceBuilder query : queries) {
+            InfinoSearch.Page unsorted = page(copy(query).size(DOCS));
+            Map<String, Float> want = new HashMap<>();
+            for (SearchHit hit : unsorted.hits()) {
+                want.put(hit.getId(), hit.getScore());
+            }
+            assertFalse(want.isEmpty());
+            float best = want.values().stream().max(Float::compare).orElseThrow();
+            assertEquals(best, unsorted.maxScore(), 1e-6);
+            for (int from : new int[] { 0, 1 }) {
+                SearchSourceBuilder sorted = copy(query).sort("seq", SortOrder.ASC).trackScores(true).from(from).size(4);
+                InfinoSearch.Plan plan = plan(sorted);
+                assertTrue(InfinoSearch.scoresBesideSort(plan, sorted));
+                InfinoSearch.Page page = page(sorted);
+                // The page is every row up to its end; the window is cut after the merge.
+                assertEquals(Math.min(from + 4, want.size()), page.hits().size());
+                int lastSeq = -1;
+                for (SearchHit hit : page.hits()) {
+                    int seq = DOCS - 1 - Integer.parseInt(hit.getId());
+                    assertTrue(lastSeq < seq);
+                    lastSeq = seq;
+                    assertEquals(query + " hit " + hit.getId(), want.get(hit.getId()), hit.getScore(), 1e-6);
+                    assertEquals(((Number) hit.getSortValues()[0]).intValue(), seq);
+                }
+                assertEquals(query.toString(), best, page.maxScore(), 1e-6);
+                // Without track_scores the hits carry no score, and the page no max_score.
+                InfinoSearch.Page untracked = page(copy(query).sort("seq", SortOrder.ASC).from(from).size(4));
+                assertTrue(Float.isNaN(untracked.hits().get(0).getScore()));
+                assertTrue(Float.isNaN(untracked.maxScore()));
+            }
+        }
+        // A query whose hits all score alike keeps scoring the constant.
+        SearchSourceBuilder constant = new SearchSourceBuilder().query(QueryBuilders.matchAllQuery())
+            .sort("seq", SortOrder.ASC)
+            .trackScores(true)
+            .size(3);
+        assertFalse(InfinoSearch.scoresBesideSort(plan(constant), constant));
+        InfinoSearch.Page page = page(constant);
+        assertEquals(1.0f, page.hits().get(0).getScore(), 0);
+        assertEquals(1.0f, page.maxScore(), 0);
+    }
+
+    /**
+     * A missing sort value carries stock's stand-in: the least long (int,
+     * on an integer, short or byte field) or double when the missing rows' side comes last in a descending sort or
+     * first in an ascending one, else the greatest; null on any other type.
+     * A search_after value equal to the stand-in resumes among the missing rows.
+     */
+    public void testAMissingSortValueCarriesStocksStandIn() {
+        for (boolean desc : new boolean[] { false, true }) {
+            for (boolean nullsFirst : new boolean[] { false, true }) {
+                boolean least = desc != nullsFirst;
+                InfinoSearch.SortSpec longs = new InfinoSearch.SortSpec("n", "n", SqlType.INT, desc, nullsFirst, false);
+                InfinoSearch.SortSpec dates = new InfinoSearch.SortSpec("d", "d", SqlType.DATE, desc, nullsFirst, false);
+                InfinoSearch.SortSpec doubles = new InfinoSearch.SortSpec("f", "f", SqlType.FLOAT, desc, nullsFirst, false);
+                InfinoSearch.SortSpec strings = new InfinoSearch.SortSpec("k", "k", SqlType.STRING, desc, nullsFirst, false);
+                InfinoSearch.SortSpec ints = new InfinoSearch.SortSpec("i", "i", SqlType.INT, desc, nullsFirst, false, true);
+                assertEquals(least ? Long.MIN_VALUE : Long.MAX_VALUE, longs.orStandIn(null));
+                // An integer, short or byte field: the 32-bit int bound, as stock's int comparator.
+                assertEquals(least ? (long) Integer.MIN_VALUE : (long) Integer.MAX_VALUE, ints.orStandIn(null));
+                assertEquals(least ? Long.MIN_VALUE : Long.MAX_VALUE, dates.orStandIn(null));
+                assertEquals(least ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY, doubles.orStandIn(null));
+                assertNull(strings.orStandIn(null));
+                assertEquals(7L, longs.orStandIn(7L));
+                assertEquals("a", strings.orStandIn("a"));
+                for (InfinoSearch.SortSpec s : List.of(longs, ints, dates, doubles)) {
+                    assertTrue(s.missingStandIn(s.standIn()));
+                    assertTrue(s.missingStandIn(s.standIn().toString()));
+                    assertFalse(s.missingStandIn(7L));
+                }
+                assertFalse(strings.missingStandIn(null));
+                // A sort whose missing value stands in a given value has no missing rows.
+                InfinoSearch.SortSpec given = new InfinoSearch.SortSpec("n", "n", SqlType.INT, desc, nullsFirst, true);
+                assertNull(given.orStandIn(null));
+                assertFalse(given.missingStandIn(given.standIn()));
+            }
+        }
+    }
+
+    /** The hit statement leaves out each hit's source when asked to, as the score reads under track_scores do. */
+    public void testAHitStatementWithoutSources() {
+        InfinoSearch.Plan plan = plan(disk());
+        String with = InfinoSearch.hitStatement(plan, 3, false, InfinoSearch.Keyset.WHOLE, 4, true);
+        String without = InfinoSearch.hitStatement(plan, 3, false, InfinoSearch.Keyset.WHOLE, 4, false);
+        assertTrue(with, with.contains(InfinoQueryTranslator.SOURCE));
+        assertFalse(without, without.contains(InfinoQueryTranslator.SOURCE));
+        List<Map<String, Object>> rows = InfinoNative.sqlRows(without);
+        assertEquals(3, rows.size());
+        assertNull(rows.get(0).get(InfinoQueryTranslator.SOURCE));
+        assertTrue(rows.get(0).get(InfinoSearch.SCORE) instanceof Number);
+    }
+
+    private static InfinoSearch.Page page(SearchSourceBuilder source) {
+        return InfinoSearch.page(new Index(TABLE, "uuid-" + TABLE), plan(source), source.fetchSource(false), true);
+    }
+
+    private static SearchSourceBuilder copy(SearchSourceBuilder source) {
+        return new SearchSourceBuilder().query(source.query());
     }
 
     private static void assertRefused(SearchSourceBuilder source, String why) {

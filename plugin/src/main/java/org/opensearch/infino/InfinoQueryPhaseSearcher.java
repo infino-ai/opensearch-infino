@@ -564,15 +564,14 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
     /**
      * The value a missing sort value stands in as, so it sorts where the plan
      * puts it in its direction: the least value when that side comes last in
-     * a descending sort or first in an ascending one, else the greatest.
+     * a descending sort or first in an ascending one, else the greatest
+     * ({@link SortSpec#standIn} for a long or a double).
      */
     private static Object missing(SortField.Type type, SortSpec s) {
-        boolean least = s.desc() != s.nullsFirst();
-        return switch (type) {
-            case LONG -> least ? Long.MIN_VALUE : Long.MAX_VALUE;
-            case DOUBLE -> least ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
-            default -> least ? SortField.STRING_FIRST : SortField.STRING_LAST;
-        };
+        if (type == SortField.Type.STRING) {
+            return s.desc() != s.nullsFirst() ? SortField.STRING_FIRST : SortField.STRING_LAST;
+        }
+        return s.standIn();
     }
 
     /** A hit's sort values from the table as its sort fields compare them. */

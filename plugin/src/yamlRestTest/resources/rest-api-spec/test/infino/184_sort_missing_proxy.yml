@@ -1,0 +1,442 @@
+# A hit missing a long, integer, date or double sort value carries the value
+# stock's comparator stands in for it, in proxy mode as in default mode: the
+# least long (int, on an integer field) or double where the missing rows'
+# side comes last in a descending sort or first in an ascending one, else the
+# greatest. Sent back as search_after, it resumes among the missing rows. A
+# top_hits hit carries it too.
+setup:
+  - do:
+      indices.create:
+        index: smp_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long }, i: { type: integer }, d: { type: date }, f: { type: double }, k: { type: keyword } } }
+  - do:
+      indices.create:
+        index: smp_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long }, i: { type: integer }, d: { type: date }, f: { type: double }, k: { type: keyword } } }
+  - do:
+      indices.create:
+        index: smp_default
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long }, i: { type: integer }, d: { type: date }, f: { type: double }, k: { type: keyword } } }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: smp_luc
+        body:
+          - index: { _id: "p1" }
+          - { n: 5, i: 5, d: "2026-01-05", f: 5.5, k: p1 }
+          - index: { _id: "p2" }
+          - { n: 3, i: 3, d: "2026-01-03", f: 3.5, k: p2 }
+          - index: { _id: "m1" }
+          - { k: m1 }
+          - index: { _id: "m2" }
+          - { k: m2 }
+  - do:
+      bulk:
+        refresh: true
+        index: smp_proxy
+        body:
+          - index: { _id: "p1" }
+          - { n: 5, i: 5, d: "2026-01-05", f: 5.5, k: p1 }
+          - index: { _id: "p2" }
+          - { n: 3, i: 3, d: "2026-01-03", f: 3.5, k: p2 }
+          - index: { _id: "m1" }
+          - { k: m1 }
+          - index: { _id: "m2" }
+          - { k: m2 }
+  - do:
+      bulk:
+        refresh: true
+        index: smp_default
+        body:
+          - index: { _id: "p1" }
+          - { n: 5, i: 5, d: "2026-01-05", f: 5.5, k: p1 }
+          - index: { _id: "p2" }
+          - { n: 3, i: 3, d: "2026-01-03", f: 3.5, k: p2 }
+          - index: { _id: "m1" }
+          - { k: m1 }
+          - index: { _id: "m2" }
+          - { k: m2 }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: smp_luc,smp_proxy,smp_default
+        ignore_unavailable: true
+
+---
+"A missing sort value carries stock's stand-in, and resumes as search_after among the missing rows":
+  # JSON, whose responses carry Infinity and -Infinity as strings; the other
+  # content types carry them as numbers.
+  - skip:
+      features: headers
+  # n ascending, missing last: the greatest long; d descending, missing first:
+  # the greatest; f ascending, missing first: the least double.
+  - do:
+      headers: { Content-Type: application/json, Accept: application/json }
+      search:
+        index: smp_luc
+        body:
+          size: 3
+          sort: [ { n: { order: asc, missing: _last } }, { d: { order: desc, missing: _first } }, { f: { order: asc, missing: _first } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: p2 }
+  - match: { hits.hits.1._id: p1 }
+  - match: { hits.hits.2._id: m1 }
+  - match: { hits.hits.0.sort.0: 3 }
+  - match: { hits.hits.2.sort.0: 9223372036854775807 }
+  - match: { hits.hits.2.sort.1: 9223372036854775807 }
+  - match: { hits.hits.2.sort.2: "-Infinity" }
+  - match: { hits.hits.2.sort.3: m1 }
+  - set: { hits.hits.2.sort: after_smp_luc }
+  - do:
+      headers: { Content-Type: application/json, Accept: application/json }
+      search:
+        index: smp_luc
+        body:
+          size: 3
+          sort: [ { n: { order: asc, missing: _last } }, { d: { order: desc, missing: _first } }, { f: { order: asc, missing: _first } }, { k: asc } ]
+          search_after: $after_smp_luc
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: m2 }
+  - match: { hits.hits.0.sort.0: 9223372036854775807 }
+  # n descending, missing last: the least long; d ascending, missing first:
+  # the least; f descending, missing first: the greatest double.
+  - do:
+      headers: { Content-Type: application/json, Accept: application/json }
+      search:
+        index: smp_luc
+        body:
+          size: 4
+          sort: [ { n: { order: desc, missing: _last } }, { d: { order: asc, missing: _first } }, { f: { order: desc, missing: _first } }, { k: asc } ]
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: p1 }
+  - match: { hits.hits.1._id: p2 }
+  - match: { hits.hits.2._id: m1 }
+  - match: { hits.hits.3._id: m2 }
+  - match: { hits.hits.0.sort.0: 5 }
+  - match: { hits.hits.3.sort.0: -9223372036854775808 }
+  - match: { hits.hits.3.sort.1: -9223372036854775808 }
+  - match: { hits.hits.3.sort.2: "Infinity" }
+  # Sorted by the missing value alone, a double missing first ascending is the least.
+  - do:
+      headers: { Content-Type: application/json, Accept: application/json }
+      search:
+        index: smp_luc
+        body:
+          size: 2
+          sort: [ { f: { order: asc, missing: _first } }, { k: asc } ]
+  - match: { hits.hits.0._id: m1 }
+  - match: { hits.hits.0.sort.0: "-Infinity" }
+  - match: { hits.hits.1._id: m2 }
+
+  # n ascending, missing last: the greatest long; d descending, missing first:
+  # the greatest; f ascending, missing first: the least double.
+  - do:
+      headers: { Content-Type: application/json, Accept: application/json }
+      search:
+        index: smp_proxy
+        body:
+          size: 3
+          sort: [ { n: { order: asc, missing: _last } }, { d: { order: desc, missing: _first } }, { f: { order: asc, missing: _first } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: p2 }
+  - match: { hits.hits.1._id: p1 }
+  - match: { hits.hits.2._id: m1 }
+  - match: { hits.hits.0.sort.0: 3 }
+  - match: { hits.hits.2.sort.0: 9223372036854775807 }
+  - match: { hits.hits.2.sort.1: 9223372036854775807 }
+  - match: { hits.hits.2.sort.2: "-Infinity" }
+  - match: { hits.hits.2.sort.3: m1 }
+  - set: { hits.hits.2.sort: after_smp_proxy }
+  - do:
+      headers: { Content-Type: application/json, Accept: application/json }
+      search:
+        index: smp_proxy
+        body:
+          size: 3
+          sort: [ { n: { order: asc, missing: _last } }, { d: { order: desc, missing: _first } }, { f: { order: asc, missing: _first } }, { k: asc } ]
+          search_after: $after_smp_proxy
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: m2 }
+  - match: { hits.hits.0.sort.0: 9223372036854775807 }
+  # n descending, missing last: the least long; d ascending, missing first:
+  # the least; f descending, missing first: the greatest double.
+  - do:
+      headers: { Content-Type: application/json, Accept: application/json }
+      search:
+        index: smp_proxy
+        body:
+          size: 4
+          sort: [ { n: { order: desc, missing: _last } }, { d: { order: asc, missing: _first } }, { f: { order: desc, missing: _first } }, { k: asc } ]
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: p1 }
+  - match: { hits.hits.1._id: p2 }
+  - match: { hits.hits.2._id: m1 }
+  - match: { hits.hits.3._id: m2 }
+  - match: { hits.hits.0.sort.0: 5 }
+  - match: { hits.hits.3.sort.0: -9223372036854775808 }
+  - match: { hits.hits.3.sort.1: -9223372036854775808 }
+  - match: { hits.hits.3.sort.2: "Infinity" }
+  # Sorted by the missing value alone, a double missing first ascending is the least.
+  - do:
+      headers: { Content-Type: application/json, Accept: application/json }
+      search:
+        index: smp_proxy
+        body:
+          size: 2
+          sort: [ { f: { order: asc, missing: _first } }, { k: asc } ]
+  - match: { hits.hits.0._id: m1 }
+  - match: { hits.hits.0.sort.0: "-Infinity" }
+  - match: { hits.hits.1._id: m2 }
+
+  # n ascending, missing last: the greatest long; d descending, missing first:
+  # the greatest; f ascending, missing first: the least double.
+  - do:
+      headers: { Content-Type: application/json, Accept: application/json }
+      search:
+        index: smp_default
+        body:
+          size: 3
+          sort: [ { n: { order: asc, missing: _last } }, { d: { order: desc, missing: _first } }, { f: { order: asc, missing: _first } }, { k: asc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: p2 }
+  - match: { hits.hits.1._id: p1 }
+  - match: { hits.hits.2._id: m1 }
+  - match: { hits.hits.0.sort.0: 3 }
+  - match: { hits.hits.2.sort.0: 9223372036854775807 }
+  - match: { hits.hits.2.sort.1: 9223372036854775807 }
+  - match: { hits.hits.2.sort.2: "-Infinity" }
+  - match: { hits.hits.2.sort.3: m1 }
+  - set: { hits.hits.2.sort: after_smp_default }
+  - do:
+      headers: { Content-Type: application/json, Accept: application/json }
+      search:
+        index: smp_default
+        body:
+          size: 3
+          sort: [ { n: { order: asc, missing: _last } }, { d: { order: desc, missing: _first } }, { f: { order: asc, missing: _first } }, { k: asc } ]
+          search_after: $after_smp_default
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: m2 }
+  - match: { hits.hits.0.sort.0: 9223372036854775807 }
+  # n descending, missing last: the least long; d ascending, missing first:
+  # the least; f descending, missing first: the greatest double.
+  - do:
+      headers: { Content-Type: application/json, Accept: application/json }
+      search:
+        index: smp_default
+        body:
+          size: 4
+          sort: [ { n: { order: desc, missing: _last } }, { d: { order: asc, missing: _first } }, { f: { order: desc, missing: _first } }, { k: asc } ]
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: p1 }
+  - match: { hits.hits.1._id: p2 }
+  - match: { hits.hits.2._id: m1 }
+  - match: { hits.hits.3._id: m2 }
+  - match: { hits.hits.0.sort.0: 5 }
+  - match: { hits.hits.3.sort.0: -9223372036854775808 }
+  - match: { hits.hits.3.sort.1: -9223372036854775808 }
+  - match: { hits.hits.3.sort.2: "Infinity" }
+  # Sorted by the missing value alone, a double missing first ascending is the least.
+  - do:
+      headers: { Content-Type: application/json, Accept: application/json }
+      search:
+        index: smp_default
+        body:
+          size: 2
+          sort: [ { f: { order: asc, missing: _first } }, { k: asc } ]
+  - match: { hits.hits.0._id: m1 }
+  - match: { hits.hits.0.sort.0: "-Infinity" }
+  - match: { hits.hits.1._id: m2 }
+
+---
+"A top_hits hit missing its sort value carries stock's stand-in":
+  - do:
+      search:
+        index: smp_luc
+        body:
+          size: 0
+          aggs:
+            top:
+              top_hits:
+                size: 4
+                sort: [ { n: { order: desc } }, { k: asc } ]
+  - length: { aggregations.top.hits.hits: 4 }
+  - match: { aggregations.top.hits.hits.0._id: p1 }
+  - match: { aggregations.top.hits.hits.0.sort.0: 5 }
+  - match: { aggregations.top.hits.hits.2._id: m1 }
+  - match: { aggregations.top.hits.hits.2.sort.0: -9223372036854775808 }
+  - match: { aggregations.top.hits.hits.3.sort.0: -9223372036854775808 }
+
+  - do:
+      search:
+        index: smp_proxy
+        body:
+          size: 0
+          aggs:
+            top:
+              top_hits:
+                size: 4
+                sort: [ { n: { order: desc } }, { k: asc } ]
+  - length: { aggregations.top.hits.hits: 4 }
+  - match: { aggregations.top.hits.hits.0._id: p1 }
+  - match: { aggregations.top.hits.hits.0.sort.0: 5 }
+  - match: { aggregations.top.hits.hits.2._id: m1 }
+  - match: { aggregations.top.hits.hits.2.sort.0: -9223372036854775808 }
+  - match: { aggregations.top.hits.hits.3.sort.0: -9223372036854775808 }
+
+  - do:
+      search:
+        index: smp_default
+        body:
+          size: 0
+          aggs:
+            top:
+              top_hits:
+                size: 4
+                sort: [ { n: { order: desc } }, { k: asc } ]
+  - length: { aggregations.top.hits.hits: 4 }
+  - match: { aggregations.top.hits.hits.0._id: p1 }
+  - match: { aggregations.top.hits.hits.0.sort.0: 5 }
+  - match: { aggregations.top.hits.hits.2._id: m1 }
+  - match: { aggregations.top.hits.hits.2.sort.0: -9223372036854775808 }
+  - match: { aggregations.top.hits.hits.3.sort.0: -9223372036854775808 }
+
+---
+"An integer field's missing value stands in as stock's 32-bit int bound, on the page and in top_hits":
+  - do:
+      search:
+        index: smp_luc
+        body:
+          size: 3
+          sort: [ { i: { order: asc, missing: _last } }, { k: asc } ]
+  - match: { hits.hits.0._id: p2 }
+  - match: { hits.hits.0.sort.0: 3 }
+  - match: { hits.hits.2._id: m1 }
+  - match: { hits.hits.2.sort.0: 2147483647 }
+  - set: { hits.hits.2.sort: after_i_smp_luc }
+  - do:
+      search:
+        index: smp_luc
+        body:
+          size: 3
+          sort: [ { i: { order: asc, missing: _last } }, { k: asc } ]
+          search_after: $after_i_smp_luc
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: m2 }
+  - match: { hits.hits.0.sort.0: 2147483647 }
+  - do:
+      search:
+        index: smp_luc
+        body:
+          size: 4
+          sort: [ { i: { order: desc, missing: _last } }, { k: asc } ]
+  - match: { hits.hits.0._id: p1 }
+  - match: { hits.hits.3._id: m2 }
+  - match: { hits.hits.3.sort.0: -2147483648 }
+  - do:
+      search:
+        index: smp_luc
+        body:
+          size: 0
+          aggs:
+            top:
+              top_hits:
+                size: 4
+                sort: [ { i: { order: desc } }, { k: asc } ]
+  - match: { aggregations.top.hits.hits.3._id: m2 }
+  - match: { aggregations.top.hits.hits.3.sort.0: -2147483648 }
+
+  - do:
+      search:
+        index: smp_proxy
+        body:
+          size: 3
+          sort: [ { i: { order: asc, missing: _last } }, { k: asc } ]
+  - match: { hits.hits.0._id: p2 }
+  - match: { hits.hits.0.sort.0: 3 }
+  - match: { hits.hits.2._id: m1 }
+  - match: { hits.hits.2.sort.0: 2147483647 }
+  - set: { hits.hits.2.sort: after_i_smp_proxy }
+  - do:
+      search:
+        index: smp_proxy
+        body:
+          size: 3
+          sort: [ { i: { order: asc, missing: _last } }, { k: asc } ]
+          search_after: $after_i_smp_proxy
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: m2 }
+  - match: { hits.hits.0.sort.0: 2147483647 }
+  - do:
+      search:
+        index: smp_proxy
+        body:
+          size: 4
+          sort: [ { i: { order: desc, missing: _last } }, { k: asc } ]
+  - match: { hits.hits.0._id: p1 }
+  - match: { hits.hits.3._id: m2 }
+  - match: { hits.hits.3.sort.0: -2147483648 }
+  - do:
+      search:
+        index: smp_proxy
+        body:
+          size: 0
+          aggs:
+            top:
+              top_hits:
+                size: 4
+                sort: [ { i: { order: desc } }, { k: asc } ]
+  - match: { aggregations.top.hits.hits.3._id: m2 }
+  - match: { aggregations.top.hits.hits.3.sort.0: -2147483648 }
+
+  - do:
+      search:
+        index: smp_default
+        body:
+          size: 3
+          sort: [ { i: { order: asc, missing: _last } }, { k: asc } ]
+  - match: { hits.hits.0._id: p2 }
+  - match: { hits.hits.0.sort.0: 3 }
+  - match: { hits.hits.2._id: m1 }
+  - match: { hits.hits.2.sort.0: 2147483647 }
+  - set: { hits.hits.2.sort: after_i_smp_default }
+  - do:
+      search:
+        index: smp_default
+        body:
+          size: 3
+          sort: [ { i: { order: asc, missing: _last } }, { k: asc } ]
+          search_after: $after_i_smp_default
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: m2 }
+  - match: { hits.hits.0.sort.0: 2147483647 }
+  - do:
+      search:
+        index: smp_default
+        body:
+          size: 4
+          sort: [ { i: { order: desc, missing: _last } }, { k: asc } ]
+  - match: { hits.hits.0._id: p1 }
+  - match: { hits.hits.3._id: m2 }
+  - match: { hits.hits.3.sort.0: -2147483648 }
+  - do:
+      search:
+        index: smp_default
+        body:
+          size: 0
+          aggs:
+            top:
+              top_hits:
+                size: 4
+                sort: [ { i: { order: desc } }, { k: asc } ]
+  - match: { aggregations.top.hits.hits.3._id: m2 }
+  - match: { aggregations.top.hits.hits.3.sort.0: -2147483648 }

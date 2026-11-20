@@ -3,7 +3,9 @@
 # on the hit and among its sort values, as stock does (#133). A query whose hits all score
 # alike is ordered by the field, the one score among the sort values. Mixed
 # sorts the table cannot order as stock does are refused. A match in filter
-# context scores nothing, as in stock, sorted or not.
+# context scores nothing, as in stock, sorted or not. Sorted by fields alone
+# under track_scores, each hit carries the score it has unsorted, and
+# max_score is the best of every match, not of the page alone.
 setup:
   - do:
       indices.create:
@@ -808,3 +810,98 @@ teardown:
         index: ssort_default
         body: { query: { bool: { filter: [{ match: { message: disk } }] } } }
   - match: { count: 6 }
+
+---
+"A field sort under track_scores scores each hit as unsorted, max_score the best of every match":
+  # By seq, the match's hits are d04 d02 d05 d03 d07 d01: the page from 2
+  # holds two "disk full" hits, and max_score is a "disk disk" hit's, off the page.
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { match: { message: disk } }
+          sort: [ { seq: asc } ]
+          track_scores: true
+          from: 2
+          size: 2
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: d05 }
+  - match: { hits.hits.1._id: d03 }
+  - gt: { hits.hits.0._score: 0.1469 }
+  - lt: { hits.hits.0._score: 0.1489 }
+  - gt: { hits.hits.1._score: 0.1469 }
+  - lt: { hits.hits.1._score: 0.1489 }
+  - match: { hits.hits.0.sort: [5] }
+  - gt: { hits.max_score: 0.2024 }
+  - lt: { hits.max_score: 0.2044 }
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { match: { message: disk } }
+          sort: [ { seq: asc } ]
+          size: 2
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.0._score: null }
+  - match: { hits.max_score: null }
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { match: { message: disk } }
+          sort: [ { seq: asc } ]
+          track_scores: true
+          from: 2
+          size: 2
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: d05 }
+  - match: { hits.hits.1._id: d03 }
+  - gt: { hits.hits.0._score: 0.1469 }
+  - lt: { hits.hits.0._score: 0.1489 }
+  - gt: { hits.hits.1._score: 0.1469 }
+  - lt: { hits.hits.1._score: 0.1489 }
+  - match: { hits.hits.0.sort: [5] }
+  - gt: { hits.max_score: 0.2024 }
+  - lt: { hits.max_score: 0.2044 }
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { match: { message: disk } }
+          sort: [ { seq: asc } ]
+          size: 2
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.0._score: null }
+  - match: { hits.max_score: null }
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { match: { message: disk } }
+          sort: [ { seq: asc } ]
+          track_scores: true
+          from: 2
+          size: 2
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: d05 }
+  - match: { hits.hits.1._id: d03 }
+  - gt: { hits.hits.0._score: 0.1469 }
+  - lt: { hits.hits.0._score: 0.1489 }
+  - gt: { hits.hits.1._score: 0.1469 }
+  - lt: { hits.hits.1._score: 0.1489 }
+  - match: { hits.hits.0.sort: [5] }
+  - gt: { hits.max_score: 0.2024 }
+  - lt: { hits.max_score: 0.2044 }
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { match: { message: disk } }
+          sort: [ { seq: asc } ]
+          size: 2
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.0._score: null }
+  - match: { hits.max_score: null }

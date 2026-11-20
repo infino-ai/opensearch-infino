@@ -21,7 +21,9 @@ import java.util.Map;
  * some documents hold several values of) is the hits the filter keeps, by
  * score, however far below the unfiltered ranking they sit: in each mode,
  * the page is the one a Lucene index of the same documents returns, sorted
- * by the score then a field, or by the score alone. The corpus is too large
+ * by the score then a field, or by the score alone. Sorted by a field alone
+ * under track_scores, each hit carries the score Lucene's does, and
+ * max_score is the best of every match. The corpus is too large
  * for a YAML suite: the kept documents rank below more stronger matches than
  * the plugin ranks in one window.
  */
@@ -74,6 +76,17 @@ public class InfinoScoreFieldSortIT extends OpenSearchRestTestCase {
         // The filter in must_not.
         String notDropped = "{\"bool\":{\"must\":[" + must + "],\"must_not\":[{\"term\":{\"tags\":\"drop\"}}]}}";
         assertSamePage(notDropped, bySeq, 0);
+
+        // Sorted by seq alone under track_scores: each hit scored as unsorted,
+        // max_score the best of every match, from the first hit and past it,
+        // and resumed after a hit.
+        String seqOnly = "[{\"seq\":\"asc\"}]";
+        for (String query : List.of(kept, bonus, notDropped)) {
+            assertSamePage(query, seqOnly, 0, true, null);
+            assertSamePage(query, seqOnly, PAGE, true, null);
+            Page first = search(LUCENE, query, seqOnly, 0, true, null);
+            assertSamePage(query, seqOnly, 0, true, first.sorts.get(PAGE - 1).get(0).toString());
+        }
     }
 
     private void create(String index, String settings) throws IOException {
@@ -122,33 +135,64 @@ public class InfinoScoreFieldSortIT extends OpenSearchRestTestCase {
 
     /** The page of {@code query} sorted by {@code sort} (by score alone when null) from {@code from}: the same in each served index as in Lucene's. */
     private void assertSamePage(String query, String sort, int from) throws IOException {
-        Page want = search(LUCENE, query, sort, from);
-        assertEquals(query, KEPT, want.total);
-        assertEquals(query, Math.min(PAGE, KEPT - from), want.ids.size());
+        assertSamePage(query, sort, from, false, null);
+    }
+
+    /**
+     * As {@link #assertSamePage(String, String, int)}, under
+     * {@code track_scores} when {@code trackScores}, resumed after the sort
+     * value {@code after} when it is not null: the same ids, scores,
+     * max_score and sort values in each served index as in Lucene's.
+     */
+    private void assertSamePage(String query, String sort, int from, boolean trackScores, String after) throws IOException {
+        Page want = search(LUCENE, query, sort, from, trackScores, after);
+        if (after == null) {
+            assertEquals(query, KEPT, want.total);
+            assertEquals(query, Math.min(PAGE, KEPT - from), want.ids.size());
+        }
+        assertFalse(query, want.ids.isEmpty());
         for (String index : SERVED) {
-            Page got = search(index, query, sort, from);
-            String what = index + " " + query + " sort " + sort + " from " + from;
+            Page got = search(index, query, sort, from, trackScores, after);
+            String what = index + " " + query + " sort " + sort + " from " + from + (trackScores ? " track_scores" : "") + (after == null ? "" : " after " + after);
             assertEquals(what, want.total, got.total);
             assertEquals(what, want.ids, got.ids);
             assertEquals(what, want.sorts.size(), got.sorts.size());
             for (int i = 0; i < want.scores.size(); i++) {
                 assertEquals(what + " score of " + want.ids.get(i), want.scores.get(i), got.scores.get(i), 1e-4);
             }
-            if (sort != null) {
-                for (int i = 0; i < want.sorts.size(); i++) {
-                    assertEquals(what, want.sorts.get(i).get(1), got.sorts.get(i).get(1));
+            assertEquals(what + " max_score", want.maxScore, got.maxScore, 1e-4);
+            for (int i = 0; i < want.sorts.size(); i++) {
+                List<Object> w = want.sorts.get(i);
+                List<Object> g = got.sorts.get(i);
+                assertEquals(what, w.size(), g.size());
+                for (int k = 0; k < w.size(); k++) {
+                    if (w.get(k) instanceof Number n) {
+                        assertEquals(what + " sort value " + k + " of " + want.ids.get(i), n.doubleValue(), ((Number) g.get(k)).doubleValue(), 1e-4);
+                    } else {
+                        assertEquals(what + " sort value " + k + " of " + want.ids.get(i), w.get(k), g.get(k));
+                    }
                 }
             }
         }
     }
 
-    private record Page(int total, List<String> ids, List<Double> scores, List<List<Object>> sorts) {}
+    /** A page's hits; a score or max_score the response leaves null is NaN. */
+    private record Page(int total, List<String> ids, List<Double> scores, List<List<Object>> sorts, double maxScore) {}
 
     @SuppressWarnings("unchecked")
-    private Page search(String index, String query, String sort, int from) throws IOException {
+    private Page search(String index, String query, String sort, int from, boolean trackScores, String after) throws IOException {
         Request search = new Request("POST", "/" + index + "/_search");
         search.setJsonEntity(
-            "{\"from\":" + from + ",\"size\":" + PAGE + ",\"track_total_hits\":true,\"query\":" + query + (sort == null ? "" : ",\"sort\":" + sort) + "}"
+            "{\"from\":"
+                + from
+                + ",\"size\":"
+                + PAGE
+                + ",\"track_total_hits\":true,\"query\":"
+                + query
+                + (sort == null ? "" : ",\"sort\":" + sort)
+                + (trackScores ? ",\"track_scores\":true" : "")
+                + (after == null ? "" : ",\"search_after\":[" + after + "]")
+                + "}"
         );
         Map<String, Object> hits = (Map<String, Object>) entityAsMap(client().performRequest(search)).get("hits");
         int total = ((Number) ((Map<String, Object>) hits.get("total")).get("value")).intValue();
@@ -157,11 +201,15 @@ public class InfinoScoreFieldSortIT extends OpenSearchRestTestCase {
         List<List<Object>> sorts = new ArrayList<>();
         for (Map<String, Object> hit : (List<Map<String, Object>>) hits.get("hits")) {
             ids.add(hit.get("_id").toString());
-            scores.add(((Number) hit.get("_score")).doubleValue());
+            scores.add(orNaN(hit.get("_score")));
             if (hit.get("sort") != null) {
                 sorts.add((List<Object>) hit.get("sort"));
             }
         }
-        return new Page(total, ids, scores, sorts);
+        return new Page(total, ids, scores, sorts, orNaN(hits.get("max_score")));
+    }
+
+    private static double orNaN(Object value) {
+        return value == null ? Double.NaN : ((Number) value).doubleValue();
     }
 }
