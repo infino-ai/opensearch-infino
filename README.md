@@ -238,7 +238,7 @@ curl -sk -u "admin:$OPENSEARCH_ADMIN_PASSWORD" -X PUT https://localhost:9200/pag
 }'
 ```
 
-The mapping names the table's columns and the field type each is read as. It is checked against the table when the index is created: a table that does not exist, a field the table has no column for, or a column of another type, is refused with a 400 and no index is created. An index whose templates ask for the attach, rather than its create request, is checked when its shard starts instead, and answers each request with the reason.
+The mapping names the table's columns and the field type each is read as. It is checked against the table when the index is created: a table that does not exist, a field the table has no column for, or a column of another type, is refused with a 400 and no index is created. The settings and mappings of the templates the index's name matches are judged with the request's, as the cluster merges them. A table that cannot be read at that moment is not judged: the index is created, and answers each request with the reason once its shard has read the table.
 
 - **The table is never changed.** Nothing is added to it when the index is created, it is not compacted, and it stays when the index is deleted.
 - **Every write is refused** with a 403: index, update, delete, a write by query, and a document an ingest pipeline sends to the index from another one. A bulk request with an item for an attached index is refused as a whole, its items for other indices included; send those in a bulk of their own.

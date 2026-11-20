@@ -635,12 +635,6 @@ public final class InfinoNative {
     }
 
     /**
-     * As {@link #ensureTable(String, String, boolean)}, or for an
-     * {@code attached} index ({@link InfinoPlugin#INFINO_ATTACHED}) declare
-     * the table it reads without creating or changing it: a missing table,
-     * or a mapped field the table has no column for, is refused.
-     */
-    /**
      * Why an index with this mapping cannot be attached to table
      * {@code name} ({@link InfinoPlugin#INFINO_ATTACHED}), or null when it
      * can: the table is missing, is one the plugin wrote, or disagrees with
@@ -661,6 +655,12 @@ public final class InfinoNative {
         }
     }
 
+    /**
+     * As {@link #ensureTable(String, String, boolean)}, or for an
+     * {@code attached} index ({@link InfinoPlugin#INFINO_ATTACHED}) declare
+     * the table it reads without creating or changing it: a missing table,
+     * or a mapped field the table has no column for, is refused.
+     */
     public static void ensureTable(String name, String mappingJson, boolean defaultBm25, boolean attached) {
         init();
         COLUMNS.remove(name);

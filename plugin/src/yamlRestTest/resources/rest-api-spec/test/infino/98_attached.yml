@@ -97,6 +97,165 @@
         index: attpl2
         body:
           settings: { index.infino.table: at_missing, number_of_shards: 1, number_of_replicas: 0 }
+
+  # The table is judged with the template's part too. The template asks for the attach and the
+  # request names a table that does not exist: no index is made.
+  - do:
+      indices.put_index_template:
+        name: attached_template
+        body:
+          index_patterns: [ "attpl*" ]
+          template:
+            settings: { index.infino.attached: true }
+            mappings: { properties: { absent: { type: keyword } } }
+  - do:
+      catch: /table\sat_missing\sdoes\snot\sexist/
+      indices.create:
+        index: attpl3
+        body:
+          settings: { index.infino.table: at_missing, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      indices.exists:
+        index: attpl3
+  - is_false: ''
+  # The request names a table that is there, and the template maps a field it has no column for.
+  - do:
+      catch: /no\scolumn\sfor/
+      indices.create:
+        index: attpl4
+        body:
+          settings: { index.infino.table: outside_pages, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { title: { type: text } } }
+  - do:
+      indices.exists:
+        index: attpl4
+  - is_false: ''
+  # The template names the table and the request only asks for the attach: the two make the index.
+  - do:
+      indices.put_index_template:
+        name: attached_template
+        body:
+          index_patterns: [ "attpl*" ]
+          template:
+            settings: { index.infino.table: outside_pages }
+            mappings: { properties: { title: { type: text } } }
+  - do:
+      indices.create:
+        index: attpl5
+        body:
+          settings: { index.infino.attached: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { hits: { type: long } } }
+  - do:
+      count:
+        index: attpl5
+  - match: { count: 3 }
+  - do:
+      indices.delete:
+        index: attpl5
   - do:
       indices.delete_index_template:
         name: attached_template
+
+---
+"An index attached to a table made outside the plugin reads it and never writes it":
+  # outside_pages is made before the node starts, through the engine, with three rows.
+  - do:
+      indices.create:
+        index: att
+        body:
+          settings: { index.infino.table: outside_pages, index.infino.attached: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { title: { type: text }, lang: { type: keyword }, hits: { type: long } } }
+  - do:
+      search:
+        index: att
+        body: { query: { match: { title: pope } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._source.title: "Pope Leo XIV" }
+  - match: { hits.hits.0._source.hits: 9 }
+  - do:
+      count:
+        index: att
+        body: { query: { term: { lang: en } } }
+  - match: { count: 2 }
+
+  # Every write is refused, by whichever request it comes.
+  - do:
+      catch: forbidden
+      index:
+        index: att
+        id: "1"
+        body: { title: "written through the index" }
+  - do:
+      catch: forbidden
+      update:
+        index: att
+        id: "1"
+        body: { doc: { hits: 1 } }
+  - do:
+      catch: forbidden
+      delete:
+        index: att
+        id: "1"
+  - do:
+      catch: forbidden
+      bulk:
+        body:
+          - index: { _index: att }
+          - { title: "written through a bulk" }
+  # Through an alias of the index.
+  - do:
+      indices.update_aliases:
+        body:
+          actions:
+            - add: { index: att, alias: att_alias }
+  - do:
+      catch: forbidden
+      index:
+        index: att_alias
+        id: "2"
+        body: { title: "written through an alias" }
+  # Through a pipeline that sends another index's document to it.
+  - do:
+      ingest.put_pipeline:
+        id: att_route
+        body:
+          processors:
+            - set: { field: _index, value: att }
+  - do:
+      catch: forbidden
+      index:
+        index: att_elsewhere
+        id: "3"
+        pipeline: att_route
+        body: { title: "sent by a pipeline" }
+  # Its mapping is the one it was created with.
+  - do:
+      catch: bad_request
+      indices.put_mapping:
+        index: att
+        body: { properties: { added: { type: keyword } } }
+  - do:
+      count:
+        index: att
+  - match: { count: 3 }
+
+  # Deleting the index leaves the table, which a new index reads again.
+  - do:
+      indices.delete:
+        index: att
+  - do:
+      indices.create:
+        index: att_again
+        body:
+          settings: { index.infino.table: outside_pages, index.infino.attached: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { title: { type: text } } }
+  - do:
+      count:
+        index: att_again
+  - match: { count: 3 }
+  - do:
+      indices.delete:
+        index: att_again
+  - do:
+      ingest.delete_pipeline:
+        id: att_route

@@ -122,6 +122,14 @@ test {
 def defaultLib = file("${projectDir}/../infino-capi/target/release/libinfino_capi.so").absolutePath
 def defaultData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog"
 def defaultUri = "file://${defaultData}"
+// The same Rust build leaves a program that makes a table as one outside the plugin
+// would (infino-capi/src/bin/outside_table.rs); -Dinfino.fixture points elsewhere.
+def defaultFixture = file("${projectDir}/../infino-capi/target/release/outside_table").absolutePath
+interface FixtureRunner {
+    @javax.inject.Inject
+    ExecOperations getExecOps()
+}
+def fixtureRunner = objects.newInstance(FixtureRunner)
 
 // The unit tests that read through the engine load the same bridge; their
 // tables stay in memory (memory://, the default catalog).
@@ -337,8 +345,15 @@ tasks.named('yamlRestTest').configure {
         excludeTestsMatching replicaTests
         excludeTestsMatching multiNodeTests
     }
+    def catalog = System.getProperty('infino.uri', defaultUri)
+    def fixture = System.getProperty('infino.fixture', defaultFixture)
     doFirst {
         delete layout.buildDirectory.dir('infino-catalog')
+        // A table made outside the plugin, in the catalog the node will open, for the suite
+        // that attaches an index to one: the node itself only ever makes the plugin's tables.
+        fixtureRunner.execOps.exec {
+            commandLine fixture, catalog, 'outside_pages'
+        }
     }
 }
 
