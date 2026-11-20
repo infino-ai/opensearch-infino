@@ -332,12 +332,13 @@ public final class InfinoTables {
     /**
      * The mapping a table is declared from: the index's, and for an index in
      * default mode the columns its engine writes beside the documents' fields
-     * (a row's routing value, the sequence numbers it is stamped and was
-     * written with, and their generation), declared so that every batch is
-     * converted against declared columns rather than typed from its
-     * documents. An edge index's table declares its edge columns as the
-     * engine's graph walks read them, whatever the mapping says of them: the
-     * tables as strings, the ids as the engine's id type.
+     * (a row's routing value, the operation that wrote it, and its
+     * generation), declared so that every batch is converted against
+     * declared columns rather than typed from its documents. The sequence
+     * number column every table has is the bridge's own, which keeps a field
+     * of the same name apart. An edge index's table declares its edge
+     * columns as the engine's graph walks read them, whatever the mapping
+     * says of them: the tables as strings, the ids as the engine's id type.
      */
     @SuppressWarnings("unchecked")
     private static String tableMapping(IndexMetadata md) {
@@ -354,7 +355,6 @@ public final class InfinoTables {
         }
         if (stamped) {
             properties.put(InfinoQueryTranslator.ROUTING, Map.of(TYPE, KEYWORD));
-            properties.put(InfinoQueryTranslator.SEQ, Map.of(TYPE, LONG));
             properties.put(InfinoQueryTranslator.OP, Map.of(TYPE, LONG));
             properties.put(InfinoQueryTranslator.GEN, Map.of(TYPE, LONG));
         }

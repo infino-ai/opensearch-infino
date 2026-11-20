@@ -1,0 +1,147 @@
+---
+"A field named source added by dynamic mapping is written and searched, as stock does (#23)":
+  - do:
+      index:
+        index: rsv_dynamic
+        id: "1"
+        refresh: true
+        body: { source: hello }
+  - do:
+      count:
+        index: rsv_dynamic
+  - match: { count: 1 }
+  - do:
+      search:
+        index: rsv_dynamic
+        q: "source:hello"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._source.source: hello }
+  - do:
+      search:
+        index: rsv_dynamic
+        body: { query: { match: { source: hello } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: rsv_dynamic
+        body: { query: { term: { source.keyword: hello } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: rsv_dynamic
+        q: "hello"
+  - match: { hits.total.value: 1 }
+  - do:
+      search:
+        index: rsv_dynamic
+        body: { query: { exists: { field: source } } }
+  - match: { hits.total.value: 1 }
+
+---
+"A field named source added by dynamic mapping in proxy mode is searched":
+  - do:
+      indices.create:
+        index: rsv_proxy
+        body:
+          settings: { index.infino.mode: proxy }
+  - do:
+      index:
+        index: rsv_proxy
+        id: "1"
+        refresh: true
+        body: { source: hello }
+  - do:
+      search:
+        index: rsv_proxy
+        q: "source:hello"
+  - match: { hits.total.value: 1 }
+
+---
+"A field named source declared at creation is searched as its type says":
+  - do:
+      indices.create:
+        index: rsv_text
+        body:
+          mappings:
+            properties:
+              source: { type: text }
+  - do:
+      indices.create:
+        index: rsv_keyword
+        body:
+          mappings:
+            properties:
+              source: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: rsv_text, _id: "1" }
+          - { source: "hello world" }
+          - index: { _index: rsv_text, _id: "2" }
+          - { source: "world hello" }
+          - index: { _index: rsv_keyword, _id: "1" }
+          - { source: hello }
+          - index: { _index: rsv_keyword, _id: "2" }
+          - { source: other }
+  - do:
+      search:
+        index: rsv_text
+        q: "source:hello"
+  - match: { hits.total.value: 2 }
+  - do:
+      search:
+        index: rsv_text
+        body: { query: { match_phrase: { source: "hello world" } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: rsv_keyword
+        body: { query: { term: { source: hello } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: rsv_keyword
+        body:
+          size: 0
+          aggs:
+            s: { terms: { field: source } }
+  - length: { aggregations.s.buckets: 2 }
+  - match: { aggregations.s.buckets.0.key: hello }
+
+---
+"Fields named osid and osseq are the documents' own, and _id is still the id":
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: rsv_ids, _id: "a" }
+          - { osid: z, osseq: 7 }
+          - index: { _index: rsv_ids, _id: "b" }
+          - { osid: y, osseq: 9 }
+  - do:
+      search:
+        index: rsv_ids
+        q: "osid:z"
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: a }
+  - do:
+      search:
+        index: rsv_ids
+        body: { query: { range: { osseq: { gte: 9 } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b }
+  - do:
+      search:
+        index: rsv_ids
+        body: { sort: [ { _id: asc } ] }
+  - match: { hits.hits.0._id: a }
+  - match: { hits.hits.1._id: b }
+  - do:
+      search:
+        index: rsv_ids
+        body: { sort: [ { osid.keyword: asc } ] }
+  - match: { hits.hits.0._id: b }
+  - match: { hits.hits.1._id: a }

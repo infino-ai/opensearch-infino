@@ -84,6 +84,11 @@ const OP: &str = "osop";
 /// compare only between rows of one writer's history, so a cut leaves
 /// another's alone.
 const GEN: &str = "osgen";
+/// The columns every table keeps for itself. A document's field of the same
+/// name is kept in a column of its own, named [`OWN_COLUMN_PREFIX`] and the
+/// field's name: no mapping can name a field so.
+const RESERVED: [&str; 3] = [OSID, SOURCE, SEQ];
+const OWN_COLUMN_PREFIX: &str = ".";
 /// Separator used when a multi-valued string field lands in a scalar string
 /// column: the values are joined so a text index sees every token. The
 /// original array is still in `source`.
@@ -1160,9 +1165,11 @@ fn mapped_fields(mapping: &Value) -> Vec<MappedField> {
 /// it is not.
 fn ensure_table(bridge: &Bridge, name: &str, mapping: &Value) -> Result<Value, String> {
     let mut mapped = mapped_fields(mapping);
-    // A field named like a reserved column is served from the document's
-    // source, not given a column of its own.
-    mapped.retain(|f| !matches!(f.path.as_str(), OSID | SOURCE | SEQ));
+    for f in &mut mapped {
+        if RESERVED.contains(&f.path.as_str()) {
+            f.path = format!("{OWN_COLUMN_PREFIX}{}", f.path);
+        }
+    }
     bridge.keep_rules(name, &mapped);
     bridge.stamp_rule(name, mapping);
     let conn = &bridge.conn;
@@ -1778,6 +1785,16 @@ fn conform_doc(
         .ok_or_else(|| "the document is not an object".to_string())?;
     let mut flat = Map::new();
     flatten(obj, "", &mut flat);
+    // A field named like a reserved column goes to its own column once the
+    // mapping declares it, and never to the reserved one.
+    for reserved in RESERVED {
+        if let Some(value) = flat.remove(reserved) {
+            let own = format!("{OWN_COLUMN_PREFIX}{reserved}");
+            if schema.field_with_name(&own).is_ok() {
+                flat.insert(own, value);
+            }
+        }
+    }
     if let Some(field) = stamp {
         let values = match flat.get(field) {
             None | Some(Value::Null) => 0,
@@ -4498,17 +4515,46 @@ mod tests {
     }
 
     /// A field named like a reserved column, added after the table exists,
-    /// leaves the column alone, as it does at creation (#23).
+    /// gets a column of its own and leaves the reserved one alone (#23).
     #[test]
-    fn a_late_field_named_like_a_reserved_column_leaves_it_alone() {
+    fn a_late_field_named_like_a_reserved_column_gets_its_own_column() {
         let h = open_logs();
         let out = ensure(
             h,
-            r#"{"properties":{"source":{"type":"text"},"osseq":{"type":"text"}}}"#,
+            r#"{"properties":{"source":{"type":"text"},"osid":{"type":"keyword"},"osseq":{"type":"long"}}}"#,
         );
         assert!(out.contains("\"created\":false"), "{out}");
-        index(h, &[("s1", r#"{"source":"hello"}"#)]);
-        assert!(get(h, "s1").contains("hello"));
+        let doc = r#"{"source":"hello world","osid":"mine","osseq":7}"#;
+        let out = index(h, &[("s1", doc)]);
+        assert_eq!(out["ok"], 1, "{out}");
+        assert!(get(h, "s1").contains("hello world"));
+        let rows = sql(
+            h,
+            r#"SELECT osid, source, osseq, ".source", ".osid", ".osseq" FROM logs"#,
+        );
+        assert_eq!(rows[0]["osid"], "s1", "{rows}");
+        assert_eq!(rows[0]["source"], doc, "{rows}");
+        assert!(rows[0]["osseq"].is_null(), "{rows}");
+        assert_eq!(rows[0][".source"], "hello world", "{rows}");
+        assert_eq!(rows[0][".osid"], "mine", "{rows}");
+        assert_eq!(rows[0][".osseq"], 7, "{rows}");
+        assert_eq!(count(h, ".source", "hello"), "1");
+        close(h);
+    }
+
+    /// A field named like a reserved column the mapping does not declare is
+    /// kept in no column: the reserved one keeps what the table puts there.
+    #[test]
+    fn an_undeclared_field_named_like_a_reserved_column_stays_out_of_it() {
+        let h = open_logs();
+        let out = index(h, &[("s1", r#"{"source":"hello","osseq":7}"#)]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let rows = sql(h, "SELECT source, osseq FROM logs");
+        assert_eq!(
+            rows[0]["source"], r#"{"source":"hello","osseq":7}"#,
+            "{rows}"
+        );
+        assert!(rows[0]["osseq"].is_null(), "{rows}");
         close(h);
     }
 
