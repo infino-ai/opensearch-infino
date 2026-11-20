@@ -2,7 +2,8 @@
 # best first, the field ordering hits that tie on it, each carrying its score
 # on the hit and among its sort values, as stock does (#133). A query whose hits all score
 # alike is ordered by the field, the one score among the sort values. Mixed
-# sorts the table cannot order as stock does are refused.
+# sorts the table cannot order as stock does are refused. A match in filter
+# context scores nothing, as in stock, sorted or not.
 setup:
   - do:
       indices.create:
@@ -525,3 +526,285 @@ teardown:
           query: { match: { message: disk } }
           sort: [{ status: desc }, { _score: desc }]
   - match: { hits.total.value: 6 }
+
+---
+"A match in filter context scores nothing: its hits score 0, or what the clauses that score give them":
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { bool: { filter: [{ match: { message: disk } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+          size: 3
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.1._id: d02 }
+  - match: { hits.hits.2._id: d05 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.0.sort.0: 0.0 }
+  - match: { hits.hits.0.sort.1: 1 }
+  - match: { hits.max_score: 0.0 }
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { bool: { filter: [{ match: { message: disk } }] } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: d01 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.5._id: d07 }
+  - match: { hits.hits.5._score: 0.0 }
+  - match: { hits.max_score: 0.0 }
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { bool: { must: [{ match: { message: full } }], filter: [{ match: { message: disk } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.1._id: d05 }
+  - match: { hits.hits.2._id: d03 }
+  - gt: { hits.hits.0._score: 0.3141 }
+  - lt: { hits.hits.0._score: 0.3161 }
+  - gt: { hits.hits.2.sort.0: 0.3141 }
+  - lt: { hits.hits.2.sort.0: 0.3161 }
+  - match: { hits.hits.2.sort.1: 7 }
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { bool: { must: [{ match: { message: full } }], filter: [{ match: { message: disk } }] } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d03 }
+  - match: { hits.hits.2._id: d05 }
+  - gt: { hits.hits.0._score: 0.3141 }
+  - lt: { hits.hits.0._score: 0.3161 }
+  - gt: { hits.max_score: 0.3141 }
+  - lt: { hits.max_score: 0.3161 }
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { bool: { must_not: [{ match: { message: disk } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d06 }
+  - match: { hits.hits.1._id: d08 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.1.sort.0: 0.0 }
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { bool: { must: [{ match_all: {} }], filter: [{ match: { message: disk } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+          size: 1
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.0._score: 1.0 }
+  - match: { hits.hits.0.sort.0: 1.0 }
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          size: 0
+          query: { bool: { filter: [{ match: { message: disk } }] } }
+          aggs: { by_status: { terms: { field: status } } }
+  - match: { hits.total.value: 6 }
+  - match: { aggregations.by_status.buckets.0.key: ok }
+  - match: { aggregations.by_status.buckets.0.doc_count: 4 }
+  - match: { aggregations.by_status.buckets.1.key: bad }
+  - match: { aggregations.by_status.buckets.1.doc_count: 2 }
+  - do:
+      count:
+        index: ssort_luc
+        body: { query: { bool: { filter: [{ match: { message: disk } }] } } }
+  - match: { count: 6 }
+
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { bool: { filter: [{ match: { message: disk } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+          size: 3
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.1._id: d02 }
+  - match: { hits.hits.2._id: d05 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.0.sort.0: 0.0 }
+  - match: { hits.hits.0.sort.1: 1 }
+  - match: { hits.max_score: 0.0 }
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { bool: { filter: [{ match: { message: disk } }] } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: d01 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.5._id: d07 }
+  - match: { hits.hits.5._score: 0.0 }
+  - match: { hits.max_score: 0.0 }
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { bool: { must: [{ match: { message: full } }], filter: [{ match: { message: disk } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.1._id: d05 }
+  - match: { hits.hits.2._id: d03 }
+  - gt: { hits.hits.0._score: 0.3141 }
+  - lt: { hits.hits.0._score: 0.3161 }
+  - gt: { hits.hits.2.sort.0: 0.3141 }
+  - lt: { hits.hits.2.sort.0: 0.3161 }
+  - match: { hits.hits.2.sort.1: 7 }
+  # Unsorted, the three hits tie on the score: only Lucene's order of them is asserted.
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { bool: { must: [{ match: { message: full } }], filter: [{ match: { message: disk } }] } }
+  - match: { hits.total.value: 3 }
+  - gt: { hits.hits.0._score: 0.3141 }
+  - lt: { hits.hits.0._score: 0.3161 }
+  - gt: { hits.max_score: 0.3141 }
+  - lt: { hits.max_score: 0.3161 }
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { bool: { must_not: [{ match: { message: disk } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d06 }
+  - match: { hits.hits.1._id: d08 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.1.sort.0: 0.0 }
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { bool: { must: [{ match_all: {} }], filter: [{ match: { message: disk } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+          size: 1
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.0._score: 1.0 }
+  - match: { hits.hits.0.sort.0: 1.0 }
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          size: 0
+          query: { bool: { filter: [{ match: { message: disk } }] } }
+          aggs: { by_status: { terms: { field: status } } }
+  - match: { hits.total.value: 6 }
+  - match: { aggregations.by_status.buckets.0.key: ok }
+  - match: { aggregations.by_status.buckets.0.doc_count: 4 }
+  - match: { aggregations.by_status.buckets.1.key: bad }
+  - match: { aggregations.by_status.buckets.1.doc_count: 2 }
+  - do:
+      count:
+        index: ssort_proxy
+        body: { query: { bool: { filter: [{ match: { message: disk } }] } } }
+  - match: { count: 6 }
+
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { bool: { filter: [{ match: { message: disk } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+          size: 3
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.1._id: d02 }
+  - match: { hits.hits.2._id: d05 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.0.sort.0: 0.0 }
+  - match: { hits.hits.0.sort.1: 1 }
+  - match: { hits.max_score: 0.0 }
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { bool: { filter: [{ match: { message: disk } }] } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: d01 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.5._id: d07 }
+  - match: { hits.hits.5._score: 0.0 }
+  - match: { hits.max_score: 0.0 }
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { bool: { must: [{ match: { message: full } }], filter: [{ match: { message: disk } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.1._id: d05 }
+  - match: { hits.hits.2._id: d03 }
+  - gt: { hits.hits.0._score: 0.3141 }
+  - lt: { hits.hits.0._score: 0.3161 }
+  - gt: { hits.hits.2.sort.0: 0.3141 }
+  - lt: { hits.hits.2.sort.0: 0.3161 }
+  - match: { hits.hits.2.sort.1: 7 }
+  # Unsorted, the three hits tie on the score: only Lucene's order of them is asserted.
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { bool: { must: [{ match: { message: full } }], filter: [{ match: { message: disk } }] } }
+  - match: { hits.total.value: 3 }
+  - gt: { hits.hits.0._score: 0.3141 }
+  - lt: { hits.hits.0._score: 0.3161 }
+  - gt: { hits.max_score: 0.3141 }
+  - lt: { hits.max_score: 0.3161 }
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { bool: { must_not: [{ match: { message: disk } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d06 }
+  - match: { hits.hits.1._id: d08 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.1.sort.0: 0.0 }
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { bool: { must: [{ match_all: {} }], filter: [{ match: { message: disk } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+          size: 1
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.0._score: 1.0 }
+  - match: { hits.hits.0.sort.0: 1.0 }
+  - do:
+      search:
+        index: ssort_default
+        body:
+          size: 0
+          query: { bool: { filter: [{ match: { message: disk } }] } }
+          aggs: { by_status: { terms: { field: status } } }
+  - match: { hits.total.value: 6 }
+  - match: { aggregations.by_status.buckets.0.key: ok }
+  - match: { aggregations.by_status.buckets.0.doc_count: 4 }
+  - match: { aggregations.by_status.buckets.1.key: bad }
+  - match: { aggregations.by_status.buckets.1.doc_count: 2 }
+  - do:
+      count:
+        index: ssort_default
+        body: { query: { bool: { filter: [{ match: { message: disk } }] } } }
+  - match: { count: 6 }

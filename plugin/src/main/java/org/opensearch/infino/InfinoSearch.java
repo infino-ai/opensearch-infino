@@ -147,10 +147,17 @@ public final class InfinoSearch {
     static final String SCORE = "score";
     /**
      * The column {@link #scoredStatement} gives, under a sort by {@code _score}
-     * then fields, the greatest score a candidate its ranked windows cut off
-     * could have (null when no window was cut).
+     * then fields or when a step removes rows after its ranked reads
+     * ({@link #narrowsAfterRanking}), the greatest score a candidate its
+     * ranked windows cut off could have (null when no window was cut).
      */
     static final String SCORE_FLOOR = "infino_floor";
+    /**
+     * The column {@link #scoredStatement} gives, when a step removes rows
+     * after its ranked reads, how many of its ranked bands kept a row: a band
+     * that kept none bounds nothing its window cut off.
+     */
+    static final String SCORE_BANDS = "infino_bands";
 
     private InfinoSearch() {}
 
@@ -583,7 +590,7 @@ public final class InfinoSearch {
     /** Whether the hits of {@code query} score by its text ({@link Plan#scored}). */
     private static boolean scored(Translation query) {
         Scoring scoring = query.scoring();
-        return query.principal() != null || scoring.reorders() || scoring.unrankable();
+        return query.ranked() != null || scoring.reorders() || scoring.unrankable();
     }
 
     /**
@@ -889,21 +896,9 @@ public final class InfinoSearch {
         } else {
             rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm));
             if (windowCutsPage(plan, rows, fetch)) {
-                // A hit past the ranked windows could score as high as the
-                // page's last and come before it on the fields: rank every
-                // candidate then, so the page is the one stock sorts.
+                // A hit past the ranked windows could belong on the page:
+                // rank every candidate then, so the page is the one stock returns.
                 TextClause text = rankedText(plan);
-                long candidates = InfinoNative.count(plan.table(), text.column(), text.query(), text.mode());
-                if (candidates > RANK_WINDOW) {
-                    int window = (int) Math.min(Integer.MAX_VALUE, candidates);
-                    rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.WHOLE, window));
-                }
-            } else if (rows.size() < fetch && rankedInWindow(plan)) {
-                // The rows removed after the ranking may have used up the window
-                // while matches remain past it (a minimum_should_match count, a
-                // text clause on another column): rank every candidate then, so
-                // the page holds what the total counts.
-                TextClause text = plan.query().principal();
                 long candidates = InfinoNative.count(plan.table(), text.column(), text.query(), text.mode());
                 if (candidates > RANK_WINDOW) {
                     int window = (int) Math.min(Integer.MAX_VALUE, candidates);
@@ -1006,7 +1001,7 @@ public final class InfinoSearch {
                 // A text query and nothing else: the engine's BM25 call returns
                 // the page with its sources, so no statement is planned for it. It
                 // returns no sequence numbers, so a request for them takes the hit statement.
-                TextClause text = q.principal();
+                TextClause text = q.ranked();
                 rows = InfinoNative.bm25Hits(plan.table(), text.column(), text.query(), text.mode(), fetch);
             } else {
                 CountedRows read = countedRows(
@@ -1079,7 +1074,7 @@ public final class InfinoSearch {
                     score = (float) (n.doubleValue() + offset);
                 }
             } else if (plan.sorts().isEmpty() || plan.vector() == null && !plan.scored()) {
-                score = constantScore(offset);
+                score = constantScore(q.scoring());
             }
             // What max_score weighs: every hit's score; on a sorted page only
             // under track_scores or a sort led by the score, best first, as
@@ -1166,6 +1161,11 @@ public final class InfinoSearch {
         return offset > 0 ? (float) offset : 1.0f;
     }
 
+    /** The score every hit of a query scored by {@code scoring} alike carries: 0 when no clause scores ({@link Scoring#zero}), else {@link #constantScore(double)}. */
+    static float constantScore(Scoring scoring) {
+        return scoring.zero() ? 0.0f : constantScore(scoring.offset());
+    }
+
     /**
      * Whether the page's hits are the principal's BM25 ranking cut to
      * {@link #RANK_WINDOW} candidates before a step removes rows
@@ -1177,24 +1177,73 @@ public final class InfinoSearch {
         return plan.searchAfter() == null
             && plan.sorts().isEmpty()
             && !scoredPage(plan)
-            && plan.query().principal() != null
+            && plan.query().ranked() != null
             && (InfinoQueryTranslator.joinsAfterRanking(where) || (!InfinoQueryTranslator.ALL.equals(where) && plan.collapse() != null));
     }
 
-    /** The text clause a scored statement ranks: the principal, else the optional text clause (null when none). */
+    /** The text clause a ranked or scored statement ranks: the ranked principal, else the optional text clause (null when none). */
     private static TextClause rankedText(Plan plan) {
-        return plan.query().principal() != null ? plan.query().principal() : plan.query().scoring().text();
+        return rankedText(plan.query());
+    }
+
+    private static TextClause rankedText(Translation q) {
+        return q.ranked() != null ? q.ranked() : q.scoring().text();
     }
 
     /**
-     * Whether a page sorted by {@code _score} then fields
-     * ({@link Plan#ranksByScore}) may be missing hits its ranked windows cut
-     * off: one could score as much as the page's last hit (at most the
-     * statement's {@link #SCORE_FLOOR}) and win the tie on the fields, or,
-     * on a page left short, be the hit that fills it.
+     * Whether {@link #scoredStatement} over {@code where} removes rows after
+     * its ranked reads: the predicate, less the optional text clause it
+     * ranks, or a bonus holds a clause the engine applies above a ranked
+     * search ({@link InfinoQueryTranslator#joinsAfterRanking}), or a bonus
+     * reads a relation joined to the ranked rows.
+     */
+    static boolean narrowsAfterRanking(Translation q, String where) {
+        TextClause text = rankedText(q);
+        if (text == null) {
+            return false;
+        }
+        for (Bonus b : q.scoring().bonuses()) {
+            if (b.join() != null || InfinoQueryTranslator.joinsAfterRanking(b.expr())) {
+                return true;
+            }
+        }
+        String match = q.ranked() != null ? null : q.textMatch(text);
+        return InfinoQueryTranslator.joinsAfterRanking(match == null ? where : where.replace(match, InfinoQueryTranslator.ALL));
+    }
+
+    /** How many ranked bands {@link #scoredStatement} reads for {@code q}: one per sum its bonuses take, or one for them all past {@link #MAX_SCORE_BANDS}. */
+    static int rankedBands(Translation q) {
+        List<Double> sums = bonusSums(q.scoring().bonuses());
+        return sums == null ? 1 : sums.size();
+    }
+
+    /**
+     * Whether the page's ranked reads may have cut off a hit that belongs on
+     * it. A page ranked in the window before a step removes rows
+     * ({@link #rankedInWindow}) may when that step leaves it short. A page
+     * read by {@link #scoredStatement}, sorted by {@code _score} then fields
+     * ({@link Plan#ranksByScore}) or ranked by more than one clause
+     * ({@link #scoredPage}), may when a cut-off hit could score as much as
+     * its last hit (at most the statement's {@link #SCORE_FLOOR}) and win
+     * the tie, or, on a page left short, be the hit that fills it. Where a
+     * step removes rows after the ranked reads, the page may also when it is
+     * short or empty, or when a band kept no row ({@link #SCORE_BANDS}):
+     * those its window cut off are bounded by nothing it kept.
      */
     static boolean windowCutsPage(Plan plan, List<Map<String, Object>> rows, int fetch) {
-        if (!plan.ranksByScore() || rankedText(plan) == null || rows.isEmpty()) {
+        if (rankedInWindow(plan)) {
+            return rows.size() < fetch;
+        }
+        if (!(plan.ranksByScore() || scoredPage(plan)) || rankedText(plan) == null) {
+            return false;
+        }
+        Translation q = plan.query();
+        if (narrowsAfterRanking(q, plan.hitWhere())) {
+            if (rows.size() < fetch || !rows.isEmpty() && (!(rows.get(0).get(SCORE_BANDS) instanceof Number bands) || bands.intValue() < rankedBands(q))) {
+                return true;
+            }
+        }
+        if (rows.isEmpty()) {
             return false;
         }
         Map<String, Object> last = rows.get(rows.size() - 1);
@@ -1212,7 +1261,7 @@ public final class InfinoSearch {
      * ({@link #scoredStatement}), though the plan has no principal.
      */
     static boolean shortPageIsTotal(Plan plan) {
-        return plan.query().principal() == null
+        return plan.query().ranked() == null
             && plan.query().scoring().text() == null
             && plan.searchAfter() == null
             && plan.collapse() == null;
@@ -1226,7 +1275,7 @@ public final class InfinoSearch {
      * BM25 call returns.
      */
     static boolean bareRanked(Plan plan) {
-        return plan.query().principal() != null
+        return plan.query().ranked() != null
             && !plan.query().scoring().reorders()
             && InfinoQueryTranslator.ALL.equals(plan.hitWhere())
             && plan.sorts().isEmpty()
@@ -1471,7 +1520,7 @@ public final class InfinoSearch {
         if (scoredPage(plan) || plan.ranksByScore()) {
             return scoredStatement(plan, hit.toString(), where, fetch, withSeq, window);
         }
-        boolean ranked = !sorted && q.principal() != null;
+        boolean ranked = !sorted && q.ranked() != null;
         String from;
         String order;
         if (sorted) {
@@ -1584,11 +1633,16 @@ public final class InfinoSearch {
             }
         }
         String bonus = parts.isEmpty() ? "0.0" : String.join(" + ", parts);
-        TextClause text = q.principal() != null ? q.principal() : scoring.text();
-        // Each branch's columns past the hit's; a ranked band's carry its number, so its cut can be told.
-        String unbanded = sorted ? ", -1 AS infino_band" : "";
+        TextClause text = rankedText(q);
+        // A band whose rows a step removes after its ranked read may have
+        // used up its window while candidates remain past it.
+        boolean afterRanking = narrowsAfterRanking(q, where);
+        // Each branch's columns past the hit's; a ranked band's carry its
+        // number, so its cut can be told where it matters: under a sort by
+        // the score then fields, or a step after the ranking.
+        boolean banded = sorted || afterRanking;
+        String unbanded = banded ? ", -1 AS infino_band" : "";
         List<String> branches = new ArrayList<>();
-        boolean afterRanking = false;
         int k = window;
         // The greatest score a hit a band's ranked read cut off could have,
         // past the least of those it read: a band's hits share their bonus.
@@ -1600,11 +1654,9 @@ public final class InfinoSearch {
         } else {
             // An optional text clause is a subquery in the predicate: true of every
             // row its ranked search returns, false of every other.
-            String match = q.principal() != null ? null : q.textMatch(text);
+            String match = q.ranked() != null ? null : q.textMatch(text);
             String ranked = match == null ? where : where.replace(match, InfinoQueryTranslator.ALL);
             List<Double> sums = bonusSums(scoring.bonuses());
-            // A band's bounds on a joined bonus are no filter the ranked search takes.
-            afterRanking = InfinoQueryTranslator.joinsAfterRanking(ranked) || InfinoQueryTranslator.joinsAfterRanking(bonus) || joins.length() > 0;
             if (sums == null) {
                 // Too many bands: one ranked read of the window, as one band.
                 // A hit it cut off scores no more than its least BM25 plus
@@ -1615,7 +1667,7 @@ public final class InfinoSearch {
                 }
                 bandFloorOf = "MIN(infino_bm25) OVER (PARTITION BY infino_band) + " + InfinoQueryTranslator.scoreLiteral(maxBonus);
                 branches.add(
-                    "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row" + (sorted ? ", 0 AS infino_band" : "") + " FROM "
+                    "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row" + (banded ? ", 0 AS infino_band" : "") + " FROM "
                         + q.rankedFrom(text, window) + joins + " WHERE " + ranked
                 );
             } else {
@@ -1633,7 +1685,7 @@ public final class InfinoSearch {
                         band.add("(" + bonus + ") < " + InfinoQueryTranslator.scoreLiteral((sums.get(i) + sums.get(i + 1)) / 2));
                     }
                     branches.add(
-                        "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row" + (sorted ? ", " + i + " AS infino_band" : "")
+                        "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row" + (banded ? ", " + i + " AS infino_band" : "")
                             + " FROM " + q.rankedFrom(text, k) + joins + (band.isEmpty() ? "" : " WHERE " + String.join(" AND ", band))
                     );
                 }
@@ -1647,17 +1699,25 @@ public final class InfinoSearch {
             }
         }
         String union = String.join(" UNION ALL ", branches);
-        if (!sorted) {
-            // Hits that tie on score come in the order they were written, as stock orders them by their place in the index.
-            return "SELECT " + String.join(", ", names) + ", infino_bm25 + infino_bonus AS score FROM (" + union + ") AS infino_scored ORDER BY score "
-                + (scoring.ascending() ? "ASC" : "DESC") + ", " + tieOrder + " LIMIT " + fetch;
+        // Hits that tie on score come in the fields' order, else in the order
+        // they were written, as stock orders them by their place in the index.
+        String order = "score " + (scoring.ascending() ? "ASC" : "DESC") + ", " + tieOrder;
+        if (!banded) {
+            return "SELECT " + String.join(", ", names) + ", infino_bm25 + infino_bonus AS score FROM (" + union + ") AS infino_scored ORDER BY " + order + " LIMIT " + fetch;
         }
         // A band whose ranked read came back full (or was narrowed after it,
-        // so may have been) cut hits scoring no more than its least.
+        // so may have been) cut hits scoring no more than its least. A
+        // band's least kept row bounds those, as the least it read does.
         String cut = afterRanking ? "TRUE" : "COUNT(*) OVER (PARTITION BY infino_band) >= " + k;
         String bandFloor = "CASE WHEN infino_band >= 0 AND " + cut + " THEN " + bandFloorOf + " END";
-        return "SELECT " + String.join(", ", names) + ", score, MAX(infino_band_floor) OVER () AS " + SCORE_FLOOR + " FROM (SELECT *, infino_bm25 + infino_bonus AS score, "
-            + bandFloor + " AS infino_band_floor FROM (" + union + ") AS infino_scored) AS infino_banded ORDER BY score DESC, " + tieOrder + " LIMIT " + fetch;
+        // Narrowed after the ranking, a band that kept no row bounds nothing:
+        // each band that kept one counts once, by its first row.
+        String seen = afterRanking
+            ? ", CASE WHEN infino_band >= 0 AND infino_row = MIN(infino_row) OVER (PARTITION BY infino_band) THEN 1 ELSE 0 END AS infino_band_seen"
+            : "";
+        String bands = afterRanking ? ", SUM(infino_band_seen) OVER () AS " + SCORE_BANDS : "";
+        return "SELECT " + String.join(", ", names) + ", score, MAX(infino_band_floor) OVER () AS " + SCORE_FLOOR + bands + " FROM (SELECT *, infino_bm25 + infino_bonus AS score, "
+            + bandFloor + " AS infino_band_floor" + seen + " FROM (" + union + ") AS infino_scored) AS infino_banded ORDER BY " + order + " LIMIT " + fetch;
     }
 
     /**
@@ -1716,7 +1776,7 @@ public final class InfinoSearch {
             if (s.isScore()) {
                 // Only a query whose hits all score alike resumes past a score
                 // (see checkScoreSort): every row carries the one constant.
-                float score = constantScore(plan.query().scoring().offset());
+                float score = constantScore(plan.query().scoring());
                 float after = value instanceof Number n ? n.floatValue() : value == null ? Float.NaN : Float.parseFloat(value.toString());
                 boolean past = s.desc() ? score < after : score > after;
                 strict = past ? InfinoQueryTranslator.ALL : InfinoQueryTranslator.NONE;

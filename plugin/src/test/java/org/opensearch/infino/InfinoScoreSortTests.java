@@ -28,12 +28,14 @@ public class InfinoScoreSortTests extends OpenSearchTestCase {
     private static final String TABLE = "score_field_sort";
     /** Documents indexed; document {@code i} has seq {@code DOCS - 1 - i}, so the seq order is not the order they were written in. */
     private static final int DOCS = 30;
+    /** The documents tagged "keep": two that mention disk once, so rank below every twice-mentioning one. */
+    private static final List<String> KEPT = List.of("1", "4");
 
     @Override
     public void setUp() throws Exception {
         super.setUp();
         InfinoNative.dropTable(TABLE);
-        InfinoNative.ensureTable(TABLE, "{\"properties\":{\"message\":{\"type\":\"text\"},\"seq\":{\"type\":\"long\"},\"status\":{\"type\":\"keyword\"}}}");
+        InfinoNative.ensureTable(TABLE, "{\"properties\":{\"message\":{\"type\":\"text\"},\"seq\":{\"type\":\"long\"},\"status\":{\"type\":\"keyword\"},\"tags\":{\"type\":\"keyword\"}}}");
         String[] ids = new String[DOCS];
         String[] sources = new String[DOCS];
         for (int i = 0; i < DOCS; i++) {
@@ -44,7 +46,17 @@ public class InfinoScoreSortTests extends OpenSearchTestCase {
                 default -> "memory full";
             };
             ids[i] = Integer.toString(i);
-            sources[i] = "{\"message\":\"" + message + "\",\"seq\":" + (DOCS - 1 - i) + ",\"status\":\"" + (i % 2 == 0 ? "ok" : "bad") + "\"}";
+            sources[i] = "{\"message\":\""
+                + message
+                + "\",\"seq\":"
+                + (DOCS - 1 - i)
+                + ",\"status\":\""
+                + (i % 2 == 0 ? "ok" : "bad")
+                + "\",\"tags\":[\""
+                + (KEPT.contains(ids[i]) ? "keep" : "drop")
+                + "\",\"t"
+                + i % 3
+                + "\"]}";
         }
         assertEquals(DOCS, InfinoNative.indexBatch(TABLE, ids, sources, DOCS).ok());
     }
@@ -156,6 +168,103 @@ public class InfinoScoreSortTests extends OpenSearchTestCase {
         for (int i = 0; i < 3; i++) {
             assertEquals(want.get(i).get(InfinoQueryTranslator.OSID), whole.get(i).get(InfinoQueryTranslator.OSID));
         }
+    }
+
+    /** The match on message, its hits kept by a term on tags, a field each document holds several values of, which the engine applies after it ranks. */
+    private static BoolQueryBuilder diskKept() {
+        return QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).filter(QueryBuilders.termQuery("tags", "keep"));
+    }
+
+    /**
+     * A filter applied after the ranking may remove every hit the ranked
+     * window read while matches it keeps rank past the window: the page,
+     * left empty, asks to be read again over every candidate, and is then
+     * the kept hits by score, then seq.
+     */
+    public void testAFilterAfterTheRankingThatEmptiesThePageIsTold() {
+        InfinoSearch.Plan plan = plan(new SearchSourceBuilder().query(diskKept()).sort(new ScoreSortBuilder()).sort("seq", SortOrder.ASC));
+        assertTrue(plan.ranksByScore());
+        assertTrue(InfinoSearch.narrowsAfterRanking(plan.query(), plan.hitWhere()));
+        // The four best candidates mention disk twice: the filter keeps none.
+        List<Map<String, Object>> cut = InfinoNative.sqlRows(InfinoSearch.hitStatement(plan, 3, false, InfinoSearch.Keyset.WHOLE, 4));
+        assertTrue(cut.toString(), cut.isEmpty());
+        assertTrue(InfinoSearch.windowCutsPage(plan, cut, 3));
+        List<Map<String, Object>> whole = InfinoNative.sqlRows(InfinoSearch.hitStatement(plan, 3, false, InfinoSearch.Keyset.WHOLE, DOCS));
+        assertEquals(List.of("4", "1"), whole.stream().map(r -> r.get(InfinoQueryTranslator.OSID).toString()).toList());
+        assertEquals(1, ((Number) whole.get(0).get(InfinoSearch.SCORE_BANDS)).intValue());
+        // A page the filter left short asks too: its window may have cut what fills it.
+        assertTrue(InfinoSearch.windowCutsPage(plan, whole, 3));
+        // Unsorted, a page ranked by more than the match is read the same way.
+        BoolQueryBuilder bonus = diskKept().should(QueryBuilders.termQuery("status", "ok"));
+        InfinoSearch.Plan scored = plan(new SearchSourceBuilder().query(bonus));
+        assertTrue(InfinoSearch.scoredPage(scored));
+        String sql = InfinoSearch.hitStatement(scored, 3, false, InfinoSearch.Keyset.WHOLE, 4);
+        assertTrue(sql, sql.contains(InfinoSearch.SCORE_BANDS));
+        cut = InfinoNative.sqlRows(sql);
+        assertTrue(cut.toString(), cut.isEmpty());
+        assertTrue(InfinoSearch.windowCutsPage(scored, cut, 3));
+        // With no step after the ranking, the statement counts no bands.
+        assertFalse(InfinoSearch.hitStatement(plan(disk().sort(new ScoreSortBuilder()).sort("seq", SortOrder.ASC)), 3, false).contains(InfinoSearch.SCORE_BANDS));
+    }
+
+    /**
+     * Narrowed after the ranking, a band that kept no row bounds nothing its
+     * window cut off: a full page missing a band asks to be read again,
+     * however its last score compares with the floor of those it kept.
+     */
+    public void testABandTheFilterEmptiedIsTold() {
+        InfinoSearch.Plan plan = plan(
+            new SearchSourceBuilder().query(diskKept().should(QueryBuilders.termQuery("status", "ok"))).sort(new ScoreSortBuilder()).sort("seq", SortOrder.ASC)
+        );
+        assertEquals(2, InfinoSearch.rankedBands(plan.query()));
+        Map<String, Object> row = new java.util.HashMap<>();
+        row.put(InfinoQueryTranslator.OSID, "4");
+        row.put(InfinoSearch.SCORE, 2.0);
+        row.put(InfinoSearch.SCORE_FLOOR, 1.0);
+        row.put(InfinoSearch.SCORE_BANDS, 1L);
+        assertTrue(InfinoSearch.windowCutsPage(plan, List.of(row), 1));
+        row.put(InfinoSearch.SCORE_BANDS, 2L);
+        assertFalse(InfinoSearch.windowCutsPage(plan, List.of(row), 1));
+        row.put(InfinoSearch.SCORE, 1.0);
+        assertTrue(InfinoSearch.windowCutsPage(plan, List.of(row), 1));
+    }
+
+    /**
+     * A match in filter context scores nothing, as in stock: its hits all
+     * score 0, so a sort by the score then seq orders them by seq alone.
+     */
+    public void testAFilterMatchIsOrderedByTheFieldAlone() {
+        InfinoSearch.Plan plan = plan(
+            new SearchSourceBuilder().query(QueryBuilders.boolQuery().filter(QueryBuilders.matchQuery("message", "disk")))
+                .sort(new ScoreSortBuilder())
+                .sort("seq", SortOrder.ASC)
+        );
+        assertFalse(plan.scored());
+        assertFalse(plan.ranksByScore());
+        assertEquals(0.0f, InfinoSearch.constantScore(plan.query().scoring()), 0);
+        List<Map<String, Object>> rows = InfinoNative.sqlRows(InfinoSearch.hitStatement(plan, DOCS, false));
+        assertEquals(20, rows.size());
+        for (int i = 1; i < rows.size(); i++) {
+            assertTrue(seq(rows.get(i - 1)) < seq(rows.get(i)));
+        }
+        // Beside a match that scores, the filter's text narrows its hits and adds nothing.
+        InfinoSearch.Plan full = plan(
+            new SearchSourceBuilder().query(
+                QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "full")).filter(QueryBuilders.matchQuery("message", "disk"))
+            ).sort(new ScoreSortBuilder()).sort("seq", SortOrder.ASC)
+        );
+        assertTrue(full.ranksByScore());
+        rows = InfinoNative.sqlRows(InfinoSearch.hitStatement(full, DOCS, false));
+        assertEquals(20, rows.size());
+        // Every hit holds "full" once in a message of two or three words: those of two outrank those of three, each tie by seq.
+        for (int i = 1; i < rows.size(); i++) {
+            double before = ((Number) rows.get(i - 1).get(InfinoSearch.SCORE)).doubleValue();
+            double after = ((Number) rows.get(i).get(InfinoSearch.SCORE)).doubleValue();
+            assertTrue(before >= after);
+            assertTrue(before > after || seq(rows.get(i - 1)) < seq(rows.get(i)));
+        }
+        // The first is the two-word message of least seq: document 28.
+        assertEquals("28", rows.get(0).get(InfinoQueryTranslator.OSID).toString());
     }
 
     /** A query whose hits all score alike is ordered by the field alone, whichever place the score takes. */

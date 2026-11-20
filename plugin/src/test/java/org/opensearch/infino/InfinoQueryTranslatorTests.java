@@ -1093,7 +1093,83 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             .must(QueryBuilders.rangeQuery("status").gte(500).boost(2))
             .filter(QueryBuilders.existsQuery("host.name"));
         assertEquals(3.0, translate(b).scoring().offset(), 0);
-        assertSame(InfinoQueryTranslator.Scoring.NONE, translate(QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error"))).scoring());
+        assertSame(InfinoQueryTranslator.Scoring.ZERO, translate(QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error"))).scoring());
+    }
+
+    /**
+     * A bool whose clauses all score nothing scores its hits 0, as Lucene
+     * does: filter and must_not clauses, or must clauses that are such bools
+     * themselves. A should clause, a must query or an empty bool scores.
+     */
+    public void testABoolOfFilterAndMustNotClausesScoresZero() {
+        for (org.opensearch.index.query.QueryBuilder zero : java.util.List.of(
+            QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error")),
+            QueryBuilders.boolQuery().mustNot(QueryBuilders.termQuery("level", "error")),
+            QueryBuilders.boolQuery().filter(QueryBuilders.matchQuery("message", "disk")).mustNot(QueryBuilders.termQuery("level", "info")),
+            QueryBuilders.boolQuery().must(QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error")))
+        )) {
+            Translation t = translate(zero);
+            assertSame(zero.toString(), InfinoQueryTranslator.Scoring.ZERO, t.scoring());
+            assertEquals(zero.toString(), 0.0f, InfinoSearch.constantScore(t.scoring()), 0);
+            assertSame(zero.toString(), InfinoQueryTranslator.Scoring.ZERO, t.unscored().scoring());
+            assertTrue(zero.toString(), t.ascending().scoring().zero());
+        }
+        for (org.opensearch.index.query.QueryBuilder scores : java.util.List.of(
+            QueryBuilders.boolQuery(),
+            QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error")).should(QueryBuilders.termQuery("level", "fatal")),
+            QueryBuilders.boolQuery().must(QueryBuilders.matchAllQuery()).filter(QueryBuilders.termQuery("level", "error")),
+            QueryBuilders.matchAllQuery()
+        )) {
+            assertFalse(scores.toString(), translate(scores).scoring().zero());
+            assertEquals(scores.toString(), 1.0f, InfinoSearch.constantScore(translate(scores).scoring()), 0);
+        }
+    }
+
+    /**
+     * A text clause in filter context scores nothing: alone, its rows are
+     * read through the token index unranked, and no hit carries its BM25.
+     */
+    public void testAFilterTextIsReadUnranked() {
+        Translation t = translate(QueryBuilders.boolQuery().filter(QueryBuilders.matchQuery("message", "disk")));
+        assertEquals(new InfinoQueryTranslator.TextClause("message", "disk", "or"), t.principal());
+        assertNull(t.ranked());
+        assertSame(InfinoQueryTranslator.Scoring.ZERO, t.scoring());
+        assertEquals("token_match('os_logs_0', 'message', 'disk', 'or')", t.from());
+        assertFalse(hits(t, null, 10).contains("bm25_search"));
+        // Beside a must that scores every hit alike, the filter still ranks nothing.
+        t = translate(QueryBuilders.boolQuery().must(QueryBuilders.matchAllQuery()).filter(QueryBuilders.matchQuery("message", "disk")));
+        assertNull(t.ranked());
+        assertFalse(t.scoring().zero());
+        assertFalse(hits(t, null, 10).contains("bm25_search"));
+    }
+
+    /**
+     * Beside a text clause that scores, a filter's text is a predicate on the
+     * scoring clause's rows: the hits rank by the scoring clause alone, and
+     * the two never join into one ranked query, however alike their modes.
+     */
+    public void testAFilterTextBesideAScoringTextIsAPredicate() {
+        Translation t = translate(
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.matchQuery("message", "full").operator(org.opensearch.index.query.Operator.AND))
+                .filter(QueryBuilders.matchQuery("message", "disk").operator(org.opensearch.index.query.Operator.AND))
+        );
+        assertEquals(new InfinoQueryTranslator.TextClause("message", "full", "and"), t.ranked());
+        assertTrue(t.where(), t.where().contains("disk"));
+        assertTrue(hits(t, null, 10), hits(t, null, 10).contains("bm25_search('os_logs_0', 'message', 'full', "));
+        // The filter comes first in the request: the scoring clause is still the ranked one.
+        t = translate(
+            QueryBuilders.boolQuery()
+                .filter(QueryBuilders.matchQuery("message", "disk"))
+                .should(QueryBuilders.matchQuery("message", "full"))
+        );
+        assertNull(t.ranked());
+        assertEquals(new InfinoQueryTranslator.TextClause("message", "full", "or"), t.scoring().text());
+        assertTrue(t.where(), t.where().contains("disk"));
+        // A must clause's text inside a filter scores nothing either.
+        t = translate(QueryBuilders.boolQuery().filter(QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk"))));
+        assertNull(t.ranked());
+        assertSame(InfinoQueryTranslator.Scoring.ZERO, t.scoring());
     }
 
     /**
