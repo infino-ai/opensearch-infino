@@ -590,6 +590,23 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     }
 
     /**
+     * Refuse the settings an index is created with when they ask for an
+     * attached index that cannot be served
+     * ({@link InfinoExplicitTableActionFilter#attachRefusal}). These are
+     * the index's templates' merged with the request's, so a template that
+     * gives the mode or leaves out the table is seen here, which the create
+     * request alone does not show: an attached index in default mode would
+     * be served by a shard's engine, which writes to its table.
+     */
+    static void checkAttach(Settings templateAndRequestSettings) {
+        String table = INFINO_TABLE.get(templateAndRequestSettings);
+        String refused = InfinoExplicitTableActionFilter.attachRefusal(templateAndRequestSettings, table.isEmpty() ? null : table);
+        if (refused != null) {
+            throw new IllegalArgumentException(refused);
+        }
+    }
+
+    /**
      * Stamp {@code index.infino.enabled} on every index the cluster creates
      * unless the request or a template sets it (and {@link #INFINO_DEFAULT_ENABLED}
      * is on). A provider's settings sit below templates and requests, so an
@@ -608,23 +625,6 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      * as it creates the index; a resized index is created without providers
      * and so carries none.
      */
-    /**
-     * Refuse the settings an index is created with when they ask for an
-     * attached index that cannot be served
-     * ({@link InfinoExplicitTableActionFilter#attachRefusal}). These are
-     * the index's templates' merged with the request's, so a template that
-     * gives the mode or leaves out the table is seen here, which the create
-     * request alone does not show: an attached index in default mode would
-     * be served by a shard's engine, which writes to its table.
-     */
-    static void checkAttach(Settings templateAndRequestSettings) {
-        String table = INFINO_TABLE.get(templateAndRequestSettings);
-        String refused = InfinoExplicitTableActionFilter.attachRefusal(templateAndRequestSettings, table.isEmpty() ? null : table);
-        if (refused != null) {
-            throw new IllegalArgumentException(refused);
-        }
-    }
-
     @Override
     public Collection<IndexSettingProvider> getAdditionalIndexSettingProviders() {
         return List.of(new IndexSettingProvider() {

@@ -1296,18 +1296,34 @@ fn ensure_table(
     mapping: &Value,
     attached: bool,
 ) -> Result<Value, String> {
+    declare_table(bridge, name, mapping, attached, false)
+}
+
+/// [`ensure_table`], or with `check_only` the same judgement of an attached
+/// table and nothing else: whether it could be attached to, with no rule
+/// kept for it on the connection. An index is created from that answer
+/// before any shard of it exists to declare the table.
+fn declare_table(
+    bridge: &Bridge,
+    name: &str,
+    mapping: &Value,
+    attached: bool,
+    check_only: bool,
+) -> Result<Value, String> {
     let mut mapped = mapped_fields(mapping);
     // A field named like a reserved column is served from the document's
     // source, not given a column of its own.
     mapped.retain(|f| !matches!(f.path.as_str(), OSID | SOURCE | SEQ));
-    bridge.keep_rules(name, &mapped);
-    bridge.stamp_rule(name, mapping);
-    if !attached {
-        bridge.attach_rule(name, None);
-    }
     let conn = &bridge.conn;
-    // The cached handle, if any, predates whatever this changes.
-    bridge.forget(name);
+    if !check_only {
+        bridge.keep_rules(name, &mapped);
+        bridge.stamp_rule(name, mapping);
+        if !attached {
+            bridge.attach_rule(name, None);
+        }
+        // The cached handle, if any, predates whatever this changes.
+        bridge.forget(name);
+    }
     match conn.open_table(name) {
         Ok(table) => {
             let schema = table.schema();
@@ -1427,15 +1443,17 @@ fn ensure_table(
                         missing.join(", ")
                     ));
                 }
-                bridge.attach_rule(
-                    name,
-                    Some(Attached {
-                        columns: Arc::new(attached::columns_of(&schema)),
-                        text: Arc::new(
-                            mapped.iter().filter(|f| f.fts).map(|f| f.path.clone()).collect(),
-                        ),
-                    }),
-                );
+                if !check_only {
+                    bridge.attach_rule(
+                        name,
+                        Some(Attached {
+                            columns: Arc::new(attached::columns_of(&schema)),
+                            text: Arc::new(
+                                mapped.iter().filter(|f| f.fts).map(|f| f.path.clone()).collect(),
+                            ),
+                        }),
+                    );
+                }
                 return Ok(json!({ "created": false, "added": 0 }));
             }
             let mut patches: Vec<FieldPatch> = mapped
@@ -1564,6 +1582,42 @@ pub unsafe extern "C" fn infino_attach_table(
         match ensure_table(conn, name, &mapping, true) {
             Ok(v) => out_json(v),
             Err(e) => err_json(&e),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Whether an index could be attached to table `name` under this mapping,
+/// asked when the index is created, before any shard declares the table:
+/// `{"refused":null}` when it could, `{"refused":"<why>"}` when the table
+/// is missing, is one the plugin wrote, or disagrees with the mapping (what
+/// [`infino_attach_table`] refuses), and `{"error":..}` when the table could
+/// not be read at all, which says nothing about it. Nothing is kept on the
+/// connection and nothing is changed.
+#[no_mangle]
+pub unsafe extern "C" fn infino_attach_check(
+    h: *mut Bridge,
+    name: *const c_char,
+    mapping_json: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(mapping)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(mapping_json)
+            })
+        else {
+            return err_json("null argument");
+        };
+        let mapping: Value = serde_json::from_str(mapping).unwrap_or(Value::Null);
+        // A table that cannot be opened for a reason other than its absence
+        // is not judged: the failure is the store's, not the request's.
+        match conn.conn.open_table(name) {
+            Ok(_) | Err(InfinoError::NotFound(_)) => {}
+            Err(e) => return err_json(&e.to_string()),
+        }
+        match declare_table(conn, name, &mapping, true, true) {
+            Ok(_) => out_json(json!({ "refused": null })),
+            Err(why) => out_json(json!({ "refused": why })),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -4862,6 +4916,33 @@ mod tests {
         let out = take(unsafe { infino_attach_table(h, c("rated").as_ptr(), c("{}").as_ptr()) });
         assert!(out.contains("holds a column [score]"), "{out}");
         assert!(!bridge.is_attached("rated"));
+        close(h);
+    }
+
+    #[test]
+    fn whether_a_table_could_be_attached_to_is_answered_without_attaching() {
+        let h = open_logs();
+        let bridge = bridge_ref(h).unwrap();
+        plain_table(bridge);
+        let check = |table: &str, mapping: &str| -> Value {
+            let out = take(unsafe { infino_attach_check(h, c(table).as_ptr(), c(mapping).as_ptr()) });
+            serde_json::from_str(&out).unwrap()
+        };
+        // A table that is there and holds what the mapping names.
+        let fits = check("plain", r#"{"properties":{"title":{"type":"text"}}}"#);
+        assert!(fits["refused"].is_null(), "{fits}");
+        // Asking attaches nothing: the table is still written as any other.
+        assert!(!bridge.is_attached("plain"));
+        assert!(bridge.refuse_write("plain").is_ok());
+        // A table that is not there.
+        let missing = check("nowhere", "{}");
+        assert!(missing["refused"].as_str().unwrap().contains("does not exist"), "{missing}");
+        // A field the table has no column for.
+        let unknown = check("plain", r#"{"properties":{"absent":{"type":"keyword"}}}"#);
+        assert!(unknown["refused"].as_str().unwrap().contains("no column for"), "{unknown}");
+        // A table the plugin wrote.
+        let own = check("logs", "{}");
+        assert!(own["refused"].as_str().unwrap().contains("holds a column [osid]"), "{own}");
         close(h);
     }
 

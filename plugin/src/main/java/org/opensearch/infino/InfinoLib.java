@@ -39,6 +39,9 @@ public interface InfinoLib extends Library {
 
     Pointer infino_attach_table(Pointer h, String name, String mappingJson);
 
+    /** Whether an index could be attached to the table: {@code {"refused": null | "<why>"}}, or {@code {"error"}} when the table could not be read. */
+    Pointer infino_attach_check(Pointer h, String name, String mappingJson);
+
     Pointer infino_columns(Pointer h, String name);
 
     Pointer infino_check_doc(Pointer h, String name, String source);

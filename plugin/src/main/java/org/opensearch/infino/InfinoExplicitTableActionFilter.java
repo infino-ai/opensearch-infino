@@ -18,6 +18,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
 
 /**
  * Holds a request that names an index's table ({@code index.infino.table})
@@ -72,7 +73,10 @@ public class InfinoExplicitTableActionFilter implements ActionFilter {
             return;
         }
         String table = namedTable(settings);
-        String refused = attachRefusal(settings, table);
+        // A template gives part of an index's settings: one that only asks for an attached index is
+        // completed by the request that names the table. The settings an index is created with,
+        // its templates' and its request's together, are checked then (InfinoPlugin#checkAttach).
+        String refused = isTemplate(request) ? null : attachRefusal(settings, table);
         if (refused != null) {
             listener.onFailure(new IllegalArgumentException(refused));
             return;
@@ -89,11 +93,64 @@ public class InfinoExplicitTableActionFilter implements ActionFilter {
             );
             return;
         }
+        Runnable proceed = () -> attachThenProceed(task, action, request, settings, table, listener, chain);
         if (InfinoScrollActionFilter.principal().isEmpty()) {
+            proceed.run();
+            return;
+        }
+        InfinoClient.requireClusterManagement(ActionListener.wrap(allowed -> proceed.run(), listener::onFailure));
+    }
+
+    /**
+     * Pass the request on, unless it creates an attached index
+     * ({@link InfinoPlugin#INFINO_ATTACHED}) over a table that cannot be
+     * attached to: one that is missing, that the plugin wrote, or that
+     * disagrees with the request's mapping. The index would be created and
+     * then fail every search, with the reason only in the node's log; the
+     * request is answered with it instead. The table is read off the
+     * calling thread, and only once the caller is known to manage the
+     * cluster, so the answer tells no one else which tables exist. An index
+     * whose templates ask for the attach is not seen here: its shard
+     * declares the table when it starts.
+     */
+    private static <Request extends ActionRequest, Response extends ActionResponse> void attachThenProceed(
+        Task task,
+        String action,
+        Request request,
+        Settings settings,
+        String table,
+        ActionListener<Response> listener,
+        ActionFilterChain<Request, Response> chain
+    ) {
+        CreateIndexRequest create = created(request);
+        if (create == null || !InfinoPlugin.INFINO_ATTACHED.get(settings)) {
             chain.proceed(task, action, request, listener);
             return;
         }
-        InfinoClient.requireClusterManagement(ActionListener.wrap(allowed -> chain.proceed(task, action, request, listener), listener::onFailure));
+        String mapping = create.mappings() == null || create.mappings().isEmpty() ? "{}" : create.mappings();
+        InfinoServices.fork(ThreadPool.Names.GENERIC, listener::onFailure, () -> {
+            String refused = InfinoNative.attachRefusal(table, mapping);
+            if (refused != null) {
+                listener.onFailure(new IllegalArgumentException("[infino] " + refused));
+                return;
+            }
+            chain.proceed(task, action, request, listener);
+        });
+    }
+
+    /** The index a request creates outright, as a create or as the new index of a rollover; null for any other request. */
+    private static CreateIndexRequest created(ActionRequest request) {
+        if (request instanceof CreateIndexRequest create) {
+            return create;
+        }
+        return request instanceof RolloverRequest rollover ? rollover.getCreateIndexRequest() : null;
+    }
+
+    /** Whether the request stores a template, whose settings reach an index only when one is created from it. */
+    private static boolean isTemplate(ActionRequest request) {
+        return request instanceof PutIndexTemplateRequest
+            || request instanceof PutComposableIndexTemplateAction.Request
+            || request instanceof PutComponentTemplateAction.Request;
     }
 
     /**

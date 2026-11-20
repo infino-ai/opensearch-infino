@@ -1,0 +1,102 @@
+"An attached index is created only over a table it can be attached to":
+  # A table that does not exist: the request is refused with the reason, and no index is left behind.
+  - do:
+      catch: /table\sat_missing\sdoes\snot\sexist/
+      indices.create:
+        index: at1
+        body:
+          settings: { index.infino.table: at_missing, index.infino.attached: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { title: { type: text } } }
+  - do:
+      indices.exists:
+        index: at1
+  - is_false: ''
+
+  # A table the plugin wrote holds a document's id and source as columns of its own.
+  - do:
+      indices.create:
+        index: at.own
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      index:
+        index: at.own
+        id: "1"
+        refresh: true
+        body: { v: 1 }
+  - do:
+      catch: /holds\sa\scolumn\s\[osid\]/
+      indices.create:
+        index: at2
+        body:
+          settings: { index.infino.table: os_at_own, index.infino.attached: true, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      indices.exists:
+        index: at2
+  - is_false: ''
+  # The refused attach left the table as it was: its index still reads and writes it.
+  - do:
+      index:
+        index: at.own
+        id: "2"
+        refresh: true
+        body: { v: 2 }
+  - do:
+      count:
+        index: at.own
+  - match: { count: 2 }
+  - do:
+      indices.delete:
+        index: at.own
+
+  # An attached index names its table, and is served in proxy mode.
+  - do:
+      catch: /needs\s\[index\.infino\.table\]/
+      indices.create:
+        index: at3
+        body:
+          settings: { index.infino.attached: true, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      catch: /needs\s\[index\.infino\.mode\]\sto\sbe\s\[proxy\]/
+      indices.create:
+        index: at4
+        body:
+          settings: { index.infino.table: at_missing, index.infino.attached: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+
+---
+"A template may ask for an attached index and leave the table to the request":
+  - do:
+      indices.put_index_template:
+        name: attached_template
+        body:
+          index_patterns: [ "attpl*" ]
+          template:
+            settings: { index.infino.attached: true }
+  # The settings the index is created with are the template's and the request's together.
+  - do:
+      catch: /needs\s\[index\.infino\.table\]/
+      indices.create:
+        index: attpl1
+        body:
+          settings: { number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      indices.exists:
+        index: attpl1
+  - is_false: ''
+  # A template that asks for default mode is refused when an index is made from it.
+  - do:
+      indices.put_index_template:
+        name: attached_template
+        body:
+          index_patterns: [ "attpl*" ]
+          template:
+            settings: { index.infino.attached: true, index.infino.mode: default }
+  - do:
+      catch: /needs\s\[index\.infino\.mode\]\sto\sbe\s\[proxy\]/
+      indices.create:
+        index: attpl2
+        body:
+          settings: { index.infino.table: at_missing, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      indices.delete_index_template:
+        name: attached_template

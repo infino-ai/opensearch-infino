@@ -640,6 +640,27 @@ public final class InfinoNative {
      * the table it reads without creating or changing it: a missing table,
      * or a mapped field the table has no column for, is refused.
      */
+    /**
+     * Why an index with this mapping cannot be attached to table
+     * {@code name} ({@link InfinoPlugin#INFINO_ATTACHED}), or null when it
+     * can: the table is missing, is one the plugin wrote, or disagrees with
+     * the mapping. Asked when the index is created, so the request is
+     * answered with the reason; nothing is declared and nothing changes.
+     * Null too when the table could not be read at all, which says nothing
+     * about it: the index's shard declares the table when it starts and
+     * reports what it finds then.
+     */
+    public static String attachRefusal(String name, String mappingJson) {
+        init();
+        try {
+            Object refused = object(takeOrThrow(lib.infino_attach_check(conn, name, mappingJson))).get("refused");
+            return refused == null ? null : refused.toString();
+        } catch (InfinoException e) {
+            log.warn("[infino] table {} could not be read to check an attach to it: {}", name, e.getMessage());
+            return null;
+        }
+    }
+
     public static void ensureTable(String name, String mappingJson, boolean defaultBm25, boolean attached) {
         init();
         COLUMNS.remove(name);

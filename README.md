@@ -238,10 +238,11 @@ curl -sk -u "admin:$OPENSEARCH_ADMIN_PASSWORD" -X PUT https://localhost:9200/pag
 }'
 ```
 
-The mapping names the table's columns and the field type each is read as. It is checked against the table: a field the table has no column for, or a column of another type, is refused.
+The mapping names the table's columns and the field type each is read as. It is checked against the table when the index is created: a table that does not exist, a field the table has no column for, or a column of another type, is refused with a 400 and no index is created. An index whose templates ask for the attach, rather than its create request, is checked when its shard starts instead, and answers each request with the reason.
 
 - **The table is never changed.** Nothing is added to it when the index is created, it is not compacted, and it stays when the index is deleted.
-- **Every write is refused** with a 403: index, update, delete, a write by query, and a document an ingest pipeline sends to the index from another one.
+- **Every write is refused** with a 403: index, update, delete, a write by query, and a document an ingest pipeline sends to the index from another one. A bulk request with an item for an attached index is refused as a whole, its items for other indices included; send those in a bulk of their own.
+- **A template may set `index.infino.attached` and leave the table to the request** that creates the index. The two are checked together when the index is created.
 - **The mapping is fixed when the index is created.** A mapping update is refused with a 400. For a different mapping, delete the index and create it again: it holds no data of its own.
 - **A document is a row.** Its `_id` is the engine's row id, and its `_source` is the row's columns; a null column is left out. A date column is read as the instant its day starts at.
 - **The index is served in proxy mode.** A request or a template that asks for default mode is refused.

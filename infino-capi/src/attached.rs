@@ -514,7 +514,13 @@ pub(crate) fn hits_json(batches: &[RecordBatch], with_source: bool) -> String {
 /// table is read under: anything else names no row, and is never put in a
 /// statement.
 pub(crate) fn is_row_id(osid: &str) -> bool {
-    !osid.is_empty() && osid.len() <= 38 && osid.bytes().all(|b| b.is_ascii_digit())
+    // Written as the table gives it back, with no leading zero: `07` reads
+    // as the number 7, and would find by one route (a get, which compares
+    // numbers) a row that another (a filter on the id's text) does not.
+    !osid.is_empty()
+        && osid.len() <= 38
+        && osid.bytes().all(|b| b.is_ascii_digit())
+        && (osid == "0" || !osid.starts_with('0'))
 }
 
 #[cfg(test)]
@@ -690,5 +696,9 @@ mod tests {
         assert!(!is_row_id(""));
         assert!(!is_row_id("a"));
         assert!(!is_row_id("1 OR 1=1"));
+        // Only as the table writes it: a leading zero is another spelling of the same number.
+        assert!(is_row_id("0"));
+        assert!(!is_row_id("07"));
+        assert!(!is_row_id("033111593466986148805638084362240"));
     }
 }
