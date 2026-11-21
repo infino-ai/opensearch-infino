@@ -179,3 +179,214 @@
         index: logs
         id: b
   - match: { _source.status: 201 }
+
+
+---
+"Ties on a sort read from the range index come in the order written, as on a Lucene twin":
+  # Every document, sorted on a date: the sorted search reads the page from
+  # the column's range index and breaks ties by row id, in both directions.
+  # The ids are written out of their own order, so the page's order is the
+  # order the documents were written, not the order of their ids. The page
+  # cuts through the tied documents, and the document without a date comes
+  # last in either direction.
+  - do:
+      indices.create:
+        index: ties_infino
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+  - do:
+      indices.create:
+        index: ties_lucene
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ties_infino, _id: z }
+          - { "@timestamp": "2026-10-24T10:00:00Z" }
+          - index: { _index: ties_infino, _id: m }
+          - { "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _index: ties_infino, _id: a }
+          - { "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _index: ties_infino, _id: q }
+          - { "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _index: ties_infino, _id: b }
+          - { "@timestamp": "2026-10-24T10:00:00Z" }
+          - index: { _index: ties_infino, _id: n }
+          - { "other": 1 }
+          - index: { _index: ties_lucene, _id: z }
+          - { "@timestamp": "2026-10-24T10:00:00Z" }
+          - index: { _index: ties_lucene, _id: m }
+          - { "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _index: ties_lucene, _id: a }
+          - { "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _index: ties_lucene, _id: q }
+          - { "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _index: ties_lucene, _id: b }
+          - { "@timestamp": "2026-10-24T10:00:00Z" }
+          - index: { _index: ties_lucene, _id: n }
+          - { "other": 1 }
+  - match: { errors: false }
+
+  # The Lucene twin first: the order the Infino index must give.
+  - do:
+      search:
+        index: ties_lucene
+        body:
+          size: 4
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: m }
+  - match: { hits.hits.1._id: a }
+  - match: { hits.hits.2._id: q }
+  - match: { hits.hits.3._id: z }
+  - do:
+      search:
+        index: ties_lucene
+        body:
+          size: 2
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.hits.0._id: m }
+  - match: { hits.hits.1._id: a }
+  - do:
+      search:
+        index: ties_lucene
+        body:
+          size: 3
+          sort: [ { "@timestamp": asc } ]
+  - match: { hits.hits.0._id: z }
+  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.2._id: m }
+  - do:
+      search:
+        index: ties_lucene
+        body:
+          size: 6
+          sort: [ { "@timestamp": asc } ]
+  - match: { hits.hits.5._id: n }
+  - do:
+      search:
+        index: ties_lucene
+        body:
+          size: 6
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.hits.5._id: n }
+
+  - do:
+      search:
+        index: ties_infino
+        body:
+          size: 4
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: m }
+  - match: { hits.hits.1._id: a }
+  - match: { hits.hits.2._id: q }
+  - match: { hits.hits.3._id: z }
+  - do:
+      search:
+        index: ties_infino
+        body:
+          size: 2
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.hits.0._id: m }
+  - match: { hits.hits.1._id: a }
+  - do:
+      search:
+        index: ties_infino
+        body:
+          size: 3
+          sort: [ { "@timestamp": asc } ]
+  - match: { hits.hits.0._id: z }
+  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.2._id: m }
+  - do:
+      search:
+        index: ties_infino
+        body:
+          size: 6
+          sort: [ { "@timestamp": asc } ]
+  - match: { hits.hits.5._id: n }
+  - do:
+      search:
+        index: ties_infino
+        body:
+          size: 6
+          sort: [ { "@timestamp": desc } ]
+  - match: { hits.hits.5._id: n }
+
+---
+"A page read from the range index leaves out a deleted document and carries its sort values, as on a Lucene twin":
+  - do:
+      indices.create:
+        index: gone_infino
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      indices.create:
+        index: gone_lucene
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: gone_infino, _id: a }
+          - { n: 3 }
+          - index: { _index: gone_infino, _id: b }
+          - { n: 2 }
+          - index: { _index: gone_infino, _id: c }
+          - { n: 1 }
+          - index: { _index: gone_lucene, _id: a }
+          - { n: 3 }
+          - index: { _index: gone_lucene, _id: b }
+          - { n: 2 }
+          - index: { _index: gone_lucene, _id: c }
+          - { n: 1 }
+  - do:
+      delete:
+        index: gone_infino
+        id: a
+        refresh: true
+  - do:
+      delete:
+        index: gone_lucene
+        id: a
+        refresh: true
+
+  - do:
+      search:
+        index: gone_lucene
+        body:
+          size: 2
+          sort: [ { n: desc } ]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: b }
+  - match: { hits.hits.0.sort: [ 2 ] }
+  - match: { hits.hits.0._source.n: 2 }
+  - match: { hits.hits.1._id: c }
+
+  - do:
+      search:
+        index: gone_infino
+        body:
+          size: 2
+          sort: [ { n: desc } ]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: b }
+  - match: { hits.hits.0.sort: [ 2 ] }
+  - match: { hits.hits.0._source.n: 2 }
+  - match: { hits.hits.1._id: c }

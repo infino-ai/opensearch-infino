@@ -768,6 +768,15 @@ public final class InfinoSearch {
         boolean seqNoAndPrimaryTerm,
         boolean resumed
     ) {
+        if (!seqNoAndPrimaryTerm && !resumed) {
+            // Before the presence count readsUnsorted makes: the range index
+            // reads rows missing the value last, in row id order, so a column
+            // no row has a value in needs no count either.
+            List<Map<String, Object>> indexed = rangeIndexRows(plan, source, fetch);
+            if (indexed != null) {
+                return indexed;
+            }
+        }
         if (readsUnsorted(plan, resumed)) {
             return InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm, wantsSource(source)));
         }
@@ -800,6 +809,21 @@ public final class InfinoSearch {
             rows = withSources(plan.table(), rows, fetch);
         }
         return rows;
+    }
+
+    /**
+     * The page read from a range index with no statement planned, or null
+     * for the hit statement: every row sorted on one range-indexed field
+     * ({@link #indexSorted}). The bridge answers null when the column has no
+     * range index, and the hit statement reads the page then.
+     */
+    private static List<Map<String, Object>> rangeIndexRows(Plan plan, SearchSourceBuilder source, int fetch) {
+        boolean withSource = wantsSource(source);
+        if (indexSorted(plan)) {
+            SortSpec first = plan.sorts().get(0);
+            return InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, withSource);
+        }
+        return null;
     }
 
     /**
@@ -1068,6 +1092,36 @@ public final class InfinoSearch {
             && plan.searchAfter() == null
             && plan.collapse() == null
             && plan.scriptFields().isEmpty();
+    }
+
+    /**
+     * Whether the page is every row sorted on one field's own column, ties
+     * broken by the row id: the engine's sorted search, which reads it from
+     * the column's range index. A predicate (a filter, a post_filter, a
+     * security rule), a text query, a vector, a search_after, a collapse, a
+     * scripted field, a sort on an expression rather than a column, or
+     * missing: _first takes the hit statement.
+     */
+    static boolean indexSorted(Plan plan) {
+        List<SortSpec> sorts = plan.sorts();
+        if (plan.vector() != null
+            || plan.query().principal() != null
+            || !InfinoQueryTranslator.ALL.equals(plan.hitWhere())
+            || plan.searchAfter() != null
+            || plan.collapse() != null
+            || !plan.scriptFields().isEmpty()
+            || sorts.size() != 2) {
+            return false;
+        }
+        SortSpec first = sorts.get(0);
+        SortSpec tie = sorts.get(1);
+        return tie.name().equals(InfinoSql.ROW_ID)
+            && !tie.desc()
+            && !first.name().equals(InfinoSql.ROW_ID)
+            && !first.name().equals(InfinoQueryTranslator.OSID)
+            && first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()))
+            // The engine puts the rows missing the value last; missing: _first is the statement's (NULLS FIRST).
+            && !first.nullsFirst();
     }
 
     /**

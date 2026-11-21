@@ -1931,4 +1931,67 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("\"level\" LIKE 'a\\%%'", translate(QueryBuilders.wildcardQuery("level", "a%*")).where());
         assertEquals("a?b%", InfinoQueryTranslator.escapedWildcardToLike("a\\?b*"));
     }
+
+    public void testEveryRowSortedOnAColumnIsTheEnginesSortedSearch() {
+        java.util.List<InfinoSearch.SortSpec> byStatus = java.util.List.of(
+            InfinoSearch.SortSpec.of(columns().get("status"), true),
+            InfinoSearch.SortSpec.rowId()
+        );
+        assertTrue(InfinoSearch.indexSorted(sortedPlan(QueryBuilders.matchAllQuery(), byStatus, null, null)));
+        assertTrue(
+            InfinoSearch.indexSorted(
+                sortedPlan(
+                    QueryBuilders.matchAllQuery(),
+                    java.util.List.of(InfinoSearch.SortSpec.of(columns().get("@timestamp"), false), InfinoSearch.SortSpec.rowId()),
+                    null,
+                    null
+                )
+            )
+        );
+        // A predicate or a post_filter narrows the rows: the hit statement.
+        assertFalse(InfinoSearch.indexSorted(sortedPlan(QueryBuilders.termQuery("level", "error"), byStatus, null, null)));
+        assertFalse(InfinoSearch.indexSorted(sortedPlan(QueryBuilders.matchAllQuery(), byStatus, "\"level\" = 'error'", null)));
+        // So does a text query, a page after given sort values, and a sort on the row id alone.
+        assertFalse(InfinoSearch.indexSorted(sortedPlan(QueryBuilders.matchQuery("message", "error"), byStatus, null, null)));
+        assertFalse(InfinoSearch.indexSorted(sortedPlan(QueryBuilders.matchAllQuery(), byStatus, null, new Object[] { 404, "7" })));
+        assertFalse(
+            InfinoSearch.indexSorted(
+                sortedPlan(QueryBuilders.matchAllQuery(), java.util.List.of(InfinoSearch.SortSpec.rowId()), null, null)
+            )
+        );
+        // missing: _first puts the rows without a value first, which the engine's sorted search does not.
+        java.util.List<InfinoSearch.SortSpec> missingFirst = java.util.List.of(
+            InfinoSearch.SortSpec.of(columns().get("status"), true).withMissing("_first", NOW),
+            InfinoSearch.SortSpec.rowId()
+        );
+        assertFalse(InfinoSearch.indexSorted(sortedPlan(QueryBuilders.matchAllQuery(), missingFirst, null, null)));
+        // A missing value standing in for the rows without one sorts on an expression: the hit statement.
+        java.util.List<InfinoSearch.SortSpec> standIn = java.util.List.of(
+            InfinoSearch.SortSpec.of(columns().get("status"), true).withMissing(0, NOW),
+            InfinoSearch.SortSpec.rowId()
+        );
+        assertFalse(InfinoSearch.indexSorted(sortedPlan(QueryBuilders.matchAllQuery(), standIn, null, null)));
+    }
+
+    /** A plan over {@code query} sorted by {@code sorts}, with {@code postWhere} and continuing after {@code after}. */
+    private static InfinoSearch.Plan sortedPlan(
+        org.opensearch.index.query.QueryBuilder query,
+        java.util.List<InfinoSearch.SortSpec> sorts,
+        String postWhere,
+        Object[] after
+    ) {
+        return new InfinoSearch.Plan(
+            TABLE,
+            columns(),
+            translate(query),
+            sorts,
+            null,
+            postWhere,
+            null,
+            after,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+    }
 }
