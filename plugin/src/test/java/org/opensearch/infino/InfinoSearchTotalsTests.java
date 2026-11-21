@@ -112,6 +112,7 @@ public class InfinoSearchTotalsTests extends OpenSearchTestCase {
         // d2 was deleted between the page's two reads: it is left out, never shown with no source.
         List<Map<String, Object>> page = InfinoSearch.withSources(
             idRows("d1", "d2", "d3"),
+            0,
             10,
             ids -> Map.of("d1", "{\"a\":1}", "d3", "{\"a\":3}")
         );
@@ -120,5 +121,36 @@ public class InfinoSearchTotalsTests extends OpenSearchTestCase {
         assertEquals("{\"a\":1}", page.get(0).get(InfinoQueryTranslator.SOURCE));
         assertEquals("d3", page.get(1).get(InfinoQueryTranslator.OSID));
         assertEquals("{\"a\":3}", page.get(1).get(InfinoQueryTranslator.SOURCE));
+    }
+
+    public void testARowDeletedInTheWindowLeavesItAndTheRowsBeforeItStay() {
+        // from 1: d1 is before the window and keeps no source; d3 was deleted between the reads.
+        List<Map<String, Object>> page = InfinoSearch.withSources(idRows("d1", "d2", "d3"), 1, 10, ids -> Map.of("d2", "{}"));
+        assertEquals(2, page.size());
+        assertEquals("d1", page.get(0).get(InfinoQueryTranslator.OSID));
+        assertFalse(page.get(0).containsKey(InfinoQueryTranslator.SOURCE));
+        assertEquals("d2", page.get(1).get(InfinoQueryTranslator.OSID));
+    }
+
+    public void testOnlyTheWindowsSourcesAreRead() {
+        // from 2, size 2: the rows before the window keep no source and are not looked up.
+        List<List<String>> asked = new ArrayList<>();
+        List<Map<String, Object>> page = InfinoSearch.withSources(idRows("d1", "d2", "d3", "d4", "d5"), 2, 4, ids -> {
+            asked.add(ids);
+            return Map.of("d3", "{}", "d4", "{}");
+        });
+        assertEquals(List.of(List.of("d3", "d4")), asked);
+        assertEquals(4, page.size());
+        assertFalse(page.get(0).containsKey(InfinoQueryTranslator.SOURCE));
+        assertFalse(page.get(1).containsKey(InfinoQueryTranslator.SOURCE));
+        assertEquals("{}", page.get(2).get(InfinoQueryTranslator.SOURCE));
+        assertEquals("d4", page.get(3).get(InfinoQueryTranslator.OSID));
+    }
+
+    public void testAWindowPastThePageReadsNoSource() {
+        List<Map<String, Object>> page = InfinoSearch.withSources(idRows("d1"), 5, 10, ids -> {
+            throw new AssertionError("no lookup expected");
+        });
+        assertEquals(1, page.size());
     }
 }

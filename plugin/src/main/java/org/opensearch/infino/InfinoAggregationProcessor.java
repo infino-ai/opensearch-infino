@@ -116,6 +116,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -174,12 +175,15 @@ public class InfinoAggregationProcessor {
     private static final String TOTAL_ALIAS = "request_total";
     /** Parent buckets a nested grouped level is restricted to; past this the key list is not worth a predicate. */
     private static final int MAX_PARENT_TUPLES = 1_000;
+    /** Terms a significant_terms background reads in one IN list. */
+    private static final int MAX_PREFETCHED_ROWS = MAX_TERMS_SIZE;
     /**
      * Rows the batched significant_terms foreground ({@link #prefetchSignificant})
-     * may return, every term of every parent bucket; past it each bucket reads
-     * its own. It also bounds the terms a background reads in one IN list.
+     * may return, every term of every parent bucket. One response holds them
+     * all, where a bucket read on its own holds one bucket's; past this many
+     * each bucket reads its own.
      */
-    private static final int MAX_PREFETCHED_ROWS = MAX_TERMS_SIZE;
+    private static final int MAX_BATCHED_FOREGROUND_ROWS = 100_000;
     /** The earliest and latest epoch milliseconds date_bin can take: it works in nanoseconds, in an i64. */
     private static final long DATE_BIN_MIN_MILLIS = Long.MIN_VALUE / 1_000_000L;
     private static final long DATE_BIN_MAX_MILLIS = Long.MAX_VALUE / 1_000_000L;
@@ -258,6 +262,29 @@ public class InfinoAggregationProcessor {
      * {@link #fold} hands that bucket.
      */
     private final Map<Significant, Map<String, List<Map<String, Object>>>> foregrounds = new HashMap<>();
+    /**
+     * For a significant_terms level whose foreground {@link #prefetchSignificant}
+     * read for every parent bucket, the least background count each term can
+     * have, by term: its count over all those buckets (see
+     * {@link #backgroundHoldsForegrounds}).
+     */
+    private final Map<Significant, Map<String, Long>> lowerBackgrounds = new HashMap<>();
+    /**
+     * The bound-ordered foreground of a significant_terms level read with
+     * its parent level's groups ({@link #fusedTopTerms}), by the level, with
+     * the relation and predicate it was read over.
+     */
+    private final Map<Significant, Fused> fused = new HashMap<>();
+
+    /** Rows of {@link #fencedForegroundSql} over every group of a parent level, read over {@code from WHERE where}. */
+    private record Fused(String from, String where, List<Map<String, Object>> rows) {}
+
+    /**
+     * For a statement of {@link #readAhead} whose groups were read with the
+     * foreground ({@link #fusedTopTerms}), the count of every group with a
+     * key: those groups are the level's best only, picked however many.
+     */
+    private final Map<String, Long> fusedKeyedTotals = new HashMap<>();
 
     /** A significant_terms background: its row count, and each term's count once read. */
     private static final class Background {
@@ -2417,6 +2444,21 @@ public class InfinoAggregationProcessor {
         record Candidate(Object key, long subsetDf, long supersetDf, Map<String, Object> row) {}
 
         /**
+         * Whether {@code heuristic}'s score of a term never rises as the
+         * term's background count rises, its other counts fixed. Then the
+         * score at a lower bound of the background count is at least the
+         * term's score, and a term whose bound is below the scores a bucket
+         * already keeps needs no background read. JLH is {@code (p - q) * (p / q)}
+         * with {@code p} the subset share and {@code q} the background share,
+         * and 0 once {@code p <= q}: as {@code q} grows each step stays or
+         * falls, in floating point too, as each operation rounds monotonically.
+         * No other heuristic is relied on so: every term's count is read.
+         */
+        static boolean scoreFallsWithBackground(SignificanceHeuristic heuristic) {
+            return heuristic != null && heuristic.getClass() == JLHScore.class;
+        }
+
+        /**
          * The {@code keep} best of a bucket's terms by score, as a stock
          * shard keeps them: every term is scored by {@code heuristic} from
          * its four counts, the highest first, and among equal scores the
@@ -2440,19 +2482,29 @@ public class InfinoAggregationProcessor {
                 out.removeIf(c -> c.subsetDf() < shardMinDocCount);
                 return out;
             }
-            List<Map.Entry<Double, Candidate>> scored = new ArrayList<>(terms.size());
-            for (Candidate c : terms) {
-                scored.add(Map.entry(heuristic.getScore(c.subsetDf(), subsetSize, c.supersetDf(), supersetSize), c));
+            if (keep <= 0) {
+                return new ArrayList<>();
             }
-            scored.sort((a, b) -> {
+            Comparator<Map.Entry<Double, Candidate>> best = (a, b) -> {
                 int byScore = Double.compare(b.getKey(), a.getKey());
                 return byScore != 0 ? byScore : compareKeys(a.getValue().key(), b.getValue().key());
-            });
-            List<Candidate> out = new ArrayList<>(Math.min(keep, scored.size()));
-            for (int i = 0; i < scored.size() && i < keep; i++) {
-                Candidate c = scored.get(i).getValue();
-                if (c.subsetDf() >= shardMinDocCount) {
-                    out.add(c);
+            };
+            // The best keep, the worst of them on top: a bucket's terms are
+            // distinct keys, so the order is total and the heap keeps what a
+            // full sort's first keep would be.
+            PriorityQueue<Map.Entry<Double, Candidate>> worstFirst = new PriorityQueue<>(Math.min(keep, terms.size()) + 1, best.reversed());
+            for (Candidate c : terms) {
+                worstFirst.add(Map.entry(heuristic.getScore(c.subsetDf(), subsetSize, c.supersetDf(), supersetSize), c));
+                if (worstFirst.size() > keep) {
+                    worstFirst.poll();
+                }
+            }
+            List<Map.Entry<Double, Candidate>> scored = new ArrayList<>(worstFirst);
+            scored.sort(best);
+            List<Candidate> out = new ArrayList<>(scored.size());
+            for (Map.Entry<Double, Candidate> e : scored) {
+                if (e.getValue().subsetDf() >= shardMinDocCount) {
+                    out.add(e.getValue());
                 }
             }
             return out;
@@ -2998,14 +3050,22 @@ public class InfinoAggregationProcessor {
         // The background does not depend on the bucket this level sits under:
         // under a parent terms level every bucket would count the same rows
         // again, so its size and each term's count are read once per request.
-        Background bg = background(s, foreground);
+        // A bucket whose foreground was read ahead had the counts its best
+        // terms need read with it (see prefetchSignificant).
+        Background bg = prefetched != null && prefetched.get(where) != null
+            ? backgroundOf(s, backgroundRows(s))
+            : background(s, List.of(new ForegroundBucket(foreground, subsetSize)), lowerBackgrounds.getOrDefault(s, Map.of()));
         long supersetSize = bg.size;
         Map<String, Long> background = bg.counts;
         List<Significant.Candidate> scored = new ArrayList<>(foreground.size());
         for (Map<String, Object> row : foreground) {
             Object k = row.get("k0");
+            Long supersetDf = background.get(keyString(k));
+            if (supersetDf == null) {
+                // Not read: its score is below the scores of shard_size terms read.
+                continue;
+            }
             long subsetDf = asLong(row.get("doc_count"));
-            long supersetDf = background.getOrDefault(keyString(k), 0L);
             scored.add(new Significant.Candidate(k, subsetDf, Math.max(subsetDf, supersetDf), row));
         }
         List<Significant.Candidate> candidates = Significant.bestByScore(scored, s.candidates, s.shardMinDocCount, subsetSize, supersetSize, s.heuristic);
@@ -3021,36 +3081,66 @@ public class InfinoAggregationProcessor {
         return s.build(candidates, topHits, nested, subsetSize, supersetSize);
     }
 
+    /** One bucket's foreground rows (each a term {@code k0} and its {@code doc_count}) and the bucket's size. */
+    record ForegroundBucket(List<Map<String, Object>> terms, long size) {}
+
     /**
      * The background of {@code s} for this request ({@link #backgrounds}),
-     * holding the count of every term among {@code foreground}'s keys: its
-     * size read once, and the terms not yet read in one statement.
+     * holding the count of every term that may be among a bucket's best
+     * {@code shard_size} by score, for each of {@code buckets}: its size read
+     * once, and the terms not yet read in one statement per round.
+     *
+     * <p>When the score never rises with the background count
+     * ({@link Significant#scoreFallsWithBackground}), a term's score at the
+     * lowest count it can have (its own count in the bucket, or its entry in
+     * {@code lower}) bounds its score from above. Each round reads, for each
+     * bucket, the terms whose bound is not below the scores of the
+     * {@code shard_size} terms it already has, or its best bounds while it
+     * has fewer: the terms left unread then score below {@code shard_size}
+     * read ones, so they are not among the best and need no count. With any
+     * other heuristic every term is read.
      */
-    private Background background(Significant s, Collection<Map<String, Object>> foreground) {
+    private Background background(Significant s, List<ForegroundBucket> buckets, Map<String, Long> lower) {
         String backgroundRows = backgroundRows(s);
-        Background bg = backgrounds.computeIfAbsent(backgroundRows, rows -> {
-            Background whole = wholeTableBackground(s);
-            return whole != null ? whole : new Background(asLong(oneRow("SELECT COUNT(*) AS c FROM " + rows).get("c")));
-        });
+        Background bg = backgroundOf(s, backgroundRows);
         Map<String, Long> background = bg.counts;
         if (bg.complete) {
             // Every term the background holds is counted; one it lacks counts 0.
-            for (Map<String, Object> row : foreground) {
-                background.putIfAbsent(keyString(row.get("k0")), 0L);
+            for (ForegroundBucket b : buckets) {
+                for (Map<String, Object> row : b.terms()) {
+                    background.putIfAbsent(keyString(row.get("k0")), 0L);
+                }
             }
             return bg;
         }
-        List<String> literals = new ArrayList<>();
-        Set<String> unread = new LinkedHashSet<>();
-        for (Map<String, Object> row : foreground) {
-            String term = keyString(row.get("k0"));
-            if (!background.containsKey(term) && unread.add(term)) {
-                literals.add(Grouped.keyLiteral(s.keyKind, row.get("k0")));
+        boolean bounded = Significant.scoreFallsWithBackground(s.heuristic);
+        // Each term's bound, worked out once for every round.
+        List<List<Bounded>> bounds = new ArrayList<>();
+        if (bounded) {
+            for (ForegroundBucket b : buckets) {
+                bounds.add(boundsOf(s, b, bg, lower));
             }
         }
-        if (!literals.isEmpty()) {
-            // Every term of a bucket is scored, so there may be many: at most
-            // MAX_PREFETCHED_ROWS of them go in one IN list.
+        while (true) {
+            Map<String, String> unread = new LinkedHashMap<>();
+            for (int i = 0; i < buckets.size(); i++) {
+                ForegroundBucket b = buckets.get(i);
+                if (bounded) {
+                    unreadBestBounds(s, b, bounds.get(i), bg, unread);
+                } else {
+                    for (Map<String, Object> row : b.terms()) {
+                        String term = keyString(row.get("k0"));
+                        if (!background.containsKey(term)) {
+                            unread.putIfAbsent(term, Grouped.keyLiteral(s.keyKind, row.get("k0")));
+                        }
+                    }
+                }
+            }
+            if (unread.isEmpty()) {
+                return bg;
+            }
+            List<String> literals = new ArrayList<>(unread.values());
+            // At most MAX_PREFETCHED_ROWS terms go in one IN list.
             for (int from = 0; from < literals.size(); from += MAX_PREFETCHED_ROWS) {
                 List<String> part = literals.subList(from, Math.min(literals.size(), from + MAX_PREFETCHED_ROWS));
                 for (Map<String, Object> row : InfinoNative.sqlRows(
@@ -3060,11 +3150,102 @@ public class InfinoAggregationProcessor {
                 }
             }
             // A term no background row holds counts 0; remember that too.
-            for (String term : unread) {
+            for (String term : unread.keySet()) {
                 background.putIfAbsent(term, 0L);
             }
         }
-        return bg;
+    }
+
+    /** The background of {@code s} over {@code backgroundRows} ({@link #backgroundRows}) for this request: its size read once. */
+    private Background backgroundOf(Significant s, String backgroundRows) {
+        return backgrounds.computeIfAbsent(backgroundRows, rows -> {
+            Background whole = wholeTableBackground(s);
+            return whole != null ? whole : new Background(asLong(oneRow("SELECT COUNT(*) AS c FROM " + rows).get("c")));
+        });
+    }
+
+    /** A term of a foreground bucket: its key, its {@link #keyString}, its count there, and its score's bound. */
+    private record Bounded(Object key, String term, long subsetDf, double bound) {}
+
+    /**
+     * The terms of bucket {@code b}, each with its bound: the score at the
+     * lowest background count it can have, its count in the bucket or its
+     * entry in {@code lower}.
+     */
+    private static List<Bounded> boundsOf(Significant s, ForegroundBucket b, Background bg, Map<String, Long> lower) {
+        List<Bounded> out = new ArrayList<>(b.terms().size());
+        for (Map<String, Object> row : b.terms()) {
+            Object key = row.get("k0");
+            String term = keyString(key);
+            long subsetDf = asLong(row.get("doc_count"));
+            long least = Math.max(subsetDf, lower.getOrDefault(term, 0L));
+            out.add(new Bounded(key, term, subsetDf, s.heuristic.getScore(subsetDf, b.size(), least, bg.size)));
+        }
+        return out;
+    }
+
+    /**
+     * Add to {@code unread} the terms of bucket {@code b} ({@code terms}, with
+     * their bounds) whose background count {@link #background} reads next:
+     * with fewer than {@code shard_size} terms read, the unread ones with the
+     * best bounds, enough to make up {@code shard_size}; after that every
+     * unread term whose bound is not below the {@code shard_size}th best
+     * score read.
+     */
+    private static void unreadBestBounds(Significant s, ForegroundBucket b, List<Bounded> terms, Background bg, Map<String, String> unread) {
+        int keep = s.candidates;
+        if (keep <= 0) {
+            return;
+        }
+        // The best keep scores read, the lowest on top.
+        PriorityQueue<Double> read = new PriorityQueue<>();
+        int readCount = 0;
+        List<Integer> left = new ArrayList<>();
+        for (int i = 0; i < terms.size(); i++) {
+            Bounded t = terms.get(i);
+            Long count = bg.counts.get(t.term());
+            if (count == null) {
+                left.add(i);
+                continue;
+            }
+            readCount++;
+            read.add(s.heuristic.getScore(t.subsetDf(), b.size(), Math.max(t.subsetDf(), count), bg.size));
+            if (read.size() > keep) {
+                read.poll();
+            }
+        }
+        if (left.isEmpty()) {
+            return;
+        }
+        if (readCount < keep) {
+            // The best bounds, highest first, ties in the bucket's order: the
+            // worst of them on top, so the heap holds the best.
+            int want = Math.min(left.size(), keep - readCount);
+            Comparator<Integer> best = (x, y) -> {
+                int byBound = Double.compare(terms.get(y).bound(), terms.get(x).bound());
+                return byBound != 0 ? byBound : Integer.compare(x, y);
+            };
+            PriorityQueue<Integer> worstFirst = new PriorityQueue<>(want + 1, best.reversed());
+            for (int i : left) {
+                worstFirst.add(i);
+                if (worstFirst.size() > want) {
+                    worstFirst.poll();
+                }
+            }
+            List<Integer> picked = new ArrayList<>(worstFirst);
+            picked.sort(best);
+            for (int i : picked) {
+                unread.putIfAbsent(terms.get(i).term(), Grouped.keyLiteral(s.keyKind, terms.get(i).key()));
+            }
+            return;
+        }
+        double kept = read.peek();
+        for (int i : left) {
+            // Not below: a term that could tie the last kept one may sort before it by key.
+            if (!(terms.get(i).bound() < kept)) {
+                unread.putIfAbsent(terms.get(i).term(), Grouped.keyLiteral(s.keyKind, terms.get(i).key()));
+            }
+        }
     }
 
     /**
@@ -3355,7 +3536,7 @@ public class InfinoAggregationProcessor {
             // one leave before the window: they take no slot and count as other to no one.
             String inner = levelInner(chain, i, from, where, restriction, level.terms);
             String parents = String.join(", ", aliases.subList(0, i));
-            List<Map<String, Object>> rows = i == 0 && level.terms ? pickTopTerms(level, inner, readAhead) : null;
+            List<Map<String, Object>> rows = i == 0 && level.terms ? pickTopTerms(level, inner, readAhead, fusedKeyedTotals.get(inner)) : null;
             if (rows == null && i == 0 && chain.size() == 1 && leafChild == null) {
                 rows = rangeCountedHistogram(level, from, where);
             }
@@ -3393,8 +3574,9 @@ public class InfinoAggregationProcessor {
             rowsByLevel.add(List.of());
             hitsByLevel.add(Map.of());
         }
-        if (rowsByLevel.get(chain.size() - 1).size() > 1) {
-            prefetchSignificant(chain, kept, leafChild, from, where);
+        // One bucket reads its own foreground, unless it was read with the parent level's groups.
+        if (rowsByLevel.get(chain.size() - 1).size() > 1 || (chain.size() == 1 && leafChild instanceof Significant s && fused.containsKey(s))) {
+            prefetchSignificant(chain, kept, rowsByLevel.get(chain.size() - 1), leafChild, from, where);
         }
         return fold(chain, 0, List.of(), rowsByLevel, hitsByLevel, total, leafChild, from, where);
     }
@@ -3408,10 +3590,26 @@ public class InfinoAggregationProcessor {
      * every chain level a terms level on a field each document gives one
      * value (so a document's keys are its buckets), and the significant
      * level carries no metric. Otherwise, past {@link #MAX_PARENT_TUPLES}
-     * buckets, or past {@link #MAX_PREFETCHED_ROWS} rows, the level reads
-     * each bucket on its own as before.
+     * buckets, or past {@link #MAX_BATCHED_FOREGROUND_ROWS} rows, the level
+     * reads each bucket on its own as before. {@code leafRows} are the
+     * leaf level's rows, one per tuple of {@code kept}, in its order, each
+     * with the bucket's {@code doc_count}.
+     *
+     * <p>The background counts every bucket's best terms by score need are
+     * then read for all the buckets together ({@link #background}). Where
+     * the background holds every foreground row
+     * ({@link #backgroundHoldsForegrounds}), a term's background count is at
+     * least its count summed over the buckets, which they are given as its
+     * least count: the buckets hold no row twice.
      */
-    private void prefetchSignificant(List<Grouped> chain, List<List<Object>> kept, BucketSpec leafChild, String from, String where) {
+    private void prefetchSignificant(
+        List<Grouped> chain,
+        List<List<Object>> kept,
+        List<Map<String, Object>> leafRows,
+        BucketSpec leafChild,
+        String from,
+        String where
+    ) {
         if (kept == null || kept.size() > MAX_PARENT_TUPLES) {
             return;
         }
@@ -3422,46 +3620,24 @@ public class InfinoAggregationProcessor {
         }
         List<BucketSpec> leaves = leafChild instanceof Siblings sib ? sib.children : leafChild == null ? List.of() : List.of(leafChild);
         int n = chain.size();
-        List<String> parents = new ArrayList<>();
-        for (int j = 0; j < n; j++) {
-            parents.add(chain.get(j).keyExpr + " AS p" + j);
-        }
-        // By SELECT position, as groupStatement groups: a field named p0 or k0
-        // would take the alias's place in a GROUP BY by name.
-        StringBuilder positions = new StringBuilder();
-        for (int j = 1; j <= n + 1; j++) {
-            positions.append(j == 1 ? "" : ", ").append(j);
-        }
         for (BucketSpec leaf : leaves) {
             if (!(leaf instanceof Significant s) || !s.metrics.isEmpty()) {
                 continue;
             }
-            String key = s.keyExpr();
-            // Every term of every bucket: the cut to shard_size is by score
-            // (see evalSignificant), which needs each term's background count.
-            List<Map<String, Object>> rows = InfinoNative.sqlRows(
-                "SELECT " + String.join(", ", parents) + ", " + key + " AS k0, COUNT(*) AS doc_count FROM " + from + " WHERE (" + where
-                    + ") AND " + tupleRestriction(chain, kept, n, false) + " AND " + key + " IS NOT NULL GROUP BY " + positions + " LIMIT "
-                    + (MAX_PREFETCHED_ROWS + 1)
-            );
-            if (rows.size() > MAX_PREFETCHED_ROWS) {
+            String restriction = keptBuckets(chain, kept, leafRows);
+            if (fencedForeground(s, chain, kept, leafRows, from, where, restriction)) {
+                continue;
+            }
+            Map<List<String>, List<Map<String, Object>>> byTuple = fullForeground(s, chain, from, where, restriction);
+            if (byTuple == null) {
                 // Past the rows one statement is let return: read each bucket
                 // on its own.
                 continue;
             }
-            Map<List<String>, List<Map<String, Object>>> byTuple = new HashMap<>();
-            for (Map<String, Object> row : rows) {
-                List<Object> tuple = new ArrayList<>();
-                for (int j = 0; j < n; j++) {
-                    tuple.add(row.get("p" + j));
-                }
-                Map<String, Object> fg = new HashMap<>();
-                fg.put("k0", row.get("k0"));
-                fg.put("doc_count", row.get("doc_count"));
-                byTuple.computeIfAbsent(tupleKey(tuple), k -> new ArrayList<>()).add(fg);
-            }
             Map<String, List<Map<String, Object>>> byWhere = new HashMap<>();
-            for (List<Object> tuple : kept) {
+            List<ForegroundBucket> buckets = new ArrayList<>();
+            for (int t = 0; t < kept.size(); t++) {
+                List<Object> tuple = kept.get(t);
                 List<Map<String, Object>> fg = byTuple.get(tupleKey(tuple));
                 if (fg == null) {
                     // No candidate came back under this bucket's keys: the bucket
@@ -3471,12 +3647,431 @@ public class InfinoAggregationProcessor {
                 }
                 String bucketWhere = "(" + where + ") AND " + tupleRestriction(chain, List.of(tuple), n, false);
                 byWhere.put(bucketWhere, fg);
+                buckets.add(new ForegroundBucket(fg, asLong(leafRows.get(t).get("doc_count"))));
             }
             foregrounds.put(s, byWhere);
-            // Every bucket's candidates are known now: their background
-            // counts are one statement, not one per bucket.
-            background(s, rows);
+            Map<String, Long> lower = new HashMap<>();
+            if (backgroundHoldsForegrounds(s)) {
+                for (List<Map<String, Object>> fg : byTuple.values()) {
+                    for (Map<String, Object> row : fg) {
+                        lower.merge(keyString(row.get("k0")), asLong(row.get("doc_count")), Long::sum);
+                    }
+                }
+            }
+            lowerBackgrounds.put(s, lower);
+            // Every bucket's terms are known now: the background counts their
+            // best need are read for all buckets at once, not bucket by bucket.
+            background(s, buckets, lower);
         }
+    }
+
+    /**
+     * The rows of the chain's kept leaf buckets, as a predicate: the
+     * {@link #tupleRestriction} of {@code kept}, or, when the chain is one
+     * terms level that kept every group it has ({@link #keptEveryGroup}),
+     * the rows with its key. A document is then in a kept bucket exactly
+     * when it has a key, and the engine checks one null rather than the key
+     * against every bucket's.
+     */
+    static String keptBuckets(List<Grouped> chain, List<List<Object>> kept, List<Map<String, Object>> leafRows) {
+        if (chain.size() == 1 && keptEveryGroup(chain.get(0), leafRows)) {
+            Grouped level = chain.get(0);
+            return presence(level.keyExpr, level.source);
+        }
+        return tupleRestriction(chain, kept, chain.size(), false);
+    }
+
+    /**
+     * Whether a top terms level's {@code rows} are every group it has: their
+     * counts add up to keyed_total, the count of every group with a key (each
+     * at least 1), with no minimum count leaving groups out of both. Only for
+     * a field each document gives one value, whose bucket is the document's
+     * value, keyed by a string, boolean or integer, whose literal is the key
+     * exactly: then the documents in the buckets are those with a value.
+     */
+    static boolean keptEveryGroup(Grouped level, List<Map<String, Object>> rows) {
+        if (!level.terms || level.source.multi() || level.minDocCount > 1 || rows.isEmpty()) {
+            return false;
+        }
+        if (level.keyKind != KeyKind.STR && level.keyKind != KeyKind.BOOL && level.keyKind != KeyKind.LONG) {
+            return false;
+        }
+        long sum = 0;
+        for (Map<String, Object> row : rows) {
+            if (!(row.get("keyed_total") instanceof Number total) || total.longValue() != asLong(rows.get(0).get("keyed_total")) || row.get("k0") == null) {
+                return false;
+            }
+            sum += asLong(row.get("doc_count"));
+        }
+        return sum == asLong(rows.get(0).get("keyed_total"));
+    }
+
+    /**
+     * Every term of every bucket {@code restriction} names, one statement:
+     * the cut to shard_size is by score (see {@link #evalSignificant}),
+     * which needs each term's background count. The rows by bucket, keyed
+     * by {@link #tupleKey} of the chain's keys, each a term {@code k0} and
+     * its {@code doc_count}; null past {@link #MAX_BATCHED_FOREGROUND_ROWS}.
+     */
+    private static Map<List<String>, List<Map<String, Object>>> fullForeground(
+        Significant s,
+        List<Grouped> chain,
+        String from,
+        String where,
+        String restriction
+    ) {
+        int n = chain.size();
+        List<String> parents = new ArrayList<>();
+        for (int j = 0; j < n; j++) {
+            parents.add(chain.get(j).keyExpr + " AS p" + j);
+        }
+        String key = s.keyExpr();
+        List<Map<String, Object>> rows = InfinoNative.sqlRows(
+            "SELECT " + String.join(", ", parents) + ", " + key + " AS k0, COUNT(*) AS doc_count FROM " + from + " WHERE (" + where + ") AND "
+                + restriction + " AND " + key + " IS NOT NULL GROUP BY " + positions(n + 1) + " LIMIT " + (MAX_BATCHED_FOREGROUND_ROWS + 1)
+        );
+        if (rows.size() > MAX_BATCHED_FOREGROUND_ROWS) {
+            return null;
+        }
+        Map<List<String>, List<Map<String, Object>>> byTuple = new HashMap<>();
+        for (Map<String, Object> row : rows) {
+            Map<String, Object> fg = new HashMap<>();
+            fg.put("k0", row.get("k0"));
+            fg.put("doc_count", row.get("doc_count"));
+            byTuple.computeIfAbsent(tupleKey(parentTuple(row, n)), k -> new ArrayList<>()).add(fg);
+        }
+        return byTuple;
+    }
+
+    /**
+     * {@code 1, 2, ..., n}: a GROUP BY by SELECT position, as groupStatement
+     * groups, since a field named p0 or k0 would take the alias's place in a
+     * GROUP BY by name.
+     */
+    private static String positions(int n) {
+        StringBuilder out = new StringBuilder();
+        for (int j = 1; j <= n; j++) {
+            out.append(j == 1 ? "" : ", ").append(j);
+        }
+        return out.toString();
+    }
+
+    /** The parent keys {@code p0 .. p(n-1)} of a batched foreground row. */
+    private static List<Object> parentTuple(Map<String, Object> row, int n) {
+        List<Object> tuple = new ArrayList<>(n);
+        for (int j = 0; j < n; j++) {
+            tuple.add(row.get("p" + j));
+        }
+        return tuple;
+    }
+
+    /**
+     * Rows a bucket's bound-ordered foreground ({@link #fencedForeground})
+     * reads per term the bucket keeps, plus one: the fence. A bucket's terms
+     * come back best bound first, and those past the fence are left unread
+     * when the fence's bound is below the bucket's shard_size-th score. On a
+     * shape of 7 buckets of 4,734 terms each keeping 25, 26 rows per bucket
+     * proved no bucket (28 to 34 were needed) and 51 proved every one.
+     */
+    static final int FENCE_ROWS_PER_KEPT_TERM = 2;
+
+    /** The rows per bucket {@link #fencedForeground} reads for a level keeping {@code candidates} terms. */
+    static int fenceRows(int candidates) {
+        return candidates * FENCE_ROWS_PER_KEPT_TERM + 1;
+    }
+
+    /**
+     * JLH's score ({@link JLHScore#getScore}) in SQL over the columns
+     * {@code subsetDf}, {@code subsetSize}, {@code supersetDf} and the
+     * superset size: the same operations in the same order on doubles, so
+     * it rounds to the same value. The superset count must be at least 1 and
+     * at least the subset count, as JLH's caller here always passes it.
+     */
+    static String jlhScoreSql(String subsetDf, String subsetSize, String supersetDf, long supersetSize) {
+        String p = "(CAST(" + subsetDf + " AS DOUBLE) / CAST(" + subsetSize + " AS DOUBLE))";
+        String q = "(CAST(" + supersetDf + " AS DOUBLE) / CAST(" + supersetSize + " AS DOUBLE))";
+        String change = "(" + p + " - " + q + ")";
+        return "CASE WHEN " + change + " > 0.0 THEN " + change + " * (" + p + " / " + q + ") ELSE 0.0 END";
+    }
+
+    /**
+     * The bound-ordered foreground of a significant_terms level under a chain
+     * of {@code parents.size()} terms levels: every (bucket, term) group of
+     * {@code from WHERE where AND restriction} (no restriction when null),
+     * the rows without the term among them so that {@code ptotal}, the sum
+     * over the bucket, is the bucket's size; {@code ktotal}, the term's count
+     * over every bucket read; {@code ub}, the JLH score at that count against
+     * {@code supersetSize}; and the first {@code fence} rows of each bucket by
+     * {@code ub}, highest first, the rows without the term last. With a
+     * {@code parentOrder} (over one parent, its count {@code ptotal} and key
+     * {@code p0}), the statement reads the parent level's groups too: only
+     * the first {@code parentSize} buckets in that order keep rows, each
+     * carrying {@code total}, the count of every row, and {@code keyed_total},
+     * of every row with a parent key; with no such bucket, the first row of
+     * the one without a key carries them.
+     */
+    static String fencedForegroundSql(
+        List<String> parents,
+        String key,
+        String from,
+        String where,
+        String restriction,
+        long supersetSize,
+        int fence,
+        String parentOrder,
+        int parentSize
+    ) {
+        int n = parents.size();
+        List<String> select = new ArrayList<>();
+        List<String> aliases = new ArrayList<>();
+        for (int j = 0; j < n; j++) {
+            select.add(parents.get(j) + " AS p" + j);
+            aliases.add("p" + j);
+        }
+        String bucket = String.join(", ", aliases);
+        String grouped = "SELECT " + String.join(", ", select) + ", " + key + " AS k0, COUNT(*) AS doc_count FROM " + from + " WHERE (" + where + ")"
+            + (restriction == null ? "" : " AND " + restriction) + " GROUP BY " + positions(n + 1);
+        String totals = "SELECT g.*, SUM(doc_count) OVER (PARTITION BY " + bucket + ") AS ptotal, SUM(doc_count) OVER (PARTITION BY k0) AS ktotal FROM ("
+            + grouped + ") g";
+        String bounded = "SELECT t.*, " + jlhScoreSql("doc_count", "ptotal", "ktotal", supersetSize) + " AS ub FROM (" + totals + ") t";
+        String rn = "ROW_NUMBER() OVER (PARTITION BY " + bucket + " ORDER BY k0 IS NULL, ub DESC, k0) AS rn";
+        if (parentOrder == null) {
+            return "SELECT * FROM (SELECT b.*, " + rn + " FROM (" + bounded + ") b) WHERE rn <= " + fence + " ORDER BY " + bucket + ", rn";
+        }
+        String ranked = "SELECT b.*, " + rn + ", DENSE_RANK() OVER (ORDER BY p0 IS NULL, " + parentOrder + ") AS prank, SUM(doc_count) OVER () AS total, "
+            + "SUM(CASE WHEN p0 IS NULL THEN 0 ELSE doc_count END) OVER () AS keyed_total FROM (" + bounded + ") b";
+        return "SELECT * FROM (" + ranked + ") WHERE rn <= " + fence + " AND ((p0 IS NOT NULL AND prank <= " + parentSize + ") OR (prank = 1 AND rn = 1))"
+            + " ORDER BY " + bucket + ", rn";
+    }
+
+    /** One bucket's rows of a bound-ordered foreground ({@link #fencedForeground}). */
+    private static final class FencedBucket {
+        final List<Object> tuple;
+        final List<Map<String, Object>> terms = new ArrayList<>();
+        /** The bucket's size, every row of it, with the term or without. */
+        long size = -1;
+        /** The bound of the fence row, the last read, when it holds a term; NaN when the bucket's terms all came back. */
+        double fenceBound = Double.NaN;
+        String where;
+
+        FencedBucket(List<Object> tuple) {
+            this.tuple = tuple;
+        }
+    }
+
+    /**
+     * Read the foreground of {@code s} under the chain's buckets as
+     * {@link #prefetchSignificant} does, but only each bucket's best terms by
+     * bound: the first {@link #fenceRows} of its terms by their JLH score at
+     * the least background count they can have, their count over every
+     * bucket read (the background holds every foreground row). Every term
+     * past the fence has a bound no higher than the fence's, and a score no
+     * higher than its bound (JLH falls as the background count rises, see
+     * {@link Significant#scoreFallsWithBackground}). So once the background
+     * counts are read, a bucket whose fence bound is strictly below its
+     * shard_size-th score keeps the same terms as from every term: the rest
+     * score below shard_size terms it read, and cannot tie them. A bucket
+     * where it is not below is read in full, as before.
+     *
+     * <p>The bound the statement orders by is checked against the one Java
+     * computes from the same counts, bit for bit, on every row read, and each
+     * bucket's size against the parent level's count: on any difference the
+     * level is read in full. False, with nothing read into the level, when
+     * the heuristic is not JLH, the background does not hold every
+     * foreground row ({@link #backgroundHoldsForegrounds}), or the rows are
+     * past {@link #MAX_BATCHED_FOREGROUND_ROWS}.
+     */
+    private boolean fencedForeground(
+        Significant s,
+        List<Grouped> chain,
+        List<List<Object>> kept,
+        List<Map<String, Object>> leafRows,
+        String from,
+        String where,
+        String restriction
+    ) {
+        if (!Significant.scoreFallsWithBackground(s.heuristic) || s.candidates <= 0 || !backgroundHoldsForegrounds(s)) {
+            return false;
+        }
+        Background bg = backgroundOf(s, backgroundRows(s));
+        if (bg.size <= 0) {
+            return false;
+        }
+        int n = chain.size();
+        int fence = fenceRows(s.candidates);
+        List<String> parents = new ArrayList<>();
+        for (Grouped g : chain) {
+            parents.add(g.keyExpr);
+        }
+        // Read already with the parent level's groups: every bucket's rows, kept or not.
+        Fused ahead = fused.remove(s);
+        List<Map<String, Object>> rows;
+        if (ahead != null && n == 1 && ahead.from().equals(from) && ahead.where().equals(where)) {
+            rows = ahead.rows();
+        } else {
+            rows = InfinoNative.sqlRows(
+                fencedForegroundSql(parents, s.keyExpr(), from, where, restriction, bg.size, fence, null, 0) + " LIMIT " + (MAX_BATCHED_FOREGROUND_ROWS + 1)
+            );
+            if (rows.size() > MAX_BATCHED_FOREGROUND_ROWS) {
+                return false;
+            }
+        }
+        Map<List<String>, FencedBucket> byTuple = new HashMap<>();
+        for (List<Object> tuple : kept) {
+            byTuple.put(tupleKey(tuple), new FencedBucket(tuple));
+        }
+        // A term's count over every bucket read: the least background count it can have.
+        Map<String, Long> lower = new HashMap<>();
+        for (Map<String, Object> row : rows) {
+            // Rows read with the parent level's groups hold its other buckets too.
+            FencedBucket b = byTuple.get(tupleKey(parentTuple(row, n)));
+            if (b == null) {
+                continue;
+            }
+            long size = asLong(row.get("ptotal"));
+            if (b.size >= 0 && b.size != size) {
+                return false;
+            }
+            b.size = size;
+            Object k = row.get("k0");
+            if (k == null) {
+                continue;
+            }
+            long subsetDf = asLong(row.get("doc_count"));
+            long least = asLong(row.get("ktotal"));
+            // Counts JLH refuses cannot come from a background holding the bucket.
+            if (subsetDf < 1 || subsetDf > size || least < subsetDf || least > bg.size) {
+                return false;
+            }
+            double bound = s.heuristic.getScore(subsetDf, size, least, bg.size);
+            if (!(row.get("ub") instanceof Number ub) || Double.doubleToLongBits(ub.doubleValue()) != Double.doubleToLongBits(bound)) {
+                log.debug("[infino] significant_terms bound {} from the engine is not {}; reading every term", row.get("ub"), bound);
+                return false;
+            }
+            Map<String, Object> fg = new HashMap<>();
+            fg.put("k0", k);
+            fg.put("doc_count", row.get("doc_count"));
+            b.terms.add(fg);
+            lower.put(keyString(k), least);
+            if (asLong(row.get("rn")) == fence) {
+                b.fenceBound = bound;
+            }
+        }
+        List<FencedBucket> read = new ArrayList<>();
+        for (int t = 0; t < kept.size(); t++) {
+            List<Object> tuple = kept.get(t);
+            FencedBucket b = byTuple.get(tupleKey(tuple));
+            if (b == null || b.terms.isEmpty()) {
+                // No term came back under this bucket's keys: the bucket reads
+                // its own foreground, so a key the statement printed
+                // differently is not taken for an empty bucket.
+                continue;
+            }
+            if (b.size != asLong(leafRows.get(t).get("doc_count"))) {
+                return false;
+            }
+            b.where = "(" + where + ") AND " + tupleRestriction(chain, List.of(tuple), n, false);
+            read.add(b);
+        }
+        Map<String, List<Map<String, Object>>> byWhere = new HashMap<>();
+        List<ForegroundBucket> buckets = new ArrayList<>();
+        for (FencedBucket b : read) {
+            byWhere.put(b.where, b.terms);
+            buckets.add(new ForegroundBucket(b.terms, b.size));
+        }
+        foregrounds.put(s, byWhere);
+        lowerBackgrounds.put(s, lower);
+        background(s, buckets, lower);
+        List<FencedBucket> unproven = new ArrayList<>();
+        for (int i = 0; i < read.size(); i++) {
+            FencedBucket b = read.get(i);
+            // Strictly below: a term past the fence that tied the last kept one could sort before it by key.
+            if (!Double.isNaN(b.fenceBound) && !(b.fenceBound < keptScore(s, buckets.get(i), bg))) {
+                unproven.add(b);
+            }
+        }
+        if (!unproven.isEmpty()) {
+            readInFull(s, chain, unproven, from, where, byWhere, lower);
+        }
+        return true;
+    }
+
+    /**
+     * The shard_size-th best score among the terms of bucket {@code b} whose
+     * background count is read; negative infinity with fewer read.
+     */
+    private static double keptScore(Significant s, ForegroundBucket b, Background bg) {
+        PriorityQueue<Double> best = new PriorityQueue<>();
+        for (Map<String, Object> row : b.terms()) {
+            Long count = bg.counts.get(keyString(row.get("k0")));
+            if (count == null) {
+                continue;
+            }
+            long subsetDf = asLong(row.get("doc_count"));
+            best.add(s.heuristic.getScore(subsetDf, b.size(), Math.max(subsetDf, count), bg.size));
+            if (best.size() > s.candidates) {
+                best.poll();
+            }
+        }
+        return best.size() < s.candidates ? Double.NEGATIVE_INFINITY : best.peek();
+    }
+
+    /**
+     * Read every term of the {@code unproven} buckets of a bound-ordered
+     * foreground in one statement, as {@link #prefetchSignificant} reads
+     * them without a fence, in place of their fenced rows, and their
+     * background counts. A bucket past the statement's bound, or whose key
+     * the statement printed differently, reads its own foreground.
+     */
+    private void readInFull(
+        Significant s,
+        List<Grouped> chain,
+        List<FencedBucket> unproven,
+        String from,
+        String where,
+        Map<String, List<Map<String, Object>>> byWhere,
+        Map<String, Long> lower
+    ) {
+        List<List<Object>> tuples = new ArrayList<>();
+        for (FencedBucket b : unproven) {
+            tuples.add(b.tuple);
+        }
+        Map<List<String>, List<Map<String, Object>>> full = fullForeground(s, chain, from, where, tupleRestriction(chain, tuples, chain.size(), false));
+        List<ForegroundBucket> buckets = new ArrayList<>();
+        Map<String, Long> sums = new HashMap<>();
+        for (FencedBucket b : unproven) {
+            List<Map<String, Object>> fg = full == null ? null : full.get(tupleKey(b.tuple));
+            if (fg == null) {
+                byWhere.remove(b.where);
+                continue;
+            }
+            byWhere.put(b.where, fg);
+            buckets.add(new ForegroundBucket(fg, b.size));
+            for (Map<String, Object> row : fg) {
+                sums.merge(keyString(row.get("k0")), asLong(row.get("doc_count")), Long::sum);
+            }
+        }
+        // Each is a least background count: the fenced read's over every bucket, this one's over these.
+        sums.forEach((term, sum) -> lower.merge(term, sum, Math::max));
+        if (!buckets.isEmpty()) {
+            background(s, buckets, lower);
+        }
+    }
+
+    /**
+     * Whether the background of {@code s} holds every row its foreground
+     * counts: it is every row of the one table the aggregations read, with
+     * no background filter and no rule narrowing what the user may see, and
+     * the term is a field each document gives one value, so a row counts
+     * once for its term in either. A term's background count is then at
+     * least its foreground count over any set of buckets that share no row.
+     */
+    private boolean backgroundHoldsForegrounds(Significant s) {
+        return tables.size() == 1
+            && tables.get(0).equals(s.table)
+            && !s.source.multi()
+            && InfinoQueryTranslator.ALL.equals(s.backgroundWhere)
+            && plan.access().documentsWhere(InfinoNative.columns(s.table), s.table, plan.nowMillis()) == null;
     }
 
     /**
@@ -3527,6 +4122,12 @@ public class InfinoAggregationProcessor {
         }
         List<Grouped> chain = List.of(level);
         String picked = levelInner(chain, 0, q.from(), q.where(), "", true);
+        if (!readsValueCounts(level, q)) {
+            Long fusedTotal = fusedTopTerms(level, q, picked);
+            if (fusedTotal != null) {
+                return fusedTotal;
+            }
+        }
         List<Map<String, Object>> groups;
         if (readsValueCounts(level, q)) {
             groups = valueCounts(level, q);
@@ -3551,6 +4152,64 @@ public class InfinoAggregationProcessor {
             return total;
         }
         readAhead.put(picked, keyed);
+        return total;
+    }
+
+    /**
+     * The request's total and a top terms level's best groups read with the
+     * bound-ordered foreground of the significant_terms level right under it
+     * ({@link #fencedForegroundSql} with the level's order), in one statement
+     * rather than the level's own GROUP BY and then the foreground: the
+     * level's first {@code size} buckets in its order, each with its size
+     * (ptotal, its rows with the term or without) and its fenced rows, and
+     * the counts of every row and of every row with a key, window sums over
+     * every bucket. The level picks its buckets from these (see
+     * {@link #pickTopTerms}) and {@link #fencedForeground} takes their rows.
+     * The statement ranks the buckets as the level's window statement does.
+     *
+     * <p>Only for a level whose groups the request total is read from (see
+     * {@link #totalFromTopTerms}), with no metric, a lone significant_terms
+     * child that fencedForeground serves, and no metric there, and when its
+     * buckets' fence rows fit in {@link #MAX_BATCHED_FOREGROUND_ROWS}, so the
+     * statement is never read for nothing. Null otherwise, for the level's
+     * own statements to run.
+     */
+    private Long fusedTopTerms(Grouped level, Translation q, String picked) {
+        if (!(level.child instanceof Significant s)
+            || !s.metrics.isEmpty()
+            || !level.metrics.isEmpty()
+            || !Significant.scoreFallsWithBackground(s.heuristic)
+            || s.candidates <= 0
+            || !backgroundHoldsForegrounds(s)) {
+            return null;
+        }
+        int fence = fenceRows(s.candidates);
+        if ((long) level.size * fence + 1 > MAX_BATCHED_FOREGROUND_ROWS) {
+            return null;
+        }
+        Background bg = backgroundOf(s, backgroundRows(s));
+        if (bg.size <= 0) {
+            return null;
+        }
+        // The level's order over the buckets' sizes: a count or key order (totalFromTopTerms checks).
+        String parentOrder = level.order("p0").replace("doc_count", "ptotal");
+        List<Map<String, Object>> rows = InfinoNative.sqlRows(
+            fencedForegroundSql(List.of(level.keyExpr), s.keyExpr(), q.from(), q.where(), null, bg.size, fence, parentOrder, level.size)
+        );
+        long total = rows.isEmpty() ? 0 : asLong(rows.get(0).get("total"));
+        long keyed = rows.isEmpty() ? 0 : asLong(rows.get(0).get("keyed_total"));
+        List<Map<String, Object>> groups = new ArrayList<>();
+        for (Map<String, Object> row : rows) {
+            if (asLong(row.get("rn")) == 1 && row.get("p0") != null) {
+                Map<String, Object> group = new HashMap<>();
+                group.put("k0", row.get("p0"));
+                group.put("doc_count", row.get("ptotal"));
+                groups.add(group);
+            }
+        }
+        readAhead.put(picked, groups);
+        fusedKeyedTotals.put(picked, keyed);
+        fused.put(s, new Fused(q.from(), q.where(), rows));
         return total;
     }
 
@@ -3599,9 +4258,17 @@ public class InfinoAggregationProcessor {
      * keyed_total, the rows of every group, as the window statement's rows
      * do. Null, for the window statement to answer, when the order reads a
      * metric (a missing metric value sorts where the engine puts it) or the
-     * level has more groups than are worth picking here.
+     * level has more groups than are worth picking here. With a
+     * {@code fusedKeyedTotal}, the groups read ahead are the level's best
+     * only, read with its foreground ({@link #fusedTopTerms}), however many,
+     * and that is the count of every group.
      */
-    private static List<Map<String, Object>> pickTopTerms(Grouped level, String inner, Map<String, List<Map<String, Object>>> readAhead) {
+    private static List<Map<String, Object>> pickTopTerms(
+        Grouped level,
+        String inner,
+        Map<String, List<Map<String, Object>>> readAhead,
+        Long fusedKeyedTotal
+    ) {
         Comparator<Map<String, Object>> order = termsOrder(level);
         if (order == null) {
             return null;
@@ -3618,12 +4285,15 @@ public class InfinoAggregationProcessor {
         } else {
             groups = new ArrayList<>(InfinoNative.sqlRows(inner + " LIMIT " + (MAX_GROUPS_PICKED_HERE + 1)));
         }
-        if (groups.size() > MAX_GROUPS_PICKED_HERE) {
+        if (groups.size() > MAX_GROUPS_PICKED_HERE && fusedKeyedTotal == null) {
             return null;
         }
         long keyedTotal = 0;
         for (Map<String, Object> group : groups) {
             keyedTotal += asLong(group.get("doc_count"));
+        }
+        if (fusedKeyedTotal != null) {
+            keyedTotal = fusedKeyedTotal;
         }
         sortTerms(level, groups);
         List<Map<String, Object>> out = new ArrayList<>();

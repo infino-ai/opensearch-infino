@@ -1,0 +1,147 @@
+---
+setup:
+  - do:
+      indices.create:
+        index: swp_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              k: { type: keyword }
+              n: { type: long }
+              obj: { properties: { a: { type: keyword }, b: { type: keyword } } }
+  - do:
+      indices.create:
+        index: swp_proxy_two
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              k: { type: keyword }
+              n: { type: long }
+              obj: { properties: { a: { type: keyword }, b: { type: keyword } } }
+  - do:
+      indices.create:
+        index: swp_default
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              k: { type: keyword }
+              n: { type: long }
+              obj: { properties: { a: { type: keyword }, b: { type: keyword } } }
+  - do:
+      indices.create:
+        index: swp_default_shards
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 2, number_of_replicas: 0 }
+          mappings:
+            properties:
+              k: { type: keyword }
+              n: { type: long }
+              obj: { properties: { a: { type: keyword }, b: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: swp_proxy, _id: "d1" }
+          - { k: "d1", n: 1, obj: { a: "a1", b: "b1" } }
+          - index: { _index: swp_proxy, _id: "d2" }
+          - { k: "d2", n: 2, obj: { a: "a2", b: "b2" } }
+          - index: { _index: swp_proxy, _id: "d3" }
+          - { k: "d3", n: 3, obj: { a: "a3", b: "b3" } }
+          - index: { _index: swp_proxy, _id: "d4" }
+          - { k: "d4", n: 4, obj: { a: "a4", b: "b4" } }
+          - index: { _index: swp_proxy, _id: "d5" }
+          - { k: "d5", n: 5, obj: { a: "a5", b: "b5" } }
+          - index: { _index: swp_proxy, _id: "d6" }
+          - { k: "d6", n: 6, obj: { a: "a6", b: "b6" } }
+          - index: { _index: swp_proxy_two, _id: "e1" }
+          - { k: "e1", n: 11, obj: { a: "a11", b: "b11" } }
+          - index: { _index: swp_proxy_two, _id: "e2" }
+          - { k: "e2", n: 12, obj: { a: "a12", b: "b12" } }
+          - index: { _index: swp_default, _id: "d1" }
+          - { k: "d1", n: 1, obj: { a: "a1", b: "b1" } }
+          - index: { _index: swp_default, _id: "d2" }
+          - { k: "d2", n: 2, obj: { a: "a2", b: "b2" } }
+          - index: { _index: swp_default, _id: "d3" }
+          - { k: "d3", n: 3, obj: { a: "a3", b: "b3" } }
+          - index: { _index: swp_default, _id: "d4" }
+          - { k: "d4", n: 4, obj: { a: "a4", b: "b4" } }
+          - index: { _index: swp_default, _id: "d5" }
+          - { k: "d5", n: 5, obj: { a: "a5", b: "b5" } }
+          - index: { _index: swp_default, _id: "d6" }
+          - { k: "d6", n: 6, obj: { a: "a6", b: "b6" } }
+          - index: { _index: swp_default_shards, _id: "d1" }
+          - { k: "d1", n: 1, obj: { a: "a1", b: "b1" } }
+          - index: { _index: swp_default_shards, _id: "d2" }
+          - { k: "d2", n: 2, obj: { a: "a2", b: "b2" } }
+          - index: { _index: swp_default_shards, _id: "d3" }
+          - { k: "d3", n: 3, obj: { a: "a3", b: "b3" } }
+          - index: { _index: swp_default_shards, _id: "d4" }
+          - { k: "d4", n: 4, obj: { a: "a4", b: "b4" } }
+          - index: { _index: swp_default_shards, _id: "d5" }
+          - { k: "d5", n: 5, obj: { a: "a5", b: "b5" } }
+          - index: { _index: swp_default_shards, _id: "d6" }
+          - { k: "d6", n: 6, obj: { a: "a6", b: "b6" } }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: swp_proxy,swp_proxy_two,swp_default,swp_default_shards
+        ignore_unavailable: true
+
+---
+"A deep sorted page returns its window's sources (proxy, one index)":
+  - do:
+      search:
+        index: swp_proxy
+        body: { from: 3, size: 2, sort: [ { n: asc } ], _source: { includes: [ "k", "obj.a" ] }, fields: [ "k" ] }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "d4" }
+  - match: { hits.hits.0._source: { k: "d4", obj: { a: "a4" } } }
+  - match: { hits.hits.0.fields.k: [ "d4" ] }
+  - match: { hits.hits.1._id: "d5" }
+  - match: { hits.hits.1._source: { k: "d5", obj: { a: "a5" } } }
+
+---
+"A deep sorted page over two indices returns its window's sources (proxy)":
+  - do:
+      search:
+        index: swp_proxy,swp_proxy_two
+        body: { from: 5, size: 2, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 8 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "d6" }
+  - match: { hits.hits.0._source.k: "d6" }
+  - match: { hits.hits.1._id: "e1" }
+  - match: { hits.hits.1._source: { k: "e1", n: 11, obj: { a: "a11", b: "b11" } } }
+
+---
+"A deep sorted page returns its window's sources (default, one shard)":
+  - do:
+      search:
+        index: swp_default
+        body: { from: 3, size: 2, sort: [ { n: desc } ], _source: { includes: [ "k", "obj.a" ] }, fields: [ "k" ] }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "d3" }
+  - match: { hits.hits.0._source: { k: "d3", obj: { a: "a3" } } }
+  - match: { hits.hits.0.fields.k: [ "d3" ] }
+  - match: { hits.hits.1._id: "d2" }
+  - match: { hits.hits.1._source: { k: "d2", obj: { a: "a2" } } }
+
+---
+"A deep sorted page returns its window's sources (default, two shards)":
+  - do:
+      search:
+        index: swp_default_shards
+        body: { from: 3, size: 2, sort: [ { n: asc } ], _source: { includes: [ "k" ] } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "d4" }
+  - match: { hits.hits.0._source: { k: "d4" } }
+  - match: { hits.hits.1._id: "d5" }
+  - match: { hits.hits.1._source: { k: "d5" } }
