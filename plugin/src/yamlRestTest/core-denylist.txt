@@ -87,7 +87,6 @@ bulk/40_source/Source filtering  # [bug] an update with _source filtering return
 search/100_stored_fields/Stored fields  # [bug] stored_fields: _none_ still returns _id
 search/330_fetch_fields/Test disable _source loading  # [bug] fields returns nothing when _source is not loaded
 search/330_fetch_fields/Test token count  # [bug] fields returns the wrong token_count
-search/400_max_score/*  # [bug] max_score is set when the sort does not lead with _score
 search/190_index_prefix_search/search with index prefixes  # [bug] max_score differs from stock scoring
 search/210_rescore_explain/Score should match explanation in rescore  # [bug] max_score differs from stock scoring
 search/50_multi_match/Cross fields do not return negative scores  # [bug] multi_match cross_fields orders hits differently from stock on some runs
