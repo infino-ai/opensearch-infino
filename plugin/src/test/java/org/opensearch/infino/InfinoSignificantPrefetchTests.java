@@ -828,6 +828,39 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
         assertEquals(List.of(9L), keysOf(InfinoAggregationProcessor.Significant.bestByScore(longs, 1, 0, 10, 100, new JLHScore())));
     }
 
+    /** The best by score are a full sort's first, by score and then key, with many ties, string keys or numbers. */
+    public void testBestByScoreIsAFullSortsFirst() {
+        JLHScore jlh = new JLHScore();
+        for (int round = 0; round < 30; round++) {
+            boolean strings = randomBoolean();
+            List<InfinoAggregationProcessor.Significant.Candidate> terms = new ArrayList<>();
+            for (int i = between(0, 200); i > 0; i--) {
+                long subsetDf = between(1, 5);
+                terms.add(term(strings ? (Object) ("k" + i) : (Object) (long) i, subsetDf, subsetDf + between(0, 5)));
+            }
+            java.util.Collections.shuffle(terms, random());
+            int keep = between(0, 30);
+            long shardMin = between(0, 3);
+            List<InfinoAggregationProcessor.Significant.Candidate> sorted = new ArrayList<>(terms);
+            sorted.sort((x, y) -> {
+                int byScore = Double.compare(jlh.getScore(y.subsetDf(), 100, y.supersetDf(), 1000), jlh.getScore(x.subsetDf(), 100, x.supersetDf(), 1000));
+                if (byScore != 0) {
+                    return byScore;
+                }
+                return strings
+                    ? new org.apache.lucene.util.BytesRef((String) x.key()).compareTo(new org.apache.lucene.util.BytesRef((String) y.key()))
+                    : Long.compare((Long) x.key(), (Long) y.key());
+            });
+            List<InfinoAggregationProcessor.Significant.Candidate> want = new ArrayList<>();
+            for (InfinoAggregationProcessor.Significant.Candidate c : sorted.subList(0, Math.min(keep, sorted.size()))) {
+                if (c.subsetDf() >= shardMin) {
+                    want.add(c);
+                }
+            }
+            assertEquals(keysOf(want), keysOf(InfinoAggregationProcessor.Significant.bestByScore(terms, keep, shardMin, 100, 1000, jlh)));
+        }
+    }
+
     /** A script heuristic cannot run on the shard: every term goes on to the reduction. */
     public void testScriptHeuristicKeepsEveryTerm() {
         List<InfinoAggregationProcessor.Significant.Candidate> terms = List.of(term("c", 4, 16), term("r2", 1, 1), term("m", 3, 10));

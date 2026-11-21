@@ -2482,19 +2482,29 @@ public class InfinoAggregationProcessor {
                 out.removeIf(c -> c.subsetDf() < shardMinDocCount);
                 return out;
             }
-            List<Map.Entry<Double, Candidate>> scored = new ArrayList<>(terms.size());
-            for (Candidate c : terms) {
-                scored.add(Map.entry(heuristic.getScore(c.subsetDf(), subsetSize, c.supersetDf(), supersetSize), c));
+            if (keep <= 0) {
+                return new ArrayList<>();
             }
-            scored.sort((a, b) -> {
+            Comparator<Map.Entry<Double, Candidate>> best = (a, b) -> {
                 int byScore = Double.compare(b.getKey(), a.getKey());
                 return byScore != 0 ? byScore : compareKeys(a.getValue().key(), b.getValue().key());
-            });
-            List<Candidate> out = new ArrayList<>(Math.min(keep, scored.size()));
-            for (int i = 0; i < scored.size() && i < keep; i++) {
-                Candidate c = scored.get(i).getValue();
-                if (c.subsetDf() >= shardMinDocCount) {
-                    out.add(c);
+            };
+            // The best keep, the worst of them on top: a bucket's terms are
+            // distinct keys, so the order is total and the heap keeps what a
+            // full sort's first keep would be.
+            PriorityQueue<Map.Entry<Double, Candidate>> worstFirst = new PriorityQueue<>(Math.min(keep, terms.size()) + 1, best.reversed());
+            for (Candidate c : terms) {
+                worstFirst.add(Map.entry(heuristic.getScore(c.subsetDf(), subsetSize, c.supersetDf(), supersetSize), c));
+                if (worstFirst.size() > keep) {
+                    worstFirst.poll();
+                }
+            }
+            List<Map.Entry<Double, Candidate>> scored = new ArrayList<>(worstFirst);
+            scored.sort(best);
+            List<Candidate> out = new ArrayList<>(scored.size());
+            for (Map.Entry<Double, Candidate> e : scored) {
+                if (e.getValue().subsetDf() >= shardMinDocCount) {
+                    out.add(e.getValue());
                 }
             }
             return out;
@@ -3040,7 +3050,11 @@ public class InfinoAggregationProcessor {
         // The background does not depend on the bucket this level sits under:
         // under a parent terms level every bucket would count the same rows
         // again, so its size and each term's count are read once per request.
-        Background bg = background(s, List.of(new ForegroundBucket(foreground, subsetSize)), lowerBackgrounds.getOrDefault(s, Map.of()));
+        // A bucket whose foreground was read ahead had the counts its best
+        // terms need read with it (see prefetchSignificant).
+        Background bg = prefetched != null && prefetched.get(where) != null
+            ? backgroundOf(s, backgroundRows(s))
+            : background(s, List.of(new ForegroundBucket(foreground, subsetSize)), lowerBackgrounds.getOrDefault(s, Map.of()));
         long supersetSize = bg.size;
         Map<String, Long> background = bg.counts;
         List<Significant.Candidate> scored = new ArrayList<>(foreground.size());
@@ -3100,11 +3114,19 @@ public class InfinoAggregationProcessor {
             return bg;
         }
         boolean bounded = Significant.scoreFallsWithBackground(s.heuristic);
+        // Each term's bound, worked out once for every round.
+        List<List<Bounded>> bounds = new ArrayList<>();
+        if (bounded) {
+            for (ForegroundBucket b : buckets) {
+                bounds.add(boundsOf(s, b, bg, lower));
+            }
+        }
         while (true) {
             Map<String, String> unread = new LinkedHashMap<>();
-            for (ForegroundBucket b : buckets) {
+            for (int i = 0; i < buckets.size(); i++) {
+                ForegroundBucket b = buckets.get(i);
                 if (bounded) {
-                    unreadBestBounds(s, b, bg, lower, unread);
+                    unreadBestBounds(s, b, bounds.get(i), bg, unread);
                 } else {
                     for (Map<String, Object> row : b.terms()) {
                         String term = keyString(row.get("k0"));
@@ -3142,44 +3164,86 @@ public class InfinoAggregationProcessor {
         });
     }
 
+    /** A term of a foreground bucket: its key, its {@link #keyString}, its count there, and its score's bound. */
+    private record Bounded(Object key, String term, long subsetDf, double bound) {}
+
     /**
-     * Add to {@code unread} the terms of bucket {@code b} whose background
-     * count {@link #background} reads next: with fewer than
-     * {@code shard_size} terms read, the unread ones with the best bounds,
-     * enough to make up {@code shard_size}; after that every unread term
-     * whose bound is not below the {@code shard_size}th best score read.
-     * The bound is the score at the term's lowest possible background count.
+     * The terms of bucket {@code b}, each with its bound: the score at the
+     * lowest background count it can have, its count in the bucket or its
+     * entry in {@code lower}.
      */
-    private static void unreadBestBounds(Significant s, ForegroundBucket b, Background bg, Map<String, Long> lower, Map<String, String> unread) {
-        List<Double> read = new ArrayList<>();
-        List<Map.Entry<Double, Map<String, Object>>> bounds = new ArrayList<>();
+    private static List<Bounded> boundsOf(Significant s, ForegroundBucket b, Background bg, Map<String, Long> lower) {
+        List<Bounded> out = new ArrayList<>(b.terms().size());
         for (Map<String, Object> row : b.terms()) {
-            String term = keyString(row.get("k0"));
+            Object key = row.get("k0");
+            String term = keyString(key);
             long subsetDf = asLong(row.get("doc_count"));
-            Long count = bg.counts.get(term);
-            if (count != null) {
-                read.add(s.heuristic.getScore(subsetDf, b.size(), Math.max(subsetDf, count), bg.size));
-            } else {
-                long least = Math.max(subsetDf, lower.getOrDefault(term, 0L));
-                bounds.add(Map.entry(s.heuristic.getScore(subsetDf, b.size(), least, bg.size), row));
-            }
+            long least = Math.max(subsetDf, lower.getOrDefault(term, 0L));
+            out.add(new Bounded(key, term, subsetDf, s.heuristic.getScore(subsetDf, b.size(), least, bg.size)));
         }
-        if (bounds.isEmpty() || s.candidates <= 0) {
+        return out;
+    }
+
+    /**
+     * Add to {@code unread} the terms of bucket {@code b} ({@code terms}, with
+     * their bounds) whose background count {@link #background} reads next:
+     * with fewer than {@code shard_size} terms read, the unread ones with the
+     * best bounds, enough to make up {@code shard_size}; after that every
+     * unread term whose bound is not below the {@code shard_size}th best
+     * score read.
+     */
+    private static void unreadBestBounds(Significant s, ForegroundBucket b, List<Bounded> terms, Background bg, Map<String, String> unread) {
+        int keep = s.candidates;
+        if (keep <= 0) {
             return;
         }
-        if (read.size() < s.candidates) {
-            bounds.sort((x, y) -> Double.compare(y.getKey(), x.getKey()));
-            for (Map.Entry<Double, Map<String, Object>> e : bounds.subList(0, Math.min(bounds.size(), s.candidates - read.size()))) {
-                unread.putIfAbsent(keyString(e.getValue().get("k0")), Grouped.keyLiteral(s.keyKind, e.getValue().get("k0")));
+        // The best keep scores read, the lowest on top.
+        PriorityQueue<Double> read = new PriorityQueue<>();
+        int readCount = 0;
+        List<Integer> left = new ArrayList<>();
+        for (int i = 0; i < terms.size(); i++) {
+            Bounded t = terms.get(i);
+            Long count = bg.counts.get(t.term());
+            if (count == null) {
+                left.add(i);
+                continue;
+            }
+            readCount++;
+            read.add(s.heuristic.getScore(t.subsetDf(), b.size(), Math.max(t.subsetDf(), count), bg.size));
+            if (read.size() > keep) {
+                read.poll();
+            }
+        }
+        if (left.isEmpty()) {
+            return;
+        }
+        if (readCount < keep) {
+            // The best bounds, highest first, ties in the bucket's order: the
+            // worst of them on top, so the heap holds the best.
+            int want = Math.min(left.size(), keep - readCount);
+            Comparator<Integer> best = (x, y) -> {
+                int byBound = Double.compare(terms.get(y).bound(), terms.get(x).bound());
+                return byBound != 0 ? byBound : Integer.compare(x, y);
+            };
+            PriorityQueue<Integer> worstFirst = new PriorityQueue<>(want + 1, best.reversed());
+            for (int i : left) {
+                worstFirst.add(i);
+                if (worstFirst.size() > want) {
+                    worstFirst.poll();
+                }
+            }
+            List<Integer> picked = new ArrayList<>(worstFirst);
+            picked.sort(best);
+            for (int i : picked) {
+                unread.putIfAbsent(terms.get(i).term(), Grouped.keyLiteral(s.keyKind, terms.get(i).key()));
             }
             return;
         }
-        read.sort(Collections.reverseOrder());
-        double kept = read.get(s.candidates - 1);
-        for (Map.Entry<Double, Map<String, Object>> e : bounds) {
+        double kept = read.peek();
+        for (int i : left) {
             // Not below: a term that could tie the last kept one may sort before it by key.
-            if (!(e.getKey() < kept)) {
-                unread.putIfAbsent(keyString(e.getValue().get("k0")), Grouped.keyLiteral(s.keyKind, e.getValue().get("k0")));
+            if (!(terms.get(i).bound() < kept)) {
+                unread.putIfAbsent(terms.get(i).term(), Grouped.keyLiteral(s.keyKind, terms.get(i).key()));
             }
         }
     }
