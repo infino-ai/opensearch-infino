@@ -255,3 +255,27 @@ teardown:
         id: "4"
         require_alias: true
         body: { user: u4 }
+
+---
+"An mget item through an alias of several indices fails alone and the others are served":
+  - do:
+      indices.put_alias:
+        index: chk_proxy,chk_default
+        name: chk_both
+  - do:
+      mget:
+        body:
+          docs:
+            - { _index: chk_proxy, _id: "1" }
+            - { _index: chk_both, _id: "1" }
+            - { _index: chk_no_such, _id: "1" }
+  - is_true: docs.0.found
+  - match: { docs.0._index: chk_proxy }
+  - match: { docs.0._source.user: u1 }
+  - is_false: docs.1.found
+  - match: { docs.1._index: chk_both }
+  - match: { docs.1._id: "1" }
+  - match: { docs.1.error.root_cause.0.type: illegal_argument_exception }
+  - match: { docs.1.error.root_cause.0.reason: "/[aA]lias.\\[chk_both\\].has.more.than.one.index.associated.with.it.\\[chk_(proxy|default),.chk_(proxy|default)\\],.can't.execute.a.single.index.op/" }
+  - match: { docs.2._index: chk_no_such }
+  - match: { docs.2.error.root_cause.0.type: index_not_found_exception }
