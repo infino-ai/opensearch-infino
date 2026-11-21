@@ -210,6 +210,21 @@ public final class InfinoWriter {
         long nextSeq = UNREAD;
         /** The copy that wrote the table when {@link #nextSeq} was read; another copy since means it is read again. */
         String seqAllocation;
+        /** The UUID of the index whose writes {@link #nextSeq} was read for. */
+        String seqIndex;
+    }
+
+    /**
+     * A table's next sequence number once the copy writing it, or the index
+     * it backs, has changed: {@code read} is one past the highest the table
+     * holds. Numbers this node gave to appends of the same index still
+     * running are not in the table yet, so it never goes back below
+     * {@code current} for that index; an index created again under the
+     * table's name starts from the table, as stock starts a new index's shard
+     * at 0.
+     */
+    static long nextSeq(long current, long read, boolean sameIndex) {
+        return current == UNREAD || !sameIndex ? read : Math.max(read, current);
     }
 
     /** Where a table's appends run: the {@code write} pool. */
@@ -496,13 +511,15 @@ public final class InfinoWriter {
         Map<String, Long> stored;
         try {
             String allocation = writerAllocation(staged);
+            String index = staged.isEmpty() ? null : staged.get(0).waiter().shardId().getIndex().getUUID();
             synchronized (batch.seqLock) {
-                if (batch.nextSeq == UNREAD || !Objects.equals(allocation, batch.seqAllocation)) {
-                    // Numbers this node gave to appends still running are not in
-                    // the table yet: never go back below them.
-                    long read = InfinoNative.maxSeq(table) + 1;
-                    batch.nextSeq = batch.nextSeq == UNREAD ? read : Math.max(read, batch.nextSeq);
+                boolean newIndex = index != null && !index.equals(batch.seqIndex);
+                if (batch.nextSeq == UNREAD || newIndex || !Objects.equals(allocation, batch.seqAllocation)) {
+                    batch.nextSeq = nextSeq(batch.nextSeq, InfinoNative.maxSeq(table) + 1, !newIndex);
                     batch.seqAllocation = allocation;
+                    if (index != null) {
+                        batch.seqIndex = index;
+                    }
                 }
             }
             // A conditioned write is checked against the sequence numbers the table
@@ -553,9 +570,7 @@ public final class InfinoWriter {
                         Long current = standing.containsKey(w.id())
                             ? standing.get(w.id())
                             : existed.contains(w.id()) ? stored.getOrDefault(w.id(), InfinoDocumentVersion.UNTRACKED_SEQ_NO) : null;
-                        Exception rejection = w.create() && current != null
-                            ? new VersionConflictEngineException(shardId, w.id(), "document already exists")
-                            : InfinoDocumentVersion.conflict(shardId, o.item(), current);
+                        Exception rejection = rejection(shardId, o, current);
                         if (rejection == null && w.update() != null) {
                             // The base is the write before it in this batch, else the table,
                             // which holds every append of its id before this one: no running
@@ -646,6 +661,26 @@ public final class InfinoWriter {
             return null;
         }
         return InfinoBulkActionFilter.writerAllocation(clusters.state(), staged.get(0).waiter().shardId().getIndex());
+    }
+
+    /**
+     * Why a write is left out before its document is made, or null when it
+     * goes on: {@code current} is the sequence number of its document as the
+     * writes before it left it, null when there is none. A create over a
+     * document conflicts. An update of no document is missing (404) whatever
+     * its sequence-number condition, as stock reads the document before it
+     * checks one; an index or a delete of no document conflicts (409) when it
+     * carries one.
+     */
+    static Exception rejection(ShardId shardId, Outcome o, Long current) {
+        Write w = o.write();
+        if (w.create() && current != null) {
+            return new VersionConflictEngineException(shardId, w.id(), "document already exists");
+        }
+        if (w.update() != null && current == null && InfinoDocumentVersion.seqConditioned(o.item())) {
+            return new DocumentMissingException(shardId, w.id());
+        }
+        return InfinoDocumentVersion.conflict(shardId, o.item(), current);
     }
 
     /** How the bridge's reason starts when a data stream's document lacks one timestamp. */
