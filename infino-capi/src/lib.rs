@@ -2458,17 +2458,21 @@ fn append_checked(
 }
 
 /// Replace the rows under the ids `rows` carry with those rows, mapped by
-/// the engine, in one update. An update refused for what its rows carry
-/// ([`refuses_content`]), one whose ids match another number of rows than it
-/// brings, or one over the table's field cap, is split in halves until each refused
-/// document stands alone, so one document leaves the others replaced. A
-/// document alone whose id the table holds no row under (its earlier version
-/// was refused) is appended as new. Any other document alone that the engine
-/// refuses for its content or its count of rows is reported permanent, since
-/// every try meets the same table; a refusal of the moment (the field cap
-/// among them, which raising the limit lifts) is reported for every document
-/// its update carried. A refused document keeps whatever row the table
-/// holds.
+/// the engine, in one update, which the engine refuses unless its ids match
+/// as many rows as it brings, one per id when no id holds a row twice and
+/// none holds none. An update refused for any reason but its rows' content
+/// ([`refuses_content`]) or the field cap has its ids' rows counted
+/// ([`rows_under`]): the documents of ids holding no row (an earlier version
+/// was refused) or several (a write landed twice) are written by
+/// [`rewrite_rows`], and the rest replace again. The hosted service reports
+/// a count it refuses as a plain status, so the counts, not the error, say
+/// which ids miscount. An update refused for its rows' content or over the
+/// field cap is split in halves until each refused document stands alone,
+/// so one document leaves the others replaced; a document alone refused
+/// for its content is reported permanent, since every try meets the same
+/// table. Any other refusal (a count that fails among them) is reported for
+/// every document its update carried, for a later try. A refused document
+/// keeps whatever row the table holds.
 fn replace_rows_checked(
     table: &Supertable,
     gate: &Gate,
@@ -2493,33 +2497,103 @@ fn replace_rows_checked(
     let Err(e) = replace else {
         return;
     };
-    let miscounted = matches!(e, InfinoError::Cardinality(_));
     let over_cap = matches!(e, InfinoError::Schema(SchemaError::FieldCapExceeded { .. }));
-    if rows.len() > 1 && (miscounted || over_cap || refuses_content(&e)) {
+    if counts_may_explain(&e) {
+        if let Ok(counts) = rows_under(table, &ids) {
+            let single: HashSet<&str> = ids
+                .iter()
+                .zip(&counts)
+                .filter(|(_, &n)| n == 1)
+                .map(|(id, _)| *id)
+                .collect();
+            let (once, miscounted): (Vec<_>, Vec<_>) = rows.iter().cloned().partition(|(_, v)| {
+                v.get(OSID)
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| single.contains(id))
+            });
+            if !miscounted.is_empty() {
+                rewrite_rows(table, gate, &miscounted, failed);
+                replace_rows_checked(table, gate, &once, failed);
+                return;
+            }
+        }
+    }
+    if rows.len() > 1 && (over_cap || refuses_content(&e)) {
         let (a, b) = rows.split_at(rows.len() / 2);
         replace_rows_checked(table, gate, a, failed);
         replace_rows_checked(table, gate, b, failed);
         return;
     }
-    // A document alone matched no row, or several: its id's earlier version
-    // was refused (the table holds none, so it is new), or the table holds
-    // the id twice. A count that fails says neither, and a later try asks
-    // again.
-    let mut permanent = rows.len() == 1 && refuses_content(&e);
-    if rows.len() == 1 && miscounted {
-        match table.count_where(std::slice::from_ref(&pred)) {
-            Ok(counts) if counts.iter().all(|&n| n == 0) => {
-                append_checked(table, gate, rows, failed);
-                return;
-            }
-            Ok(_) => permanent = true,
-            Err(_) => {}
-        }
-    }
+    let permanent = rows.len() == 1 && refuses_content(&e);
     let reason = format!("replace: {e}");
     for (i, _) in rows {
         failed.push(json!({"i": i, "reason": reason, "permanent": permanent}));
     }
+}
+
+/// Whether a refused update may have been refused for its count of rows:
+/// any refusal but one of its rows' content or of the field cap. The local
+/// engine names a miscount ([`InfinoError::Cardinality`]); the hosted
+/// service answers it as a status the engine passes on untyped.
+fn counts_may_explain(e: &InfinoError) -> bool {
+    !refuses_content(e) && !matches!(e, InfinoError::Schema(SchemaError::FieldCapExceeded { .. }))
+}
+
+/// Ids whose rows one call to [`rows_under`] counts.
+const COUNT_IDS_PER_CALL: usize = 1_000;
+
+/// How many live rows the table holds under each of `ids`, in order.
+fn rows_under(table: &Supertable, ids: &[&str]) -> Result<Vec<u64>, InfinoError> {
+    let mut counts = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(COUNT_IDS_PER_CALL) {
+        let preds: Vec<Expr> = chunk
+            .iter()
+            .map(|id| col(OSID).eq(lit(id.to_string())))
+            .collect();
+        let got = table.count_where(&preds)?;
+        if got.len() != chunk.len() {
+            return Err(InfinoError::Backend(format!(
+                "{} counts for {} ids",
+                got.len(),
+                chunk.len()
+            )));
+        }
+        counts.extend(got);
+    }
+    Ok(counts)
+}
+
+/// Write documents whose ids hold no row or several: every row under those
+/// ids is deleted, then the documents are appended ([`append_checked`]), so
+/// each id ends with the one row its document brings. Two mutations: until
+/// the append lands a read finds no row under the ids, and a document whose
+/// append fails is reported for a later try, which finds no row and
+/// appends it. A delete that fails reports every document for a later try.
+fn rewrite_rows(table: &Supertable, gate: &Gate, rows: &[(usize, Value)], failed: &mut Vec<Value>) {
+    let mut ids: Vec<String> = rows
+        .iter()
+        .filter_map(|(_, v)| v.get(OSID).and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    eprintln!(
+        "[capi] replace: {} ids held no row or several; their rows are deleted and the documents appended",
+        ids.len()
+    );
+    let pred = col(OSID).in_list(ids.into_iter().map(lit).collect(), false);
+    let deleted = {
+        let _pass = gate.whole();
+        waiting(|| table.delete(pred.clone()))
+    };
+    if let Err(e) = deleted {
+        let reason = format!("replace: {e}");
+        for (i, _) in rows {
+            failed.push(json!({"i": i, "reason": reason, "permanent": false}));
+        }
+        return;
+    }
+    append_checked(table, gate, rows, failed);
 }
 
 /// Index many documents in one append. `osids` and `sources` are parallel
@@ -6094,6 +6168,76 @@ mod tests {
             let rows = sql(h, &format!("SELECT osid FROM logs WHERE osid = '{id}'"));
             assert_eq!(rows.as_array().map(|r| r.len()), Some(1), "{rows}");
         }
+        close(h);
+    }
+
+    /// An id the table holds twice (a write that landed twice, #151) is
+    /// written, not refused: its rows give way to the one row its document
+    /// brings, beside an id with one row, which is replaced. Refused, it was
+    /// refused on every try. (The engine compares the rows matched with the
+    /// rows brought in total, so an id with none beside it would hide the
+    /// miscount.)
+    #[test]
+    fn a_replace_of_an_id_the_table_holds_twice_leaves_one_row() {
+        let h = open_logs();
+        for _ in 0..2 {
+            let out = index(h, &[("d1", r#"{"level":"info","status":1}"#)]);
+            assert_eq!(out["ok"], 1, "{out}");
+        }
+        let out = index(h, &[("d2", r#"{"level":"info","status":2}"#)]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let rows = sql(h, "SELECT osid FROM logs WHERE osid = 'd1'");
+        assert_eq!(rows.as_array().map(|r| r.len()), Some(2), "{rows}");
+        let p = prepared(
+            h,
+            &[
+                ("d1", r#"{"level":"warn","status":11}"#),
+                ("d2", r#"{"level":"warn","status":22}"#),
+            ],
+        );
+        let out = append_replacing(h, p, &["d1", "d2"]);
+        assert_eq!(out["ok"], 2, "{out}");
+        assert!(out["failed"].as_array().is_none_or(Vec::is_empty), "{out}");
+        for (id, status) in [("d1", 11), ("d2", 22)] {
+            let rows = sql(
+                h,
+                &format!("SELECT osid, status FROM logs WHERE osid = '{id}'"),
+            );
+            assert_eq!(rows.as_array().map(|r| r.len()), Some(1), "{rows}");
+            assert_eq!(rows[0]["status"], status, "{rows}");
+        }
+        close(h);
+    }
+
+    /// The hosted service answers a replace whose ids match another number
+    /// of rows than it brings with a plain status, which the engine passes
+    /// on untyped; it is checked against the counts as the local miscount is.
+    /// A refusal of a row's content, or of the field cap, is not.
+    #[test]
+    fn a_hosted_refusal_of_a_replace_is_checked_against_the_counts() {
+        let hosted = InfinoError::Backend(
+            "update: server returned 400: mutation error: cardinality: update: cardinality \
+             mismatch: predicate matched 72 rows; new_rows has 64"
+                .into(),
+        );
+        assert!(counts_may_explain(&hosted));
+        assert!(counts_may_explain(&InfinoError::Cardinality(
+            "mismatch".into()
+        )));
+        let h = open_logs();
+        index(h, &[("s1", r#"{"level":"info","status":1,"rec":"x"}"#)]);
+        let refused = {
+            let conn = bridge_ref(h).unwrap();
+            let table = conn.table("logs").unwrap();
+            let pred = col(OSID).in_list(vec![lit("s1")], false);
+            table
+                .update_rows(
+                    pred,
+                    &[json!({"osid": "s1", "level": "info", "rec": {"n": 1}})],
+                )
+                .expect_err("a path beneath a live column")
+        };
+        assert!(!counts_may_explain(&refused), "{refused}");
         close(h);
     }
 
