@@ -3543,7 +3543,7 @@ public class InfinoAggregationProcessor {
             if (!(leaf instanceof Significant s) || !s.metrics.isEmpty()) {
                 continue;
             }
-            String restriction = tupleRestriction(chain, kept, n, false);
+            String restriction = keptBuckets(chain, kept, leafRows);
             if (fencedForeground(s, chain, kept, leafRows, from, where, restriction)) {
                 continue;
             }
@@ -3582,6 +3582,47 @@ public class InfinoAggregationProcessor {
             // best need are read for all buckets at once, not bucket by bucket.
             background(s, buckets, lower);
         }
+    }
+
+    /**
+     * The rows of the chain's kept leaf buckets, as a predicate: the
+     * {@link #tupleRestriction} of {@code kept}, or, when the chain is one
+     * terms level that kept every group it has ({@link #keptEveryGroup}),
+     * the rows with its key. A document is then in a kept bucket exactly
+     * when it has a key, and the engine checks one null rather than the key
+     * against every bucket's.
+     */
+    static String keptBuckets(List<Grouped> chain, List<List<Object>> kept, List<Map<String, Object>> leafRows) {
+        if (chain.size() == 1 && keptEveryGroup(chain.get(0), leafRows)) {
+            Grouped level = chain.get(0);
+            return presence(level.keyExpr, level.source);
+        }
+        return tupleRestriction(chain, kept, chain.size(), false);
+    }
+
+    /**
+     * Whether a top terms level's {@code rows} are every group it has: their
+     * counts add up to keyed_total, the count of every group with a key (each
+     * at least 1), with no minimum count leaving groups out of both. Only for
+     * a field each document gives one value, whose bucket is the document's
+     * value, keyed by a string, boolean or integer, whose literal is the key
+     * exactly: then the documents in the buckets are those with a value.
+     */
+    static boolean keptEveryGroup(Grouped level, List<Map<String, Object>> rows) {
+        if (!level.terms || level.source.multi() || level.minDocCount > 1 || rows.isEmpty()) {
+            return false;
+        }
+        if (level.keyKind != KeyKind.STR && level.keyKind != KeyKind.BOOL && level.keyKind != KeyKind.LONG) {
+            return false;
+        }
+        long sum = 0;
+        for (Map<String, Object> row : rows) {
+            if (!(row.get("keyed_total") instanceof Number total) || total.longValue() != asLong(rows.get(0).get("keyed_total")) || row.get("k0") == null) {
+                return false;
+            }
+            sum += asLong(row.get("doc_count"));
+        }
+        return sum == asLong(rows.get(0).get("keyed_total"));
     }
 
     /**

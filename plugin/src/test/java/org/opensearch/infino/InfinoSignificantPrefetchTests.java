@@ -296,6 +296,61 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
         assertEquals(bruteBest(docs, 25, java.util.Set.of("a", "b")), shardBest(r));
     }
 
+    /** Three parents of 30, 20 and 10 documents, each with its own and shared tags. */
+    private static List<Object[]> threeParents() {
+        List<Object[]> docs = new ArrayList<>();
+        String[] parents = { "a", "b", "c" };
+        for (int p = 0; p < 3; p++) {
+            for (int i = 0; i < 30 - 10 * p; i++) {
+                docs.add(new Object[] { parents[p], i % 3 == 0 ? "shared" + (i % 4) : parents[p] + (i % (7 + p)) });
+            }
+        }
+        indexDocs(docs, "tag");
+        return docs;
+    }
+
+    /**
+     * The parent level kept every group: a document is in a kept bucket
+     * when it has a parent, so the foreground reads the rows with one rather
+     * than naming each bucket.
+     */
+    public void testAParentKeepingEveryGroupIsANullCheck() {
+        List<Object[]> docs = threeParents();
+        Run r = run(parentOver("tag", 10, 3), new SearchSourceBuilder());
+        String fg = significantForeground(r);
+        assertTrue(fg, fg.contains("IS NOT NULL GROUP BY 1, 2"));
+        assertFalse(fg, fg.contains("= 'a'"));
+        assertEquals(bruteBest(docs, 3, java.util.Set.of("a", "b", "c")), shardBest(r));
+    }
+
+    /** The parent level kept 2 of its 3 groups: the foreground names the 2. */
+    public void testAParentKeepingFewerGroupsNamesThem() {
+        List<Object[]> docs = threeParents();
+        Run r = run(parentOver("tag", 2, 3), new SearchSourceBuilder());
+        String fg = significantForeground(r);
+        assertTrue(fg, fg.contains("= 'a'") && fg.contains("= 'b'"));
+        assertFalse(fg, fg.contains("= 'c'"));
+        assertEquals(bruteBest(docs, 3, java.util.Set.of("a", "b")), shardBest(r));
+    }
+
+    /**
+     * min_doc_count 15 leaves c (10 documents) out of the groups and of
+     * their total alike, so the kept buckets' counts still add up to it: the
+     * foreground names a and b rather than reading every row with a parent.
+     */
+    public void testAParentMinDocCountNamesTheKeptGroups() {
+        List<Object[]> docs = threeParents();
+        AggregationBuilder parent = AggregationBuilders.terms("p")
+            .field("p")
+            .size(10)
+            .minDocCount(15)
+            .subAggregation(AggregationBuilders.significantTerms("sig").field("tag").size(3).shardSize(3).minDocCount(1));
+        Run r = run(parent, new SearchSourceBuilder());
+        String fg = significantForeground(r);
+        assertTrue(fg, fg.contains("= 'a'") && fg.contains("= 'b'"));
+        assertEquals(bruteBest(docs, 3, java.util.Set.of("a", "b")), shardBest(r));
+    }
+
     /** The bound-ordered foreground's statement, as built. */
     public void testFencedForegroundSql() {
         assertEquals(51, InfinoAggregationProcessor.fenceRows(25));
@@ -396,6 +451,16 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
             assertEquals("round " + round, Math.min(parentSize, withParent.size()), got.size());
             assertEquals("round " + round, bruteBest(docs, keep, got.keySet()), got);
         }
+    }
+
+    /** The first statement of {@code r} reading the significant level's foreground under the parent's buckets. */
+    private static String significantForeground(Run r) {
+        for (String s : r.foregrounds()) {
+            if (s.contains("AS p0")) {
+                return s;
+            }
+        }
+        throw new AssertionError("no foreground under the parent in " + r.foregrounds());
     }
 
     /** A terms parent over p, keeping {@code parents} buckets, over significant {@code field} keeping {@code keep} terms. */
