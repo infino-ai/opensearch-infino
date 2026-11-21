@@ -70,9 +70,6 @@ scroll/10_basic/Basic scroll with 1 shard  # [bug:proxy] a scroll returns hits a
 mget/14_alias_to_multiple_indices/*  # [bug:proxy] an mget through an alias of several indices is not rejected (https://github.com/infino-ai/opensearch-infino/issues/57)
 
 # --- Write responses
-bulk/10_basic/When setting require_alias flag  # [bug] require_alias on an index that is not an alias creates the index (https://github.com/infino-ai/opensearch-infino/issues/57)
-bulk/10_basic/When setting require_alias flag per request  # [bug] require_alias on an index that is not an alias creates the index (https://github.com/infino-ai/opensearch-infino/issues/57)
-index/70_require_alias/Set require_alias flag  # [bug] require_alias on an index that is not an alias creates the index (https://github.com/infino-ai/opensearch-infino/issues/57)
 update/12_result/Update result field  # [bug] an update reports the wrong result or _version
 update/16_noop/Noop  # [bug] an update that changes nothing is not a noop: it takes a new _seq_no
 update/40_routing/Routing  # [bug] an update with routing returns no get._source (default) or no _routing (proxy)

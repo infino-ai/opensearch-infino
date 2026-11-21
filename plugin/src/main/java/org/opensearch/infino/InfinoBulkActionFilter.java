@@ -377,6 +377,12 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                 continue;
             }
             String index = concrete.get(slot);
+            IndexNotFoundException noAlias = notAnAlias(bulk.requests().get(slot), state.metadata());
+            if (noAlias != null) {
+                items[slot] = failure(slot, bulk.requests().get(slot), bulk.requests().get(slot).index(), noAlias);
+                anyAnswered = true;
+                continue;
+            }
             Destination destination = byIndex.computeIfAbsent(index, name -> destination(state, infino.get(name), local, forwards));
             if (destination.moved()) {
                 items[slot] = failure(slot, bulk.requests().get(slot), index, movedOn(infino.get(index).getIndex()));
@@ -870,15 +876,21 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
      * The indices the bulk's items name that do not exist and the cluster
      * would create for a stock bulk, in order; empty when none. When the
      * cluster's rule forbids creating one, nothing is listed: the stock path
-     * reports the missing index.
+     * reports the missing index. Neither is one an item requires be an alias
+     * ({@link #aliasRequired}): the cluster creates no index for it, and the
+     * item fails.
      */
     static List<String> missingIndices(ClusterService clusters, BulkRequest bulk) {
         ClusterState state = clusters.state();
         AutoCreateIndex rule = InfinoServices.autoCreateIndex();
+        Set<String> aliasRequired = aliasRequired(bulk);
         Set<String> missing = new LinkedHashSet<>();
         for (DocWriteRequest<?> item : bulk.requests()) {
             String name = item.index();
-            if (name == null || state.metadata().getIndicesLookup().containsKey(name) || missing.contains(name)) {
+            if (name == null
+                || state.metadata().getIndicesLookup().containsKey(name)
+                || missing.contains(name)
+                || aliasRequired.contains(name)) {
                 continue;
             }
             try {
@@ -890,6 +902,36 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
             }
         }
         return new ArrayList<>(missing);
+    }
+
+    /**
+     * The names a bulk's items write to with {@code require_alias} set, which
+     * the stock bulk never creates an index for: one such item keeps the name
+     * from being created for every item that names it.
+     */
+    static Set<String> aliasRequired(BulkRequest bulk) {
+        Set<String> names = new HashSet<>();
+        for (DocWriteRequest<?> item : bulk.requests()) {
+            if (item.isRequireAlias() && item.index() != null) {
+                names.add(item.index());
+            }
+        }
+        return names;
+    }
+
+    /**
+     * Why an item that requires its index be an alias fails, as the stock
+     * bulk fails it, when the name it writes to is no alias; null when it
+     * passes or requires nothing.
+     */
+    static IndexNotFoundException notAnAlias(DocWriteRequest<?> item, Metadata metadata) {
+        if (!item.isRequireAlias() || metadata.hasAlias(item.index())) {
+            return null;
+        }
+        return new IndexNotFoundException(
+            "[" + DocWriteRequest.REQUIRE_ALIAS + "] request flag is [true] and [" + item.index() + "] is not an alias",
+            item.index()
+        );
     }
 
     /** Create the indices named, one after another, then tell {@code then}. */

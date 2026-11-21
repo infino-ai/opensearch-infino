@@ -211,3 +211,47 @@ teardown:
         id: "1"
         require_alias: true
         body: { doc: { foo: bar } }
+
+---
+"A write with require_alias to a name that is not an alias is missing, and no index is created for it":
+  - do:
+      indices.put_alias:
+        index: chk_proxy
+        name: chk_proxy_alias
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: chk_no_such, _id: "1", require_alias: true }
+          - { user: u1 }
+          - index: { _index: chk_proxy, _id: "2", require_alias: true }
+          - { user: u2 }
+          - index: { _index: chk_default, _id: "2", require_alias: true }
+          - { user: u2 }
+          - index: { _index: chk_proxy_alias, _id: "3", require_alias: true }
+          - { user: u3 }
+  - match: { errors: true }
+  - match: { items.0.index.status: 404 }
+  - match: { items.0.index.error.type: index_not_found_exception }
+  - match: { items.0.index.error.reason: "no such index [chk_no_such] and [require_alias] request flag is [true] and [chk_no_such] is not an alias" }
+  - match: { items.1.index.status: 404 }
+  - match: { items.1.index.error.reason: "no such index [chk_proxy] and [require_alias] request flag is [true] and [chk_proxy] is not an alias" }
+  - match: { items.2.index.status: 404 }
+  - match: { items.2.index.error.reason: "no such index [chk_default] and [require_alias] request flag is [true] and [chk_default] is not an alias" }
+  - match: { items.3.index.result: created }
+  - match: { items.3.index._index: chk_proxy }
+  - do:
+      catch: missing
+      indices.get:
+        index: chk_no_such
+  - do:
+      count:
+        index: chk_proxy
+  - match: { count: 2 }
+  - do:
+      catch: missing
+      index:
+        index: chk_proxy
+        id: "4"
+        require_alias: true
+        body: { user: u4 }
