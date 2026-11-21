@@ -219,10 +219,39 @@ The security plugin's index is Infino-backed too, so its roles, users and passwo
 | `index.infino.enabled` | on (`infino.index.default_enabled`) | Whether the index is Infino-backed. |
 | `index.infino.mode` | `default` | `default` or `proxy`; fixed at creation. See [How it works](#how-it-works). |
 | `index.infino.table` | derived from the index's name | The table behind the index, named explicitly, to reattach a recreated index to its rows. A named table is kept when its index is deleted. |
+| `index.infino.attached` | `false` | The table named in `index.infino.table` was made outside the plugin: it is read as it is and never changed. Fixed at creation. See [Attaching to an existing table](#attaching-to-an-existing-table). |
 | `index.infino.optimize_interval` | `60s` | How often the table is compacted (5 seconds at least; off for a hosted account, which compacts its own tables). |
 | `index.infino.edges` | `false` | The index holds a graph's edges, for `graph_walk` and `graph_rank` in [SQL](#sql). |
 
 A table backs one live index. If two indices name the same table (explicitly, or by names that map to one table, such as `logs.app` and `logs_app`), the older one is served from it and the other is refused, even after the older one is deleted. With the security plugin, setting `index.infino.table` in a create, resize, rollover or template request needs the right to manage the cluster.
+
+### Attaching to an existing table
+
+An index can read a table that was made and filled outside the plugin, such as one loaded through the engine or the hosted service:
+
+```bash
+curl -sk -u "admin:$OPENSEARCH_ADMIN_PASSWORD" -X PUT https://localhost:9200/pageviews -H 'Content-Type: application/json' -d '{
+  "settings": { "index.infino.table": "pageviews", "index.infino.attached": true },
+  "mappings": { "properties": {
+    "time":  { "type": "date" },
+    "title": { "type": "text" },
+    "hits":  { "type": "long" }
+  } }
+}'
+```
+
+The mapping names the table's columns and the field type each is read as. It is checked against the table when the index is created: a table that does not exist, a field the table has no column for, or a column of another type, is refused with a 400 and no index is created. The settings and mappings of the templates the index's name matches are judged with the request's, as the cluster merges them. A table that cannot be read at that moment is not judged: the index is created, and answers each request with the reason once its shard has read the table.
+
+- **The table is never changed.** Nothing is added to it when the index is created, it is not compacted, and it stays when the index is deleted.
+- **Every write is refused** with a 403: index, update, delete, a write by query, and a document an ingest pipeline sends to the index from another one. A bulk request with an item for an attached index is refused as a whole, its items for other indices included; send those in a bulk of their own.
+- **A template may set `index.infino.attached` and leave the table to the request** that creates the index. The two are checked together when the index is created.
+- **The mapping is fixed when the index is created.** A mapping update is refused with a 400. For a different mapping, delete the index and create it again: it holds no data of its own.
+- **A document is a row.** Its `_id` is the engine's row id, and its `_source` is the row's columns; a null column is left out. A date column is read as the instant its day starts at.
+- **The index is served in proxy mode.** A request or a template that asks for default mode is refused.
+- **A `text` field needs a full-text index on its column.** One without positions matches and ranks terms; a phrase query needs positions. A column with a full-text index is searched as text only when its field is mapped as `text`: mapped as `keyword`, or left out of the mapping, it is compared whole.
+- **A table with a column named `score`, `osid`, `source` or `osseq` is not attached to.** A search gives each row's score under the first, and the plugin reads a document through the others.
+- **A column the table's owner removes later** is noticed by a statement that fails on it, which then runs again over the columns the table holds now. A ranked search (`match`, k-NN, hybrid) does not: create the index again after such a change.
+- A table the plugin wrote is not attached to. Name it in `index.infino.table` without this setting.
 
 **Node settings** (`opensearch.yml`)
 
@@ -305,6 +334,7 @@ A `nested` query (Dashboards' `has_reference` on saved objects' `references` is 
 
 **Proxy mode.** Each engine append is a commit, and a bulk is acknowledged only after the append carrying its writes, so an acknowledged write is durable.
 
+- **Visibility.** Every acknowledged write is refreshed. `index.refresh_interval` does not delay it, and a get with `realtime=false` finds it as a search does; stock would wait for the next refresh. On the hosted service a read may trail a write by `infino.platform.read_window`; with `refresh=true` or `wait_for`, the write is acknowledged only after that window, so the next search sees it.
 - **Grouped commits.** A bulk that arrives while no append is running starts one at once. Bulks that arrive during an append go into the next one.
 - **Replace, delete, update.** Indexing an existing id replaces it, and a delete removes it. An update merges into the document (partial `doc`, `doc_as_upsert`, `upsert`); update scripts are refused. Updates apply in order, including two updates of one document in the same bulk.
 - **No lookup for new ids.** Which ids exist is answered by the id column's term index, so a stream of new documents pays no lookup.
@@ -322,7 +352,7 @@ cd plugin && gradle check   # precommit, unit tests, and the REST suites on a te
 
 `gradle check` loads the bridge as `libinfino_capi.so`; on macOS pass `-Dinfino.lib=$PWD/../infino-capi/target/release/libinfino_capi.dylib`. `check-all.sh` reads the bridge from `INFINO_LIB` and the releases from `RELEASES` (default `3.9.0 3.6.0 3.3.2 3.0.0 2.19.6`).
 
-OpenSearch's own YAML REST suites (index, get, bulk, update, delete, search, aggregations, scroll and the rest of the document and search APIs, from the release's `rest-api-spec` artifact) run in tasks of their own, outside `check`:
+OpenSearch's own YAML REST suites (index, get, bulk, update, delete, search, aggregations, scroll and the rest of the document and search APIs, from the release's `rest-api-spec` artifact) run in tasks of their own, outside `check`. CI does not run them, so run them before a change to how documents are written or searched:
 
 ```bash
 cd plugin
@@ -331,7 +361,17 @@ gradle coreYamlRestTestProxy    # every index in proxy mode
 gradle coreYamlRestTestLucene   # the same cluster without the plugin: the baseline
 ```
 
-A test that fails on the baseline fails because of the test cluster (the security plugin, the single node), not because of Infino. Tests to skip go in `plugin/src/yamlRestTest/core-denylist.txt`, one per line, each with the reason.
+A test that fails on the baseline fails because of the test cluster (the security plugin, the single node), not because of Infino.
+
+Tests known not to pass are skipped, so a run reports 0 failures and any failure is a regression. They are listed in `plugin/src/yamlRestTest/core-denylist.txt`, one per line, each tagged and with its reason: `[gap]` for a test that needs a feature Infino does not have yet, `[bug]` for any other failure (a wrong answer, a 500, or a refusal of what an existing feature should handle), `[by-design]` for a test that asserts stock behaviour Infino improves on purpose (the first three narrowed to one mode as `[gap:proxy]`, `[by-design:proxy]` or `[bug:default]`), and `[cluster]` for a test that fails on the baseline too. `-Dinfino.core.skip` chooses how much is skipped:
+
+```bash
+gradle coreYamlRestTest -Dinfino.core.skip=all    # the default: every entry for the mode
+gradle coreYamlRestTest -Dinfino.core.skip=gaps   # all but [bug]: the known bugs run and fail
+gradle coreYamlRestTest -Dinfino.core.skip=none   # nothing: shows which entries pass now
+```
+
+`scripts/core-denylist.py default|proxy|lucene` reads a run's results and prints the failures no entry covers, as lines to tag and add; the entries whose tests that ran all passed, which can go; and the `[bug]` entries a wider entry of another tag already skips, which `skip=gaps` cannot run. It exits 1 when a failure is not covered, including one outside any YAML test, such as a suite whose cluster failed during setup. It reads the XML the task left, so check the task itself ran.
 
 No OpenSearch checkout is needed: the plugin builds against the release named by `OPENSEARCH_VERSION`, pulled from Maven. `gradle check` builds against one release. The security integration takes a different path on 2.x, on 3.0 to 3.5, and on 3.6 and later, so run `check-all.sh` before relying on any release but the default. Each release's build tools want their own Gradle:
 

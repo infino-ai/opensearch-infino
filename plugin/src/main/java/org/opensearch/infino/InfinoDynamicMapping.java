@@ -310,13 +310,21 @@ final class InfinoDynamicMapping {
     /**
      * The columns the table holds that the mapping does not name, and every
      * object path above them: a field there is left to the table as before.
+     * The table's own columns hold no field: a field of the same name is
+     * mapped as any new field is.
      */
     private record Unmapped(Set<String> columns, Set<String> objects) {
         static Unmapped of(IndexMetadata md, MapperService mappers) {
             Set<String> columns = new HashSet<>();
             Set<String> objects = new HashSet<>();
-            for (String column : InfinoNative.columns(InfinoNative.tableFor(md.getIndex(), md.getSettings())).keySet()) {
-                if (mappers.fieldType(column) != null) {
+            for (Map.Entry<String, InfinoNative.Column> entry : InfinoNative.columns(InfinoNative.tableFor(md.getIndex(), md.getSettings()))
+                .entrySet()) {
+                String column = entry.getKey();
+                String name = entry.getValue().name();
+                boolean reserved = name.equals(InfinoQueryTranslator.OSID)
+                    || name.equals(InfinoQueryTranslator.SOURCE)
+                    || name.equals(InfinoQueryTranslator.SEQ);
+                if (reserved || mappers.fieldType(column) != null) {
                     continue;
                 }
                 columns.add(column);

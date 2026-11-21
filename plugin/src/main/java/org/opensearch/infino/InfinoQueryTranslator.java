@@ -129,6 +129,11 @@ final class InfinoQueryTranslator {
      */
     static final String LIST_SUFFIX = "[]";
     /**
+     * What the bridge puts before the name of a field named like {@link #OSID}, {@link #SOURCE} or {@link #SEQ}
+     * for the column holding it: no mapping names a field so.
+     */
+    static final String OWN_COLUMN_PREFIX = ".";
+    /**
      * The names a list's subquery gives a document's id and each of its
      * values, and the aliases of the table it reads and of its rows. The
      * engine plans the subquery only with both relations aliased.
@@ -746,9 +751,18 @@ final class InfinoQueryTranslator {
         return c;
     }
 
-    /** The field a column holds: its own name, or a list column's field ({@link #LIST_SUFFIX}). */
+    /**
+     * The field a column holds: its own name, a list column's field ({@link #LIST_SUFFIX}), or the field named like
+     * a reserved column ({@link #OWN_COLUMN_PREFIX}).
+     */
     static String fieldOf(String column) {
-        return column.endsWith(LIST_SUFFIX) ? column.substring(0, column.length() - LIST_SUFFIX.length()) : column;
+        String field = column.endsWith(LIST_SUFFIX) ? column.substring(0, column.length() - LIST_SUFFIX.length()) : column;
+        return field.startsWith(OWN_COLUMN_PREFIX) ? field.substring(OWN_COLUMN_PREFIX.length()) : field;
+    }
+
+    /** The name a column is looked up by: its field's, except a list column's, which is its own. */
+    static String keyOf(String column) {
+        return column.endsWith(LIST_SUFFIX) ? column : fieldOf(column);
     }
 
     /** The list column holding a field's values for the documents that give it several; null when no document has. */
@@ -822,7 +836,8 @@ final class InfinoQueryTranslator {
             if (name.equals(OSID) || name.equals(SOURCE) || name.equals(SEQ)) {
                 continue;
             }
-            if (name.startsWith(under) || (pattern && org.opensearch.common.regex.Regex.simpleMatch(field, name))) {
+            String held = fieldOf(name);
+            if (held.startsWith(under) || (pattern && org.opensearch.common.regex.Regex.simpleMatch(field, held))) {
                 present.add(quoteIdent(name) + " IS NOT NULL");
             }
         }
@@ -1866,7 +1881,7 @@ final class InfinoQueryTranslator {
             for (Map.Entry<String, Column> entry : cols.entrySet()) {
                 Column c = entry.getValue();
                 if (c.fts() && !InfinoNative.isAlias(entry.getKey(), c) && !c.name().equals(OSID) && (trusted || !c.masked())) {
-                    targets.add(c.name());
+                    targets.add(entry.getKey());
                 }
             }
         }
@@ -2461,6 +2476,9 @@ final class InfinoQueryTranslator {
     // ---- scalars ----
 
     private String equality(String field, Object value) {
+        if ("_id".equals(field)) {
+            return value == null ? NONE : OSID + " = " + literal(String.valueOf(value));
+        }
         Column c = column(field);
         if (c == null || value == null) {
             return c == null ? NONE : null;
@@ -2470,6 +2488,13 @@ final class InfinoQueryTranslator {
     }
 
     private String inList(String field, List<Object> values) {
+        if ("_id".equals(field) && values != null && !values.isEmpty()) {
+            List<String> ids = new ArrayList<>();
+            for (Object v : values) {
+                ids.add(literal(String.valueOf(v)));
+            }
+            return OSID + " IN (" + String.join(", ", ids) + ")";
+        }
         Column c = column(field);
         if (c == null) {
             return NONE;

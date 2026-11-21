@@ -679,8 +679,12 @@ public final class InfinoSearch {
 
     static Column columnFor(Map<String, Column> cols, String field) {
         if ("_id".equals(field)) {
-            // The document id is the id column: a sort or collapse on it is served there.
-            return cols.get(InfinoQueryTranslator.OSID);
+            // The document id is the id column: a sort or collapse on it is served there. A field
+            // named like the id column is looked up by that name instead.
+            Column id = cols.get(InfinoQueryTranslator.OSID);
+            return id == null || id.name().equals(InfinoQueryTranslator.OSID)
+                ? id
+                : new Column(InfinoQueryTranslator.OSID, "str", true, false);
         }
         Column c = cols.get(field);
         if (c == null && field.endsWith(".keyword")) {
@@ -1681,8 +1685,9 @@ public final class InfinoSearch {
             }
             for (Map.Entry<String, Column> e : cols.entrySet()) {
                 Column c = e.getValue();
-                if (InfinoNative.isAlias(e.getKey(), c) && Regex.simpleMatch(f.field, e.getKey()) && flat.containsKey(c.name())) {
-                    fillField(h, e.getKey(), flat.get(c.name()), c, f.format, docValues);
+                String target = InfinoQueryTranslator.fieldOf(c.name());
+                if (InfinoNative.isAlias(e.getKey(), c) && Regex.simpleMatch(f.field, e.getKey()) && flat.containsKey(target)) {
+                    fillField(h, e.getKey(), flat.get(target), c, f.format, docValues);
                 }
             }
         }
