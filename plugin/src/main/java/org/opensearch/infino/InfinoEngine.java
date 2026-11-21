@@ -1013,13 +1013,34 @@ public class InfinoEngine extends InternalEngine {
         } finally {
             recordLock.readLock().unlock();
         }
-        // The found result carries no translog location, so the delete's is
-        // synced here when the index syncs for each request: a plain sync, as the
-        // delete is not replicated yet and its commit waits for the request's own.
-        if (result.getTranslogLocation() != null && config().getIndexSettings().getTranslogDurability() == Translog.Durability.REQUEST) {
-            translogManager().syncTranslog();
+        return new FoundInTable(result);
+    }
+
+    /**
+     * A delete the skeleton did not find and the table did, reported found:
+     * at the translog location and with the time of the skeleton's delete, so
+     * the request syncs the translog (and so commits the table) through it
+     * before it is acknowledged, as for any other delete. A bulk requires a
+     * location of every write it applied. The result's setters are
+     * package-private in OpenSearch 2.19 and 3.0, hence the overrides.
+     */
+    private static final class FoundInTable extends DeleteResult {
+        private final DeleteResult skeleton;
+
+        FoundInTable(DeleteResult skeleton) {
+            super(skeleton.getVersion(), skeleton.getTerm(), skeleton.getSeqNo(), true);
+            this.skeleton = skeleton;
         }
-        return new DeleteResult(result.getVersion(), result.getTerm(), result.getSeqNo(), true);
+
+        @Override
+        public Translog.Location getTranslogLocation() {
+            return skeleton.getTranslogLocation();
+        }
+
+        @Override
+        public long getTook() {
+            return skeleton.getTook();
+        }
     }
 
     /**
