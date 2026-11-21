@@ -8,7 +8,6 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.MultiMatchQueryBuilder;
 import org.opensearch.index.query.Operator;
-import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.QueryShardException;
 import org.opensearch.infino.InfinoNative.Column;
@@ -16,10 +15,7 @@ import org.opensearch.infino.InfinoQueryTranslator.Translation;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Collection;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 
 /** The SQL a query-DSL tree translates to, over a log table's columns. */
@@ -501,9 +497,9 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
     }
 
     public void testAnUnsortedPageKeepsTheSortsUnrankedRows() {
-        // A text query sorted on a field no row holds is read in the row id's
-        // order, from the same unranked relation the sorted read selects
-        // from: not BM25's best, and with no score.
+        // A text query sorted on a field no row holds is read with no order,
+        // from the same unranked relation the sorted read selects from: not
+        // BM25's best, and with no score.
         InfinoSearch.Plan plan = new InfinoSearch.Plan(
             TABLE,
             columns(),
@@ -518,138 +514,36 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             NOW
         );
         String sorted = InfinoSearch.hitStatement(plan, 1, false);
-        String unsorted = InfinoSearch.unsortedStatement(plan, 1, false);
+        String unsorted = InfinoSearch.unsortedStatement(plan, 1, false, true);
         // Plain words are a text_match on the table in both: rows in the page's order, each checked.
-        // The page selects each row's id alone; its source is read by that id afterwards.
-        assertEquals(
-            "SELECT osid FROM \"os_logs_0\" WHERE (1=1) AND text_match(\"message\", 'disk', 'or') ORDER BY \"_id\" ASC NULLS LAST LIMIT 1",
-            unsorted
-        );
+        assertEquals("SELECT osid, source FROM \"os_logs_0\" WHERE (1=1) AND text_match(\"message\", 'disk', 'or') LIMIT 1", unsorted);
         assertTrue(sorted, sorted.contains(" FROM \"os_logs_0\" WHERE (1=1) AND text_match(\"message\", 'disk', 'or') ORDER BY "));
         assertEquals(
-            "SELECT osid, osseq FROM \"os_logs_0\" WHERE 1=1 ORDER BY \"_id\" ASC NULLS LAST LIMIT 5",
-            InfinoSearch.unsortedStatement(afterPlan(null, null), 5, true)
+            "SELECT osid, source, osseq FROM \"os_logs_0\" WHERE 1=1 LIMIT 5",
+            InfinoSearch.unsortedStatement(afterPlan(null, null), 5, true, true)
         );
+        // A hit that neither returns its source nor reads fields from it does not read it.
+        assertEquals("SELECT osid, osseq FROM \"os_logs_0\" WHERE 1=1 LIMIT 5", InfinoSearch.unsortedStatement(afterPlan(null, null), 5, true, false));
     }
 
-    public void testAPageWithNoOrderIsReadInTheRowIdOrder() {
-        // A page with no sort and no score is the first rows in the row id's
-        // order, so each page of one search starts where the last one ended.
-        // It selects each row's id alone; the sources are read by id once the page is chosen.
+    public void testAPageWithNoOrderLeavesTheOrderToTheEngine() {
+        // A page with no sort and no score carries no ORDER BY: the engine
+        // reads a scan under a LIMIT with no order in file order, so each page
+        // of one search starts where the last one ended. Its source is read
+        // in the same scan.
         assertEquals(
-            "SELECT osid FROM \"os_logs_0\" WHERE \"level\" = 'error' ORDER BY \"_id\" ASC NULLS LAST LIMIT 10",
+            "SELECT osid, source FROM \"os_logs_0\" WHERE \"level\" = 'error' LIMIT 10",
             hits(translate(QueryBuilders.termQuery("level", "error")), null, 10)
         );
-        // Under a collapse, each value's first row and the page's rows follow the same order.
+    }
+
+    public void testACollapseWithNoOrderKeepsTheRowIdOrder() {
+        // The window's rows come out grouped by value, so the first row of
+        // each value and the page's rows both follow the row id's order.
         String collapsed = hits(translate(QueryBuilders.matchAllQuery()), columns().get("level"), 10);
-        assertTrue(collapsed, collapsed.contains("PARTITION BY \"level\" ORDER BY \"_id\" ASC NULLS LAST)"));
-        assertTrue(collapsed, collapsed.endsWith(" = 1 ORDER BY \"_id\" ASC NULLS LAST LIMIT 10"));
-    }
-
-    public void testACollapseWithNoOrderReadsItsSourcesById() {
-        // The window and its outer read carry the id and the collapse value, not the source.
-        String collapsed = hits(translate(QueryBuilders.matchAllQuery()), columns().get("level"), 10);
-        assertTrue(collapsed, collapsed.startsWith("SELECT osid, \"level\" AS \"collapse_key\" FROM (SELECT t.*, "));
-        assertFalse(collapsed, collapsed.contains("source"));
-    }
-
-    public void testWhichPagesReadTheirSourcesById() {
-        // A page in the row id's order: plain, filtered, collapsed.
-        assertTrue(InfinoSearch.sourcesById(plainPlan(QueryBuilders.matchAllQuery(), List.of(), null)));
-        assertTrue(InfinoSearch.sourcesById(plainPlan(QueryBuilders.termQuery("level", "error"), List.of(), null)));
-        assertTrue(InfinoSearch.sourcesById(plainPlan(QueryBuilders.matchAllQuery(), List.of(), columns().get("level"))));
-        // A sorted page without a collapse.
-        List<InfinoSearch.SortSpec> byStatus = List.of(InfinoSearch.SortSpec.of(columns().get("status"), true));
-        assertTrue(InfinoSearch.sourcesById(plainPlan(QueryBuilders.matchAllQuery(), byStatus, null)));
-        // The page read unsorted (its sort orders nothing) is a sorted page without a collapse.
-        InfinoSearch.Plan unsorted = plainPlan(
-            QueryBuilders.matchQuery("message", "disk"),
-            List.of(InfinoSearch.SortSpec.of(columns().get("status"), true), InfinoSearch.SortSpec.rowId()),
-            null
-        );
-        assertTrue(InfinoSearch.sourcesById(unsorted));
-        // A sorted collapse and a ranked page read their sources with their rows.
-        assertFalse(InfinoSearch.sourcesById(plainPlan(QueryBuilders.matchAllQuery(), byStatus, columns().get("level"))));
-        InfinoSearch.Plan ranked = plainPlan(QueryBuilders.matchQuery("message", "disk"), List.of(), null);
-        assertFalse(InfinoSearch.sourcesById(ranked));
-        assertTrue(InfinoSearch.hitStatement(ranked, 10, false).startsWith("SELECT osid, source, "));
-    }
-
-    public void testSourcesByIdKeepThePagesOrder() {
-        // The page's rows in the row id's order; the lookup returns their sources in no order.
-        List<Map<String, Object>> page = List.of(row("c", 11L), row("a", 12L), row("b", 13L));
-        List<Collection<String>> lookedUp = new ArrayList<>();
-        List<Map<String, Object>> out = InfinoSearch.withSources(TABLE, page, 3, (table, ids) -> {
-            assertEquals(TABLE, table);
-            lookedUp.add(List.copyOf(ids));
-            Map<String, String> found = new java.util.HashMap<>();
-            found.put("b", "{\"n\":2}");
-            found.put("a", "{\"n\":1}");
-            found.put("c", "{\"n\":3}");
-            return found;
-        });
-        // One lookup, over the page's ids in the page's order.
-        assertEquals(List.of(List.of("c", "a", "b")), lookedUp);
-        assertEquals(List.of("c", "a", "b"), out.stream().map(r -> r.get("osid")).toList());
-        assertEquals(List.of("{\"n\":3}", "{\"n\":1}", "{\"n\":2}"), out.stream().map(r -> r.get("source")).toList());
-        // Each row keeps what the page read.
-        assertEquals(List.of(11L, 12L, 13L), out.stream().map(r -> r.get("osseq")).toList());
-    }
-
-    public void testARowTheLookupMissesKeepsItsPlaceWithNoSource() {
-        // b was deleted between the page's read and the lookup of its sources:
-        // it keeps its place, so the page's count and window are the read's.
-        List<Map<String, Object>> page = List.of(row("a", 1L), row("b", 2L), row("c", 3L));
-        List<Map<String, Object>> out = InfinoSearch.withSources(
-            TABLE,
-            page,
-            3,
-            (table, ids) -> Map.of("a", "{\"n\":1}", "c", "{\"n\":3}")
-        );
-        assertEquals(List.of("a", "b", "c"), out.stream().map(r -> r.get("osid")).toList());
-        assertEquals(List.of("{\"n\":1}", "", "{\"n\":3}"), out.stream().map(r -> r.get("source")).toList());
-        assertEquals(List.of(1L, 2L, 3L), out.stream().map(r -> r.get("osseq")).toList());
-    }
-
-    public void testSourcesByIdStopAtThePagesEnd() {
-        List<Map<String, Object>> page = List.of(row("a", 1L), row("b", 2L), row("c", 3L));
-        List<Collection<String>> lookedUp = new ArrayList<>();
-        List<Map<String, Object>> out = InfinoSearch.withSources(TABLE, page, 2, (table, ids) -> {
-            lookedUp.add(List.copyOf(ids));
-            return Map.of("a", "{}", "b", "{}", "c", "{}");
-        });
-        assertEquals(List.of(List.of("a", "b")), lookedUp);
-        assertEquals(List.of("a", "b"), out.stream().map(r -> r.get("osid")).toList());
-        // An empty page looks nothing up.
-        assertEquals(
-            List.of(),
-            InfinoSearch.withSources(TABLE, List.of(), 10, (table, ids) -> { throw new AssertionError("no lookup: " + ids); })
-        );
-    }
-
-    /** A page row as the hit statement returns it: its id and its sequence number. */
-    private static Map<String, Object> row(String osid, long seq) {
-        Map<String, Object> r = new java.util.HashMap<>();
-        r.put("osid", osid);
-        r.put("osseq", seq);
-        return r;
-    }
-
-    /** A plan over {@code q} with these sorts and collapse, as the request names them. */
-    private static InfinoSearch.Plan plainPlan(QueryBuilder q, List<InfinoSearch.SortSpec> sorts, Column collapse) {
-        return new InfinoSearch.Plan(
-            TABLE,
-            columns(),
-            translate(q),
-            sorts,
-            null,
-            null,
-            collapse,
-            null,
-            java.util.List.of(),
-            InfinoAccess.NONE,
-            NOW
-        );
+        assertTrue(collapsed, collapsed.contains("PARTITION BY \"level\" ORDER BY " + InfinoSearch.ROW_ID_ORDER + ")"));
+        assertTrue(collapsed, collapsed.endsWith(" = 1 ORDER BY " + InfinoSearch.ROW_ID_ORDER + " LIMIT 10"));
+        assertEquals("\"_id\" ASC NULLS LAST", InfinoSearch.ROW_ID_ORDER);
     }
 
     public void testTiesBreakByTheEngineRowId() {

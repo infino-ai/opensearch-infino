@@ -1,8 +1,8 @@
 ---
 "A search with no sort pages through a table of several files in write order, every row once, as a Lucene twin pages it":
   # Each bulk below is its own refresh, so the table holds three files. A
-  # page with no order would be whichever rows the read reached first, which
-  # can differ between two requests, so from/size pages could skip rows.
+  # page with no order must read them in the same order on every request,
+  # or from/size pages would repeat or skip rows.
   - do:
       indices.create:
         index: uo_inf

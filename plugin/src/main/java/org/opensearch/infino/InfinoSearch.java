@@ -80,7 +80,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -134,7 +133,7 @@ public final class InfinoSearch {
     private static final String EPOCH_MILLIS_FORMAT = "epoch_millis";
     /** Digits of the engine's row id: its type is {@code DECIMAL(38, 0)}. */
     private static final int ROW_ID_DIGITS = 38;
-    /** The order of a page whose request orders nothing: the engine's row id, ascending ({@link SortSpec#rowId}). */
+    /** The order a collapse with no order of its own keeps: the engine's row id, ascending ({@link SortSpec#rowId}). */
     static final String ROW_ID_ORDER = orderBy(List.of(SortSpec.rowId())).get(0);
     /** The sort a scroll without one pages by: the document id, which {@link #columnFor} resolves to the id column. */
     private static final String ID_SORT_FIELD = "_id";
@@ -758,8 +757,7 @@ public final class InfinoSearch {
 
     /**
      * The page's rows from its hit statement, with their sources when they
-     * are read once the rows are chosen; {@code resumed} as {@link #page}
-     * takes it.
+     * are read by id; {@code resumed} as {@link #page} takes it.
      */
     private static List<Map<String, Object>> hitRows(
         Plan plan,
@@ -768,11 +766,11 @@ public final class InfinoSearch {
         boolean seqNoAndPrimaryTerm,
         boolean resumed
     ) {
-        List<Map<String, Object>> rows;
         if (readsUnsorted(plan, resumed)) {
-            // Its plan is sorted with no collapse, so its sources are read by id below.
-            rows = InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm));
-        } else if (splitsMissingTail(plan)) {
+            return InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm, wantsSource(source)));
+        }
+        List<Map<String, Object>> rows;
+        if (splitsMissingTail(plan)) {
             // The rows past a present first sort value come first; the
             // rows missing it follow them all, so they are read only
             // when the first part leaves the page short.
@@ -1072,21 +1070,13 @@ public final class InfinoSearch {
 
     /**
      * Whether the page's sources are read by id once its rows are chosen,
-     * rather than in the hit statement. A sorted page without a collapse:
-     * the sort weighs every row the predicate keeps, and every row that
-     * ties on the first key competes on the next, so a source in the
-     * statement would be read for each of those rows to keep a page's
-     * worth. And a page read in the row id's order (no sort, no text to
-     * rank by, no score; see {@link #hitStatement}), with or without a
-     * collapse: the read that orders and limits its rows then carries the
-     * narrow id columns only, and the wide source column is read for the
-     * page's rows alone. The page {@link #readsUnsorted} is read so as well.
+     * rather than in the hit statement: a sorted page without a collapse.
+     * The sort weighs every row the predicate keeps, and every row that ties
+     * on the first key competes on the next, so a source in the statement
+     * would be read for each of those rows to keep a page's worth.
      */
     static boolean sourcesById(Plan plan) {
-        if (plan.sorts().isEmpty()) {
-            return plan.query().principal() == null && !scoredPage(plan);
-        }
-        return plan.collapse() == null;
+        return !plan.sorts().isEmpty() && plan.collapse() == null;
     }
 
     /** Whether a hit's response carries its source. */
@@ -1107,25 +1097,8 @@ public final class InfinoSearch {
         return returnsSource(source) || !requestedFields(source.docValueFields(), source.fetchFields()).isEmpty();
     }
 
-    /**
-     * {@code rows} up to {@code fetch}, in their order, each with its source
-     * from the table, looked up by its id. A row the lookup does not find
-     * (deleted since the rows were chosen) keeps its place with an empty
-     * source, as a row with no source reads, so the page's rows stay the
-     * ones its statement chose: a short page still counts as the total, and
-     * the window over the merged pages still starts where it should.
-     */
+    /** {@code rows} up to {@code fetch}, each with its source from the table, looked up by its id. */
     private static List<Map<String, Object>> withSources(String table, List<Map<String, Object>> rows, int fetch) {
-        return withSources(table, rows, fetch, InfinoNative::sources);
-    }
-
-    /** As {@link #withSources(String, List, int)}, through this lookup of sources by id. */
-    static List<Map<String, Object>> withSources(
-        String table,
-        List<Map<String, Object>> rows,
-        int fetch,
-        BiFunction<String, Collection<String>, Map<String, String>> lookup
-    ) {
         List<Map<String, Object>> page = rows.subList(0, Math.min(rows.size(), fetch));
         List<String> ids = new ArrayList<>(page.size());
         for (Map<String, Object> row : page) {
@@ -1134,13 +1107,12 @@ public final class InfinoSearch {
                 ids.add(id.toString());
             }
         }
-        Map<String, String> sources = ids.isEmpty() ? Map.of() : lookup.apply(table, ids);
+        Map<String, String> sources = InfinoNative.sources(table, ids);
         List<Map<String, Object>> out = new ArrayList<>(page.size());
         for (Map<String, Object> row : page) {
-            Object id = row.get(InfinoQueryTranslator.OSID);
-            String found = id == null ? null : sources.get(id.toString());
             Map<String, Object> withSource = new HashMap<>(row);
-            withSource.put(InfinoQueryTranslator.SOURCE, found == null ? "" : found);
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            withSource.put(InfinoQueryTranslator.SOURCE, id == null ? null : sources.get(id.toString()));
             out.add(withSource);
         }
         return out;
@@ -1153,8 +1125,9 @@ public final class InfinoSearch {
      * {@code seq_no_primary_term}) and, under a collapse, its collapse value.
      * A sorted request
      * orders the filtered relation; a text-ranked one orders the engine's
-     * ranked candidates by score; anything else is a filtered scan in the
-     * row id's order. A
+     * ranked candidates by score; anything else is a filtered scan with no
+     * order, which the engine reads in file order under a page's
+     * {@code LIMIT}, so pages at growing offsets follow one another. A
      * search_after narrows the relation to the rows past the given sort values
      * (a keyset, so no earlier page is scanned), and a collapse keeps the first
      * row of each collapse value in the request's order, through a window.
@@ -1176,12 +1149,11 @@ public final class InfinoSearch {
     /**
      * Whether the page is read as the unsorted search reads it: its sort
      * orders nothing ({@link #sortsNothing}), so every hit's sort value is
-     * missing and the page is the predicate's rows in the row id's order,
-     * as stock reads a sort on a field no document has in its index's
-     * order. The hits still carry the
-     * sort. Not when a later page resumes from the hits' sort values
-     * ({@code resumed}, a scroll): the unsorted read selects no sort value,
-     * so every value would be missing and the keyset past them would keep no
+     * missing and the page is the predicate's rows in file order, as stock
+     * reads a sort on a field no document has in its index's order. The hits
+     * still carry the sort. Not when a later page resumes from the hits' sort values
+     * ({@code resumed}, a scroll): the unsorted read selects no row id, so
+     * every value would be missing and the keyset past them would keep no
      * row; that page is read in the sort's order, the row id's.
      */
     static boolean readsUnsorted(Plan plan, boolean resumed) {
@@ -1191,20 +1163,21 @@ public final class InfinoSearch {
     /**
      * The statement {@link #readsUnsorted} reads a page with: the sorted
      * statement's rows ({@link #hitStatement}, unranked, as a field sort
-     * selects them) in the row id's order, each with its id alone; its
-     * source is read by that id afterwards ({@link #withSources}) when the
-     * hit returns it or reads requested fields from it. A text query is neither
-     * ranked by BM25 nor scored, so the page is
-     * the rows the sorted read would select, not the best-scoring ones. Every
-     * row's sort value is missing, so the row id alone orders the page, as it
-     * breaks the sort's ties; the engine's top-k on the row id skips the
-     * row groups its bound rules out.
+     * selects them) with no order, each with its source when
+     * {@code withSource} (the hit returns it or reads requested fields from
+     * it). A text query is neither ranked by BM25 nor scored, so the page is
+     * the rows the sorted read would select, not the best-scoring ones. With
+     * no order the read stops at its LIMIT; ordering by the row id would read
+     * the id of every row the filter keeps. The engine reads a scan under a
+     * {@code LIMIT} with no order in file order, so two pages of one search
+     * start where the last one ended.
      */
-    static String unsortedStatement(Plan plan, int fetch, boolean withSeq) {
+    static String unsortedStatement(Plan plan, int fetch, boolean withSeq, boolean withSource) {
         String hit = InfinoQueryTranslator.OSID
+            + (withSource ? ", " + InfinoQueryTranslator.SOURCE : "")
             + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "");
         Unranked read = unranked(plan.query(), plan.hitWhere());
-        return "SELECT " + hit + " FROM " + read.from() + " WHERE " + read.where() + " ORDER BY " + ROW_ID_ORDER + " LIMIT " + fetch;
+        return "SELECT " + hit + " FROM " + read.from() + " WHERE " + read.where() + " LIMIT " + fetch;
     }
 
     /** The relation and predicate a page with no score reads its rows from. */
@@ -1354,23 +1327,22 @@ public final class InfinoSearch {
             hit.append(", score");
             order = "score DESC";
         } else {
-            // A page with no order would be whichever rows the engine's read
-            // reached first, which differs between requests, so one page can
-            // skip rows another shows: it is read in the row id's order, which
-            // follows each writer's write order, as stock reads such a page in
-            // its index's order.
             from = q.from();
-            order = ROW_ID_ORDER;
+            order = null;
         }
         if (plan.collapse() == null) {
-            return "SELECT " + hit + " FROM " + from + " WHERE " + where + " ORDER BY " + order + " LIMIT " + fetch;
+            return "SELECT " + hit + " FROM " + from + " WHERE " + where + (order == null ? "" : " ORDER BY " + order) + " LIMIT " + fetch;
         }
-        // One row per collapse value: the first in the request's order.
+        // One row per collapse value: the first in the request's order, or in
+        // the row id's when the request names none. The window's rows come
+        // out grouped by value, not in file order, so the page orders them
+        // the same way, and pages at growing offsets follow one another.
+        String within = order == null ? ROW_ID_ORDER : order;
         String partition = InfinoQueryTranslator.quoteIdent(plan.collapse().name());
         String rank = InfinoQueryTranslator.quoteIdent(freeAlias(plan, COLLAPSE_RANK));
-        return "SELECT " + hit + " FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY " + order
+        return "SELECT " + hit + " FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY " + within
             + ") AS " + rank + " FROM " + from + " t WHERE " + where + ") WHERE " + rank + " = 1"
-            + " ORDER BY " + order + " LIMIT " + fetch;
+            + " ORDER BY " + within + " LIMIT " + fetch;
     }
 
     /**
