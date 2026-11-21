@@ -321,3 +321,72 @@
           size: 6
           sort: [ { "@timestamp": desc } ]
   - match: { hits.hits.5._id: n }
+
+---
+"A page read from the range index leaves out a deleted document and carries its sort values, as on a Lucene twin":
+  - do:
+      indices.create:
+        index: gone_infino
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      indices.create:
+        index: gone_lucene
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: gone_infino, _id: a }
+          - { n: 3 }
+          - index: { _index: gone_infino, _id: b }
+          - { n: 2 }
+          - index: { _index: gone_infino, _id: c }
+          - { n: 1 }
+          - index: { _index: gone_lucene, _id: a }
+          - { n: 3 }
+          - index: { _index: gone_lucene, _id: b }
+          - { n: 2 }
+          - index: { _index: gone_lucene, _id: c }
+          - { n: 1 }
+  - do:
+      delete:
+        index: gone_infino
+        id: a
+        refresh: true
+  - do:
+      delete:
+        index: gone_lucene
+        id: a
+        refresh: true
+
+  - do:
+      search:
+        index: gone_lucene
+        body:
+          size: 2
+          sort: [ { n: desc } ]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: b }
+  - match: { hits.hits.0.sort: [ 2 ] }
+  - match: { hits.hits.0._source.n: 2 }
+  - match: { hits.hits.1._id: c }
+
+  - do:
+      search:
+        index: gone_infino
+        body:
+          size: 2
+          sort: [ { n: desc } ]
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: b }
+  - match: { hits.hits.0.sort: [ 2 ] }
+  - match: { hits.hits.0._source.n: 2 }
+  - match: { hits.hits.1._id: c }

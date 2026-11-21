@@ -768,16 +768,19 @@ public final class InfinoSearch {
         boolean seqNoAndPrimaryTerm,
         boolean resumed
     ) {
-        if (readsUnsorted(plan, resumed)) {
-            return InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm, wantsSource(source)));
-        }
-        List<Map<String, Object>> rows;
         if (!seqNoAndPrimaryTerm && !resumed) {
+            // Before the presence count readsUnsorted makes: the range index
+            // reads rows missing the value last, in row id order, so a column
+            // no row has a value in needs no count either.
             List<Map<String, Object>> indexed = rangeIndexRows(plan, source, fetch);
             if (indexed != null) {
                 return indexed;
             }
         }
+        if (readsUnsorted(plan, resumed)) {
+            return InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm, wantsSource(source)));
+        }
+        List<Map<String, Object>> rows;
         if (splitsMissingTail(plan)) {
             // The rows past a present first sort value come first; the
             // rows missing it follow them all, so they are read only
