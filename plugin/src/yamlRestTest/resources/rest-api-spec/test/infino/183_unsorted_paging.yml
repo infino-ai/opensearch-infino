@@ -1,0 +1,339 @@
+---
+"A search with no sort pages through a table of several files in write order, every row once, as a Lucene twin pages it":
+  # Each bulk below is its own refresh, so the table holds three files. A
+  # page with no order must read them in the same order on every request,
+  # or from/size pages would repeat or skip rows.
+  - do:
+      indices.create:
+        index: uo_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: uo_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tag: { type: keyword }
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        index: uo_inf
+        body:
+          - index: { _id: "k7" }
+          - { tag: "x" }
+          - index: { _id: "c2" }
+          - { tag: "y" }
+          - index: { _id: "x1" }
+          - { tag: "x" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: uo_inf
+        body:
+          - index: { _id: "a9" }
+          - { tag: "x" }
+          - index: { _id: "q4" }
+          - { tag: "y" }
+          - index: { _id: "m5" }
+          - { tag: "x" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: uo_inf
+        body:
+          - index: { _id: "z3" }
+          - { tag: "y" }
+          - index: { _id: "b8" }
+          - { tag: "x" }
+          - index: { _id: "h6" }
+          - { tag: "x" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: uo_luc
+        body:
+          - index: { _id: "k7" }
+          - { tag: "x" }
+          - index: { _id: "c2" }
+          - { tag: "y" }
+          - index: { _id: "x1" }
+          - { tag: "x" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: uo_luc
+        body:
+          - index: { _id: "a9" }
+          - { tag: "x" }
+          - index: { _id: "q4" }
+          - { tag: "y" }
+          - index: { _id: "m5" }
+          - { tag: "x" }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: uo_luc
+        body:
+          - index: { _id: "z3" }
+          - { tag: "y" }
+          - index: { _id: "b8" }
+          - { tag: "x" }
+          - index: { _id: "h6" }
+          - { tag: "x" }
+  - match: { errors: false }
+
+  # match_all: the pages hold the nine rows in the order they were written, none twice.
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 0, size: 2 }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "k7" }
+  - match: { hits.hits.1._id: "c2" }
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 2, size: 2 }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "x1" }
+  - match: { hits.hits.1._id: "a9" }
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 4, size: 2 }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "q4" }
+  - match: { hits.hits.1._id: "m5" }
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 6, size: 2 }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "z3" }
+  - match: { hits.hits.1._id: "b8" }
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 8, size: 2 }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "h6" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 0, size: 2 }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "k7" }
+  - match: { hits.hits.1._id: "c2" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 2, size: 2 }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "x1" }
+  - match: { hits.hits.1._id: "a9" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 4, size: 2 }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "q4" }
+  - match: { hits.hits.1._id: "m5" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 6, size: 2 }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "z3" }
+  - match: { hits.hits.1._id: "b8" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 8, size: 2 }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "h6" }
+
+  # A filter keeps that order among the rows it keeps.
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 0, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "k7" }
+  - match: { hits.hits.1._id: "x1" }
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 2, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "a9" }
+  - match: { hits.hits.1._id: "m5" }
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 4, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b8" }
+  - match: { hits.hits.1._id: "h6" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 0, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "k7" }
+  - match: { hits.hits.1._id: "x1" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 2, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "a9" }
+  - match: { hits.hits.1._id: "m5" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 4, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b8" }
+  - match: { hits.hits.1._id: "h6" }
+
+  # A sort on a field no row holds orders nothing: the rows come in the same order.
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 0, size: 2, sort: [ { n: { order: desc } } ] }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "k7" }
+  - match: { hits.hits.1._id: "c2" }
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 2, size: 2, sort: [ { n: { order: desc } } ] }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "x1" }
+  - match: { hits.hits.1._id: "a9" }
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 4, size: 2, sort: [ { n: { order: desc } } ] }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "q4" }
+  - match: { hits.hits.1._id: "m5" }
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 6, size: 2, sort: [ { n: { order: desc } } ] }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "z3" }
+  - match: { hits.hits.1._id: "b8" }
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 8, size: 2, sort: [ { n: { order: desc } } ] }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "h6" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 0, size: 2, sort: [ { n: { order: desc } } ] }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "k7" }
+  - match: { hits.hits.1._id: "c2" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 2, size: 2, sort: [ { n: { order: desc } } ] }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "x1" }
+  - match: { hits.hits.1._id: "a9" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 4, size: 2, sort: [ { n: { order: desc } } ] }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "q4" }
+  - match: { hits.hits.1._id: "m5" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 6, size: 2, sort: [ { n: { order: desc } } ] }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "z3" }
+  - match: { hits.hits.1._id: "b8" }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 8, size: 2, sort: [ { n: { order: desc } } ] }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "h6" }
+  # A collapse with no sort keeps each group's first row in that order, and
+  # orders the groups by it, as the Lucene twin does.
+  - do:
+      search:
+        index: uo_inf
+        body: { size: 5, collapse: { field: tag } }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "k7" }
+  - match: { hits.hits.0.fields.tag: [ "x" ] }
+  - match: { hits.hits.1._id: "c2" }
+  - match: { hits.hits.1.fields.tag: [ "y" ] }
+  - do:
+      search:
+        index: uo_inf
+        body: { from: 1, size: 1, collapse: { field: tag } }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "c2" }
+  - do:
+      search:
+        index: uo_luc
+        body: { size: 5, collapse: { field: tag } }
+  - match: { hits.total.value: 9 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "k7" }
+  - match: { hits.hits.0.fields.tag: [ "x" ] }
+  - match: { hits.hits.1._id: "c2" }
+  - match: { hits.hits.1.fields.tag: [ "y" ] }
+  - do:
+      search:
+        index: uo_luc
+        body: { from: 1, size: 1, collapse: { field: tag } }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "c2" }

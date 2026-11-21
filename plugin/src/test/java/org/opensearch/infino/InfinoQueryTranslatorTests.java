@@ -526,6 +526,26 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("SELECT osid, osseq FROM \"os_logs_0\" WHERE 1=1 LIMIT 5", InfinoSearch.unsortedStatement(afterPlan(null, null), 5, true, false));
     }
 
+    public void testAPageWithNoOrderLeavesTheOrderToTheEngine() {
+        // A page with no sort and no score carries no ORDER BY: the engine
+        // reads a scan under a LIMIT with no order in file order, so each page
+        // of one search starts where the last one ended. Its source is read
+        // in the same scan.
+        assertEquals(
+            "SELECT osid, source FROM \"os_logs_0\" WHERE \"level\" = 'error' LIMIT 10",
+            hits(translate(QueryBuilders.termQuery("level", "error")), null, 10)
+        );
+    }
+
+    public void testACollapseWithNoOrderKeepsTheRowIdOrder() {
+        // The window's rows come out grouped by value, so the first row of
+        // each value and the page's rows both follow the row id's order.
+        String collapsed = hits(translate(QueryBuilders.matchAllQuery()), columns().get("level"), 10);
+        assertTrue(collapsed, collapsed.contains("PARTITION BY \"level\" ORDER BY " + InfinoSearch.ROW_ID_ORDER + ")"));
+        assertTrue(collapsed, collapsed.endsWith(" = 1 ORDER BY " + InfinoSearch.ROW_ID_ORDER + " LIMIT 10"));
+        assertEquals("\"_id\" ASC NULLS LAST", InfinoSearch.ROW_ID_ORDER);
+    }
+
     public void testTiesBreakByTheEngineRowId() {
         // Rows sharing the sort value are ordered by the engine's row id, which
         // the engine answers from its range index; a page continuing from a row

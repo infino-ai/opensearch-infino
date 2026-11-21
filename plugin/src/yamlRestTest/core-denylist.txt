@@ -93,7 +93,6 @@ search/210_rescore_explain/Score should match explanation in rescore  # [bug] ma
 search/50_multi_match/Cross fields do not return negative scores  # [bug] multi_match cross_fields orders hits differently from stock on some runs
 search/270_wildcard_fieldtype_queries/case insensitive query on wildcard field  # [bug] hits with equal scores come back in a different order from stock, so the first _id differs on some runs
 search/270_wildcard_fieldtype_queries/case insensitive regexp query on wildcard field  # [bug] hits with equal scores come back in a different order from stock, so the first _id differs on some runs
-index/115_constant_keyword/Mappings and Indexing  # [bug] a match_all with no sort returns the two documents in a different order from stock on some runs, so hits.0 is the second one written
 
 # --- Aggregation results
 search.aggregation/10_histogram/Deprecated _time order  # [bug] histogram buckets have no key_as_string
