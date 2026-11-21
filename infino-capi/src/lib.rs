@@ -3391,27 +3391,22 @@ fn ranked_columns(conn: &Bridge, name: &str) -> Vec<String> {
 
 /// The row of an attached table read under `osid`, its row id's digits, as
 /// [`get_row`] gives a row: its columns as the source, and no sequence
-/// number. None when `osid` is no row id or the table holds no such row.
-fn attached_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
+/// number. None when `osid` is no row id or the table holds no such row; an
+/// error when the read fails.
+fn attached_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String, i64)>, String> {
     if !attached::is_row_id(osid) {
-        return None;
+        return Ok(None);
     }
     let sql = format!(
         "SELECT * FROM \"{}\" WHERE \"{}\" = {osid} LIMIT 1",
         name.replace('"', "\"\""),
         attached::ROW_ID
     );
-    let batches = match conn.conn.query_sql(&sql) {
-        Ok(batches) => batches,
-        Err(e) => {
-            eprintln!("[capi] get: {e}");
-            return None;
-        }
-    };
-    batches
+    let batches = conn.conn.query_sql(&sql).map_err(|e| e.to_string())?;
+    Ok(batches
         .iter()
         .find(|b| b.num_rows() > 0)
-        .map(|b| (attached::source_json(b, 0), 0))
+        .map(|b| (attached::source_json(b, 0), 0)))
 }
 
 /// Most rows of an attached table one statement of [`attached_rows`] asks
@@ -3422,8 +3417,13 @@ const ATTACHED_ROWS_PER_STATEMENT: usize = 500;
 /// as [`attached_row`] gives it; an id that is no row id, or names no row,
 /// is absent. A page of a search reads its sources this way once its ids are
 /// chosen: the table has no lookup by id but the row id itself, so the page
-/// is read in one statement over its ids rather than one a row.
-fn attached_rows(conn: &Bridge, name: &str, osids: &[&str]) -> serde_json::Map<String, Value> {
+/// is read in one statement over its ids rather than one a row. An error
+/// when a read fails.
+fn attached_rows(
+    conn: &Bridge,
+    name: &str,
+    osids: &[&str],
+) -> Result<serde_json::Map<String, Value>, String> {
     let mut found = serde_json::Map::new();
     let ids: Vec<&str> = osids
         .iter()
@@ -3437,13 +3437,7 @@ fn attached_rows(conn: &Bridge, name: &str, osids: &[&str]) -> serde_json::Map<S
             attached::ROW_ID,
             chunk.join(", ")
         );
-        let batches = match conn.conn.query_sql(&sql) {
-            Ok(batches) => batches,
-            Err(e) => {
-                eprintln!("[capi] get_many: {e}");
-                continue;
-            }
-        };
+        let batches = conn.conn.query_sql(&sql).map_err(|e| e.to_string())?;
         for batch in &batches {
             for r in 0..batch.num_rows() {
                 if let Some(id) = attached::id_of(batch, r) {
@@ -3452,17 +3446,17 @@ fn attached_rows(conn: &Bridge, name: &str, osids: &[&str]) -> serde_json::Map<S
             }
         }
     }
-    found
+    Ok(found)
 }
 
 /// The source of the row under `osid` and the sequence number it was
-/// written under (0 for a row written without one), or None when the table
-/// holds no such row.
-fn get_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
+/// written under (0 for a row written without one), None when the table
+/// holds no such row, or an error when the read fails.
+fn get_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String, i64)>, String> {
     if conn.is_attached(name) {
         return attached_row(conn, name, osid);
     }
-    let table = conn.table(name).ok()?;
+    let table = conn.table(name).map_err(|e| e.to_string())?;
     // A term lookup through the id column's FTS index, projected to the
     // source and the sequence number. A table declared before the id column
     // carried that index refuses the lookup; it falls back to an equality on
@@ -3472,13 +3466,7 @@ fn get_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
         Err(_) => {
             let esc = osid.replace('\'', "''");
             let sql = format!("SELECT {SOURCE}, {SEQ} FROM {name} WHERE {OSID} = '{esc}' LIMIT 1");
-            match conn.conn.query_sql(&sql) {
-                Ok(batches) => batches,
-                Err(e) => {
-                    eprintln!("[capi] get: {e}");
-                    return None;
-                }
-            }
+            conn.conn.query_sql(&sql).map_err(|e| e.to_string())?
         }
     };
     for b in &batches {
@@ -3499,9 +3487,17 @@ fn get_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
             .filter(|a| !a.is_null(0))
             .map_or(0, |a| a.value(0));
-        return Some((source.value(0).to_string(), seq));
+        return Ok(Some((source.value(0).to_string(), seq)));
     }
-    None
+    Ok(None)
+}
+
+/// [`get_row`], a failed read logged and answered as absent.
+fn found_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
+    get_row(conn, name, osid).unwrap_or_else(|e| {
+        eprintln!("[capi] get: {e}");
+        None
+    })
 }
 
 /// The raw `_source` JSON for one osid, or "" if absent.
@@ -3517,7 +3513,7 @@ pub unsafe extern "C" fn infino_get(
         else {
             return ptr::null_mut();
         };
-        out_string(get_row(conn, name, osid).map_or_else(String::new, |(source, _)| source))
+        out_string(found_row(conn, name, osid).map_or_else(String::new, |(source, _)| source))
     }))
     .unwrap_or(ptr::null_mut())
 }
@@ -3526,7 +3522,8 @@ pub unsafe extern "C" fn infino_get(
 const GET_MANY_THREADS: usize = 16;
 
 /// The raw `_source` JSON of several osids, as one JSON object from each id
-/// the table holds to its source; an id it does not hold is absent.
+/// the table holds to its source; an id it does not hold is absent, and a
+/// lookup that fails answers `{"error":..}` for the whole call.
 ///
 /// Each id is looked up as [`infino_get`] looks it up, through the id
 /// column's index. A page of a sorted search reads its sources this way once
@@ -3553,25 +3550,30 @@ pub unsafe extern "C" fn infino_get_many(
                 .collect()
         };
         if conn.is_attached(name) {
-            return out_json(Value::Object(attached_rows(conn, name, &ids)));
+            return match attached_rows(conn, name, &ids) {
+                Ok(found) => out_json(Value::Object(found)),
+                Err(e) => err_json(&format!("get_many: {e}")),
+            };
         }
         let mut found = serde_json::Map::new();
         for chunk in ids.chunks(GET_MANY_THREADS) {
-            let sources: Vec<Option<String>> = std::thread::scope(|scope| {
+            let sources: Vec<Result<Option<(String, i64)>, String>> = std::thread::scope(|scope| {
                 let lookups: Vec<_> = chunk
                     .iter()
-                    .map(|id| {
-                        scope.spawn(move || get_row(conn, name, id).map(|(source, _)| source))
-                    })
+                    .map(|id| scope.spawn(move || get_row(conn, name, id)))
                     .collect();
                 lookups
                     .into_iter()
-                    .map(|lookup| lookup.join().ok().flatten())
+                    .map(|lookup| lookup.join().unwrap_or_else(|_| Err("a lookup panicked".into())))
                     .collect()
             });
             for (id, source) in chunk.iter().zip(sources) {
-                if let Some(source) = source.filter(|s| !s.is_empty()) {
-                    found.insert((*id).to_owned(), Value::String(source));
+                match source {
+                    Ok(Some((source, _))) if !source.is_empty() => {
+                        found.insert((*id).to_owned(), Value::String(source));
+                    }
+                    Ok(_) => {}
+                    Err(e) => return err_json(&format!("get_many {id}: {e}")),
                 }
             }
         }
@@ -3594,7 +3596,7 @@ pub unsafe extern "C" fn infino_get_doc(
         else {
             return ptr::null_mut();
         };
-        match get_row(conn, name, osid) {
+        match found_row(conn, name, osid) {
             Some((source, seq)) => out_json(json!({ "source": source, "seq": seq })),
             None => out_string(String::new()),
         }
@@ -5438,6 +5440,12 @@ mod tests {
         assert_eq!(many["b"].as_str(), Some(get(h, "b").as_str()), "{many}");
         assert_eq!(many.as_object().map(|o| o.len()), Some(2), "{many}");
         assert_eq!(get_many(h, &[]), json!({}));
+        // A read that fails is an error, never an absent id; one get still
+        // answers it as absent.
+        let id = c("a");
+        let failed = take(unsafe { infino_get_many(h, c("no_such_table").as_ptr(), &id.as_ptr(), 1) });
+        assert!(failed.starts_with("{\"error\""), "{failed}");
+        assert_eq!(take(unsafe { infino_get(h, c("no_such_table").as_ptr(), id.as_ptr()) }), "");
         close(h);
     }
 
