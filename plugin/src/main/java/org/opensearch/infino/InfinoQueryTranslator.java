@@ -58,6 +58,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -1740,6 +1741,215 @@ final class InfinoQueryTranslator {
         // text_match is a predicate the scan answers from the index; inside an
         // aggregate's expression it would be evaluated row by row instead.
         return predicate.contains(TEXT_SUBQUERY) || predicate.contains(TEXT_PREDICATE);
+    }
+
+    /** One {@code text_match} call exactly as {@link #textPredicate} writes it: column, plain words, mode. */
+    private static final Pattern TEXT_MATCH_CALL = Pattern.compile("text_match\\(\"((?:[^\"]|\"\")*)\", '((?:[^']|'')*)', '(and|or)'\\)");
+    /** The SQL keywords whose own AND would be read as a conjunction by {@link #junction}. */
+    private static final Pattern AMBIGUOUS_AND = Pattern.compile("(?i)\\b(BETWEEN|CASE)\\b");
+
+    /**
+     * The statement that counts the rows of {@code table} matching {@code where}
+     * up to {@code cap} from the token index, or null when {@code where} is not
+     * filters joined by AND to one OR of plain-words {@code text_match} calls.
+     * Each column's clauses become one {@code token_match} part (the words of
+     * its any-word clauses, and of its one-word all-words clauses, merged into
+     * one any-word match; another all-words clause a part of its own), each
+     * under the filters. A row counts in the first part that holds it only:
+     * every later part leaves out the rows an earlier part's clause matches, so
+     * the parts are disjoint and their rows add up with no set of ids to keep,
+     * and the cap stops the count. The scan the predicate would run instead
+     * reads the rows the filters keep and matches each against every clause.
+     */
+    static String textCountStatement(String table, String where, long cap) {
+        List<String> conjuncts = new ArrayList<>();
+        if (!flatten(where, "AND", conjuncts)) {
+            return null;
+        }
+        List<String> filters = new ArrayList<>();
+        String text = null;
+        for (String c : conjuncts) {
+            if (!readsTextIndex(c) && !c.contains("token_match(") && !c.toUpperCase(Locale.ROOT).contains("SELECT")) {
+                filters.add("(" + c + ")");
+            } else if (text == null) {
+                text = c;
+            } else {
+                return null;
+            }
+        }
+        List<String> calls = new ArrayList<>();
+        if (text == null || !flatten(text, "OR", calls)) {
+            return null;
+        }
+        // Per column: the words any of which a row may hold, then each clause needing all of its words.
+        Map<String, List<String>> anyWords = new LinkedHashMap<>();
+        Map<String, List<String>> allWords = new LinkedHashMap<>();
+        for (String call : calls) {
+            java.util.regex.Matcher m = TEXT_MATCH_CALL.matcher(call);
+            if (!m.matches()) {
+                return null;
+            }
+            String column = m.group(1).replace("\"\"", "\"");
+            String words = m.group(2).replace("''", "'");
+            if (!plainQuery(words)) {
+                return null;
+            }
+            boolean any = "or".equals(m.group(3)) || oneToken(words);
+            (any ? anyWords : allWords).computeIfAbsent(column, k -> new ArrayList<>()).add(words);
+            (any ? allWords : anyWords).computeIfAbsent(column, k -> new ArrayList<>());
+        }
+        List<TextClause> parts = new ArrayList<>();
+        for (Map.Entry<String, List<String>> e : anyWords.entrySet()) {
+            if (!e.getValue().isEmpty()) {
+                parts.add(new TextClause(e.getKey(), String.join(" ", e.getValue()), "or"));
+            }
+            for (String words : allWords.get(e.getKey())) {
+                parts.add(new TextClause(e.getKey(), words, "and"));
+            }
+        }
+        List<String> selects = new ArrayList<>();
+        for (int i = 0; i < parts.size(); i++) {
+            TextClause part = parts.get(i);
+            List<String> conditions = new ArrayList<>(filters);
+            for (TextClause earlier : parts.subList(0, i)) {
+                // A row an earlier part holds; a NULL there holds no word.
+                conditions.add(not(textPredicate(table, earlier)));
+            }
+            selects.add(
+                "SELECT 1 AS one FROM token_match("
+                    + literal(table)
+                    + ", "
+                    + literal(part.column())
+                    + ", "
+                    + literal(part.query())
+                    + ", "
+                    + literal(part.mode())
+                    + ")"
+                    + (conditions.isEmpty() ? "" : " WHERE " + String.join(" AND ", conditions))
+            );
+        }
+        if (selects.size() == 1) {
+            return "SELECT COUNT(*) AS c FROM (" + selects.get(0) + " LIMIT " + cap + ") capped";
+        }
+        return "SELECT COUNT(*) AS c FROM (SELECT one FROM (" + String.join(" UNION ALL ", selects) + ") matched LIMIT " + cap + ") capped";
+    }
+
+    /**
+     * Adds to {@code out} the parts {@code expr} joins with {@code op} at any
+     * depth of parentheses holding that operator only, each with its outer
+     * parentheses removed; false when a level mixes AND with OR, or holds the
+     * other operator where {@code op} is asked for (an OR inside the ANDs is one
+     * part: it is the OR flattened next), or a keyword whose AND is its own.
+     */
+    private static boolean flatten(String expr, String op, List<String> out) {
+        String s = unwrap(expr.trim());
+        List<String> parts = new ArrayList<>();
+        String found = junction(s, parts);
+        if (found == null) {
+            return false;
+        }
+        if (found.isEmpty() || (!found.equals(op) && "AND".equals(op))) {
+            if (found.isEmpty() && AMBIGUOUS_AND.matcher(s).find()) {
+                return false;
+            }
+            out.add(s);
+            return true;
+        }
+        if (!found.equals(op)) {
+            return false;
+        }
+        for (String p : parts) {
+            if (!flatten(p, op, out)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** {@code s} without parentheses enclosing the whole of it. */
+    private static String unwrap(String s) {
+        while (s.length() > 1 && s.charAt(0) == '(' && closing(s, 0) == s.length() - 1) {
+            s = s.substring(1, s.length() - 1).trim();
+        }
+        return s;
+    }
+
+    /** The index of the parenthesis closing the one at {@code open}, outside quotes; -1 when none. */
+    private static int closing(String s, int open) {
+        int depth = 0;
+        for (int i = open; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\'' || c == '"') {
+                i = quoteEnd(s, i);
+                if (i < 0) {
+                    return -1;
+                }
+            } else if (c == '(') {
+                depth++;
+            } else if (c == ')' && --depth == 0) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** The index of the quote closing the one at {@code start} (a doubled quote is part of the text); -1 when none. */
+    private static int quoteEnd(String s, int start) {
+        char q = s.charAt(start);
+        for (int i = start + 1; i < s.length(); i++) {
+            if (s.charAt(i) == q) {
+                if (i + 1 < s.length() && s.charAt(i + 1) == q) {
+                    i++;
+                } else {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * The operator joining {@code s}'s parts outside quotes and parentheses
+     * ("AND" or "OR", the parts added to {@code parts}), "" when there is none,
+     * null when both join them or the quotes and parentheses do not balance.
+     */
+    private static String junction(String s, List<String> parts) {
+        String op = "";
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\'' || c == '"') {
+                i = quoteEnd(s, i);
+                if (i < 0) {
+                    return null;
+                }
+            } else if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                if (--depth < 0) {
+                    return null;
+                }
+            } else if (depth == 0 && Character.isWhitespace(c)) {
+                String here = s.regionMatches(true, i, " AND ", 0, 5) ? "AND" : s.regionMatches(true, i, " OR ", 0, 4) ? "OR" : null;
+                if (here != null) {
+                    if (!op.isEmpty() && !op.equals(here)) {
+                        return null;
+                    }
+                    op = here;
+                    parts.add(s.substring(start, i));
+                    i += here.length() + 1;
+                    start = i + 1;
+                }
+            }
+        }
+        if (depth != 0) {
+            return null;
+        }
+        if (!op.isEmpty()) {
+            parts.add(s.substring(start));
+        }
+        return op;
     }
 
     /**

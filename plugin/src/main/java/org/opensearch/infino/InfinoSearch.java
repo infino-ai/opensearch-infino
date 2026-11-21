@@ -1802,13 +1802,18 @@ public final class InfinoSearch {
     /**
      * The number of rows the request matches, or {@code cap} when it matches at
      * least that many. A predicate that reads the token index is counted under
-     * a LIMIT, so the scan stops at the cap instead of matching every row; any
-     * other keeps the engine's count, which a range answers from its index.
+     * a LIMIT, so the scan stops at the cap instead of matching every row: from
+     * the token index itself when it is filters and one OR of plain-words text
+     * clauses ({@link InfinoQueryTranslator#textCountStatement}). Any other
+     * keeps the engine's count, which a range answers from its index.
      */
     static long count(String table, Translation q, long cap) {
         if (cap != Long.MAX_VALUE && q.principal() == null && InfinoQueryTranslator.readsTextIndex(q.where())) {
+            String fromIndex = InfinoQueryTranslator.textCountStatement(q.table(), q.where(), cap);
             List<Map<String, Object>> rows = InfinoNative.sqlRows(
-                "SELECT COUNT(*) AS c FROM (SELECT 1 AS one FROM " + q.from() + " WHERE " + q.where() + " LIMIT " + cap + ") capped"
+                fromIndex != null
+                    ? fromIndex
+                    : "SELECT COUNT(*) AS c FROM (SELECT 1 AS one FROM " + q.from() + " WHERE " + q.where() + " LIMIT " + cap + ") capped"
             );
             Object c = rows.isEmpty() ? null : rows.get(0).get("c");
             return c instanceof Number n ? n.longValue() : 0;
