@@ -192,13 +192,13 @@ final class InfinoSearchChecks {
     }
 
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> properties(MappingMetadata mapping) {
+    static Map<String, Object> properties(MappingMetadata mapping) {
         Object properties = mapping == null ? null : mapping.sourceAsMap().get("properties");
         return properties instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
     }
 
     /** A field's mapping by its full name, through objects and multi-fields, an alias followed; null when it is not mapped. */
-    private static Map<String, Object> field(Map<String, Object> properties, String name) {
+    static Map<String, Object> field(Map<String, Object> properties, String name) {
         Map<String, Object> field = lookup(properties, name);
         if (field != null && "alias".equals(field.get("type")) && field.get("path") instanceof String path) {
             return lookup(properties, path);

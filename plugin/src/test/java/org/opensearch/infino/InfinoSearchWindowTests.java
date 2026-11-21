@@ -12,6 +12,8 @@ import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.time.Instant;
 
 /** The span of time one search of an index may read, when the index sets one. */
@@ -30,8 +32,15 @@ public class InfinoSearchWindowTests extends OpenSearchTestCase {
         if (max != null) {
             settings.put(InfinoSearchWindow.MAX.getKey(), max);
         }
-        return IndexMetadata.builder("pages").settings(settings).build();
+        try {
+            return IndexMetadata.builder("pages").settings(settings).putMapping(MAPPING).build();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
+
+    private static final String MAPPING = "{\"properties\":{\"time\":{\"type\":\"date\"},\"title\":{\"type\":\"text\"},"
+        + "\"lang\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"hits\":{\"type\":\"long\"}}}";
 
     private static final IndexMetadata A_DAY = index("time", "1d");
 
@@ -170,6 +179,31 @@ public class InfinoSearchWindowTests extends OpenSearchTestCase {
         allowed(new SearchSourceBuilder().size(0).query(QueryBuilders.queryStringQuery("title:pope")), A_DAY);
         // And an index with no limit serves a phrase as before.
         allowed(inside, index(null, null));
+    }
+
+    /**
+     * A phrase query on a field that is not text is a comparison with the
+     * whole value, as a filter on a keyword or a number is commonly sent:
+     * it is no phrase lookup, and is served.
+     */
+    public void testAPhraseQueryOnAFieldThatIsNotTextIsAComparison() {
+        SearchSourceBuilder english = new SearchSourceBuilder().size(0)
+            .query(
+                QueryBuilders.boolQuery()
+                    .filter(QueryBuilders.matchPhraseQuery("lang", "en"))
+                    .filter(QueryBuilders.matchPhraseQuery("kind", "article"))
+                    .filter(QueryBuilders.matchPhraseQuery("hits", 5))
+                    .filter(QueryBuilders.rangeQuery("time").gte("2025-05-08T15:00:00Z").lte("2025-05-08T21:00:00Z"))
+            )
+            .aggregation(AggregationBuilders.terms("kinds").field("kind"));
+        allowed(english, A_DAY);
+        // A field the index does not map is not text either.
+        allowed(new SearchSourceBuilder().size(0).query(QueryBuilders.matchPhraseQuery("unmapped", "x")), A_DAY);
+        // A multi-field phrase that reaches a text field is one.
+        assertTrue(
+            refused(new SearchSourceBuilder().size(0).query(QueryBuilders.multiMatchQuery("pope leo", "lang", "title").type("phrase")), A_DAY).contains("a phrase")
+        );
+        allowed(new SearchSourceBuilder().size(0).query(QueryBuilders.multiMatchQuery("en", "lang", "kind").type("phrase")), A_DAY);
     }
 
     public void testABreakdownIsHeldToTheLimit() {

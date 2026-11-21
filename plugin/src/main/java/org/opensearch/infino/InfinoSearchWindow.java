@@ -29,6 +29,8 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.Map;
+import java.util.Set;
 import java.util.function.LongSupplier;
 
 /**
@@ -64,6 +66,9 @@ final class InfinoSearchWindow {
         Setting.Property.Dynamic
     );
 
+    /** The mapped types whose values are searched as text, a phrase among the ways. */
+    private static final Set<String> TEXT_TYPES = Set.of("text", "match_only_text");
+
     /** A range's bounds are read as a date field reads them unless the range names a format of its own. */
     private static final String DEFAULT_FORMAT = "strict_date_optional_time||epoch_millis";
 
@@ -76,7 +81,8 @@ final class InfinoSearchWindow {
             return;
         }
         String name = index.getIndex().getName();
-        if (source != null && (phrase(source.query()) || phrase(source.postFilter()))) {
+        Map<String, Object> properties = InfinoSearchChecks.properties(index.mapping());
+        if (source != null && (phrase(source.query(), properties) || phrase(source.postFilter(), properties))) {
             // Whatever else the search asks for, a count included: the phrase is looked up first.
             throw new IllegalArgumentException(
                 "[infino] index ["
@@ -136,16 +142,27 @@ final class InfinoSearchWindow {
      * other clauses, its range of time among them, but a phrase through a
      * lookup of its own over every row, which a range does not narrow: on a
      * table that needs a limit on its span, that lookup does not finish.
+     *
+     * <p>Only over a field mapped as text. A phrase query on any other field
+     * is a comparison with the whole value, which is how a filter on a
+     * keyword, a number or a date is commonly written, and the table answers
+     * it as a comparison. A query string names its fields inside its text, so
+     * one with a quoted run is taken for a phrase whichever field it means.
      */
-    static boolean phrase(QueryBuilder query) {
+    static boolean phrase(QueryBuilder query, Map<String, Object> properties) {
         if (query == null) {
             return false;
         }
-        if (query instanceof MatchPhraseQueryBuilder || query instanceof MatchPhrasePrefixQueryBuilder) {
-            return true;
+        if (query instanceof MatchPhraseQueryBuilder match) {
+            return text(properties, match.fieldName());
+        }
+        if (query instanceof MatchPhrasePrefixQueryBuilder match) {
+            return text(properties, match.fieldName());
         }
         if (query instanceof MultiMatchQueryBuilder multi) {
-            return multi.type() == MultiMatchQueryBuilder.Type.PHRASE || multi.type() == MultiMatchQueryBuilder.Type.PHRASE_PREFIX;
+            boolean phrases = multi.type() == MultiMatchQueryBuilder.Type.PHRASE || multi.type() == MultiMatchQueryBuilder.Type.PHRASE_PREFIX;
+            // With no fields named it searches the index's default ones, text among them.
+            return phrases && (multi.fields().isEmpty() || multi.fields().keySet().stream().anyMatch(f -> text(properties, f)));
         }
         if (query instanceof QueryStringQueryBuilder string) {
             return string.queryString() != null && string.queryString().indexOf('"') >= 0;
@@ -154,11 +171,17 @@ final class InfinoSearchWindow {
             return simple.value() != null && simple.value().indexOf('"') >= 0;
         }
         for (QueryBuilder inner : InfinoSearchChecks.inner(query)) {
-            if (phrase(inner)) {
+            if (phrase(inner, properties)) {
                 return true;
             }
         }
         return false;
+    }
+
+    /** Whether the index maps {@code field} as text, whose phrases the table looks up in its token index. */
+    private static boolean text(Map<String, Object> properties, String field) {
+        Map<String, Object> mapped = InfinoSearchChecks.field(properties, field);
+        return mapped != null && TEXT_TYPES.contains(String.valueOf(mapped.get("type")));
     }
 
     /**
