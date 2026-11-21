@@ -85,6 +85,16 @@ const OP: &str = "osop";
 /// compare only between rows of one writer's history, so a cut leaves
 /// another's alone.
 const GEN: &str = "osgen";
+/// The columns every table keeps for itself. A document's field of the same
+/// name is kept in a column of its own, named [`OWN_COLUMN_PREFIX`] and the
+/// field's name: no mapping can name a field so.
+const RESERVED: [&str; 3] = [OSID, SOURCE, SEQ];
+const OWN_COLUMN_PREFIX: &str = ".";
+/// Where a table's mapping declares, as `properties` declares fields, the
+/// columns the plugin's engine writes beside a document's fields in default
+/// mode ([`ROUTING`], [`OP`], [`GEN`]). Like [`RESERVED`], they hold no
+/// field: a document's field of the same name gets a column of its own.
+const ENGINE_COLUMNS: &str = "_engine_columns";
 /// Separator used when a multi-valued string field lands in a scalar string
 /// column: the values are joined so a text index sees every token. The
 /// original array is still in `source`.
@@ -448,6 +458,9 @@ pub struct Bridge {
     /// one value at, from the mapping's `_data_stream_timestamp` (set with
     /// [`Bridge::kept`]).
     stamps: RwLock<HashMap<String, Arc<str>>>,
+    /// The columns each table's engine writes, from the mapping it was last
+    /// declared from ([`ENGINE_COLUMNS`]).
+    engine: RwLock<HashMap<String, Arc<Vec<String>>>>,
     /// The tables an index is attached to rather than owns: tables that
     /// existed before the index, declared through `infino_attach_table`.
     /// Such a table is read as it is and never changed: it holds none of
@@ -500,6 +513,22 @@ impl Bridge {
                 Some(field) => all.insert(name.to_string(), field.into()),
                 None => all.remove(name),
             };
+        }
+    }
+
+    /// The columns of `name` its engine writes ([`ENGINE_COLUMNS`]).
+    fn engine_columns(&self, name: &str) -> Arc<Vec<String>> {
+        self.engine
+            .read()
+            .ok()
+            .and_then(|all| all.get(name).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Record the columns `name`'s engine writes, replacing the earlier ones.
+    fn engine_rule(&self, name: &str, columns: Vec<String>) {
+        if let Ok(mut all) = self.engine.write() {
+            all.insert(name.to_string(), Arc::new(columns));
         }
     }
 
@@ -720,6 +749,7 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
         hosted,
         kept: RwLock::new(HashMap::new()),
         stamps: RwLock::new(HashMap::new()),
+        engine: RwLock::new(HashMap::new()),
         attached: RwLock::new(HashMap::new()),
         gates: Mutex::new(HashMap::new()),
     })
@@ -1311,12 +1341,21 @@ fn declare_table(
     check_only: bool,
 ) -> Result<Value, String> {
     let mut mapped = mapped_fields(mapping);
-    // A field named like a reserved column is served from the document's
-    // source, not given a column of its own.
-    mapped.retain(|f| !matches!(f.path.as_str(), OSID | SOURCE | SEQ));
+    let mut engine = Vec::new();
+    if let Some(props) = mapping.get(ENGINE_COLUMNS).and_then(Value::as_object) {
+        walk_properties(props, "", &mut engine);
+    }
+    let engine_columns: Vec<String> = engine.iter().map(|f| f.path.clone()).collect();
+    for f in &mut mapped {
+        if RESERVED.contains(&f.path.as_str()) || engine_columns.contains(&f.path) {
+            f.path = format!("{OWN_COLUMN_PREFIX}{}", f.path);
+        }
+    }
+    mapped.extend(engine);
     let conn = &bridge.conn;
     if !check_only {
         bridge.keep_rules(name, &mapped);
+        bridge.engine_rule(name, engine_columns);
         bridge.stamp_rule(name, mapping);
         if !attached {
             bridge.attach_rule(name, None);
@@ -2050,7 +2089,13 @@ pub unsafe extern "C" fn infino_check_doc(
         let schema = table.schema();
         let stamp = conn.stamp(name);
         out_string(
-            match conform_doc(source, &schema, &conn.kept(name), stamp.as_deref()) {
+            match conform_doc(
+                source,
+                &schema,
+                &conn.kept(name),
+                &conn.engine_columns(name),
+                stamp.as_deref(),
+            ) {
                 Ok(_) => String::new(),
                 Err(why) => why,
             },
@@ -2068,11 +2113,14 @@ pub unsafe extern "C" fn infino_check_doc(
 /// by its own format. With `stamp`, the document must hold exactly one
 /// non-null value at that field, as a data stream's documents must. An array
 /// of arrays at a field without a scalar or string column the mapping
-/// declares is refused, as the engine would refuse it.
+/// declares is refused, as the engine would refuse it. A field named like
+/// one of the table's own columns ([`RESERVED`], or `engine`, those its
+/// engine writes) goes to a column of its own.
 fn conform_doc(
     source: &str,
     schema: &Schema,
     kept: &HashMap<String, Kept>,
+    engine: &[String],
     stamp: Option<&str>,
 ) -> Result<Map<String, Value>, String> {
     let doc: Value = serde_json::from_str(source).map_err(|e| format!("malformed JSON: {e}"))?;
@@ -2081,6 +2129,19 @@ fn conform_doc(
         .ok_or_else(|| "the document is not an object".to_string())?;
     let mut flat = Map::new();
     flatten(obj, "", &mut flat);
+    // A field named like a reserved column goes to its own column once the
+    // mapping declares it, and never to the reserved one.
+    for reserved in RESERVED
+        .into_iter()
+        .chain(engine.iter().map(String::as_str))
+    {
+        if let Some(value) = flat.remove(reserved) {
+            let own = format!("{OWN_COLUMN_PREFIX}{reserved}");
+            if schema.field_with_name(&own).is_ok() {
+                flat.insert(own, value);
+            }
+        }
+    }
     if let Some(field) = stamp {
         let values = match flat.get(field) {
             None | Some(Value::Null) => 0,
@@ -2493,6 +2554,7 @@ pub unsafe extern "C" fn infino_index_batch(
         };
         let schema = table.schema();
         let kept = conn.kept(name);
+        let engine = conn.engine_columns(name);
         let stamp = conn.stamp(name);
 
         let mut failed: Vec<Value> = Vec::new();
@@ -2500,7 +2562,7 @@ pub unsafe extern "C" fn infino_index_batch(
         for i in 0..n {
             let osid = unsafe { cstr(os_p[i]) }.unwrap_or("");
             let source = unsafe { cstr(sr_p[i]) }.unwrap_or("{}");
-            let mut flat = match conform_doc(source, &schema, &kept, stamp.as_deref()) {
+            let mut flat = match conform_doc(source, &schema, &kept, &engine, stamp.as_deref()) {
                 Ok(flat) => flat,
                 Err(why) => {
                     failed.push(json!({ "i": i, "reason": why, "permanent": true }));
@@ -2649,6 +2711,7 @@ unsafe fn prepare(
     let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
     let schema = table.schema();
     let kept = conn.kept(name);
+    let engine = conn.engine_columns(name);
     let stamp = conn.stamp(name);
 
     // Each row's id, source and routing value as borrowed slices of the
@@ -2677,7 +2740,7 @@ unsafe fn prepare(
     let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
         .par_iter()
         .map(|(id, src, routing, seq, op)| {
-            conform_doc(src, &schema, &kept, stamp.as_deref()).map(|mut flat| {
+            conform_doc(src, &schema, &kept, &engine, stamp.as_deref()).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 flat.insert(SOURCE.into(), Value::String((*src).to_string()));
                 if !routing.is_empty() {
@@ -5421,17 +5484,117 @@ mod tests {
     }
 
     /// A field named like a reserved column, added after the table exists,
-    /// leaves the column alone, as it does at creation (#23).
+    /// gets a column of its own and leaves the reserved one alone (#23).
     #[test]
-    fn a_late_field_named_like_a_reserved_column_leaves_it_alone() {
+    fn a_late_field_named_like_a_reserved_column_gets_its_own_column() {
         let h = open_logs();
         let out = ensure(
             h,
-            r#"{"properties":{"source":{"type":"text"},"osseq":{"type":"text"}}}"#,
+            r#"{"properties":{"source":{"type":"text"},"osid":{"type":"keyword"},"osseq":{"type":"long"}}}"#,
         );
         assert!(out.contains("\"created\":false"), "{out}");
-        index(h, &[("s1", r#"{"source":"hello"}"#)]);
-        assert!(get(h, "s1").contains("hello"));
+        let doc = r#"{"source":"hello world","osid":"mine","osseq":7}"#;
+        let out = index(h, &[("s1", doc)]);
+        assert_eq!(out["ok"], 1, "{out}");
+        assert!(get(h, "s1").contains("hello world"));
+        let rows = sql(
+            h,
+            r#"SELECT osid, source, osseq, ".source", ".osid", ".osseq" FROM logs"#,
+        );
+        assert_eq!(rows[0]["osid"], "s1", "{rows}");
+        assert_eq!(rows[0]["source"], doc, "{rows}");
+        assert!(rows[0]["osseq"].is_null(), "{rows}");
+        assert_eq!(rows[0][".source"], "hello world", "{rows}");
+        assert_eq!(rows[0][".osid"], "mine", "{rows}");
+        assert_eq!(rows[0][".osseq"], 7, "{rows}");
+        assert_eq!(count(h, ".source", "hello"), "1");
+        close(h);
+    }
+
+    /// A field named like a column the engine writes in default mode, which
+    /// the plugin declares apart from the fields ([`ENGINE_COLUMNS`]), gets
+    /// a column of its own, declared or not: the engine's column holds only
+    /// what the write gives it.
+    #[test]
+    fn a_field_named_like_an_engine_column_gets_its_own_column() {
+        let h = open_logs();
+        let out = ensure(
+            h,
+            r#"{"properties":{"osop":{"type":"text"},"osgen":{"type":"long"}},
+                "_engine_columns":{"osrouting":{"type":"keyword"},"osop":{"type":"long"},"osgen":{"type":"long"}}}"#,
+        );
+        assert!(out.contains("\"created\":false"), "{out}");
+        let doc = r#"{"osop":"hello world","osgen":7,"osrouting":"mine"}"#;
+        assert_eq!(check(h, doc), "");
+        // As a shard's engine writes a batch, by writer 3: s1 with no routing
+        // value and no operation (only the newest row records one), s2 with
+        // routing r and operation 5. The undeclared osrouting field too stays
+        // out of the engine's column.
+        let doc2 = r#"{"osop":"other","osgen":8,"osrouting":"theirs"}"#;
+        let buf = format!("s1{doc}s2{doc2}r");
+        let s1 = 2 + doc.len() as u32;
+        let s2 = s1 + 2 + doc2.len() as u32;
+        let p = unsafe {
+            infino_prepare_batch_meta(
+                h,
+                c("logs").as_ptr(),
+                buf.as_ptr(),
+                buf.len(),
+                [2u32, s1 + 2].as_ptr(),
+                [s1, s2].as_ptr(),
+                [s1, s2 + 1].as_ptr(),
+                [4i64, 5].as_ptr(),
+                [-1i64, 5].as_ptr(),
+                3,
+                2,
+            )
+        };
+        assert!(!p.is_null());
+        let out = take(unsafe {
+            infino_append_prepared(
+                h,
+                c("logs").as_ptr(),
+                [p].as_ptr(),
+                1,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+            )
+        });
+        assert!(out.contains("\"ok\":2"), "{out}");
+        let rows = sql(
+            h,
+            r#"SELECT osid, osrouting, osop, osgen, ".osop", ".osgen" FROM logs ORDER BY osid"#,
+        );
+        assert!(rows[0]["osrouting"].is_null(), "{rows}");
+        assert!(rows[0]["osop"].is_null(), "{rows}");
+        assert_eq!(rows[0]["osgen"], 3, "{rows}");
+        assert_eq!(rows[0][".osop"], "hello world", "{rows}");
+        assert_eq!(rows[0][".osgen"], 7, "{rows}");
+        assert_eq!(rows[1]["osrouting"], "r", "{rows}");
+        assert_eq!(rows[1]["osop"], 5, "{rows}");
+        assert_eq!(rows[1][".osgen"], 8, "{rows}");
+        // How far the table holds the writer's history is its own operations'.
+        let highest = sql(h, "SELECT max(osop) AS highest FROM logs WHERE osgen = 3");
+        assert_eq!(highest[0]["highest"], 5, "{highest}");
+        assert_eq!(count(h, ".osop", "hello"), "1");
+        close(h);
+    }
+
+    /// A field named like a reserved column the mapping does not declare is
+    /// kept in no column: the reserved one keeps what the table puts there.
+    #[test]
+    fn an_undeclared_field_named_like_a_reserved_column_stays_out_of_it() {
+        let h = open_logs();
+        let out = index(h, &[("s1", r#"{"source":"hello","osseq":7}"#)]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let rows = sql(h, "SELECT source, osseq FROM logs");
+        assert_eq!(
+            rows[0]["source"], r#"{"source":"hello","osseq":7}"#,
+            "{rows}"
+        );
+        assert!(rows[0]["osseq"].is_null(), "{rows}");
         close(h);
     }
 
@@ -5699,7 +5862,7 @@ mod tests {
                     .iter()
                     .map(|(id, src)| {
                         let mut flat =
-                            conform_doc(src, &schema, &conn.kept("bench"), None).unwrap();
+                            conform_doc(src, &schema, &conn.kept("bench"), &[], None).unwrap();
                         flat.insert(OSID.into(), Value::String(id.clone()));
                         flat.insert(SOURCE.into(), Value::String(src.clone()));
                         flat
@@ -6805,7 +6968,7 @@ mod tests {
 
         let schema = Schema::new(vec![Field::new("message", DataType::LargeUtf8, true)]);
         let kept = HashMap::new();
-        let check = |doc: &str| conform_doc(doc, &schema, &kept, Some("@timestamp"));
+        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], Some("@timestamp"));
         assert!(check(r#"{"@timestamp": "2023-01-01T00:00:01Z"}"#).is_ok());
         assert!(check(r#"{"@timestamp": ["2023-01-01T00:00:01Z", null]}"#).is_ok());
         for doc in [
@@ -6815,6 +6978,6 @@ mod tests {
         ] {
             assert_eq!(check(doc), Err(no_timestamp("@timestamp")), "{doc}");
         }
-        assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, None).is_ok());
+        assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, &[], None).is_ok());
     }
 }

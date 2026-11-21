@@ -898,15 +898,22 @@ public final class InfinoNative {
                 null,
                 (String) c.get("elem")
             );
+            String key = InfinoQueryTranslator.keyOf(column);
             // A list column of a mapped field reads its dates as the field's do.
             String format = mapping == null ? null : mapping.dateFormats().get(InfinoQueryTranslator.fieldOf(column));
-            if (mapping != null && mapping.similarityFields().contains(column)) {
+            if (mapping != null && mapping.similarityFields().contains(key)) {
                 described = described.scoredBySimilarity();
             }
             if (mapping != null && mapping.otherSimilarityFields().contains(InfinoQueryTranslator.fieldOf(column))) {
                 described = described.scoredByOtherSimilarity();
             }
-            out.put(column, format == null ? described : described.dated(format));
+            Column kept = format == null ? described : described.dated(format);
+            // A field named like a reserved column is looked up by its name, in place of the reserved column.
+            if (key.equals(column)) {
+                out.putIfAbsent(key, kept);
+            } else {
+                out.put(key, kept);
+            }
         }
         for (Map.Entry<String, String> alias : (mapping == null ? Map.<String, String>of() : mapping.aliases()).entrySet()) {
             Column target = out.get(alias.getValue());
@@ -932,7 +939,7 @@ public final class InfinoNative {
 
     /** Whether {@code key} names {@code column} by an alias rather than by the column's own name. */
     static boolean isAlias(String key, Column column) {
-        return !key.equals(column.name());
+        return !key.equals(InfinoQueryTranslator.keyOf(column.name()));
     }
 
     public static void forgetColumns(String name) {
