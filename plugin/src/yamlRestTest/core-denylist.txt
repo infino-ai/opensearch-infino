@@ -18,18 +18,20 @@
 # also skips mget/40_routing/Routing.
 #
 # The tag says which tasks skip the test:
-#   [gap]       the test needs a feature Infino does not have yet, in the engine
-#               or the plugin; remove the entry when the feature lands
-#   [bug]       any other failure: a wrong answer, a 500, or a refusal of what
-#               an existing feature should handle; remove the entry with the fix
-#   [cluster]   fails on the same cluster without the plugin too
-# gap and bug may be narrowed to one mode: [gap:proxy], [bug:default].
+#   [gap]        the test needs a feature Infino does not have yet, in the engine
+#                or the plugin; remove the entry when the feature lands
+#   [bug]        any other failure: a wrong answer, a 500, or a refusal of what
+#                an existing feature should handle; remove the entry with the fix
+#   [by-design]  Infino answers better than stock on purpose, and the test
+#                asserts stock's weaker behaviour; the entry stays
+#   [cluster]    fails on the same cluster without the plugin too
+# gap, by-design and bug may be narrowed to one mode: [gap:proxy], [bug:default].
 # Without a mode they apply to both. coreYamlRestTestLucene skips only
 # [cluster] entries.
 #
 # -Dinfino.core.skip chooses how much is skipped:
 #   all    (default) every entry for the task's mode
-#   gaps   [gap] and [cluster] only, so the known bugs run and fail
+#   gaps   [gap], [by-design] and [cluster] only, so the known bugs run and fail
 #   none   nothing, to find entries whose tests pass now
 # scripts/core-denylist.py reads a run's results and prints the failures no
 # entry covers, and the entries whose tests all passed.
@@ -39,15 +41,8 @@
 
 # --- Bugs: failures existing features should not have. Remove the entry with the fix.
 
-# --- The refresh parameter on single-document writes, and realtime=false gets
-index/60_refresh/*  # [bug] a write with refresh=true, "" or wait_for is not visible to the next search, or has no forced_refresh (https://github.com/infino-ai/opensearch-infino/issues/55)
-create/60_refresh/*  # [bug] a write with refresh=true, "" or wait_for is not visible to the next search, or has no forced_refresh (https://github.com/infino-ai/opensearch-infino/issues/55)
-delete/50_refresh/*  # [bug] a write with refresh=true, "" or wait_for is not visible to the next search, or has no forced_refresh (https://github.com/infino-ai/opensearch-infino/issues/55)
-update/60_refresh/*  # [bug] a write with refresh=true, "" or wait_for is not visible to the next search, or has no forced_refresh (https://github.com/infino-ai/opensearch-infino/issues/55)
-get/60_realtime_refresh/Realtime Refresh  # [bug] realtime=false finds a write that is not refreshed (https://github.com/infino-ai/opensearch-infino/issues/55)
-get_source/60_realtime_refresh/Realtime  # [bug] realtime=false finds a write that is not refreshed (https://github.com/infino-ai/opensearch-infino/issues/55)
-exists/60_realtime_refresh/Realtime Refresh  # [bug] realtime=false finds a write that is not refreshed (https://github.com/infino-ai/opensearch-infino/issues/55)
-mget/60_realtime_refresh/Realtime Refresh  # [bug] realtime=false finds a write that is not refreshed (https://github.com/infino-ai/opensearch-infino/issues/55)
+# --- A delete without refresh, in default mode
+delete/50_refresh/Refresh  # [bug:default] a delete sent without refresh hides the document from the next search, before any refresh (https://github.com/infino-ai/opensearch-infino/issues/157)
 
 # --- Requests stock rejects are accepted, or answered with another status
 search/330_fetch_fields/Test date formatting  # [bug] a fields request stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
@@ -400,3 +395,15 @@ search.aggregation/170_cardinality_metric_unsigned/profiler unsigned_long  # [cl
 search.aggregation/50_filter/Filter aggs no lookup and ensure it's cached  # [cluster] the request cache counts differ on this cluster
 search.aggregation/50_filter/Filter aggs with terms lookup and ensure it's cached  # [cluster] the request cache counts differ on this cluster
 search.aggregation/40_range/Date range  # [cluster] the date_range bucket key carries the full dates on this cluster
+
+# --- By design: Infino answers better than stock on purpose. These entries stay.
+
+# --- Proxy mode refreshes every acknowledged write
+index/60_refresh/Refresh  # [by-design:proxy] proxy mode refreshes every acknowledged write, so a write sent without refresh is visible at once; the test expects it hidden until a refresh
+create/60_refresh/Refresh  # [by-design:proxy] proxy mode refreshes every acknowledged write, so a write sent without refresh is visible at once; the test expects it hidden until a refresh
+update/60_refresh/Refresh  # [by-design:proxy] proxy mode refreshes every acknowledged write, so a write sent without refresh is visible at once; the test expects it hidden until a refresh
+delete/50_refresh/Refresh  # [by-design:proxy] proxy mode refreshes every acknowledged write, so a write sent without refresh is visible at once; the test expects it hidden until a refresh
+get/60_realtime_refresh/Realtime Refresh  # [by-design:proxy] proxy mode refreshes every acknowledged write, so realtime=false finds a write sent without refresh; the test expects a miss until a refresh
+get_source/60_realtime_refresh/Realtime  # [by-design:proxy] proxy mode refreshes every acknowledged write, so realtime=false finds a write sent without refresh; the test expects a miss until a refresh
+exists/60_realtime_refresh/Realtime Refresh  # [by-design:proxy] proxy mode refreshes every acknowledged write, so realtime=false finds a write sent without refresh; the test expects a miss until a refresh
+mget/60_realtime_refresh/Realtime Refresh  # [by-design:proxy] proxy mode refreshes every acknowledged write, so realtime=false finds a write sent without refresh; the test expects a miss until a refresh

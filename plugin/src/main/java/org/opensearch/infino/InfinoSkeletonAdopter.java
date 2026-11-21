@@ -17,6 +17,8 @@ import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.OperationRouting;
+import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.Setting;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.index.shard.ShardId;
@@ -24,6 +26,7 @@ import org.opensearch.index.engine.Engine;
 import org.opensearch.index.mapper.IdFieldMapper;
 import org.opensearch.index.mapper.Uid;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
@@ -53,6 +56,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * shard, so the skeleton and the translog end where the table is. Until a
  * shard's skeleton is whole, its engine looks ids up in the table
  * ({@link InfinoEngine#skeletonComplete}).
+ *
+ * <p>While {@link #PAUSED} is set, a rebuild waits before it reads the
+ * table: the index's searches miss the rows written before the rebuild, and
+ * its engine goes on looking ids up in the table.
  */
 final class InfinoSkeletonAdopter {
 
@@ -64,6 +71,21 @@ final class InfinoSkeletonAdopter {
     private static final int PAGE_ROWS = 10_000;
     /** The count's alias in the row-count statement. */
     private static final String COUNT_ALIAS = "n";
+
+    /**
+     * Hold every skeleton rebuild that has not begun reading its table until
+     * the setting is cleared, as {@code PUT _cluster/settings} sets it: an
+     * operator keeps a rebuild's writes off a busy cluster, and a test holds
+     * a skeleton incomplete while it writes.
+     */
+    static final Setting<Boolean> PAUSED = Setting.boolSetting(
+        "infino.skeleton_rebuild.paused",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+    /** How often a paused rebuild looks whether it may go on. */
+    private static final long PAUSE_POLL_MILLIS = 200;
 
     /** The shards whose skeleton is being rebuilt on this node, so a second start does not run beside the first. */
     private static final Set<ShardId> RUNNING = ConcurrentHashMap.newKeySet();
@@ -90,6 +112,9 @@ final class InfinoSkeletonAdopter {
 
     private static void adopt(IndexShard shard, String table) throws IOException {
         ShardId shardId = shard.shardId();
+        if (!waitWhilePaused(shard)) {
+            return;
+        }
         IndexMetadata md = shard.indexSettings().getIndexMetadata();
         long rows = tableRows(table);
         long docs;
@@ -143,6 +168,36 @@ final class InfinoSkeletonAdopter {
             log.warn("[infino] {} rows of table {} route to another shard of {} by their id and keep no routing value; they are left out of its skeleton", unroutable, table, shardId);
         }
         log.info("[infino] rebuilt the skeleton of {}: created {} documents from table {}", shardId, created, table);
+    }
+
+    /**
+     * Wait while {@link #PAUSED} is set. False when the shard closed (or
+     * the node stops the wait) meanwhile: the shard's next start rebuilds it.
+     */
+    private static boolean waitWhilePaused(IndexShard shard) {
+        boolean logged = false;
+        while (paused()) {
+            if (shard.state() == IndexShardState.CLOSED) {
+                return false;
+            }
+            if (!logged) {
+                log.info("[infino] the skeleton of {} waits to be rebuilt: {} is set", shard.shardId(), PAUSED.getKey());
+                logged = true;
+            }
+            try {
+                Thread.sleep(PAUSE_POLL_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return shard.state() != IndexShardState.CLOSED;
+    }
+
+    /** Whether the cluster's settings pause rebuilds now. */
+    private static boolean paused() {
+        ClusterService clusterService = InfinoServices.clusterService();
+        return clusterService != null && PAUSED.get(clusterService.state().metadata().settings());
     }
 
     /** A row the skeleton lacks: its source, and the routing value it was written with (null for none). */

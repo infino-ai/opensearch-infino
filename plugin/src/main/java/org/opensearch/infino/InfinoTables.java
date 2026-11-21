@@ -66,6 +66,8 @@ public final class InfinoTables {
     private static final String SIMILARITY_TYPE = "type";
     /** Mapping keys and field types the default-mode columns are declared with. */
     private static final String PROPERTIES = "properties";
+    /** Where a table's mapping declares the columns its engine writes, which the bridge keeps apart from the fields. */
+    private static final String ENGINE_COLUMNS = "_engine_columns";
     private static final String TYPE = "type";
     private static final String KEYWORD = "keyword";
     private static final String LONG = "long";
@@ -81,6 +83,9 @@ public final class InfinoTables {
 
     /** The mapping version each table was last declared from, by table. */
     private final Map<String, Long> declared = new ConcurrentHashMap<>();
+
+    /** The connection {@link #declared} was filled over, as {@link InfinoNative#opens} counts them. */
+    private volatile long declaredOver = -1;
 
     /** The live Infino-backed indices naming each table, as one cluster metadata holds them. */
     private record Naming(Metadata metadata, Map<String, List<IndexMetadata>> byTable) {}
@@ -304,16 +309,20 @@ public final class InfinoTables {
         Naming known = naming;
         claim(table, md, known == null ? Map.of() : known.byTable());
         long version = md.getMappingVersion();
+        forgetOver(InfinoNative.opens());
         Long last = declared.get(table);
         if (last != null && last == version) {
             return table;
         }
         synchronized (this) {
+            // Declaring opens the connection if none is open, which counts as one more.
+            InfinoNative.init();
+            forgetOver(InfinoNative.opens());
             last = declared.get(table);
             if (last != null && last == version) {
                 return table;
             }
-            InfinoNative.ensureTable(table, tableMapping(md), defaultBm25(md.getSettings()));
+            InfinoNative.ensureTable(table, tableMapping(md), defaultBm25(md.getSettings()), InfinoPlugin.INFINO_ATTACHED.get(md.getSettings()));
             declared.put(table, version);
             log.info("[infino] table {} declared from mapping version {} of {}", table, version, md.getIndex().getName());
         }
@@ -332,12 +341,15 @@ public final class InfinoTables {
     /**
      * The mapping a table is declared from: the index's, and for an index in
      * default mode the columns its engine writes beside the documents' fields
-     * (a row's routing value, the sequence numbers it is stamped and was
-     * written with, and their generation), declared so that every batch is
-     * converted against declared columns rather than typed from its
-     * documents. An edge index's table declares its edge columns as the
-     * engine's graph walks read them, whatever the mapping says of them: the
-     * tables as strings, the ids as the engine's id type.
+     * (a row's routing value, the operation that wrote it, and its
+     * generation), declared so that every batch is converted against
+     * declared columns rather than typed from its documents. They are
+     * declared apart from the fields ({@link #ENGINE_COLUMNS}): a field of
+     * the same name keeps a column of its own, as a field named like the
+     * sequence number column every table has does. An edge index's table
+     * declares its edge columns as the engine's graph walks read them,
+     * whatever the mapping says of them: the tables as strings, the ids as
+     * the engine's id type.
      */
     @SuppressWarnings("unchecked")
     private static String tableMapping(IndexMetadata md) {
@@ -352,18 +364,19 @@ public final class InfinoTables {
         if (declared instanceof Map<?, ?> m) {
             properties.putAll((Map<String, Object>) m);
         }
-        if (stamped) {
-            properties.put(InfinoQueryTranslator.ROUTING, Map.of(TYPE, KEYWORD));
-            properties.put(InfinoQueryTranslator.SEQ, Map.of(TYPE, LONG));
-            properties.put(InfinoQueryTranslator.OP, Map.of(TYPE, LONG));
-            properties.put(InfinoQueryTranslator.GEN, Map.of(TYPE, LONG));
-        }
         if (edges) {
             EDGE_TABLES.forEach(column -> properties.put(column, Map.of(TYPE, KEYWORD)));
             EDGE_IDS.forEach(column -> properties.put(column, Map.of(TYPE, ENGINE_ID)));
         }
         Map<String, Object> table = new LinkedHashMap<>();
         table.put(PROPERTIES, properties);
+        if (stamped) {
+            Map<String, Object> engine = new LinkedHashMap<>();
+            engine.put(InfinoQueryTranslator.ROUTING, Map.of(TYPE, KEYWORD));
+            engine.put(InfinoQueryTranslator.OP, Map.of(TYPE, LONG));
+            engine.put(InfinoQueryTranslator.GEN, Map.of(TYPE, LONG));
+            table.put(ENGINE_COLUMNS, engine);
+        }
         // A data stream's timestamp field, which the bridge requires of each document.
         Object stream = mapping == null ? null : mapping.sourceAsMap().get(DataStreamFieldMapper.NAME);
         if (stream != null) {
@@ -375,6 +388,36 @@ public final class InfinoTables {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    /**
+     * Forget every declaration made over a connection other than the
+     * {@code opens}-th: the connection holds what a table was declared
+     * with, an attached table's view among it, and a new one (another
+     * account, new credentials) holds none, so each table is declared again
+     * on its next use.
+     */
+    void forgetOver(long opens) {
+        if (declaredOver == opens) {
+            return;
+        }
+        synchronized (this) {
+            if (declaredOver != opens) {
+                declared.clear();
+                declaredOver = opens;
+            }
+        }
+    }
+
+    /** Note the table as declared from mapping {@code version}, as {@link #ensure} does once it has declared it; for tests. */
+    void declaredForTest(String table, long version) {
+        declared.put(table, version);
+    }
+
+    /** Whether the table is declared from mapping {@code version} over the current connection. */
+    boolean declaredAt(String table, long version) {
+        Long last = declared.get(table);
+        return last != null && last == version;
     }
 
     /** The table is gone; a later index under the same name declares afresh. */
