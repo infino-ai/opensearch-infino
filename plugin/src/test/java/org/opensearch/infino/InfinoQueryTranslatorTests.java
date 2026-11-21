@@ -220,6 +220,51 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertTrue(collapsed, collapsed.startsWith("SELECT osid, source, "));
     }
 
+    /** {@code t} over {@code sorts} then the row id, as a request's plan orders it. */
+    private static InfinoSearch.Plan sortedPlan(Translation t, java.util.List<InfinoSearch.SortSpec> sorts) {
+        java.util.List<InfinoSearch.SortSpec> all = new java.util.ArrayList<>(sorts);
+        all.add(InfinoSearch.SortSpec.rowId());
+        return new InfinoSearch.Plan(TABLE, columns(), t, all, null, null, null, null, java.util.List.of(), InfinoAccess.NONE, NOW);
+    }
+
+    public void testASortedPageTheRangeIndexPicksReadsItsSourcesInItsStatement() {
+        org.opensearch.search.sort.SortOrder desc = org.opensearch.search.sort.SortOrder.DESC;
+        InfinoSearch.Keyset whole = InfinoSearch.Keyset.WHOLE;
+        // A numeric or date column then the row id: the range index picks the
+        // page's rows, and the engine reads the sources of those rows alone.
+        InfinoSearch.Plan plan = sortedPlan(translate(QueryBuilders.matchAllQuery()), statusSort(desc, null));
+        assertTrue(InfinoSearch.sourceInSortedStatement(plan, 10, whole));
+        String sql = InfinoSearch.hitStatement(plan, 10, false, whole, 10_000, true);
+        assertTrue(sql, sql.startsWith("SELECT osid, source, \"status\" AS \"status\", \"_id\" AS \"_id\" FROM \"os_logs_0\" WHERE 1=1 ORDER BY "));
+        // A page whose hits need no source selects none.
+        String bare = InfinoSearch.hitStatement(plan, 10, false, whole, 10_000, false);
+        assertFalse(bare, bare.contains("source"));
+        java.util.List<InfinoSearch.SortSpec> byTime = java.util.List.of(InfinoSearch.SortSpec.of(columns().get("@timestamp"), false));
+        assertTrue(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.termQuery("level", "error")), byTime), 10, whole));
+        // Plain words are checked on the table's rows; a phrase reads the token index, every match of it.
+        assertTrue(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchQuery("message", "error timeout")), byTime), 10, whole));
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchPhraseQuery("message", "error timeout")), byTime), 10, whole));
+        // A keyword column has no range index; a missing value or missing first is not the column's own order.
+        java.util.List<InfinoSearch.SortSpec> byLevel = java.util.List.of(InfinoSearch.SortSpec.of(columns().get("level"), false));
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchAllQuery()), byLevel), 10, whole));
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchAllQuery()), statusSort(desc, "_first")), 10, whole));
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchAllQuery()), statusSort(desc, 0)), 10, whole));
+        // A deep page reads its rows first and the returned ones' sources by id.
+        assertFalse(InfinoSearch.sourceInSortedStatement(plan, InfinoSearch.SORTED_SOURCE_ROWS + 1, whole));
+        String deep = InfinoSearch.hitStatement(plan, InfinoSearch.SORTED_SOURCE_ROWS + 1, false, whole, 10_000, true);
+        assertFalse(deep, deep.contains("source"));
+        // After a search_after value the present rows are the range index's; the missing ones are in none.
+        InfinoSearch.Plan after = afterPlan(new Object[] { 404, "7" }, null);
+        assertTrue(InfinoSearch.sourceInSortedStatement(after, 10, InfinoSearch.Keyset.PRESENT));
+        assertFalse(InfinoSearch.sourceInSortedStatement(after, 10, InfinoSearch.Keyset.MISSING));
+        String missing = InfinoSearch.hitStatement(after, 10, false, InfinoSearch.Keyset.MISSING, 10_000, true);
+        assertFalse(missing, missing.contains("source"));
+        // After a missing value the keyset is read whole, among the rows missing it.
+        assertFalse(InfinoSearch.sourceInSortedStatement(afterPlan(new Object[] { null, "7" }, null), 10, whole));
+        // A collapse's statement reads its sources as before.
+        assertFalse(InfinoSearch.sourceInSortedStatement(afterPlan(null, columns().get("level")), 10, whole));
+    }
+
     /** The sorts of a request sorted on {@code status} in {@code order}, with {@code missing} (null for none). */
     private static java.util.List<InfinoSearch.SortSpec> statusSort(org.opensearch.search.sort.SortOrder order, Object missing) {
         org.opensearch.search.sort.FieldSortBuilder sort = org.opensearch.search.sort.SortBuilders.fieldSort("status").order(order);

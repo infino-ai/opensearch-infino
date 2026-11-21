@@ -1,0 +1,86 @@
+---
+"A sorted page carries each hit's own source, read in its statement or by id":
+  # A page sorted on a numeric field reads its sources in its hit statement;
+  # the rows missing the sort's value are read by id. A search_after page that
+  # ends among the present values and continues into the missing ones joins
+  # both, and every hit carries its own source.
+  - do:
+      indices.create:
+        index: sps
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              k: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: sps
+        body:
+          - index: { _id: "p1" }
+          - { n: 5, k: "p1" }
+          - index: { _id: "p2" }
+          - { n: 4, k: "p2" }
+          - index: { _id: "p3" }
+          - { n: 3, k: "p3" }
+          - index: { _id: "p4" }
+          - { n: 2, k: "p4" }
+          - index: { _id: "m1" }
+          - { k: "m1" }
+          - index: { _id: "m2" }
+          - { k: "m2" }
+  - match: { errors: false }
+
+  - do:
+      search:
+        index: sps
+        body:
+          size: 3
+          sort: [ { n: desc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p1" }
+  - match: { hits.hits.0._source: { n: 5, k: "p1" } }
+  - match: { hits.hits.1._source: { n: 4, k: "p2" } }
+  - match: { hits.hits.2._id: "p3" }
+  - match: { hits.hits.2._source: { n: 3, k: "p3" } }
+  - set: { hits.hits.2.sort: after }
+
+  - do:
+      search:
+        index: sps
+        body:
+          size: 3
+          sort: [ { n: desc } ]
+          search_after: $after
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p4" }
+  - match: { hits.hits.0._source: { n: 2, k: "p4" } }
+  - match: { hits.hits.1._id: "m1" }
+  - match: { hits.hits.1._source: { k: "m1" } }
+  - match: { hits.hits.2._id: "m2" }
+  - match: { hits.hits.2._source: { k: "m2" } }
+
+  # A page that returns no source reads none; includes keep their fields.
+  - do:
+      search:
+        index: sps
+        body:
+          size: 2
+          _source: false
+          sort: [ { n: asc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p4" }
+  - is_false: hits.hits.0._source
+  - do:
+      search:
+        index: sps
+        body:
+          size: 2
+          _source: { includes: [ "k" ] }
+          seq_no_primary_term: true
+          sort: [ { n: asc } ]
+  - match: { hits.hits.0._id: "p4" }
+  - match: { hits.hits.0._source: { k: "p4" } }
+  - is_true: hits.hits.0._primary_term
+  - match: { hits.hits.1._source: { k: "p3" } }
