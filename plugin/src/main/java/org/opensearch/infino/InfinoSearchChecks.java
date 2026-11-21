@@ -48,6 +48,10 @@ final class InfinoSearchChecks {
 
     /** Refuse {@code source} over {@code indices} as a shard of each would. */
     static void check(SearchSourceBuilder source, List<IndexMetadata> indices, boolean allowExpensive) {
+        // The one check a search with no source can fail: it lists documents over every time there is.
+        for (IndexMetadata index : indices) {
+            InfinoSearchWindow.check(source, index, System::currentTimeMillis);
+        }
         if (source == null) {
             return;
         }
@@ -154,7 +158,7 @@ final class InfinoSearchChecks {
     }
 
     /** The queries a compound query holds. */
-    private static List<QueryBuilder> inner(QueryBuilder qb) {
+    static List<QueryBuilder> inner(QueryBuilder qb) {
         if (qb instanceof BoolQueryBuilder b) {
             List<QueryBuilder> all = new ArrayList<>(b.must());
             all.addAll(b.filter());
@@ -188,13 +192,13 @@ final class InfinoSearchChecks {
     }
 
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> properties(MappingMetadata mapping) {
+    static Map<String, Object> properties(MappingMetadata mapping) {
         Object properties = mapping == null ? null : mapping.sourceAsMap().get("properties");
         return properties instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
     }
 
     /** A field's mapping by its full name, through objects and multi-fields, an alias followed; null when it is not mapped. */
-    private static Map<String, Object> field(Map<String, Object> properties, String name) {
+    static Map<String, Object> field(Map<String, Object> properties, String name) {
         Map<String, Object> field = lookup(properties, name);
         if (field != null && "alias".equals(field.get("type")) && field.get("path") instanceof String path) {
             return lookup(properties, path);
