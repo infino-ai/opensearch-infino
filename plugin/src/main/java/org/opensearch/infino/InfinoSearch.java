@@ -389,8 +389,16 @@ public final class InfinoSearch {
         }
     }
 
-    /** The hits and total of one index, before the response is assembled. */
-    record Page(List<SearchHit> hits, long total, boolean exact, float maxScore) {}
+    /**
+     * The hits and total of one index, before the response is assembled. The
+     * first {@code unsourced} hits sit before the caller's window and carry no
+     * source (see {@link #page(Index, Plan, SearchSourceBuilder, boolean, boolean, boolean, int)}).
+     */
+    record Page(List<SearchHit> hits, long total, boolean exact, float maxScore, int unsourced) {
+        Page(List<SearchHit> hits, long total, boolean exact, float maxScore) {
+            this(hits, total, exact, maxScore, 0);
+        }
+    }
 
     // ---- plan ----
 
@@ -766,7 +774,8 @@ public final class InfinoSearch {
         SearchSourceBuilder source,
         int fetch,
         boolean seqNoAndPrimaryTerm,
-        boolean resumed
+        boolean resumed,
+        int sourceFrom
     ) {
         if (readsUnsorted(plan, resumed)) {
             return InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm, wantsSource(source)));
@@ -796,8 +805,8 @@ public final class InfinoSearch {
                 }
             }
         }
-        if (sourcesById(plan) && wantsSource(source)) {
-            rows = withSources(plan.table(), rows, fetch);
+        if (readsSourcesById(plan, source, resumed)) {
+            rows = withSources(plan.table(), rows, sourceFrom, fetch);
         }
         return rows;
     }
@@ -823,9 +832,21 @@ public final class InfinoSearch {
      * when that sort orders nothing ({@link #sortsNothing}).
      */
     static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count, boolean capTotal, boolean resumed) {
+        return page(index, plan, source, count, capTotal, resumed, 0);
+    }
+
+    /**
+     * As {@link #page(Index, Plan, SearchSourceBuilder, boolean, boolean, boolean)}.
+     * A caller whose window starts at {@code sourceFrom} (one index's or one
+     * shard's search) never shows the hits before it, so when the sources are
+     * read by id those hits come without one ({@link Page#unsourced}).
+     */
+    static Page page(Index index, Plan plan, SearchSourceBuilder source, boolean count, boolean capTotal, boolean resumed, int sourceFrom) {
         final int from = Math.max(0, source.from());
         final int size = source.size() < 0 ? DEFAULT_SIZE : source.size();
         final int fetch = from + size;
+        // The rows before the caller's window, whose sources are not read.
+        final int unsourcedRows = readsSourcesById(plan, source, resumed) ? Math.min(Math.max(0, sourceFrom), from) : 0;
         final Translation q = plan.query();
         List<Map<String, Object>> rows;
         boolean knnDistance = false;
@@ -897,7 +918,7 @@ public final class InfinoSearch {
                 CountedRows read = countedRows(
                     firstCount,
                     () -> total(plan, cap),
-                    () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed)
+                    () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed, unsourcedRows)
                 );
                 rows = read.rows();
                 counted = read.total();
@@ -940,11 +961,15 @@ public final class InfinoSearch {
         // Every row up to the window's end: the window itself is applied once,
         // over the merged pages, as a coordinator applies it over its shards.
         int end = Math.min(rows.size(), fetch);
+        int unsourced = 0;
         for (int i = 0; i < end; i++) {
             Map<String, Object> row = rows.get(i);
             Object id = row.get(InfinoQueryTranslator.OSID);
             if (id == null) {
                 continue;
+            }
+            if (i < unsourcedRows) {
+                unsourced++;
             }
             SearchHit h = new SearchHit(i, id.toString(), Map.of(), Map.of());
             h.shard(target);
@@ -983,7 +1008,7 @@ public final class InfinoSearch {
                 );
                 h.setPrimaryTerm(InfinoDocumentVersion.PRIMARY_TERM);
             }
-            if (withSource || !docValueFields.isEmpty() || !fetchFields.isEmpty()) {
+            if (i >= unsourcedRows && (withSource || !docValueFields.isEmpty() || !fetchFields.isEmpty())) {
                 String src = String.valueOf(row.get(InfinoQueryTranslator.SOURCE));
                 // The source as the user may see it: hidden fields gone, masked values hashed.
                 src = plan.access().read(id.toString(), src);
@@ -1021,7 +1046,7 @@ public final class InfinoSearch {
             }
             hits.add(h);
         }
-        return new Page(hits, total, exact || plan.vector() != null, maxScore);
+        return new Page(hits, total, exact || plan.vector() != null, maxScore, unsourced);
     }
 
     /**
@@ -1081,6 +1106,11 @@ public final class InfinoSearch {
         return !plan.sorts().isEmpty() && plan.collapse() == null;
     }
 
+    /** Whether {@link #hitRows} reads this page's sources by id ({@link #sourcesById}) after its rows. */
+    private static boolean readsSourcesById(Plan plan, SearchSourceBuilder source, boolean resumed) {
+        return plan.vector() == null && !readsUnsorted(plan, resumed) && sourcesById(plan) && wantsSource(source);
+    }
+
     /** Whether a hit's response carries its source. */
     private static boolean returnsSource(SearchSourceBuilder source) {
         if (source.fetchSource() != null) {
@@ -1099,9 +1129,25 @@ public final class InfinoSearch {
         return returnsSource(source) || !requestedFields(source.docValueFields(), source.fetchFields()).isEmpty();
     }
 
-    /** {@code rows} up to {@code fetch}, each with its source from the table, looked up by its id. */
-    private static List<Map<String, Object>> withSources(String table, List<Map<String, Object>> rows, int fetch) {
-        List<Map<String, Object>> page = rows.subList(0, Math.min(rows.size(), fetch));
+    /**
+     * {@code rows} up to {@code fetch}, those from {@code sourceFrom} on each
+     * with its source from the table, looked up by its id; the rows before it
+     * stay as they are.
+     */
+    private static List<Map<String, Object>> withSources(String table, List<Map<String, Object>> rows, int sourceFrom, int fetch) {
+        return withSources(rows, sourceFrom, fetch, ids -> InfinoNative.sources(table, ids));
+    }
+
+    /** As {@link #withSources(String, List, int, int)}, with the sources read by {@code lookup}. */
+    static List<Map<String, Object>> withSources(
+        List<Map<String, Object>> rows,
+        int sourceFrom,
+        int fetch,
+        Function<List<String>, Map<String, String>> lookup
+    ) {
+        int end = Math.min(rows.size(), fetch);
+        int start = Math.min(Math.max(0, sourceFrom), end);
+        List<Map<String, Object>> page = rows.subList(start, end);
         List<String> ids = new ArrayList<>(page.size());
         for (Map<String, Object> row : page) {
             Object id = row.get(InfinoQueryTranslator.OSID);
@@ -1109,8 +1155,8 @@ public final class InfinoSearch {
                 ids.add(id.toString());
             }
         }
-        Map<String, String> sources = InfinoNative.sources(table, ids);
-        List<Map<String, Object>> out = new ArrayList<>(page.size());
+        Map<String, String> sources = ids.isEmpty() ? Map.of() : lookup.apply(ids);
+        List<Map<String, Object>> out = new ArrayList<>(rows.subList(0, start));
         for (Map<String, Object> row : page) {
             Map<String, Object> withSource = new HashMap<>(row);
             Object id = row.get(InfinoQueryTranslator.OSID);
@@ -1942,7 +1988,9 @@ public final class InfinoSearch {
             // full: a capped one would undercount it (top_hits' total, a
             // significant_terms subset size). A scroll's next page resumes
             // from this one's last hits (the cursor below).
-            Page page = page(index, plan, perIndex, !countWithAggs, scrollId == null && !sharedTotal, after != null);
+            // One index's window is cut from its own page (merge): the hits before it need no source.
+            int sourceFrom = indices.size() == 1 ? Math.max(0, perIndex.from()) : 0;
+            Page page = page(index, plan, perIndex, !countWithAggs, scrollId == null && !sharedTotal, after != null, sourceFrom);
             if (!builders.isEmpty()) {
                 InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(index).evaluate(
                     builders,
@@ -1951,7 +1999,7 @@ public final class InfinoSearch {
                 );
                 aggs.add(counted.aggregations());
                 if (countWithAggs) {
-                    page = new Page(page.hits(), counted.total(), page.exact(), page.maxScore());
+                    page = new Page(page.hits(), counted.total(), page.exact(), page.maxScore(), page.unsourced());
                 }
             }
             pages.add(page);
