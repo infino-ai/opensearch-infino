@@ -215,45 +215,282 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
         return run(parent, new SearchSourceBuilder()).foregrounds();
     }
 
-    /** 2 parents times 50,000 terms is 100,000 rows, the bound: one statement reads both foregrounds. */
+    /**
+     * 2 parents times 50,000 terms, each in one document: every bound ties
+     * every score, so the fenced read proves no bucket, and both are read in
+     * full in one statement, 100,000 rows, the bound.
+     */
     public void testAtTheBoundBothBucketsAreReadInOneStatement() {
         List<String> read = wideForegrounds(50_000);
-        assertEquals(read.toString(), 1, read.size());
-        assertTrue(read.get(0), read.get(0).contains("AS p0"));
+        assertEquals(read.toString(), 2, read.size());
+        assertTrue(read.get(0), read.get(0).contains("ROW_NUMBER()"));
+        assertTrue(read.get(1), read.get(1).contains("AS p0"));
+        assertFalse(read.get(1), read.get(1).contains("ROW_NUMBER()"));
     }
 
-    /** 2 parents times 50,001 terms is past it: after the batched read, each bucket reads its own. */
+    /** 2 parents times 50,001 terms is past it: after the fenced and the full read, each bucket reads its own. */
     public void testPastTheBoundEachBucketIsReadOnItsOwn() {
         List<String> read = wideForegrounds(50_001);
-        assertEquals(read.toString(), 3, read.size());
-        assertTrue(read.get(0), read.get(0).contains("AS p0"));
-        for (String s : read.subList(1, 3)) {
+        assertEquals(read.toString(), 4, read.size());
+        assertTrue(read.get(0), read.get(0).contains("ROW_NUMBER()"));
+        assertTrue(read.get(1), read.get(1).contains("AS p0"));
+        for (String s : read.subList(2, 4)) {
             assertFalse(s, s.contains("AS p0"));
         }
     }
 
     /**
      * The shape of big5's terms-significant-2: 7 parents (process.name), each
-     * with 800 values of the significant field (log_stream). Every term of
-     * every bucket comes back, 5,600 rows where a cut by count returned 7 x 25
-     * = 175, and that is still one statement.
+     * with all 800 values of the significant field (log_stream). 30 values
+     * are each one parent's own, more frequent there; the rest are as common
+     * in every parent and score 0. Each bucket's 51 best bounds come back,
+     * 357 rows where every term was 5,600, and the 51st bound (0) is below
+     * the 25th score, so no bucket is read again.
      */
-    public void testBig5ShapeIsOneStatementOfEveryTerm() {
-        List<String[]> docs = new ArrayList<>();
+    public void testBig5ShapeReadsOnlyEachBucketsBestBounds() {
+        List<Object[]> docs = new ArrayList<>();
         for (int p = 0; p < 7; p++) {
             for (int i = 0; i < 800; i++) {
-                docs.add(new String[] { "p" + p, "s" + i });
+                int home = i / 30;
+                int n = home == p ? 2 + i % 30 : 1;
+                for (int d = 0; d < n; d++) {
+                    docs.add(new Object[] { "p" + p, "s" + i });
+                }
             }
         }
-        index(docs);
-        AggregationBuilder parent = AggregationBuilders.terms("p").field("p").size(10).subAggregation(AggregationBuilders.significantTerms("sig").field("tag"));
-        List<String> read = run(parent, new SearchSourceBuilder()).foregrounds();
-        assertEquals(read.toString(), 1, read.size());
-        String logged = read.get(0);
+        indexDocs(docs, "tag");
+        Run r = run(parentOver("tag", 10, 25), new SearchSourceBuilder());
+        assertEquals(r.foregrounds().toString(), 1, r.foregrounds().size());
+        String logged = r.foregrounds().get(0);
+        assertTrue(logged, logged.contains("ROW_NUMBER()"));
         String sql = logged.substring("[infino] sql: ".length(), logged.lastIndexOf(" -> "));
-        int rows = InfinoNative.sqlRows(sql).size();
-        logger.info("big5-shaped significant_terms foreground: {} rows in one statement", rows);
-        assertEquals(5_600, rows);
+        assertEquals(7 * 51, InfinoNative.sqlRows(sql).size());
+        assertEquals(bruteBest(docs, 25, java.util.Set.of("p0", "p1", "p2", "p3", "p4", "p5", "p6")), shardBest(r));
+    }
+
+    /**
+     * Bucket a's 60 terms are each in one of its documents and nowhere else,
+     * so every bound equals every score: the 51st bound is not below the
+     * 25th score, and a is read in full. Bucket b's terms have counts 1 to
+     * 50: its 51st bound is below its 25th score, and it is not read again.
+     * Both keep the best by score over every term.
+     */
+    public void testABucketWhoseFenceIsNotBelowItsKeptScoreIsReadInFull() {
+        List<Object[]> docs = new ArrayList<>();
+        for (int i = 0; i < 60; i++) {
+            docs.add(new Object[] { "a", "a" + i });
+        }
+        for (int i = 0; i < 200; i++) {
+            for (int d = 0; d <= i % 50; d++) {
+                docs.add(new Object[] { "b", "b" + i });
+            }
+        }
+        indexDocs(docs, "tag");
+        Run r = run(parentOver("tag", 10, 25), new SearchSourceBuilder());
+        assertEquals(r.foregrounds().toString(), 2, r.foregrounds().size());
+        assertTrue(r.foregrounds().get(0), r.foregrounds().get(0).contains("ROW_NUMBER()"));
+        String full = r.foregrounds().get(1);
+        assertFalse(full, full.contains("ROW_NUMBER()"));
+        assertTrue(full, full.contains("= 'a'"));
+        assertFalse(full, full.contains("= 'b'"));
+        assertEquals(bruteBest(docs, 25, java.util.Set.of("a", "b")), shardBest(r));
+    }
+
+    /** The bound-ordered foreground's statement, as built. */
+    public void testFencedForegroundSql() {
+        assertEquals(51, InfinoAggregationProcessor.fenceRows(25));
+        String p = "(CAST(doc_count AS DOUBLE) / CAST(ptotal AS DOUBLE))";
+        String q = "(CAST(ktotal AS DOUBLE) / CAST(1000 AS DOUBLE))";
+        String jlh = "CASE WHEN (" + p + " - " + q + ") > 0.0 THEN (" + p + " - " + q + ") * (" + p + " / " + q + ") ELSE 0.0 END";
+        assertEquals(jlh, InfinoAggregationProcessor.jlhScoreSql("doc_count", "ptotal", "ktotal", 1000));
+        assertEquals(
+            "SELECT * FROM (SELECT b.*, ROW_NUMBER() OVER (PARTITION BY p0 ORDER BY k0 IS NULL, ub DESC, k0) AS rn FROM (SELECT t.*, "
+                + jlh
+                + " AS ub FROM (SELECT g.*, SUM(doc_count) OVER (PARTITION BY p0) AS ptotal, SUM(doc_count) OVER (PARTITION BY k0) AS ktotal FROM ("
+                + "SELECT \"p\" AS p0, (\"tag\") AS k0, COUNT(*) AS doc_count FROM \"t\" WHERE (x > 1) AND (\"p\" = 'a') GROUP BY 1, 2) g) t) b)"
+                + " WHERE rn <= 5 ORDER BY p0, rn",
+            InfinoAggregationProcessor.fencedForegroundSql(List.of("\"p\""), "(\"tag\")", "\"t\"", "x > 1", "(\"p\" = 'a')", 1000, 5)
+        );
+    }
+
+    /** The engine's JLH from jlhScoreSql is Java's to the bit, over random counts. */
+    public void testJlhInSqlIsJavasToTheBit() {
+        JLHScore jlh = new JLHScore();
+        for (int round = 0; round < 5; round++) {
+            long supersetSize = randomFrom(1L, 31L, randomLongBetween(2, 1_000), randomLongBetween(1_000, 1L << 40));
+            List<long[]> cases = new ArrayList<>();
+            StringBuilder values = new StringBuilder();
+            for (int i = 0; i < 300; i++) {
+                long subsetSize = randomLongBetween(1, supersetSize);
+                long subsetDf = randomLongBetween(1, subsetSize);
+                // Half near the subset's share, where the score is near 0 or 0.
+                long near = (long) Math.floor((double) subsetDf / subsetSize * supersetSize) + randomLongBetween(-1, 1);
+                long supersetDf = randomBoolean() ? randomLongBetween(subsetDf, supersetSize) : Math.min(supersetSize, Math.max(subsetDf, near));
+                cases.add(new long[] { subsetDf, subsetSize, supersetDf });
+                values.append(i == 0 ? "" : ", ").append("(").append(subsetDf).append(", ").append(subsetSize).append(", ").append(supersetDf).append(")");
+            }
+            List<Map<String, Object>> rows = InfinoNative.sqlRows(
+                "SELECT column1 AS a, column2 AS b, column3 AS c, "
+                    + InfinoAggregationProcessor.jlhScoreSql("column1", "column2", "column3", supersetSize)
+                    + " AS ub FROM (VALUES "
+                    + values
+                    + ")"
+            );
+            assertEquals(cases.size(), rows.size());
+            for (Map<String, Object> row : rows) {
+                long a = ((Number) row.get("a")).longValue(), b = ((Number) row.get("b")).longValue(), c = ((Number) row.get("c")).longValue();
+                double want = jlh.getScore(a, b, c, supersetSize);
+                double got = ((Number) row.get("ub")).doubleValue();
+                assertEquals(a + "/" + b + " vs " + c + "/" + supersetSize + ": " + got + " vs " + want, Double.doubleToLongBits(want), Double.doubleToLongBits(got));
+            }
+        }
+    }
+
+    /**
+     * Random parents and terms, the counts from a narrow range so bounds and
+     * scores often tie, some documents without a parent or a term, the
+     * parent level keeping all its buckets or fewer, string terms (whose
+     * background is the table's value counts) or numbers (whose counts are
+     * statements): each kept bucket keeps the best by score over every term,
+     * in order, with the same counts. Several rounds over fresh tables.
+     */
+    public void testRandomFencedForegroundsKeepTheBestByScore() {
+        for (int round = 0; round < 6; round++) {
+            InfinoNative.dropTable(TABLE);
+            InfinoNative.ensureTable(TABLE, "{\"properties\":{\"p\":{\"type\":\"keyword\"},\"tag\":{\"type\":\"keyword\"},\"code\":{\"type\":\"long\"}}}");
+            boolean strings = randomBoolean();
+            int parents = between(1, 5);
+            int keep = between(1, 6);
+            int maxCount = between(1, 4);
+            List<Object[]> docs = new ArrayList<>();
+            for (int p = 0; p < parents; p++) {
+                int terms = between(0, 80);
+                for (int t = 0; t < terms; t++) {
+                    long code = between(0, 120);
+                    int n = between(1, maxCount);
+                    for (int d = 0; d < n; d++) {
+                        docs.add(new Object[] { "p" + p, strings ? (Object) ("t" + code) : (Object) code });
+                    }
+                }
+                for (int d = between(0, 3); d > 0; d--) {
+                    docs.add(new Object[] { "p" + p, null });
+                }
+            }
+            for (int d = between(0, 40); d > 0; d--) {
+                long code = between(0, 120);
+                docs.add(new Object[] { null, strings ? (Object) ("t" + code) : (Object) code });
+            }
+            if (docs.isEmpty()) {
+                continue;
+            }
+            indexDocs(docs, strings ? "tag" : "code");
+            int parentSize = between(1, parents + 1);
+            Run r = run(parentOver(strings ? "tag" : "code", parentSize, keep), new SearchSourceBuilder());
+            Map<String, List<String>> got = shardBest(r);
+            java.util.Set<String> withParent = new TreeSet<>();
+            for (Object[] d : docs) {
+                if (d[0] != null) {
+                    withParent.add((String) d[0]);
+                }
+            }
+            assertEquals("round " + round, Math.min(parentSize, withParent.size()), got.size());
+            assertEquals("round " + round, bruteBest(docs, keep, got.keySet()), got);
+        }
+    }
+
+    /** A terms parent over p, keeping {@code parents} buckets, over significant {@code field} keeping {@code keep} terms. */
+    private static AggregationBuilder parentOver(String field, int parents, int keep) {
+        return AggregationBuilders.terms("p")
+            .field("p")
+            .size(parents)
+            .shardSize(parents)
+            .subAggregation(AggregationBuilders.significantTerms("sig").field(field).size(keep).shardSize(keep).minDocCount(1));
+    }
+
+    /** Index one document per (p, term) pair, either may be null, the term into {@code field}. */
+    private static void indexDocs(List<Object[]> docs, String field) {
+        String[] ids = new String[docs.size()];
+        String[] sources = new String[docs.size()];
+        for (int i = 0; i < docs.size(); i++) {
+            ids[i] = Integer.toString(i);
+            List<String> fields = new ArrayList<>();
+            if (docs.get(i)[0] != null) {
+                fields.add("\"p\":\"" + docs.get(i)[0] + "\"");
+            }
+            Object term = docs.get(i)[1];
+            if (term != null) {
+                fields.add("\"" + field + "\":" + (term instanceof String ? "\"" + term + "\"" : term.toString()));
+            }
+            sources[i] = "{" + String.join(",", fields) + "}";
+        }
+        assertEquals(docs.size(), InfinoNative.indexBatch(TABLE, ids, sources, ids.length).ok());
+    }
+
+    /**
+     * Each kept bucket's significant terms, as the shard returns them, best
+     * first: key, count in the bucket, count in the background.
+     */
+    private static Map<String, List<String>> shardBest(Run r) {
+        Map<String, List<String>> out = new java.util.TreeMap<>();
+        for (StringTerms.Bucket b : ((StringTerms) r.result()).getBuckets()) {
+            List<String> terms = new ArrayList<>();
+            SignificantTerms sig = b.getAggregations().get("sig");
+            for (SignificantTerms.Bucket c : sig.getBuckets()) {
+                assertEquals(b.getDocCount(), c.getSubsetSize());
+                terms.add(c.getKeyAsString() + ":" + c.getSubsetDf() + ":" + c.getSupersetDf());
+            }
+            out.put(b.getKeyAsString(), terms);
+        }
+        return out;
+    }
+
+    /**
+     * Each of {@code parents}' best terms worked out here from the documents,
+     * as {@link #shardBest} prints them: every term of the bucket scored by
+     * JLH against the whole table, best first, ties by key (strings by
+     * bytes, numbers by value), the first {@code keep}.
+     */
+    private static Map<String, List<String>> bruteBest(List<Object[]> docs, int keep, java.util.Set<String> parents) {
+        Map<Object, Long> background = new java.util.HashMap<>();
+        Map<String, Long> sizes = new java.util.HashMap<>();
+        Map<String, Map<Object, Long>> counts = new java.util.HashMap<>();
+        for (Object[] d : docs) {
+            if (d[1] != null) {
+                background.merge(d[1], 1L, Long::sum);
+            }
+            if (d[0] != null) {
+                sizes.merge((String) d[0], 1L, Long::sum);
+                if (d[1] != null) {
+                    counts.computeIfAbsent((String) d[0], k -> new java.util.HashMap<>()).merge(d[1], 1L, Long::sum);
+                }
+            }
+        }
+        JLHScore jlh = new JLHScore();
+        Map<String, List<String>> out = new java.util.TreeMap<>();
+        for (Map.Entry<String, Long> parent : sizes.entrySet()) {
+            if (!parents.contains(parent.getKey())) {
+                continue;
+            }
+            List<Map.Entry<Object, Long>> terms = new ArrayList<>(counts.getOrDefault(parent.getKey(), Map.of()).entrySet());
+            long size = parent.getValue();
+            java.util.function.ToDoubleFunction<Map.Entry<Object, Long>> score = e -> jlh.getScore(e.getValue(), size, background.get(e.getKey()), docs.size());
+            terms.sort((x, y) -> {
+                int byScore = Double.compare(score.applyAsDouble(y), score.applyAsDouble(x));
+                if (byScore != 0) {
+                    return byScore;
+                }
+                if (x.getKey() instanceof Long a && y.getKey() instanceof Long b) {
+                    return Long.compare(a, b);
+                }
+                return new org.apache.lucene.util.BytesRef(x.getKey().toString()).compareTo(new org.apache.lucene.util.BytesRef(y.getKey().toString()));
+            });
+            List<String> best = new ArrayList<>();
+            for (Map.Entry<Object, Long> e : terms.subList(0, Math.min(keep, terms.size()))) {
+                best.add(e.getKey() + ":" + e.getValue() + ":" + background.get(e.getKey()));
+            }
+            out.put(parent.getKey(), best);
+        }
+        return out;
     }
 
     /**
