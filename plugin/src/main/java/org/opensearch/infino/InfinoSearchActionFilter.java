@@ -11,7 +11,6 @@ import org.opensearch.action.search.SearchAction;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.ShardSearchFailure;
-import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -46,7 +45,7 @@ import java.util.function.Supplier;
  * usual; one mixing both is refused. A scroll request opens a scroll (see
  * {@link InfinoScrolls}) and answers its first page.
  */
-public class InfinoSearchActionFilter implements ActionFilter {
+public class InfinoSearchActionFilter extends InfinoActionFilter {
 
     private static final Logger log = LogManager.getLogger(InfinoSearchActionFilter.class);
     /**
@@ -73,7 +72,7 @@ public class InfinoSearchActionFilter implements ActionFilter {
     }
 
     @Override
-    public <Request extends ActionRequest, Response extends ActionResponse> void apply(
+    protected <Request extends ActionRequest, Response extends ActionResponse> void filter(
         Task task,
         String action,
         Request request,

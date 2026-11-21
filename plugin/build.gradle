@@ -64,6 +64,10 @@ opensearchplugin {
 // target release joins the build.
 sourceSets.main.java.srcDirs += versionMajor >= 3 ? 'src/main/security3' : 'src/main/security2'
 sourceSets.main.java.srcDirs += versionMajor >= 3 ? 'src/main/client3' : 'src/main/client2'
+// The action filters' base: 3.4 and later call a filter with the request's
+// metadata and mark the call without it for removal; earlier releases make
+// only that call.
+sourceSets.main.java.srcDirs += versionMajor > 3 || (versionMajor == 3 && versionMinor >= 4) ? 'src/main/filter34' : 'src/main/filter33'
 
 configurations {
     securityPlugin
@@ -122,6 +126,14 @@ test {
 def defaultLib = file("${projectDir}/../infino-capi/target/release/libinfino_capi.so").absolutePath
 def defaultData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog"
 def defaultUri = "file://${defaultData}"
+// The same Rust build leaves a program that makes a table as one outside the plugin
+// would (infino-capi/src/bin/outside_table.rs); -Dinfino.fixture points elsewhere.
+def defaultFixture = file("${projectDir}/../infino-capi/target/release/outside_table").absolutePath
+interface FixtureRunner {
+    @javax.inject.Inject
+    ExecOperations getExecOps()
+}
+def fixtureRunner = objects.newInstance(FixtureRunner)
 
 // The unit tests that read through the engine load the same bridge; their
 // tables stay in memory (memory://, the default catalog).
@@ -184,7 +196,7 @@ def coreLuceneTask = 'coreYamlRestTestLucene'
 def coreTests = 'org.opensearch.infino.InfinoCoreYamlTestSuiteIT'
 // Each core-denylist.txt entry is `pattern  # [tag] reason`; the file's header
 // says what the tags mean. -Dinfino.core.skip chooses how much each task skips:
-// all (the default), gaps (gaps and cluster failures, so the known bugs run),
+// all (the default), gaps (everything but the known bugs, so those run),
 // or none.
 def coreSkip = System.getProperty('infino.core.skip', 'all')
 // Read and checked when a core task runs, so a malformed line or a wrong
@@ -194,7 +206,7 @@ def coreDenylist = { -> coreDenylistFile.readLines()
     .collect { it.trim() }
     .findAll { it && !it.startsWith('#') }
     .collect { line ->
-        def m = line =~ /^(.+?)\s+#\s*\[(gap|bug|cluster)(?::(default|proxy))?\]\s*\S.*$/
+        def m = line =~ /^(.+?)\s+#\s*\[(gap|by-design|bug|cluster)(?::(default|proxy))?\]\s*\S.*$/
         if (!m.matches() || (m.group(2) == 'cluster' && m.group(3))) {
             throw new GradleException("core-denylist.txt: no [tag] and reason: ${line}")
         }
@@ -213,7 +225,7 @@ def coreDenylistFor = { String mode ->
         if (e.kind == 'cluster') {
             return coreSkip != 'none'
         }
-        mode != 'lucene' && (e.mode == null || e.mode == mode) && (coreSkip == 'all' || (coreSkip == 'gaps' && e.kind == 'gap'))
+        mode != 'lucene' && (e.mode == null || e.mode == mode) && (coreSkip == 'all' || (coreSkip == 'gaps' && e.kind != 'bug'))
     }.collect { e ->
         e.pattern.replaceAll('[\\\\^$.|?+()\\[\\]{},]') { '\\' + it }
     }.unique()
@@ -373,8 +385,16 @@ tasks.named('yamlRestTest').configure {
         excludeTestsMatching replicaTests
         excludeTestsMatching multiNodeTests
     }
+    def catalog = System.getProperty('infino.uri', defaultUri)
+    def fixture = System.getProperty('infino.fixture', defaultFixture)
     doFirst {
         delete layout.buildDirectory.dir('infino-catalog')
+        // Tables made outside the plugin, in the catalog the node will open, for the suite that
+        // attaches indices to them: the node itself only ever makes the plugin's tables. One a
+        // test, so a test that fails with its index still there leaves the other's table free.
+        fixtureRunner.execOps.exec {
+            commandLine fixture, catalog, 'outside_pages', 'outside_pages_templated'
+        }
     }
 }
 

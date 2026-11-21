@@ -1,0 +1,178 @@
+---
+"A date histogram counted from the range index has the same buckets as a Lucene twin, unfiltered and under one range":
+  # A date histogram whose buckets hold only their count, over the plain
+  # table, either unfiltered or under a query that is one range on the same
+  # date column: the plugin counts each bucket as one interval of the column
+  # with count_where, from the range index. The range's bounds fall inside a
+  # bucket, one bucket is empty, a document sits on a bucket's last
+  # millisecond and one has no date. Both indices must give the same buckets.
+  - do:
+      indices.create:
+        index: dhc_inf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: dhc_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              "@timestamp": { type: date }
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        index: dhc_inf
+        body:
+          - index: { _id: "a" }
+          - { "@timestamp": "2026-01-01T09:59:59Z", n: 0 }
+          - index: { _id: "b" }
+          - { "@timestamp": "2026-01-01T10:00:00Z", n: 1 }
+          - index: { _id: "c" }
+          - { "@timestamp": "2026-01-01T10:30:00Z", n: 2 }
+          - index: { _id: "d" }
+          - { "@timestamp": "2026-01-01T10:59:59.999Z", n: 3 }
+          - index: { _id: "e" }
+          - { "@timestamp": "2026-01-01T12:00:00Z", n: 4 }
+          - index: { _id: "f" }
+          - { "@timestamp": "2026-01-01T12:45:00Z", n: 5 }
+          - index: { _id: "g" }
+          - { "@timestamp": "2026-01-01T13:00:00Z", n: 6 }
+          - index: { _id: "h" }
+          - { n: 7 }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: dhc_luc
+        body:
+          - index: { _id: "a" }
+          - { "@timestamp": "2026-01-01T09:59:59Z", n: 0 }
+          - index: { _id: "b" }
+          - { "@timestamp": "2026-01-01T10:00:00Z", n: 1 }
+          - index: { _id: "c" }
+          - { "@timestamp": "2026-01-01T10:30:00Z", n: 2 }
+          - index: { _id: "d" }
+          - { "@timestamp": "2026-01-01T10:59:59.999Z", n: 3 }
+          - index: { _id: "e" }
+          - { "@timestamp": "2026-01-01T12:00:00Z", n: 4 }
+          - index: { _id: "f" }
+          - { "@timestamp": "2026-01-01T12:45:00Z", n: 5 }
+          - index: { _id: "g" }
+          - { "@timestamp": "2026-01-01T13:00:00Z", n: 6 }
+          - index: { _id: "h" }
+          - { n: 7 }
+  - match: { errors: false }
+  - do:
+      search:
+        index: dhc_luc
+        body:
+          size: 0
+          track_total_hits: true
+          aggs:
+            h: { date_histogram: { field: "@timestamp", calendar_interval: hour } }
+  - match: { hits.total.value: 8 }
+  - length: { aggregations.h.buckets: 5 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2026-01-01T09:00:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2026-01-01T10:00:00.000Z" }
+  - match: { aggregations.h.buckets.1.doc_count: 3 }
+  - match: { aggregations.h.buckets.2.key_as_string: "2026-01-01T11:00:00.000Z" }
+  - match: { aggregations.h.buckets.2.doc_count: 0 }
+  - match: { aggregations.h.buckets.3.key_as_string: "2026-01-01T12:00:00.000Z" }
+  - match: { aggregations.h.buckets.3.doc_count: 2 }
+  - match: { aggregations.h.buckets.4.key_as_string: "2026-01-01T13:00:00.000Z" }
+  - match: { aggregations.h.buckets.4.doc_count: 1 }
+  - do:
+      search:
+        index: dhc_inf
+        body:
+          size: 0
+          track_total_hits: true
+          aggs:
+            h: { date_histogram: { field: "@timestamp", calendar_interval: hour } }
+  - match: { hits.total.value: 8 }
+  - length: { aggregations.h.buckets: 5 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2026-01-01T09:00:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2026-01-01T10:00:00.000Z" }
+  - match: { aggregations.h.buckets.1.doc_count: 3 }
+  - match: { aggregations.h.buckets.2.key_as_string: "2026-01-01T11:00:00.000Z" }
+  - match: { aggregations.h.buckets.2.doc_count: 0 }
+  - match: { aggregations.h.buckets.3.key_as_string: "2026-01-01T12:00:00.000Z" }
+  - match: { aggregations.h.buckets.3.doc_count: 2 }
+  - match: { aggregations.h.buckets.4.key_as_string: "2026-01-01T13:00:00.000Z" }
+  - match: { aggregations.h.buckets.4.doc_count: 1 }
+  - do:
+      search:
+        index: dhc_luc
+        body:
+          size: 0
+          track_total_hits: true
+          query: { range: { "@timestamp": { gte: "2026-01-01T10:30:00Z", lt: "2026-01-01T13:00:00Z" } } }
+          aggs:
+            h: { date_histogram: { field: "@timestamp", calendar_interval: hour } }
+  - match: { hits.total.value: 4 }
+  - length: { aggregations.h.buckets: 3 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2026-01-01T10:00:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 2 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2026-01-01T11:00:00.000Z" }
+  - match: { aggregations.h.buckets.1.doc_count: 0 }
+  - match: { aggregations.h.buckets.2.key_as_string: "2026-01-01T12:00:00.000Z" }
+  - match: { aggregations.h.buckets.2.doc_count: 2 }
+  - do:
+      search:
+        index: dhc_inf
+        body:
+          size: 0
+          track_total_hits: true
+          query: { range: { "@timestamp": { gte: "2026-01-01T10:30:00Z", lt: "2026-01-01T13:00:00Z" } } }
+          aggs:
+            h: { date_histogram: { field: "@timestamp", calendar_interval: hour } }
+  - match: { hits.total.value: 4 }
+  - length: { aggregations.h.buckets: 3 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2026-01-01T10:00:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 2 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2026-01-01T11:00:00.000Z" }
+  - match: { aggregations.h.buckets.1.doc_count: 0 }
+  - match: { aggregations.h.buckets.2.key_as_string: "2026-01-01T12:00:00.000Z" }
+  - match: { aggregations.h.buckets.2.doc_count: 2 }
+  - do:
+      search:
+        index: dhc_luc
+        body:
+          size: 0
+          track_total_hits: true
+          query: { range: { "@timestamp": { gte: "2026-01-01T10:30:00Z", lt: "2026-01-01T13:00:00Z" } } }
+          aggs:
+            m: { date_histogram: { field: "@timestamp", fixed_interval: 30m, min_doc_count: 1 } }
+  - match: { hits.total.value: 4 }
+  - length: { aggregations.m.buckets: 3 }
+  - match: { aggregations.m.buckets.0.key_as_string: "2026-01-01T10:30:00.000Z" }
+  - match: { aggregations.m.buckets.0.doc_count: 2 }
+  - match: { aggregations.m.buckets.1.key_as_string: "2026-01-01T12:00:00.000Z" }
+  - match: { aggregations.m.buckets.1.doc_count: 1 }
+  - match: { aggregations.m.buckets.2.key_as_string: "2026-01-01T12:30:00.000Z" }
+  - match: { aggregations.m.buckets.2.doc_count: 1 }
+  - do:
+      search:
+        index: dhc_inf
+        body:
+          size: 0
+          track_total_hits: true
+          query: { range: { "@timestamp": { gte: "2026-01-01T10:30:00Z", lt: "2026-01-01T13:00:00Z" } } }
+          aggs:
+            m: { date_histogram: { field: "@timestamp", fixed_interval: 30m, min_doc_count: 1 } }
+  - match: { hits.total.value: 4 }
+  - length: { aggregations.m.buckets: 3 }
+  - match: { aggregations.m.buckets.0.key_as_string: "2026-01-01T10:30:00.000Z" }
+  - match: { aggregations.m.buckets.0.doc_count: 2 }
+  - match: { aggregations.m.buckets.1.key_as_string: "2026-01-01T12:00:00.000Z" }
+  - match: { aggregations.m.buckets.1.doc_count: 1 }
+  - match: { aggregations.m.buckets.2.key_as_string: "2026-01-01T12:30:00.000Z" }
+  - match: { aggregations.m.buckets.2.doc_count: 1 }

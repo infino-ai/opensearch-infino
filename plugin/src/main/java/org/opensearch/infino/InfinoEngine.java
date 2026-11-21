@@ -771,6 +771,31 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /**
+     * {@code id}'s document as the latest refresh left it, which a get with
+     * {@code realtime=false} sees: the table's, unless the id was created
+     * since that refresh. A pending write is not seen.
+     */
+    static InfinoNative.Doc refreshedDoc(String table, String id) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine != null) {
+            synchronized (engine.batchLock) {
+                if (engine.unrefreshed.containsKey(id)) {
+                    return null;
+                }
+            }
+        }
+        return InfinoNative.getDoc(table, id);
+    }
+
+    /** Refresh the copy of {@code table}'s shard this node holds, as a get with {@code refresh=true} does; none, nothing to do. */
+    static void refreshFor(String table, String source) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine != null) {
+            engine.refresh(source);
+        }
+    }
+
+    /**
      * The routing value {@code id} was last written with, as a read sees it
      * now: a pending write's, else the table's; null when it was written with
      * none.
@@ -1038,9 +1063,10 @@ public class InfinoEngine extends InternalEngine {
      * Commit every write applied so far before the shard syncs its translog
      * for a write, waiting for the copies to hold them, so a write is in the
      * table before it is acknowledged (see the class comment). A failure
-     * fails the sync, and so the write; a wait that runs out acknowledges
-     * the write all the same, as its copies hold it, and leaves it to a later
-     * commit or to the primary that takes over.
+     * fails the sync, and so the write; a wait that runs out, or a commit
+     * that leaves writes the table did not take, acknowledges the write all
+     * the same, as its copies hold it, and leaves it to a later commit or to
+     * the primary that takes over.
      */
     protected void commitBeforeSync() {
         if (commitLock == null) {
@@ -1048,7 +1074,7 @@ public class InfinoEngine extends InternalEngine {
         }
         long through = getProcessedLocalCheckpoint();
         if (!commitThrough(through)) {
-            log.debug("[infino] the copies of {} did not hold every operation through {} in time for a write's sync", shardId, through);
+            log.debug("[infino] {} holds operations through {} that {} does not yet at a write's sync", shardId, through, table);
         }
     }
 
@@ -1063,7 +1089,7 @@ public class InfinoEngine extends InternalEngine {
         }
         long through = getProcessedLocalCheckpoint();
         if (!commitThrough(through)) {
-            log.warn("[infino] {} handed off with writes past {} its copies did not hold in time; they are not in {}", shardId, through, table);
+            log.warn("[infino] {} handed off with writes through {} that are not in {}; the new primary writes them", shardId, through, table);
         }
     }
 
@@ -1103,13 +1129,15 @@ public class InfinoEngine extends InternalEngine {
     /**
      * Commit the writes the copies hold to the table; batches reach it in the
      * order they were taken. The translog is synced first (see the class
-     * comment). A failure keeps the writes for the next commit and is thrown.
+     * comment). A failure keeps the writes for the next commit and is thrown;
+     * false when the table took the commit but not every write of it, which
+     * waits for the next commit (see {@link #notTaken}).
      */
-    private void commitBatch() {
+    private boolean commitBatch() {
         synchronized (commitLock) {
             synchronized (batchLock) {
                 if (batch.isEmpty()) {
-                    return;
+                    return true;
                 }
             }
             try {
@@ -1128,7 +1156,7 @@ public class InfinoEngine extends InternalEngine {
                     } else if (batch.anyTakenBy(through)) {
                         b = batch.take(through);
                     } else {
-                        return;
+                        return true;
                     }
                     committing = b;
                 }
@@ -1150,6 +1178,7 @@ public class InfinoEngine extends InternalEngine {
             }
             // Every write through `through` is in the table now, but for those to retry.
             holdHistoryThrough(retry.isEmpty() ? through : Math.min(through, retry.lowestSeq() - 1));
+            return retry.isEmpty();
         }
     }
 
@@ -1272,13 +1301,18 @@ public class InfinoEngine extends InternalEngine {
     /**
      * Commit the writes through operation {@code through}, waiting up to
      * {@link #COPIES_WAIT_NANOS} for the copies to hold them; true when the
-     * table took every one, false when the wait ran out first.
+     * table took every one, false when the wait ran out first or a commit
+     * left writes the table did not take for the next one: committing again
+     * at once meets the same table, and the writes put back would otherwise
+     * hold every sync and refresh for the whole wait.
      */
     private boolean commitThrough(long through) {
         long deadline = System.nanoTime() + COPIES_WAIT_NANOS;
         long pause = COPIES_POLL_MIN_NANOS;
         while (waiting(through)) {
-            commitBatch();
+            if (!commitBatch()) {
+                return false;
+            }
             if (!waiting(through)) {
                 return true;
             }
@@ -1452,7 +1486,7 @@ public class InfinoEngine extends InternalEngine {
     private void commitBeforeLucene(String why, long through) {
         try {
             if (!commitThrough(through)) {
-                log.debug("[infino] the copies of {} did not hold every operation through {} in time for its {}", shardId, through, why);
+                log.debug("[infino] {} holds operations through {} that {} does not yet at its {}", shardId, through, table, why);
             }
         } catch (RuntimeException e) {
             log.warn("[infino] committing to {} on {} failed", table, why, e);
@@ -1522,7 +1556,7 @@ public class InfinoEngine extends InternalEngine {
             if (closing) {
                 commitBatch(); // a closing copy does not wait on the others; the history keeps the rest
             } else if (!commitThrough(getProcessedLocalCheckpoint())) {
-                log.debug("[infino] {} flushes with writes its copies do not hold yet", shardId);
+                log.debug("[infino] {} flushes with writes {} does not hold yet", shardId, table);
             }
         } catch (RuntimeException e) {
             throw new FlushFailedEngineException(shardId, e);
