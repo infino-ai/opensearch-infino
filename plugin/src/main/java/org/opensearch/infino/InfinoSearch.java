@@ -757,11 +757,40 @@ public final class InfinoSearch {
         return Math.max(counted, rows);
     }
 
+    /** How many times a page whose row lost its source between its two reads is read again. */
+    private static final int SOURCE_REREADS = 2;
+
     /**
      * The page's rows from its hit statement, with their sources when they
-     * are read by id; {@code resumed} as {@link #page} takes it.
+     * are read by id; {@code resumed} as {@link #page} takes it. How many rows
+     * the statement chose goes in {@code chosen}.
      */
     private static List<Map<String, Object>> hitRows(
+        Plan plan,
+        SearchSourceBuilder source,
+        int fetch,
+        boolean seqNoAndPrimaryTerm,
+        boolean resumed,
+        int[] chosen
+    ) {
+        boolean byId = !readsUnsorted(plan, resumed) && sourcesById(plan) && wantsSource(source);
+        for (int read = 0;; read++) {
+            List<Map<String, Object>> rows = chosenRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed);
+            chosen[0] = rows.size();
+            if (!byId) {
+                return rows;
+            }
+            List<Map<String, Object>> sourced = withSources(plan.table(), rows, fetch);
+            // A row deleted between the two reads has no source left: the page
+            // is read again, and after the last try goes without that row.
+            if (sourced.size() == Math.min(rows.size(), fetch) || read == SOURCE_REREADS) {
+                return sourced;
+            }
+        }
+    }
+
+    /** The rows the page's hit statement chooses, without the sources read by id. */
+    private static List<Map<String, Object>> chosenRows(
         Plan plan,
         SearchSourceBuilder source,
         int fetch,
@@ -795,9 +824,6 @@ public final class InfinoSearch {
                     rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.WHOLE, window));
                 }
             }
-        }
-        if (sourcesById(plan) && wantsSource(source)) {
-            rows = withSources(plan.table(), rows, fetch);
         }
         return rows;
     }
@@ -856,6 +882,8 @@ public final class InfinoSearch {
         // The exact total, when it is read before the page.
         Long counted = null;
         boolean shortPage = false;
+        // How many rows the hit statement chose, before any lost its source.
+        int[] chosen = { 0 };
         try {
             if (size == 0 && !stockKnn) {
                 rows = List.of();
@@ -897,11 +925,11 @@ public final class InfinoSearch {
                 CountedRows read = countedRows(
                     firstCount,
                     () -> total(plan, cap),
-                    () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed)
+                    () -> hitRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed, chosen)
                 );
                 rows = read.rows();
                 counted = read.total();
-                shortPage = rows.size() < fetch && shortPageIsTotal(plan);
+                shortPage = chosen[0] < fetch && shortPageIsTotal(plan);
             }
         } catch (RuntimeException | Error e) {
             // A page that fails waits out its count rather than leave it running past the request.
@@ -1099,8 +1127,21 @@ public final class InfinoSearch {
         return returnsSource(source) || !requestedFields(source.docValueFields(), source.fetchFields()).isEmpty();
     }
 
-    /** {@code rows} up to {@code fetch}, each with its source from the table, looked up by its id. */
+    /**
+     * {@code rows} up to {@code fetch}, each with its source from the table,
+     * looked up by its id. A row whose id the table no longer holds (deleted
+     * since the rows were chosen) is left out.
+     */
     private static List<Map<String, Object>> withSources(String table, List<Map<String, Object>> rows, int fetch) {
+        return withSources(rows, fetch, ids -> InfinoNative.sources(table, ids));
+    }
+
+    /** As {@link #withSources(String, List, int)}, with the sources read by {@code lookup}. */
+    static List<Map<String, Object>> withSources(
+        List<Map<String, Object>> rows,
+        int fetch,
+        Function<List<String>, Map<String, String>> lookup
+    ) {
         List<Map<String, Object>> page = rows.subList(0, Math.min(rows.size(), fetch));
         List<String> ids = new ArrayList<>(page.size());
         for (Map<String, Object> row : page) {
@@ -1109,12 +1150,16 @@ public final class InfinoSearch {
                 ids.add(id.toString());
             }
         }
-        Map<String, String> sources = InfinoNative.sources(table, ids);
+        Map<String, String> sources = lookup.apply(ids);
         List<Map<String, Object>> out = new ArrayList<>(page.size());
         for (Map<String, Object> row : page) {
-            Map<String, Object> withSource = new HashMap<>(row);
             Object id = row.get(InfinoQueryTranslator.OSID);
-            withSource.put(InfinoQueryTranslator.SOURCE, id == null ? null : sources.get(id.toString()));
+            String found = id == null ? null : sources.get(id.toString());
+            if (found == null) {
+                continue;
+            }
+            Map<String, Object> withSource = new HashMap<>(row);
+            withSource.put(InfinoQueryTranslator.SOURCE, found);
             out.add(withSource);
         }
         return out;
