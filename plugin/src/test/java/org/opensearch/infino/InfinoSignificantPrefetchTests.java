@@ -10,8 +10,11 @@ import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.core.LogEvent;
 import org.apache.logging.log4j.core.appender.AbstractAppender;
 import org.opensearch.common.logging.Loggers;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.index.Index;
 import org.opensearch.script.Script;
+import org.opensearch.search.SearchModule;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.aggregations.InternalAggregation;
@@ -62,8 +65,10 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
     @Override
     public void setUp() throws Exception {
         super.setUp();
+        // A numeric significant_terms result is built through the wire format, which needs the registry.
+        InfinoServices.namedWriteableRegistry(new NamedWriteableRegistry(new SearchModule(Settings.EMPTY, List.of()).getNamedWriteables()));
         InfinoNative.dropTable(TABLE);
-        InfinoNative.ensureTable(TABLE, "{\"properties\":{\"p\":{\"type\":\"keyword\"},\"tag\":{\"type\":\"keyword\"}}}");
+        InfinoNative.ensureTable(TABLE, "{\"properties\":{\"p\":{\"type\":\"keyword\"},\"tag\":{\"type\":\"keyword\"},\"code\":{\"type\":\"long\"}}}");
     }
 
     @Override
@@ -107,8 +112,8 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
         index(docs);
     }
 
-    /** A run of {@code agg} over the table, with the foreground statements it ran. */
-    private record Run(InternalAggregation result, List<String> foregrounds) {}
+    /** A run of {@code agg} over the table, with the foreground and background-count statements it ran. */
+    private record Run(InternalAggregation result, List<String> foregrounds, List<String> backgrounds) {}
 
     private static Run run(AggregationBuilder agg, SearchSourceBuilder source) {
         source.size(0).aggregation(agg);
@@ -126,12 +131,16 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
             Loggers.setLevel(logger, was);
         }
         List<String> out = new ArrayList<>();
+        List<String> background = new ArrayList<>();
         for (String s : statements.sql) {
             if (s.contains("AS k0, COUNT(*) AS doc_count FROM")) {
                 out.add(s);
             }
+            if (s.contains("WHERE k0 IN (")) {
+                background.add(s);
+            }
         }
-        return new Run(result, out);
+        return new Run(result, out, background);
     }
 
     private static SignificantTermsAggregationBuilder sig(int size, int shardSize, int minDocCount) {
@@ -206,16 +215,16 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
         return run(parent, new SearchSourceBuilder()).foregrounds();
     }
 
-    /** 2 parents times 5,000 terms is 10,000 rows, the bound: one statement reads both foregrounds. */
+    /** 2 parents times 50,000 terms is 100,000 rows, the bound: one statement reads both foregrounds. */
     public void testAtTheBoundBothBucketsAreReadInOneStatement() {
-        List<String> read = wideForegrounds(5_000);
+        List<String> read = wideForegrounds(50_000);
         assertEquals(read.toString(), 1, read.size());
         assertTrue(read.get(0), read.get(0).contains("AS p0"));
     }
 
-    /** 2 parents times 5,001 terms is past it: after the batched read, each bucket reads its own. */
+    /** 2 parents times 50,001 terms is past it: after the batched read, each bucket reads its own. */
     public void testPastTheBoundEachBucketIsReadOnItsOwn() {
-        List<String> read = wideForegrounds(5_001);
+        List<String> read = wideForegrounds(50_001);
         assertEquals(read.toString(), 3, read.size());
         assertTrue(read.get(0), read.get(0).contains("AS p0"));
         for (String s : read.subList(1, 3)) {
@@ -245,6 +254,128 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
         int rows = InfinoNative.sqlRows(sql).size();
         logger.info("big5-shaped significant_terms foreground: {} rows in one statement", rows);
         assertEquals(5_600, rows);
+    }
+
+    /**
+     * Each parent bucket's best codes by JLH over every code, worked out
+     * here from the counts: what the shard must keep.
+     */
+    private static Map<String, TreeSet<Long>> expectedBest(Map<String, Map<Long, Integer>> counts, List<String> parents, int keep) {
+        Map<Long, Long> background = new java.util.HashMap<>();
+        long supersetSize = 0;
+        for (Map<Long, Integer> byCode : counts.values()) {
+            for (Map.Entry<Long, Integer> e : byCode.entrySet()) {
+                background.merge(e.getKey(), (long) e.getValue(), Long::sum);
+                supersetSize += e.getValue();
+            }
+        }
+        Map<String, TreeSet<Long>> out = new java.util.HashMap<>();
+        for (String p : parents) {
+            long subsetSize = counts.get(p).values().stream().mapToLong(Integer::longValue).sum();
+            List<InfinoAggregationProcessor.Significant.Candidate> all = new ArrayList<>();
+            for (Map.Entry<Long, Integer> e : counts.get(p).entrySet()) {
+                all.add(term(e.getKey(), e.getValue(), Math.max(e.getValue(), background.get(e.getKey()))));
+            }
+            TreeSet<Long> best = new TreeSet<>();
+            for (InfinoAggregationProcessor.Significant.Candidate c : InfinoAggregationProcessor.Significant.bestByScore(all, keep, 0, subsetSize, supersetSize, new JLHScore())) {
+                best.add((Long) c.key());
+            }
+            out.put(p, best);
+        }
+        return out;
+    }
+
+    /**
+     * Index {@code counts} (parent, then code, then documents) and run a terms
+     * parent of size {@code parents} over significant codes. The codes are
+     * numbers, whose background the table's value counts never read whole,
+     * so their counts are statements.
+     */
+    private static Run runCounts(Map<String, Map<Long, Integer>> counts, int parents, int keep) {
+        List<String> ids = new ArrayList<>();
+        List<String> sources = new ArrayList<>();
+        for (Map.Entry<String, Map<Long, Integer>> byParent : counts.entrySet()) {
+            for (Map.Entry<Long, Integer> e : byParent.getValue().entrySet()) {
+                for (int i = 0; i < e.getValue(); i++) {
+                    ids.add(Integer.toString(ids.size()));
+                    sources.add("{\"p\":\"" + byParent.getKey() + "\",\"code\":" + e.getKey() + "}");
+                }
+            }
+        }
+        assertEquals(ids.size(), InfinoNative.indexBatch(TABLE, ids.toArray(new String[0]), sources.toArray(new String[0]), ids.size()).ok());
+        AggregationBuilder parent = AggregationBuilders.terms("p")
+            .field("p")
+            .size(parents)
+            .subAggregation(AggregationBuilders.significantTerms("sig").field("code").size(keep).shardSize(keep).minDocCount(1));
+        return run(parent, new SearchSourceBuilder());
+    }
+
+    private static Map<String, TreeSet<Long>> keptByParent(Run r) {
+        Map<String, TreeSet<Long>> out = new java.util.HashMap<>();
+        for (StringTerms.Bucket b : ((StringTerms) r.result()).getBuckets()) {
+            TreeSet<Long> codes = new TreeSet<>();
+            for (SignificantTerms.Bucket c : ((SignificantTerms) b.getAggregations().get("sig")).getBuckets()) {
+                codes.add(((Number) c.getKey()).longValue());
+            }
+            out.put(b.getKeyAsString(), codes);
+        }
+        return out;
+    }
+
+    /** The codes the background statements of {@code r} counted, all together. */
+    private static int backgroundTerms(Run r) {
+        int n = 0;
+        for (String s : r.backgrounds()) {
+            String list = s.substring(s.indexOf("WHERE k0 IN (") + "WHERE k0 IN (".length(), s.indexOf(") GROUP BY"));
+            n += list.split(",").length;
+        }
+        return n;
+    }
+
+    /**
+     * Two kept parents of 200 codes each, and a third, smaller parent the
+     * terms level does not keep, which adds to every code's background.
+     * A code's background count is at least its count over the kept
+     * buckets, which bounds its JLH score from above; only the codes whose
+     * bound reaches a bucket's fifth best score are counted, in rounds, and each bucket keeps the same codes as when every code is scored.
+     */
+    public void testOnlyTermsThatCanBeKeptAreCounted() {
+        Map<String, Map<Long, Integer>> counts = new java.util.LinkedHashMap<>();
+        for (String p : new String[] { "a", "b", "z" }) {
+            counts.put(p, new java.util.LinkedHashMap<>());
+        }
+        for (long t = 0; t < 200; t++) {
+            counts.get("a").put(t, (int) (10 + t % 7));
+            counts.get("b").put(t, (int) (10 + (t * 3) % 11));
+            counts.get("z").put(t, 3);
+        }
+        Run r = runCounts(counts, 2, 5);
+        assertEquals(expectedBest(counts, List.of("a", "b"), 5), keptByParent(r));
+        // 70 when ties in the first round fall as worked out by hand; far below 200 whichever way they fall.
+        assertTrue(r.backgrounds().toString(), backgroundTerms(r) < 100);
+    }
+
+    /** Random counts: each kept bucket's codes are the best by score over every code, however few were counted. */
+    public void testRandomCountsKeepTheBestByScore() {
+        int codes = between(1, 120);
+        int parents = between(1, 4);
+        Map<String, Map<Long, Integer>> counts = new java.util.LinkedHashMap<>();
+        for (int p = 0; p < parents + 1; p++) {
+            Map<Long, Integer> byCode = new java.util.LinkedHashMap<>();
+            for (long t = 1; t < codes; t++) {
+                if (randomBoolean()) {
+                    // The last parent, which the terms level does not keep, is smaller than every kept one.
+                    byCode.put(t, p == parents ? 1 : between(1, 30));
+                }
+            }
+            byCode.put(0L, p == parents ? 1 : 30 * codes);
+            counts.put("p" + p, byCode);
+        }
+        int keep = between(1, 10);
+        Run r = runCounts(counts, parents, keep);
+        List<String> kept = new ArrayList<>(keptByParent(r).keySet());
+        assertEquals(parents, kept.size());
+        assertEquals(expectedBest(counts, kept, keep), keptByParent(r));
     }
 
     private static InfinoAggregationProcessor.Significant.Candidate term(Object key, long subsetDf, long supersetDf) {
