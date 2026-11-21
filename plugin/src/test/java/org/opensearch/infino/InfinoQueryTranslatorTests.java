@@ -688,6 +688,79 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertNull(one.ascending().scoring().across());
     }
 
+    public void testTheWordAfterAnOrIsAClauseOfItsOwn() {
+        // Stock: jackal OR bear owl cat is jackal | bear | (owl cat); a run starts only at the word after the OR's.
+        Map<String, Column> cols = columns();
+        cols.put("title", new Column("title", "str", true, false));
+        InfinoQueryTranslator.Across across = InfinoQueryTranslator.translate(
+            QueryBuilders.queryStringQuery("jackal OR bear owl cat").field("message").field("title"),
+            cols,
+            TABLE,
+            NOW
+        ).scoring().across();
+        assertNotNull(across);
+        assertEquals(
+            List.of(List.of("jackal"), List.of("bear"), List.of("owl cat")),
+            across.clauses().stream().map(c -> c.stream().map(InfinoQueryTranslator.TextClause::query).distinct().toList()).toList()
+        );
+        for (List<InfinoQueryTranslator.TextClause> clause : across.clauses()) {
+            assertEquals(List.of("message", "title"), clause.stream().map(InfinoQueryTranslator.TextClause::column).toList());
+        }
+        // A field:word after an OR is its own clause, and the word after it may start a run.
+        InfinoQueryTranslator.Across fielded = InfinoQueryTranslator.translate(
+            QueryBuilders.queryStringQuery("jackal OR message:bear owl cat").field("message").field("title"),
+            cols,
+            TABLE,
+            NOW
+        ).scoring().across();
+        assertNotNull(fielded);
+        assertEquals(
+            List.of(List.of("jackal"), List.of("bear"), List.of("owl cat")),
+            fielded.clauses().stream().map(c -> c.stream().map(InfinoQueryTranslator.TextClause::query).distinct().toList()).toList()
+        );
+        assertEquals(List.of(new InfinoQueryTranslator.TextClause("message", "bear", "or")), fielded.clauses().get(1));
+        assertEquals(
+            List.of(new InfinoQueryTranslator.TextClause("message", "owl cat", "or"), new InfinoQueryTranslator.TextClause("title", "owl cat", "or")),
+            fielded.clauses().get(2)
+        );
+    }
+
+    public void testAFieldTheMappingDoesNotHaveAddsNothing() {
+        // Stock's dis_max has no clause for an unmapped field: the others still rank the page.
+        Map<String, Column> cols = columns();
+        cols.put("title", new Column("title", "str", true, false));
+        InfinoQueryTranslator.Across across = InfinoQueryTranslator.translate(
+            QueryBuilders.queryStringQuery("jackal bear").field("message").field("title").field("nosuch"),
+            cols,
+            TABLE,
+            NOW
+        ).scoring().across();
+        assertNotNull(across);
+        assertEquals(
+            List.of(List.of(new InfinoQueryTranslator.TextClause("message", "jackal bear", "or"), new InfinoQueryTranslator.TextClause("title", "jackal bear", "or"))),
+            across.clauses()
+        );
+        // Nor does a field:word on such a field: it matches nothing, and the other clauses rank.
+        InfinoQueryTranslator.Across fielded = InfinoQueryTranslator.translate(
+            QueryBuilders.queryStringQuery("jackal OR nosuch:bear owl").field("message").field("title"),
+            cols,
+            TABLE,
+            NOW
+        ).scoring().across();
+        assertNotNull(fielded);
+        assertEquals(
+            List.of(List.of("jackal"), List.of("owl")),
+            fielded.clauses().stream().map(c -> c.stream().map(InfinoQueryTranslator.TextClause::query).distinct().toList()).toList()
+        );
+        // A mapped column with no text index, or a field pattern, which stock expands over the mapping, still leaves it unranked.
+        for (QueryStringQueryBuilder qs : List.of(
+            QueryBuilders.queryStringQuery("jackal bear").field("message").field("title").field("level"),
+            QueryBuilders.queryStringQuery("jackal bear").field("title").field("mess*")
+        )) {
+            assertNull(qs.toString(), InfinoQueryTranslator.translate(qs, cols, TABLE, NOW).scoring().across());
+        }
+    }
+
     public void testTextUnderShouldIsARowPredicate() {
         BoolQueryBuilder b = QueryBuilders.boolQuery()
             .should(QueryBuilders.matchQuery("message", "disk"))

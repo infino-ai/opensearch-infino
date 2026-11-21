@@ -283,6 +283,240 @@
   - match: { hits.hits.3._id: "d07" }
   - match: { hits.hits.4._id: "d12" }
 
+  # A word right after an OR is a clause of its own; a run starts at the
+  # word after it (jackal | bear | owl, not jackal | (bear owl)). Only the
+  # scores tell the two readings apart here: d05 is 1.242 joined.
+  - do:
+      search:
+        index: qa_luc
+        body:
+          size: 5
+          query: { query_string: { query: "jackal OR bear owl", fields: [ message, title ] } }
+  - match: { hits.total.value: 12 }
+  - match: { hits.hits.0._id: "d02" }
+  - match: { hits.hits.1._id: "d05" }
+  - match: { hits.hits.2._id: "d04" }
+  - match: { hits.hits.3._id: "d09" }
+  - match: { hits.hits.4._id: "d07" }
+  - gt: { hits.hits.0._score: 1.5969 }
+  - lt: { hits.hits.0._score: 1.5989 }
+  - gt: { hits.hits.1._score: 1.5582 }
+  - lt: { hits.hits.1._score: 1.5602 }
+  - do:
+      search:
+        index: qa_proxy
+        body:
+          size: 5
+          query: { query_string: { query: "jackal OR bear owl", fields: [ message, title ] } }
+  - match: { hits.total.value: 12 }
+  - match: { hits.hits.0._id: "d02" }
+  - match: { hits.hits.1._id: "d05" }
+  - match: { hits.hits.2._id: "d04" }
+  - match: { hits.hits.3._id: "d09" }
+  - match: { hits.hits.4._id: "d07" }
+  - gt: { hits.hits.0._score: 1.5969 }
+  - lt: { hits.hits.0._score: 1.5989 }
+  - gt: { hits.hits.1._score: 1.5582 }
+  - lt: { hits.hits.1._score: 1.5602 }
+  - do:
+      search:
+        index: qa_default
+        body:
+          size: 5
+          query: { query_string: { query: "jackal OR bear owl", fields: [ message, title ] } }
+  - match: { hits.total.value: 12 }
+  - match: { hits.hits.0._id: "d02" }
+  - match: { hits.hits.1._id: "d05" }
+  - match: { hits.hits.2._id: "d04" }
+  - match: { hits.hits.3._id: "d09" }
+  - match: { hits.hits.4._id: "d07" }
+  - gt: { hits.hits.0._score: 1.5969 }
+  - lt: { hits.hits.0._score: 1.5989 }
+  - gt: { hits.hits.1._score: 1.5582 }
+  - lt: { hits.hits.1._score: 1.5602 }
+
+  # Here the order tells them apart: joining emu fox puts d08 first.
+  - do:
+      search:
+        index: qa_luc
+        body:
+          size: 5
+          query: { query_string: { query: "bat OR emu fox", fields: [ message, title ] } }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "d11" }
+  - match: { hits.hits.1._id: "d08" }
+  - match: { hits.hits.2._id: "d12" }
+  - match: { hits.hits.3._id: "d03" }
+  - match: { hits.hits.4._id: "d06" }
+  - gt: { hits.hits.0._score: 1.6920 }
+  - lt: { hits.hits.0._score: 1.6940 }
+  - gt: { hits.hits.1._score: 1.4239 }
+  - lt: { hits.hits.1._score: 1.4259 }
+  - do:
+      search:
+        index: qa_proxy
+        body:
+          size: 5
+          query: { query_string: { query: "bat OR emu fox", fields: [ message, title ] } }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "d11" }
+  - match: { hits.hits.1._id: "d08" }
+  - match: { hits.hits.2._id: "d12" }
+  - match: { hits.hits.3._id: "d03" }
+  - match: { hits.hits.4._id: "d06" }
+  - gt: { hits.hits.0._score: 1.6920 }
+  - lt: { hits.hits.0._score: 1.6940 }
+  - gt: { hits.hits.1._score: 1.4239 }
+  - lt: { hits.hits.1._score: 1.4259 }
+  - do:
+      search:
+        index: qa_default
+        body:
+          size: 5
+          query: { query_string: { query: "bat OR emu fox", fields: [ message, title ] } }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "d11" }
+  - match: { hits.hits.1._id: "d08" }
+  - match: { hits.hits.2._id: "d12" }
+  - match: { hits.hits.3._id: "d03" }
+  - match: { hits.hits.4._id: "d06" }
+  - gt: { hits.hits.0._score: 1.6920 }
+  - lt: { hits.hits.0._score: 1.6940 }
+  - gt: { hits.hits.1._score: 1.4239 }
+  - lt: { hits.hits.1._score: 1.4259 }
+
+  # A field the mapping does not have adds nothing: the others still rank.
+  - do:
+      search:
+        index: qa_luc
+        body:
+          size: 5
+          query: { query_string: { query: "jackal bear", fields: [ message, title, nosuch ] } }
+  - match: { hits.total.value: 10 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d05" }
+  - match: { hits.hits.2._id: "d09" }
+  - match: { hits.hits.3._id: "d07" }
+  - match: { hits.hits.4._id: "d12" }
+  - gt: { hits.hits.0._score: 1.0809 }
+  - lt: { hits.hits.0._score: 1.0829 }
+  - do:
+      search:
+        index: qa_proxy
+        body:
+          size: 5
+          query: { query_string: { query: "jackal bear", fields: [ message, title, nosuch ] } }
+  - match: { hits.total.value: 10 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d05" }
+  - match: { hits.hits.2._id: "d09" }
+  - match: { hits.hits.3._id: "d07" }
+  - match: { hits.hits.4._id: "d12" }
+  - gt: { hits.hits.0._score: 1.0809 }
+  - lt: { hits.hits.0._score: 1.0829 }
+  - do:
+      search:
+        index: qa_default
+        body:
+          size: 5
+          query: { query_string: { query: "jackal bear", fields: [ message, title, nosuch ] } }
+  - match: { hits.total.value: 10 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d05" }
+  - match: { hits.hits.2._id: "d09" }
+  - match: { hits.hits.3._id: "d07" }
+  - match: { hits.hits.4._id: "d12" }
+  - gt: { hits.hits.0._score: 1.0809 }
+  - lt: { hits.hits.0._score: 1.0829 }
+
+  # A page further in keeps the ranking.
+  - do:
+      search:
+        index: qa_luc
+        body:
+          from: 2
+          size: 3
+          query: { query_string: { query: "monkey jackal bear" } }
+  - match: { hits.total.value: 12 }
+  - match: { hits.hits.0._id: "d12" }
+  - match: { hits.hits.1._id: "d06" }
+  - match: { hits.hits.2._id: "d05" }
+  - gt: { hits.hits.0._score: 1.0223 }
+  - lt: { hits.hits.0._score: 1.0243 }
+  - do:
+      search:
+        index: qa_proxy
+        body:
+          from: 2
+          size: 3
+          query: { query_string: { query: "monkey jackal bear" } }
+  - match: { hits.total.value: 12 }
+  - match: { hits.hits.0._id: "d12" }
+  - match: { hits.hits.1._id: "d06" }
+  - match: { hits.hits.2._id: "d05" }
+  - gt: { hits.hits.0._score: 1.0223 }
+  - lt: { hits.hits.0._score: 1.0243 }
+  - do:
+      search:
+        index: qa_default
+        body:
+          from: 2
+          size: 3
+          query: { query_string: { query: "monkey jackal bear" } }
+  - match: { hits.total.value: 12 }
+  - match: { hits.hits.0._id: "d12" }
+  - match: { hits.hits.1._id: "d06" }
+  - match: { hits.hits.2._id: "d05" }
+  - gt: { hits.hits.0._score: 1.0223 }
+  - lt: { hits.hits.0._score: 1.0243 }
+
+  # A post_filter leaves the scores and drops the rows it does not pass.
+  - do:
+      search:
+        index: qa_luc
+        body:
+          post_filter: { range: { n: { lte: 6 } } }
+          size: 3
+          query: { query_string: { query: "monkey jackal bear" } }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d06" }
+  - gt: { hits.hits.0._score: 1.5195 }
+  - lt: { hits.hits.0._score: 1.5215 }
+  - gt: { hits.hits.2._score: 0.8343 }
+  - lt: { hits.hits.2._score: 0.8363 }
+  - do:
+      search:
+        index: qa_proxy
+        body:
+          post_filter: { range: { n: { lte: 6 } } }
+          size: 3
+          query: { query_string: { query: "monkey jackal bear" } }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d06" }
+  - gt: { hits.hits.0._score: 1.5195 }
+  - lt: { hits.hits.0._score: 1.5215 }
+  - gt: { hits.hits.2._score: 0.8343 }
+  - lt: { hits.hits.2._score: 0.8363 }
+  - do:
+      search:
+        index: qa_default
+        body:
+          post_filter: { range: { n: { lte: 6 } } }
+          size: 3
+          query: { query_string: { query: "monkey jackal bear" } }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d06" }
+  - gt: { hits.hits.0._score: 1.5195 }
+  - lt: { hits.hits.0._score: 1.5215 }
+  - gt: { hits.hits.2._score: 0.8343 }
+  - lt: { hits.hits.2._score: 0.8363 }
+
   # Ranked pages score by BM25, not the constant of an unranked read.
   - do:
       search:

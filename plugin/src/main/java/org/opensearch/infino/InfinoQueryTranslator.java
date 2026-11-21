@@ -540,13 +540,16 @@ final class InfinoQueryTranslator {
      * <p>Stock's parser (Lucene's, not splitting on whitespace) makes a
      * clause of each {@code field:word}, and one clause of each run of words
      * with no operator between them, on the default fields; a word before a
-     * {@code field:} or an {@code OR} ends the run. Over several fields a
+     * {@code field:} or an {@code OR} ends the run, and the word right after
+     * an {@code OR} is a clause of its own, the run starting at the word
+     * after it ({@code a OR b c d} is {@code a}, {@code b} and {@code c d}).
+     * A field the mapping does not have adds nothing. Over several fields a
      * clause is a {@code dis_max} of each field's BM25 for its words
      * (best_fields, tie_breaker 0), and the clauses are summed. Read here:
      * plain words (one token each, no word twice in a run), {@code field:word}
      * on a text column and {@code OR}, under the default operator OR, every
-     * field a text column with boost 1, and no option that changes the
-     * scoring.
+     * mapped field a text column with boost 1, and no option that changes
+     * the scoring.
      */
     private Across across(QueryStringQueryBuilder qs) {
         if (qs.defaultOperator() != Operator.OR
@@ -575,14 +578,21 @@ final class InfinoQueryTranslator {
             return null;
         }
         List<String> defaults = new ArrayList<>();
-        for (String f : queryTargets(new ArrayList<>(qs.fields().keySet()), qs.defaultField())) {
-            Column c = column(f);
-            if (c == null || !c.fts()) {
-                return null;
+        try {
+            for (String f : queryTargets(new ArrayList<>(qs.fields().keySet()), qs.defaultField())) {
+                Column c = column(f);
+                if (c == null && f.indexOf('*') < 0) {
+                    continue; // stock's dis_max has no clause for a field the mapping does not have
+                }
+                if (c == null || !c.fts()) {
+                    return null; // a pattern, or a column with no text index
+                }
+                if (!defaults.contains(c.name())) {
+                    defaults.add(c.name());
+                }
             }
-            if (!defaults.contains(c.name())) {
-                defaults.add(c.name());
-            }
+        } catch (IllegalArgumentException | OpenSearchSecurityException e) {
+            return null; // a field the table serves no column of, or one masked for the user
         }
         List<String> tokens = new ArrayList<>();
         for (String piece : QUERY_WHITESPACE.split(qs.queryString().trim())) {
@@ -614,6 +624,7 @@ final class InfinoQueryTranslator {
                 i++;
                 continue;
             }
+            boolean single = afterOr && i > 0; // the token before this one is an OR
             afterOr = false;
             if (i + 1 < tokens.size() && ":".equals(tokens.get(i + 1))) {
                 // field:word, one clause on that field's column.
@@ -622,21 +633,25 @@ final class InfinoQueryTranslator {
                     return null;
                 }
                 Column c = column(t);
-                if (c == null || !c.fts() || (!trusted && c.masked())) {
+                if (c != null && (!c.fts() || (!trusted && c.masked()))) {
                     return null;
                 }
-                clauses.add(List.of(new TextClause(c.name(), tokens.get(i + 2), "or")));
-                searches++;
+                if (c != null) {
+                    // A field the mapping does not have matches nothing and adds nothing.
+                    clauses.add(List.of(new TextClause(c.name(), tokens.get(i + 2), "or")));
+                    searches++;
+                }
                 i += 3;
                 continue;
             }
             if (!plainWord(t)) {
                 return null;
             }
-            // A run: the words that follow while the word after each is no field's colon or OR.
+            // A run: the words that follow while the word after each is no
+            // field's colon or OR. The word right after an OR is alone.
             List<String> run = new ArrayList<>(List.of(t));
             int j = i + 1;
-            while (j < tokens.size() && plainWord(tokens.get(j))
+            while (!single && j < tokens.size() && plainWord(tokens.get(j))
                 && (j + 1 >= tokens.size() || !(":".equals(tokens.get(j + 1)) || "OR".equals(tokens.get(j + 1))))) {
                 run.add(tokens.get(j));
                 j++;
