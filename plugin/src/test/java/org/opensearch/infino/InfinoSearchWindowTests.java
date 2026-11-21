@@ -139,6 +139,39 @@ public class InfinoSearchWindowTests extends OpenSearchTestCase {
         );
     }
 
+    public void testAPhraseIsRefusedWhateverRangeTheSearchNames() {
+        // Inside the limit, and even as a count: the phrase is looked up over the whole table first.
+        SearchSourceBuilder inside = new SearchSourceBuilder().query(
+            QueryBuilders.boolQuery()
+                .filter(QueryBuilders.matchPhraseQuery("title", "pope leo"))
+                .filter(QueryBuilders.rangeQuery("time").gte("2025-05-08T15:00:00Z").lte("2025-05-08T21:00:00Z"))
+        );
+        String why = refused(inside, A_DAY);
+        assertTrue(why, why.contains("a phrase is looked up across the whole table"));
+        assertTrue(why, why.contains("without the quotes"));
+        assertTrue(refused(inside.size(0), A_DAY).contains("a phrase"));
+        // However the phrase is written, and however deep.
+        assertTrue(refused(new SearchSourceBuilder().size(0).query(QueryBuilders.queryStringQuery("title:\"pope leo\"")), A_DAY).contains("a phrase"));
+        assertTrue(refused(new SearchSourceBuilder().size(0).query(QueryBuilders.simpleQueryStringQuery("\"pope leo\"")), A_DAY).contains("a phrase"));
+        assertTrue(
+            refused(
+                new SearchSourceBuilder().size(0)
+                    .query(QueryBuilders.boolQuery().filter(QueryBuilders.boolQuery().should(QueryBuilders.matchPhraseQuery("title", "pope leo")).minimumShouldMatch(1))),
+                A_DAY
+            ).contains("a phrase")
+        );
+        assertTrue(refused(new SearchSourceBuilder().size(0).postFilter(QueryBuilders.matchPhrasePrefixQuery("title", "pope le")), A_DAY).contains("a phrase"));
+        // Words are a filter the range narrows, and are served.
+        allowed(
+            new SearchSourceBuilder().size(0)
+                .query(QueryBuilders.boolQuery().filter(QueryBuilders.matchQuery("title", "pope leo")).filter(QueryBuilders.rangeQuery("time").gte("now-6h").lte("now"))),
+            A_DAY
+        );
+        allowed(new SearchSourceBuilder().size(0).query(QueryBuilders.queryStringQuery("title:pope")), A_DAY);
+        // And an index with no limit serves a phrase as before.
+        allowed(inside, index(null, null));
+    }
+
     public void testABreakdownIsHeldToTheLimit() {
         SearchSourceBuilder byLanguage = over("2025-01-01T00:00:00Z", "2026-01-01T00:00:00Z").size(0)
             .aggregation(AggregationBuilders.terms("langs").field("lang"));

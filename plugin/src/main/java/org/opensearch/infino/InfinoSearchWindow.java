@@ -11,8 +11,13 @@ import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ConstantScoreQueryBuilder;
+import org.opensearch.index.query.MatchPhrasePrefixQueryBuilder;
+import org.opensearch.index.query.MatchPhraseQueryBuilder;
+import org.opensearch.index.query.MultiMatchQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryStringQueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
+import org.opensearch.index.query.SimpleQueryStringBuilder;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.MaxAggregationBuilder;
@@ -67,7 +72,23 @@ final class InfinoSearchWindow {
         Settings settings = index.getSettings();
         String field = FIELD.get(settings);
         TimeValue max = MAX.get(settings);
-        if (field.isEmpty() || max.millis() < 0 || !limited(source)) {
+        if (field.isEmpty() || max.millis() < 0) {
+            return;
+        }
+        String name = index.getIndex().getName();
+        if (source != null && (phrase(source.query()) || phrase(source.postFilter()))) {
+            // Whatever else the search asks for, a count included: the phrase is looked up first.
+            throw new IllegalArgumentException(
+                "[infino] index ["
+                    + name
+                    + "] limits the span of ["
+                    + field
+                    + "] one search reads, and a phrase is looked up across the whole table whatever range the search names; search for the words without the quotes ["
+                    + MAX.getKey()
+                    + "]"
+            );
+        }
+        if (!limited(source)) {
             return;
         }
         long[] span = { Long.MIN_VALUE, Long.MAX_VALUE };
@@ -75,7 +96,6 @@ final class InfinoSearchWindow {
             narrow(source.query(), field, now, span);
             narrow(source.postFilter(), field, now, span);
         }
-        String name = index.getIndex().getName();
         if (span[0] == Long.MIN_VALUE || span[1] == Long.MAX_VALUE) {
             throw new IllegalArgumentException(
                 "[infino] index ["
@@ -107,6 +127,38 @@ final class InfinoSearchWindow {
                     + "]"
             );
         }
+    }
+
+    /**
+     * Whether the query asks for a phrase anywhere in it: a phrase query, a
+     * multi-field match of the phrase kinds, or a query string holding a
+     * quoted run. The table answers words as a filter beside the search's
+     * other clauses, its range of time among them, but a phrase through a
+     * lookup of its own over every row, which a range does not narrow: on a
+     * table that needs a limit on its span, that lookup does not finish.
+     */
+    static boolean phrase(QueryBuilder query) {
+        if (query == null) {
+            return false;
+        }
+        if (query instanceof MatchPhraseQueryBuilder || query instanceof MatchPhrasePrefixQueryBuilder) {
+            return true;
+        }
+        if (query instanceof MultiMatchQueryBuilder multi) {
+            return multi.type() == MultiMatchQueryBuilder.Type.PHRASE || multi.type() == MultiMatchQueryBuilder.Type.PHRASE_PREFIX;
+        }
+        if (query instanceof QueryStringQueryBuilder string) {
+            return string.queryString() != null && string.queryString().indexOf('"') >= 0;
+        }
+        if (query instanceof SimpleQueryStringBuilder simple) {
+            return simple.value() != null && simple.value().indexOf('"') >= 0;
+        }
+        for (QueryBuilder inner : InfinoSearchChecks.inner(query)) {
+            if (phrase(inner)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

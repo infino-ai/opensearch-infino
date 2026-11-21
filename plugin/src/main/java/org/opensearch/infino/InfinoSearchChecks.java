@@ -158,7 +158,7 @@ final class InfinoSearchChecks {
     }
 
     /** The queries a compound query holds. */
-    private static List<QueryBuilder> inner(QueryBuilder qb) {
+    static List<QueryBuilder> inner(QueryBuilder qb) {
         if (qb instanceof BoolQueryBuilder b) {
             List<QueryBuilder> all = new ArrayList<>(b.must());
             all.addAll(b.filter());
