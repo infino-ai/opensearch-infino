@@ -306,6 +306,8 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
         AggregationBuilder parent = AggregationBuilders.terms("p")
             .field("p")
             .size(parents)
+            // The shard keeps exactly these parents, so the last, smallest one is a bucket of none.
+            .shardSize(parents)
             .subAggregation(AggregationBuilders.significantTerms("sig").field("code").size(keep).shardSize(keep).minDocCount(1));
         return run(parent, new SearchSourceBuilder());
     }
