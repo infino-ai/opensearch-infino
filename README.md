@@ -220,6 +220,8 @@ The security plugin's index is Infino-backed too, so its roles, users and passwo
 | `index.infino.mode` | `default` | `default` or `proxy`; fixed at creation. See [How it works](#how-it-works). |
 | `index.infino.table` | derived from the index's name | The table behind the index, named explicitly, to reattach a recreated index to its rows. A named table is kept when its index is deleted. |
 | `index.infino.attached` | `false` | The table named in `index.infino.table` was made outside the plugin: it is read as it is and never changed. Fixed at creation. See [Attaching to an existing table](#attaching-to-an-existing-table). |
+| `index.infino.search.window.field` | none | The date field a search's span of time is read from, for `index.infino.search.window.max`. Dynamic. |
+| `index.infino.search.window.max` | none | The widest span of that field one search may list documents or break them into groups over, such as `1d`. A wider search, or one that names no range with both ends, is refused at once with a 400, and the table is not sent it. A count, and a sum, average, minimum, maximum, value count or stats with no hits beside them, are answered over any span. For a table too large to read whole on a visitor's request, where such a search would run for minutes and hold a search thread of the node until it ends. Dynamic. |
 | `index.infino.optimize_interval` | `60s` | How often the table is compacted (5 seconds at least; off for a hosted account, which compacts its own tables). |
 | `index.infino.edges` | `false` | The index holds a graph's edges, for `graph_walk` and `graph_rank` in [SQL](#sql). |
 

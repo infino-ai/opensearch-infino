@@ -48,6 +48,10 @@ final class InfinoSearchChecks {
 
     /** Refuse {@code source} over {@code indices} as a shard of each would. */
     static void check(SearchSourceBuilder source, List<IndexMetadata> indices, boolean allowExpensive) {
+        // The one check a search with no source can fail: it lists documents over every time there is.
+        for (IndexMetadata index : indices) {
+            InfinoSearchWindow.check(source, index, System::currentTimeMillis);
+        }
         if (source == null) {
             return;
         }
