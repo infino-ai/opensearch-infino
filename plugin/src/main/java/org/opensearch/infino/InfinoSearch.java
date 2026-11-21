@@ -2183,6 +2183,10 @@ public final class InfinoSearch {
      * disabled, else the count up to the limit (the stock default when the request names none), and
      * the limit itself, as a lower bound, past it. The pages count exactly whenever tracking is on,
      * so a default-mode shard's coordinator can apply the same rule.
+     *
+     * <p>A request that tracks every hit carries the largest {@code int} as its limit, which is
+     * how the request says there is none: no Lucene shard holds more documents than that, but a
+     * table does, and its total is reported as counted rather than cut to that number.
      */
     static TotalHits reported(long total, boolean exact, SearchSourceBuilder source) {
         Integer upTo = source.trackTotalHitsUpTo();
@@ -2190,7 +2194,7 @@ public final class InfinoSearch {
         if (limit == SearchContext.TRACK_TOTAL_HITS_DISABLED) {
             return null;
         }
-        if (exact && total > limit) {
+        if (exact && limit != SearchContext.TRACK_TOTAL_HITS_ACCURATE && total > limit) {
             return new TotalHits(limit, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
         }
         return new TotalHits(total, exact ? TotalHits.Relation.EQUAL_TO : TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
