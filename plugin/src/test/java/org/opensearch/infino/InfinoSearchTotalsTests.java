@@ -98,4 +98,27 @@ public class InfinoSearchTotalsTests extends OpenSearchTestCase {
         assertEquals(7, InfinoSearch.besideTotal(7, 3));
         assertEquals(0, InfinoSearch.besideTotal(0, 0));
     }
+
+    /** Rows of a page as its statement chose them: ids only. */
+    private static List<Map<String, Object>> idRows(String... ids) {
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (String id : ids) {
+            rows.add(Map.of(InfinoQueryTranslator.OSID, id));
+        }
+        return rows;
+    }
+
+    public void testARowDeletedBeforeItsSourceIsReadLeavesThePage() {
+        // d2 was deleted between the page's two reads: it is left out, never shown with no source.
+        List<Map<String, Object>> page = InfinoSearch.withSources(
+            idRows("d1", "d2", "d3"),
+            10,
+            ids -> Map.of("d1", "{\"a\":1}", "d3", "{\"a\":3}")
+        );
+        assertEquals(2, page.size());
+        assertEquals("d1", page.get(0).get(InfinoQueryTranslator.OSID));
+        assertEquals("{\"a\":1}", page.get(0).get(InfinoQueryTranslator.SOURCE));
+        assertEquals("d3", page.get(1).get(InfinoQueryTranslator.OSID));
+        assertEquals("{\"a\":3}", page.get(1).get(InfinoQueryTranslator.SOURCE));
+    }
 }
