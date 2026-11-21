@@ -269,6 +269,22 @@ public class InfinoAggregationProcessor {
      * {@link #backgroundHoldsForegrounds}).
      */
     private final Map<Significant, Map<String, Long>> lowerBackgrounds = new HashMap<>();
+    /**
+     * The bound-ordered foreground of a significant_terms level read with
+     * its parent level's groups ({@link #fusedTopTerms}), by the level, with
+     * the relation and predicate it was read over.
+     */
+    private final Map<Significant, Fused> fused = new HashMap<>();
+
+    /** Rows of {@link #fencedForegroundSql} over every group of a parent level, read over {@code from WHERE where}. */
+    private record Fused(String from, String where, List<Map<String, Object>> rows) {}
+
+    /**
+     * For a statement of {@link #readAhead} whose groups were read with the
+     * foreground ({@link #fusedTopTerms}), the count of every group with a
+     * key: those groups are the level's best only, picked however many.
+     */
+    private final Map<String, Long> fusedKeyedTotals = new HashMap<>();
 
     /** A significant_terms background: its row count, and each term's count once read. */
     private static final class Background {
@@ -3456,7 +3472,7 @@ public class InfinoAggregationProcessor {
             // one leave before the window: they take no slot and count as other to no one.
             String inner = levelInner(chain, i, from, where, restriction, level.terms);
             String parents = String.join(", ", aliases.subList(0, i));
-            List<Map<String, Object>> rows = i == 0 && level.terms ? pickTopTerms(level, inner, readAhead) : null;
+            List<Map<String, Object>> rows = i == 0 && level.terms ? pickTopTerms(level, inner, readAhead, fusedKeyedTotals.get(inner)) : null;
             if (rows == null && i == 0 && chain.size() == 1 && leafChild == null) {
                 rows = rangeCountedHistogram(level, from, where);
             }
@@ -3494,7 +3510,8 @@ public class InfinoAggregationProcessor {
             rowsByLevel.add(List.of());
             hitsByLevel.add(Map.of());
         }
-        if (rowsByLevel.get(chain.size() - 1).size() > 1) {
+        // One bucket reads its own foreground, unless it was read with the parent level's groups.
+        if (rowsByLevel.get(chain.size() - 1).size() > 1 || (chain.size() == 1 && leafChild instanceof Significant s && fused.containsKey(s))) {
             prefetchSignificant(chain, kept, rowsByLevel.get(chain.size() - 1), leafChild, from, where);
         }
         return fold(chain, 0, List.of(), rowsByLevel, hitsByLevel, total, leafChild, from, where);
@@ -3721,7 +3738,13 @@ public class InfinoAggregationProcessor {
      * over the bucket, is the bucket's size; {@code ktotal}, the term's count
      * over every bucket read; {@code ub}, the JLH score at that count against
      * {@code supersetSize}; and the first {@code fence} rows of each bucket by
-     * {@code ub}, highest first, the rows without the term last.
+     * {@code ub}, highest first, the rows without the term last. With a
+     * {@code parentOrder} (over one parent, its count {@code ptotal} and key
+     * {@code p0}), the statement reads the parent level's groups too: only
+     * the first {@code parentSize} buckets in that order keep rows, each
+     * carrying {@code total}, the count of every row, and {@code keyed_total},
+     * of every row with a parent key; with no such bucket, the first row of
+     * the one without a key carries them.
      */
     static String fencedForegroundSql(
         List<String> parents,
@@ -3730,7 +3753,9 @@ public class InfinoAggregationProcessor {
         String where,
         String restriction,
         long supersetSize,
-        int fence
+        int fence,
+        String parentOrder,
+        int parentSize
     ) {
         int n = parents.size();
         List<String> select = new ArrayList<>();
@@ -3745,8 +3770,14 @@ public class InfinoAggregationProcessor {
         String totals = "SELECT g.*, SUM(doc_count) OVER (PARTITION BY " + bucket + ") AS ptotal, SUM(doc_count) OVER (PARTITION BY k0) AS ktotal FROM ("
             + grouped + ") g";
         String bounded = "SELECT t.*, " + jlhScoreSql("doc_count", "ptotal", "ktotal", supersetSize) + " AS ub FROM (" + totals + ") t";
-        String ranked = "SELECT b.*, ROW_NUMBER() OVER (PARTITION BY " + bucket + " ORDER BY k0 IS NULL, ub DESC, k0) AS rn FROM (" + bounded + ") b";
-        return "SELECT * FROM (" + ranked + ") WHERE rn <= " + fence + " ORDER BY " + bucket + ", rn";
+        String rn = "ROW_NUMBER() OVER (PARTITION BY " + bucket + " ORDER BY k0 IS NULL, ub DESC, k0) AS rn";
+        if (parentOrder == null) {
+            return "SELECT * FROM (SELECT b.*, " + rn + " FROM (" + bounded + ") b) WHERE rn <= " + fence + " ORDER BY " + bucket + ", rn";
+        }
+        String ranked = "SELECT b.*, " + rn + ", DENSE_RANK() OVER (ORDER BY p0 IS NULL, " + parentOrder + ") AS prank, SUM(doc_count) OVER () AS total, "
+            + "SUM(CASE WHEN p0 IS NULL THEN 0 ELSE doc_count END) OVER () AS keyed_total FROM (" + bounded + ") b";
+        return "SELECT * FROM (" + ranked + ") WHERE rn <= " + fence + " AND ((p0 IS NOT NULL AND prank <= " + parentSize + ") OR (prank = 1 AND rn = 1))"
+            + " ORDER BY " + bucket + ", rn";
     }
 
     /** One bucket's rows of a bound-ordered foreground ({@link #fencedForeground}). */
@@ -3808,18 +3839,31 @@ public class InfinoAggregationProcessor {
         for (Grouped g : chain) {
             parents.add(g.keyExpr);
         }
-        List<Map<String, Object>> rows = InfinoNative.sqlRows(
-            fencedForegroundSql(parents, s.keyExpr(), from, where, restriction, bg.size, fence) + " LIMIT " + (MAX_BATCHED_FOREGROUND_ROWS + 1)
-        );
-        if (rows.size() > MAX_BATCHED_FOREGROUND_ROWS) {
-            return false;
+        // Read already with the parent level's groups: every bucket's rows, kept or not.
+        Fused ahead = fused.remove(s);
+        List<Map<String, Object>> rows;
+        if (ahead != null && n == 1 && ahead.from().equals(from) && ahead.where().equals(where)) {
+            rows = ahead.rows();
+        } else {
+            rows = InfinoNative.sqlRows(
+                fencedForegroundSql(parents, s.keyExpr(), from, where, restriction, bg.size, fence, null, 0) + " LIMIT " + (MAX_BATCHED_FOREGROUND_ROWS + 1)
+            );
+            if (rows.size() > MAX_BATCHED_FOREGROUND_ROWS) {
+                return false;
+            }
         }
         Map<List<String>, FencedBucket> byTuple = new HashMap<>();
+        for (List<Object> tuple : kept) {
+            byTuple.put(tupleKey(tuple), new FencedBucket(tuple));
+        }
         // A term's count over every bucket read: the least background count it can have.
         Map<String, Long> lower = new HashMap<>();
         for (Map<String, Object> row : rows) {
-            List<Object> tuple = parentTuple(row, n);
-            FencedBucket b = byTuple.computeIfAbsent(tupleKey(tuple), k -> new FencedBucket(tuple));
+            // Rows read with the parent level's groups hold its other buckets too.
+            FencedBucket b = byTuple.get(tupleKey(parentTuple(row, n)));
+            if (b == null) {
+                continue;
+            }
             long size = asLong(row.get("ptotal"));
             if (b.size >= 0 && b.size != size) {
                 return false;
@@ -4014,6 +4058,12 @@ public class InfinoAggregationProcessor {
         }
         List<Grouped> chain = List.of(level);
         String picked = levelInner(chain, 0, q.from(), q.where(), "", true);
+        if (!readsValueCounts(level, q)) {
+            Long fusedTotal = fusedTopTerms(level, q, picked);
+            if (fusedTotal != null) {
+                return fusedTotal;
+            }
+        }
         List<Map<String, Object>> groups;
         if (readsValueCounts(level, q)) {
             groups = valueCounts(level, q);
@@ -4038,6 +4088,64 @@ public class InfinoAggregationProcessor {
             return total;
         }
         readAhead.put(picked, keyed);
+        return total;
+    }
+
+    /**
+     * The request's total and a top terms level's best groups read with the
+     * bound-ordered foreground of the significant_terms level right under it
+     * ({@link #fencedForegroundSql} with the level's order), in one statement
+     * rather than the level's own GROUP BY and then the foreground: the
+     * level's first {@code size} buckets in its order, each with its size
+     * (ptotal, its rows with the term or without) and its fenced rows, and
+     * the counts of every row and of every row with a key, window sums over
+     * every bucket. The level picks its buckets from these (see
+     * {@link #pickTopTerms}) and {@link #fencedForeground} takes their rows.
+     * The statement ranks the buckets as the level's window statement does.
+     *
+     * <p>Only for a level whose groups the request total is read from (see
+     * {@link #totalFromTopTerms}), with no metric, a lone significant_terms
+     * child that fencedForeground serves, and no metric there, and when its
+     * buckets' fence rows fit in {@link #MAX_BATCHED_FOREGROUND_ROWS}, so the
+     * statement is never read for nothing. Null otherwise, for the level's
+     * own statements to run.
+     */
+    private Long fusedTopTerms(Grouped level, Translation q, String picked) {
+        if (!(level.child instanceof Significant s)
+            || !s.metrics.isEmpty()
+            || !level.metrics.isEmpty()
+            || !Significant.scoreFallsWithBackground(s.heuristic)
+            || s.candidates <= 0
+            || !backgroundHoldsForegrounds(s)) {
+            return null;
+        }
+        int fence = fenceRows(s.candidates);
+        if ((long) level.size * fence + 1 > MAX_BATCHED_FOREGROUND_ROWS) {
+            return null;
+        }
+        Background bg = backgroundOf(s, backgroundRows(s));
+        if (bg.size <= 0) {
+            return null;
+        }
+        // The level's order over the buckets' sizes: a count or key order (totalFromTopTerms checks).
+        String parentOrder = level.order("p0").replace("doc_count", "ptotal");
+        List<Map<String, Object>> rows = InfinoNative.sqlRows(
+            fencedForegroundSql(List.of(level.keyExpr), s.keyExpr(), q.from(), q.where(), null, bg.size, fence, parentOrder, level.size)
+        );
+        long total = rows.isEmpty() ? 0 : asLong(rows.get(0).get("total"));
+        long keyed = rows.isEmpty() ? 0 : asLong(rows.get(0).get("keyed_total"));
+        List<Map<String, Object>> groups = new ArrayList<>();
+        for (Map<String, Object> row : rows) {
+            if (asLong(row.get("rn")) == 1 && row.get("p0") != null) {
+                Map<String, Object> group = new HashMap<>();
+                group.put("k0", row.get("p0"));
+                group.put("doc_count", row.get("ptotal"));
+                groups.add(group);
+            }
+        }
+        readAhead.put(picked, groups);
+        fusedKeyedTotals.put(picked, keyed);
+        fused.put(s, new Fused(q.from(), q.where(), rows));
         return total;
     }
 
@@ -4086,9 +4194,17 @@ public class InfinoAggregationProcessor {
      * keyed_total, the rows of every group, as the window statement's rows
      * do. Null, for the window statement to answer, when the order reads a
      * metric (a missing metric value sorts where the engine puts it) or the
-     * level has more groups than are worth picking here.
+     * level has more groups than are worth picking here. With a
+     * {@code fusedKeyedTotal}, the groups read ahead are the level's best
+     * only, read with its foreground ({@link #fusedTopTerms}), however many,
+     * and that is the count of every group.
      */
-    private static List<Map<String, Object>> pickTopTerms(Grouped level, String inner, Map<String, List<Map<String, Object>>> readAhead) {
+    private static List<Map<String, Object>> pickTopTerms(
+        Grouped level,
+        String inner,
+        Map<String, List<Map<String, Object>>> readAhead,
+        Long fusedKeyedTotal
+    ) {
         Comparator<Map<String, Object>> order = termsOrder(level);
         if (order == null) {
             return null;
@@ -4105,12 +4221,15 @@ public class InfinoAggregationProcessor {
         } else {
             groups = new ArrayList<>(InfinoNative.sqlRows(inner + " LIMIT " + (MAX_GROUPS_PICKED_HERE + 1)));
         }
-        if (groups.size() > MAX_GROUPS_PICKED_HERE) {
+        if (groups.size() > MAX_GROUPS_PICKED_HERE && fusedKeyedTotal == null) {
             return null;
         }
         long keyedTotal = 0;
         for (Map<String, Object> group : groups) {
             keyedTotal += asLong(group.get("doc_count"));
+        }
+        if (fusedKeyedTotal != null) {
+            keyedTotal = fusedKeyedTotal;
         }
         sortTerms(level, groups);
         List<Map<String, Object>> out = new ArrayList<>();

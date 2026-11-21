@@ -915,3 +915,82 @@
   - match: { aggregations.groups.buckets.1.sig.buckets.1.doc_count: 1 }
   - match: { aggregations.groups.buckets.1.sig.buckets.1.bg_count: 1 }
   - match: { aggregations.groups.buckets.1.sig.buckets.1.score: $fence_a2 }
+
+  # Under a query the parent's groups and the total come with the
+  # foreground; the documents without a group count in the total and in
+  # each term's least background count. Same buckets, counts and scores.
+  - do:
+      search:
+        index: sbf_luc
+        body:
+          size: 0
+          query: { bool: { must_not: { term: { group: none } } } }
+          aggs:
+            groups:
+              terms: { field: group, size: 1 }
+              aggs:
+                sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - match: { hits.total.value: 44 }
+  - length: { aggregations.groups.buckets: 1 }
+  - match: { aggregations.groups.sum_other_doc_count: 8 }
+  - match: { aggregations.groups.buckets.0.key: b }
+  - match: { aggregations.groups.buckets.0.doc_count: 16 }
+  - match: { aggregations.groups.buckets.0.sig.bg_count: 44 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.key: b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.doc_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.bg_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.score: $fence_b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.key: b2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.doc_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.bg_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.score: $fence_b2 }
+  - do:
+      search:
+        index: sbf_def
+        body:
+          size: 0
+          query: { bool: { must_not: { term: { group: none } } } }
+          aggs:
+            groups:
+              terms: { field: group, size: 1 }
+              aggs:
+                sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - match: { hits.total.value: 44 }
+  - length: { aggregations.groups.buckets: 1 }
+  - match: { aggregations.groups.sum_other_doc_count: 8 }
+  - match: { aggregations.groups.buckets.0.key: b }
+  - match: { aggregations.groups.buckets.0.doc_count: 16 }
+  - match: { aggregations.groups.buckets.0.sig.bg_count: 44 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.key: b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.doc_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.bg_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.score: $fence_b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.key: b2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.doc_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.bg_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.score: $fence_b2 }
+  - do:
+      search:
+        index: sbf_prx
+        body:
+          size: 0
+          query: { bool: { must_not: { term: { group: none } } } }
+          aggs:
+            groups:
+              terms: { field: group, size: 1 }
+              aggs:
+                sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - match: { hits.total.value: 44 }
+  - length: { aggregations.groups.buckets: 1 }
+  - match: { aggregations.groups.sum_other_doc_count: 8 }
+  - match: { aggregations.groups.buckets.0.key: b }
+  - match: { aggregations.groups.buckets.0.doc_count: 16 }
+  - match: { aggregations.groups.buckets.0.sig.bg_count: 44 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.key: b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.doc_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.bg_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.score: $fence_b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.key: b2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.doc_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.bg_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.score: $fence_b2 }

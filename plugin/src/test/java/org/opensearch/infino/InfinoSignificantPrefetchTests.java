@@ -113,7 +113,7 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
     }
 
     /** A run of {@code agg} over the table, with the foreground and background-count statements it ran. */
-    private record Run(InternalAggregation result, List<String> foregrounds, List<String> backgrounds) {}
+    private record Run(InternalAggregation result, List<String> foregrounds, List<String> backgrounds, long total, List<String> statements) {}
 
     private static Run run(AggregationBuilder agg, SearchSourceBuilder source) {
         source.size(0).aggregation(agg);
@@ -123,9 +123,12 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
         Loggers.addAppender(logger, statements);
         Loggers.setLevel(logger, Level.DEBUG);
         InternalAggregation result;
+        long total;
         try {
             InfinoSearch.Plan plan = InfinoSearch.plan(TABLE, source, System.currentTimeMillis());
-            result = new InfinoAggregationProcessor(new Index(TABLE, "_na_")).evaluate(List.of(agg), plan, null).aggregations().get(agg.getName());
+            InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(new Index(TABLE, "_na_")).evaluate(List.of(agg), plan, null);
+            result = counted.aggregations().get(agg.getName());
+            total = counted.total();
         } finally {
             Loggers.removeAppender(logger, statements);
             Loggers.setLevel(logger, was);
@@ -140,7 +143,7 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
                 background.add(s);
             }
         }
-        return new Run(result, out, background);
+        return new Run(result, out, background, total, statements.sql);
     }
 
     private static SignificantTermsAggregationBuilder sig(int size, int shardSize, int minDocCount) {
@@ -351,6 +354,96 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
         assertEquals(bruteBest(docs, 3, java.util.Set.of("a", "b")), shardBest(r));
     }
 
+    /** A query every document matches, which is not the whole table to the planner. */
+    private static SearchSourceBuilder everyDocument() {
+        return new SearchSourceBuilder().query(
+            org.opensearch.index.query.QueryBuilders.boolQuery().mustNot(org.opensearch.index.query.QueryBuilders.termQuery("p", "none"))
+        );
+    }
+
+    /**
+     * Under a query, the parent level's groups and the request's total are
+     * read with the foreground, one statement: the parent's own GROUP BY is
+     * not run. The documents without a parent count in the total, and their
+     * terms in each term's least background count.
+     */
+    public void testParentGroupsAndTotalAreReadWithTheForeground() {
+        List<Object[]> docs = threeParents();
+        List<Object[]> orphans = new ArrayList<>();
+        for (int i = 0; i < 12; i++) {
+            orphans.add(new Object[] { null, "shared" + (i % 4) });
+        }
+        String[] ids = new String[orphans.size()];
+        String[] sources = new String[orphans.size()];
+        for (int i = 0; i < orphans.size(); i++) {
+            ids[i] = "o" + i;
+            sources[i] = "{\"tag\":\"" + orphans.get(i)[1] + "\"}";
+        }
+        assertEquals(orphans.size(), InfinoNative.indexBatch(TABLE, ids, sources, ids.length).ok());
+        docs.addAll(orphans);
+        Run r = run(parentOver("tag", 2, 3), everyDocument());
+        assertEquals(r.foregrounds().toString(), 1, r.foregrounds().size());
+        String fg = r.foregrounds().get(0);
+        assertTrue(fg, fg.contains("DENSE_RANK()"));
+        assertEquals(docs.size(), r.total());
+        StringTerms parents = (StringTerms) r.result();
+        assertEquals(2, parents.getBuckets().size());
+        assertEquals(30, parents.getBuckets().get(0).getDocCount());
+        assertEquals(20, parents.getBuckets().get(1).getDocCount());
+        // c, the bucket not kept, is what sum_other_doc_count counts.
+        assertEquals(10, parents.getSumOfOtherDocCounts());
+        assertEquals(bruteBest(docs, 3, java.util.Set.of("a", "b")), shardBest(r));
+    }
+
+    /**
+     * Past the groups a parent level picks from its own GROUP BY (1,000),
+     * the fused statement still serves: it ranks the parents itself and
+     * returns rows for the kept ones only. The parent's own GROUP BY is not
+     * run, the parents not kept still count in sum_other_doc_count, and each
+     * kept bucket keeps its best by score.
+     */
+    public void testManyParentGroupsArePickedFromTheFusedStatement() {
+        List<Object[]> docs = new ArrayList<>();
+        for (int p = 0; p < 1_002; p++) {
+            docs.add(new Object[] { "q" + p, "t" + (p % 5) });
+        }
+        for (int i = 0; i < 40; i++) {
+            docs.add(new Object[] { "q" + (i % 3), "hot" + (i % 7) });
+        }
+        indexDocs(docs, "tag");
+        Run r = run(parentOver("tag", 3, 2), everyDocument());
+        String logged = r.foregrounds().get(0);
+        assertTrue(logged, logged.contains("DENSE_RANK()"));
+        // 3 parents of at most 5 rows each, of 1,002.
+        assertTrue(logged, InfinoNative.sqlRows(logged.substring("[infino] sql: ".length(), logged.lastIndexOf(" -> "))).size() <= 15);
+        for (String s : r.statements()) {
+            assertFalse(s, s.contains("\"p\" AS k0"));
+        }
+        assertEquals(docs.size(), r.total());
+        // 1,042 documents, less the kept buckets' 15 + 14 + 14.
+        assertEquals(999, ((StringTerms) r.result()).getSumOfOtherDocCounts());
+        assertEquals(bruteBest(docs, 2, java.util.Set.of("q0", "q1", "q2")), shardBest(r));
+    }
+
+    /**
+     * 2,000 parents kept, each up to 51 rows, could pass the rows one
+     * statement returns: the parent level runs its own statement, and the
+     * fused one is not run at all.
+     */
+    public void testParentsWhoseRowsCouldPassTheBoundAreNotFused() {
+        List<Object[]> docs = threeParents();
+        AggregationBuilder parent = AggregationBuilders.terms("p")
+            .field("p")
+            .size(2_000)
+            .subAggregation(AggregationBuilders.significantTerms("sig").field("tag").size(10).shardSize(25).minDocCount(1));
+        Run r = run(parent, everyDocument());
+        for (String s : r.statements()) {
+            assertFalse(s, s.contains("DENSE_RANK()"));
+        }
+        assertEquals(docs.size(), r.total());
+        assertEquals(bruteBest(docs, 25, java.util.Set.of("a", "b", "c")), shardBest(r));
+    }
+
     /** The bound-ordered foreground's statement, as built. */
     public void testFencedForegroundSql() {
         assertEquals(51, InfinoAggregationProcessor.fenceRows(25));
@@ -364,8 +457,19 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
                 + " AS ub FROM (SELECT g.*, SUM(doc_count) OVER (PARTITION BY p0) AS ptotal, SUM(doc_count) OVER (PARTITION BY k0) AS ktotal FROM ("
                 + "SELECT \"p\" AS p0, (\"tag\") AS k0, COUNT(*) AS doc_count FROM \"t\" WHERE (x > 1) AND (\"p\" = 'a') GROUP BY 1, 2) g) t) b)"
                 + " WHERE rn <= 5 ORDER BY p0, rn",
-            InfinoAggregationProcessor.fencedForegroundSql(List.of("\"p\""), "(\"tag\")", "\"t\"", "x > 1", "(\"p\" = 'a')", 1000, 5)
+            InfinoAggregationProcessor.fencedForegroundSql(List.of("\"p\""), "(\"tag\")", "\"t\"", "x > 1", "(\"p\" = 'a')", 1000, 5, null, 0)
         );
+        // Over every parent, ranked in the parent level's order: the first 3 keep rows, and every row carries the totals.
+        String fused = InfinoAggregationProcessor.fencedForegroundSql(List.of("\"p\""), "(\"tag\")", "\"t\"", "x > 1", null, 1000, 5, "ptotal DESC, p0 ASC", 3);
+        assertTrue(fused, fused.contains("FROM \"t\" WHERE (x > 1) GROUP BY 1, 2) g"));
+        assertTrue(
+            fused,
+            fused.contains(
+                ", DENSE_RANK() OVER (ORDER BY p0 IS NULL, ptotal DESC, p0 ASC) AS prank, SUM(doc_count) OVER () AS total,"
+                    + " SUM(CASE WHEN p0 IS NULL THEN 0 ELSE doc_count END) OVER () AS keyed_total FROM ("
+            )
+        );
+        assertTrue(fused, fused.endsWith(" WHERE rn <= 5 AND ((p0 IS NOT NULL AND prank <= 3) OR (prank = 1 AND rn = 1)) ORDER BY p0, rn"));
     }
 
     /** The engine's JLH from jlhScoreSql is Java's to the bit, over random counts. */
@@ -440,7 +544,12 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
             }
             indexDocs(docs, strings ? "tag" : "code");
             int parentSize = between(1, parents + 1);
-            Run r = run(parentOver(strings ? "tag" : "code", parentSize, keep), new SearchSourceBuilder());
+            // A query that keeps every document: the parent's groups are then read with the foreground.
+            SearchSourceBuilder source = randomBoolean()
+                ? new SearchSourceBuilder()
+                : new SearchSourceBuilder().query(org.opensearch.index.query.QueryBuilders.boolQuery().mustNot(org.opensearch.index.query.QueryBuilders.termQuery("p", "none")));
+            Run r = run(parentOver(strings ? "tag" : "code", parentSize, keep), source);
+            assertEquals("round " + round, docs.size(), r.total());
             Map<String, List<String>> got = shardBest(r);
             java.util.Set<String> withParent = new TreeSet<>();
             for (Object[] d : docs) {
@@ -449,6 +558,15 @@ public class InfinoSignificantPrefetchTests extends OpenSearchTestCase {
                 }
             }
             assertEquals("round " + round, Math.min(parentSize, withParent.size()), got.size());
+            Map<String, Integer> parentCounts = new java.util.HashMap<>();
+            for (Object[] d : docs) {
+                if (d[0] != null) {
+                    parentCounts.merge((String) d[0], 1, Integer::sum);
+                }
+            }
+            List<String> byCount = new ArrayList<>(parentCounts.keySet());
+            byCount.sort((x, y) -> parentCounts.get(x).equals(parentCounts.get(y)) ? x.compareTo(y) : parentCounts.get(y) - parentCounts.get(x));
+            assertEquals("round " + round, new TreeSet<>(byCount.subList(0, got.size())), got.keySet());
             assertEquals("round " + round, bruteBest(docs, keep, got.keySet()), got);
         }
     }
