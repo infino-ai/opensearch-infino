@@ -64,6 +64,10 @@ opensearchplugin {
 // target release joins the build.
 sourceSets.main.java.srcDirs += versionMajor >= 3 ? 'src/main/security3' : 'src/main/security2'
 sourceSets.main.java.srcDirs += versionMajor >= 3 ? 'src/main/client3' : 'src/main/client2'
+// The action filters' base: 3.4 and later call a filter with the request's
+// metadata and mark the call without it for removal; earlier releases make
+// only that call.
+sourceSets.main.java.srcDirs += versionMajor > 3 || (versionMajor == 3 && versionMinor >= 4) ? 'src/main/filter34' : 'src/main/filter33'
 
 configurations {
     securityPlugin
