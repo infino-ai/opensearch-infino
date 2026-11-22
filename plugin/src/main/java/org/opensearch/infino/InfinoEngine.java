@@ -1050,7 +1050,7 @@ public class InfinoEngine extends InternalEngine {
      * have before the rebuild.
      */
     private boolean deleteTableOnly(String id, long seq) {
-        if (InfinoNative.existingOsids(table, List.of(id)).isEmpty()) {
+        if (InfinoNative.existingOsidsLatest(table, List.of(id)).isEmpty()) {
             return false;
         }
         synchronized (batchLock) {
@@ -1384,8 +1384,12 @@ public class InfinoEngine extends InternalEngine {
                 lookedUp.add(id);
             }
         }
+        // An id this node has no record of may be a row another node wrote:
+        // a replayed operation, after a takeover, of a write that node
+        // committed. The table's latest commit says, so the write replaces
+        // the row rather than appending it again.
         if (!lookedUp.isEmpty()) {
-            replaced.addAll(InfinoNative.existingOsids(table, lookedUp));
+            replaced.addAll(InfinoNative.existingOsidsLatest(table, lookedUp));
         }
         Batch retry = new Batch();
         // Deletes go first: until a commit's rows are in, the highest operation the

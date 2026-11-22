@@ -102,6 +102,9 @@ public interface InfinoLib extends Library {
 
     Pointer infino_sql(Pointer h, String sql);
 
+    /** {@link #infino_sql} reading each table's latest commit: for a read whose answer decides what a write does. */
+    Pointer infino_sql_latest(Pointer h, String sql);
+
     /** The indices a caller's read-only statement reads, as {@code {"indices": [..]}}, or an error with its status. */
     Pointer infino_sql_indices(String sql);
 
