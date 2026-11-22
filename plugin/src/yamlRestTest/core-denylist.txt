@@ -25,6 +25,9 @@
 #   [by-design]  Infino answers better than stock on purpose, and the test
 #                asserts stock's weaker behaviour; the entry stays
 #   [cluster]    fails on the same cluster without the plugin too
+# A check stock makes that the plugin skips, so the plugin answers or accepts
+# a request stock rejects, is a [gap]. A feature the plugin silently ignores
+# while answering is a [bug] until the plugin refuses the request.
 # gap, by-design and bug may be narrowed to one mode: [gap:proxy], [bug:default].
 # Without a mode they apply to both. coreYamlRestTestLucene skips only
 # [cluster] entries.
@@ -45,28 +48,7 @@
 delete/50_refresh/Refresh  # [bug:default] a delete sent without refresh hides the document from the next search, before any refresh (https://github.com/infino-ai/opensearch-infino/issues/157)
 
 # --- Requests stock rejects are accepted, or answered with another status
-search/330_fetch_fields/Test date formatting  # [bug] a fields request stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
 search/260_sort_mixed/*  # [bug] a sort across long, double and unsigned_long indices stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
-search/110_field_collapsing/field collapsing and rescore  # [bug:default] a collapse stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
-search/110_field_collapsing/field collapsing and scroll  # [bug:default] a collapse stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
-search/110_field_collapsing/field collapsing with search_after - basic functionality  # [bug:default] a collapse stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
-search/40_indices_boost/Indices boost for nonexistent index/alias  # [bug] indices_boost on a missing index is not rejected (https://github.com/infino-ai/opensearch-infino/issues/57)
-
-# --- Write responses and checks in proxy mode
-index/20_optype/Optype  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
-index/30_cas/Compare And Swap Sequence Numbers  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
-delete/10_basic/Basic  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
-delete/11_shard_header/*  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
-update/10_doc/Partial document  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
-update/11_shard_header/*  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
-update/13_legacy_doc/*  # [bug:proxy] a write in proxy mode reports the wrong _version or _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
-bulk/10_basic/Empty _id  # [bug:proxy] a bulk item stock rejects is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
-bulk/10_basic/Empty _id with op_type create  # [bug:proxy] a bulk item stock rejects is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
-bulk/110_bulk_adaptive_shard_select/Test basic use  # [bug:proxy] a bulk item stock rejects is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
-search/240_date_nanos/date_nanos requires dates after 1970 and before 2262  # [bug:proxy] a date_nanos value out of range is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
-scroll/20_keep_alive/Max keep alive  # [bug:proxy] a scroll over search.max_keep_alive is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
-scroll/10_basic/Basic scroll  # [bug:proxy] a scroll returns hits after it is cleared or done (https://github.com/infino-ai/opensearch-infino/issues/57)
-scroll/10_basic/Basic scroll with 1 shard  # [bug:proxy] a scroll returns hits after it is cleared or done (https://github.com/infino-ai/opensearch-infino/issues/57)
 
 # --- Write responses
 update/12_result/Update result field  # [bug] an update reports the wrong result or _version
@@ -88,7 +70,7 @@ search/270_wildcard_fieldtype_queries/case insensitive regexp query on wildcard 
 index/115_constant_keyword/Mappings and Indexing  # [bug] a match_all with no sort returns the two documents in a different order from stock on some runs, so hits.0 is the second one written
 
 # --- Aggregation results
-search.aggregation/10_histogram/Deprecated _time order  # [bug] histogram buckets have no key_as_string
+search.aggregation/10_histogram/Deprecated _time order  # [bug] date_histogram ignores order: a descending key order comes back ascending
 search.aggregation/10_histogram/Format test  # [bug] histogram buckets have no key_as_string
 search.aggregation/20_terms/Unmapped booleans  # [bug] terms on an unmapped field with value_type and missing returns a string key
 search.aggregation/20_terms/Unmapped dates  # [bug] terms on an unmapped field with value_type and missing returns a string key
@@ -104,16 +86,15 @@ search.aggregation/40_range/Date Range Missing  # [bug] date_range with missing 
 
 # --- Errors that differ from stock
 search.aggregation/230_composite/Composite aggregation and array size  # [bug] the error message differs from stock
-search.aggregation/230_composite/Invalid Composite aggregation  # [bug:proxy] a composite stock rejects is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
 search/110_field_collapsing/field collapsing with search_after - _score and _doc sorts  # [bug:default] the error message differs from stock
 search/30_limits/Regexp length limit  # [bug] the error message differs from stock
 
 # --- An index named "index" never starts
-search/260_sort_geopoint/*  # [bug] an index named index is refused at create: its table would be the registry's (https://github.com/infino-ai/opensearch-infino/issues/58)
+search/260_sort_geopoint/*  # [bug] an index named index is refused at create: its table would be the registry's (https://github.com/infino-ai/opensearch-infino/issues/171)
 
-# --- ignore_malformed
-search/200_ignore_malformed/*  # [bug] ignore_malformed is not honoured: a document with a malformed value is dropped after it is acknowledged (default) or refused with a 400 (proxy), not indexed without that field (https://github.com/infino-ai/opensearch-infino/issues/53)
-search/330_fetch_fields/Test ignore malformed  # [bug] ignore_malformed is not honoured: a document with a malformed value is dropped after it is acknowledged (default) or refused with a 400 (proxy), not indexed without that field (https://github.com/infino-ai/opensearch-infino/issues/53)
+# --- ignore_malformed, in default mode
+search/200_ignore_malformed/*  # [bug:default] ignore_malformed is not honoured: a document with a malformed value is dropped after it is acknowledged, not indexed without that field (https://github.com/infino-ai/opensearch-infino/issues/172)
+search/330_fetch_fields/Test ignore malformed  # [bug:default] ignore_malformed is not honoured: a document with a malformed value is dropped after it is acknowledged, not indexed without that field (https://github.com/infino-ai/opensearch-infino/issues/172)
 
 # --- Gaps: tests that need a feature Infino does not have yet. Remove the entry when the feature lands.
 # Derived from the stock tests' own requests, checked against what the query and aggregation translators serve;
@@ -281,6 +262,36 @@ search/380_bitmap_filtering/Boolean should bitmap filtering  # [gap] not served:
 search/381_bitmap_filtering_long/Terms lookup on a binary field with bitmap (long)  # [gap] not served: terms lookup, which returns 500 (a null pointer) instead of the clear refusal the filter aggregation gives
 search/390_search_as_you_type/*  # [gap] not served: multi_match type bool_prefix
 search/400_combined_fields/*  # [gap] not served: query combined_fields
+
+# --- Checks stock makes that the plugin skips: it answers or accepts what stock rejects
+search/330_fetch_fields/Test date formatting  # [gap] the plugin does not make stock's check: a fields request stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/110_field_collapsing/field collapsing and rescore  # [gap:default] the plugin does not make stock's check: a collapse stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/110_field_collapsing/field collapsing and scroll  # [gap:default] the plugin does not make stock's check: a collapse stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/110_field_collapsing/field collapsing with search_after - basic functionality  # [gap:default] the plugin does not make stock's check: a collapse stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/40_indices_boost/Indices boost for nonexistent index/alias  # [gap] the plugin does not make stock's check: indices_boost on a missing index is not rejected (https://github.com/infino-ai/opensearch-infino/issues/57)
+bulk/10_basic/Empty _id  # [gap:proxy] the plugin does not make stock's check: a bulk item stock rejects is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
+bulk/10_basic/Empty _id with op_type create  # [gap:proxy] the plugin does not make stock's check: a bulk item stock rejects is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
+bulk/110_bulk_adaptive_shard_select/Test basic use  # [gap:proxy] the plugin does not make stock's check: a bulk item stock rejects is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
+search/240_date_nanos/date_nanos requires dates after 1970 and before 2262  # [gap:proxy] the plugin does not make stock's check: a date_nanos value out of range is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
+scroll/20_keep_alive/Max keep alive  # [gap:proxy] the plugin does not make stock's check: a scroll over search.max_keep_alive is accepted (https://github.com/infino-ai/opensearch-infino/issues/57)
+search.aggregation/230_composite/Invalid Composite aggregation  # [gap:proxy] the plugin does not make stock's check: a composite under a parent aggregation, which stock rejects, is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
+
+# --- Proxy mode keeps no per-document version
+index/20_optype/Optype  # [gap:proxy] proxy mode keeps no per-document _version, so every write reports 1 (https://github.com/infino-ai/opensearch-infino/issues/57)
+index/30_cas/Compare And Swap Sequence Numbers  # [gap:proxy] proxy mode keeps no per-document _version, so every write reports 1 (https://github.com/infino-ai/opensearch-infino/issues/57)
+delete/10_basic/Basic  # [gap:proxy] proxy mode keeps no per-document _version, so every write reports 1 (https://github.com/infino-ai/opensearch-infino/issues/57)
+delete/11_shard_header/*  # [gap:proxy] proxy mode keeps no per-document _version, so every write reports 1 (https://github.com/infino-ai/opensearch-infino/issues/57)
+update/10_doc/Partial document  # [gap:proxy] proxy mode keeps no per-document _version, so every write reports 1 (https://github.com/infino-ai/opensearch-infino/issues/57)
+update/11_shard_header/*  # [gap:proxy] proxy mode keeps no per-document _version, so every write reports 1 (https://github.com/infino-ai/opensearch-infino/issues/57)
+update/13_legacy_doc/*  # [gap:proxy] proxy mode keeps no per-document _version, so every write reports 1 (https://github.com/infino-ai/opensearch-infino/issues/57)
+
+# --- Scrolls are not point-in-time
+scroll/10_basic/Basic scroll  # [gap:proxy] a scroll is not a point-in-time snapshot: a document indexed after it opens shows in its later pages (https://github.com/infino-ai/opensearch-infino/issues/57)
+scroll/10_basic/Basic scroll with 1 shard  # [gap:proxy] a scroll is not a point-in-time snapshot: a document indexed after it opens shows in its later pages (https://github.com/infino-ai/opensearch-infino/issues/57)
+
+# --- ignore_malformed, in proxy mode
+search/200_ignore_malformed/*  # [gap:proxy] ignore_malformed is not honoured: a document with a malformed value is refused with a 400, not indexed without that field (https://github.com/infino-ai/opensearch-infino/issues/172)
+search/330_fetch_fields/Test ignore malformed  # [gap:proxy] ignore_malformed is not honoured: a document with a malformed value is refused with a 400, not indexed without that field (https://github.com/infino-ai/opensearch-infino/issues/172)
 
 # --- Answered differently, because the table has no such feature
 get/20_stored_fields/Stored fields  # [gap] not served: stored_fields; the table keeps no stored fields

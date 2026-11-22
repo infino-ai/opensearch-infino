@@ -1383,6 +1383,22 @@ public final class InfinoNative {
         return rows(out);
     }
 
+    /**
+     * The first {@code k} rows of table {@code n} by {@code column},
+     * descending when {@code desc}, rows sharing a value in row id order and
+     * rows without one last, each with its id, row id, the column's value
+     * and, when {@code withSource}, its source: a sorted page in one engine
+     * call, read from the column's range index with no statement to plan,
+     * its sources read by row id along with it. Null when the column has no
+     * range index, for the caller to plan the statement.
+     */
+    public static List<Map<String, Object>> sortedRows(String n, String column, boolean desc, int k, boolean withSource) {
+        init();
+        String out = takeOrThrow(lib.infino_sorted(conn, n, column, desc ? 1 : 0, k, withSource ? 1 : 0)).trim();
+        log.debug("[infino] sorted: {} {} {} k={} -> {} chars", n, column, desc ? "desc" : "asc", k, out.length());
+        return out.equals("null") ? null : rows(out);
+    }
+
     /** Count of rows matching a full-text query ({@code mode} "and" / "or"), without materializing them. */
     public static long count(String n, String c, String q, String mode) {
         init();
