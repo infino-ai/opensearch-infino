@@ -69,4 +69,35 @@ public class InfinoBulkActionFilterTests extends OpenSearchTestCase {
         assertNull(InfinoBulkActionFilter.notAnAlias(write("new_index_created", false), metadata));
         assertNull(InfinoBulkActionFilter.notAnAlias(write("backing_index", false), metadata));
     }
+
+    public void testAnItemToAMissingNameAnotherItemRequiresBeAnAliasFindsNoIndex() {
+        IndexMetadata base = IndexMetadata.builder("base")
+            .settings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                    .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            )
+            .putAlias(AliasMetadata.builder("base_alias"))
+            .build();
+        Metadata metadata = Metadata.builder().put(base, false).build();
+        BulkRequest bulk = new BulkRequest().add(write("base", false))
+            .add(write("new_index", true))
+            .add(write("new_index", false))
+            .add(write("base_alias", true))
+            .add(write("base_alias", false))
+            .add(write("other_new", false));
+        Set<String> aliasRequired = InfinoBulkActionFilter.aliasRequired(bulk);
+
+        // The flagless item to the name the flagged one requires be an alias finds no index, as stock answers it.
+        IndexNotFoundException missing = InfinoBulkActionFilter.notCreated(write("new_index", false), aliasRequired, metadata);
+        assertNotNull(missing);
+        assertEquals(RestStatus.NOT_FOUND, ExceptionsHelper.status(missing));
+        assertEquals("no such index [new_index]", missing.getMessage());
+        // A name that exists, as an index or an alias, is written as usual.
+        assertNull(InfinoBulkActionFilter.notCreated(write("base", false), aliasRequired, metadata));
+        assertNull(InfinoBulkActionFilter.notCreated(write("base_alias", false), aliasRequired, metadata));
+        // A missing name no item requires be an alias is created as usual.
+        assertNull(InfinoBulkActionFilter.notCreated(write("other_new", false), aliasRequired, metadata));
+    }
 }

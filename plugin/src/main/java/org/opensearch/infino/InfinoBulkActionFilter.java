@@ -370,6 +370,7 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
         Map<String, Destination> byIndex = new HashMap<>();
         Map<Destination, List<Integer>> slotsByDestination = new LinkedHashMap<>();
         boolean anyAnswered = false;
+        Set<String> aliasRequired = aliasRequired(bulk);
         for (int slot = 0; slot < bulk.requests().size(); slot++) {
             if (answered[slot] != null) {
                 items[slot] = answered[slot];
@@ -378,6 +379,9 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
             }
             String index = concrete.get(slot);
             IndexNotFoundException noAlias = notAnAlias(bulk.requests().get(slot), state.metadata());
+            if (noAlias == null) {
+                noAlias = notCreated(bulk.requests().get(slot), aliasRequired, state.metadata());
+            }
             if (noAlias != null) {
                 items[slot] = failure(slot, bulk.requests().get(slot), bulk.requests().get(slot).index(), noAlias);
                 anyAnswered = true;
@@ -932,6 +936,22 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
             "[" + DocWriteRequest.REQUIRE_ALIAS + "] request flag is [true] and [" + item.index() + "] is not an alias",
             item.index()
         );
+    }
+
+    /**
+     * Why an item fails, as the stock bulk fails it, when no index or alias
+     * has the name it writes to and another item of the bulk requires that
+     * name be an alias ({@link #aliasRequired}): the name is not created, so
+     * the item finds no index. Null when the name exists or no item requires
+     * it be an alias. Failing it here keeps it out of the part sent on to
+     * the stock bulk, which would create the index for it.
+     */
+    static IndexNotFoundException notCreated(DocWriteRequest<?> item, Set<String> aliasRequired, Metadata metadata) {
+        String name = item.index();
+        if (name == null || !aliasRequired.contains(name) || metadata.getIndicesLookup().containsKey(name)) {
+            return null;
+        }
+        return new IndexNotFoundException(name);
     }
 
     /** Create the indices named, one after another, then tell {@code then}. */

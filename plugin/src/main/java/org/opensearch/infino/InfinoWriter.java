@@ -388,12 +388,24 @@ public final class InfinoWriter {
     /**
      * Take the next append's bulks, under the batch's lock: the staged bulks
      * in order up to the first that names an id a running append names (it
-     * waits for that append, and every bulk after it waits behind it). Marks
-     * the ids the taken bulks name as busy. Empty when nothing can go now.
+     * waits for that append, and every bulk after it waits behind it), or
+     * the first of another index than the bulks before it. Marks the ids the
+     * taken bulks name as busy. Empty when nothing can go now.
+     *
+     * <p>An append holds the writes of one index, which {@link #apply} reads
+     * its sequence numbers for: the table is named after the index, so
+     * writes to an index deleted and created again under that name can be
+     * staged behind writes to the old one.
      */
     private static List<Staged> take(Batch batch) {
         List<Staged> taken = new ArrayList<>();
+        String index = null;
         for (Staged s : batch.staged) {
+            String uuid = s.waiter().shardId().getIndex().getUUID();
+            if (index != null && !index.equals(uuid)) {
+                break;
+            }
+            index = uuid;
             boolean blocked = false;
             for (String id : s.named()) {
                 if (batch.busy.containsKey(id)) {
@@ -511,6 +523,7 @@ public final class InfinoWriter {
         Map<String, Long> stored;
         try {
             String allocation = writerAllocation(staged);
+            // Every write of an append is to one index ({@link #take}).
             String index = staged.isEmpty() ? null : staged.get(0).waiter().shardId().getIndex().getUUID();
             synchronized (batch.seqLock) {
                 boolean newIndex = index != null && !index.equals(batch.seqIndex);
