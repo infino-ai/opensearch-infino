@@ -975,6 +975,56 @@
         index: ep
 
 ---
+"Default mode: a write of an id its table holds twice leaves one row, of the write":
+  # An index named onto a table that outlived another holds rows its
+  # skeleton does not know: its first write of such an id adds a second row,
+  # as a write that landed twice leaves one (#151).
+  - do:
+      indices.create:
+        index: dup_old
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, index.infino.table: os_dup_rows, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      index: { index: dup_old, id: x, refresh: true, body: { n: 1 } }
+  - do:
+      indices.delete: { index: dup_old }
+  - do:
+      indices.create:
+        index: dup
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, index.infino.table: os_dup_rows, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      index: { index: dup, id: x, refresh: true, body: { n: 2 } }
+  - do:
+      infino.sql:
+        body: { query: "SELECT count(*) AS c FROM dup WHERE osid = 'x'" }
+  - match: { rows.0.c: 2 }
+
+  # The next write replaces both rows with its one.
+  - do:
+      index: { index: dup, id: x, refresh: true, body: { n: 3 } }
+  - do:
+      infino.sql:
+        body: { query: "SELECT count(*) AS c, min(n) AS lo, max(n) AS hi FROM dup WHERE osid = 'x'" }
+  - match: { rows.0.c: 1 }
+  - match: { rows.0.lo: 3 }
+  - match: { rows.0.hi: 3 }
+  - do:
+      get: { index: dup, id: x }
+  - match: { _source.n: 3 }
+
+  # Writes after it land.
+  - do:
+      index: { index: dup, id: y, refresh: true, body: { n: 4 } }
+  - do:
+      infino.sql:
+        body: { query: "SELECT count(*) AS c, count(DISTINCT osid) AS ids FROM dup" }
+  - match: { rows.0.c: 2 }
+  - match: { rows.0.ids: 2 }
+  - do:
+      indices.delete: { index: dup }
+
+---
 "Default mode: a document the table cannot hold is refused when it is written, never acknowledged and lost":
   - do:
       indices.create:

@@ -58,6 +58,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -128,6 +129,11 @@ final class InfinoQueryTranslator {
      * keeps the values joined, for its text index).
      */
     static final String LIST_SUFFIX = "[]";
+    /**
+     * What the bridge puts before the name of a field named like {@link #OSID}, {@link #SOURCE} or {@link #SEQ}
+     * for the column holding it: no mapping names a field so.
+     */
+    static final String OWN_COLUMN_PREFIX = ".";
     /**
      * The names a list's subquery gives a document's id and each of its
      * values, and the aliases of the table it reads and of its rows. The
@@ -201,13 +207,27 @@ final class InfinoQueryTranslator {
      * clause is the principal when there is one; otherwise {@code text}, a
      * text clause in should, whose BM25 counts where it matches.
      * {@code ascending} when the request sorts by the score ascending: the
-     * least sums come first.
+     * least sums come first. {@code unrankable} when the query scores its
+     * hits apart in stock but no one ranked read here can: a should clause
+     * the table cannot score, or several text clauses with no principal. Its
+     * hits then all carry {@code offset}. {@code zero} when no clause of the
+     * query scores at all (a bool of filter and must_not clauses alone,
+     * {@link #scoresNothing}): every hit scores 0, as in stock.
      */
-    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending) {
+    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable, boolean zero) {
         static final Scoring NONE = new Scoring(null, 0, List.of());
+        static final Scoring ZERO = new Scoring(null, 0, List.of(), false, false, true);
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses) {
-            this(text, offset, bonuses, false);
+            this(text, offset, bonuses, false, false, false);
+        }
+
+        Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending) {
+            this(text, offset, bonuses, ascending, false, false);
+        }
+
+        Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable) {
+            this(text, offset, bonuses, ascending, unrankable, false);
         }
 
         /** Whether hits rank by more than the principal's BM25 alone: then {@code offset} only shifts every score alike. */
@@ -217,23 +237,31 @@ final class InfinoQueryTranslator {
     }
 
     /**
-     * What a query translates to. {@code span} is set when the query is one
-     * range on a date column with both bounds, and is then exactly the rows
-     * {@code where} keeps; null otherwise.
+     * What a query translates to. {@code principal} is the text clause the
+     * rows are read through ({@link #from}), and {@code ranks} whether its
+     * BM25 scores the hits: false for a clause in filter context, which
+     * scores nothing in stock ({@link #ranked}). {@code span} is set when
+     * the query is one range on a date column with both bounds, and is then
+     * exactly the rows {@code where} keeps; null otherwise.
      */
-    record Translation(String table, String where, TextClause principal, Scoring scoring, Span span) {
+    record Translation(String table, String where, TextClause principal, boolean ranks, Scoring scoring, Span span) {
         Translation(String table, String where, TextClause principal) {
-            this(table, where, principal, Scoring.NONE, null);
+            this(table, where, principal, true, Scoring.NONE, null);
+        }
+
+        /** The principal when its BM25 scores the hits, else null. */
+        TextClause ranked() {
+            return ranks ? principal : null;
         }
 
         /** This translation with {@code where} as its predicate, scored as before; no longer one span. */
         Translation withWhere(String where) {
-            return new Translation(table, where, principal, scoring, null);
+            return new Translation(table, where, principal, ranks, scoring, null);
         }
 
         /** This translation with no clause but the principal's BM25 scoring the hits. */
         Translation unscored() {
-            return new Translation(table, where, principal, Scoring.NONE, span);
+            return new Translation(table, where, principal, ranks, scoring.zero() ? Scoring.ZERO : Scoring.NONE, span);
         }
 
         /**
@@ -242,10 +270,11 @@ final class InfinoQueryTranslator {
          * clause's BM25 ranks its best hits only, so such a query is unscored.
          */
         Translation ascending() {
-            if (principal != null || scoring.text() != null) {
+            if (ranked() != null || scoring.text() != null) {
                 return unscored();
             }
-            return new Translation(table, where, principal, new Scoring(null, scoring.offset(), scoring.bonuses(), true), span);
+            Scoring up = new Scoring(null, scoring.offset(), scoring.bonuses(), true, scoring.unrankable(), scoring.zero());
+            return new Translation(table, where, principal, ranks, up, span);
         }
 
         /** The relation the predicate applies to: the table, or its token-match set. */
@@ -274,9 +303,9 @@ final class InfinoQueryTranslator {
             return principal == null || !plainQuery(principal.query()) ? null : textPredicate(table, principal);
         }
 
-        /** The ranked relation for hits: BM25 over the principal clause, {@code k} candidates. */
+        /** The ranked relation for hits: BM25 over the ranked principal clause ({@link #ranked}), {@code k} candidates. */
         String rankedFrom(int k) {
-            return rankedFrom(principal, k);
+            return rankedFrom(ranked(), k);
         }
 
         /** The ranked relation for hits: BM25 over {@code text}, {@code k} candidates. */
@@ -337,6 +366,16 @@ final class InfinoQueryTranslator {
     /** How the translator reads rows of the table: a nested query's candidates, with their sources. */
     private final Function<String, List<Map<String, Object>>> rows;
     private TextClause principal;
+    /** Whether {@link #principal} came from a clause that scores, not one in filter context. */
+    private boolean principalRanks;
+    /** How many filter clauses enclose the clause being translated: within any, a clause scores nothing. */
+    private int filtering;
+    /**
+     * Whether a text clause in filter context is a predicate rather than the
+     * principal: so when another text clause scores the hits, which must
+     * then be the ranked one, read with the filter's restriction on its rows.
+     */
+    private boolean filterTextIsPredicate;
     /** Each nested clause's matching documents with their scores, read once whether it filters, scores or both. */
     private final Map<NestedQueryBuilder, Map<String, Double>> nestedScores = new java.util.IdentityHashMap<>();
     /** Each BM25-scored term clause's score ({@link #bm25TermScore}), read once per clause. */
@@ -374,11 +413,70 @@ final class InfinoQueryTranslator {
     /** {@link #translate(QueryBuilder, Map, String, long)}, reading the table's rows through {@code rows}. */
     static Translation translate(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis, Function<String, List<Map<String, Object>>> rows) {
         InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, false, false, rows);
+        t.filterTextIsPredicate = t.scoresText(qb);
         String where = t.predicate(qb, true);
         if (where == null) {
             return null;
         }
-        return new Translation(table, where, t.principal, t.scoring(qb), qb instanceof RangeQueryBuilder ? t.span : null);
+        return new Translation(table, where, t.principal, t.principalRanks, t.scoring(qb), qb instanceof RangeQueryBuilder ? t.span : null);
+    }
+
+    /**
+     * Whether a text clause scores the hits of {@code qb}: one reached
+     * through must and should clauses alone (filter and must_not clauses
+     * score nothing) that reads the token index as a principal would.
+     */
+    private boolean scoresText(QueryBuilder qb) {
+        if (qb instanceof BoolQueryBuilder b) {
+            for (QueryBuilder c : b.must()) {
+                if (scoresText(c)) {
+                    return true;
+                }
+            }
+            for (QueryBuilder c : b.should()) {
+                if (scoresText(c)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (!(qb instanceof MatchQueryBuilder
+            || qb instanceof MatchPhraseQueryBuilder
+            || qb instanceof MultiMatchQueryBuilder
+            || qb instanceof QueryStringQueryBuilder
+            || qb instanceof SimpleQueryStringBuilder)) {
+            return false;
+        }
+        InfinoQueryTranslator alone = new InfinoQueryTranslator(cols, table, nowMillis, trusted, columnValuesOnly, rows);
+        try {
+            alone.predicate(qb, true);
+        } catch (RuntimeException e) {
+            // A clause the table cannot read is refused when the query is translated.
+            return false;
+        }
+        return alone.principal != null;
+    }
+
+    /**
+     * Whether no clause of {@code qb} scores: a bool whose clauses are all
+     * filter and must_not ones, or must and should ones that score nothing
+     * themselves. Lucene scores its hits 0.
+     */
+    static boolean scoresNothing(QueryBuilder qb) {
+        if (!(qb instanceof BoolQueryBuilder b) || !b.hasClauses()) {
+            return false;
+        }
+        for (QueryBuilder c : b.should()) {
+            if (!scoresNothing(c)) {
+                return false;
+            }
+        }
+        for (QueryBuilder c : b.must()) {
+            if (!scoresNothing(c)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // ---- scoring ----
@@ -393,17 +491,21 @@ final class InfinoQueryTranslator {
         List<Bonus> bonuses = new ArrayList<>();
         List<TextClause> texts = new ArrayList<>();
         boolean[] unscored = { false };
+        if (scoresNothing(root)) {
+            return Scoring.ZERO;
+        }
         required(root, offset, bonuses, texts, unscored);
-        if (principal == null && (unscored[0] || texts.size() > 1)) {
+        TextClause ranked = principalRanks ? principal : null;
+        if (ranked == null && (unscored[0] || texts.size() > 1)) {
             // A should clause the table cannot score (or a second text clause,
             // which would add its BM25 beside the first) would leave some of the
             // hits it matches at 0, under hits it outscores in stock: with no
             // ranked clause, the hits keep the one score they all had.
-            return offset[0] == 0 ? Scoring.NONE : new Scoring(null, offset[0], List.of());
+            return new Scoring(null, offset[0], List.of(), false, true);
         }
         // Beside a ranked clause a should clause the table cannot score adds
         // nothing, as before; the others add theirs.
-        TextClause text = principal == null && texts.size() == 1 ? texts.get(0) : null;
+        TextClause text = ranked == null && texts.size() == 1 ? texts.get(0) : null;
         return offset[0] == 0 && bonuses.isEmpty() && text == null ? Scoring.NONE : new Scoring(text, offset[0], List.copyOf(bonuses));
     }
 
@@ -435,7 +537,7 @@ final class InfinoQueryTranslator {
             // other (a text clause on a second column, a query string over
             // several, a script) scores nothing here, where stock scores it.
             TextClause t = textOnly(qb);
-            if (t == null || !t.equals(principal)) {
+            if (t == null || !principalRanks || !t.equals(principal)) {
                 unscored[0] = true;
             }
         }
@@ -746,9 +848,18 @@ final class InfinoQueryTranslator {
         return c;
     }
 
-    /** The field a column holds: its own name, or a list column's field ({@link #LIST_SUFFIX}). */
+    /**
+     * The field a column holds: its own name, a list column's field ({@link #LIST_SUFFIX}), or the field named like
+     * a reserved column ({@link #OWN_COLUMN_PREFIX}).
+     */
     static String fieldOf(String column) {
-        return column.endsWith(LIST_SUFFIX) ? column.substring(0, column.length() - LIST_SUFFIX.length()) : column;
+        String field = column.endsWith(LIST_SUFFIX) ? column.substring(0, column.length() - LIST_SUFFIX.length()) : column;
+        return field.startsWith(OWN_COLUMN_PREFIX) ? field.substring(OWN_COLUMN_PREFIX.length()) : field;
+    }
+
+    /** The name a column is looked up by: its field's, except a list column's, which is its own. */
+    static String keyOf(String column) {
+        return column.endsWith(LIST_SUFFIX) ? column : fieldOf(column);
     }
 
     /** The list column holding a field's values for the documents that give it several; null when no document has. */
@@ -822,7 +933,8 @@ final class InfinoQueryTranslator {
             if (name.equals(OSID) || name.equals(SOURCE) || name.equals(SEQ)) {
                 continue;
             }
-            if (name.startsWith(under) || (pattern && org.opensearch.common.regex.Regex.simpleMatch(field, name))) {
+            String held = fieldOf(name);
+            if (held.startsWith(under) || (pattern && org.opensearch.common.regex.Regex.simpleMatch(field, held))) {
                 present.add(quoteIdent(name) + " IS NOT NULL");
             }
         }
@@ -1039,7 +1151,12 @@ final class InfinoQueryTranslator {
             and.add(predicate(c, positive));
         }
         for (QueryBuilder c : b.filter()) {
-            and.add(predicate(c, positive));
+            filtering++;
+            try {
+                and.add(predicate(c, positive));
+            } finally {
+                filtering--;
+            }
         }
         if (and.contains(null)) {
             return null;
@@ -1696,13 +1813,24 @@ final class InfinoQueryTranslator {
                 "[infino] a knn filter matching text on [" + column + "] (" + query + ") is not served: the engine narrows its vector search by column values, and a text match is a search of its own"
             );
         }
-        if (positive && principal == null) {
+        // A clause in filter context scores nothing: it may still be the
+        // principal the rows are read through, unranked, unless another text
+        // clause scores the hits.
+        boolean scores = filtering == 0;
+        if (positive && principal == null && (scores || !filterTextIsPredicate)) {
             principal = new TextClause(column, query, mode);
+            principalRanks = scores;
             return ALL;
         }
-        if (positive && principal != null && principal.column().equals(column) && "and".equals(mode) && "and".equals(principal.mode())) {
-            // A second required clause on the same column joins the ranked query, so
-            // the score reflects both; under all-terms mode the join reads the same.
+        if (positive
+            && principal != null
+            && principalRanks == scores
+            && principal.column().equals(column)
+            && "and".equals(mode)
+            && "and".equals(principal.mode())) {
+            // A second required clause on the same column joins the principal, so
+            // a ranked one's score reflects both; under all-terms mode the join
+            // reads the same. A clause scoring otherwise than the principal stays apart.
             principal = new TextClause(column, principal.query() + " " + query, mode);
             return ALL;
         }
@@ -1736,6 +1864,215 @@ final class InfinoQueryTranslator {
         // text_match is a predicate the scan answers from the index; inside an
         // aggregate's expression it would be evaluated row by row instead.
         return predicate.contains(TEXT_SUBQUERY) || predicate.contains(TEXT_PREDICATE);
+    }
+
+    /** One {@code text_match} call exactly as {@link #textPredicate} writes it: column, plain words, mode. */
+    private static final Pattern TEXT_MATCH_CALL = Pattern.compile("text_match\\(\"((?:[^\"]|\"\")*)\", '((?:[^']|'')*)', '(and|or)'\\)");
+    /** The SQL keywords whose own AND would be read as a conjunction by {@link #junction}. */
+    private static final Pattern AMBIGUOUS_AND = Pattern.compile("(?i)\\b(BETWEEN|CASE)\\b");
+
+    /**
+     * The statement that counts the rows of {@code table} matching {@code where}
+     * up to {@code cap} from the token index, or null when {@code where} is not
+     * filters joined by AND to one OR of plain-words {@code text_match} calls.
+     * Each column's clauses become one {@code token_match} part (the words of
+     * its any-word clauses, and of its one-word all-words clauses, merged into
+     * one any-word match; another all-words clause a part of its own), each
+     * under the filters. A row counts in the first part that holds it only:
+     * every later part leaves out the rows an earlier part's clause matches, so
+     * the parts are disjoint and their rows add up with no set of ids to keep,
+     * and the cap stops the count. The scan the predicate would run instead
+     * reads the rows the filters keep and matches each against every clause.
+     */
+    static String textCountStatement(String table, String where, long cap) {
+        List<String> conjuncts = new ArrayList<>();
+        if (!flatten(where, "AND", conjuncts)) {
+            return null;
+        }
+        List<String> filters = new ArrayList<>();
+        String text = null;
+        for (String c : conjuncts) {
+            if (!readsTextIndex(c) && !c.contains("token_match(") && !c.toUpperCase(Locale.ROOT).contains("SELECT")) {
+                filters.add("(" + c + ")");
+            } else if (text == null) {
+                text = c;
+            } else {
+                return null;
+            }
+        }
+        List<String> calls = new ArrayList<>();
+        if (text == null || !flatten(text, "OR", calls)) {
+            return null;
+        }
+        // Per column: the words any of which a row may hold, then each clause needing all of its words.
+        Map<String, List<String>> anyWords = new LinkedHashMap<>();
+        Map<String, List<String>> allWords = new LinkedHashMap<>();
+        for (String call : calls) {
+            java.util.regex.Matcher m = TEXT_MATCH_CALL.matcher(call);
+            if (!m.matches()) {
+                return null;
+            }
+            String column = m.group(1).replace("\"\"", "\"");
+            String words = m.group(2).replace("''", "'");
+            if (!plainQuery(words)) {
+                return null;
+            }
+            boolean any = "or".equals(m.group(3)) || oneToken(words);
+            (any ? anyWords : allWords).computeIfAbsent(column, k -> new ArrayList<>()).add(words);
+            (any ? allWords : anyWords).computeIfAbsent(column, k -> new ArrayList<>());
+        }
+        List<TextClause> parts = new ArrayList<>();
+        for (Map.Entry<String, List<String>> e : anyWords.entrySet()) {
+            if (!e.getValue().isEmpty()) {
+                parts.add(new TextClause(e.getKey(), String.join(" ", e.getValue()), "or"));
+            }
+            for (String words : allWords.get(e.getKey())) {
+                parts.add(new TextClause(e.getKey(), words, "and"));
+            }
+        }
+        List<String> selects = new ArrayList<>();
+        for (int i = 0; i < parts.size(); i++) {
+            TextClause part = parts.get(i);
+            List<String> conditions = new ArrayList<>(filters);
+            for (TextClause earlier : parts.subList(0, i)) {
+                // A row an earlier part holds; a NULL there holds no word.
+                conditions.add(not(textPredicate(table, earlier)));
+            }
+            selects.add(
+                "SELECT 1 AS one FROM token_match("
+                    + literal(table)
+                    + ", "
+                    + literal(part.column())
+                    + ", "
+                    + literal(part.query())
+                    + ", "
+                    + literal(part.mode())
+                    + ")"
+                    + (conditions.isEmpty() ? "" : " WHERE " + String.join(" AND ", conditions))
+            );
+        }
+        if (selects.size() == 1) {
+            return "SELECT COUNT(*) AS c FROM (" + selects.get(0) + " LIMIT " + cap + ") capped";
+        }
+        return "SELECT COUNT(*) AS c FROM (SELECT one FROM (" + String.join(" UNION ALL ", selects) + ") matched LIMIT " + cap + ") capped";
+    }
+
+    /**
+     * Adds to {@code out} the parts {@code expr} joins with {@code op} at any
+     * depth of parentheses holding that operator only, each with its outer
+     * parentheses removed; false when a level mixes AND with OR, or holds the
+     * other operator where {@code op} is asked for (an OR inside the ANDs is one
+     * part: it is the OR flattened next), or a keyword whose AND is its own.
+     */
+    private static boolean flatten(String expr, String op, List<String> out) {
+        String s = unwrap(expr.trim());
+        List<String> parts = new ArrayList<>();
+        String found = junction(s, parts);
+        if (found == null) {
+            return false;
+        }
+        if (found.isEmpty() || (!found.equals(op) && "AND".equals(op))) {
+            if (found.isEmpty() && AMBIGUOUS_AND.matcher(s).find()) {
+                return false;
+            }
+            out.add(s);
+            return true;
+        }
+        if (!found.equals(op)) {
+            return false;
+        }
+        for (String p : parts) {
+            if (!flatten(p, op, out)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** {@code s} without parentheses enclosing the whole of it. */
+    private static String unwrap(String s) {
+        while (s.length() > 1 && s.charAt(0) == '(' && closing(s, 0) == s.length() - 1) {
+            s = s.substring(1, s.length() - 1).trim();
+        }
+        return s;
+    }
+
+    /** The index of the parenthesis closing the one at {@code open}, outside quotes; -1 when none. */
+    private static int closing(String s, int open) {
+        int depth = 0;
+        for (int i = open; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\'' || c == '"') {
+                i = quoteEnd(s, i);
+                if (i < 0) {
+                    return -1;
+                }
+            } else if (c == '(') {
+                depth++;
+            } else if (c == ')' && --depth == 0) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** The index of the quote closing the one at {@code start} (a doubled quote is part of the text); -1 when none. */
+    private static int quoteEnd(String s, int start) {
+        char q = s.charAt(start);
+        for (int i = start + 1; i < s.length(); i++) {
+            if (s.charAt(i) == q) {
+                if (i + 1 < s.length() && s.charAt(i + 1) == q) {
+                    i++;
+                } else {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * The operator joining {@code s}'s parts outside quotes and parentheses
+     * ("AND" or "OR", the parts added to {@code parts}), "" when there is none,
+     * null when both join them or the quotes and parentheses do not balance.
+     */
+    private static String junction(String s, List<String> parts) {
+        String op = "";
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\'' || c == '"') {
+                i = quoteEnd(s, i);
+                if (i < 0) {
+                    return null;
+                }
+            } else if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                if (--depth < 0) {
+                    return null;
+                }
+            } else if (depth == 0 && Character.isWhitespace(c)) {
+                String here = s.regionMatches(true, i, " AND ", 0, 5) ? "AND" : s.regionMatches(true, i, " OR ", 0, 4) ? "OR" : null;
+                if (here != null) {
+                    if (!op.isEmpty() && !op.equals(here)) {
+                        return null;
+                    }
+                    op = here;
+                    parts.add(s.substring(start, i));
+                    i += here.length() + 1;
+                    start = i + 1;
+                }
+            }
+        }
+        if (depth != 0) {
+            return null;
+        }
+        if (!op.isEmpty()) {
+            parts.add(s.substring(start));
+        }
+        return op;
     }
 
     /**
@@ -1877,7 +2214,7 @@ final class InfinoQueryTranslator {
             for (Map.Entry<String, Column> entry : cols.entrySet()) {
                 Column c = entry.getValue();
                 if (c.fts() && !InfinoNative.isAlias(entry.getKey(), c) && !c.name().equals(OSID) && (trusted || !c.masked())) {
-                    targets.add(c.name());
+                    targets.add(entry.getKey());
                 }
             }
         }

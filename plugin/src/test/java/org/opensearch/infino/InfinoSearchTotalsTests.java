@@ -30,6 +30,25 @@ public class InfinoSearchTotalsTests extends OpenSearchTestCase {
         assertEquals(new TotalHits(CAP + 1, TotalHits.Relation.EQUAL_TO), InfinoSearch.reported(CAP + 1, true, source));
     }
 
+    /**
+     * Tracking every hit has no limit, though the request carries the largest
+     * int as one: a table holds more rows than any Lucene shard holds
+     * documents, and a total past that number is reported as counted.
+     */
+    public void testTrackingEveryHitCountsPastTheLargestInt() {
+        SearchSourceBuilder source = new SearchSourceBuilder().trackTotalHits(true);
+        long justPast = (long) Integer.MAX_VALUE + 1;
+        long aTrillion = 1_000_000_000_000L;
+        assertEquals(new TotalHits(Integer.MAX_VALUE, TotalHits.Relation.EQUAL_TO), InfinoSearch.reported(Integer.MAX_VALUE, true, source));
+        assertEquals(new TotalHits(justPast, TotalHits.Relation.EQUAL_TO), InfinoSearch.reported(justPast, true, source));
+        assertEquals(new TotalHits(aTrillion, TotalHits.Relation.EQUAL_TO), InfinoSearch.reported(aTrillion, true, source));
+        // A limit the request names is still a limit, however many rows there are.
+        SearchSourceBuilder limited = new SearchSourceBuilder().trackTotalHitsUpTo(50_000);
+        assertEquals(new TotalHits(50_000, TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO), InfinoSearch.reported(aTrillion, true, limited));
+        // And a search that tracks none reports none.
+        assertNull(InfinoSearch.reported(aTrillion, true, new SearchSourceBuilder().trackTotalHits(false)));
+    }
+
     /** A hit statement's one row. */
     private static final List<Map<String, Object>> ONE_ROW = List.of(Map.of(InfinoQueryTranslator.OSID, "d1"));
 
@@ -97,5 +116,36 @@ public class InfinoSearchTotalsTests extends OpenSearchTestCase {
         assertEquals(1, InfinoSearch.besideTotal(0, 1));
         assertEquals(7, InfinoSearch.besideTotal(7, 3));
         assertEquals(0, InfinoSearch.besideTotal(0, 0));
+    }
+
+    /** Rows of a page as its statement chose them: ids only. */
+    private static List<Map<String, Object>> idRows(String... ids) {
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (String id : ids) {
+            rows.add(Map.of(InfinoQueryTranslator.OSID, id));
+        }
+        return rows;
+    }
+
+    public void testOnlyTheWindowsSourcesAreRead() {
+        // from 2, size 2: the rows before the window keep no source and are not looked up.
+        List<List<String>> asked = new ArrayList<>();
+        List<Map<String, Object>> page = InfinoSearch.withSources(idRows("d1", "d2", "d3", "d4", "d5"), 2, 4, ids -> {
+            asked.add(ids);
+            return Map.of("d3", "{}", "d4", "{}");
+        });
+        assertEquals(List.of(List.of("d3", "d4")), asked);
+        assertEquals(4, page.size());
+        assertFalse(page.get(0).containsKey(InfinoQueryTranslator.SOURCE));
+        assertFalse(page.get(1).containsKey(InfinoQueryTranslator.SOURCE));
+        assertEquals("{}", page.get(2).get(InfinoQueryTranslator.SOURCE));
+        assertEquals("d4", page.get(3).get(InfinoQueryTranslator.OSID));
+    }
+
+    public void testAWindowPastThePageReadsNoSource() {
+        List<Map<String, Object>> page = InfinoSearch.withSources(idRows("d1"), 5, 10, ids -> {
+            throw new AssertionError("no lookup expected");
+        });
+        assertEquals(1, page.size());
     }
 }

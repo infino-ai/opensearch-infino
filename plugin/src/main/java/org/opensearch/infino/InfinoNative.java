@@ -89,6 +89,8 @@ public final class InfinoNative {
     /** Where the engine caches what it reads from the node's own storage (see {@link InfinoPlugin#CACHE_DIR}); null for none. */
     private static volatile String cacheDir;
     private static volatile Pointer conn;
+    /** See {@link #opens()}; written under the class lock that opens a connection. */
+    private static volatile long opens;
     /** The target {@link #conn} was opened to. */
     private static volatile Target opened;
     /** The target the node is configured for: its own URI until the settings or the account route say otherwise. */
@@ -112,6 +114,8 @@ public final class InfinoNative {
     private static final Set<String> DATE_TYPES = Set.of("date", "date_nanos");
     /** The mapping types whose values a sort compares as 32-bit floats (stock's float comparator). */
     private static final Set<String> FLOAT_TYPES = Set.of("float", "half_float");
+    /** The integral field types narrower than a long, whose sort stock compares as 32-bit ints. */
+    private static final Set<String> INT_TYPES = Set.of("integer", "short", "byte");
     /** The type of a multi-field that holds its field's value whole, the exact form of a text field. */
     private static final String KEYWORD_TYPE = "keyword";
     /** The other type that holds a value whole: a wildcard field compares the value as a keyword one does. */
@@ -351,6 +355,7 @@ public final class InfinoNative {
                 log.info("[infino] tables are served from {}", target.name());
             }
             boolean switched = conn != null;
+            opens++;
             COLUMNS.clear();
             SOURCES.invalidateAll();
             InfinoRequestCache.changedAll();
@@ -360,6 +365,17 @@ public final class InfinoNative {
                 InfinoRequestCache.clearShardCaches();
             }
         }
+    }
+
+    /**
+     * How many connections the node has opened. A connection holds what
+     * each table was declared with (how its fields keep their values, and
+     * for an attached table that it is one and what it is read with), and a
+     * new one holds none of it: whoever remembers that a table is declared
+     * ({@link InfinoTables}) declares it again when this has moved.
+     */
+    static long opens() {
+        return opens;
     }
 
     /** Why an open returned null, as the exception the caller gets. */
@@ -627,11 +643,42 @@ public final class InfinoNative {
      * default BM25 ({@link Mapping}).
      */
     public static void ensureTable(String name, String mappingJson, boolean defaultBm25) {
+        ensureTable(name, mappingJson, defaultBm25, false);
+    }
+
+    /**
+     * Why an index with this mapping cannot be attached to table
+     * {@code name} ({@link InfinoPlugin#INFINO_ATTACHED}), or null when it
+     * can: the table is missing, is one the plugin wrote, or disagrees with
+     * the mapping. Asked when the index is created, so the request is
+     * answered with the reason; nothing is declared and nothing changes.
+     * Null too when the table could not be read at all, which says nothing
+     * about it: the index's shard declares the table when it starts and
+     * reports what it finds then.
+     */
+    public static String attachRefusal(String name, String mappingJson) {
+        init();
+        try {
+            Object refused = object(takeOrThrow(lib.infino_attach_check(conn, name, mappingJson))).get("refused");
+            return refused == null ? null : refused.toString();
+        } catch (InfinoException e) {
+            log.warn("[infino] table {} could not be read to check an attach to it: {}", name, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * As {@link #ensureTable(String, String, boolean)}, or for an
+     * {@code attached} index ({@link InfinoPlugin#INFINO_ATTACHED}) declare
+     * the table it reads without creating or changing it: a missing table,
+     * or a mapped field the table has no column for, is refused.
+     */
+    public static void ensureTable(String name, String mappingJson, boolean defaultBm25, boolean attached) {
         init();
         COLUMNS.remove(name);
         InfinoRequestCache.changed(name);
         try {
-            takeOrThrow(lib.infino_ensure_table(conn, name, mappingJson));
+            takeOrThrow(attached ? lib.infino_attach_table(conn, name, mappingJson) : lib.infino_ensure_table(conn, name, mappingJson));
         } finally {
             InfinoRequestCache.changed(name);
             wrote(name);
@@ -650,7 +697,9 @@ public final class InfinoNative {
      * column holds the value the multi-field indexes whole (a log mapping's
      * {@code request.raw} under the text field {@code request}, as a dynamic
      * mapping's {@code name.keyword}); each date field's declared format;
-     * and each {@code float} or {@code half_float} field ({@code floatFields}).
+     * each {@code float} or {@code half_float} field ({@code floatFields});
+     * and each {@code integer}, {@code short} or {@code byte} field
+     * ({@code intFields}).
      * A wildcard multi-field reads as a keyword one. {@code multiFields} are
      * every multi-field's path, and {@code normalized} the keyword and
      * wildcard fields with a normalizer, whose values the table keeps as
@@ -664,6 +713,7 @@ public final class InfinoNative {
         Set<String> similarityFields,
         Set<String> otherSimilarityFields,
         Set<String> floatFields,
+        Set<String> intFields,
         Set<String> multiFields,
         Set<String> normalized,
         boolean defaultBm25
@@ -686,6 +736,7 @@ public final class InfinoNative {
                 new LinkedHashMap<>(),
                 new LinkedHashMap<>(),
                 new LinkedHashMap<>(),
+                new HashSet<>(),
                 new HashSet<>(),
                 new HashSet<>(),
                 new HashSet<>(),
@@ -721,6 +772,9 @@ public final class InfinoNative {
                 }
                 if (field.get(TYPE) instanceof String type && FLOAT_TYPES.contains(type)) {
                     floatFields.add(path);
+                }
+                if (field.get(TYPE) instanceof String type && INT_TYPES.contains(type)) {
+                    intFields.add(path);
                 }
                 if (scoresBySimilarity(field)) {
                     similarityFields.add(path);
@@ -825,6 +879,16 @@ public final class InfinoNative {
     }
 
     /**
+     * The fields of {@code table} its mapping declares {@code integer},
+     * {@code short} or {@code byte}, which a sort compares as 32-bit ints;
+     * empty for a table no mapping has declared yet.
+     */
+    static Set<String> intFields(String table) {
+        Mapping mapping = MAPPINGS.get(table);
+        return mapping == null ? Set.of() : mapping.intFields();
+    }
+
+    /**
      * Column name → description; empty if the table does not exist yet. A
      * field alias is a name of its target's column, as a keyword multi-field
      * is of its string field's, and a date column carries the format its
@@ -853,15 +917,22 @@ public final class InfinoNative {
                 null,
                 (String) c.get("elem")
             );
+            String key = InfinoQueryTranslator.keyOf(column);
             // A list column of a mapped field reads its dates as the field's do.
             String format = mapping == null ? null : mapping.dateFormats().get(InfinoQueryTranslator.fieldOf(column));
-            if (mapping != null && mapping.similarityFields().contains(column)) {
+            if (mapping != null && mapping.similarityFields().contains(key)) {
                 described = described.scoredBySimilarity();
             }
             if (mapping != null && mapping.otherSimilarityFields().contains(InfinoQueryTranslator.fieldOf(column))) {
                 described = described.scoredByOtherSimilarity();
             }
-            out.put(column, format == null ? described : described.dated(format));
+            Column kept = format == null ? described : described.dated(format);
+            // A field named like a reserved column is looked up by its name, in place of the reserved column.
+            if (key.equals(column)) {
+                out.putIfAbsent(key, kept);
+            } else {
+                out.put(key, kept);
+            }
         }
         for (Map.Entry<String, String> alias : (mapping == null ? Map.<String, String>of() : mapping.aliases()).entrySet()) {
             Column target = out.get(alias.getValue());
@@ -887,7 +958,7 @@ public final class InfinoNative {
 
     /** Whether {@code key} names {@code column} by an alias rather than by the column's own name. */
     static boolean isAlias(String key, Column column) {
-        return !key.equals(column.name());
+        return !key.equals(InfinoQueryTranslator.keyOf(column.name()));
     }
 
     public static void forgetColumns(String name) {
@@ -911,6 +982,10 @@ public final class InfinoNative {
      * also build the adjacency index the engine's graph walks read over its rows.
      */
     public static int optimize(String name, Settings indexSettings) {
+        if (InfinoPlugin.INFINO_ATTACHED.get(indexSettings)) {
+            // An attached index reads a table it does not own: compacting it is its owner's to do.
+            return 0;
+        }
         init();
         boolean edges = InfinoPlugin.INFINO_EDGES.get(indexSettings);
         InfinoRequestCache.changed(name);
@@ -1303,6 +1378,22 @@ public final class InfinoNative {
         String out = takeOrThrow(lib.infino_bm25(conn, n, c, q, mode, k));
         log.debug("[infino] bm25: {} {} {} k={} -> {} chars", n, c, q, k, out.length());
         return rows(out);
+    }
+
+    /**
+     * The first {@code k} rows of table {@code n} by {@code column},
+     * descending when {@code desc}, rows sharing a value in row id order and
+     * rows without one last, each with its id, row id, the column's value
+     * and, when {@code withSource}, its source: a sorted page in one engine
+     * call, read from the column's range index with no statement to plan,
+     * its sources read by row id along with it. Null when the column has no
+     * range index, for the caller to plan the statement.
+     */
+    public static List<Map<String, Object>> sortedRows(String n, String column, boolean desc, int k, boolean withSource) {
+        init();
+        String out = takeOrThrow(lib.infino_sorted(conn, n, column, desc ? 1 : 0, k, withSource ? 1 : 0)).trim();
+        log.debug("[infino] sorted: {} {} {} k={} -> {} chars", n, column, desc ? "desc" : "asc", k, out.length());
+        return out.equals("null") ? null : rows(out);
     }
 
     /** Count of rows matching a full-text query ({@code mode} "and" / "or"), without materializing them. */

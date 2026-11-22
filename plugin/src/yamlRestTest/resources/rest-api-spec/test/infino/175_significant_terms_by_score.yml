@@ -486,3 +486,511 @@
             sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1, shard_min_doc_count: 2 } }
   - length: { aggregations.sig.buckets: 1 }
   - match: { aggregations.sig.buckets.0.key: r1 }
+
+---
+"significant_terms under a terms parent keeps each bucket's best by score past the fence, as a Lucene twin does":
+  # The plugin reads each bucket's 2 * shard_size + 1 best terms by an
+  # upper bound of their score. In a, x1..x5 are rare there but common in
+  # the documents without a group: their bound ties a2's score, so the
+  # fence proves nothing and a is read in full. In b the counts fall
+  # steadily and the fence holds. Either way a bucket keeps the terms a
+  # stock shard keeps: a1, a2 and b1, b2.
+  - do:
+      indices.create:
+        index: sbf_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              group: { type: keyword }
+              tag: { type: keyword }
+  - do:
+      indices.create:
+        index: sbf_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              group: { type: keyword }
+              tag: { type: keyword }
+  - do:
+      indices.create:
+        index: sbf_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              group: { type: keyword }
+              tag: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: sbf_luc
+        body:
+          - index: { _id: "d0" }
+          - { group: a, tag: a1 }
+          - index: { _id: "d1" }
+          - { group: a, tag: a1 }
+          - index: { _id: "d2" }
+          - { group: a, tag: a2 }
+          - index: { _id: "d3" }
+          - { group: a, tag: x1 }
+          - index: { _id: "d4" }
+          - { group: a, tag: x2 }
+          - index: { _id: "d5" }
+          - { group: a, tag: x3 }
+          - index: { _id: "d6" }
+          - { group: a, tag: x4 }
+          - index: { _id: "d7" }
+          - { group: a, tag: x5 }
+          - index: { _id: "d8" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d9" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d10" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d11" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d12" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d13" }
+          - { group: b, tag: b2 }
+          - index: { _id: "d14" }
+          - { group: b, tag: b2 }
+          - index: { _id: "d15" }
+          - { group: b, tag: b2 }
+          - index: { _id: "d16" }
+          - { group: b, tag: b2 }
+          - index: { _id: "d17" }
+          - { group: b, tag: b3 }
+          - index: { _id: "d18" }
+          - { group: b, tag: b3 }
+          - index: { _id: "d19" }
+          - { group: b, tag: b3 }
+          - index: { _id: "d20" }
+          - { group: b, tag: b4 }
+          - index: { _id: "d21" }
+          - { group: b, tag: b4 }
+          - index: { _id: "d22" }
+          - { group: b, tag: b5 }
+          - index: { _id: "d23" }
+          - { group: b, tag: b6 }
+          - index: { _id: "d24" }
+          - { tag: x1 }
+          - index: { _id: "d25" }
+          - { tag: x1 }
+          - index: { _id: "d26" }
+          - { tag: x1 }
+          - index: { _id: "d27" }
+          - { tag: x1 }
+          - index: { _id: "d28" }
+          - { tag: x2 }
+          - index: { _id: "d29" }
+          - { tag: x2 }
+          - index: { _id: "d30" }
+          - { tag: x2 }
+          - index: { _id: "d31" }
+          - { tag: x2 }
+          - index: { _id: "d32" }
+          - { tag: x3 }
+          - index: { _id: "d33" }
+          - { tag: x3 }
+          - index: { _id: "d34" }
+          - { tag: x3 }
+          - index: { _id: "d35" }
+          - { tag: x3 }
+          - index: { _id: "d36" }
+          - { tag: x4 }
+          - index: { _id: "d37" }
+          - { tag: x4 }
+          - index: { _id: "d38" }
+          - { tag: x4 }
+          - index: { _id: "d39" }
+          - { tag: x4 }
+          - index: { _id: "d40" }
+          - { tag: x5 }
+          - index: { _id: "d41" }
+          - { tag: x5 }
+          - index: { _id: "d42" }
+          - { tag: x5 }
+          - index: { _id: "d43" }
+          - { tag: x5 }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sbf_def
+        body:
+          - index: { _id: "d0" }
+          - { group: a, tag: a1 }
+          - index: { _id: "d1" }
+          - { group: a, tag: a1 }
+          - index: { _id: "d2" }
+          - { group: a, tag: a2 }
+          - index: { _id: "d3" }
+          - { group: a, tag: x1 }
+          - index: { _id: "d4" }
+          - { group: a, tag: x2 }
+          - index: { _id: "d5" }
+          - { group: a, tag: x3 }
+          - index: { _id: "d6" }
+          - { group: a, tag: x4 }
+          - index: { _id: "d7" }
+          - { group: a, tag: x5 }
+          - index: { _id: "d8" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d9" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d10" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d11" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d12" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d13" }
+          - { group: b, tag: b2 }
+          - index: { _id: "d14" }
+          - { group: b, tag: b2 }
+          - index: { _id: "d15" }
+          - { group: b, tag: b2 }
+          - index: { _id: "d16" }
+          - { group: b, tag: b2 }
+          - index: { _id: "d17" }
+          - { group: b, tag: b3 }
+          - index: { _id: "d18" }
+          - { group: b, tag: b3 }
+          - index: { _id: "d19" }
+          - { group: b, tag: b3 }
+          - index: { _id: "d20" }
+          - { group: b, tag: b4 }
+          - index: { _id: "d21" }
+          - { group: b, tag: b4 }
+          - index: { _id: "d22" }
+          - { group: b, tag: b5 }
+          - index: { _id: "d23" }
+          - { group: b, tag: b6 }
+          - index: { _id: "d24" }
+          - { tag: x1 }
+          - index: { _id: "d25" }
+          - { tag: x1 }
+          - index: { _id: "d26" }
+          - { tag: x1 }
+          - index: { _id: "d27" }
+          - { tag: x1 }
+          - index: { _id: "d28" }
+          - { tag: x2 }
+          - index: { _id: "d29" }
+          - { tag: x2 }
+          - index: { _id: "d30" }
+          - { tag: x2 }
+          - index: { _id: "d31" }
+          - { tag: x2 }
+          - index: { _id: "d32" }
+          - { tag: x3 }
+          - index: { _id: "d33" }
+          - { tag: x3 }
+          - index: { _id: "d34" }
+          - { tag: x3 }
+          - index: { _id: "d35" }
+          - { tag: x3 }
+          - index: { _id: "d36" }
+          - { tag: x4 }
+          - index: { _id: "d37" }
+          - { tag: x4 }
+          - index: { _id: "d38" }
+          - { tag: x4 }
+          - index: { _id: "d39" }
+          - { tag: x4 }
+          - index: { _id: "d40" }
+          - { tag: x5 }
+          - index: { _id: "d41" }
+          - { tag: x5 }
+          - index: { _id: "d42" }
+          - { tag: x5 }
+          - index: { _id: "d43" }
+          - { tag: x5 }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: sbf_prx
+        body:
+          - index: { _id: "d0" }
+          - { group: a, tag: a1 }
+          - index: { _id: "d1" }
+          - { group: a, tag: a1 }
+          - index: { _id: "d2" }
+          - { group: a, tag: a2 }
+          - index: { _id: "d3" }
+          - { group: a, tag: x1 }
+          - index: { _id: "d4" }
+          - { group: a, tag: x2 }
+          - index: { _id: "d5" }
+          - { group: a, tag: x3 }
+          - index: { _id: "d6" }
+          - { group: a, tag: x4 }
+          - index: { _id: "d7" }
+          - { group: a, tag: x5 }
+          - index: { _id: "d8" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d9" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d10" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d11" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d12" }
+          - { group: b, tag: b1 }
+          - index: { _id: "d13" }
+          - { group: b, tag: b2 }
+          - index: { _id: "d14" }
+          - { group: b, tag: b2 }
+          - index: { _id: "d15" }
+          - { group: b, tag: b2 }
+          - index: { _id: "d16" }
+          - { group: b, tag: b2 }
+          - index: { _id: "d17" }
+          - { group: b, tag: b3 }
+          - index: { _id: "d18" }
+          - { group: b, tag: b3 }
+          - index: { _id: "d19" }
+          - { group: b, tag: b3 }
+          - index: { _id: "d20" }
+          - { group: b, tag: b4 }
+          - index: { _id: "d21" }
+          - { group: b, tag: b4 }
+          - index: { _id: "d22" }
+          - { group: b, tag: b5 }
+          - index: { _id: "d23" }
+          - { group: b, tag: b6 }
+          - index: { _id: "d24" }
+          - { tag: x1 }
+          - index: { _id: "d25" }
+          - { tag: x1 }
+          - index: { _id: "d26" }
+          - { tag: x1 }
+          - index: { _id: "d27" }
+          - { tag: x1 }
+          - index: { _id: "d28" }
+          - { tag: x2 }
+          - index: { _id: "d29" }
+          - { tag: x2 }
+          - index: { _id: "d30" }
+          - { tag: x2 }
+          - index: { _id: "d31" }
+          - { tag: x2 }
+          - index: { _id: "d32" }
+          - { tag: x3 }
+          - index: { _id: "d33" }
+          - { tag: x3 }
+          - index: { _id: "d34" }
+          - { tag: x3 }
+          - index: { _id: "d35" }
+          - { tag: x3 }
+          - index: { _id: "d36" }
+          - { tag: x4 }
+          - index: { _id: "d37" }
+          - { tag: x4 }
+          - index: { _id: "d38" }
+          - { tag: x4 }
+          - index: { _id: "d39" }
+          - { tag: x4 }
+          - index: { _id: "d40" }
+          - { tag: x5 }
+          - index: { _id: "d41" }
+          - { tag: x5 }
+          - index: { _id: "d42" }
+          - { tag: x5 }
+          - index: { _id: "d43" }
+          - { tag: x5 }
+  - match: { errors: false }
+
+  - do:
+      search:
+        index: sbf_luc
+        body:
+          size: 0
+          aggs:
+            groups:
+              terms: { field: group }
+              aggs:
+                sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - match: { hits.total.value: 44 }
+  - length: { aggregations.groups.buckets: 2 }
+  - match: { aggregations.groups.buckets.0.key: b }
+  - match: { aggregations.groups.buckets.0.sig.doc_count: 16 }
+  - match: { aggregations.groups.buckets.0.sig.bg_count: 44 }
+  - length: { aggregations.groups.buckets.0.sig.buckets: 2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.key: b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.doc_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.bg_count: 5 }
+  - set: { aggregations.groups.buckets.0.sig.buckets.0.score: fence_b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.key: b2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.doc_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.bg_count: 4 }
+  - set: { aggregations.groups.buckets.0.sig.buckets.1.score: fence_b2 }
+  - match: { aggregations.groups.buckets.1.key: a }
+  - match: { aggregations.groups.buckets.1.sig.doc_count: 8 }
+  - match: { aggregations.groups.buckets.1.sig.bg_count: 44 }
+  - length: { aggregations.groups.buckets.1.sig.buckets: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.key: a1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.doc_count: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.bg_count: 2 }
+  - set: { aggregations.groups.buckets.1.sig.buckets.0.score: fence_a1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.key: a2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.doc_count: 1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.bg_count: 1 }
+  - set: { aggregations.groups.buckets.1.sig.buckets.1.score: fence_a2 }
+
+  - do:
+      search:
+        index: sbf_def
+        body:
+          size: 0
+          aggs:
+            groups:
+              terms: { field: group }
+              aggs:
+                sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - match: { hits.total.value: 44 }
+  - length: { aggregations.groups.buckets: 2 }
+  - match: { aggregations.groups.buckets.0.key: b }
+  - match: { aggregations.groups.buckets.0.sig.doc_count: 16 }
+  - match: { aggregations.groups.buckets.0.sig.bg_count: 44 }
+  - length: { aggregations.groups.buckets.0.sig.buckets: 2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.key: b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.doc_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.bg_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.score: $fence_b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.key: b2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.doc_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.bg_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.score: $fence_b2 }
+  - match: { aggregations.groups.buckets.1.key: a }
+  - match: { aggregations.groups.buckets.1.sig.doc_count: 8 }
+  - match: { aggregations.groups.buckets.1.sig.bg_count: 44 }
+  - length: { aggregations.groups.buckets.1.sig.buckets: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.key: a1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.doc_count: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.bg_count: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.score: $fence_a1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.key: a2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.doc_count: 1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.bg_count: 1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.score: $fence_a2 }
+
+  - do:
+      search:
+        index: sbf_prx
+        body:
+          size: 0
+          aggs:
+            groups:
+              terms: { field: group }
+              aggs:
+                sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - match: { hits.total.value: 44 }
+  - length: { aggregations.groups.buckets: 2 }
+  - match: { aggregations.groups.buckets.0.key: b }
+  - match: { aggregations.groups.buckets.0.sig.doc_count: 16 }
+  - match: { aggregations.groups.buckets.0.sig.bg_count: 44 }
+  - length: { aggregations.groups.buckets.0.sig.buckets: 2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.key: b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.doc_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.bg_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.score: $fence_b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.key: b2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.doc_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.bg_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.score: $fence_b2 }
+  - match: { aggregations.groups.buckets.1.key: a }
+  - match: { aggregations.groups.buckets.1.sig.doc_count: 8 }
+  - match: { aggregations.groups.buckets.1.sig.bg_count: 44 }
+  - length: { aggregations.groups.buckets.1.sig.buckets: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.key: a1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.doc_count: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.bg_count: 2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.0.score: $fence_a1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.key: a2 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.doc_count: 1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.bg_count: 1 }
+  - match: { aggregations.groups.buckets.1.sig.buckets.1.score: $fence_a2 }
+
+  # Under a query the parent's groups and the total come with the
+  # foreground; the documents without a group count in the total and in
+  # each term's least background count. Same buckets, counts and scores.
+  - do:
+      search:
+        index: sbf_luc
+        body:
+          size: 0
+          query: { bool: { must_not: { term: { group: none } } } }
+          aggs:
+            groups:
+              terms: { field: group, size: 1 }
+              aggs:
+                sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - match: { hits.total.value: 44 }
+  - length: { aggregations.groups.buckets: 1 }
+  - match: { aggregations.groups.sum_other_doc_count: 8 }
+  - match: { aggregations.groups.buckets.0.key: b }
+  - match: { aggregations.groups.buckets.0.doc_count: 16 }
+  - match: { aggregations.groups.buckets.0.sig.bg_count: 44 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.key: b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.doc_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.bg_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.score: $fence_b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.key: b2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.doc_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.bg_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.score: $fence_b2 }
+  - do:
+      search:
+        index: sbf_def
+        body:
+          size: 0
+          query: { bool: { must_not: { term: { group: none } } } }
+          aggs:
+            groups:
+              terms: { field: group, size: 1 }
+              aggs:
+                sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - match: { hits.total.value: 44 }
+  - length: { aggregations.groups.buckets: 1 }
+  - match: { aggregations.groups.sum_other_doc_count: 8 }
+  - match: { aggregations.groups.buckets.0.key: b }
+  - match: { aggregations.groups.buckets.0.doc_count: 16 }
+  - match: { aggregations.groups.buckets.0.sig.bg_count: 44 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.key: b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.doc_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.bg_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.score: $fence_b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.key: b2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.doc_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.bg_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.score: $fence_b2 }
+  - do:
+      search:
+        index: sbf_prx
+        body:
+          size: 0
+          query: { bool: { must_not: { term: { group: none } } } }
+          aggs:
+            groups:
+              terms: { field: group, size: 1 }
+              aggs:
+                sig: { significant_terms: { field: tag, size: 2, shard_size: 2, min_doc_count: 1 } }
+  - match: { hits.total.value: 44 }
+  - length: { aggregations.groups.buckets: 1 }
+  - match: { aggregations.groups.sum_other_doc_count: 8 }
+  - match: { aggregations.groups.buckets.0.key: b }
+  - match: { aggregations.groups.buckets.0.doc_count: 16 }
+  - match: { aggregations.groups.buckets.0.sig.bg_count: 44 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.key: b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.doc_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.bg_count: 5 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.0.score: $fence_b1 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.key: b2 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.doc_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.bg_count: 4 }
+  - match: { aggregations.groups.buckets.0.sig.buckets.1.score: $fence_b2 }
