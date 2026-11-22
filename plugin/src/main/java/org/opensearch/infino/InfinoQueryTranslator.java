@@ -207,13 +207,27 @@ final class InfinoQueryTranslator {
      * clause is the principal when there is one; otherwise {@code text}, a
      * text clause in should, whose BM25 counts where it matches.
      * {@code ascending} when the request sorts by the score ascending: the
-     * least sums come first.
+     * least sums come first. {@code unrankable} when the query scores its
+     * hits apart in stock but no one ranked read here can: a should clause
+     * the table cannot score, or several text clauses with no principal. Its
+     * hits then all carry {@code offset}. {@code zero} when no clause of the
+     * query scores at all (a bool of filter and must_not clauses alone,
+     * {@link #scoresNothing}): every hit scores 0, as in stock.
      */
-    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending) {
+    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable, boolean zero) {
         static final Scoring NONE = new Scoring(null, 0, List.of());
+        static final Scoring ZERO = new Scoring(null, 0, List.of(), false, false, true);
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses) {
-            this(text, offset, bonuses, false);
+            this(text, offset, bonuses, false, false, false);
+        }
+
+        Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending) {
+            this(text, offset, bonuses, ascending, false, false);
+        }
+
+        Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable) {
+            this(text, offset, bonuses, ascending, unrankable, false);
         }
 
         /** Whether hits rank by more than the principal's BM25 alone: then {@code offset} only shifts every score alike. */
@@ -223,23 +237,31 @@ final class InfinoQueryTranslator {
     }
 
     /**
-     * What a query translates to. {@code span} is set when the query is one
-     * range on a date column with both bounds, and is then exactly the rows
-     * {@code where} keeps; null otherwise.
+     * What a query translates to. {@code principal} is the text clause the
+     * rows are read through ({@link #from}), and {@code ranks} whether its
+     * BM25 scores the hits: false for a clause in filter context, which
+     * scores nothing in stock ({@link #ranked}). {@code span} is set when
+     * the query is one range on a date column with both bounds, and is then
+     * exactly the rows {@code where} keeps; null otherwise.
      */
-    record Translation(String table, String where, TextClause principal, Scoring scoring, Span span) {
+    record Translation(String table, String where, TextClause principal, boolean ranks, Scoring scoring, Span span) {
         Translation(String table, String where, TextClause principal) {
-            this(table, where, principal, Scoring.NONE, null);
+            this(table, where, principal, true, Scoring.NONE, null);
+        }
+
+        /** The principal when its BM25 scores the hits, else null. */
+        TextClause ranked() {
+            return ranks ? principal : null;
         }
 
         /** This translation with {@code where} as its predicate, scored as before; no longer one span. */
         Translation withWhere(String where) {
-            return new Translation(table, where, principal, scoring, null);
+            return new Translation(table, where, principal, ranks, scoring, null);
         }
 
         /** This translation with no clause but the principal's BM25 scoring the hits. */
         Translation unscored() {
-            return new Translation(table, where, principal, Scoring.NONE, span);
+            return new Translation(table, where, principal, ranks, scoring.zero() ? Scoring.ZERO : Scoring.NONE, span);
         }
 
         /**
@@ -248,10 +270,11 @@ final class InfinoQueryTranslator {
          * clause's BM25 ranks its best hits only, so such a query is unscored.
          */
         Translation ascending() {
-            if (principal != null || scoring.text() != null) {
+            if (ranked() != null || scoring.text() != null) {
                 return unscored();
             }
-            return new Translation(table, where, principal, new Scoring(null, scoring.offset(), scoring.bonuses(), true), span);
+            Scoring up = new Scoring(null, scoring.offset(), scoring.bonuses(), true, scoring.unrankable(), scoring.zero());
+            return new Translation(table, where, principal, ranks, up, span);
         }
 
         /** The relation the predicate applies to: the table, or its token-match set. */
@@ -280,9 +303,9 @@ final class InfinoQueryTranslator {
             return principal == null || !plainQuery(principal.query()) ? null : textPredicate(table, principal);
         }
 
-        /** The ranked relation for hits: BM25 over the principal clause, {@code k} candidates. */
+        /** The ranked relation for hits: BM25 over the ranked principal clause ({@link #ranked}), {@code k} candidates. */
         String rankedFrom(int k) {
-            return rankedFrom(principal, k);
+            return rankedFrom(ranked(), k);
         }
 
         /** The ranked relation for hits: BM25 over {@code text}, {@code k} candidates. */
@@ -343,6 +366,16 @@ final class InfinoQueryTranslator {
     /** How the translator reads rows of the table: a nested query's candidates, with their sources. */
     private final Function<String, List<Map<String, Object>>> rows;
     private TextClause principal;
+    /** Whether {@link #principal} came from a clause that scores, not one in filter context. */
+    private boolean principalRanks;
+    /** How many filter clauses enclose the clause being translated: within any, a clause scores nothing. */
+    private int filtering;
+    /**
+     * Whether a text clause in filter context is a predicate rather than the
+     * principal: so when another text clause scores the hits, which must
+     * then be the ranked one, read with the filter's restriction on its rows.
+     */
+    private boolean filterTextIsPredicate;
     /** Each nested clause's matching documents with their scores, read once whether it filters, scores or both. */
     private final Map<NestedQueryBuilder, Map<String, Double>> nestedScores = new java.util.IdentityHashMap<>();
     /** Each BM25-scored term clause's score ({@link #bm25TermScore}), read once per clause. */
@@ -380,11 +413,70 @@ final class InfinoQueryTranslator {
     /** {@link #translate(QueryBuilder, Map, String, long)}, reading the table's rows through {@code rows}. */
     static Translation translate(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis, Function<String, List<Map<String, Object>>> rows) {
         InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, false, false, rows);
+        t.filterTextIsPredicate = t.scoresText(qb);
         String where = t.predicate(qb, true);
         if (where == null) {
             return null;
         }
-        return new Translation(table, where, t.principal, t.scoring(qb), qb instanceof RangeQueryBuilder ? t.span : null);
+        return new Translation(table, where, t.principal, t.principalRanks, t.scoring(qb), qb instanceof RangeQueryBuilder ? t.span : null);
+    }
+
+    /**
+     * Whether a text clause scores the hits of {@code qb}: one reached
+     * through must and should clauses alone (filter and must_not clauses
+     * score nothing) that reads the token index as a principal would.
+     */
+    private boolean scoresText(QueryBuilder qb) {
+        if (qb instanceof BoolQueryBuilder b) {
+            for (QueryBuilder c : b.must()) {
+                if (scoresText(c)) {
+                    return true;
+                }
+            }
+            for (QueryBuilder c : b.should()) {
+                if (scoresText(c)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (!(qb instanceof MatchQueryBuilder
+            || qb instanceof MatchPhraseQueryBuilder
+            || qb instanceof MultiMatchQueryBuilder
+            || qb instanceof QueryStringQueryBuilder
+            || qb instanceof SimpleQueryStringBuilder)) {
+            return false;
+        }
+        InfinoQueryTranslator alone = new InfinoQueryTranslator(cols, table, nowMillis, trusted, columnValuesOnly, rows);
+        try {
+            alone.predicate(qb, true);
+        } catch (RuntimeException e) {
+            // A clause the table cannot read is refused when the query is translated.
+            return false;
+        }
+        return alone.principal != null;
+    }
+
+    /**
+     * Whether no clause of {@code qb} scores: a bool whose clauses are all
+     * filter and must_not ones, or must and should ones that score nothing
+     * themselves. Lucene scores its hits 0.
+     */
+    static boolean scoresNothing(QueryBuilder qb) {
+        if (!(qb instanceof BoolQueryBuilder b) || !b.hasClauses()) {
+            return false;
+        }
+        for (QueryBuilder c : b.should()) {
+            if (!scoresNothing(c)) {
+                return false;
+            }
+        }
+        for (QueryBuilder c : b.must()) {
+            if (!scoresNothing(c)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // ---- scoring ----
@@ -399,17 +491,21 @@ final class InfinoQueryTranslator {
         List<Bonus> bonuses = new ArrayList<>();
         List<TextClause> texts = new ArrayList<>();
         boolean[] unscored = { false };
+        if (scoresNothing(root)) {
+            return Scoring.ZERO;
+        }
         required(root, offset, bonuses, texts, unscored);
-        if (principal == null && (unscored[0] || texts.size() > 1)) {
+        TextClause ranked = principalRanks ? principal : null;
+        if (ranked == null && (unscored[0] || texts.size() > 1)) {
             // A should clause the table cannot score (or a second text clause,
             // which would add its BM25 beside the first) would leave some of the
             // hits it matches at 0, under hits it outscores in stock: with no
             // ranked clause, the hits keep the one score they all had.
-            return offset[0] == 0 ? Scoring.NONE : new Scoring(null, offset[0], List.of());
+            return new Scoring(null, offset[0], List.of(), false, true);
         }
         // Beside a ranked clause a should clause the table cannot score adds
         // nothing, as before; the others add theirs.
-        TextClause text = principal == null && texts.size() == 1 ? texts.get(0) : null;
+        TextClause text = ranked == null && texts.size() == 1 ? texts.get(0) : null;
         return offset[0] == 0 && bonuses.isEmpty() && text == null ? Scoring.NONE : new Scoring(text, offset[0], List.copyOf(bonuses));
     }
 
@@ -441,7 +537,7 @@ final class InfinoQueryTranslator {
             // other (a text clause on a second column, a query string over
             // several, a script) scores nothing here, where stock scores it.
             TextClause t = textOnly(qb);
-            if (t == null || !t.equals(principal)) {
+            if (t == null || !principalRanks || !t.equals(principal)) {
                 unscored[0] = true;
             }
         }
@@ -1044,7 +1140,12 @@ final class InfinoQueryTranslator {
             and.add(predicate(c, positive));
         }
         for (QueryBuilder c : b.filter()) {
-            and.add(predicate(c, positive));
+            filtering++;
+            try {
+                and.add(predicate(c, positive));
+            } finally {
+                filtering--;
+            }
         }
         if (and.contains(null)) {
             return null;
@@ -1701,13 +1802,24 @@ final class InfinoQueryTranslator {
                 "[infino] a knn filter matching text on [" + column + "] (" + query + ") is not served: the engine narrows its vector search by column values, and a text match is a search of its own"
             );
         }
-        if (positive && principal == null) {
+        // A clause in filter context scores nothing: it may still be the
+        // principal the rows are read through, unranked, unless another text
+        // clause scores the hits.
+        boolean scores = filtering == 0;
+        if (positive && principal == null && (scores || !filterTextIsPredicate)) {
             principal = new TextClause(column, query, mode);
+            principalRanks = scores;
             return ALL;
         }
-        if (positive && principal != null && principal.column().equals(column) && "and".equals(mode) && "and".equals(principal.mode())) {
-            // A second required clause on the same column joins the ranked query, so
-            // the score reflects both; under all-terms mode the join reads the same.
+        if (positive
+            && principal != null
+            && principalRanks == scores
+            && principal.column().equals(column)
+            && "and".equals(mode)
+            && "and".equals(principal.mode())) {
+            // A second required clause on the same column joins the principal, so
+            // a ranked one's score reflects both; under all-terms mode the join
+            // reads the same. A clause scoring otherwise than the principal stays apart.
             principal = new TextClause(column, principal.query() + " " + query, mode);
             return ALL;
         }
@@ -2921,15 +3033,41 @@ final class InfinoQueryTranslator {
      * as OpenSearch refuses it, rather than matching nothing.
      */
     private String dateBound(Object value, String format, boolean roundUp, ZoneId zone) {
-        String lit = dateLiteral(value, format, roundUp, zone);
-        if (lit == null) {
+        return literal(Instant.ofEpochMilli(dateBoundMillis(value, format, roundUp, zone, nowMillis)).toString());
+    }
+
+    /**
+     * A range's date bound as epoch milliseconds, read as {@link #range}
+     * reads it into the statement: {@code format} is the range's own, else
+     * the field's mapped one, {@code roundUp} is set for an exclusive lower
+     * bound and an inclusive upper one, and a bound the format cannot read
+     * is refused as OpenSearch refuses it. Anything that judges a range
+     * before it is sent reads its bounds here, so it judges what is read.
+     */
+    static long dateBoundMillis(Object value, String format, boolean roundUp, ZoneId zone, long nowMillis) {
+        Long at = dateMillis(value, format, roundUp, zone, nowMillis);
+        if (at == null) {
             throw new OpenSearchParseException(
                 "failed to parse date field [{}] with format [{}]",
                 value,
                 format == null ? DEFAULT_DATE_FORMAT : format
             );
         }
-        return lit;
+        return at;
+    }
+
+    /**
+     * A date, epoch number or date math as epoch milliseconds, or null when
+     * {@code format} cannot read it. A number is epoch milliseconds in the
+     * default format and read by {@code format} when one is given, as
+     * OpenSearch reads a number by the field's format (an
+     * {@code epoch_second} field's {@code 893966296} is seconds).
+     */
+    private static Long dateMillis(Object value, String format, boolean roundUp, ZoneId zone, long nowMillis) {
+        if (value instanceof Number n && format == null) {
+            return n.longValue();
+        }
+        return dateMathMillis(value.toString(), format, roundUp, zone, nowMillis);
     }
 
     /**
@@ -2939,18 +3077,8 @@ final class InfinoQueryTranslator {
      * {@code 893966296} is seconds).
      */
     private String dateLiteral(Object value, String format, boolean roundUp, ZoneId zone) {
-        Instant at;
-        if (value instanceof Number n && format == null) {
-            at = Instant.ofEpochMilli(n.longValue());
-        } else {
-            DateMathParser parser = DateFormatter.forPattern(format == null ? DEFAULT_DATE_FORMAT : format).toDateMathParser();
-            try {
-                at = parser.parse(value.toString(), InfinoClock.of(nowMillis), roundUp, zone);
-            } catch (RuntimeException e) {
-                return null;
-            }
-        }
+        Long at = dateMillis(value, format, roundUp, zone, nowMillis);
         // The column holds milliseconds; a rounded-up bound ends in .999.
-        return literal(Instant.ofEpochMilli(at.toEpochMilli()).toString());
+        return at == null ? null : literal(Instant.ofEpochMilli(at).toString());
     }
 }
