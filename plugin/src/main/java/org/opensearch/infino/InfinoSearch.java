@@ -487,8 +487,15 @@ public final class InfinoSearch {
      * The hits and total of one index, before the response is assembled. The
      * first {@code unsourced} hits sit before the caller's window and carry no
      * source (see {@link #page(Index, Plan, SearchSourceBuilder, boolean, boolean, boolean, int)}).
+     * {@code chosen} is how many rows the page's statement chose, counted
+     * before any row deleted since dropped out: a page with fewer hits than it
+     * asked for is the last only when it chose fewer.
      */
-    record Page(List<SearchHit> hits, long total, boolean exact, float maxScore, int unsourced) {
+    record Page(List<SearchHit> hits, long total, boolean exact, float maxScore, int unsourced, int chosen) {
+        Page(List<SearchHit> hits, long total, boolean exact, float maxScore, int unsourced) {
+            this(hits, total, exact, maxScore, unsourced, hits.size());
+        }
+
         Page(List<SearchHit> hits, long total, boolean exact, float maxScore) {
             this(hits, total, exact, maxScore, 0);
         }
@@ -944,7 +951,7 @@ public final class InfinoSearch {
     }
 
     /** How many times a page whose row lost its source between its two reads is read again. */
-    private static final int SOURCE_REREADS = 2;
+    static final int SOURCE_REREADS = 2;
 
     /**
      * The page's rows from its hit statement, with their sources when they
@@ -971,16 +978,33 @@ public final class InfinoSearch {
                 return indexed;
             }
         }
-        boolean byId = readsSourcesById(plan, source, resumed);
-        for (int read = 0;; read++) {
-            List<Map<String, Object>> rows = chosenRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed);
+        Supplier<List<Map<String, Object>>> choose = () -> chosenRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed);
+        if (!readsSourcesById(plan, source, resumed)) {
+            List<Map<String, Object>> rows = choose.get();
             chosen[0] = rows.size();
-            if (!byId) {
-                return rows;
-            }
-            List<Map<String, Object>> sourced = withSources(plan.table(), rows, sourceFrom, fetch);
-            // A row deleted between the two reads has no source left: the page
-            // is read again, and after the last try goes without that row.
+            return rows;
+        }
+        return sourcedRows(choose, rows -> withSources(plan.table(), rows, sourceFrom, fetch), fetch, chosen);
+    }
+
+    /**
+     * The rows {@code choose} reads, each given its source by {@code source}.
+     * A row deleted between the two reads has no source left and drops out:
+     * the page is then read again, up to {@link #SOURCE_REREADS} times, and
+     * after the last try goes without that row. How many rows the last read
+     * chose, before any dropped out, goes in {@code chosen}: a page that lost
+     * a row is still a full page, and only a short choice ends the hits.
+     */
+    static List<Map<String, Object>> sourcedRows(
+        Supplier<List<Map<String, Object>>> choose,
+        Function<List<Map<String, Object>>, List<Map<String, Object>>> source,
+        int fetch,
+        int[] chosen
+    ) {
+        for (int read = 0;; read++) {
+            List<Map<String, Object>> rows = choose.get();
+            chosen[0] = rows.size();
+            List<Map<String, Object>> sourced = source.apply(rows);
             if (sourced.size() == Math.min(rows.size(), fetch) || read == SOURCE_REREADS) {
                 return sourced;
             }
@@ -1394,7 +1418,7 @@ public final class InfinoSearch {
             float best = bestScore(plan);
             maxScore = Float.isNaN(maxScore) ? best : Float.isNaN(best) ? maxScore : Math.max(maxScore, best);
         }
-        return new Page(hits, total, exact || plan.vector() != null, maxScore, unsourced);
+        return new Page(hits, total, exact || plan.vector() != null, maxScore, unsourced, Math.max(hits.size(), chosen[0]));
     }
 
     /**
@@ -2569,7 +2593,7 @@ public final class InfinoSearch {
                 );
                 aggs.add(counted.aggregations());
                 if (countWithAggs) {
-                    page = new Page(page.hits(), counted.total(), page.exact(), page.maxScore(), page.unsourced());
+                    page = new Page(page.hits(), counted.total(), page.exact(), page.maxScore(), page.unsourced(), page.chosen());
                 }
             }
             pages.add(page);

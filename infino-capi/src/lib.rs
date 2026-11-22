@@ -3465,11 +3465,10 @@ fn get_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String, i64)
     // the column.
     let batches = match table.exact_match(OSID, osid, Some(&[SOURCE, SEQ])) {
         Ok(batches) => batches,
-        Err(_) => {
-            let esc = osid.replace('\'', "''");
-            let sql = format!("SELECT {SOURCE}, {SEQ} FROM {name} WHERE {OSID} = '{esc}' LIMIT 1");
-            conn.conn.query_sql(&sql).map_err(|e| e.to_string())?
-        }
+        Err(_) => conn
+            .conn
+            .query_sql(&row_by_osid_sql(name, osid))
+            .map_err(|e| e.to_string())?,
     };
     for b in &batches {
         if b.num_rows() == 0 {
@@ -3492,6 +3491,18 @@ fn get_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String, i64)
         return Ok(Some((source.value(0).to_string(), seq)));
     }
     Ok(None)
+}
+
+/// The statement [`get_row`] falls back to: the source and sequence number
+/// of the row under `osid`, by an equality on the id column. The table name
+/// is quoted as every other statement over a table quotes it, so an index
+/// whose name holds a `-` reads as one name.
+fn row_by_osid_sql(name: &str, osid: &str) -> String {
+    format!(
+        "SELECT {SOURCE}, {SEQ} FROM \"{}\" WHERE {OSID} = '{}' LIMIT 1",
+        name.replace('"', "\"\""),
+        osid.replace('\'', "''")
+    )
 }
 
 /// [`get_row`], a failed read logged and answered as absent.
@@ -3523,9 +3534,11 @@ pub unsafe extern "C" fn infino_get(
 /// Most lookups [`infino_get_many`] runs at once.
 const GET_MANY_THREADS: usize = 16;
 
-/// The raw `_source` JSON of several osids, as one JSON object from each id
-/// the table holds to its source; an id it does not hold is absent, and a
-/// lookup that fails answers `{"error":..}` for the whole call.
+/// The raw `_source` JSON of several osids, as `{"sources": {..}}`, an
+/// object from each id the table holds to its source; an id it does not hold
+/// is absent, and a lookup that fails answers `{"error":..}` for the whole
+/// call. The ids sit one level down so that no id, `error` included, can
+/// make the answer read as an error.
 ///
 /// Each id is looked up as [`infino_get`] looks it up, through the id
 /// column's index. A page of a sorted search reads its sources this way once
@@ -3553,7 +3566,7 @@ pub unsafe extern "C" fn infino_get_many(
         };
         if conn.is_attached(name) {
             return match attached_rows(conn, name, &ids) {
-                Ok(found) => out_json(Value::Object(found)),
+                Ok(found) => out_json(json!({ "sources": found })),
                 Err(e) => err_json(&format!("get_many: {e}")),
             };
         }
@@ -3579,7 +3592,7 @@ pub unsafe extern "C" fn infino_get_many(
                 }
             }
         }
-        out_json(Value::Object(found))
+        out_json(json!({ "sources": found }))
     }))
     .unwrap_or(ptr::null_mut())
 }
@@ -4629,7 +4642,9 @@ mod tests {
         let out = take(unsafe {
             infino_get_many(h, c("logs").as_ptr(), idp.as_ptr(), osids.len() as c_int)
         });
-        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+        let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert!(v["sources"].is_object(), "{out}");
+        v["sources"].clone()
     }
 
     fn delete(h: *mut Bridge, osids: &[&str]) -> c_int {
@@ -5091,6 +5106,7 @@ mod tests {
             infino_get_many(h, c("plain").as_ptr(), ptrs.as_ptr(), ptrs.len() as c_int)
         }))
         .unwrap();
+        let many = &many["sources"];
         assert_eq!(many.as_object().unwrap().len(), 2, "{many}");
         let source: Value = serde_json::from_str(many[&ids[0]].as_str().unwrap()).unwrap();
         assert_eq!(source["title"], "India", "{many}");
@@ -5510,6 +5526,78 @@ mod tests {
         let failed = take(unsafe { infino_get_many(h, c("no_such_table").as_ptr(), &id.as_ptr(), 1) });
         assert!(failed.starts_with("{\"error\""), "{failed}");
         assert_eq!(take(unsafe { infino_get(h, c("no_such_table").as_ptr(), id.as_ptr()) }), "");
+        close(h);
+    }
+
+    /// A document whose id is `error` is read as a document. The answer
+    /// keeps its ids under `sources`, so an id that sorts first and spells
+    /// `error` cannot make it start as an error object does.
+    #[test]
+    fn a_document_with_the_id_error_is_read_as_a_document() {
+        let h = open_logs();
+        let out = index(
+            h,
+            &[
+                ("error", r#"{"level":"info","message":"named error"}"#),
+                ("zz", r#"{"level":"warn","message":"after error"}"#),
+            ],
+        );
+        assert_eq!(out["ok"], 2, "{out}");
+        for ids in [&["error"][..], &["error", "zz"][..]] {
+            let idc: Vec<CString> = ids.iter().map(|x| c(x)).collect();
+            let idp: Vec<*const c_char> = idc.iter().map(|x| x.as_ptr()).collect();
+            let raw = take(unsafe {
+                infino_get_many(h, c("logs").as_ptr(), idp.as_ptr(), ids.len() as c_int)
+            });
+            assert!(raw.starts_with("{\"sources\""), "{raw}");
+            assert!(!raw.starts_with("{\"error\""), "{raw}");
+        }
+        let many = get_many(h, &["error", "zz"]);
+        assert_eq!(
+            many["error"].as_str(),
+            Some(get(h, "error").as_str()),
+            "{many}"
+        );
+        assert!(
+            many["error"].as_str().unwrap().contains("named error"),
+            "{many}"
+        );
+        assert_eq!(many.as_object().map(|o| o.len()), Some(2), "{many}");
+        close(h);
+    }
+
+    /// The equality [`get_row`] falls back to quotes the table name, so an
+    /// index whose name holds a `-` (or a `"`) reads as one name rather than
+    /// failing to parse.
+    #[test]
+    fn the_fallback_lookup_quotes_the_table_name() {
+        assert_eq!(
+            row_by_osid_sql("my-logs", "it's"),
+            format!("SELECT {SOURCE}, {SEQ} FROM \"my-logs\" WHERE {OSID} = 'it''s' LIMIT 1")
+        );
+        assert!(row_by_osid_sql("a\"b", "x").contains("FROM \"a\"\"b\" WHERE"));
+        let h = open_logs();
+        let made =
+            take(unsafe { infino_ensure_table(h, c("my-logs").as_ptr(), c(MAPPING).as_ptr()) });
+        assert!(made.contains("\"created\":true"), "{made}");
+        let ids = [c("a")];
+        let srcs = [c(r#"{"level":"info","message":"dashed"}"#)];
+        let out = take(unsafe {
+            infino_index_batch(
+                h,
+                c("my-logs").as_ptr(),
+                &ids[0].as_ptr(),
+                &srcs[0].as_ptr(),
+                1,
+            )
+        });
+        assert!(out.contains("\"ok\":1"), "{out}");
+        let bridge = bridge_ref(h).unwrap();
+        let batches = bridge
+            .conn
+            .query_sql(&row_by_osid_sql("my-logs", "a"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         close(h);
     }
 

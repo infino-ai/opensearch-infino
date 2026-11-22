@@ -1290,9 +1290,23 @@ public final class InfinoNative {
         // One call for the page: the bridge runs its lookups side by side.
         init();
         String json = takeOrThrow(lib.infino_get_many(conn, name, osids.toArray(new String[0]), osids.size()));
-        for (Map.Entry<String, Object> entry : object(json).entrySet()) {
+        return sourcesOf(json);
+    }
+
+    /**
+     * The sources of a {@code get_many} answer, {@code {"sources":{id: source}}}.
+     * The ids sit under {@code sources}, never at the top, so an id such as
+     * {@code error} cannot make the answer read as an error object.
+     */
+    static Map<String, String> sourcesOf(String json) {
+        Object found = object(json).get("sources");
+        if (!(found instanceof Map<?, ?> byId)) {
+            throw new InfinoException("the bridge answered no sources", RestStatus.INTERNAL_SERVER_ERROR);
+        }
+        Map<String, String> out = new HashMap<>();
+        for (Map.Entry<?, ?> entry : byId.entrySet()) {
             if (entry.getValue() instanceof String source && !source.isEmpty()) {
-                out.put(entry.getKey(), source);
+                out.put(entry.getKey().toString(), source);
             }
         }
         return out;
