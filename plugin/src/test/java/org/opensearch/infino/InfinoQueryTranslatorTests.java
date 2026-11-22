@@ -537,6 +537,52 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
     }
 
+    public void testAPageWithNoOrderThatIsNotAPlainScanIsReadInRowIdOrder() {
+        // A filter joined by id, or rows read from the token index, come out
+        // of the engine in no fixed order once it has read them all, so the
+        // page orders them by the row id. A plain scan, a plain-words
+        // text_match included, keeps no order.
+        String byRowId = " ORDER BY " + InfinoSearch.ROW_ID_ORDER + " LIMIT 10";
+        String noSort = hits(translate(QueryBuilders.boolQuery().mustNot(QueryBuilders.matchPhraseQuery("message", "disk full"))), null, 10);
+        assertTrue(noSort, noSort.contains("osid IN (SELECT osid FROM token_match("));
+        assertTrue(noSort, noSort.endsWith(byRowId));
+        // A sort on a field no row holds reads the same way.
+        String phraseOut = unsortedHits(QueryBuilders.boolQuery().mustNot(QueryBuilders.matchPhraseQuery("message", "disk full")), columns());
+        assertTrue(phraseOut, phraseOut.contains("osid IN (SELECT osid FROM token_match("));
+        assertTrue(phraseOut, phraseOut.endsWith(byRowId));
+        Map<String, Column> cols = columns();
+        cols.put("level[]", Column.list("level[]", "str"));
+        String listed = unsortedHits(QueryBuilders.termQuery("level", "error"), cols);
+        assertTrue(listed, listed.contains("osid IN (SELECT list_rows.list_id FROM "));
+        assertTrue(listed, listed.endsWith(byRowId));
+        String phrase = unsortedHits(QueryBuilders.matchPhraseQuery("message", "disk full"), columns());
+        assertTrue(phrase, phrase.startsWith("SELECT osid, source FROM token_match("));
+        assertTrue(phrase, phrase.endsWith(byRowId));
+        assertEquals(
+            "SELECT osid, source FROM \"os_logs_0\" WHERE (1=1) AND text_match(\"message\", 'disk', 'or') LIMIT 10",
+            unsortedHits(QueryBuilders.matchQuery("message", "disk"), columns())
+        );
+        assertEquals("SELECT osid, source FROM \"os_logs_0\" WHERE \"level\" = 'error' LIMIT 10", unsortedHits(QueryBuilders.termQuery("level", "error"), columns()));
+    }
+
+    /** The unsorted statement for {@code qb} over {@code cols}, sorted on a field no row holds. */
+    private static String unsortedHits(org.opensearch.index.query.QueryBuilder qb, Map<String, Column> cols) {
+        InfinoSearch.Plan plan = new InfinoSearch.Plan(
+            TABLE,
+            cols,
+            InfinoQueryTranslator.translate(qb, cols, TABLE, NOW),
+            java.util.List.of(InfinoSearch.SortSpec.of(cols.get("status"), true), InfinoSearch.SortSpec.rowId()),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        return InfinoSearch.unsortedStatement(plan, 10, false, true);
+    }
+
     public void testACollapseWithNoOrderKeepsTheRowIdOrder() {
         // The window's rows come out grouped by value, so the first row of
         // each value and the page's rows both follow the row id's order.
