@@ -40,13 +40,18 @@ public class InfinoWriterTests extends OpenSearchTestCase {
 
     /** A bulk that deletes these ids: it names them, and stages without the native bridge (a delete carries no row). */
     private static InfinoWriter.Waiter deletes(ActionListener<BulkResponse> listener, String... ids) {
+        return deletesFrom("_na_", listener, ids);
+    }
+
+    /** {@link #deletes} from the index of this UUID, under the same name as every other. */
+    private static InfinoWriter.Waiter deletesFrom(String uuid, ActionListener<BulkResponse> listener, String... ids) {
         List<InfinoWriter.Outcome> outcomes = new ArrayList<>();
         for (int slot = 0; slot < ids.length; slot++) {
             InfinoWriter.Write delete = new InfinoWriter.Write(ids[slot], null, true);
             outcomes.add(new InfinoWriter.Outcome(slot, new DeleteRequest("i", ids[slot]), delete, null));
         }
         return new InfinoWriter.Waiter(
-            new ShardId("i", "_na_", 0),
+            new ShardId("i", uuid, 0),
             "i",
             outcomes,
             new BulkItemResponse[ids.length],
@@ -129,6 +134,30 @@ public class InfinoWriterTests extends OpenSearchTestCase {
         writer.submit("t", deletes(pending(), "y"));
 
         assertEquals(2, appendsStarted.get());
+    }
+
+    /**
+     * Appends running at once write one index. A bulk to an index created
+     * again under the table's name waits while appends of the old index run,
+     * and a bulk staged behind it waits too, even one to the old index: the
+     * sequence numbers of the appends running are read for one index.
+     */
+    public void testABulkToAnotherIndexOfTheTableWaitsForTheRunningAppendsOfTheOld() {
+        AtomicInteger appendsStarted = new AtomicInteger();
+        InfinoWriter writer = new InfinoWriter(() -> task -> appendsStarted.incrementAndGet(), 10, Long.MAX_VALUE, 4);
+
+        writer.submit("t", deletesFrom("old", pending(), "x"));
+        writer.submit("t", deletesFrom("old", pending(), "y"));
+        assertEquals("two appends of one index run at once", 2, appendsStarted.get());
+
+        writer.submit("t", deletesFrom("new", pending(), "z"));
+        assertEquals("a bulk of the index created again waits for the old one's appends", 2, appendsStarted.get());
+
+        writer.submit("t", deletesFrom("old", pending(), "w"));
+        assertEquals("a bulk staged behind it waits behind it", 2, appendsStarted.get());
+
+        writer.submit("u", deletesFrom("new", pending(), "z"));
+        assertEquals("another table's appends are its own", 3, appendsStarted.get());
     }
 
     /**

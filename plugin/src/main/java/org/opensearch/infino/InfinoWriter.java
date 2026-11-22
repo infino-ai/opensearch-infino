@@ -198,6 +198,8 @@ public final class InfinoWriter {
         long bytes = 0;
         /** Appends running for the table. */
         int running = 0;
+        /** The UUID of the index the running appends write, while {@link #running} is above 0 ({@link InfinoWriter#take}). */
+        String runningIndex;
         /** The ids the running appends name, with how many of them name each. */
         final Map<String, Integer> busy = new HashMap<>();
         /** Guards {@link #nextSeq} and {@link #seqAllocation}: appends running at once take numbers in turn. */
@@ -389,17 +391,20 @@ public final class InfinoWriter {
      * Take the next append's bulks, under the batch's lock: the staged bulks
      * in order up to the first that names an id a running append names (it
      * waits for that append, and every bulk after it waits behind it), or
-     * the first of another index than the bulks before it. Marks the ids the
-     * taken bulks name as busy. Empty when nothing can go now.
+     * the first of another index than the bulks before it or the appends
+     * running. Marks the ids the taken bulks name as busy. Empty when
+     * nothing can go now. {@link Batch#running} counts the other appends
+     * running, not the caller's own, and goes up by one when this takes any.
      *
-     * <p>An append holds the writes of one index, which {@link #apply} reads
-     * its sequence numbers for: the table is named after the index, so
-     * writes to an index deleted and created again under that name can be
-     * staged behind writes to the old one.
+     * <p>The appends running at once write one index, which {@link #apply}
+     * reads their sequence numbers for: the table is named after the index,
+     * so writes to an index deleted and created again under that name can be
+     * staged behind writes to the old one, and they wait until the old
+     * one's appends end.
      */
     private static List<Staged> take(Batch batch) {
         List<Staged> taken = new ArrayList<>();
-        String index = null;
+        String index = batch.running > 0 ? batch.runningIndex : null;
         for (Staged s : batch.staged) {
             String uuid = s.waiter().shardId().getIndex().getUUID();
             if (index != null && !index.equals(uuid)) {
@@ -422,6 +427,7 @@ public final class InfinoWriter {
             return taken;
         }
         batch.staged.subList(0, taken.size()).clear();
+        batch.runningIndex = index;
         for (Staged s : taken) {
             batch.docs -= s.docs();
             batch.bytes -= s.bytes();
@@ -467,9 +473,10 @@ public final class InfinoWriter {
             batch.lock.lock();
             try {
                 release(batch, staged);
+                batch.running--;
                 staged = take(batch);
-                if (staged.isEmpty()) {
-                    batch.running--;
+                if (!staged.isEmpty()) {
+                    batch.running++;
                 }
                 // Releasing these ids may have unblocked bulks for slots another append left free.
                 while (batch.running < maxAppends) {
@@ -523,7 +530,7 @@ public final class InfinoWriter {
         Map<String, Long> stored;
         try {
             String allocation = writerAllocation(staged);
-            // Every write of an append is to one index ({@link #take}).
+            // The appends running at once write one index ({@link #take}).
             String index = staged.isEmpty() ? null : staged.get(0).waiter().shardId().getIndex().getUUID();
             synchronized (batch.seqLock) {
                 boolean newIndex = index != null && !index.equals(batch.seqIndex);
