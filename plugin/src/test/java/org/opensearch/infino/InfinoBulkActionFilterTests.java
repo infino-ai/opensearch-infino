@@ -126,7 +126,7 @@ public class InfinoBulkActionFilterTests extends OpenSearchTestCase {
     public void testAnItemAPipelineAlreadyAnsweredRequiresNoAlias() {
         BulkRequest bulk = new BulkRequest().add(write("new_index", false)).add(write("new_index", true)).add(write("other", true));
         BulkItemResponse[] answered = new BulkItemResponse[3];
-        answered[1] = BulkItemResponse.failure(
+        answered[1] = new BulkItemResponse(
             1,
             DocWriteRequest.OpType.INDEX,
             new BulkItemResponse.Failure("new_index", "1", new IllegalStateException("pipeline failed"))
@@ -153,12 +153,12 @@ public class InfinoBulkActionFilterTests extends OpenSearchTestCase {
             .add(write("flag_failed", false))
             .add(write("flag_failed", true));
         BulkItemResponse[] answered = new BulkItemResponse[5];
-        answered[0] = BulkItemResponse.failure(
+        answered[0] = new BulkItemResponse(
             0,
             DocWriteRequest.OpType.INDEX,
             new BulkItemResponse.Failure("dropped_only", "1", new IllegalStateException("pipeline failed"))
         );
-        answered[4] = BulkItemResponse.failure(
+        answered[4] = new BulkItemResponse(
             4,
             DocWriteRequest.OpType.INDEX,
             new BulkItemResponse.Failure("flag_failed", "1", new IllegalStateException("pipeline failed"))
