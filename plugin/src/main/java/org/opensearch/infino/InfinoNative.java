@@ -114,6 +114,8 @@ public final class InfinoNative {
     private static final Set<String> DATE_TYPES = Set.of("date", "date_nanos");
     /** The mapping types whose values a sort compares as 32-bit floats (stock's float comparator). */
     private static final Set<String> FLOAT_TYPES = Set.of("float", "half_float");
+    /** The integral field types narrower than a long, whose sort stock compares as 32-bit ints. */
+    private static final Set<String> INT_TYPES = Set.of("integer", "short", "byte");
     /** The type of a multi-field that holds its field's value whole, the exact form of a text field. */
     private static final String KEYWORD_TYPE = "keyword";
     /** The other type that holds a value whole: a wildcard field compares the value as a keyword one does. */
@@ -695,7 +697,9 @@ public final class InfinoNative {
      * column holds the value the multi-field indexes whole (a log mapping's
      * {@code request.raw} under the text field {@code request}, as a dynamic
      * mapping's {@code name.keyword}); each date field's declared format;
-     * and each {@code float} or {@code half_float} field ({@code floatFields}).
+     * each {@code float} or {@code half_float} field ({@code floatFields});
+     * and each {@code integer}, {@code short} or {@code byte} field
+     * ({@code intFields}).
      * A wildcard multi-field reads as a keyword one. {@code multiFields} are
      * every multi-field's path, and {@code normalized} the keyword and
      * wildcard fields with a normalizer, whose values the table keeps as
@@ -709,6 +713,7 @@ public final class InfinoNative {
         Set<String> similarityFields,
         Set<String> otherSimilarityFields,
         Set<String> floatFields,
+        Set<String> intFields,
         Set<String> multiFields,
         Set<String> normalized,
         boolean defaultBm25
@@ -731,6 +736,7 @@ public final class InfinoNative {
                 new LinkedHashMap<>(),
                 new LinkedHashMap<>(),
                 new LinkedHashMap<>(),
+                new HashSet<>(),
                 new HashSet<>(),
                 new HashSet<>(),
                 new HashSet<>(),
@@ -766,6 +772,9 @@ public final class InfinoNative {
                 }
                 if (field.get(TYPE) instanceof String type && FLOAT_TYPES.contains(type)) {
                     floatFields.add(path);
+                }
+                if (field.get(TYPE) instanceof String type && INT_TYPES.contains(type)) {
+                    intFields.add(path);
                 }
                 if (scoresBySimilarity(field)) {
                     similarityFields.add(path);
@@ -867,6 +876,16 @@ public final class InfinoNative {
     static Set<String> floatFields(String table) {
         Mapping mapping = MAPPINGS.get(table);
         return mapping == null ? Set.of() : mapping.floatFields();
+    }
+
+    /**
+     * The fields of {@code table} its mapping declares {@code integer},
+     * {@code short} or {@code byte}, which a sort compares as 32-bit ints;
+     * empty for a table no mapping has declared yet.
+     */
+    static Set<String> intFields(String table) {
+        Mapping mapping = MAPPINGS.get(table);
+        return mapping == null ? Set.of() : mapping.intFields();
     }
 
     /**
