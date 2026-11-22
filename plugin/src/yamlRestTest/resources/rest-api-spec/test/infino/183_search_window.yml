@@ -1,0 +1,141 @@
+# What one search of an index may ask of its table, when the index sets a limit.
+setup:
+  - do:
+      indices.create:
+        index: win
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0, index.infino.search.window.field: time, index.infino.search.window.max: 1d }
+          mappings: { properties: { time: { type: date }, title: { type: text }, lang: { type: keyword }, hits: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: win, _id: "1" }
+          - { time: "2025-05-08T18:00:00Z", title: "Pope Leo XIV", lang: en, hits: 9 }
+          - index: { _index: win, _id: "2" }
+          - { time: "2025-05-08T19:00:00Z", title: "Leo the pope", lang: en, hits: 5 }
+          - index: { _index: win, _id: "3" }
+          - { time: "2024-01-01T00:00:00Z", title: "New year", lang: de, hits: 3 }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: win
+        ignore_unavailable: true
+
+---
+"A listing or a breakdown is held to the span, and a count or a total is not":
+  # Inside the span: served.
+  - do:
+      search:
+        index: win
+        body: { query: { range: { time: { gte: "2025-05-08T00:00:00Z", lte: "2025-05-09T00:00:00Z" } } }, sort: [ { hits: desc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: win
+        body: { size: 0, query: { range: { time: { gte: "2025-05-08T00:00:00Z", lte: "2025-05-09T00:00:00Z" } } }, aggs: { langs: { terms: { field: lang } } } }
+  - match: { aggregations.langs.buckets.0.key: en }
+  - match: { aggregations.langs.buckets.0.doc_count: 2 }
+
+  # Wider than the span, or with no range at all: refused with what may be asked.
+  - do:
+      catch: /lists\sdocuments\sand\sbreaks\sthem\sinto\sgroups\sover\sat\smost\s\[1d\]\sof\s\[time\]/
+      search:
+        index: win
+        body: { query: { range: { time: { gte: "2024-01-01T00:00:00Z", lte: "2025-12-31T00:00:00Z" } } } }
+  - do:
+      catch: bad_request
+      search:
+        index: win
+        body: { query: { range: { time: { gte: "2024-01-01T00:00:00Z", lte: "2025-12-31T00:00:00Z" } } } }
+  - do:
+      catch: /names\sno\ssuch\srange/
+      search:
+        index: win
+  - do:
+      catch: /names\sno\ssuch\srange/
+      search:
+        index: win
+        body: { size: 0, aggs: { langs: { terms: { field: lang } } } }
+  # Ends that are written alike and read a year apart are measured as they are read.
+  - do:
+      catch: /lists\sdocuments\sand\sbreaks\sthem\sinto\sgroups/
+      search:
+        index: win
+        body: { query: { range: { time: { gte: "2025-05-08||/y", lte: "2025-05-08||/y" } } } }
+  # A bound in seconds is read as seconds.
+  - do:
+      catch: /lists\sdocuments\sand\sbreaks\sthem\sinto\sgroups/
+      search:
+        index: win
+        body: { query: { range: { time: { gte: 1704067200, lte: 1735689600, format: epoch_second } } } }
+
+  # A count and a plain total answer over any span.
+  - do:
+      count:
+        index: win
+  - match: { count: 3 }
+  - do:
+      count:
+        index: win
+        body: { query: { range: { time: { gte: "2024-01-01T00:00:00Z", lte: "2025-12-31T00:00:00Z" } } } }
+  - match: { count: 3 }
+  - do:
+      search:
+        index: win
+        body: { size: 0, track_total_hits: true, aggs: { views: { sum: { field: hits } } } }
+  - match: { hits.total.value: 3 }
+  - match: { aggregations.views.value: 17.0 }
+
+  # The limit is a setting of a live index: lifted, the same search is served.
+  - do:
+      indices.put_settings:
+        index: win
+        body: { index.infino.search.window.max: null }
+  - do:
+      search:
+        index: win
+        body: { query: { range: { time: { gte: "2024-01-01T00:00:00Z", lte: "2025-12-31T00:00:00Z" } } } }
+  - match: { hits.total.value: 3 }
+
+---
+"An index may refuse phrases, and still serves a phrase query on a field that is not text":
+  # Served by default.
+  - do:
+      search:
+        index: win
+        body: { size: 0, track_total_hits: true, query: { match_phrase: { title: "pope leo" } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      indices.put_settings:
+        index: win
+        body: { index.infino.search.phrases: false }
+  - do:
+      catch: /does\snot\ssearch\sfor\sa\sphrase/
+      search:
+        index: win
+        body: { size: 0, query: { match_phrase: { title: "pope leo" } } }
+  - do:
+      catch: bad_request
+      count:
+        index: win
+        body: { query: { match_phrase: { title: "pope leo" } } }
+  - do:
+      catch: /does\snot\ssearch\sfor\sa\sphrase/
+      search:
+        index: win
+        body: { size: 0, query: { query_string: { query: "title:\"pope leo\"" } } }
+  # The words are a filter, and so is a phrase query on a keyword.
+  - do:
+      count:
+        index: win
+        body: { query: { match: { title: { query: "pope leo", operator: and } } } }
+  - match: { count: 2 }
+  - do:
+      count:
+        index: win
+        body: { query: { match_phrase: { lang: en } } }
+  - match: { count: 2 }

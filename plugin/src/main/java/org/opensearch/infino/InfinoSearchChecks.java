@@ -48,19 +48,18 @@ final class InfinoSearchChecks {
 
     /** Refuse {@code source} over {@code indices} as a shard of each would. */
     static void check(SearchSourceBuilder source, List<IndexMetadata> indices, boolean allowExpensive) {
-        // The one check a search with no source can fail: it lists documents over every time there is.
-        for (IndexMetadata index : indices) {
-            InfinoSearchWindow.check(source, index, System::currentTimeMillis);
-        }
-        if (source == null) {
-            return;
-        }
         for (IndexMetadata index : indices) {
             Settings settings = index.getSettings();
+            // The mapping is read once for an index, for every check that needs its fields.
+            Map<String, Object> properties = properties(index.mapping());
+            // The one check a search with no source can fail: it lists documents over every time there is.
+            InfinoSearchWindow.check(source, index, properties, System::currentTimeMillis);
+            if (source == null) {
+                continue;
+            }
             checkRescores(source, settings);
             checkFields(source, settings);
             int maxTerms = IndexSettings.MAX_TERMS_COUNT_SETTING.get(settings);
-            Map<String, Object> properties = properties(index.mapping());
             checkQuery(source.query(), maxTerms, allowExpensive, properties);
             checkQuery(source.postFilter(), maxTerms, allowExpensive, properties);
         }
