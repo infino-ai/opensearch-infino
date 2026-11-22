@@ -297,7 +297,11 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         // A total the aggregations take as their population is counted in full
         // (see InfinoSearch.search); a scroll's next round resumes from this
         // round's last hit (see scrollRound).
-        InfinoSearch.Page page = InfinoSearch.page(index, plan, source, !countWithAggs, scroll == null && !sharedTotal, scroll != null);
+        // A search of this shard alone cuts its window from this page: the hits
+        // before it need no source. They are not kept, so a fetch that does ask
+        // for one reads it again (see InfinoFetchSubPhase).
+        int sourceFrom = scroll == null && context.request().numberOfShards() == 1 ? Math.max(0, source.from()) : 0;
+        InfinoSearch.Page page = InfinoSearch.page(index, plan, source, !countWithAggs, scroll == null && !sharedTotal, scroll != null, sourceFrom);
         long total = page.total();
         if (!builders.isEmpty()) {
             // A search over several shards (this index's, or other indices')
@@ -343,12 +347,16 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             : null;
         List<ScoreDoc> docs = new ArrayList<>(rows.size());
         List<Object> collapseValues = new ArrayList<>();
-        for (SearchHit h : rows) {
+        int unsourced = page.unsourced();
+        for (int i = 0; i < rows.size(); i++) {
+            SearchHit h = rows.get(i);
             int doc = docId(searcher, h.getId());
             if (doc < 0) {
                 continue; // in the table, not in the skeleton reader this search holds (see scrollRows)
             }
-            KEPT.put(key(carried.request(), shardId, h.getId()), h);
+            if (i >= unsourced) {
+                KEPT.put(key(carried.request(), shardId, h.getId()), h);
+            }
             float score = Float.isNaN(h.getScore()) && !sorted ? 1.0f : h.getScore();
             if (sorted) {
                 docs.add(new FieldDoc(doc, score, sortValues(h.getSortValues(), plan.sorts())));

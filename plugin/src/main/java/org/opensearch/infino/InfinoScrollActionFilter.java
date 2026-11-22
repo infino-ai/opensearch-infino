@@ -15,7 +15,6 @@ import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchScrollAction;
 import org.opensearch.action.search.SearchScrollRequest;
-import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -49,7 +48,7 @@ import java.util.function.Supplier;
  * cursor moves to where the page stopped. A scroll id another node or
  * OpenSearch itself issued goes on as it is.
  */
-public class InfinoScrollActionFilter implements ActionFilter {
+public class InfinoScrollActionFilter extends InfinoActionFilter {
 
     private static final Logger log = LogManager.getLogger(InfinoScrollActionFilter.class);
     /** The thread-context key the security plugin keeps the authenticated user under; its string form names the scroll's owner. */
@@ -72,7 +71,7 @@ public class InfinoScrollActionFilter implements ActionFilter {
     }
 
     @Override
-    public <Request extends ActionRequest, Response extends ActionResponse> void apply(
+    protected <Request extends ActionRequest, Response extends ActionResponse> void filter(
         Task task,
         String action,
         Request request,

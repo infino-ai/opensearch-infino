@@ -11,7 +11,6 @@ import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
-import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.support.WriteRequest;
 import org.opensearch.action.update.UpdateAction;
@@ -38,7 +37,7 @@ import java.util.function.Supplier;
  * the cluster as that one-item bulk, which the bulk filter merges and hands
  * to the shard as a write of the whole document.
  */
-public class InfinoUpdateActionFilter implements ActionFilter {
+public class InfinoUpdateActionFilter extends InfinoActionFilter {
 
     private static final Logger log = LogManager.getLogger(InfinoUpdateActionFilter.class);
 
@@ -59,7 +58,7 @@ public class InfinoUpdateActionFilter implements ActionFilter {
     }
 
     @Override
-    public <Request extends ActionRequest, Response extends ActionResponse> void apply(
+    protected <Request extends ActionRequest, Response extends ActionResponse> void filter(
         Task task,
         String action,
         Request request,

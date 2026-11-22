@@ -3,7 +3,8 @@
 # on the hit and among its sort values, as stock does (#133). A query whose hits all score
 # alike is ordered by the field, the one score among the sort values. Mixed
 # sorts the table cannot order as stock does are refused. A match in filter
-# context scores nothing, as in stock, sorted or not. Sorted by fields alone
+# context scores nothing, as in stock, sorted or not, and so does a should
+# clause that scores nothing itself. Sorted by fields alone
 # under track_scores, each hit carries the score it has unsorted, and
 # max_score is the best of every match, not of the page alone.
 setup:
@@ -905,3 +906,75 @@ teardown:
   - match: { hits.hits.0._id: d04 }
   - match: { hits.hits.0._score: null }
   - match: { hits.max_score: null }
+
+---
+"A should clause that scores nothing itself adds nothing: every hit scores 0":
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { bool: { filter: [{ match: { message: disk } }], should: [{ bool: { filter: [{ term: { status: ok } }] } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+          size: 3
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.1._id: d02 }
+  - match: { hits.hits.2._id: d05 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.0.sort.0: 0.0 }
+  - match: { hits.max_score: 0.0 }
+  - do:
+      search:
+        index: ssort_luc
+        body:
+          query: { bool: { filter: [{ match: { message: disk } }], should: [{ bool: { filter: [{ term: { status: ok } }] } }] } }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.5._score: 0.0 }
+  - match: { hits.max_score: 0.0 }
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { bool: { filter: [{ match: { message: disk } }], should: [{ bool: { filter: [{ term: { status: ok } }] } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+          size: 3
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.1._id: d02 }
+  - match: { hits.hits.2._id: d05 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.0.sort.0: 0.0 }
+  - match: { hits.max_score: 0.0 }
+  - do:
+      search:
+        index: ssort_proxy
+        body:
+          query: { bool: { filter: [{ match: { message: disk } }], should: [{ bool: { filter: [{ term: { status: ok } }] } }] } }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.5._score: 0.0 }
+  - match: { hits.max_score: 0.0 }
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { bool: { filter: [{ match: { message: disk } }], should: [{ bool: { filter: [{ term: { status: ok } }] } }] } }
+          sort: [{ _score: desc }, { seq: asc }]
+          size: 3
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: d04 }
+  - match: { hits.hits.1._id: d02 }
+  - match: { hits.hits.2._id: d05 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.0.sort.0: 0.0 }
+  - match: { hits.max_score: 0.0 }
+  - do:
+      search:
+        index: ssort_default
+        body:
+          query: { bool: { filter: [{ match: { message: disk } }], should: [{ bool: { filter: [{ term: { status: ok } }] } }] } }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._score: 0.0 }
+  - match: { hits.hits.5._score: 0.0 }
+  - match: { hits.max_score: 0.0 }

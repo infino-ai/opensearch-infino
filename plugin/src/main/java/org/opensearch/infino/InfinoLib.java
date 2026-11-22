@@ -37,6 +37,11 @@ public interface InfinoLib extends Library {
 
     Pointer infino_ensure_table(Pointer h, String name, String mappingJson);
 
+    Pointer infino_attach_table(Pointer h, String name, String mappingJson);
+
+    /** Whether an index could be attached to the table: {@code {"refused": null | "<why>"}}, or {@code {"error"}} when the table could not be read. */
+    Pointer infino_attach_check(Pointer h, String name, String mappingJson);
+
     Pointer infino_columns(Pointer h, String name);
 
     Pointer infino_check_doc(Pointer h, String name, String source);
@@ -104,6 +109,8 @@ public interface InfinoLib extends Library {
     Pointer infino_sql_read(Pointer h, String sql, String views);
 
     Pointer infino_bm25(Pointer h, String name, String column, String query, String mode, int k);
+
+    Pointer infino_sorted(Pointer h, String name, String column, int descending, int k, int withSource);
 
     Pointer infino_count(Pointer h, String name, String column, String query, String mode);
 
