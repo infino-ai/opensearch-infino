@@ -48,15 +48,18 @@ final class InfinoSearchChecks {
 
     /** Refuse {@code source} over {@code indices} as a shard of each would. */
     static void check(SearchSourceBuilder source, List<IndexMetadata> indices, boolean allowExpensive) {
-        if (source == null) {
-            return;
-        }
         for (IndexMetadata index : indices) {
             Settings settings = index.getSettings();
+            // The mapping is read once for an index, for every check that needs its fields.
+            Map<String, Object> properties = properties(index.mapping());
+            // The one check a search with no source can fail: it lists documents over every time there is.
+            InfinoSearchWindow.check(source, index, properties, System::currentTimeMillis);
+            if (source == null) {
+                continue;
+            }
             checkRescores(source, settings);
             checkFields(source, settings);
             int maxTerms = IndexSettings.MAX_TERMS_COUNT_SETTING.get(settings);
-            Map<String, Object> properties = properties(index.mapping());
             checkQuery(source.query(), maxTerms, allowExpensive, properties);
             checkQuery(source.postFilter(), maxTerms, allowExpensive, properties);
         }
@@ -154,7 +157,7 @@ final class InfinoSearchChecks {
     }
 
     /** The queries a compound query holds. */
-    private static List<QueryBuilder> inner(QueryBuilder qb) {
+    static List<QueryBuilder> inner(QueryBuilder qb) {
         if (qb instanceof BoolQueryBuilder b) {
             List<QueryBuilder> all = new ArrayList<>(b.must());
             all.addAll(b.filter());
@@ -188,13 +191,13 @@ final class InfinoSearchChecks {
     }
 
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> properties(MappingMetadata mapping) {
+    static Map<String, Object> properties(MappingMetadata mapping) {
         Object properties = mapping == null ? null : mapping.sourceAsMap().get("properties");
         return properties instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
     }
 
     /** A field's mapping by its full name, through objects and multi-fields, an alias followed; null when it is not mapped. */
-    private static Map<String, Object> field(Map<String, Object> properties, String name) {
+    static Map<String, Object> field(Map<String, Object> properties, String name) {
         Map<String, Object> field = lookup(properties, name);
         if (field != null && "alias".equals(field.get("type")) && field.get("path") instanceof String path) {
             return lookup(properties, path);

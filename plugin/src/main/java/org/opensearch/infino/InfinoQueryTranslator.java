@@ -3291,15 +3291,41 @@ final class InfinoQueryTranslator {
      * as OpenSearch refuses it, rather than matching nothing.
      */
     private String dateBound(Object value, String format, boolean roundUp, ZoneId zone) {
-        String lit = dateLiteral(value, format, roundUp, zone);
-        if (lit == null) {
+        return literal(Instant.ofEpochMilli(dateBoundMillis(value, format, roundUp, zone, nowMillis)).toString());
+    }
+
+    /**
+     * A range's date bound as epoch milliseconds, read as {@link #range}
+     * reads it into the statement: {@code format} is the range's own, else
+     * the field's mapped one, {@code roundUp} is set for an exclusive lower
+     * bound and an inclusive upper one, and a bound the format cannot read
+     * is refused as OpenSearch refuses it. Anything that judges a range
+     * before it is sent reads its bounds here, so it judges what is read.
+     */
+    static long dateBoundMillis(Object value, String format, boolean roundUp, ZoneId zone, long nowMillis) {
+        Long at = dateMillis(value, format, roundUp, zone, nowMillis);
+        if (at == null) {
             throw new OpenSearchParseException(
                 "failed to parse date field [{}] with format [{}]",
                 value,
                 format == null ? DEFAULT_DATE_FORMAT : format
             );
         }
-        return lit;
+        return at;
+    }
+
+    /**
+     * A date, epoch number or date math as epoch milliseconds, or null when
+     * {@code format} cannot read it. A number is epoch milliseconds in the
+     * default format and read by {@code format} when one is given, as
+     * OpenSearch reads a number by the field's format (an
+     * {@code epoch_second} field's {@code 893966296} is seconds).
+     */
+    private static Long dateMillis(Object value, String format, boolean roundUp, ZoneId zone, long nowMillis) {
+        if (value instanceof Number n && format == null) {
+            return n.longValue();
+        }
+        return dateMathMillis(value.toString(), format, roundUp, zone, nowMillis);
     }
 
     /**
@@ -3309,18 +3335,8 @@ final class InfinoQueryTranslator {
      * {@code 893966296} is seconds).
      */
     private String dateLiteral(Object value, String format, boolean roundUp, ZoneId zone) {
-        Instant at;
-        if (value instanceof Number n && format == null) {
-            at = Instant.ofEpochMilli(n.longValue());
-        } else {
-            DateMathParser parser = DateFormatter.forPattern(format == null ? DEFAULT_DATE_FORMAT : format).toDateMathParser();
-            try {
-                at = parser.parse(value.toString(), InfinoClock.of(nowMillis), roundUp, zone);
-            } catch (RuntimeException e) {
-                return null;
-            }
-        }
+        Long at = dateMillis(value, format, roundUp, zone, nowMillis);
         // The column holds milliseconds; a rounded-up bound ends in .999.
-        return literal(Instant.ofEpochMilli(at.toEpochMilli()).toString());
+        return at == null ? null : literal(Instant.ofEpochMilli(at).toString());
     }
 }
