@@ -22,8 +22,9 @@ import java.util.Map;
  * The fetch phase of a default-mode shard: each hit gets what its query
  * phase built for it from the table ({@link InfinoQueryPhaseSearcher}) —
  * its source, filtered and masked as proxy mode serves it, and the
- * requested fields, script fields and collapse value — since the shard's
- * Lucene skeleton keeps no source and no values. A hit whose kept copy is
+ * requested fields, script fields and collapse value, and a field-sorted
+ * hit's score under track_scores — since the shard's Lucene skeleton keeps
+ * no source and no values. A hit whose kept copy is
  * gone (it waited past its time) is read from the table again by the same
  * hit statement, under the same rules. Other shards get no processor.
  */
@@ -59,6 +60,13 @@ public class InfinoFetchSubPhase implements FetchSubPhase {
                 }
                 stored.refuse(shardId.getIndexName(), written.fetchSource(), fetchFields);
                 SearchHit kept = InfinoQueryPhaseSearcher.take(carried.request(), shardId, id);
+                if (kept != null && !Float.isNaN(kept.getScore())) {
+                    // A hit sorted by fields carries the score its query phase gave it
+                    // (under track_scores): the shard's Lucene skeleton cannot score it,
+                    // and the coordinating node takes a field-sorted hit's score from
+                    // its fetched copy. A hit read again below has no such score.
+                    hit.hit().score(kept.getScore());
+                }
                 if (kept == null) {
                     kept = reread(table, shardId, id, written, now);
                 }
