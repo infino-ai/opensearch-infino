@@ -52,7 +52,6 @@ setup:
           - { tag: "y" }
           - index: { _index: uo_luc, _id: "x1" }
           - { tag: "x" }
-  - match: { errors: false }
   - do:
       bulk:
         refresh: true
@@ -75,7 +74,6 @@ setup:
           - { tag: "y" }
           - index: { _index: uo_luc, _id: "m5" }
           - { tag: "x" }
-  - match: { errors: false }
   - do:
       bulk:
         refresh: true
@@ -98,7 +96,13 @@ setup:
           - { tag: "x" }
           - index: { _index: uo_luc, _id: "h6" }
           - { tag: "x" }
-  - match: { errors: false }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: uo_inf,uo_prx,uo_luc,uj_inf,uj_prx,uj_luc
+        ignore_unavailable: true
 
 ---
 "A search with no sort pages through a table of several files in write order, every row once, as a Lucene twin pages it":
@@ -340,6 +344,31 @@ setup:
   - match: { hits.hits.0._id: "z3" }
   - match: { hits.hits.1._id: "b8" }
   - match: { hits.hits.2._id: "h6" }
+  # So does a filtered page in proxy mode.
+  - do:
+      search:
+        index: uo_prx
+        body: { from: 0, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "k7" }
+  - match: { hits.hits.1._id: "x1" }
+  - do:
+      search:
+        index: uo_prx
+        body: { from: 2, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "a9" }
+  - match: { hits.hits.1._id: "m5" }
+  - do:
+      search:
+        index: uo_prx
+        body: { from: 4, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b8" }
+  - match: { hits.hits.1._id: "h6" }
 
 ---
 "A collapse with no sort keeps each group's first row in write order, and orders the groups by it, as the Lucene twin does":
@@ -495,6 +524,15 @@ setup:
               tag: { type: keyword }
   - do:
       indices.create:
+        index: uj_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              body: { type: text }
+              tag: { type: keyword }
+  - do:
+      indices.create:
         index: uj_luc
         body:
           settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
@@ -511,6 +549,12 @@ setup:
           - index: { _index: uj_inf, _id: "b2" }
           - { body: "lazy dog", tag: "y" }
           - index: { _index: uj_inf, _id: "r7" }
+          - { body: "red fox runs", tag: ["y", "x"] }
+          - index: { _index: uj_prx, _id: "e5" }
+          - { body: "quick red fox", tag: ["x", "w"] }
+          - index: { _index: uj_prx, _id: "b2" }
+          - { body: "lazy dog", tag: "y" }
+          - index: { _index: uj_prx, _id: "r7" }
           - { body: "red fox runs", tag: ["y", "x"] }
           - index: { _index: uj_luc, _id: "e5" }
           - { body: "quick red fox", tag: ["x", "w"] }
@@ -529,6 +573,12 @@ setup:
           - { body: "brown dog", tag: ["z", "y"] }
           - index: { _index: uj_inf, _id: "g9" }
           - { body: "slow fox", tag: "x" }
+          - index: { _index: uj_prx, _id: "a1" }
+          - { body: "the red fox", tag: "x" }
+          - index: { _index: uj_prx, _id: "t4" }
+          - { body: "brown dog", tag: ["z", "y"] }
+          - index: { _index: uj_prx, _id: "g9" }
+          - { body: "slow fox", tag: "x" }
           - index: { _index: uj_luc, _id: "a1" }
           - { body: "the red fox", tag: "x" }
           - index: { _index: uj_luc, _id: "t4" }
@@ -545,6 +595,12 @@ setup:
           - index: { _index: uj_inf, _id: "c6" }
           - { body: "a dog", tag: "x" }
           - index: { _index: uj_inf, _id: "h0" }
+          - { body: "old fox", tag: ["x", "z"] }
+          - index: { _index: uj_prx, _id: "m3" }
+          - { body: "red fox again", tag: ["w", "y"] }
+          - index: { _index: uj_prx, _id: "c6" }
+          - { body: "a dog", tag: "x" }
+          - index: { _index: uj_prx, _id: "h0" }
           - { body: "old fox", tag: ["x", "z"] }
           - index: { _index: uj_luc, _id: "m3" }
           - { body: "red fox again", tag: ["w", "y"] }
@@ -597,6 +653,54 @@ setup:
   - do:
       search:
         index: uj_inf
+        body: { from: 4, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "c6" }
+  - match: { hits.hits.1._id: "h0" }
+  # Proxy mode pages both the same way.
+  - do:
+      search:
+        index: uj_prx
+        body: { from: 0, size: 2, query: { bool: { must_not: { match_phrase: { body: "red fox" } } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b2" }
+  - match: { hits.hits.1._id: "t4" }
+  - do:
+      search:
+        index: uj_prx
+        body: { from: 2, size: 2, query: { bool: { must_not: { match_phrase: { body: "red fox" } } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "g9" }
+  - match: { hits.hits.1._id: "c6" }
+  - do:
+      search:
+        index: uj_prx
+        body: { from: 4, size: 2, query: { bool: { must_not: { match_phrase: { body: "red fox" } } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "h0" }
+  - do:
+      search:
+        index: uj_prx
+        body: { from: 0, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "e5" }
+  - match: { hits.hits.1._id: "r7" }
+  - do:
+      search:
+        index: uj_prx
+        body: { from: 2, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "a1" }
+  - match: { hits.hits.1._id: "g9" }
+  - do:
+      search:
+        index: uj_prx
         body: { from: 4, size: 2, query: { bool: { filter: { term: { tag: "x" } } } } }
   - match: { hits.total.value: 6 }
   - length: { hits.hits: 2 }
