@@ -857,6 +857,16 @@ fn err_json(e: &str) -> *mut c_char {
     out_json(error_value(e))
 }
 
+/// The error object of a failed read by id: the message names the call and
+/// what it read (the id, or the table for a read of many ids), but the
+/// status is read off the engine's message alone, so an id that spells
+/// `server returned 200` cannot set it.
+fn read_err_json(call: &str, what: &str, e: &str) -> *mut c_char {
+    let mut v = error_value(e);
+    v["error"] = json!(format!("{call} {what}: {e}"));
+    out_json(v)
+}
+
 // ---------------------------------------------------------------------------
 // Connection lifecycle
 // ---------------------------------------------------------------------------
@@ -3836,15 +3846,12 @@ fn row_by_osid_sql(name: &str, osid: &str, columns: &[&str]) -> String {
     )
 }
 
-/// [`get_row`], a failed read logged and answered as absent.
-fn found_row(conn: &Bridge, name: &str, osid: &str) -> Option<Row> {
-    get_row(conn, name, osid).unwrap_or_else(|e| {
-        eprintln!("[capi] get: {e}");
-        None
-    })
-}
-
-/// The raw `_source` JSON for one osid, or "" if absent.
+/// The raw `_source` JSON of one osid, as `{"source": ..}`, null when the
+/// table holds no such id, or `{"error":..}` when the lookup fails. A failed
+/// read is never answered as absent: a write would take the document as
+/// missing and create or overwrite it. The source sits one level down so
+/// that no document, one whose first field is `error` included, can make
+/// the answer read as an error.
 #[no_mangle]
 pub unsafe extern "C" fn infino_get(
     h: *mut Bridge,
@@ -3857,16 +3864,20 @@ pub unsafe extern "C" fn infino_get(
         else {
             return ptr::null_mut();
         };
-        out_string(found_row(conn, name, osid).map_or_else(String::new, |row| row.source))
+        match get_row(conn, name, osid) {
+            Ok(row) => out_json(json!({ "source": row.map(|row| row.source) })),
+            Err(e) => read_err_json("get", osid, &e),
+        }
     }))
     .unwrap_or(ptr::null_mut())
 }
 
-/// [`infino_get`] as of the table's latest commit ([`get_row_latest`]): for
-/// a write that merges into the document it finds, when the last node to
-/// write the table may be another. A lookup that fails answers null rather
-/// than "": a source is any JSON object, so no error object can stand for
-/// the failure.
+/// One osid's raw `_source` JSON as of the table's latest commit
+/// ([`get_row_latest`]), "" when the table holds no such id: for a write
+/// that merges into the document it finds, when the last node to write the
+/// table may be another. A lookup that fails answers null rather than "":
+/// a source is any JSON object, so no error object can stand for the
+/// failure.
 #[no_mangle]
 pub unsafe extern "C" fn infino_get_latest(
     h: *mut Bridge,
@@ -3922,10 +3933,12 @@ pub unsafe extern "C" fn infino_get_many(
                 Err(e) => err_json(&format!("get_many: {e}")),
             };
         }
+        // A failure keeps the id apart from the engine's message, so the id
+        // names itself in the error but cannot set its status.
         let rows = side_by_side(
             &ids,
-            |id| get_row(conn, name, id).map_err(|e| format!("{id}: {e}")),
-            |e| e,
+            |id| get_row(conn, name, id).map_err(|e| (id.to_owned(), e)),
+            |e| (String::new(), e),
         );
         match rows {
             Ok(rows) => {
@@ -3937,16 +3950,17 @@ pub unsafe extern "C" fn infino_get_many(
                 }
                 out_json(json!({ "sources": found }))
             }
-            Err(e) => err_json(&format!("get_many {e}")),
+            Err((id, e)) => read_err_json("get_many", &id, &e),
         }
     }))
     .unwrap_or(ptr::null_mut())
 }
 
-/// One osid's document as `{"source": .., "seq": n, "routing": ..}`, its
-/// sequence number what a conditional write on it is checked against and
-/// `routing` (left out for none) what a get reports as `_routing`; "" if
-/// absent.
+/// One osid's document as `{"doc": {"source": .., "seq": n, "routing": ..}}`,
+/// its sequence number what a conditional write on it is checked against and
+/// `routing` (left out for none) what a get reports as `_routing`;
+/// `{"doc": null}` when the table holds no such id, and `{"error":..}` when
+/// the lookup fails, as [`infino_get`] answers.
 #[no_mangle]
 pub unsafe extern "C" fn infino_get_doc(
     h: *mut Bridge,
@@ -3959,20 +3973,22 @@ pub unsafe extern "C" fn infino_get_doc(
         else {
             return ptr::null_mut();
         };
-        match found_row(conn, name, osid) {
-            Some(row) => out_json(row.doc_json()),
-            None => out_string(String::new()),
+        match get_row(conn, name, osid) {
+            Ok(row) => out_json(json!({ "doc": row.map(Row::doc_json) })),
+            Err(e) => read_err_json("get_doc", osid, &e),
         }
     }))
     .unwrap_or(ptr::null_mut())
 }
 
 /// The documents of several osids ([`rows_of`]), as `{"docs": {id: doc}}`,
-/// each doc as [`infino_get_doc`] gives it; an id the table does not hold
-/// is absent. For a realtime multi-get on the node whose own connection has
-/// read every commit: one open of the table for all the ids. A lookup that
-/// fails answers null rather than an answer missing ids, so a failed read
-/// is never taken for a missing document.
+/// each doc `{"source", "seq", "routing"}` as [`infino_get_doc`] gives it;
+/// an id the table does not hold is absent. For a realtime multi-get on the
+/// node whose own connection has read every commit: one open of the table
+/// for all the ids. A lookup that fails answers `{"error":..}` for the whole
+/// call, as [`infino_get`] answers, never an answer missing ids, so a failed
+/// read is never taken for a missing document. The ids sit one level down,
+/// so no id, `error` included, can make the answer read as an error.
 #[no_mangle]
 pub unsafe extern "C" fn infino_get_docs(
     h: *mut Bridge,
@@ -4018,8 +4034,12 @@ unsafe fn get_docs(
                 out_json(json!({ "docs": docs }))
             }
             Err(e) => {
-                eprintln!("[capi] get_docs (latest: {latest}): {e}");
-                ptr::null_mut()
+                let call = if latest {
+                    "get_docs_latest"
+                } else {
+                    "get_docs"
+                };
+                read_err_json(call, name, &e.to_string())
             }
         }
     }))
@@ -4915,6 +4935,11 @@ fn cell_json(col: &dyn Array, r: usize) -> String {
 mod tests {
     use super::*;
 
+    /// How many catalogs [`open_logs`] has made in this process: part of
+    /// each one's directory name, since tests running at once can read the
+    /// same clock time.
+    static OPENED_LOGS: AtomicUsize = AtomicUsize::new(0);
+
     const MAPPING: &str = r#"{"properties":{
         "@timestamp":{"type":"date"},
         "level":{"type":"keyword"},
@@ -4940,8 +4965,9 @@ mod tests {
     /// storage, and delete / update need one.
     fn open_logs() -> *mut Bridge {
         let dir = std::env::temp_dir().join(format!(
-            "infino-capi-test-{}-{}",
+            "infino-capi-test-{}-{}-{}",
             std::process::id(),
+            OPENED_LOGS.fetch_add(1, Ordering::SeqCst),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -5028,10 +5054,21 @@ mod tests {
 
     /// [`infino_get_docs_latest`] of `ids` in table `logs`.
     fn docs_latest(h: *mut Bridge, ids: &[&str]) -> String {
+        docs_from(h, "logs", ids, true)
+    }
+
+    /// [`infino_get_docs`] of `ids` in `table`, or [`infino_get_docs_latest`]
+    /// when `latest`.
+    fn docs_from(h: *mut Bridge, table: &str, ids: &[&str], latest: bool) -> String {
         let ids: Vec<CString> = ids.iter().map(|id| c(id)).collect();
         let ptrs: Vec<*const c_char> = ids.iter().map(|id| id.as_ptr()).collect();
+        let (table, count) = (c(table), ptrs.len() as c_int);
         take(unsafe {
-            infino_get_docs_latest(h, c("logs").as_ptr(), ptrs.as_ptr(), ptrs.len() as c_int)
+            if latest {
+                infino_get_docs_latest(h, table.as_ptr(), ptrs.as_ptr(), count)
+            } else {
+                infino_get_docs(h, table.as_ptr(), ptrs.as_ptr(), count)
+            }
         })
     }
 
@@ -5099,7 +5136,16 @@ mod tests {
     }
 
     fn get(h: *mut Bridge, osid: &str) -> String {
-        take(unsafe { infino_get(h, c("logs").as_ptr(), c(osid).as_ptr()) })
+        get_from(h, "logs", osid)
+    }
+
+    /// One id's source from `table` as `infino_get` answers it, "" when the
+    /// table holds no such id; a lookup that fails panics.
+    fn get_from(h: *mut Bridge, table: &str, osid: &str) -> String {
+        let out = take(unsafe { infino_get(h, c(table).as_ptr(), c(osid).as_ptr()) });
+        let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert!(v.get("source").is_some(), "{out}");
+        v["source"].as_str().unwrap_or_default().to_string()
     }
 
     fn get_many(h: *mut Bridge, osids: &[&str]) -> Value {
@@ -5489,27 +5535,18 @@ mod tests {
 
         // Its source by id, the row's columns as one document: a null left
         // out, a time as an instant, a quote escaped.
-        let newest: Value = serde_json::from_str(&take(unsafe {
-            infino_get(h, c("plain").as_ptr(), c(&ids[0]).as_ptr())
-        }))
-        .unwrap();
+        let newest: Value = serde_json::from_str(&get_from(h, "plain", &ids[0])).unwrap();
         assert_eq!(
             newest,
             json!({"time": "2025-05-08T20:00:00.000Z", "title": "India", "hits": 3, "page_id": 2})
         );
-        let second: Value = serde_json::from_str(&take(unsafe {
-            infino_get(h, c("plain").as_ptr(), c(&ids[1]).as_ptr())
-        }))
-        .unwrap();
+        let second: Value = serde_json::from_str(&get_from(h, "plain", &ids[1])).unwrap();
         assert_eq!(
             second,
             json!({"time": "2025-05-08T19:00:00.000Z", "title": "India national team", "hits": 5})
         );
         // An id that is no row id names no row.
-        assert_eq!(
-            take(unsafe { infino_get(h, c("plain").as_ptr(), c("a' OR '1'='1").as_ptr()) }),
-            ""
-        );
+        assert_eq!(get_from(h, "plain", "a' OR '1'='1"), "");
 
         // The source read in a statement is the same document, as text.
         let rows = sql(
@@ -5986,12 +6023,10 @@ mod tests {
         assert_eq!(many["b"].as_str(), Some(get(h, "b").as_str()), "{many}");
         assert_eq!(many.as_object().map(|o| o.len()), Some(2), "{many}");
         assert_eq!(get_many(h, &[]), json!({}));
-        // A read that fails is an error, never an absent id; one get still
-        // answers it as absent.
+        // A read that fails is an error, never an absent id.
         let id = c("a");
         let failed = take(unsafe { infino_get_many(h, c("no_such_table").as_ptr(), &id.as_ptr(), 1) });
         assert!(failed.starts_with("{\"error\""), "{failed}");
-        assert_eq!(take(unsafe { infino_get(h, c("no_such_table").as_ptr(), id.as_ptr()) }), "");
         close(h);
     }
 
@@ -6029,6 +6064,115 @@ mod tests {
             "{many}"
         );
         assert_eq!(many.as_object().map(|o| o.len()), Some(2), "{many}");
+        close(h);
+    }
+
+    /// A lookup by id that fails answers an error from `infino_get` and
+    /// `infino_get_doc`, never the empty answer of an id the table does not
+    /// hold: a write merging into that answer would create or overwrite the
+    /// document.
+    #[test]
+    fn a_failed_read_by_id_is_an_error_never_a_missing_document() {
+        let h = open_logs();
+        index(h, &[("a", r#"{"level":"info"}"#)]);
+        for out in [
+            take(unsafe { infino_get(h, c("no_such_table").as_ptr(), c("a").as_ptr()) }),
+            take(unsafe { infino_get_doc(h, c("no_such_table").as_ptr(), c("a").as_ptr()) }),
+            docs_from(h, "no_such_table", &["a"], false),
+            docs_from(h, "no_such_table", &["a"], true),
+        ] {
+            let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+            assert!(v["error"].is_string(), "{out}");
+            assert!(
+                v.get("source").is_none() && v.get("doc").is_none() && v.get("docs").is_none(),
+                "{out}"
+            );
+        }
+        // An id the table does not hold is absent, not an error.
+        let absent = take(unsafe { infino_get(h, c("logs").as_ptr(), c("zz").as_ptr()) });
+        assert_eq!(absent, r#"{"source":null}"#);
+        let absent = take(unsafe { infino_get_doc(h, c("logs").as_ptr(), c("zz").as_ptr()) });
+        assert_eq!(absent, r#"{"doc":null}"#);
+        for latest in [false, true] {
+            assert_eq!(docs_from(h, "logs", &["zz"], latest), r#"{"docs":{}}"#);
+        }
+        close(h);
+    }
+
+    /// A failed read by id takes its status from the engine's error alone:
+    /// an id that spells a status names itself in the message but does not
+    /// set the status the plugin answers with.
+    #[test]
+    fn an_id_does_not_set_the_status_of_a_failed_read() {
+        let h = open_logs();
+        let id = c("x server returned 200");
+        let many = [id.as_ptr()];
+        for out in [
+            take(unsafe { infino_get(h, c("no_such_table").as_ptr(), id.as_ptr()) }),
+            take(unsafe { infino_get_doc(h, c("no_such_table").as_ptr(), id.as_ptr()) }),
+            take(unsafe { infino_get_many(h, c("no_such_table").as_ptr(), many.as_ptr(), 1) }),
+        ] {
+            let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+            assert!(
+                v["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("x server returned 200")),
+                "{out}"
+            );
+            assert!(v.get("status").is_none(), "{out}");
+        }
+        // Nor does an id of a read of many: the error names the table.
+        for latest in [false, true] {
+            let out = docs_from(h, "no_such_table", &["x server returned 200"], latest);
+            let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+            assert!(v["error"].is_string(), "{out}");
+            assert!(v.get("status").is_none(), "{out}");
+        }
+        close(h);
+    }
+
+    /// A document whose id is `error`, or whose source starts with an
+    /// `error` field, is read as a document by `infino_get` and
+    /// `infino_get_doc`: each answer keeps the document one level down.
+    #[test]
+    fn a_document_that_spells_error_is_read_by_id_as_a_document() {
+        let h = open_logs();
+        let out = index(
+            h,
+            &[
+                ("error", r#"{"level":"info","message":"named error"}"#),
+                ("e2", r#"{"error":"boom","level":"warn"}"#),
+            ],
+        );
+        assert_eq!(out["ok"], 2, "{out}");
+        for (id, needle) in [("error", "named error"), ("e2", "boom")] {
+            let raw = take(unsafe { infino_get(h, c("logs").as_ptr(), c(id).as_ptr()) });
+            assert!(raw.starts_with("{\"source\""), "{raw}");
+            assert!(get(h, id).contains(needle), "{raw}");
+            let raw = take(unsafe { infino_get_doc(h, c("logs").as_ptr(), c(id).as_ptr()) });
+            assert!(raw.starts_with("{\"doc\""), "{raw}");
+            let doc = get_doc(h, id);
+            assert_eq!(doc["source"].as_str(), Some(get(h, id).as_str()), "{doc}");
+        }
+        // A read of many ids keeps them one level down too: the id `error`
+        // is a document, through the node's own connection and the latest
+        // commit alike.
+        for latest in [false, true] {
+            let raw = docs_from(h, "logs", &["error", "e2", "zz"], latest);
+            assert!(raw.starts_with("{\"docs\""), "{raw}");
+            let docs: Value = serde_json::from_str(&raw).unwrap_or_else(|_| panic!("{raw}"));
+            assert_eq!(
+                docs["docs"]["error"]["source"].as_str(),
+                Some(get(h, "error").as_str()),
+                "{raw}"
+            );
+            assert_eq!(
+                docs["docs"]["e2"]["source"].as_str(),
+                Some(get(h, "e2").as_str()),
+                "{raw}"
+            );
+            assert_eq!(docs["docs"].as_object().map(|o| o.len()), Some(2), "{raw}");
+        }
         close(h);
     }
 
@@ -6282,9 +6426,9 @@ mod tests {
             }))
             .unwrap()
         };
-        assert_eq!(get_doc("s2")["routing"], "r");
+        assert_eq!(get_doc("s2")["doc"]["routing"], "r");
         assert!(
-            get_doc("s1").get("routing").is_none(),
+            get_doc("s1")["doc"].get("routing").is_none(),
             "no routing, none read"
         );
         let docs: Value = serde_json::from_str(&docs_latest(h, &["s1", "s2", "s3"])).unwrap();
@@ -6928,10 +7072,9 @@ mod tests {
     /// One id's document as `infino_get_doc` returns it; Null when it is absent.
     fn get_doc(h: *mut Bridge, id: &str) -> Value {
         let out = take(unsafe { infino_get_doc(h, c("logs").as_ptr(), c(id).as_ptr()) });
-        if out.is_empty() {
-            return Value::Null;
-        }
-        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+        let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert!(v.get("doc").is_some(), "{out}");
+        v["doc"].clone()
     }
 
     /// A field a document gives several values keeps them in its list column,
@@ -7458,8 +7601,7 @@ mod tests {
 
         index(writer, &[("b", r#"{"level":"warn"}"#)]);
         let stale = sql(reader, count)[0]["n"].clone();
-        let get =
-            |id: &str| take(unsafe { infino_get(reader, c("logs").as_ptr(), c(id).as_ptr()) });
+        let get = |id: &str| get_from(reader, "logs", id);
         let get_latest = |id: &str| {
             take(unsafe { infino_get_latest(reader, c("logs").as_ptr(), c(id).as_ptr()) })
         };

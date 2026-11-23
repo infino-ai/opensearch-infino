@@ -95,6 +95,13 @@ public final class InfinoNative {
         }
     }
 
+    /**
+     * The status a read by id that fails is answered with: 503, as a stock
+     * read that no copy of its shard could serve is, so the client may try
+     * it again. Never the answer of a missing document.
+     */
+    private static final RestStatus READ_FAILED = RestStatus.SERVICE_UNAVAILABLE;
+
     private static volatile InfinoLib lib;
     /** Where the engine caches what it reads from the node's own storage (see {@link InfinoPlugin#CACHE_DIR}); null for none. */
     private static volatile String cacheDir;
@@ -1238,20 +1245,45 @@ public final class InfinoNative {
         }
     }
 
-    /** The source of one id: the page prefetch when the query phase ran one, else a lookup. */
+    /**
+     * The source of one id: the page prefetch when the query phase ran one,
+     * else a lookup; null when the table holds no such id. A lookup that
+     * fails throws ({@link #READ_FAILED}), so a failed read is never taken
+     * for a missing document.
+     */
     public static String getSource(String name, String osid) {
         init();
         String prefetched = SOURCES.get(name + "\u0000" + osid);
         if (prefetched != null) {
             return prefetched;
         }
-        return take(lib.infino_get(conn, name, osid));
+        return getSourceFresh(name, osid);
     }
 
-    /** The source of one id from the table, never from the prefetch: for a write that merges into it. */
+    /**
+     * The source of one id from the table, never from the prefetch: for a
+     * write that merges into it. Null when the table holds no such id; a
+     * lookup that fails throws, so the write fails rather than creating or
+     * overwriting the document.
+     */
     public static String getSourceFresh(String name, String osid) {
         init();
-        return take(lib.infino_get(conn, name, osid));
+        return sourceOf(takeOrThrow(lib.infino_get(conn, name, osid), READ_FAILED));
+    }
+
+    /**
+     * The source of a {@code get} answer, {@code {"source": ..}}; null when
+     * the table holds no such id. The source sits under {@code source},
+     * never at the top, so a document whose first field is {@code error}
+     * cannot make the answer read as an error object.
+     */
+    static String sourceOf(String json) {
+        Map<String, Object> answer = object(json);
+        if (!answer.containsKey("source")) {
+            throw new InfinoException("the bridge answered no source", RestStatus.INTERNAL_SERVER_ERROR);
+        }
+        Object source = answer.get("source");
+        return source == null ? null : source.toString();
     }
 
     /**
@@ -1295,10 +1327,15 @@ public final class InfinoNative {
      */
     public record Doc(String source, long seq, String routing) {}
 
-    /** One id's document from the table, never from the prefetch; null when the table holds no such id. */
+    /**
+     * One id's document from the table, never from the prefetch; null when
+     * the table holds no such id. A lookup that fails throws
+     * ({@link #READ_FAILED}), so a failed read is never taken for a missing
+     * document.
+     */
     public static Doc getDoc(String name, String osid) {
         init();
-        return doc(take(lib.infino_get_doc(conn, name, osid)));
+        return docOf(takeOrThrow(lib.infino_get_doc(conn, name, osid), READ_FAILED));
     }
 
     /**
@@ -1307,29 +1344,17 @@ public final class InfinoNative {
      * for a node that may not have read the last commit another node made,
      * else through the node's own connection. One open of the table serves
      * every id. An id the table does not hold is absent; a lookup that fails
-     * throws rather than answering that the table holds no such id.
+     * throws ({@link #READ_FAILED}) rather than answering that the table
+     * holds no such id.
      */
-    @SuppressWarnings("unchecked")
     public static Map<String, Doc> docsOf(String name, Collection<String> osids, boolean latest) {
-        Map<String, Doc> out = new HashMap<>();
         if (osids.isEmpty()) {
-            return out;
+            return new HashMap<>();
         }
         init();
         String[] ids = osids.toArray(new String[0]);
         Pointer p = latest ? lib.infino_get_docs_latest(conn, name, ids, ids.length) : lib.infino_get_docs(conn, name, ids, ids.length);
-        if (p == null) {
-            String from = latest ? "the latest commit of " : "";
-            throw new InfinoException("reading " + ids.length + " ids from " + from + name + " failed", RestStatus.SERVICE_UNAVAILABLE);
-        }
-        Object docs = object(take(p)).get("docs");
-        if (!(docs instanceof Map<?, ?> byId)) {
-            throw new InfinoException("the bridge answered no documents", RestStatus.INTERNAL_SERVER_ERROR);
-        }
-        for (Map.Entry<?, ?> e : byId.entrySet()) {
-            out.put(e.getKey().toString(), doc((Map<String, Object>) e.getValue()));
-        }
-        return out;
+        return docsFrom(takeOrThrow(p, READ_FAILED));
     }
 
     /** Close the connection the latest reads go through, so the next opens it afresh without the table handles it held. */
@@ -1338,18 +1363,43 @@ public final class InfinoNative {
         lib.infino_forget_latest(conn);
     }
 
-    /** The document an {@code infino_get_doc} answer names; null for "", no such id. */
-    private static Doc doc(String out) {
-        if (out == null || out.isEmpty()) {
-            return null;
+    /**
+     * The document of a {@code get_doc} answer, {@code {"doc": {"source": .., "seq": n, "routing": ..}}};
+     * null when the table holds no such id. The document sits under {@code doc},
+     * never at the top, so no document can make the answer read as an error.
+     */
+    static Doc docOf(String json) {
+        Map<String, Object> answer = object(json);
+        if (!answer.containsKey("doc")) {
+            throw new InfinoException("the bridge answered no document", RestStatus.INTERNAL_SERVER_ERROR);
         }
-        return doc(object(out));
+        return answer.get("doc") instanceof Map<?, ?> doc ? doc(doc) : null;
+    }
+
+    /**
+     * The documents of a {@code get_docs} answer, {@code {"docs": {id: doc}}},
+     * by id; an id the table does not hold is absent. The ids sit under
+     * {@code docs}, never at the top, so an id such as {@code error} reads as
+     * a document.
+     */
+    static Map<String, Doc> docsFrom(String json) {
+        if (!(object(json).get("docs") instanceof Map<?, ?> byId)) {
+            throw new InfinoException("the bridge answered no documents", RestStatus.INTERNAL_SERVER_ERROR);
+        }
+        Map<String, Doc> out = new HashMap<>();
+        for (Map.Entry<?, ?> e : byId.entrySet()) {
+            if (e.getValue() instanceof Map<?, ?> doc) {
+                out.put(e.getKey().toString(), doc(doc));
+            }
+        }
+        return out;
     }
 
     /** The document of one {@code {"source", "seq", "routing"}} answer. */
-    private static Doc doc(Map<String, Object> doc) {
+    private static Doc doc(Map<?, ?> doc) {
+        Object source = doc.get("source");
         Object routing = doc.get("routing");
-        return new Doc((String) doc.get("source"), seq(doc.get("seq")), routing == null ? null : routing.toString());
+        return new Doc(source == null ? null : source.toString(), seq(doc.get("seq")), routing == null ? null : routing.toString());
     }
 
     /**
