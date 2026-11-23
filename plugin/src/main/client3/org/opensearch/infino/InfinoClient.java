@@ -7,6 +7,7 @@ package org.opensearch.infino;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.admin.cluster.reroute.ClusterRerouteRequest;
+import org.opensearch.action.admin.indices.create.AutoCreateAction;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
@@ -29,9 +30,24 @@ final class InfinoClient {
         client = injector.getInstance(Client.class);
     }
 
-    /** Create {@code index} with the cluster's defaults; one that appeared meanwhile counts as created. */
+    /** Create {@code index} as stock's bulk creates a missing one (the data stream a template makes of it, or an index with the cluster's defaults); one that appeared meanwhile counts as created. */
     static void createIndex(String index, ActionListener<Void> listener) {
-        createIndex(new CreateIndexRequest(index), listener);
+        Client c = client;
+        if (c == null) {
+            listener.onFailure(new IllegalStateException("[infino] the node client is not available yet"));
+            return;
+        }
+        // The action stock's bulk creates a missing index with: a name that
+        // a data stream's template matches becomes that data stream, any
+        // other an index. A plain create index refuses such a name.
+        CreateIndexRequest request = new CreateIndexRequest(index).cause("auto(bulk api)");
+        c.execute(AutoCreateAction.INSTANCE, request, ActionListener.wrap(response -> listener.onResponse(null), e -> {
+            if (ExceptionsHelper.unwrapCause(e) instanceof ResourceAlreadyExistsException) {
+                listener.onResponse(null);
+            } else {
+                listener.onFailure(e);
+            }
+        }));
     }
 
     /**

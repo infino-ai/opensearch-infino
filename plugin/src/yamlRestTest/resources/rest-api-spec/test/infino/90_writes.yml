@@ -406,6 +406,67 @@
   - match: { count: 3 }
 
 ---
+"The first write to a data stream's name creates the data stream, in both modes":
+  - do:
+      indices.put_index_template:
+        name: auto-ds-template
+        body:
+          index_patterns: [ "auto-ds-*" ]
+          data_stream: {}
+          priority: 300
+          template:
+            settings: { number_of_shards: 1, number_of_replicas: 0 }
+            mappings: { properties: { message: { type: text } } }
+  # A single document, as log shippers write; no create_data_stream first.
+  - do:
+      index:
+        index: auto-ds-one
+        refresh: true
+        body: { "@timestamp": "2023-01-01T00:00:01Z", message: one }
+  - match: { _index: "/^\\.ds-auto-ds-one-/" }
+  # A bulk create, beside an item for a plain index the same bulk creates.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: auto-ds-two }
+          - { "@timestamp": "2023-01-01T00:00:01Z", message: two }
+          - index: { _index: auto-plain-two }
+          - { message: plain }
+  - match: { errors: false }
+  - match: { items.0.create._index: "/^\\.ds-auto-ds-two-/" }
+  - match: { items.1.index._index: auto-plain-two }
+  - do:
+      indices.get_data_stream:
+        name: auto-ds-*
+  - length: { data_streams: 2 }
+  - do:
+      count:
+        index: auto-ds-two
+  - match: { count: 1 }
+  - do:
+      indices.put_index_template:
+        name: auto-ds-proxy-template
+        body:
+          index_patterns: [ "auto-px-*" ]
+          data_stream: {}
+          priority: 300
+          template:
+            settings: { number_of_shards: 1, number_of_replicas: 0, index.infino.mode: proxy }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: auto-px-logs }
+          - { "@timestamp": "2023-01-01T00:00:01Z", message: three }
+  - match: { errors: false }
+  - match: { items.0.create._index: "/^\\.ds-auto-px-logs-/" }
+  - do:
+      count:
+        index: auto-px-logs
+  - match: { count: 1 }
+
+---
 "Writes: refresh=wait_for returns once a search finds the write":
   # The engine releases wait_for requests itself after a refresh; one that never did would hang here.
   - do:
