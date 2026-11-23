@@ -411,6 +411,18 @@ public class InfinoEngine extends InternalEngine {
     /** The next renewal of the table's lease where it is, until the engine closes. */
     private volatile Scheduler.ScheduledCancellable leaseRefresh;
     private volatile boolean leaseRefreshStopped;
+
+    /**
+     * Whether this engine holds open the connection the latest reads go
+     * through ({@link InfinoNative#holdLatest}). While a rebuilt index's
+     * skeleton is rebuilt, each commit with a write the skeleton took as new,
+     * and each delete it did not find, reads the table's latest commit, as
+     * each commit of a replay does; without a hold, each would open the table
+     * again. Under {@link #latestHoldLock}.
+     */
+    private boolean holdsLatest;
+
+    private final Object latestHoldLock = new Object();
     private final Object[] idLocks = new Object[ID_LOCK_STRIPES];
     private Batch batch = new Batch();
     /** The batch being committed, until the table has it; a read still sees its writes meanwhile. */
@@ -484,6 +496,11 @@ public class InfinoEngine extends InternalEngine {
     /** {@code shard}'s skeleton holds a document for every row of its table: ids need no lookup. */
     static void skeletonComplete(ShardId shard) {
         SKELETON_COMPLETE.add(shard);
+        for (InfinoEngine engine : BY_TABLE.values()) {
+            if (engine.shardId.equals(shard)) {
+                engine.holdLatestWhileLookingUp(false);
+            }
+        }
     }
 
     /** This node no longer holds a copy of {@code shard}. */
@@ -502,6 +519,27 @@ public class InfinoEngine extends InternalEngine {
     /** Whether the skeleton can say which ids the table holds: not while a rebuilt index's skeleton is rebuilt. */
     private boolean skeletonKnowsIds() {
         return !rebuilt || SKELETON_COMPLETE.contains(shardId);
+    }
+
+    /**
+     * Hold the latest connection open ({@link #holdsLatest}) while the
+     * skeleton cannot say which ids the table holds or, as {@code lookingUp}
+     * says, the commits look ids up; let it go once neither holds or the
+     * engine closes.
+     */
+    private void holdLatestWhileLookingUp(boolean lookingUp) {
+        synchronized (latestHoldLock) {
+            boolean wanted = (lookingUp || !skeletonKnowsIds()) && !leaseRefreshStopped;
+            if (wanted == holdsLatest) {
+                return;
+            }
+            holdsLatest = wanted;
+            if (wanted) {
+                InfinoNative.holdLatest();
+            } else {
+                InfinoNative.releaseLatest();
+            }
+        }
     }
 
     /** Whether the write being applied is a skeleton-only one, whose row the table holds already. */
@@ -811,6 +849,11 @@ public class InfinoEngine extends InternalEngine {
     @Override
     public void close() throws IOException {
         leaseRefreshStopped = true;
+        holdLatestWhileLookingUp(false);
+        InfinoWriter writer = InfinoServices.writer();
+        if (writer != null) {
+            writer.stopReadingLatest(table);
+        }
         Scheduler.ScheduledCancellable next = leaseRefresh;
         if (next != null) {
             next.cancel();
@@ -1050,7 +1093,8 @@ public class InfinoEngine extends InternalEngine {
      * have before the rebuild.
      */
     private boolean deleteTableOnly(String id, long seq) {
-        if (InfinoNative.existingOsids(table, List.of(id)).isEmpty()) {
+        holdLatestWhileLookingUp(false);
+        if (InfinoNative.existingOsidsLatest(table, List.of(id)).isEmpty()) {
             return false;
         }
         synchronized (batchLock) {
@@ -1384,8 +1428,13 @@ public class InfinoEngine extends InternalEngine {
                 lookedUp.add(id);
             }
         }
+        // An id this node has no record of may be a row another node wrote:
+        // a replayed operation, after a takeover, of a write that node
+        // committed. The table's latest commit says, so the write replaces
+        // the row rather than appending it again.
+        holdLatestWhileLookingUp(!lookedUp.isEmpty());
         if (!lookedUp.isEmpty()) {
-            replaced.addAll(InfinoNative.existingOsids(table, lookedUp));
+            replaced.addAll(InfinoNative.existingOsidsLatest(table, lookedUp));
         }
         Batch retry = new Batch();
         // Deletes go first: until a commit's rows are in, the highest operation the

@@ -2120,7 +2120,7 @@ dependencies = [
 [[package]]
 name = "infino"
 version = "0.11.36"
-source = "git+https://github.com/infino-ai/infino?rev=3b572c039011032a7cec73cd5d2df61bbe038642#3b572c039011032a7cec73cd5d2df61bbe038642"
+source = "git+https://github.com/infino-ai/infino?rev=19b88a5eb25117994c1dbfce61ff5edb0f1987ae#19b88a5eb25117994c1dbfce61ff5edb0f1987ae"
 dependencies = [
  "apache-avro",
  "arc-swap",
