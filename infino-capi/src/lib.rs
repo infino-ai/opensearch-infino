@@ -1071,6 +1071,7 @@ impl MappedField {
         self.precision
             .map(Kept::Precision)
             .or_else(|| self.date_formats.clone().map(Kept::Date))
+            .or_else(|| self.exact.then_some(Kept::Term))
     }
 }
 
@@ -1082,13 +1083,16 @@ enum Kept {
     Precision(Precision),
     /// A date read by the formats its mapping declares, in order.
     Date(Vec<DateFormat>),
+    /// A keyword the `keyword` analyzer indexes whole: each value is one
+    /// term, of at most [`KEYWORD_TERM_MAX_BYTES`].
+    Term,
 }
 
 impl Kept {
     fn precision(&self) -> Option<Precision> {
         match self {
             Self::Precision(p) => Some(*p),
-            Self::Date(_) => None,
+            Self::Date(_) | Self::Term => None,
         }
     }
 }
@@ -1300,6 +1304,32 @@ fn kept_as(value: f64, precision: Precision) -> Result<f64, String> {
 
 /// A conformed value of a field kept at `precision`, as OpenSearch keeps it
 /// ([`kept_as`]); a null stays null.
+/// The longest value, in UTF-8 bytes, the engine's `keyword` analyzer takes
+/// as one term; Lucene's limit, which stock OpenSearch refuses past too.
+const KEYWORD_TERM_MAX_BYTES: usize = 32_766;
+
+/// `value` when each string in it fits one keyword term. A longer one fails
+/// its document here, as stock fails it, before a write is acknowledged: the
+/// engine would refuse the whole append at commit.
+fn within_term_cap(value: Value) -> Result<Value, String> {
+    let longest = match &value {
+        Value::String(s) => s.len(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::len)
+            .max()
+            .unwrap_or(0),
+        _ => 0,
+    };
+    if longest > KEYWORD_TERM_MAX_BYTES {
+        return Err(format!(
+            "a keyword value of {longest} bytes is longer than the {KEYWORD_TERM_MAX_BYTES} bytes one term holds (an immense term); `ignore_above` does not skip it yet"
+        ));
+    }
+    Ok(value)
+}
+
 fn keep(value: Value, precision: Option<Precision>) -> Result<Value, String> {
     match (precision, value.as_f64()) {
         (Some(precision), Some(number)) => Ok(json!(kept_as(number, precision)?)),
@@ -2333,6 +2363,7 @@ fn conform_doc(
             Some(Kept::Date(formats)) if matches!(dt, DataType::Timestamp(..)) => {
                 conform_date(v, formats)
             }
+            Some(Kept::Term) => conform(v, dt).and_then(within_term_cap),
             _ => conform(v, dt).and_then(|v| keep(v, rule.and_then(Kept::precision))),
         };
         let why = |why: String| format!("field [{path}]: {why}");
@@ -4916,6 +4947,27 @@ mod tests {
         }
         for (doc, path) in &refused[..2] {
             refuses(doc, path);
+        }
+        close(h);
+    }
+
+    /// A keyword value past the 32,766 bytes one term holds is refused by
+    /// the check that runs before a write is acknowledged, alone or in an
+    /// array, as stock refuses it; one at the limit is stored. Without the
+    /// check, default mode would acknowledge it and the engine would refuse
+    /// the append at commit.
+    #[test]
+    fn a_keyword_value_past_one_term_is_refused_before_the_ack() {
+        let h = open_logs();
+        let at_cap = "x".repeat(KEYWORD_TERM_MAX_BYTES);
+        let past = "x".repeat(KEYWORD_TERM_MAX_BYTES + 1);
+        let doc = |v: Value| json!({ "level": v }).to_string();
+        assert_eq!(check(h, &doc(json!(at_cap))), "");
+        let out = index(h, &[("1", &doc(json!(at_cap)))]);
+        assert_eq!(out["ok"], 1, "{out}");
+        for refused in [json!(past.clone()), json!(["info", past])] {
+            let why = check(h, &doc(refused));
+            assert!(why.contains("field [level]") && why.contains("immense term"), "{why}");
         }
         close(h);
     }
