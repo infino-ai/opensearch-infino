@@ -1325,6 +1325,7 @@ public final class InfinoSearch {
         // apart (see scoresBesideSort), for the rows a window can hold.
         boolean tracked = scoresBesideSort(plan, source);
         Map<String, Object> trackedScores = tracked ? trackedScores(plan, rows, unsourcedRows, end) : null;
+        Map<String, List<String>> ignored = ignored(plan.query().table(), plan.cols(), rows, end);
         int unsourced = 0;
         for (int i = 0; i < end; i++) {
             Map<String, Object> row = rows.get(i);
@@ -1335,7 +1336,8 @@ public final class InfinoSearch {
             if (i < unsourcedRows) {
                 unsourced++;
             }
-            SearchHit h = new SearchHit(i, id.toString(), Map.of(), Map.of());
+            List<String> ignoredFields = ignored.getOrDefault(id.toString(), List.of());
+            SearchHit h = new SearchHit(i, id.toString(), Map.of(), ignoredField(ignoredFields));
             h.shard(target);
             float score = Float.NaN;
             // Only a scored or vector read ranks a score column; any other
@@ -1400,7 +1402,7 @@ public final class InfinoSearch {
                             h.sourceRef(shown);
                         }
                     }
-                    fillRequested(h, src, stored, docValueFields, fetchFields, plan.cols());
+                    fillRequested(h, src, stored, docValueFields, fetchFields, plan.cols(), ignoredFields);
                 }
             }
             if (!plan.sorts().isEmpty()) {
@@ -2268,6 +2270,52 @@ public final class InfinoSearch {
         return md == null ? null : md.mapping();
     }
 
+    /**
+     * The paths of the ignored fields ({@link InfinoIgnored}) of each of the
+     * first {@code end} rows that has any, by id: read by id from the
+     * {@link InfinoQueryTranslator#IGNORED} column, which a table holds once
+     * a document has had a field ignored; none when it holds no such column.
+     */
+    private static Map<String, List<String>> ignored(String table, Map<String, Column> cols, List<Map<String, Object>> rows, int end) {
+        if (InfinoQueryTranslator.ignoredColumn(cols) == null) {
+            return Map.of();
+        }
+        List<String> literals = new ArrayList<>();
+        for (int i = 0; i < end; i++) {
+            Object id = rows.get(i).get(InfinoQueryTranslator.OSID);
+            if (id != null) {
+                literals.add(InfinoQueryTranslator.literal(id.toString()));
+            }
+        }
+        if (literals.isEmpty()) {
+            return Map.of();
+        }
+        String column = InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.IGNORED);
+        Map<String, List<String>> out = new HashMap<>();
+        // Joined one per line (InfinoIgnored.SEPARATOR, which no path holds): a row reads a list column back as a string.
+        for (Map<String, Object> row : InfinoNative.sqlRows(
+            "SELECT " + InfinoQueryTranslator.OSID + ", array_to_string(" + column + ", chr(10)) AS " + column + " FROM "
+                + InfinoQueryTranslator.quoteIdent(table) + " WHERE " + InfinoQueryTranslator.OSID + " IN (" + String.join(", ", literals)
+                + ") AND " + column + " IS NOT NULL"
+        )) {
+            Object id = row.get(InfinoQueryTranslator.OSID);
+            if (id != null && row.get(InfinoQueryTranslator.IGNORED) instanceof String paths && !paths.isEmpty()) {
+                out.put(id.toString(), List.of(paths.split(InfinoIgnored.SEPARATOR)));
+            }
+        }
+        return out;
+    }
+
+    /** A hit's metadata fields: {@code _ignored} when the mapper ignored any of its fields, as stock's hit carries it. */
+    private static Map<String, DocumentField> ignoredField(List<String> fields) {
+        if (fields.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, DocumentField> meta = new HashMap<>();
+        meta.put(InfinoQueryTranslator.IGNORED_FIELD, new DocumentField(InfinoQueryTranslator.IGNORED_FIELD, new ArrayList<>(fields)));
+        return meta;
+    }
+
     /** The shard target a hit of {@code index} carries; it names the index in the response. */
     private static SearchShardTarget target(Index index) {
         return new SearchShardTarget(NODE, new ShardId(index, 0), null, OriginalIndices.NONE);
@@ -2322,7 +2370,7 @@ public final class InfinoSearch {
                             h.sourceRef(shown);
                         }
                     }
-                    fillRequested(h, src, stored, docValueFields, fetchFields, cols);
+                    fillRequested(h, src, stored, docValueFields, fetchFields, cols, List.of());
                 }
             }
             if (!sorts.isEmpty()) {
@@ -2377,6 +2425,8 @@ public final class InfinoSearch {
      * field asked for both ways takes the {@code fields} value when the
      * source holds it, as stock's fields phase runs after its doc values
      * phase. A mapping that keeps the source whole reads it once for both.
+     * A field the mapper ignored ({@code ignored}, by path) has no value to
+     * give either way, as stock indexed none, though the source keeps it.
      */
     static void fillRequested(
         SearchHit h,
@@ -2384,15 +2434,24 @@ public final class InfinoSearch {
         InfinoMappingSource stored,
         List<FieldAndFormat> docValueFields,
         List<FieldAndFormat> fetchFields,
-        Map<String, Column> cols
+        Map<String, Column> cols,
+        List<String> ignored
     ) {
-        Map<String, Object> flat = docValueFields.isEmpty() ? null : flat(src);
+        Map<String, Object> flat = docValueFields.isEmpty() ? null : withoutIgnored(flat(src), ignored);
         if (flat != null) {
             fillFields(h, flat, docValueFields, cols, true);
         }
         if (!fetchFields.isEmpty() && stored.enabled()) {
-            fillFields(h, flat != null && stored.whole() ? flat : flat(stored.kept(src)), fetchFields, cols, false);
+            fillFields(h, flat != null && stored.whole() ? flat : withoutIgnored(flat(stored.kept(src)), ignored), fetchFields, cols, false);
         }
+    }
+
+    /** {@code flat} without the leaves at or under an ignored field's path. */
+    private static Map<String, Object> withoutIgnored(Map<String, Object> flat, List<String> ignored) {
+        if (!ignored.isEmpty()) {
+            flat.keySet().removeIf(path -> ignored.stream().anyMatch(field -> path.equals(field) || path.startsWith(field + ".")));
+        }
+        return flat;
     }
 
     /**

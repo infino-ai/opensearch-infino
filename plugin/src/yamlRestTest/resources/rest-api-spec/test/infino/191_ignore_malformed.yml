@@ -1,0 +1,348 @@
+# A value a field cannot parse is left out of the index when the field, or
+# the index, sets ignore_malformed: the document is indexed without it, the
+# source keeps it, and _ignored lists the field. Each case runs the same
+# documents into a Lucene twin, a proxy-mode index and a default-mode index.
+---
+"Malformed date, ip, integer and geo_point values are left out of the index, kept in the source and listed under _ignored":
+  - do:
+      indices.create:
+        index: im_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { d: { type: date, ignore_malformed: true }, ip: { type: ip, ignore_malformed: true }, n: { type: integer, ignore_malformed: true }, g: { type: geo_point, ignore_malformed: true }, tag: { type: keyword } } }
+  - do:
+      indices.create:
+        index: im_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { d: { type: date, ignore_malformed: true }, ip: { type: ip, ignore_malformed: true }, n: { type: integer, ignore_malformed: true }, g: { type: geo_point, ignore_malformed: true }, tag: { type: keyword } } }
+  - do:
+      indices.create:
+        index: im_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { d: { type: date, ignore_malformed: true }, ip: { type: ip, ignore_malformed: true }, n: { type: integer, ignore_malformed: true }, g: { type: geo_point, ignore_malformed: true }, tag: { type: keyword } } }
+  - do: { bulk: { refresh: true, index: im_luc, body: [ {"index": {"_id": "g1"}}, {"d": "2024-01-01", "ip": "10.0.0.1", "n": 5, "g": {"lat": 1, "lon": 2}, "tag": "a"}, {"index": {"_id": "b1"}}, {"d": "nope", "ip": "10.0.0.2", "n": 7, "g": "40,-70", "tag": "b"}, {"index": {"_id": "b2"}}, {"d": "2024-02-02", "ip": "not-an-ip", "n": "seven", "g": {"lat": "north", "lon": 1}, "tag": "c"} ] } }
+  - match: { errors: false }
+  - match: { items.1.index.status: 201 }
+  - match: { items.2.index.status: 201 }
+  - do: { count: { index: im_luc } }
+  - match: { count: 3 }
+  # _ignored on the hits, the malformed values still in the source.
+  - do: { search: { index: im_luc, body: { query: { ids: { values: [b1] } } } } }
+  - match: { hits.hits.0._ignored: [d] }
+  - match: { hits.hits.0._source.d: nope }
+  - do: { search: { index: im_luc, body: { query: { ids: { values: [b2] } } } } }
+  - length: { hits.hits.0._ignored: 3 }
+  - match: { hits.hits.0._source.ip: not-an-ip }
+  - match: { hits.hits.0._source.n: seven }
+  - match: { hits.hits.0._source.g.lat: north }
+  - do: { search: { index: im_luc, body: { query: { ids: { values: [g1] } } } } }
+  - is_false: hits.hits.0._ignored
+  # _ignored with stored_fields named.
+  - do: { search: { index: im_luc, body: { query: { ids: { values: [b1] } }, stored_fields: [tag] } } }
+  - match: { hits.hits.0._ignored: [d] }
+  # exists, term and terms on _ignored.
+  - do: { search: { index: im_luc, body: { query: { exists: { field: _ignored } }, sort: [ { tag: asc } ] } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: b1 }
+  - match: { hits.hits.1._id: b2 }
+  - do: { search: { index: im_luc, body: { query: { term: { _ignored: n } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b2 }
+  - do: { search: { index: im_luc, body: { query: { terms: { _ignored: [d, g] } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: im_luc, body: { query: { bool: { must_not: { exists: { field: _ignored } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: g1 }
+  # The ignored values are not indexed: the fields match only the good ones.
+  - do: { search: { index: im_luc, body: { query: { range: { n: { gte: 0 } } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: im_luc, body: { query: { exists: { field: d } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: im_luc, body: { query: { exists: { field: ip } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: im_luc, body: { query: { term: { ip: 10.0.0.2 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b1 }
+  # The fields API leaves out a field the mapper ignored.
+  - do: { search: { index: im_luc, body: { query: { ids: { values: [b2] } }, fields: [n, ip, d, tag] } } }
+  - is_false: hits.hits.0.fields.n
+  - is_false: hits.hits.0.fields.ip
+  - match: { hits.hits.0.fields.tag: [c] }
+  - match: { hits.hits.0.fields.d: ["2024-02-02T00:00:00.000Z"] }
+  - do: { bulk: { refresh: true, index: im_px, body: [ {"index": {"_id": "g1"}}, {"d": "2024-01-01", "ip": "10.0.0.1", "n": 5, "g": {"lat": 1, "lon": 2}, "tag": "a"}, {"index": {"_id": "b1"}}, {"d": "nope", "ip": "10.0.0.2", "n": 7, "g": "40,-70", "tag": "b"}, {"index": {"_id": "b2"}}, {"d": "2024-02-02", "ip": "not-an-ip", "n": "seven", "g": {"lat": "north", "lon": 1}, "tag": "c"} ] } }
+  - match: { errors: false }
+  - match: { items.1.index.status: 201 }
+  - match: { items.2.index.status: 201 }
+  - do: { count: { index: im_px } }
+  - match: { count: 3 }
+  # _ignored on the hits, the malformed values still in the source.
+  - do: { search: { index: im_px, body: { query: { ids: { values: [b1] } } } } }
+  - match: { hits.hits.0._ignored: [d] }
+  - match: { hits.hits.0._source.d: nope }
+  - do: { search: { index: im_px, body: { query: { ids: { values: [b2] } } } } }
+  - length: { hits.hits.0._ignored: 3 }
+  - match: { hits.hits.0._source.ip: not-an-ip }
+  - match: { hits.hits.0._source.n: seven }
+  - match: { hits.hits.0._source.g.lat: north }
+  - do: { search: { index: im_px, body: { query: { ids: { values: [g1] } } } } }
+  - is_false: hits.hits.0._ignored
+  # _ignored with stored_fields named.
+  - do: { search: { index: im_px, body: { query: { ids: { values: [b1] } }, stored_fields: [tag] } } }
+  - match: { hits.hits.0._ignored: [d] }
+  # exists, term and terms on _ignored.
+  - do: { search: { index: im_px, body: { query: { exists: { field: _ignored } }, sort: [ { tag: asc } ] } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: b1 }
+  - match: { hits.hits.1._id: b2 }
+  - do: { search: { index: im_px, body: { query: { term: { _ignored: n } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b2 }
+  - do: { search: { index: im_px, body: { query: { terms: { _ignored: [d, g] } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: im_px, body: { query: { bool: { must_not: { exists: { field: _ignored } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: g1 }
+  # The ignored values are not indexed: the fields match only the good ones.
+  - do: { search: { index: im_px, body: { query: { range: { n: { gte: 0 } } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: im_px, body: { query: { exists: { field: d } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: im_px, body: { query: { exists: { field: ip } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: im_px, body: { query: { term: { ip: 10.0.0.2 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b1 }
+  # The fields API leaves out a field the mapper ignored.
+  - do: { search: { index: im_px, body: { query: { ids: { values: [b2] } }, fields: [n, ip, d, tag] } } }
+  - is_false: hits.hits.0.fields.n
+  - is_false: hits.hits.0.fields.ip
+  - match: { hits.hits.0.fields.tag: [c] }
+  - match: { hits.hits.0.fields.d: ["2024-02-02T00:00:00.000Z"] }
+  - do: { bulk: { refresh: true, index: im_def, body: [ {"index": {"_id": "g1"}}, {"d": "2024-01-01", "ip": "10.0.0.1", "n": 5, "g": {"lat": 1, "lon": 2}, "tag": "a"}, {"index": {"_id": "b1"}}, {"d": "nope", "ip": "10.0.0.2", "n": 7, "g": "40,-70", "tag": "b"}, {"index": {"_id": "b2"}}, {"d": "2024-02-02", "ip": "not-an-ip", "n": "seven", "g": {"lat": "north", "lon": 1}, "tag": "c"} ] } }
+  - match: { errors: false }
+  - match: { items.1.index.status: 201 }
+  - match: { items.2.index.status: 201 }
+  - do: { count: { index: im_def } }
+  - match: { count: 3 }
+  # _ignored on the hits, the malformed values still in the source.
+  - do: { search: { index: im_def, body: { query: { ids: { values: [b1] } } } } }
+  - match: { hits.hits.0._ignored: [d] }
+  - match: { hits.hits.0._source.d: nope }
+  - do: { search: { index: im_def, body: { query: { ids: { values: [b2] } } } } }
+  - length: { hits.hits.0._ignored: 3 }
+  - match: { hits.hits.0._source.ip: not-an-ip }
+  - match: { hits.hits.0._source.n: seven }
+  - match: { hits.hits.0._source.g.lat: north }
+  - do: { search: { index: im_def, body: { query: { ids: { values: [g1] } } } } }
+  - is_false: hits.hits.0._ignored
+  # _ignored with stored_fields named.
+  - do: { search: { index: im_def, body: { query: { ids: { values: [b1] } }, stored_fields: [tag] } } }
+  - match: { hits.hits.0._ignored: [d] }
+  # exists, term and terms on _ignored.
+  - do: { search: { index: im_def, body: { query: { exists: { field: _ignored } }, sort: [ { tag: asc } ] } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: b1 }
+  - match: { hits.hits.1._id: b2 }
+  - do: { search: { index: im_def, body: { query: { term: { _ignored: n } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b2 }
+  - do: { search: { index: im_def, body: { query: { terms: { _ignored: [d, g] } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: im_def, body: { query: { bool: { must_not: { exists: { field: _ignored } } } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: g1 }
+  # The ignored values are not indexed: the fields match only the good ones.
+  - do: { search: { index: im_def, body: { query: { range: { n: { gte: 0 } } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: im_def, body: { query: { exists: { field: d } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: im_def, body: { query: { exists: { field: ip } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: im_def, body: { query: { term: { ip: 10.0.0.2 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: b1 }
+  # The fields API leaves out a field the mapper ignored.
+  - do: { search: { index: im_def, body: { query: { ids: { values: [b2] } }, fields: [n, ip, d, tag] } } }
+  - is_false: hits.hits.0.fields.n
+  - is_false: hits.hits.0.fields.ip
+  - match: { hits.hits.0.fields.tag: [c] }
+  - match: { hits.hits.0.fields.d: ["2024-02-02T00:00:00.000Z"] }
+
+---
+"The index setting ignores malformed values in every field, a field's own false overrides it, and a bulk mixes the outcomes":
+  - do:
+      indices.create:
+        index: ims_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0, index.mapping.ignore_malformed: true }
+          mappings: { properties: { d: { type: date, ignore_malformed: false }, n: { type: integer }, ip: { type: ip }, k: { type: keyword } } }
+  - do:
+      indices.create:
+        index: ims_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0, index.mapping.ignore_malformed: true }
+          mappings: { properties: { d: { type: date, ignore_malformed: false }, n: { type: integer }, ip: { type: ip }, k: { type: keyword } } }
+  - do:
+      indices.create:
+        index: ims_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0, index.mapping.ignore_malformed: true }
+          mappings: { properties: { d: { type: date, ignore_malformed: false }, n: { type: integer }, ip: { type: ip }, k: { type: keyword } } }
+  - do: { index: { index: ims_luc, id: s1, refresh: true, body: { k: s1, n: "x", ip: "10.0.0.9" } } }
+  - match: { result: created }
+  - do:
+      catch: /failed to parse field \[d\] of type \[date\]/
+      index: { index: ims_luc, id: s2, body: { k: s2, d: "nope" } }
+  - do: { bulk: { refresh: true, index: ims_luc, body: [ {"index": {"_id": "s3"}}, {"k": "s3", "n": 3, "ip": "10.0.0.3"}, {"index": {"_id": "s4"}}, {"k": "s4", "n": 4, "ip": "bad"}, {"index": {"_id": "s5"}}, {"k": "s5", "d": "never", "n": 5}, {"create": {"_id": "s6"}}, {"k": "s6", "n": "six", "d": "2024-03-03"} ] } }
+  - match: { errors: true }
+  - match: { items.0.index.status: 201 }
+  - match: { items.1.index.status: 201 }
+  - match: { items.2.index.status: 400 }
+  - match: { items.2.index.error.type: mapper_parsing_exception }
+  - match: { items.3.create.status: 201 }
+  - do: { count: { index: ims_luc } }
+  - match: { count: 4 }
+  - do: { search: { index: ims_luc, body: { query: { exists: { field: _ignored } }, sort: [ { k: asc } ] } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: s1 }
+  - match: { hits.hits.0._ignored: [n] }
+  - match: { hits.hits.1._id: s4 }
+  - match: { hits.hits.1._ignored: [ip] }
+  - match: { hits.hits.2._id: s6 }
+  - match: { hits.hits.2._ignored: [n] }
+  - match: { hits.hits.2._source.n: six }
+  - do: { search: { index: ims_luc, body: { query: { range: { n: { gte: 0 } } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { index: { index: ims_px, id: s1, refresh: true, body: { k: s1, n: "x", ip: "10.0.0.9" } } }
+  - match: { result: created }
+  - do:
+      catch: /failed to parse field \[d\] of type \[date\]/
+      index: { index: ims_px, id: s2, body: { k: s2, d: "nope" } }
+  - do: { bulk: { refresh: true, index: ims_px, body: [ {"index": {"_id": "s3"}}, {"k": "s3", "n": 3, "ip": "10.0.0.3"}, {"index": {"_id": "s4"}}, {"k": "s4", "n": 4, "ip": "bad"}, {"index": {"_id": "s5"}}, {"k": "s5", "d": "never", "n": 5}, {"create": {"_id": "s6"}}, {"k": "s6", "n": "six", "d": "2024-03-03"} ] } }
+  - match: { errors: true }
+  - match: { items.0.index.status: 201 }
+  - match: { items.1.index.status: 201 }
+  - match: { items.2.index.status: 400 }
+  - match: { items.2.index.error.type: mapper_parsing_exception }
+  - match: { items.3.create.status: 201 }
+  - do: { count: { index: ims_px } }
+  - match: { count: 4 }
+  - do: { search: { index: ims_px, body: { query: { exists: { field: _ignored } }, sort: [ { k: asc } ] } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: s1 }
+  - match: { hits.hits.0._ignored: [n] }
+  - match: { hits.hits.1._id: s4 }
+  - match: { hits.hits.1._ignored: [ip] }
+  - match: { hits.hits.2._id: s6 }
+  - match: { hits.hits.2._ignored: [n] }
+  - match: { hits.hits.2._source.n: six }
+  - do: { search: { index: ims_px, body: { query: { range: { n: { gte: 0 } } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { index: { index: ims_def, id: s1, refresh: true, body: { k: s1, n: "x", ip: "10.0.0.9" } } }
+  - match: { result: created }
+  - do:
+      catch: /failed to parse field \[d\] of type \[date\]/
+      index: { index: ims_def, id: s2, body: { k: s2, d: "nope" } }
+  - do: { bulk: { refresh: true, index: ims_def, body: [ {"index": {"_id": "s3"}}, {"k": "s3", "n": 3, "ip": "10.0.0.3"}, {"index": {"_id": "s4"}}, {"k": "s4", "n": 4, "ip": "bad"}, {"index": {"_id": "s5"}}, {"k": "s5", "d": "never", "n": 5}, {"create": {"_id": "s6"}}, {"k": "s6", "n": "six", "d": "2024-03-03"} ] } }
+  - match: { errors: true }
+  - match: { items.0.index.status: 201 }
+  - match: { items.1.index.status: 201 }
+  - match: { items.2.index.status: 400 }
+  - match: { items.2.index.error.type: mapper_parsing_exception }
+  - match: { items.3.create.status: 201 }
+  - do: { count: { index: ims_def } }
+  - match: { count: 4 }
+  - do: { search: { index: ims_def, body: { query: { exists: { field: _ignored } }, sort: [ { k: asc } ] } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: s1 }
+  - match: { hits.hits.0._ignored: [n] }
+  - match: { hits.hits.1._id: s4 }
+  - match: { hits.hits.1._ignored: [ip] }
+  - match: { hits.hits.2._id: s6 }
+  - match: { hits.hits.2._ignored: [n] }
+  - match: { hits.hits.2._source.n: six }
+  - do: { search: { index: ims_def, body: { query: { range: { n: { gte: 0 } } } } } }
+  - match: { hits.total.value: 2 }
+
+---
+"An update that brings in a malformed value ignores it, and one that fixes it indexes it again":
+  - do:
+      indices.create:
+        index: imu_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: integer, ignore_malformed: true }, tag: { type: keyword } } }
+  - do:
+      indices.create:
+        index: imu_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: integer, ignore_malformed: true }, tag: { type: keyword } } }
+  - do:
+      indices.create:
+        index: imu_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: integer, ignore_malformed: true }, tag: { type: keyword } } }
+  - do: { index: { index: imu_luc, id: u1, refresh: true, body: { n: 1, tag: a } } }
+  - do: { update: { index: imu_luc, id: u1, refresh: true, body: { doc: { n: "one" } } } }
+  - match: { result: updated }
+  - do: { search: { index: imu_luc, body: { query: { exists: { field: _ignored } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._ignored: [n] }
+  - match: { hits.hits.0._source.n: one }
+  - match: { hits.hits.0._source.tag: a }
+  - do: { search: { index: imu_luc, body: { query: { range: { n: { gte: 0 } } } } } }
+  - match: { hits.total.value: 0 }
+  - do: { search: { index: imu_luc, body: { query: { term: { tag: a } } } } }
+  - match: { hits.total.value: 1 }
+  - do: { update: { index: imu_luc, id: u1, refresh: true, body: { doc: { n: 2 } } } }
+  - match: { result: updated }
+  - do: { search: { index: imu_luc, body: { query: { exists: { field: _ignored } } } } }
+  - match: { hits.total.value: 0 }
+  - do: { search: { index: imu_luc, body: { query: { range: { n: { gte: 0 } } } } } }
+  - match: { hits.total.value: 1 }
+  - is_false: hits.hits.0._ignored
+  - match: { hits.hits.0._source.n: 2 }
+  - do: { index: { index: imu_px, id: u1, refresh: true, body: { n: 1, tag: a } } }
+  - do: { update: { index: imu_px, id: u1, refresh: true, body: { doc: { n: "one" } } } }
+  - match: { result: updated }
+  - do: { search: { index: imu_px, body: { query: { exists: { field: _ignored } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._ignored: [n] }
+  - match: { hits.hits.0._source.n: one }
+  - match: { hits.hits.0._source.tag: a }
+  - do: { search: { index: imu_px, body: { query: { range: { n: { gte: 0 } } } } } }
+  - match: { hits.total.value: 0 }
+  - do: { search: { index: imu_px, body: { query: { term: { tag: a } } } } }
+  - match: { hits.total.value: 1 }
+  - do: { update: { index: imu_px, id: u1, refresh: true, body: { doc: { n: 2 } } } }
+  - match: { result: updated }
+  - do: { search: { index: imu_px, body: { query: { exists: { field: _ignored } } } } }
+  - match: { hits.total.value: 0 }
+  - do: { search: { index: imu_px, body: { query: { range: { n: { gte: 0 } } } } } }
+  - match: { hits.total.value: 1 }
+  - is_false: hits.hits.0._ignored
+  - match: { hits.hits.0._source.n: 2 }
+  - do: { index: { index: imu_def, id: u1, refresh: true, body: { n: 1, tag: a } } }
+  - do: { update: { index: imu_def, id: u1, refresh: true, body: { doc: { n: "one" } } } }
+  - match: { result: updated }
+  - do: { search: { index: imu_def, body: { query: { exists: { field: _ignored } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._ignored: [n] }
+  - match: { hits.hits.0._source.n: one }
+  - match: { hits.hits.0._source.tag: a }
+  - do: { search: { index: imu_def, body: { query: { range: { n: { gte: 0 } } } } } }
+  - match: { hits.total.value: 0 }
+  - do: { search: { index: imu_def, body: { query: { term: { tag: a } } } } }
+  - match: { hits.total.value: 1 }
+  - do: { update: { index: imu_def, id: u1, refresh: true, body: { doc: { n: 2 } } } }
+  - match: { result: updated }
+  - do: { search: { index: imu_def, body: { query: { exists: { field: _ignored } } } } }
+  - match: { hits.total.value: 0 }
+  - do: { search: { index: imu_def, body: { query: { range: { n: { gte: 0 } } } } } }
+  - match: { hits.total.value: 1 }
+  - is_false: hits.hits.0._ignored
+  - match: { hits.hits.0._source.n: 2 }

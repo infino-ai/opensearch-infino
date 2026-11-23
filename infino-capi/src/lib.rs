@@ -88,10 +88,18 @@ const OP: &str = "osop";
 /// compare only between rows of one writer's history, so a cut leaves
 /// another's alone.
 const GEN: &str = "osgen";
+/// The fields OpenSearch's mapper left out of a row's document for a value
+/// it could not parse (under `ignore_malformed`), by path: what a search
+/// reads as the document's `_ignored` field. A list of strings, null for a
+/// document with none; the column appears with the first such write.
+const IGNORED: &str = "osignored";
+/// What separates the paths of a document's ignored fields where the caller
+/// hands them over: no field name holds it.
+const IGNORED_SEPARATOR: char = '\n';
 /// The columns every table keeps for itself. A document's field of the same
 /// name is kept in a column of its own, named [`OWN_COLUMN_PREFIX`] and the
 /// field's name: no mapping can name a field so.
-const RESERVED: [&str; 3] = [OSID, SOURCE, SEQ];
+const RESERVED: [&str; 4] = [OSID, SOURCE, SEQ, IGNORED];
 const OWN_COLUMN_PREFIX: &str = ".";
 /// Where a table's mapping declares, as `properties` declares fields, the
 /// columns the plugin's engine writes beside a document's fields in default
@@ -2219,11 +2227,15 @@ fn unify_new_paths(rows: &mut [Map<String, Value>], schema: &Schema) {
 /// caller can refuse it synchronously (an OpenSearch bulk item error) rather
 /// than learn after the batch commits. A failure to check at all (the table
 /// cannot be opened) is an error object, not a verdict on the document.
+/// `ignored` (null for none) names the fields OpenSearch's mapper left out
+/// of the document, one path per line ([`IGNORED_SEPARATOR`]): they are
+/// not checked, as the row leaves them out.
 #[no_mangle]
 pub unsafe extern "C" fn infino_check_doc(
     h: *mut Bridge,
     name: *const c_char,
     source: *const c_char,
+    ignored: *const c_char,
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name), Some(source)) =
@@ -2232,6 +2244,14 @@ pub unsafe extern "C" fn infino_check_doc(
             })
         else {
             return err_json("null argument");
+        };
+        let ignored = if ignored.is_null() {
+            Vec::new()
+        } else {
+            match unsafe { cstr(ignored) } {
+                Some(paths) => ignored_paths(paths),
+                None => return err_json("ignored paths are not UTF-8"),
+            }
         };
         let table = match conn.table(name) {
             Ok(t) => t,
@@ -2246,6 +2266,7 @@ pub unsafe extern "C" fn infino_check_doc(
                 &conn.kept(name),
                 &conn.engine_columns(name),
                 stamp.as_deref(),
+                &ignored,
             ) {
                 Ok(_) => String::new(),
                 Err(why) => why,
@@ -2253,6 +2274,25 @@ pub unsafe extern "C" fn infino_check_doc(
         )
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// The paths of a document's ignored fields, as the caller hands them over
+/// ([`IGNORED_SEPARATOR`] between them), each once, in order.
+fn ignored_paths(paths: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for path in paths.split(IGNORED_SEPARATOR) {
+        if !path.is_empty() && !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Whether the flattened `path` is the field `field` or a path under it (a
+/// geo_point given as an object flattens to the paths under its field).
+fn is_at_or_under(path: &str, field: &str) -> bool {
+    path.strip_prefix(field)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 /// Parse, flatten and conform one document to the declared columns. The
@@ -2266,13 +2306,16 @@ pub unsafe extern "C" fn infino_check_doc(
 /// of arrays at a field without a scalar or string column the mapping
 /// declares is refused, as the engine would refuse it. A field named like
 /// one of the table's own columns ([`RESERVED`], or `engine`, those its
-/// engine writes) goes to a column of its own.
+/// engine writes) goes to a column of its own. A field `ignored` names, and
+/// every path under it, is left out of the row, as OpenSearch's mapper left
+/// it out of the document (its value stays in the source).
 fn conform_doc(
     source: &str,
     schema: &Schema,
     kept: &HashMap<String, Kept>,
     engine: &[String],
     stamp: Option<&str>,
+    ignored: &[&str],
 ) -> Result<Map<String, Value>, String> {
     let doc: Value = serde_json::from_str(source).map_err(|e| format!("malformed JSON: {e}"))?;
     let obj = doc
@@ -2280,6 +2323,9 @@ fn conform_doc(
         .ok_or_else(|| "the document is not an object".to_string())?;
     let mut flat = Map::new();
     flatten(obj, "", &mut flat);
+    if !ignored.is_empty() {
+        flat.retain(|path, _| !ignored.iter().any(|field| is_at_or_under(path, field)));
+    }
     // A field named like a reserved column goes to its own column once the
     // mapping declares it, and never to the reserved one.
     for reserved in RESERVED
@@ -2787,7 +2833,8 @@ pub unsafe extern "C" fn infino_index_batch(
         for i in 0..n {
             let osid = unsafe { cstr(os_p[i]) }.unwrap_or("");
             let source = unsafe { cstr(sr_p[i]) }.unwrap_or("{}");
-            let mut flat = match conform_doc(source, &schema, &kept, &engine, stamp.as_deref()) {
+            let mut flat = match conform_doc(source, &schema, &kept, &engine, stamp.as_deref(), &[])
+            {
                 Ok(flat) => flat,
                 Err(why) => {
                     failed.push(json!({ "i": i, "reason": why, "permanent": true }));
@@ -2858,6 +2905,7 @@ pub unsafe extern "C" fn infino_index_batch_buf(
                 id_ends,
                 src_ends,
                 None,
+                ptr::null(),
                 count as usize,
             )
         } {
@@ -2894,6 +2942,18 @@ pub struct Prepared {
     failed: Vec<(usize, String)>,
 }
 
+/// One row of a buffer handed to [`prepare`]: its id, source, routing value
+/// (empty for none) and ignored fields, borrowed from the buffer, with its
+/// stamp and operation (negative for none).
+struct RowIn<'a> {
+    id: &'a str,
+    src: &'a str,
+    routing: &'a str,
+    ignored: Vec<&'a str>,
+    seq: i64,
+    op: i64,
+}
+
 /// Each row's routing value and sequence numbers, beside the buffer of ids
 /// and sources: `rt_ends[i]` is where row i's routing value ends (it follows
 /// the row's source in the buffer; an empty one is none), `seqs[i]` its
@@ -2910,7 +2970,10 @@ struct RowMeta {
 /// Parse the buffer's documents in parallel and convert them to one Arrow
 /// batch. With `meta`, each row also keeps its routing value in
 /// [`ROUTING`], its stamp in [`SEQ`] and its operation in [`OP`] (see
-/// [`RowMeta`]).
+/// [`RowMeta`]). With `ig_ends`, each row's segment ends with the paths of
+/// the fields OpenSearch's mapper left out of its document
+/// ([`IGNORED_SEPARATOR`] between them; an empty one is none), up to
+/// `ig_ends[i]`: the row leaves them out and keeps them in [`IGNORED`].
 #[allow(clippy::too_many_arguments)]
 unsafe fn prepare(
     conn: &Bridge,
@@ -2920,11 +2983,13 @@ unsafe fn prepare(
     id_ends: *const u32,
     src_ends: *const u32,
     meta: Option<RowMeta>,
+    ig_ends: *const u32,
     n: usize,
 ) -> Result<Prepared, String> {
     let bytes = unsafe { std::slice::from_raw_parts(buf, buf_len) };
     let id_ends = unsafe { std::slice::from_raw_parts(id_ends, n) };
     let src_ends = unsafe { std::slice::from_raw_parts(src_ends, n) };
+    let ig_ends = (!ig_ends.is_null()).then(|| unsafe { std::slice::from_raw_parts(ig_ends, n) });
     let rt_ends = meta.map(|m| unsafe { std::slice::from_raw_parts(m.rt_ends, n) });
     let seqs = meta.map(|m| unsafe { std::slice::from_raw_parts(m.seqs, n) });
     let ops = meta.map(|m| unsafe { std::slice::from_raw_parts(m.ops, n) });
@@ -2939,35 +3004,50 @@ unsafe fn prepare(
     let engine = conn.engine_columns(name);
     let stamp = conn.stamp(name);
 
-    // Each row's id, source and routing value as borrowed slices of the
-    // buffer, with its stamp and operation.
-    let mut rows_in: Vec<(&str, &str, &str, i64, i64)> = Vec::with_capacity(n);
+    // Each row's id, source, routing value and ignored fields as borrowed
+    // slices of the buffer, with its stamp and operation.
+    let mut rows_in: Vec<RowIn> = Vec::with_capacity(n);
     let mut start = 0usize;
     for i in 0..n {
         let (id_end, src_end) = (id_ends[i] as usize, src_ends[i] as usize);
         let rt_end = rt_ends.map_or(src_end, |ends| ends[i] as usize);
-        if id_end < start || src_end < id_end || rt_end < src_end || rt_end > buf_len {
+        let ig_end = ig_ends.map_or(rt_end, |ends| ends[i] as usize);
+        if id_end < start
+            || src_end < id_end
+            || rt_end < src_end
+            || ig_end < rt_end
+            || ig_end > buf_len
+        {
             return Err("offsets out of range".into());
         }
-        let id = std::str::from_utf8(&bytes[start..id_end]).unwrap_or("");
-        let src = std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}");
-        let routing = std::str::from_utf8(&bytes[src_end..rt_end]).unwrap_or("");
-        rows_in.push((
-            id,
-            src,
-            routing,
-            seqs.map_or(-1, |s| s[i]),
-            ops.map_or(-1, |o| o[i]),
-        ));
-        start = rt_end;
+        rows_in.push(RowIn {
+            id: std::str::from_utf8(&bytes[start..id_end]).unwrap_or(""),
+            src: std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}"),
+            routing: std::str::from_utf8(&bytes[src_end..rt_end]).unwrap_or(""),
+            ignored: ignored_paths(std::str::from_utf8(&bytes[rt_end..ig_end]).unwrap_or("")),
+            seq: seqs.map_or(-1, |s| s[i]),
+            op: ops.map_or(-1, |o| o[i]),
+        });
+        start = ig_end;
     }
 
     let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
         .par_iter()
-        .map(|(id, src, routing, seq, op)| {
-            conform_doc(src, &schema, &kept, &engine, stamp.as_deref()).map(|mut flat| {
+        .map(|row| {
+            let RowIn {
+                id,
+                src,
+                routing,
+                ignored,
+                seq,
+                op,
+            } = row;
+            conform_doc(src, &schema, &kept, &engine, stamp.as_deref(), ignored).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 flat.insert(SOURCE.into(), Value::String((*src).to_string()));
+                if !ignored.is_empty() {
+                    flat.insert(IGNORED.into(), json!(ignored));
+                }
                 if !routing.is_empty() {
                     flat.insert(ROUTING.into(), Value::String((*routing).to_string()));
                 }
@@ -3282,11 +3362,14 @@ fn append_prepared(
 }
 
 /// Parse and convert a batch ahead of its append; see [`Prepared`]. The
-/// buffer layout is that of [`infino_index_batch_buf`]. Returns null when
+/// buffer layout is that of [`infino_index_batch_buf`], each row's segment
+/// followed by the paths of its ignored fields up to `ig_ends[i]` when
+/// `ig_ends` is not null (see [`prepare`]). Returns null when
 /// the table is unknown or the offsets do not fit the buffer; otherwise a
 /// handle that [`infino_append_prepared`] consumes or
 /// [`infino_free_prepared`] releases.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn infino_prepare_batch(
     h: *mut Bridge,
     name: *const c_char,
@@ -3294,6 +3377,7 @@ pub unsafe extern "C" fn infino_prepare_batch(
     buf_len: usize,
     id_ends: *const u32,
     src_ends: *const u32,
+    ig_ends: *const u32,
     count: c_int,
 ) -> *mut Prepared {
     catch_unwind(AssertUnwindSafe(|| {
@@ -3312,6 +3396,7 @@ pub unsafe extern "C" fn infino_prepare_batch(
                 id_ends,
                 src_ends,
                 None,
+                ig_ends,
                 count as usize,
             )
         } {
@@ -3330,7 +3415,9 @@ pub unsafe extern "C" fn infino_prepare_batch(
 /// `rt_ends[i]` is where row i's routing value ends (an empty one is none),
 /// `seqs[i]` is its stamp and `ops[i]` the operation that wrote it (each
 /// negative for none), by writer `gen`. A row keeps them in the
-/// `osrouting`, `osseq`, `osop` and `osgen` columns.
+/// `osrouting`, `osseq`, `osop` and `osgen` columns. With `ig_ends`, each
+/// routing value is followed by the paths of the row's ignored fields, as in
+/// [`infino_prepare_batch`].
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn infino_prepare_batch_meta(
@@ -3344,6 +3431,7 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
     seqs: *const i64,
     ops: *const i64,
     gen: i64,
+    ig_ends: *const u32,
     count: c_int,
 ) -> *mut Prepared {
     catch_unwind(AssertUnwindSafe(|| {
@@ -3374,6 +3462,7 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
                     ops,
                     gen,
                 }),
+                ig_ends,
                 count as usize,
             )
         } {
@@ -4806,6 +4895,7 @@ mod tests {
                 h,
                 c("no_such_table").as_ptr(),
                 c(r#"{"level":"info"}"#).as_ptr(),
+                ptr::null(),
             )
         });
         let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
@@ -4848,7 +4938,7 @@ mod tests {
     }
 
     fn check(h: *mut Bridge, doc: &str) -> String {
-        take(unsafe { infino_check_doc(h, c("logs").as_ptr(), c(doc).as_ptr()) })
+        take(unsafe { infino_check_doc(h, c("logs").as_ptr(), c(doc).as_ptr(), ptr::null()) })
     }
 
     fn bm25(h: *mut Bridge, column: &str, query: &str) -> String {
@@ -5427,6 +5517,7 @@ mod tests {
                 doc.len(),
                 [1u32].as_ptr(),
                 [doc.len() as u32].as_ptr(),
+                ptr::null(),
                 1,
             )
         };
@@ -6024,6 +6115,7 @@ mod tests {
                 [4i64, 5].as_ptr(),
                 [-1i64, 5].as_ptr(),
                 3,
+                ptr::null(),
                 2,
             )
         };
@@ -6058,6 +6150,92 @@ mod tests {
         assert_eq!(highest[0]["highest"], 5, "{highest}");
         assert_eq!(count(h, ".osop", "hello"), "1");
         close(h);
+    }
+
+    /// The fields OpenSearch's mapper ignored for a malformed value are left
+    /// out of the check and of the row, a field's paths under it with it
+    /// (a geo_point given as an object), and kept by path in the ignored
+    /// column; the source keeps them whole. A row with none leaves the
+    /// column null, and a document's own field of that name stays out of it.
+    #[test]
+    fn ignored_fields_stay_out_of_the_row_and_are_kept_by_path() {
+        let h = open_logs();
+        let bad = r#"{"status":"not a number","geo":{"lat":"north","lon":1},"level":"info"}"#;
+        assert!(
+            check(h, bad).contains("status"),
+            "the column refuses the value"
+        );
+        let ignoring = |doc: &str, paths: &str| {
+            take(unsafe {
+                infino_check_doc(h, c("logs").as_ptr(), c(doc).as_ptr(), c(paths).as_ptr())
+            })
+        };
+        assert_eq!(ignoring(bad, "status\ngeo"), "");
+        assert_eq!(ignoring(r#"{"status":"x","statuses":"y"}"#, "status"), "");
+
+        let docs = [
+            ("a", bad, "status\ngeo\nstatus"),
+            ("b", r#"{"status":5,"osignored":"mine"}"#, ""),
+        ];
+        let mut buf: Vec<u8> = Vec::new();
+        let (mut id_ends, mut src_ends, mut ig_ends) = (Vec::new(), Vec::new(), Vec::new());
+        for (id, src, ignored) in docs {
+            buf.extend_from_slice(id.as_bytes());
+            id_ends.push(buf.len() as u32);
+            buf.extend_from_slice(src.as_bytes());
+            src_ends.push(buf.len() as u32);
+            buf.extend_from_slice(ignored.as_bytes());
+            ig_ends.push(buf.len() as u32);
+        }
+        let p = unsafe {
+            infino_prepare_batch(
+                h,
+                c("logs").as_ptr(),
+                buf.as_ptr(),
+                buf.len(),
+                id_ends.as_ptr(),
+                src_ends.as_ptr(),
+                ig_ends.as_ptr(),
+                docs.len() as c_int,
+            )
+        };
+        assert!(!p.is_null());
+        let out = append_with_seqs(h, &[p], &[], &[]);
+        assert_eq!(out["ok"], 2, "{out}");
+        let rows = sql(
+            h,
+            r#"SELECT osid, status, level, source, array_to_string(osignored, ',') AS ignored
+                FROM logs ORDER BY osid"#,
+        );
+        assert!(rows[0]["status"].is_null(), "{rows}");
+        assert_eq!(rows[0]["level"], "info", "{rows}");
+        assert_eq!(rows[0]["source"], bad, "{rows}");
+        assert_eq!(rows[0]["ignored"], "status,geo", "{rows}");
+        assert_eq!(rows[1]["status"], 5, "{rows}");
+        assert!(rows[1]["ignored"].is_null(), "{rows}");
+        let found = sql(h, "SELECT osid FROM logs WHERE array_has(osignored, 'geo')");
+        assert_eq!(found, json!([{"osid": "a"}]), "{found}");
+        // Read as the plugin reads it: the paths one per line.
+        let listed = sql(
+            h,
+            "SELECT osid, array_to_string(osignored, chr(10)) AS osignored FROM logs WHERE osignored IS NOT NULL",
+        );
+        assert_eq!(
+            listed,
+            json!([{"osid": "a", "osignored": "status\ngeo"}]),
+            "{listed}"
+        );
+        close(h);
+    }
+
+    #[test]
+    fn an_ignored_field_covers_its_own_path_and_those_under_it() {
+        assert!(is_at_or_under("geo", "geo"));
+        assert!(is_at_or_under("geo.lat", "geo"));
+        assert!(!is_at_or_under("geography", "geo"));
+        assert!(!is_at_or_under("a.geo", "geo"));
+        assert_eq!(ignored_paths("a\n\nb\na"), vec!["a", "b"]);
+        assert!(ignored_paths("").is_empty());
     }
 
     /// A field named like a reserved column the mapping does not declare is
@@ -6340,7 +6518,7 @@ mod tests {
                     .iter()
                     .map(|(id, src)| {
                         let mut flat =
-                            conform_doc(src, &schema, &conn.kept("bench"), &[], None).unwrap();
+                            conform_doc(src, &schema, &conn.kept("bench"), &[], None, &[]).unwrap();
                         flat.insert(OSID.into(), Value::String(id.clone()));
                         flat.insert(SOURCE.into(), Value::String(src.clone()));
                         flat
@@ -6391,6 +6569,7 @@ mod tests {
                 buf.len(),
                 id_ends.as_ptr(),
                 src_ends.as_ptr(),
+                ptr::null(),
                 docs.len() as c_int,
             )
         };
@@ -7731,7 +7910,7 @@ mod tests {
 
         let schema = Schema::new(vec![Field::new("message", DataType::LargeUtf8, true)]);
         let kept = HashMap::new();
-        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], Some("@timestamp"));
+        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], Some("@timestamp"), &[]);
         assert!(check(r#"{"@timestamp": "2023-01-01T00:00:01Z"}"#).is_ok());
         assert!(check(r#"{"@timestamp": ["2023-01-01T00:00:01Z", null]}"#).is_ok());
         for doc in [
@@ -7741,6 +7920,6 @@ mod tests {
         ] {
             assert_eq!(check(doc), Err(no_timestamp("@timestamp")), "{doc}");
         }
-        assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, &[], None).is_ok());
+        assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, &[], None, &[]).is_ok());
     }
 }

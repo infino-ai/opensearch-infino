@@ -53,6 +53,7 @@ import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.engine.DocumentMissingException;
+import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.infino.InfinoWriter.Outcome;
 import org.opensearch.infino.InfinoWriter.Waiter;
@@ -1180,6 +1181,8 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
      */
     private static List<Outcome> stage(ShardId shardId, List<DocWriteRequest<?>> requests, BulkItemResponse[] answered) {
         String indexName = shardId.getIndexName();
+        // Parsed by the mapper only when the index may ignore a malformed value: the fields it ignores stay out of the row.
+        MapperService ignoring = InfinoIgnored.ignoring(shardId.getIndex());
         List<Outcome> outcomes = new ArrayList<>(requests.size());
         for (int slot = 0; slot < requests.size(); slot++) {
             DocWriteRequest<?> item = requests.get(slot);
@@ -1203,10 +1206,18 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                 // appended, and a refused one comes back as its own item then; checking it
                 // here too would parse every document twice.
                 String source = sourceAsJson(index.source(), index.getContentType());
+                List<String> ignored;
+                try {
+                    ignored = InfinoIgnored.parse(ignoring, indexName, index.id(), source, index.routing());
+                } catch (RuntimeException e) {
+                    // The mapper refuses it, as a shard's would: a malformed value in a field that does not ignore one.
+                    outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, e)));
+                    continue;
+                }
                 // A generated id is new by definition; an explicit id is looked up at flush,
                 // to replace its row, or to refuse a create that would duplicate it.
                 boolean create = index.opType() == DocWriteRequest.OpType.CREATE;
-                outcomes.add(new Outcome(slot, item, new Write(index.id(), source, !generated, create && !generated), null));
+                outcomes.add(new Outcome(slot, item, new Write(index.id(), source, !generated, create && !generated, ignored), null));
             } else if (item instanceof DeleteRequest delete) {
                 outcomes.add(new Outcome(slot, item, new Write(delete.id(), null, true), null));
             } else if (item instanceof UpdateRequest update) {

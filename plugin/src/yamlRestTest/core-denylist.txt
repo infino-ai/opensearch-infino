@@ -90,10 +90,6 @@ search/30_limits/Regexp length limit  # [bug] the error message differs from sto
 # --- An index named "index" never starts
 search/260_sort_geopoint/*  # [bug] an index named index is refused at create: its table would be the registry's (https://github.com/infino-ai/opensearch-infino/issues/171)
 
-# --- ignore_malformed, in default mode
-search/200_ignore_malformed/*  # [bug:default] ignore_malformed is not honoured: a document with a malformed value is dropped after it is acknowledged, not indexed without that field (https://github.com/infino-ai/opensearch-infino/issues/172)
-search/330_fetch_fields/Test ignore malformed  # [bug:default] ignore_malformed is not honoured: a document with a malformed value is dropped after it is acknowledged, not indexed without that field (https://github.com/infino-ai/opensearch-infino/issues/172)
-
 # --- Gaps: tests that need a feature Infino does not have yet. Remove the entry when the feature lands.
 # Derived from the stock tests' own requests, checked against what the query and aggregation translators serve;
 # the inventory is in the parent issue (https://github.com/infino-ai/opensearch-infino/issues/51).
@@ -286,10 +282,6 @@ update/13_legacy_doc/*  # [gap:proxy] proxy mode keeps no per-document _version,
 # --- Scrolls are not point-in-time
 scroll/10_basic/Basic scroll  # [gap:proxy] a scroll is not a point-in-time snapshot: a document indexed after it opens shows in its later pages (https://github.com/infino-ai/opensearch-infino/issues/57)
 scroll/10_basic/Basic scroll with 1 shard  # [gap:proxy] a scroll is not a point-in-time snapshot: a document indexed after it opens shows in its later pages (https://github.com/infino-ai/opensearch-infino/issues/57)
-
-# --- ignore_malformed, in proxy mode
-search/200_ignore_malformed/*  # [gap:proxy] ignore_malformed is not honoured: a document with a malformed value is refused with a 400, not indexed without that field (https://github.com/infino-ai/opensearch-infino/issues/172)
-search/330_fetch_fields/Test ignore malformed  # [gap:proxy] ignore_malformed is not honoured: a document with a malformed value is refused with a 400, not indexed without that field (https://github.com/infino-ai/opensearch-infino/issues/172)
 
 # --- Answered differently, because the table has no such feature
 get/20_stored_fields/Stored fields  # [gap] not served: stored_fields; the table keeps no stored fields
