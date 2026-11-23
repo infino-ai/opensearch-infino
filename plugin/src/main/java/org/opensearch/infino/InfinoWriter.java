@@ -732,6 +732,23 @@ public final class InfinoWriter {
     }
 
     /**
+     * Whether this node's own connection has read {@code table}'s latest
+     * commit: it started writing the table as the copy {@code allocation}
+     * and an append it started since has committed ({@link Batch#readLatest}
+     * cleared), so the last commit is its own. Until then, another copy may
+     * have committed last.
+     */
+    boolean caughtUp(String table, String allocation) {
+        Batch batch = batches.get(table);
+        if (batch == null || allocation == null) {
+            return false;
+        }
+        synchronized (batch.seqLock) {
+            return !batch.readLatest && allocation.equals(batch.seqAllocation);
+        }
+    }
+
+    /**
      * This node has committed to the batch's table since its reads were set
      * to read the latest commit ({@link Batch#readLatest}), as the setting
      * {@code set} counts: its connection now reads from that commit on, so

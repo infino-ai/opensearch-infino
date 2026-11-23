@@ -192,4 +192,30 @@ public class InfinoEngineTests extends OpenSearchTestCase {
             }
         }
     }
+
+    /**
+     * A realtime get reads through the node's own connection only on the
+     * shard's primary, once it has committed since it began writing as that
+     * copy: then the table's last commit is its own. A replica, a node with
+     * no copy, and a primary that has not committed since it took over may
+     * be behind another node's commit, so each reads the latest commit.
+     */
+    public void testARealtimeGetReadsTheLatestCommitUnlessTheLastCommitIsThisNodes() {
+        String allocation = "alloc-1";
+        assertFalse("no copy here", InfinoEngine.readsEveryCommit(null, a -> true));
+        assertFalse("no engine here", InfinoEngine.readsEveryCommit("no_such_table"));
+        assertFalse("a replica", InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(false, allocation), a -> true));
+        assertFalse(
+            "a primary that has not committed since it took over",
+            InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(true, allocation), a -> false)
+        );
+        assertFalse(
+            "a primary whose last commit was as another copy",
+            InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(true, allocation), "alloc-0"::equals)
+        );
+        assertTrue(
+            "a primary that has committed as this copy",
+            InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(true, allocation), allocation::equals)
+        );
+    }
 }

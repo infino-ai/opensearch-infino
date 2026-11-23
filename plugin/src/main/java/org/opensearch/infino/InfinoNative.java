@@ -1280,10 +1280,29 @@ public final class InfinoNative {
     public record Doc(String source, long seq) {}
 
     /** One id's document from the table, never from the prefetch; null when the table holds no such id. */
-    @SuppressWarnings("unchecked")
     public static Doc getDoc(String name, String osid) {
         init();
-        String out = take(lib.infino_get_doc(conn, name, osid));
+        return doc(take(lib.infino_get_doc(conn, name, osid)));
+    }
+
+    /**
+     * {@link #getDoc} as of the table's latest commit, as {@link #latestRows}
+     * reads: for a realtime get on a node that may not have read the last
+     * commit another node made. A lookup that fails throws rather than
+     * answering that the table holds no such id.
+     */
+    public static Doc getDocLatest(String name, String osid) {
+        init();
+        Pointer p = lib.infino_get_doc_latest(conn, name, osid);
+        if (p == null) {
+            throw new InfinoException("reading " + osid + " from the latest commit of " + name + " failed", RestStatus.SERVICE_UNAVAILABLE);
+        }
+        return doc(take(p));
+    }
+
+    /** The document an {@code infino_get_doc} answer names; null for "", no such id. */
+    @SuppressWarnings("unchecked")
+    private static Doc doc(String out) {
         if (out == null || out.isEmpty()) {
             return null;
         }
@@ -1689,6 +1708,14 @@ public final class InfinoNative {
      * none, when there is no row, or when the table never took a routed write.
      */
     public static String routingOf(String name, String id) {
+        return routingOf(name, id, false);
+    }
+
+    /**
+     * {@link #routingOf}, as of the table's latest commit ({@link #latestRows})
+     * when {@code latest}: for a realtime get that reads the document so.
+     */
+    public static String routingOf(String name, String id, boolean latest) {
         if (!columns(name).containsKey(InfinoQueryTranslator.ROUTING)) {
             return null;
         }
@@ -1697,7 +1724,7 @@ public final class InfinoNative {
             ? "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
                 + InfinoQueryTranslator.literal(idTerms(List.of(id))) + ", 'and')"
             : byIds(name, columns, List.of(id), null);
-        for (Map<String, Object> row : sqlRows(sql)) {
+        for (Map<String, Object> row : latest ? latestRows(sql) : sqlRows(sql)) {
             Object rowId = row.get(InfinoQueryTranslator.OSID);
             Object routing = row.get(InfinoQueryTranslator.ROUTING);
             if (rowId != null && id.equals(rowId.toString())) {

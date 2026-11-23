@@ -218,6 +218,15 @@ public class InfinoWriterTests extends OpenSearchTestCase {
         assertEquals(0L, InfinoWriter.nextSeq(7L, 0L, false));
     }
 
+    /** A node that has not written a table, or whose copy closed, has not caught up with its latest commit. */
+    public void testANodeThatHasNotCommittedToATableIsNotCaughtUp() {
+        InfinoWriter writer = new InfinoWriter(() -> task -> {}, 10, Long.MAX_VALUE);
+        assertFalse(writer.caughtUp("t", "alloc-1"));
+        assertFalse(writer.caughtUp("t", null));
+        writer.stopReadingLatest("t");
+        assertFalse(writer.caughtUp("t", "alloc-1"));
+    }
+
     private static final ShardId SHARD = new ShardId("i", "_na_", 0);
 
     private static InfinoWriter.Outcome update(String id, long ifSeqNo) {

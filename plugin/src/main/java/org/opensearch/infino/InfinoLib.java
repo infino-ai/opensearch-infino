@@ -97,6 +97,9 @@ public interface InfinoLib extends Library {
     /** One id's document as {@code {"source", "seq"}}; "" when the table holds no such id. */
     Pointer infino_get_doc(Pointer h, String name, String osid);
 
+    /** {@link #infino_get_doc} as of the table's latest commit; null when the lookup fails. */
+    Pointer infino_get_doc_latest(Pointer h, String name, String osid);
+
     int infino_drop(Pointer h, String name);
 
     int infino_optimize(Pointer h, String name);

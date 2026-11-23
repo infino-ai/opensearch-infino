@@ -56,6 +56,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 
 /**
  * The engine of an index in default mode ({@code index.infino.mode: default}):
@@ -386,7 +387,7 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /** Which copy of a shard this node holds: whether it is the primary, and its allocation. */
-    private record Copy(boolean primary, String allocationId) {}
+    record Copy(boolean primary, String allocationId) {}
 
     private final String table;
     private final ShardId shardId;
@@ -805,7 +806,96 @@ public class InfinoEngine extends InternalEngine {
         if (v != null) {
             return v.source() == null ? null : new InfinoNative.Doc(v.source(), v.seq());
         }
-        return InfinoNative.getDoc(table, id);
+        if (readsEveryCommit(table)) {
+            return InfinoNative.getDoc(table, id);
+        }
+        holdLatestForRealtime();
+        return InfinoNative.getDocLatest(table, id);
+    }
+
+    /**
+     * How long the latest connection stays held after this node's last
+     * realtime read through it. Unheld, each such read opens the connection
+     * and the table again (a catalog read and the manifest); held, it costs
+     * one pointer read. While held, the connection keeps a handle (and the
+     * manifest) of each table it has read beside the node's own.
+     */
+    private static final TimeValue REALTIME_LATEST_LINGER = TimeValue.timeValueSeconds(30);
+    private static final Object REALTIME_HOLD_LOCK = new Object();
+    /** Whether realtime reads hold the latest connection open; under {@link #REALTIME_HOLD_LOCK}. */
+    private static boolean realtimeHolds;
+    /** When a realtime read last went through the latest connection ({@link System#nanoTime}). */
+    private static volatile long lastRealtimeLatest;
+
+    /**
+     * Hold the latest connection open for realtime reads until
+     * {@link #REALTIME_LATEST_LINGER} passes with none. Without a thread
+     * pool to time the release (a unit test), each read opens it alone.
+     */
+    private static void holdLatestForRealtime() {
+        lastRealtimeLatest = System.nanoTime();
+        ThreadPool pool = InfinoServices.threadPool();
+        if (pool == null) {
+            return;
+        }
+        synchronized (REALTIME_HOLD_LOCK) {
+            if (realtimeHolds) {
+                return;
+            }
+            InfinoNative.holdLatest();
+            realtimeHolds = true;
+        }
+        releaseWhenIdle(pool);
+    }
+
+    /** Let go of the realtime reads' hold once none has read for {@link #REALTIME_LATEST_LINGER}; else check again then. */
+    private static void releaseWhenIdle(ThreadPool pool) {
+        try {
+            pool.schedule(() -> {
+                synchronized (REALTIME_HOLD_LOCK) {
+                    if (System.nanoTime() - lastRealtimeLatest < REALTIME_LATEST_LINGER.nanos()) {
+                        releaseWhenIdle(pool);
+                        return;
+                    }
+                    realtimeHolds = false;
+                }
+                InfinoNative.releaseLatest();
+            }, REALTIME_LATEST_LINGER, ThreadPool.Names.GENERIC);
+        } catch (Exception e) {
+            // The pool is shutting down: let go now.
+            synchronized (REALTIME_HOLD_LOCK) {
+                realtimeHolds = false;
+            }
+            InfinoNative.releaseLatest();
+        }
+    }
+
+    /**
+     * Whether this node's own connection has read every commit to
+     * {@code table}, so a realtime read may go through it. That connection
+     * reads under the engine's staleness bound: for up to its window after
+     * another node commits, it may answer from the commit before. Only the
+     * shard's primary, once it has committed since it began writing here,
+     * knows the last commit is its own. Every other node (a replica, a node
+     * holding no copy, a primary that has just taken over) may be behind, so
+     * its realtime reads read the table's latest commit
+     * ({@link InfinoNative#getDocLatest}). Searches are not realtime and keep
+     * the bound.
+     */
+    static boolean readsEveryCommit(String table) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        InfinoWriter writer = InfinoServices.writer();
+        return engine != null && writer != null && readsEveryCommit(COPIES.get(engine.shardId), allocation -> writer.caughtUp(table, allocation));
+    }
+
+    /**
+     * {@link #readsEveryCommit(String)} for this node's {@code copy} of the
+     * shard (null for none), where {@code caughtUp} says whether this node
+     * has committed to the table since it began writing it as a copy
+     * ({@link InfinoWriter#caughtUp}).
+     */
+    static boolean readsEveryCommit(Copy copy, Predicate<String> caughtUp) {
+        return copy != null && copy.primary() && caughtUp.test(copy.allocationId());
     }
 
     /**
@@ -843,7 +933,11 @@ public class InfinoEngine extends InternalEngine {
         if (v != null && v.source() != null) {
             return v.routing();
         }
-        return InfinoNative.routingOf(table, id);
+        if (readsEveryCommit(table)) {
+            return InfinoNative.routingOf(table, id);
+        }
+        holdLatestForRealtime();
+        return InfinoNative.routingOf(table, id, true);
     }
 
     @Override

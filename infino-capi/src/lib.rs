@@ -3825,6 +3825,34 @@ pub unsafe extern "C" fn infino_get_doc(
     .unwrap_or(ptr::null_mut())
 }
 
+/// [`infino_get_doc`] as of the table's latest commit ([`get_row_latest`]):
+/// for a realtime get on a node that may not have read the last commit
+/// another node made. A lookup that fails answers null rather than "", so
+/// a failed read is never taken for a missing document.
+#[no_mangle]
+pub unsafe extern "C" fn infino_get_doc_latest(
+    h: *mut Bridge,
+    name: *const c_char,
+    osid: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(osid)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(osid) })
+        else {
+            return ptr::null_mut();
+        };
+        match get_row_latest(conn, name, osid) {
+            Ok(Some((source, seq))) => out_json(json!({ "source": source, "seq": seq })),
+            Ok(None) => out_string(String::new()),
+            Err(e) => {
+                eprintln!("[capi] get_doc_latest: {e}");
+                ptr::null_mut()
+            }
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// Drop a table and purge its storage. A missing table is not fatal.
 #[no_mangle]
 pub unsafe extern "C" fn infino_drop(h: *mut Bridge, name: *const c_char) -> c_int {
@@ -7248,6 +7276,25 @@ mod tests {
             "the latest get finds the new id"
         );
         assert_eq!(get_latest("c"), "", "an id the table does not hold is \"\"");
+        let get_doc_latest = |id: &str| {
+            take(unsafe { infino_get_doc_latest(reader, c("logs").as_ptr(), c(id).as_ptr()) })
+        };
+        let doc: Value = serde_json::from_str(&get_doc_latest("b")).unwrap();
+        let source: Value = serde_json::from_str(doc["source"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            source,
+            json!({ "level": "warn" }),
+            "the latest realtime get finds the new id with its source"
+        );
+        assert!(
+            doc["seq"].is_i64(),
+            "and the sequence number it was written under: {doc}"
+        );
+        assert_eq!(
+            get_doc_latest("c"),
+            "",
+            "an id the table does not hold is \"\""
+        );
         // Only the latest connection has read the second commit, when the
         // reader's own read was stale; the blocks it read land in the cache.
         if stale == 1 {
