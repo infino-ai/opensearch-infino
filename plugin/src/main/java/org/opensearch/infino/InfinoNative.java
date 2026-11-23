@@ -24,6 +24,7 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.seqno.SequenceNumbers;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -39,6 +40,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 
@@ -1123,7 +1125,9 @@ public final class InfinoNative {
 
     /**
      * The highest operation writer {@code gen} recorded on a row of table
-     * {@code name}, or null when no row carries one of its operations.
+     * {@code name}, or null when no row carries one of its operations; read
+     * from the table's latest commit ({@link #latestRows}), since a replay
+     * starts after it.
      */
     public static Long highestOp(String name, long gen) {
         if (!columns(name).containsKey(InfinoQueryTranslator.OP)) {
@@ -1132,7 +1136,7 @@ public final class InfinoNative {
         String op = InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.OP);
         String sql = "SELECT max(" + op + ") AS highest FROM " + InfinoQueryTranslator.quoteIdent(name) + " WHERE "
             + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.GEN) + " = " + gen;
-        for (Map<String, Object> row : sqlRows(sql)) {
+        for (Map<String, Object> row : latestRows(sql)) {
             Object highest = row.get("highest");
             if (highest instanceof Number n) {
                 return n.longValue();
@@ -1238,6 +1242,40 @@ public final class InfinoNative {
         return take(lib.infino_get(conn, name, osid));
     }
 
+    /**
+     * {@link #getSourceFresh} as of the table's latest commit, as
+     * {@link #latestRows} reads: for a write that merges into the document
+     * when the last node to write the table may be another. A lookup that
+     * fails throws rather than answering that the table holds no such id.
+     */
+    public static String getSourceLatest(String name, String osid) {
+        init();
+        Pointer p = lib.infino_get_latest(conn, name, osid);
+        if (p == null) {
+            throw new InfinoException("reading " + osid + " from the latest commit of " + name + " failed", RestStatus.SERVICE_UNAVAILABLE);
+        }
+        return take(p);
+    }
+
+    /**
+     * Keep the connection the latest reads ({@link #latestRows},
+     * {@link #getSourceLatest}) go through open until {@link #releaseLatest},
+     * for a reader that reads the latest commit for each batch it writes.
+     * The connection holds a handle to each table it has read, each keeping
+     * that table's manifest in memory beside the one the node's own
+     * connection holds, so it closes after each read no one holds it for.
+     */
+    public static void holdLatest() {
+        init();
+        lib.infino_hold_latest(conn);
+    }
+
+    /** Let go of a hold {@link #holdLatest} took. */
+    public static void releaseLatest() {
+        init();
+        lib.infino_release_latest(conn);
+    }
+
     /** One document as the table holds it: its source and the sequence number it was written under. */
     public record Doc(String source, long seq) {}
 
@@ -1279,31 +1317,34 @@ public final class InfinoNative {
      * The sources of these ids, by id, each looked up through the id
      * column's index: a page's worth costs what its ids do, whatever the
      * table holds, where one statement over the ids would read the whole id
-     * column. An id the table does not hold is absent.
+     * column. An id the table does not hold is absent; a lookup that fails
+     * throws, so a failed read is never taken for a deleted document.
      */
     public static Map<String, String> sources(String name, Collection<String> osids) {
         Map<String, String> out = new HashMap<>();
-        if (osids.size() > 1) {
-            // One call for the page: the bridge runs its lookups side by side.
-            init();
-            String json = take(lib.infino_get_many(conn, name, osids.toArray(new String[0]), osids.size()));
-            if (json != null && !json.isEmpty()) {
-                try (XContentParser parser = parser(json)) {
-                    for (Map.Entry<String, Object> entry : parser.map().entrySet()) {
-                        if (entry.getValue() instanceof String source && !source.isEmpty()) {
-                            out.put(entry.getKey(), source);
-                        }
-                    }
-                    return out;
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
-                }
-            }
+        if (osids.isEmpty()) {
+            return out;
         }
-        for (String id : osids) {
-            String source = getSourceFresh(name, id);
-            if (source != null && !source.isEmpty()) {
-                out.put(id, source);
+        // One call for the page: the bridge runs its lookups side by side.
+        init();
+        String json = takeOrThrow(lib.infino_get_many(conn, name, osids.toArray(new String[0]), osids.size()));
+        return sourcesOf(json);
+    }
+
+    /**
+     * The sources of a {@code get_many} answer, {@code {"sources":{id: source}}}.
+     * The ids sit under {@code sources}, never at the top, so an id such as
+     * {@code error} cannot make the answer read as an error object.
+     */
+    static Map<String, String> sourcesOf(String json) {
+        Object found = object(json).get("sources");
+        if (!(found instanceof Map<?, ?> byId)) {
+            throw new InfinoException("the bridge answered no sources", RestStatus.INTERNAL_SERVER_ERROR);
+        }
+        Map<String, String> out = new HashMap<>();
+        for (Map.Entry<?, ?> entry : byId.entrySet()) {
+            if (entry.getValue() instanceof String source && !source.isEmpty()) {
+                out.put(entry.getKey().toString(), source);
             }
         }
         return out;
@@ -1314,11 +1355,32 @@ public final class InfinoNative {
         return value instanceof Number n ? n.longValue() : InfinoDocumentVersion.UNTRACKED_SEQ_NO;
     }
 
-    /** The highest sequence number the table holds, {@link InfinoDocumentVersion#UNTRACKED_SEQ_NO} when it holds none. */
+    /**
+     * The highest sequence number the table holds as of its latest commit
+     * ({@link #latestRows}; see {@link #highestSeq}):
+     * {@link SequenceNumbers#NO_OPS_PERFORMED} when it holds no row, so its
+     * first write is given 0, as stock gives a new shard's first operation.
+     */
     public static long maxSeq(String name) {
-        String sql = "SELECT MAX(" + InfinoQueryTranslator.SEQ + ") AS " + InfinoQueryTranslator.SEQ + " FROM " + InfinoQueryTranslator.quoteIdent(name);
-        List<Map<String, Object>> rows = sqlRows(sql);
-        return rows.isEmpty() ? InfinoDocumentVersion.UNTRACKED_SEQ_NO : seq(rows.get(0).get(InfinoQueryTranslator.SEQ));
+        String table = InfinoQueryTranslator.quoteIdent(name);
+        String sql = "SELECT MAX(" + InfinoQueryTranslator.SEQ + ") AS " + InfinoQueryTranslator.SEQ + " FROM " + table;
+        List<Map<String, Object>> rows = latestRows(sql);
+        Object max = rows.isEmpty() ? null : rows.get(0).get(InfinoQueryTranslator.SEQ);
+        return highestSeq(max, () -> !latestRows("SELECT " + InfinoQueryTranslator.OSID + " FROM " + table + " LIMIT 1").isEmpty());
+    }
+
+    /**
+     * The highest sequence number of a table whose rows' highest stored one
+     * is {@code max} (null when no row stores one): that number, else
+     * {@link InfinoDocumentVersion#UNTRACKED_SEQ_NO} when the table holds rows
+     * written without one (those report it, so the next write is given a
+     * number past it), else {@link SequenceNumbers#NO_OPS_PERFORMED}.
+     */
+    static long highestSeq(Object max, BooleanSupplier holdsRows) {
+        if (max instanceof Number n) {
+            return n.longValue();
+        }
+        return holdsRows.getAsBoolean() ? InfinoDocumentVersion.UNTRACKED_SEQ_NO : SequenceNumbers.NO_OPS_PERFORMED;
     }
 
     /** Drop the prefetched sources of ids a write just changed, so a read after the write sees the table. */
@@ -1366,6 +1428,25 @@ public final class InfinoNative {
 
     public static List<Map<String, Object>> sqlRows(String q) {
         return rows(sql(q));
+    }
+
+    /**
+     * The rows of {@code q} as of each table's latest commit, for a read whose
+     * answer decides what a write does: whether an id is already a row, so a
+     * write replaces it rather than appending it again, or where a replay or
+     * a new writer's numbering starts. {@link #sqlRows} reads under the
+     * engine's staleness bound and, for up to its window after another node
+     * commits, may answer from the commit before, which is what a shard
+     * taking over from that node reads first. The engine's own update and
+     * delete read the latest commit to find their rows but give a caller no
+     * way to on a connection opened under the bound, so the bridge reads
+     * these through a connection of its own that does.
+     */
+    static List<Map<String, Object>> latestRows(String q) {
+        init();
+        String out = takeOrThrow(lib.infino_sql_latest(conn, q));
+        log.debug("[infino] latest sql: {} -> {} chars", q, out.length());
+        return rows(out);
     }
 
     /**
@@ -1485,7 +1566,17 @@ public final class InfinoNative {
      * name ids that only share one. An id with no term is compared by value.
      */
     public static Set<String> existingOsids(String name, Collection<String> osids) {
-        return probe(name, osids, false).keySet();
+        return probe(name, osids, false, false).keySet();
+    }
+
+    /**
+     * {@link #existingOsids} as of the table's latest commit
+     * ({@link #latestRows}): for ids whose write replaces their row only if
+     * the table holds one, when the last node to write the table may be
+     * another.
+     */
+    public static Set<String> existingOsidsLatest(String name, Collection<String> osids) {
+        return probe(name, osids, false, true).keySet();
     }
 
     /**
@@ -1494,27 +1585,49 @@ public final class InfinoNative {
      * an id the table does not hold is absent.
      */
     public static Map<String, Long> storedSeqs(String name, Collection<String> osids) {
-        return probe(name, osids, true);
+        return probe(name, osids, true, false);
     }
 
-    private static Map<String, Long> probe(String name, Collection<String> osids, boolean withSeqs) {
+    /** {@link #storedSeqs} as of the table's latest commit ({@link #latestRows}). */
+    public static Map<String, Long> storedSeqsLatest(String name, Collection<String> osids) {
+        return probe(name, osids, true, true);
+    }
+
+    private static Map<String, Long> probe(String name, Collection<String> osids, boolean withSeqs, boolean latest) {
         Set<String> wanted = new HashSet<>(osids);
         Map<String, Long> found = new HashMap<>();
         List<String> batch = new ArrayList<>(PROBE_IDS_PER_STATEMENT);
-        for (String id : wanted) {
-            batch.add(id);
-            if (batch.size() == PROBE_IDS_PER_STATEMENT) {
-                probe(name, batch, withSeqs, wanted, found);
-                batch.clear();
-            }
+        // A latest probe's statements share one connection.
+        if (latest) {
+            holdLatest();
         }
-        if (!batch.isEmpty()) {
-            probe(name, batch, withSeqs, wanted, found);
+        try {
+            for (String id : wanted) {
+                batch.add(id);
+                if (batch.size() == PROBE_IDS_PER_STATEMENT) {
+                    probe(name, batch, withSeqs, latest, wanted, found);
+                    batch.clear();
+                }
+            }
+            if (!batch.isEmpty()) {
+                probe(name, batch, withSeqs, latest, wanted, found);
+            }
+        } finally {
+            if (latest) {
+                releaseLatest();
+            }
         }
         return found;
     }
 
-    private static void probe(String name, List<String> ids, boolean withSeqs, Set<String> wanted, Map<String, Long> found) {
+    private static void probe(
+        String name,
+        List<String> ids,
+        boolean withSeqs,
+        boolean latest,
+        Set<String> wanted,
+        Map<String, Long> found
+    ) {
         String columns = withSeqs ? InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SEQ : InfinoQueryTranslator.OSID;
         // An id with no letter or digit indexes as no term, so the term index
         // cannot find it: those are compared by value over the id column.
@@ -1534,7 +1647,7 @@ public final class InfinoNative {
             statements.add(byIds(name, columns, bare, null));
         }
         for (String sql : statements) {
-            for (Map<String, Object> row : sqlRows(sql)) {
+            for (Map<String, Object> row : latest ? latestRows(sql) : sqlRows(sql)) {
                 Object id = row.get(InfinoQueryTranslator.OSID);
                 if (id != null && wanted.contains(id.toString())) {
                     found.put(id.toString(), seq(row.get(InfinoQueryTranslator.SEQ)));

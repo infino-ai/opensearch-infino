@@ -7,11 +7,16 @@ package org.opensearch.infino;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.delete.DeleteRequest;
+import org.opensearch.action.index.IndexRequest;
+import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.index.engine.DocumentMissingException;
+import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
@@ -35,13 +40,18 @@ public class InfinoWriterTests extends OpenSearchTestCase {
 
     /** A bulk that deletes these ids: it names them, and stages without the native bridge (a delete carries no row). */
     private static InfinoWriter.Waiter deletes(ActionListener<BulkResponse> listener, String... ids) {
+        return deletesFrom("_na_", listener, ids);
+    }
+
+    /** {@link #deletes} from the index of this UUID, under the same name as every other. */
+    private static InfinoWriter.Waiter deletesFrom(String uuid, ActionListener<BulkResponse> listener, String... ids) {
         List<InfinoWriter.Outcome> outcomes = new ArrayList<>();
         for (int slot = 0; slot < ids.length; slot++) {
             InfinoWriter.Write delete = new InfinoWriter.Write(ids[slot], null, true);
             outcomes.add(new InfinoWriter.Outcome(slot, new DeleteRequest("i", ids[slot]), delete, null));
         }
         return new InfinoWriter.Waiter(
-            new ShardId("i", "_na_", 0),
+            new ShardId("i", uuid, 0),
             "i",
             outcomes,
             new BulkItemResponse[ids.length],
@@ -127,6 +137,30 @@ public class InfinoWriterTests extends OpenSearchTestCase {
     }
 
     /**
+     * Appends running at once write one index. A bulk to an index created
+     * again under the table's name waits while appends of the old index run,
+     * and a bulk staged behind it waits too, even one to the old index: the
+     * sequence numbers of the appends running are read for one index.
+     */
+    public void testABulkToAnotherIndexOfTheTableWaitsForTheRunningAppendsOfTheOld() {
+        AtomicInteger appendsStarted = new AtomicInteger();
+        InfinoWriter writer = new InfinoWriter(() -> task -> appendsStarted.incrementAndGet(), 10, Long.MAX_VALUE, 4);
+
+        writer.submit("t", deletesFrom("old", pending(), "x"));
+        writer.submit("t", deletesFrom("old", pending(), "y"));
+        assertEquals("two appends of one index run at once", 2, appendsStarted.get());
+
+        writer.submit("t", deletesFrom("new", pending(), "z"));
+        assertEquals("a bulk of the index created again waits for the old one's appends", 2, appendsStarted.get());
+
+        writer.submit("t", deletesFrom("old", pending(), "w"));
+        assertEquals("a bulk staged behind it waits behind it", 2, appendsStarted.get());
+
+        writer.submit("u", deletesFrom("new", pending(), "z"));
+        assertEquals("another table's appends are its own", 3, appendsStarted.get());
+    }
+
+    /**
      * A bulk that names an id a running append writes waits for that append,
      * and a bulk staged after it waits behind it even when it names nothing,
      * so writes to one id reach the table in the order they arrived.
@@ -171,5 +205,75 @@ public class InfinoWriterTests extends OpenSearchTestCase {
 
         writer.submit("t", deletes(pending(), "x"));
         assertEquals("x and the table's only slot are free again", 1, appendsStarted.get());
+    }
+
+    /** A table's next number is read afresh for a new index of its name, and never goes back for the same index. */
+    public void testTheNextSequenceNumberStartsAgainForANewIndexOnly() {
+        assertEquals(0L, InfinoWriter.nextSeq(-1L, 0L, false));
+        assertEquals(0L, InfinoWriter.nextSeq(-1L, 0L, true));
+        // The copy writing the same index moved: numbers given to running appends stay taken.
+        assertEquals(7L, InfinoWriter.nextSeq(7L, 3L, true));
+        assertEquals(9L, InfinoWriter.nextSeq(7L, 9L, true));
+        // The index was deleted and created again under the table's name: its first write is 0.
+        assertEquals(0L, InfinoWriter.nextSeq(7L, 0L, false));
+    }
+
+    private static final ShardId SHARD = new ShardId("i", "_na_", 0);
+
+    private static InfinoWriter.Outcome update(String id, long ifSeqNo) {
+        UpdateRequest request = new UpdateRequest("i", id).doc("{\"a\":1}", MediaTypeRegistry.JSON);
+        if (ifSeqNo >= 0) {
+            request.setIfSeqNo(ifSeqNo).setIfPrimaryTerm(1);
+        }
+        return new InfinoWriter.Outcome(0, request, InfinoWriter.Write.update(request), null);
+    }
+
+    private static InfinoWriter.Outcome index(String id, long ifSeqNo, boolean create) {
+        IndexRequest request = new IndexRequest("i").id(id).source("{\"a\":1}", MediaTypeRegistry.JSON).create(create);
+        if (ifSeqNo >= 0) {
+            request.setIfSeqNo(ifSeqNo).setIfPrimaryTerm(1);
+        }
+        return new InfinoWriter.Outcome(0, request, new InfinoWriter.Write(id, "{\"a\":1}", true, create), null);
+    }
+
+    private static InfinoWriter.Outcome delete(String id, long ifSeqNo) {
+        DeleteRequest request = new DeleteRequest("i", id);
+        if (ifSeqNo >= 0) {
+            request.setIfSeqNo(ifSeqNo).setIfPrimaryTerm(1);
+        }
+        return new InfinoWriter.Outcome(0, request, new InfinoWriter.Write(id, null, true), null);
+    }
+
+    /** A conditioned update of no document is missing (404), as stock reads the document before it checks the condition. */
+    public void testAConditionedUpdateOfNoDocumentIsMissingNotAConflict() {
+        Exception e = InfinoWriter.rejection(SHARD, update("1", 1), null);
+        assertTrue(e.toString(), e instanceof DocumentMissingException);
+        assertEquals(RestStatus.NOT_FOUND, ExceptionsHelper.status(e));
+    }
+
+    /** An index or a delete of no document conditioned on a sequence number conflicts (409), as stock answers them. */
+    public void testAConditionedIndexOrDeleteOfNoDocumentConflicts() {
+        for (InfinoWriter.Outcome o : List.of(index("1", 1, false), delete("1", 1))) {
+            Exception e = InfinoWriter.rejection(SHARD, o, null);
+            assertTrue(e.toString(), e instanceof VersionConflictEngineException);
+            assertEquals(RestStatus.CONFLICT, ExceptionsHelper.status(e));
+        }
+    }
+
+    /** A document at sequence number 0 meets a condition on 0 and conflicts with one on any other number. */
+    public void testADocumentAtSequenceNumberZeroIsCheckedAsAnyOther() {
+        assertNull(InfinoWriter.rejection(SHARD, update("1", 0), 0L));
+        assertNull(InfinoWriter.rejection(SHARD, index("1", 0, false), 0L));
+        assertNull(InfinoWriter.rejection(SHARD, delete("1", 0), 0L));
+        Exception e = InfinoWriter.rejection(SHARD, update("1", 234), 0L);
+        assertTrue(e.toString(), e instanceof VersionConflictEngineException);
+    }
+
+    /** Without a condition an update of no document is left to its merge (an upsert makes one), and a create over a document conflicts. */
+    public void testAnUnconditionedUpdateGoesOnAndACreateOverADocumentConflicts() {
+        assertNull(InfinoWriter.rejection(SHARD, update("1", -1), null));
+        Exception e = InfinoWriter.rejection(SHARD, index("1", -1, true), 0L);
+        assertTrue(e.toString(), e instanceof VersionConflictEngineException);
+        assertNull(InfinoWriter.rejection(SHARD, index("1", -1, true), null));
     }
 }
