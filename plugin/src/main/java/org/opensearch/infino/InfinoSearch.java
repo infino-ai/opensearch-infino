@@ -685,8 +685,9 @@ public final class InfinoSearch {
         if (scoring.unrankable()) {
             throw new IllegalArgumentException(what + " is not served for a query whose score the table does not rank");
         }
-        if (scoring.across() != null && query.principal() == null) {
-            throw new IllegalArgumentException(what + " is not served for a query string scored across several text columns");
+        if (scoring.across() != null) {
+            // The summed BM25 ranks only an unsorted page, so the hits would score apart from the max_score.
+            throw new IllegalArgumentException(what + " is not served for a query whose text clauses' scores are summed");
         }
         if (source.collapse() != null) {
             throw new IllegalArgumentException(what + " is not served with collapse on a scored query");
@@ -1458,6 +1459,7 @@ public final class InfinoSearch {
             && plan.sorts().isEmpty()
             && !scoredPage(plan)
             && plan.query().ranked() != null
+            && !ranksAcross(plan)
             && (InfinoQueryTranslator.joinsAfterRanking(where) || (!InfinoQueryTranslator.ALL.equals(where) && plan.collapse() != null));
     }
 
