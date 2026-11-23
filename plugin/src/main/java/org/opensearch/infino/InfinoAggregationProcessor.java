@@ -281,8 +281,9 @@ public class InfinoAggregationProcessor {
 
     /**
      * For a statement of {@link #readAhead} whose groups were read with the
-     * foreground ({@link #fusedTopTerms}), the count of every group with a
-     * key: those groups are the level's best only, picked however many.
+     * foreground ({@link #fusedTopTerms}) or picked by the engine
+     * ({@link #topValueCounts}), the count of every group with a key: those
+     * groups are the level's best only, picked however many.
      */
     private final Map<String, Long> fusedKeyedTotals = new HashMap<>();
 
@@ -4131,6 +4132,10 @@ public class InfinoAggregationProcessor {
         }
         List<Map<String, Object>> groups;
         if (readsValueCounts(level, q)) {
+            Long topTotal = topValueCounts(level, q, picked);
+            if (topTotal != null) {
+                return topTotal;
+            }
             groups = valueCounts(level, q);
         } else {
             groups = InfinoNative.sqlRows(levelInner(chain, 0, q.from(), q.where(), "", false) + " LIMIT " + (MAX_GROUPS_PICKED_HERE + 2));
@@ -4215,6 +4220,80 @@ public class InfinoAggregationProcessor {
     }
 
     /**
+     * The request's total and a top terms level's best groups over the whole
+     * table in one engine call ({@link InfinoNative#valueCountsTop}), however
+     * many values the column has: the engine counts a keyword column's values
+     * from its term index, keeps the level's first
+     * {@code size} in its order, and gives the count of every row with a
+     * value and of every row without. Those groups are read ahead for the
+     * level to pick its buckets from ({@link #pickTopTerms}), with the count
+     * of every row with a value as their keyed total, so
+     * {@code sum_other_doc_count} counts the groups left out exactly, as the
+     * window statement does. Without this, a column of more values than are
+     * picked here counted them all once and then ran the window statement
+     * over the table.
+     *
+     * <p>Only for a level whose groups are the table's value counts
+     * ({@link #readsValueCounts}), keyed by a string shown as stored, in the
+     * default order (count descending, then key ascending, which the engine
+     * ranks by too), and taking no more groups than are picked here. Null
+     * otherwise, and when the bridge declines (a column without the keyword
+     * analyzer, as on a table made before it), for the level's own reads.
+     */
+    private Long topValueCounts(Grouped level, Translation q, String picked) {
+        if (!takesTopValueCounts(level)) {
+            return null;
+        }
+        Map<String, Object> top = InfinoNative.valueCountsTop(q.table(), level.source.column(), level.size);
+        List<Map<String, Object>> groups = topGroups(top, level.source.column());
+        if (groups == null) {
+            return null;
+        }
+        long keyedTotal = asLong(top.get("keyed_total"));
+        readAhead.put(picked, groups);
+        fusedKeyedTotals.put(picked, keyedTotal);
+        return keyedTotal + asLong(top.get("nulls"));
+    }
+
+    /**
+     * Whether a terms level over the whole table may take its groups from
+     * {@link InfinoNative#valueCountsTop}: keyed by a string column shown as
+     * stored, in the default order (count descending, then key ascending,
+     * which the engine ranks by too), and taking no more groups than are
+     * picked here.
+     */
+    static boolean takesTopValueCounts(Grouped level) {
+        return level.terms
+            && level.keyKind == KeyKind.STR
+            && level.source.column() != null
+            && !level.source.masked()
+            && level.size <= MAX_GROUPS_PICKED_HERE
+            && "doc_count DESC, {key} ASC".equals(level.orderTemplate)
+            // The engine's value counts name their count column so, and refuse a field of that name.
+            && !InfinoNative.VALUE_COUNT.equals(level.source.column());
+    }
+
+    /**
+     * The groups of {@link InfinoNative#valueCountsTop}'s answer, in its
+     * order, as a level's GROUP BY names them ({@code k0}, {@code doc_count}).
+     * Null for no answer.
+     */
+    static List<Map<String, Object>> topGroups(Map<String, Object> top, String column) {
+        if (top == null || !(top.get("rows") instanceof List<?> rows)) {
+            return null;
+        }
+        List<Map<String, Object>> groups = new ArrayList<>(rows.size());
+        for (Object o : rows) {
+            Map<?, ?> row = (Map<?, ?>) o;
+            Map<String, Object> group = new HashMap<>();
+            group.put("k0", row.get(column));
+            group.put("doc_count", row.get(InfinoNative.VALUE_COUNT));
+            groups.add(group);
+        }
+        return groups;
+    }
+
+    /**
      * Whether a top terms level's groups are the table's value counts: a
      * request that does not filter the table, over a column no document gives
      * several values (the counts are the column's own, not its list's), with
@@ -4264,7 +4343,7 @@ public class InfinoAggregationProcessor {
      * only, read with its foreground ({@link #fusedTopTerms}), however many,
      * and that is the count of every group.
      */
-    private static List<Map<String, Object>> pickTopTerms(
+    static List<Map<String, Object>> pickTopTerms(
         Grouped level,
         String inner,
         Map<String, List<Map<String, Object>>> readAhead,
