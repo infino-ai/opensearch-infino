@@ -186,7 +186,8 @@ const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
 /// optionally `T` and `HH[:mm[:ss[.fraction]]]`, any of it (`2026-11-23T`
 /// is a day), then optionally a zone (`Z`, `±HH`, `±HHmm`, `±HH:mm`), UTC
 /// when there is none; failing that, a whole number of milliseconds. `None`
-/// for any other string, which the engine's own parser then reads.
+/// for any other string: [`conform`] reads one with a space for the `T`
+/// ([`space_separated_millis`]) and refuses the rest.
 fn default_format_millis(s: &str) -> Option<i64> {
     optional_time_millis(s, true).or_else(|| {
         let digits = s.strip_prefix('-').unwrap_or(s);
@@ -194,6 +195,17 @@ fn default_format_millis(s: &str) -> Option<i64> {
             .then(|| s.parse::<i64>().ok())
             .flatten()
     })
+}
+
+/// A date and a time apart by one space (`2026-11-23 10:30:15`, a fraction
+/// and a zone allowed), which the engine's parser read before this bridge
+/// read every date itself: the default format with that space as its `T`.
+fn space_separated_millis(s: &str) -> Option<i64> {
+    let (date, time) = s.split_once(' ')?;
+    if time.is_empty() || time.contains(' ') {
+        return None;
+    }
+    optional_time_millis(&format!("{date}T{time}"), true)
 }
 
 /// `strict_date_optional_time` (see [`default_format_millis`]), or with
@@ -332,10 +344,13 @@ fn epoch_millis(s: &str, unit_millis: i64) -> Option<i64> {
 /// `value` as a date field of `formats` holds it: the first form that reads
 /// it gives its epoch milliseconds, as OpenSearch tries a field's formats in
 /// order (a number by its digits, so an `epoch_second` field's `893966296`
-/// is a day of 1998, not of 1970). A form this bridge does not read (a
-/// custom pattern) does not stop the others: only when none of them reads
-/// the value is it left to [`conform`], as a field of the default format.
-/// A value no form reads fails its document, as OpenSearch fails it.
+/// is a day of 1998, not of 1970). A custom pattern is read by
+/// [`JavaPattern`]. A form this bridge does not read (a pattern with a letter
+/// it does not translate, a named format it does not know) does not stop the
+/// others: only when none of them reads the value is it read as a field of
+/// the default format ([`conform`]). A value nothing reads fails its
+/// document, as OpenSearch fails it: the engine is never handed a date as
+/// text, which its commit would refuse after the write was acknowledged.
 fn conform_date(value: Value, formats: &[DateFormat]) -> Result<Value, String> {
     let text = match &value {
         Value::Null => return Ok(value),
@@ -349,6 +364,11 @@ fn conform_date(value: Value, formats: &[DateFormat]) -> Result<Value, String> {
             DateFormat::OptionalTime { strict } => optional_time_millis(&text, *strict),
             DateFormat::EpochMillis => epoch_millis(&text, 1),
             DateFormat::EpochSecond => epoch_millis(&text, MILLIS_PER_SECOND),
+            DateFormat::IsoNamed(_) => optional_time_millis(&text, false),
+            DateFormat::Pattern(pattern) => {
+                custom = true;
+                pattern.millis(&text)
+            }
             DateFormat::Other(_) => {
                 custom = true;
                 None
@@ -358,14 +378,17 @@ fn conform_date(value: Value, formats: &[DateFormat]) -> Result<Value, String> {
             return Ok(json!(millis));
         }
     }
-    if custom {
-        return conform(value, &date_type());
-    }
     let names: Vec<&str> = formats.iter().map(DateFormat::name).collect();
-    Err(format!(
-        "failed to parse date field [{text}] with format [{}]",
-        names.join("||")
-    ))
+    let refused = || {
+        format!(
+            "failed to parse date field [{text}] with format [{}]",
+            names.join("||")
+        )
+    };
+    if custom {
+        return conform(value, &date_type()).map_err(|_| refused());
+    }
+    Err(refused())
 }
 
 /// Exactly `n` ASCII digits of `b` from `at`, as a number, moving `at` past them.
@@ -1113,9 +1136,223 @@ enum DateFormat {
     EpochMillis,
     /// `epoch_second`: seconds since the epoch, a fraction allowed.
     EpochSecond,
-    /// Any other form (a custom pattern, a named format this bridge does not
-    /// read); a value reaching it is read as a field of the default format.
+    /// A named ISO 8601 format (`date_time`, `strict_date_hour_minute_second`
+    /// and the like), each a form of `date_optional_time`, read as it reads
+    /// them. Its name is kept for the refusal's message.
+    IsoNamed(String),
+    /// A custom pattern (`yyyy/MM/dd HH:mm:ss`), read by [`JavaPattern`].
+    Pattern(JavaPattern),
+    /// Any other form (a pattern with a letter [`JavaPattern`] does not
+    /// translate, a named format this bridge does not read); a value reaching
+    /// it is read as a field of the default format, or refused.
     Other(String),
+}
+
+/// The named formats that are forms of `date_optional_time`: a date
+/// `yyyy-MM-dd`, then optionally `T` and a time, then optionally a zone.
+const ISO_NAMED_FORMATS: &[&str] = &[
+    "date",
+    "strict_date",
+    "date_hour",
+    "strict_date_hour",
+    "date_hour_minute",
+    "strict_date_hour_minute",
+    "date_hour_minute_second",
+    "strict_date_hour_minute_second",
+    "date_hour_minute_second_millis",
+    "strict_date_hour_minute_second_millis",
+    "date_hour_minute_second_fraction",
+    "strict_date_hour_minute_second_fraction",
+    "date_time",
+    "strict_date_time",
+    "date_time_no_millis",
+    "strict_date_time_no_millis",
+    "date_optional_time_nanos",
+    "strict_date_optional_time_nanos",
+    "year_month_day",
+    "strict_year_month_day",
+];
+
+/// A date field's custom pattern in Java's `DateTimeFormatter` letters, as
+/// OpenSearch reads it, translated to `chrono`'s: `yyyy`/`uuuu`, `yy`, `M` to
+/// `MMMM`, `d`/`dd`, `H`/`HH`, `h`/`hh` with `a`, `m`/`mm`, `s`/`ss`, `S`
+/// repeated (a fraction of the second), `EEE`/`EEEE`, the zones `Z` to
+/// `ZZZ`, `ZZZZZ`, `X`, `XX`, `XXX` (which also read `Z` as UTC), quoted
+/// text, and any other character as itself. A pattern with any other letter
+/// has no translation ([`JavaPattern::translate`] gives `None`): it is never
+/// guessed. A pattern without a zone reads its value as UTC, as OpenSearch
+/// does; one without a time reads midnight.
+#[derive(Clone, Debug, PartialEq)]
+struct JavaPattern {
+    /// The pattern as the mapping gives it.
+    java: String,
+    /// The same pattern in `chrono`'s format specifiers.
+    chrono: String,
+    /// The pattern names a zone, so a value reads as a moment.
+    zone: bool,
+    /// The pattern names a time of day, so a value with a date alone is no match.
+    time: bool,
+    /// What a trailing `Z` (UTC) reads as for an `X` zone, which `chrono`
+    /// does not read as an offset.
+    zulu: Option<&'static str>,
+}
+
+impl JavaPattern {
+    fn translate(java: &str) -> Option<Self> {
+        let chars: Vec<char> = java.chars().collect();
+        let mut out = String::new();
+        let (mut zone, mut time, mut hour, mut zulu) = (false, false, false, None);
+        let (mut twelve, mut meridiem) = (false, false);
+        let literal = |out: &mut String, c: char| {
+            if c == '%' {
+                out.push_str("%%");
+            } else {
+                out.push(c);
+            }
+        };
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\'' {
+                // `''` is a quote; `'text'` is text, with `''` a quote inside it.
+                if chars.get(i + 1) == Some(&'\'') {
+                    out.push('\'');
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                loop {
+                    match chars.get(i) {
+                        None => return None,
+                        Some('\'') if chars.get(i + 1) == Some(&'\'') => {
+                            out.push('\'');
+                            i += 2;
+                        }
+                        Some('\'') => {
+                            i += 1;
+                            break;
+                        }
+                        Some(&t) => {
+                            literal(&mut out, t);
+                            i += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            if !c.is_ascii_alphabetic() {
+                literal(&mut out, c);
+                i += 1;
+                continue;
+            }
+            let mut n = 1;
+            while chars.get(i + n) == Some(&c) {
+                n += 1;
+            }
+            let spec = match (c, n) {
+                ('y' | 'u', 2) => "%y",
+                ('y' | 'u', 1 | 3 | 4) => "%Y",
+                ('M', 1 | 2) => "%m",
+                ('M', 3) => "%b",
+                ('M', 4) => "%B",
+                ('d', 1 | 2) => "%d",
+                ('H', 1 | 2) => {
+                    hour = true;
+                    "%H"
+                }
+                ('h', 1 | 2) => {
+                    hour = true;
+                    twelve = true;
+                    "%I"
+                }
+                ('a', 1) => {
+                    meridiem = true;
+                    "%p"
+                }
+                ('m', 1 | 2) => "%M",
+                ('s', 1 | 2) => "%S",
+                ('S', 3) => "%3f",
+                ('S', 6) => "%6f",
+                ('S', 9) => "%9f",
+                // Another number of fraction digits: read after its dot,
+                // whatever its length.
+                ('S', 1..=9) if out.ends_with('.') => {
+                    out.pop();
+                    "%.f"
+                }
+                ('E', 3) => "%a",
+                ('E', 4) => "%A",
+                ('Z', 1..=3) => {
+                    zone = true;
+                    "%z"
+                }
+                ('Z', 5) => {
+                    zone = true;
+                    "%:z"
+                }
+                ('X', 1) => {
+                    zone = true;
+                    zulu = Some("+00");
+                    "%#z"
+                }
+                ('X', 2) => {
+                    zone = true;
+                    zulu = Some("+0000");
+                    "%z"
+                }
+                ('X', 3) => {
+                    zone = true;
+                    zulu = Some("+00:00");
+                    "%:z"
+                }
+                _ => return None,
+            };
+            if matches!(c, 'H' | 'h' | 'm' | 's' | 'S' | 'a') {
+                time = true;
+            }
+            out.push_str(spec);
+            i += n;
+        }
+        // A time with no hour, or a 12-hour clock with no half of the day,
+        // names no instant: such a pattern is not guessed at.
+        if (time && !hour) || (twelve != meridiem) {
+            return None;
+        }
+        Some(Self {
+            java: java.to_string(),
+            chrono: out,
+            zone,
+            time,
+            zulu,
+        })
+    }
+
+    /// `text` in this pattern as epoch milliseconds, `None` when it does not
+    /// read: the whole of `text` must match.
+    fn millis(&self, text: &str) -> Option<i64> {
+        let with_offset;
+        let text = match (self.zulu, text.strip_suffix('Z')) {
+            (Some(utc), Some(head)) => {
+                with_offset = format!("{head}{utc}");
+                with_offset.as_str()
+            }
+            _ => text,
+        };
+        if self.zone {
+            return chrono::DateTime::parse_from_str(text, &self.chrono)
+                .ok()
+                .map(|d| d.timestamp_millis());
+        }
+        if self.time {
+            return chrono::NaiveDateTime::parse_from_str(text, &self.chrono)
+                .ok()
+                .map(|d| d.and_utc().timestamp_millis());
+        }
+        chrono::NaiveDate::parse_from_str(text, &self.chrono)
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|d| d.and_utc().timestamp_millis())
+    }
 }
 
 impl DateFormat {
@@ -1130,7 +1367,9 @@ impl DateFormat {
                 "date_optional_time" => Self::OptionalTime { strict: false },
                 "epoch_millis" => Self::EpochMillis,
                 "epoch_second" => Self::EpochSecond,
-                other => Self::Other(other.to_string()),
+                named if ISO_NAMED_FORMATS.contains(&named) => Self::IsoNamed(named.to_string()),
+                other => JavaPattern::translate(other)
+                    .map_or_else(|| Self::Other(other.to_string()), Self::Pattern),
             })
             .collect()
     }
@@ -1142,7 +1381,8 @@ impl DateFormat {
             Self::OptionalTime { strict: false } => "date_optional_time",
             Self::EpochMillis => "epoch_millis",
             Self::EpochSecond => "epoch_second",
-            Self::Other(f) => f,
+            Self::IsoNamed(f) | Self::Other(f) => f,
+            Self::Pattern(p) => &p.java,
         }
     }
 }
@@ -2031,9 +2271,19 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
         },
         DataType::Timestamp(..) => match &value {
             // A string in OpenSearch's default date format is read as it
-            // reads it; any other is left to the engine's parser. An
+            // reads it, and one with a space for the `T`
+            // (`2026-11-23 10:30:15`) as the engine's own parser read it. Any
+            // other string is refused here: handed to the engine as text, it
+            // would fail the commit after the write was acknowledged. An
             // epoch-millisecond integer is taken as is.
-            Value::String(s) => Ok(default_format_millis(s).map_or(value.clone(), |ms| json!(ms))),
+            Value::String(s) => default_format_millis(s)
+                .or_else(|| space_separated_millis(s))
+                .map(|ms| json!(ms))
+                .ok_or_else(|| {
+                    format!(
+                        "failed to parse date field [{s}] with format [strict_date_optional_time||epoch_millis]"
+                    )
+                }),
             Value::Number(n) if n.is_i64() || n.is_u64() => Ok(value),
             _ => Err("not a date".into()),
         },
@@ -7668,11 +7918,26 @@ mod tests {
             conform(json!("2026-11-23T"), &date_type()).unwrap(),
             json!(1_795_392_000_000i64)
         );
-        // A form only the engine reads is left to it, as before.
+        // A space for the `T`, which the engine's parser read, still reads,
+        // now as milliseconds; any other string is refused here, never handed
+        // to the engine as text.
         assert_eq!(
             conform(json!("2026-11-23 10:30:15"), &date_type()).unwrap(),
-            json!("2026-11-23 10:30:15")
+            json!(1_795_429_815_000i64)
         );
+        assert_eq!(
+            conform(json!("2026-11-23 10:30:15.5+05:30"), &date_type()).unwrap(),
+            json!(1_795_410_015_500i64)
+        );
+        for refused in ["2026/11/23 10:30:15", "23/Nov/2026", "yesterday", "2026-11-23  10:30"] {
+            assert_eq!(
+                conform(json!(refused), &date_type()),
+                Err(format!(
+                    "failed to parse date field [{refused}] with format [strict_date_optional_time||epoch_millis]"
+                )),
+                "{refused}"
+            );
+        }
     }
 
     /// A date field is read by the format its mapping declares: an
@@ -7713,11 +7978,11 @@ mod tests {
             conform_date(json!(893966296000i64), &millis),
             Ok(json!(893_966_296_000i64))
         );
-        // A custom pattern's value is read as the default format's, as before.
+        // A custom pattern reads its value itself.
         let custom = DateFormat::parse_all("yyyy-MM-dd HH:mm:ss||strict_date_optional_time");
         assert_eq!(
             conform_date(json!("2026-11-23 10:30:15"), &custom),
-            Ok(json!("2026-11-23 10:30:15"))
+            Ok(json!(1_795_429_815_000i64))
         );
         // A custom pattern does not stop the forms after it: an
         // `epoch_second` listed after one still reads a number as seconds,
@@ -7788,6 +8053,83 @@ mod tests {
             conform_date(json!("noon"), &lenient),
             Err("failed to parse date field [noon] with format [date_optional_time]".into())
         );
+    }
+
+    /// A custom pattern is read as OpenSearch reads it: the format dynamic
+    /// mapping gives a date in slashes, an Apache log's timestamp, an ISO
+    /// pattern with an `X` zone. A value no form reads is refused, naming
+    /// the formats, and a pattern with a letter that has no translation is
+    /// never guessed at: its value is read as the default format's or refused.
+    #[test]
+    fn a_custom_date_pattern_reads_its_values() {
+        let dynamic = DateFormat::parse_all("yyyy/MM/dd HH:mm:ss||yyyy/MM/dd||epoch_millis");
+        assert_eq!(
+            conform_date(json!("2026/11/24 10:00:00"), &dynamic),
+            Ok(json!(1_795_514_400_000i64))
+        );
+        assert_eq!(
+            conform_date(json!("2026/11/24"), &dynamic),
+            Ok(json!(1_795_478_400_000i64))
+        );
+        assert_eq!(
+            conform_date(json!(1_795_514_400_000i64), &dynamic),
+            Ok(json!(1_795_514_400_000i64))
+        );
+        assert_eq!(
+            conform_date(json!("24/11/2026"), &dynamic),
+            Err(
+                "failed to parse date field [24/11/2026] with format [yyyy/MM/dd HH:mm:ss||yyyy/MM/dd||epoch_millis]"
+                    .into()
+            )
+        );
+        let apache = DateFormat::parse_all("dd/MMM/yyyy:HH:mm:ss Z");
+        assert_eq!(
+            conform_date(json!("24/Nov/2026:10:00:00 +0530"), &apache),
+            Ok(json!(1_795_514_400_000i64 - 19_800_000))
+        );
+        assert_eq!(
+            conform_date(json!("24/Nov/2026:10:00:00 +0000"), &apache),
+            Ok(json!(1_795_514_400_000i64))
+        );
+        let iso = DateFormat::parse_all("yyyy-MM-dd'T'HH:mm:ss.SSSXXX");
+        assert_eq!(
+            conform_date(json!("2026-11-24T10:00:00.250+05:30"), &iso),
+            Ok(json!(1_795_514_400_250i64 - 19_800_000))
+        );
+        assert_eq!(
+            conform_date(json!("2026-11-24T10:00:00.250Z"), &iso),
+            Ok(json!(1_795_514_400_250i64))
+        );
+        let twelve = DateFormat::parse_all("MM/dd/yyyy hh:mm:ss a");
+        assert_eq!(
+            conform_date(json!("11/24/2026 02:30:00 PM"), &twelve),
+            Ok(json!(1_795_514_400_000i64 + 4 * 3_600_000 + 30 * 60_000))
+        );
+        let named = DateFormat::parse_all("date_time||strict_date_hour_minute_second");
+        assert_eq!(
+            conform_date(json!("2026-11-24T10:00:00Z"), &named),
+            Ok(json!(1_795_514_400_000i64))
+        );
+        // No translation: a week-based year, an hour without a half of the
+        // day, a minute without an hour. Each is kept by name, never guessed.
+        for java in ["YYYY-MM-dd", "yyyy-MM-dd hh:mm", "yyyy-MM-dd mm:ss", "yyyy-MM-dd'T"] {
+            assert_eq!(JavaPattern::translate(java), None, "{java}");
+            assert_eq!(DateFormat::parse_all(java), vec![DateFormat::Other(java.into())]);
+        }
+        let untranslated = DateFormat::parse_all("YYYY/ww");
+        assert_eq!(
+            conform_date(json!("2026/48"), &untranslated),
+            Err("failed to parse date field [2026/48] with format [YYYY/ww]".into())
+        );
+        // An ISO value still reads under an untranslated pattern, as the
+        // default format, as it did before.
+        assert_eq!(
+            conform_date(json!("2026-11-24T10:00:00Z"), &untranslated),
+            Ok(json!(1_795_514_400_000i64))
+        );
+        // A quote and a percent sign are text.
+        let quoted = JavaPattern::translate("yyyy'-''%'MM").expect("translates");
+        assert_eq!(quoted.chrono, "%Y-'%%%m");
     }
 
     /// A string field's arrays of arrays are read through, as OpenSearch

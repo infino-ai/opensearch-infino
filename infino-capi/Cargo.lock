@@ -2179,6 +2179,7 @@ dependencies = [
 name = "infino-capi"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "datafusion",
  "infino",
  "libmimalloc-sys",
