@@ -27,10 +27,10 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
     private static Map<String, Column> columns() {
         Map<String, Column> cols = new LinkedHashMap<>();
         cols.put("osid", new Column("osid", "str", false, false));
-        cols.put("@timestamp", new Column("@timestamp", "ts", false, false));
+        cols.put("@timestamp", new Column("@timestamp", "ts", false, false).rangeIndexed());
         cols.put("level", new Column("level", "str", false, false));
         cols.put("message", new Column("message", "str", true, false));
-        cols.put("status", new Column("status", "i64", false, false));
+        cols.put("status", new Column("status", "i64", false, false).rangeIndexed());
         cols.put("host.name", new Column("host.name", "str", false, false));
         return cols;
     }
@@ -222,16 +222,22 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
 
     /** {@code t} over {@code sorts} then the row id, as a request's plan orders it. */
     private static InfinoSearch.Plan sortedPlan(Translation t, java.util.List<InfinoSearch.SortSpec> sorts) {
-        java.util.List<InfinoSearch.SortSpec> all = new java.util.ArrayList<>(sorts);
-        all.add(InfinoSearch.SortSpec.rowId());
-        return new InfinoSearch.Plan(TABLE, columns(), t, all, null, null, null, null, java.util.List.of(), InfinoAccess.NONE, NOW);
+        return sortedPlan(columns(), t, sorts, null);
     }
 
-    public void testASortedPageTheRangeIndexPicksReadsItsSourcesInItsStatement() {
+    /** As {@link #sortedPlan(Translation, java.util.List)}, over {@code cols} and with {@code postWhere} (null for none). */
+    private static InfinoSearch.Plan sortedPlan(Map<String, Column> cols, Translation t, java.util.List<InfinoSearch.SortSpec> sorts, String postWhere) {
+        java.util.List<InfinoSearch.SortSpec> all = new java.util.ArrayList<>(sorts);
+        all.add(InfinoSearch.SortSpec.rowId());
+        return new InfinoSearch.Plan(TABLE, cols, t, all, null, postWhere, null, null, java.util.List.of(), InfinoAccess.NONE, NOW);
+    }
+
+    public void testASortedPageTheRangeIndexAloneAnswersReadsItsSourcesInItsStatement() {
         org.opensearch.search.sort.SortOrder desc = org.opensearch.search.sort.SortOrder.DESC;
         InfinoSearch.Keyset whole = InfinoSearch.Keyset.WHOLE;
-        // A numeric or date column then the row id: the range index picks the
-        // page's rows, and the engine reads the sources of those rows alone.
+        // A range-indexed numeric or date column then the row id, over every
+        // row: the range index picks the page's rows, and the engine reads
+        // the sources of those rows alone.
         InfinoSearch.Plan plan = sortedPlan(translate(QueryBuilders.matchAllQuery()), statusSort(desc, null));
         assertTrue(InfinoSearch.sourceInSortedStatement(plan, 10, whole));
         assertTrue(InfinoSearch.selectsSource(plan, 10, whole, true));
@@ -241,11 +247,27 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(InfinoSearch.selectsSource(plan, 10, whole, false));
         String bare = InfinoSearch.hitStatement(plan, 10, false, whole, 10_000, InfinoSearch.selectsSource(plan, 10, whole, false));
         assertFalse(bare, bare.contains("source"));
+        // One bounded range on the sort column is the range index's too.
         java.util.List<InfinoSearch.SortSpec> byTime = java.util.List.of(InfinoSearch.SortSpec.of(columns().get("@timestamp"), false));
-        assertTrue(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.termQuery("level", "error")), byTime), 10, whole));
-        // Plain words are checked on the table's rows; a phrase reads the token index, every match of it.
-        assertTrue(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchQuery("message", "error timeout")), byTime), 10, whole));
+        Translation span = translate(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00").lt("2023-01-03T00:00:00"));
+        assertTrue(InfinoSearch.sourceInSortedStatement(sortedPlan(span, byTime), 10, whole));
+        // The same range under a post_filter, or on another column than the sort's, is checked on each row.
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(columns(), span, byTime, "\"status\" = 500"), 10, whole));
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(span, statusSort(desc, null)), 10, whole));
+        // Any other predicate has the engine walk the index checking each row,
+        // and a walk that gives up reads every matching row: a term, plain
+        // words, a phrase, or a range nested in a bool.
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.termQuery("level", "error")), byTime), 10, whole));
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchQuery("message", "error timeout")), byTime), 10, whole));
         assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchPhraseQuery("message", "error timeout")), byTime), 10, whole));
+        Translation nested = translate(
+            QueryBuilders.boolQuery().filter(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00").lt("2023-01-03T00:00:00"))
+        );
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(nested, byTime), 10, whole));
+        // A selective filter, whose walk would give up, reads its sources by id.
+        InfinoSearch.Plan rare = sortedPlan(translate(QueryBuilders.termQuery("level", "fatal")), byTime);
+        String rareSql = InfinoSearch.hitStatement(rare, 10, false, whole, 10_000, InfinoSearch.selectsSource(rare, 10, whole, true));
+        assertFalse(rareSql, rareSql.contains("source"));
         // A keyword column has no range index; a missing value or missing first is not the column's own order.
         java.util.List<InfinoSearch.SortSpec> byLevel = java.util.List.of(InfinoSearch.SortSpec.of(columns().get("level"), false));
         assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchAllQuery()), byLevel), 10, whole));
@@ -256,17 +278,37 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         int deepFetch = InfinoSearch.SORTED_SOURCE_ROWS + 1;
         String deep = InfinoSearch.hitStatement(plan, deepFetch, false, whole, 10_000, InfinoSearch.selectsSource(plan, deepFetch, whole, true));
         assertFalse(deep, deep.contains("source"));
-        // After a search_after value the present rows are the range index's; the missing ones are in none.
+        // After the sort's value alone, the present part is one more range on the column.
+        InfinoSearch.Plan afterValue = afterPlan(new Object[] { 404 }, null);
+        assertTrue(InfinoSearch.sourceInSortedStatement(afterValue, 10, InfinoSearch.Keyset.PRESENT));
+        assertFalse(InfinoSearch.sourceInSortedStatement(afterValue, 10, InfinoSearch.Keyset.MISSING));
+        // A keyset that also breaks ties by id is a predicate the engine walks, in either part.
         InfinoSearch.Plan after = afterPlan(new Object[] { 404, "7" }, null);
-        assertTrue(InfinoSearch.sourceInSortedStatement(after, 10, InfinoSearch.Keyset.PRESENT));
+        assertFalse(InfinoSearch.sourceInSortedStatement(after, 10, InfinoSearch.Keyset.PRESENT));
         assertFalse(InfinoSearch.sourceInSortedStatement(after, 10, InfinoSearch.Keyset.MISSING));
-        InfinoSearch.Keyset missingPart = InfinoSearch.Keyset.MISSING;
-        String missing = InfinoSearch.hitStatement(after, 10, false, missingPart, 10_000, InfinoSearch.selectsSource(after, 10, missingPart, true));
-        assertFalse(missing, missing.contains("source"));
-        // After a missing value the keyset is read whole, among the rows missing it.
+        InfinoSearch.Keyset presentPart = InfinoSearch.Keyset.PRESENT;
+        String present = InfinoSearch.hitStatement(after, 10, false, presentPart, 10_000, InfinoSearch.selectsSource(after, 10, presentPart, true));
+        assertFalse(present, present.contains("source"));
         assertFalse(InfinoSearch.sourceInSortedStatement(afterPlan(new Object[] { null, "7" }, null), 10, whole));
         // A collapse's statement reads its sources as before.
         assertFalse(InfinoSearch.sourceInSortedStatement(afterPlan(null, columns().get("level")), 10, whole));
+    }
+
+    public void testAColumnWithNoRangeIndexReadsItsSourcesById() {
+        // A numeric field mapped "index": false: the table keeps no range index on its column.
+        Map<String, Column> cols = columns();
+        cols.put("bytes", new Column("bytes", "i64", false, false));
+        Translation all = InfinoQueryTranslator.translate(QueryBuilders.matchAllQuery(), cols, TABLE, NOW);
+        java.util.List<InfinoSearch.SortSpec> byBytes = java.util.List.of(InfinoSearch.SortSpec.of(cols.get("bytes"), true));
+        InfinoSearch.Plan plan = sortedPlan(cols, all, byBytes, null);
+        InfinoSearch.Keyset whole = InfinoSearch.Keyset.WHOLE;
+        assertFalse(InfinoSearch.sourceInSortedStatement(plan, 10, whole));
+        String sql = InfinoSearch.hitStatement(plan, 10, false, whole, 10_000, InfinoSearch.selectsSource(plan, 10, whole, true));
+        assertFalse(sql, sql.contains("source"));
+        // The same column with its range index does.
+        cols.put("bytes", cols.get("bytes").rangeIndexed());
+        byBytes = java.util.List.of(InfinoSearch.SortSpec.of(cols.get("bytes"), true));
+        assertTrue(InfinoSearch.sourceInSortedStatement(sortedPlan(cols, all, byBytes, null), 10, whole));
     }
 
     /** The sorts of a request sorted on {@code status} in {@code order}, with {@code missing} (null for none). */

@@ -157,7 +157,9 @@ public final class InfinoNative {
      * {@code use_similarity}, whose terms Lucene scores by BM25.
      * {@code otherSimilarity} is whether its field scores by a similarity
      * other than the default BM25: its mapping names one, or the index's
-     * default is another.
+     * default is another. {@code ranged} is whether the table keeps a range
+     * index on the column, which a numeric or date field mapped with
+     * {@code "index": false} has none of.
      */
     public record Column(
         String name,
@@ -168,8 +170,23 @@ public final class InfinoNative {
         String dateFormat,
         String elem,
         boolean similarity,
-        boolean otherSimilarity
+        boolean otherSimilarity,
+        boolean ranged
     ) {
+        public Column(
+            String name,
+            String type,
+            boolean fts,
+            boolean vector,
+            UnaryOperator<String> mask,
+            String dateFormat,
+            String elem,
+            boolean similarity,
+            boolean otherSimilarity
+        ) {
+            this(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, false);
+        }
+
         public Column(
             String name,
             String type,
@@ -198,22 +215,27 @@ public final class InfinoNative {
 
         /** This column as the request sees it, its values masked by {@code mask}. */
         Column masked(UnaryOperator<String> mask) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, ranged);
         }
 
         /** This column with the date format its mapping declares. */
         Column dated(String dateFormat) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, ranged);
         }
 
         /** This column as a keyword field with {@code use_similarity} maps it. */
         Column scoredBySimilarity() {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, true, otherSimilarity);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, true, otherSimilarity, ranged);
         }
 
         /** This column as a field scored by a similarity other than the default BM25. */
         Column scoredByOtherSimilarity() {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, true);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, true, ranged);
+        }
+
+        /** This column with a range index the table keeps on it. */
+        Column rangeIndexed() {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, true);
         }
 
         /**
@@ -236,7 +258,7 @@ public final class InfinoNative {
          * mapping's, not its field's: neither here.
          */
         Column exact() {
-            return fts || similarity || otherSimilarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false, false) : this;
+            return fts || similarity || otherSimilarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false, false, ranged) : this;
         }
 
         /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */
@@ -920,6 +942,9 @@ public final class InfinoNative {
             String key = InfinoQueryTranslator.keyOf(column);
             // A list column of a mapped field reads its dates as the field's do.
             String format = mapping == null ? null : mapping.dateFormats().get(InfinoQueryTranslator.fieldOf(column));
+            if (Boolean.TRUE.equals(c.get("range"))) {
+                described = described.rangeIndexed();
+            }
             if (mapping != null && mapping.similarityFields().contains(key)) {
                 described = described.scoredBySimilarity();
             }

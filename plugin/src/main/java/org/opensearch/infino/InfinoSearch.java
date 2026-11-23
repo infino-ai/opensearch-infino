@@ -1622,42 +1622,72 @@ public final class InfinoSearch {
 
     /**
      * Whether a sorted page's hit statement reads its rows' sources itself
-     * rather than by id ({@link #sourcesById}): the engine's range index picks the page's
-     * rows, and the engine reads the source of those rows alone. That is a
-     * sort on one numeric or date field's own column, which the table gives
-     * a range index, then on the row id ascending, missing values last, over
-     * the table itself (no text clause, or plain words checked on each row,
-     * {@link #unranked}), with no scripted field. Not the rows missing the
-     * sort's value, which no range index holds: a search_after's
-     * {@link Keyset#MISSING} part, or its whole keyset, which is read whole
-     * only after a missing value ({@link #splitsMissingTail}). Not
-     * past {@link #SORTED_SOURCE_ROWS} rows either: every row up to the
-     * window's end would be read with its source, where by id only those
-     * the page returns are.
+     * rather than by id ({@link #sourcesById}). That pays only when the
+     * engine's range index alone picks the page's rows, so the statement
+     * reads the source of those rows and no others. The index answers alone
+     * for a sort on one numeric or date field's own column that has a range
+     * index ({@link Column#ranged}), then on the row id ascending, missing
+     * values last, when nothing else narrows the rows: no predicate at all,
+     * or one bounded range on the sort column ({@link Translation#span}),
+     * and at most a search_after of the sort's value alone
+     * ({@link #keysetIsARange}). Any other predicate, a text clause or a
+     * keyset that also breaks ties by id among them, has the engine walk the
+     * index checking each row, and a walk that finds too few rows gives up
+     * and has the statement read every matching row; with the source
+     * selected, that would read every matching row's source where the by-id
+     * read takes only the page's. Not past
+     * {@link #SORTED_SOURCE_ROWS} rows either, nor for a scripted field or a
+     * vector query.
      */
     static boolean sourceInSortedStatement(Plan plan, int fetch, Keyset part) {
         List<SortSpec> sorts = plan.sorts();
         if (!sourcesById(plan)
-            || part == Keyset.MISSING
-            || (part == Keyset.WHOLE && plan.searchAfter() != null)
+            || !keysetIsARange(plan, part)
             || fetch > SORTED_SOURCE_ROWS
             || plan.vector() != null
             || !plan.scriptFields().isEmpty()
+            || plan.query().principal() != null
             || sorts.size() != 2) {
             return false;
         }
         SortSpec first = sorts.get(0);
         SortSpec tie = sorts.get(1);
         Column c = plan.cols().get(first.name());
-        Translation q = plan.query();
         return tie.name().equals(InfinoSql.ROW_ID)
             && !tie.desc()
             && !first.nullsFirst()
             && first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()))
             && c != null
             && !c.isList()
+            && c.ranged()
             && (c.isNumeric() || c.isTimestamp())
-            && unranked(q, plan.hitWhere()).from().equals(InfinoQueryTranslator.quoteIdent(q.table()));
+            && rangeOnlyOn(plan, first.name());
+    }
+
+    /**
+     * Whether {@code part} of {@code plan}'s rows adds at most a range on the
+     * first sort's column: the whole of a page with no search_after, or the
+     * present part of one after the first sort's value alone
+     * ({@code s < v}). A search_after that also carries the row id adds an
+     * {@code OR} of the two ({@link #keysetPredicate}), and the rows missing
+     * the value are in no range index.
+     */
+    private static boolean keysetIsARange(Plan plan, Keyset part) {
+        Object[] after = plan.searchAfter();
+        return part == Keyset.WHOLE ? after == null : part == Keyset.PRESENT && after != null && after.length == 1;
+    }
+
+    /**
+     * Whether the only predicate on {@code plan}'s hits is, at most, one
+     * bounded range on {@code column}: none at all, or a range query on it
+     * alone (no post_filter, no security rule).
+     */
+    private static boolean rangeOnlyOn(Plan plan, String column) {
+        if (InfinoQueryTranslator.ALL.equals(plan.hitWhere())) {
+            return true;
+        }
+        InfinoQueryTranslator.Span span = plan.query().span();
+        return plan.postWhere() == null && span != null && span.column().equals(column);
     }
 
     /**
