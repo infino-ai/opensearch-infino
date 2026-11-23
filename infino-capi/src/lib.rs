@@ -4459,9 +4459,10 @@ pub unsafe extern "C" fn infino_value_counts(
 /// the column has. One call: the engine reads a keyword column's counts from
 /// its term index, so only `top` rows cross, however many values it has.
 /// `null`, for the caller's own statement to run, for a column without the
-/// `keyword` analyzer: the engine would run the grouped count there, which
-/// the statement runs as well. The engine counts every value in memory
-/// before the top `n` are picked; bounding that is infino-ai/infino#1459.
+/// `keyword` analyzer (the engine would run the grouped count there, which
+/// the statement runs as well), and where the engine's count fails. The
+/// engine counts every value in memory before the top `n` are picked;
+/// bounding that is infino-ai/infino#1459.
 #[no_mangle]
 pub unsafe extern "C" fn infino_value_counts_top(
     h: *mut Bridge,
@@ -4487,7 +4488,7 @@ pub unsafe extern "C" fn infino_value_counts_top(
 }
 
 /// [`infino_value_counts_top`]'s answer, None for a column without the
-/// `keyword` analyzer.
+/// `keyword` analyzer or where the engine's count fails.
 fn value_counts_top(
     conn: &Bridge,
     name: &str,
@@ -4514,16 +4515,13 @@ fn value_counts_top(
         return Ok(None);
     }
     let table = conn.table(name).map_err(|e| e.to_string())?;
-    let batches = match table.value_counts(column) {
-        Ok(b) => vec![b],
-        // As in infino_value_counts: where the engine's own count fails,
-        // the grouped count as a statement gives the same rows.
-        Err(e) => conn
-            .conn
-            .query_sql(&grouped_count(name, column, None))
-            .map_err(|_| e.to_string())?,
-    };
-    Ok(top_values(&batches, column, top))
+    // Where the engine's own count fails, decline: the caller's bounded
+    // statement gives the same answer, where a grouped count here would
+    // bring every value of the column across the bridge.
+    match table.value_counts(column) {
+        Ok(b) => Ok(top_values(&[b], column, top)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// [`infino_value_counts_top`]'s answer from a column's value counts
@@ -5285,7 +5283,8 @@ mod tests {
         index(h, &[("10", r#"{"status":200,"message":"no level here"}"#)]);
         assert_eq!(value_counts_top(h, "status", 3), Value::Null);
         assert_eq!(value_counts_top(h, "message", 3), Value::Null);
-        // After a delete the engine runs the grouped count; same ranking.
+        // After a delete the engine's term counts leave the deleted row out
+        // themselves; same ranking.
         assert_eq!(delete(h, &["1"]), 0);
         let out = value_counts_top(h, "level", 2);
         assert_eq!(top_rows(&out), pairs(&[("a", 2), ("b", 1)]));
