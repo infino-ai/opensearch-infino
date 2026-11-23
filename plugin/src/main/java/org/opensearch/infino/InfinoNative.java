@@ -370,23 +370,17 @@ public final class InfinoNative {
          * field holds is such a float, so the comparison is stock's (which
          * steps an exclusive bound to the next float, and a half-float's to
          * the next half-float in its direction). A scaled float's bound is
-         * stock's long over the factor, inclusive: the lower one rounded up
-         * (past an exclusive bound first), the upper one down. Null when
-         * the field's type holds the bound only as an infinity.
+         * stock's long nearest the bound times the factor, over the factor,
+         * compared as written. Null when the field's type holds the bound
+         * only as an infinity.
          */
         Bound bound(Object value, boolean lower, boolean inclusive) {
             String op = lower ? (inclusive ? " >= " : " > ") : (inclusive ? " <= " : " < ");
             switch (type) {
                 case SCALED_FLOAT -> {
                     double scaled = asDouble(value) * scalingFactor;
-                    if (Double.isFinite(scaled) == false) {
-                        return null;
-                    }
-                    if (inclusive == false) {
-                        scaled = lower ? Math.nextUp(scaled) : Math.nextDown(scaled);
-                    }
-                    long l = Math.round(lower ? Math.ceil(scaled) : Math.floor(scaled));
-                    return new Bound(lower ? " >= " : " <= ", l / scalingFactor);
+                    // Stock rounds each bound to the nearest long and keeps its inclusiveness.
+                    return Double.isFinite(scaled) ? new Bound(op, Math.round(scaled) / scalingFactor) : null;
                 }
                 case HALF_FLOAT -> {
                     float f = asFloat(value);

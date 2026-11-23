@@ -94,12 +94,13 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         // The half float nearest 0.3 is 0.300048828125; a range bound is the 32-bit float, compared as written.
         assertEquals("\"h\" = 0.300048828125", preciseWhere(QueryBuilders.termQuery("h", 0.3)));
         assertEquals("(\"h\" >= 2.700000047683716)", preciseWhere(QueryBuilders.rangeQuery("h").gte(2.7)));
-        // A scaled float compares at its factor: a term rounds to the nearest hundredth, a range rounds
-        // its lower bound up and its upper bound down, both then inclusive, as stock's long range.
+        // A scaled float compares at its factor: a term and each range bound round to the nearest
+        // hundredth, and a bound keeps its inclusiveness, as stock's long range does.
         assertEquals("\"s\" = 1.23", preciseWhere(QueryBuilders.termQuery("s", 1.234)));
-        assertEquals("(\"s\" >= 1.24 AND \"s\" <= 2.5)", preciseWhere(QueryBuilders.rangeQuery("s").gt(1.23).lte(2.509)));
-        assertEquals("(\"s\" <= 1.22)", preciseWhere(QueryBuilders.rangeQuery("s").lt(1.23)));
-        assertEquals("(\"s\" >= 1.24)", preciseWhere(QueryBuilders.rangeQuery("s").gte(1.231)));
+        assertEquals("(\"s\" > 1.23 AND \"s\" <= 2.51)", preciseWhere(QueryBuilders.rangeQuery("s").gt(1.23).lte(2.509)));
+        assertEquals("(\"s\" < 1.23)", preciseWhere(QueryBuilders.rangeQuery("s").lt(1.234)));
+        assertEquals("(\"s\" >= 1.23)", preciseWhere(QueryBuilders.rangeQuery("s").gte(1.234)));
+        assertEquals("(\"s\" >= 1.24)", preciseWhere(QueryBuilders.rangeQuery("s").gte(1.236)));
         // A double keeps the value as written.
         assertEquals("\"d\" = 0.3", preciseWhere(QueryBuilders.termQuery("d", 0.3)));
         assertEquals("(\"d\" > 0.3)", preciseWhere(QueryBuilders.rangeQuery("d").gt(0.3)));
