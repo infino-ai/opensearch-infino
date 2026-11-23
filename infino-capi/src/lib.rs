@@ -41,7 +41,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -429,6 +429,18 @@ unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
         return None;
     }
     unsafe { CStr::from_ptr(p) }.to_str().ok()
+}
+
+/// The strings of a C array of `count` of them; one that is null or not
+/// UTF-8 is left out, and a null array is none.
+unsafe fn cstrs<'a>(p: *const *const c_char, count: c_int) -> Vec<&'a str> {
+    if p.is_null() || count <= 0 {
+        return Vec::new();
+    }
+    unsafe { std::slice::from_raw_parts(p, count as usize) }
+        .iter()
+        .filter_map(|s| unsafe { cstr(*s) })
+        .collect()
 }
 
 fn out_string(s: String) -> *mut c_char {
@@ -875,6 +887,12 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
     if let Some(dir) = cache_dir.filter(|_| !hosted) {
         options = options.with_cache_dir(dir);
     }
+    let staleness = READ_STALENESS_MS.load(Ordering::SeqCst);
+    if staleness > 0 && !hosted {
+        options = options.with_read_consistency(Consistency::BoundedStaleness(
+            Duration::from_millis(staleness),
+        ));
+    }
     let conn = connect_with(uri, options)?;
     let latest_from = (!hosted && !uri.starts_with(MEMORY_SCHEME)).then(|| LatestFrom {
         uri: uri.to_string(),
@@ -905,6 +923,22 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
 
 /// The scheme of a catalog held in this process's memory.
 const MEMORY_SCHEME: &str = "memory://";
+
+/// The staleness window the connections opened from here on read under, in
+/// milliseconds ([`infino_set_read_staleness_ms`]); 0 for the engine's
+/// default.
+static READ_STALENESS_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Open the connections from here on to read under a staleness window of
+/// `ms` milliseconds rather than the engine's default (0 restores it). For
+/// tests only: a wide window makes a read that should have gone to the
+/// table's latest commit, and went to a node's own connection instead,
+/// answer from the commit before every time rather than now and then. The
+/// connection that reads every commit ([`Bridge::latest`]) is unchanged.
+#[no_mangle]
+pub extern "C" fn infino_set_read_staleness_ms(ms: u64) {
+    READ_STALENESS_MS.store(ms, Ordering::SeqCst);
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn infino_open(uri: *const c_char) -> *mut Bridge {
@@ -3540,11 +3574,31 @@ fn ranked_columns(conn: &Bridge, name: &str) -> Vec<String> {
     }
 }
 
+/// One row as a get reads it: its source, the sequence number it was
+/// written under (0 for a row written without one), and the routing value
+/// it was written with ([`ROUTING`]; None for none).
+struct Row {
+    source: String,
+    seq: i64,
+    routing: Option<String>,
+}
+
+impl Row {
+    /// The row as `{"source", "seq"}`, with `"routing"` when it has one.
+    fn doc_json(self) -> Value {
+        let mut doc = json!({ "source": self.source, "seq": self.seq });
+        if let Some(routing) = self.routing {
+            doc["routing"] = Value::String(routing);
+        }
+        doc
+    }
+}
+
 /// The row of an attached table read under `osid`, its row id's digits, as
 /// [`get_row`] gives a row: its columns as the source, and no sequence
-/// number. None when `osid` is no row id or the table holds no such row; an
-/// error when the read fails.
-fn attached_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String, i64)>, String> {
+/// number or routing. None when `osid` is no row id or the table holds no
+/// such row; an error when the read fails.
+fn attached_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<Row>, String> {
     if !attached::is_row_id(osid) {
         return Ok(None);
     }
@@ -3554,10 +3608,11 @@ fn attached_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String,
         attached::ROW_ID
     );
     let batches = conn.conn.query_sql(&sql).map_err(|e| e.to_string())?;
-    Ok(batches
-        .iter()
-        .find(|b| b.num_rows() > 0)
-        .map(|b| (attached::source_json(b, 0), 0)))
+    Ok(batches.iter().find(|b| b.num_rows() > 0).map(|b| Row {
+        source: attached::source_json(b, 0),
+        seq: 0,
+        routing: None,
+    }))
 }
 
 /// Most rows of an attached table one statement of [`attached_rows`] asks
@@ -3600,10 +3655,9 @@ fn attached_rows(
     Ok(found)
 }
 
-/// The source of the row under `osid` and the sequence number it was
-/// written under (0 for a row written without one), None when the table
-/// holds no such row, or an error when the read fails.
-fn get_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String, i64)>, String> {
+/// The row under `osid` ([`Row`]), None when the table holds no such row,
+/// or an error when the read fails.
+fn get_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<Row>, String> {
     if conn.is_attached(name) {
         return attached_row(conn, name, osid);
     }
@@ -3615,11 +3669,7 @@ fn get_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String, i64)
 /// [`Bridge::on_latest`]: for a write that merges into the document it
 /// finds. A lookup that fails is an error rather than no row, so the write
 /// fails instead of finding nothing to merge into.
-fn get_row_latest(
-    conn: &Bridge,
-    name: &str,
-    osid: &str,
-) -> Result<Option<(String, i64)>, InfinoError> {
+fn get_row_latest(conn: &Bridge, name: &str, osid: &str) -> Result<Option<Row>, InfinoError> {
     if conn.is_attached(name) {
         return attached_row(conn, name, osid).map_err(InfinoError::Query);
     }
@@ -3631,22 +3681,106 @@ fn get_row_latest(
     conn.on_latest(|latest| row_in(&latest.open_table(name)?, latest, name, osid))
 }
 
-/// The source and sequence number of the row under `osid` in `table`,
-/// which `sql` (the connection it was opened on) holds; None when it holds
-/// no such row.
+/// The rows under `osids`, each id to its [`Row`] (an id the table does
+/// not hold is absent), for a realtime get or multi-get: as of the table's
+/// latest commit when `latest`, for a node that may not have read the last
+/// commit another node made, else through `conn` itself. One open of the
+/// table serves every id, whose lookups run side by side
+/// ([`side_by_side`]). A lookup that fails is an error for the whole call,
+/// so a failed read is never taken for a missing document.
+fn rows_of(
+    conn: &Bridge,
+    name: &str,
+    osids: &[&str],
+    latest: bool,
+) -> Result<Vec<(String, Row)>, InfinoError> {
+    if conn.is_attached(name) {
+        // An attached table is read in one statement over its ids, as a page is.
+        return Ok(attached_rows(conn, name, osids)
+            .map_err(InfinoError::Query)?
+            .into_iter()
+            .filter_map(|(id, source)| match source {
+                Value::String(source) => Some((
+                    id,
+                    Row {
+                        source,
+                        seq: 0,
+                        routing: None,
+                    },
+                )),
+                _ => None,
+            })
+            .collect());
+    }
+    let found = |table: &Supertable, sql: &Connection| {
+        side_by_side(osids, |id| row_in(table, sql, name, id), InfinoError::Query)
+    };
+    let rows = if !latest || conn.latest_from.is_none() {
+        // As in [`get_row_latest`]: where `conn` reads every commit already,
+        // its cached handle serves.
+        found(&conn.table(name)?, &conn.conn)?
+    } else {
+        conn.on_latest(|latest| found(&latest.open_table(name)?, latest))?
+    };
+    Ok(osids
+        .iter()
+        .zip(rows)
+        .filter_map(|(id, row)| row.map(|row| ((*id).to_owned(), row)))
+        .collect())
+}
+
+/// `lookup` of each of `ids`, in their order, run at most
+/// [`GET_MANY_THREADS`] at once: a page of lookups costs about what its
+/// slowest one does. The first that fails fails the whole call.
+fn side_by_side<T: Send, E: Send>(
+    ids: &[&str],
+    lookup: impl Fn(&str) -> Result<T, E> + Sync,
+    panicked: fn(String) -> E,
+) -> Result<Vec<T>, E> {
+    let mut out = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(GET_MANY_THREADS) {
+        let results: Vec<Result<T, E>> = std::thread::scope(|scope| {
+            let lookup = &lookup;
+            let running: Vec<_> = chunk
+                .iter()
+                .map(|id| scope.spawn(move || lookup(id)))
+                .collect();
+            running
+                .into_iter()
+                .map(|r| {
+                    r.join()
+                        .unwrap_or_else(|_| Err(panicked("a lookup panicked".to_string())))
+                })
+                .collect()
+        });
+        for result in results {
+            out.push(result?);
+        }
+    }
+    Ok(out)
+}
+
+/// The row under `osid` in `table` ([`Row`]), which `sql` (the connection
+/// it was opened on) holds; None when it holds no such row.
 fn row_in(
     table: &Supertable,
     sql: &Connection,
     name: &str,
     osid: &str,
-) -> Result<Option<(String, i64)>, InfinoError> {
+) -> Result<Option<Row>, InfinoError> {
     // A term lookup through the id column's FTS index, projected to the
-    // source and the sequence number. A table declared before the id column
-    // carried that index refuses the lookup; it falls back to an equality on
-    // the column.
-    let batches = match table.exact_match(OSID, osid, Some(&[SOURCE, SEQ])) {
+    // source, the sequence number and, where the table has taken a routed
+    // write, the routing. A table declared before the id column carried that
+    // index refuses the lookup; it falls back to an equality on the column.
+    let routed = table.schema().field_with_name(ROUTING).is_ok();
+    let columns: &[&str] = if routed {
+        &[SOURCE, SEQ, ROUTING]
+    } else {
+        &[SOURCE, SEQ]
+    };
+    let batches = match table.exact_match(OSID, osid, Some(columns)) {
         Ok(batches) => batches,
-        Err(_) => sql.query_sql(&row_by_osid_sql(name, osid))?,
+        Err(_) => sql.query_sql(&row_by_osid_sql(name, osid, columns))?,
     };
     for b in &batches {
         if b.num_rows() == 0 {
@@ -3666,25 +3800,44 @@ fn row_in(
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
             .filter(|a| !a.is_null(0))
             .map_or(0, |a| a.value(0));
-        return Ok(Some((source.value(0).to_string(), seq)));
+        let routing = b
+            .column_by_name(ROUTING)
+            .filter(|c| !c.is_null(0))
+            .and_then(|c| match c.data_type() {
+                DataType::LargeUtf8 => c
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .map(|a| a.value(0).to_string()),
+                DataType::Utf8 => c
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .map(|a| a.value(0).to_string()),
+                _ => None,
+            });
+        return Ok(Some(Row {
+            source: source.value(0).to_string(),
+            seq,
+            routing,
+        }));
     }
     Ok(None)
 }
 
-/// The statement [`row_in`] falls back to: the source and sequence number
-/// of the row under `osid`, by an equality on the id column. The table name
-/// is quoted as every other statement over a table quotes it, so an index
-/// whose name holds a `-` reads as one name.
-fn row_by_osid_sql(name: &str, osid: &str) -> String {
+/// The statement [`row_in`] falls back to: `columns` of the row under
+/// `osid`, by an equality on the id column. The table name is quoted as
+/// every other statement over a table quotes it, so an index whose name
+/// holds a `-` reads as one name.
+fn row_by_osid_sql(name: &str, osid: &str, columns: &[&str]) -> String {
     format!(
-        "SELECT {SOURCE}, {SEQ} FROM \"{}\" WHERE {OSID} = '{}' LIMIT 1",
+        "SELECT {} FROM \"{}\" WHERE {OSID} = '{}' LIMIT 1",
+        columns.join(", "),
         name.replace('"', "\"\""),
         osid.replace('\'', "''")
     )
 }
 
 /// [`get_row`], a failed read logged and answered as absent.
-fn found_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
+fn found_row(conn: &Bridge, name: &str, osid: &str) -> Option<Row> {
     get_row(conn, name, osid).unwrap_or_else(|e| {
         eprintln!("[capi] get: {e}");
         None
@@ -3704,7 +3857,7 @@ pub unsafe extern "C" fn infino_get(
         else {
             return ptr::null_mut();
         };
-        out_string(found_row(conn, name, osid).map_or_else(String::new, |(source, _)| source))
+        out_string(found_row(conn, name, osid).map_or_else(String::new, |row| row.source))
     }))
     .unwrap_or(ptr::null_mut())
 }
@@ -3727,7 +3880,7 @@ pub unsafe extern "C" fn infino_get_latest(
             return ptr::null_mut();
         };
         match get_row_latest(conn, name, osid) {
-            Ok(row) => out_string(row.map_or_else(String::new, |(source, _)| source)),
+            Ok(row) => out_string(row.map_or_else(String::new, |row| row.source)),
             Err(e) => {
                 eprintln!("[capi] get_latest: {e}");
                 ptr::null_mut()
@@ -3762,49 +3915,38 @@ pub unsafe extern "C" fn infino_get_many(
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return ptr::null_mut();
         };
-        let ids: Vec<&str> = if osids.is_null() || count <= 0 {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(osids, count as usize) }
-                .iter()
-                .filter_map(|p| unsafe { cstr(*p) })
-                .collect()
-        };
+        let ids = unsafe { cstrs(osids, count) };
         if conn.is_attached(name) {
             return match attached_rows(conn, name, &ids) {
                 Ok(found) => out_json(json!({ "sources": found })),
                 Err(e) => err_json(&format!("get_many: {e}")),
             };
         }
-        let mut found = serde_json::Map::new();
-        for chunk in ids.chunks(GET_MANY_THREADS) {
-            let sources: Vec<Result<Option<(String, i64)>, String>> = std::thread::scope(|scope| {
-                let lookups: Vec<_> = chunk
-                    .iter()
-                    .map(|id| scope.spawn(move || get_row(conn, name, id)))
-                    .collect();
-                lookups
-                    .into_iter()
-                    .map(|lookup| lookup.join().unwrap_or_else(|_| Err("a lookup panicked".into())))
-                    .collect()
-            });
-            for (id, source) in chunk.iter().zip(sources) {
-                match source {
-                    Ok(Some((source, _))) if !source.is_empty() => {
-                        found.insert((*id).to_owned(), Value::String(source));
+        let rows = side_by_side(
+            &ids,
+            |id| get_row(conn, name, id).map_err(|e| format!("{id}: {e}")),
+            |e| e,
+        );
+        match rows {
+            Ok(rows) => {
+                let mut found = serde_json::Map::new();
+                for (id, row) in ids.iter().zip(rows) {
+                    if let Some(row) = row.filter(|row| !row.source.is_empty()) {
+                        found.insert((*id).to_owned(), Value::String(row.source));
                     }
-                    Ok(_) => {}
-                    Err(e) => return err_json(&format!("get_many {id}: {e}")),
                 }
+                out_json(json!({ "sources": found }))
             }
+            Err(e) => err_json(&format!("get_many {e}")),
         }
-        out_json(json!({ "sources": found }))
     }))
     .unwrap_or(ptr::null_mut())
 }
 
-/// One osid's document as `{"source": .., "seq": n}`, its sequence number
-/// what a conditional write on it is checked against; "" if absent.
+/// One osid's document as `{"source": .., "seq": n, "routing": ..}`, its
+/// sequence number what a conditional write on it is checked against and
+/// `routing` (left out for none) what a get reports as `_routing`; "" if
+/// absent.
 #[no_mangle]
 pub unsafe extern "C" fn infino_get_doc(
     h: *mut Bridge,
@@ -3818,34 +3960,65 @@ pub unsafe extern "C" fn infino_get_doc(
             return ptr::null_mut();
         };
         match found_row(conn, name, osid) {
-            Some((source, seq)) => out_json(json!({ "source": source, "seq": seq })),
+            Some(row) => out_json(row.doc_json()),
             None => out_string(String::new()),
         }
     }))
     .unwrap_or(ptr::null_mut())
 }
 
-/// [`infino_get_doc`] as of the table's latest commit ([`get_row_latest`]):
-/// for a realtime get on a node that may not have read the last commit
-/// another node made. A lookup that fails answers null rather than "", so
-/// a failed read is never taken for a missing document.
+/// The documents of several osids ([`rows_of`]), as `{"docs": {id: doc}}`,
+/// each doc as [`infino_get_doc`] gives it; an id the table does not hold
+/// is absent. For a realtime multi-get on the node whose own connection has
+/// read every commit: one open of the table for all the ids. A lookup that
+/// fails answers null rather than an answer missing ids, so a failed read
+/// is never taken for a missing document.
 #[no_mangle]
-pub unsafe extern "C" fn infino_get_doc_latest(
+pub unsafe extern "C" fn infino_get_docs(
     h: *mut Bridge,
     name: *const c_char,
-    osid: *const c_char,
+    osids: *const *const c_char,
+    count: c_int,
+) -> *mut c_char {
+    unsafe { get_docs(h, name, osids, count, false) }
+}
+
+/// [`infino_get_docs`] as of the table's latest commit: for a realtime get
+/// or multi-get on a node that may not have read the last commit another
+/// node made, one read of the latest commit for all the ids.
+#[no_mangle]
+pub unsafe extern "C" fn infino_get_docs_latest(
+    h: *mut Bridge,
+    name: *const c_char,
+    osids: *const *const c_char,
+    count: c_int,
+) -> *mut c_char {
+    unsafe { get_docs(h, name, osids, count, true) }
+}
+
+/// [`infino_get_docs`], as of the table's latest commit when `latest`.
+unsafe fn get_docs(
+    h: *mut Bridge,
+    name: *const c_char,
+    osids: *const *const c_char,
+    count: c_int,
+    latest: bool,
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
-        let (Some(conn), Some(name), Some(osid)) =
-            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(osid) })
-        else {
+        let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return ptr::null_mut();
         };
-        match get_row_latest(conn, name, osid) {
-            Ok(Some((source, seq))) => out_json(json!({ "source": source, "seq": seq })),
-            Ok(None) => out_string(String::new()),
+        let ids = unsafe { cstrs(osids, count) };
+        match rows_of(conn, name, &ids, latest) {
+            Ok(rows) => {
+                let docs: serde_json::Map<String, Value> = rows
+                    .into_iter()
+                    .map(|(id, row)| (id, row.doc_json()))
+                    .collect();
+                out_json(json!({ "docs": docs }))
+            }
             Err(e) => {
-                eprintln!("[capi] get_doc_latest: {e}");
+                eprintln!("[capi] get_docs (latest: {latest}): {e}");
                 ptr::null_mut()
             }
         }
@@ -3973,6 +4146,18 @@ pub unsafe extern "C" fn infino_hold_latest(h: *mut Bridge) {
 pub unsafe extern "C" fn infino_release_latest(h: *mut Bridge) {
     if let Some(bridge) = bridge_ref(h) {
         bridge.release_latest();
+    }
+}
+
+/// Close the connection the latest reads go through, holds or not
+/// ([`Bridge::forget_latest`]), so the next latest read opens it afresh
+/// with no table handle: for a holder that keeps the connection open while
+/// reads keep coming, to let go of the handles of tables no longer read.
+/// A read running on it keeps what it holds until it ends.
+#[no_mangle]
+pub unsafe extern "C" fn infino_forget_latest(h: *mut Bridge) {
+    if let Some(bridge) = bridge_ref(h) {
+        bridge.forget_latest();
     }
 }
 
@@ -4839,6 +5024,15 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
         assert!(v["error"].is_string(), "{out}");
         close(h);
+    }
+
+    /// [`infino_get_docs_latest`] of `ids` in table `logs`.
+    fn docs_latest(h: *mut Bridge, ids: &[&str]) -> String {
+        let ids: Vec<CString> = ids.iter().map(|id| c(id)).collect();
+        let ptrs: Vec<*const c_char> = ids.iter().map(|id| id.as_ptr()).collect();
+        take(unsafe {
+            infino_get_docs_latest(h, c("logs").as_ptr(), ptrs.as_ptr(), ptrs.len() as c_int)
+        })
     }
 
     fn close(h: *mut Bridge) {
@@ -5844,10 +6038,10 @@ mod tests {
     #[test]
     fn the_fallback_lookup_quotes_the_table_name() {
         assert_eq!(
-            row_by_osid_sql("my-logs", "it's"),
+            row_by_osid_sql("my-logs", "it's", &[SOURCE, SEQ]),
             format!("SELECT {SOURCE}, {SEQ} FROM \"my-logs\" WHERE {OSID} = 'it''s' LIMIT 1")
         );
-        assert!(row_by_osid_sql("a\"b", "x").contains("FROM \"a\"\"b\" WHERE"));
+        assert!(row_by_osid_sql("a\"b", "x", &[SOURCE]).contains("FROM \"a\"\"b\" WHERE"));
         let h = open_logs();
         let made =
             take(unsafe { infino_ensure_table(h, c("my-logs").as_ptr(), c(MAPPING).as_ptr()) });
@@ -5867,7 +6061,7 @@ mod tests {
         let bridge = bridge_ref(h).unwrap();
         let batches = bridge
             .conn
-            .query_sql(&row_by_osid_sql("my-logs", "a"))
+            .query_sql(&row_by_osid_sql("my-logs", "a", &[SOURCE, SEQ]))
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         close(h);
@@ -6081,6 +6275,23 @@ mod tests {
         assert_eq!(rows[1]["osrouting"], "r", "{rows}");
         assert_eq!(rows[1]["osop"], 5, "{rows}");
         assert_eq!(rows[1][".osgen"], 8, "{rows}");
+        // A get reads the routing with the document, so a found get is one read.
+        let get_doc = |id: &str| -> Value {
+            serde_json::from_str(&take(unsafe {
+                infino_get_doc(h, c("logs").as_ptr(), c(id).as_ptr())
+            }))
+            .unwrap()
+        };
+        assert_eq!(get_doc("s2")["routing"], "r");
+        assert!(
+            get_doc("s1").get("routing").is_none(),
+            "no routing, none read"
+        );
+        let docs: Value = serde_json::from_str(&docs_latest(h, &["s1", "s2", "s3"])).unwrap();
+        assert_eq!(docs["docs"]["s2"]["routing"], "r", "{docs}");
+        assert_eq!(docs["docs"]["s2"]["seq"], 5, "{docs}");
+        assert!(docs["docs"]["s1"].get("routing").is_none(), "{docs}");
+        assert!(docs["docs"].get("s3").is_none(), "{docs}");
         // How far the table holds the writer's history is its own operations'.
         let highest = sql(h, "SELECT max(osop) AS highest FROM logs WHERE osgen = 3");
         assert_eq!(highest[0]["highest"], 5, "{highest}");
@@ -7276,24 +7487,25 @@ mod tests {
             "the latest get finds the new id"
         );
         assert_eq!(get_latest("c"), "", "an id the table does not hold is \"\"");
-        let get_doc_latest = |id: &str| {
-            take(unsafe { infino_get_doc_latest(reader, c("logs").as_ptr(), c(id).as_ptr()) })
-        };
-        let doc: Value = serde_json::from_str(&get_doc_latest("b")).unwrap();
-        let source: Value = serde_json::from_str(doc["source"].as_str().unwrap()).unwrap();
+        let docs: Value = serde_json::from_str(&docs_latest(reader, &["a", "b", "c"])).unwrap();
+        let source: Value =
+            serde_json::from_str(docs["docs"]["b"]["source"].as_str().unwrap()).unwrap();
         assert_eq!(
             source,
             json!({ "level": "warn" }),
             "the latest realtime get finds the new id with its source"
         );
         assert!(
-            doc["seq"].is_i64(),
-            "and the sequence number it was written under: {doc}"
+            docs["docs"]["b"]["seq"].is_i64(),
+            "and the sequence number it was written under: {docs}"
         );
-        assert_eq!(
-            get_doc_latest("c"),
-            "",
-            "an id the table does not hold is \"\""
+        assert!(
+            docs["docs"]["a"].is_object(),
+            "and the id of the first commit: {docs}"
+        );
+        assert!(
+            docs["docs"].get("c").is_none(),
+            "an id the table does not hold is absent: {docs}"
         );
         // Only the latest connection has read the second commit, when the
         // reader's own read was stale; the blocks it read land in the cache.

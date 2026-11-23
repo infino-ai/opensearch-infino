@@ -33,8 +33,12 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
     private static final int LATER = 5;
     /** How long a copy may take to recover. */
     private static final String GREEN_TIMEOUT = "60s";
-    /** How long a node's reads may take to see another node's commit: well past the table's read staleness window. */
-    private static final long STALENESS_WAIT_SECONDS = 10;
+    /**
+     * How long a node's reads may take to see another node's commit: well past
+     * the table's read staleness window, which a run may widen to make a read
+     * that should have read the latest commit fail every time.
+     */
+    private static final long STALENESS_WAIT_SECONDS = 10 + TimeUnit.MILLISECONDS.toSeconds(Long.getLong("tests.infino.read.staleness.ms", 0L));
     /** The retention lease a default-mode table holds on its shard's history (the engine's {@code TABLE_LEASE}). */
     private static final String TABLE_LEASE = "infino_table";
     /** Distinct users among the documents written before the refresh. */

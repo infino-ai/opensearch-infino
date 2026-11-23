@@ -54,6 +54,10 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
     private static final String CACHE_TEST_REFRESH = "60s";
     /** The status of a write refused for a conflict. */
     private static final int CONFLICT = 409;
+    /** The status of a get of a document the index does not hold. */
+    private static final int NOT_FOUND = 404;
+    /** Rounds of a write and a get of it on each node, in the get test. */
+    private static final int GET_ROUNDS = 30;
 
     /** A client per node, each reaching that node alone. */
     private final List<RestClient> nodeClients = new ArrayList<>();
@@ -130,6 +134,37 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
             Map<String, Object> got = entityAsMap(client().performRequest(new Request("GET", "/" + index + "/_doc/x")));
             assertEquals("the newer write stands", 2, ((Map<?, ?>) got.get("_source")).get("v"));
         }, STALENESS_WAIT_SECONDS, TimeUnit.SECONDS);
+    }
+
+    /**
+     * A get sent to either node right after a write is acknowledged finds
+     * it, on the node without the index's primary as on the one with it, the
+     * first time. Each round, each node first reads the table (a get of the
+     * id about to be written), so its own view of the table is as recent as
+     * it gets. Before, the node without the primary answered from that view,
+     * which trails the primary's commit by up to the table's read staleness
+     * window, and found nothing.
+     */
+    @SuppressWarnings("unchecked")
+    public void testAGetSentToEitherNodeFindsTheWriteJustAcknowledged() throws IOException {
+        String index = "multi_get";
+        createIndex(index);
+        for (int i = 0; i < GET_ROUNDS; i++) {
+            String path = "/" + index + "/_doc/d" + i;
+            for (int node = 0; node < NODES; node++) {
+                int asked = node;
+                ResponseException missing = expectThrows(ResponseException.class, () -> on(asked, new Request("GET", path)));
+                assertEquals(NOT_FOUND, missing.getResponse().getStatusLine().getStatusCode());
+            }
+            Request put = new Request("PUT", path);
+            put.setJsonEntity("{\"n\":" + i + "}");
+            on(i % NODES, put);
+            for (int node = 0; node < NODES; node++) {
+                Map<String, Object> got = on(node, new Request("GET", path));
+                assertEquals("round " + i + ", node " + node + ": " + got, true, got.get("found"));
+                assertEquals("round " + i + ", node " + node, i, ((Map<String, Object>) got.get("_source")).get("n"));
+            }
+        }
     }
 
     /**

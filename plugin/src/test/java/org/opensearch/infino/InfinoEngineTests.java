@@ -4,6 +4,9 @@
 
 package org.opensearch.infino;
 
+import com.sun.jna.Memory;
+import com.sun.jna.Pointer;
+
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
@@ -11,16 +14,24 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.ReaderManager;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.Directory;
+import org.opensearch.index.seqno.ReplicationTracker;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
+import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /** What a skeleton reader covers is known before a search can use it, and refreshes no search sees do not push it out. */
 public class InfinoEngineTests extends OpenSearchTestCase {
@@ -196,26 +207,86 @@ public class InfinoEngineTests extends OpenSearchTestCase {
     /**
      * A realtime get reads through the node's own connection only on the
      * shard's primary, once it has committed since it began writing as that
-     * copy: then the table's last commit is its own. A replica, a node with
-     * no copy, and a primary that has not committed since it took over may
-     * be behind another node's commit, so each reads the latest commit.
+     * copy and until it hands the shard off: then the table's last commit is
+     * its own. A replica, a node with no copy, a primary that has not
+     * committed since it took over, and a primary that has handed off (whose
+     * new primary commits from then on) may be behind another node's commit,
+     * so each reads the latest commit.
      */
     public void testARealtimeGetReadsTheLatestCommitUnlessTheLastCommitIsThisNodes() {
         String allocation = "alloc-1";
-        assertFalse("no copy here", InfinoEngine.readsEveryCommit(null, a -> true));
+        InfinoEngine.Copy primary = new InfinoEngine.Copy(true, allocation);
+        assertFalse("no copy here", InfinoEngine.readsEveryCommit(null, false, a -> true));
         assertFalse("no engine here", InfinoEngine.readsEveryCommit("no_such_table"));
-        assertFalse("a replica", InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(false, allocation), a -> true));
+        assertFalse("a replica", InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(false, allocation), false, a -> true));
+        assertFalse("a primary that has not committed since it took over", InfinoEngine.readsEveryCommit(primary, false, a -> false));
+        assertFalse("a primary whose last commit was as another copy", InfinoEngine.readsEveryCommit(primary, false, "alloc-0"::equals));
+        assertTrue("a primary that has committed as this copy", InfinoEngine.readsEveryCommit(primary, false, allocation::equals));
         assertFalse(
-            "a primary that has not committed since it took over",
-            InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(true, allocation), a -> false)
+            "a primary that has handed the shard off, until it closes",
+            InfinoEngine.readsEveryCommit(primary, true, allocation::equals)
         );
-        assertFalse(
-            "a primary whose last commit was as another copy",
-            InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(true, allocation), "alloc-0"::equals)
-        );
+    }
+
+    /**
+     * A copy has handed its shard off once its checkpoints say it is
+     * relocated: from the hand-off, not from when the copy closes. Checkpoints
+     * that cannot be read say nothing of a hand-off.
+     */
+    public void testACopyHasHandedOffOnceItsTrackerIsRelocated() {
+        ReplicationTracker tracker = mock(ReplicationTracker.class);
+        when(tracker.isRelocated()).thenReturn(false);
+        assertFalse(InfinoEngine.handedOff(tracker));
+        when(tracker.isRelocated()).thenReturn(true);
+        assertTrue(InfinoEngine.handedOff(tracker));
         assertTrue(
-            "a primary that has committed as this copy",
-            InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(true, allocation), allocation::equals)
+            "a relocated primary reads the latest commit",
+            InfinoEngine.readsEveryCommit(new InfinoEngine.Copy(true, "a"), InfinoEngine.handedOff(tracker), "a"::equals) == false
         );
+        assertFalse(InfinoEngine.handedOff(() -> 0L));
+    }
+
+    /**
+     * A realtime get on a node that may be behind the table's last commit (here
+     * one holding no copy of its shard) reads the latest commit, in one call
+     * for every id, with each document's routing; never the node's own view.
+     */
+    public void testARealtimeGetOnANodeThatMayBeBehindReadsTheLatestCommit() {
+        List<String> calls = new CopyOnWriteArrayList<>();
+        InfinoLib bridge = (InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> {
+            switch (method.getName()) {
+                case "infino_open_with":
+                    return new Memory(1);
+                case "infino_get_doc":
+                case "infino_get_docs":
+                    calls.add(method.getName());
+                    return string("{\"docs\":{}}");
+                case "infino_get_docs_latest":
+                    calls.add(method.getName() + " " + List.of((String[]) args[2]));
+                    return string("{\"docs\":{\"d1\":{\"source\":\"{}\",\"seq\":3,\"routing\":\"r\"}}}");
+                default:
+                    return null;
+            }
+        });
+        InfinoNative.useLib(bridge);
+        try {
+            InfinoNative.Doc doc = InfinoEngine.currentDoc("not_held_here", "d1");
+            assertEquals(new InfinoNative.Doc("{}", 3, "r"), doc);
+            assertEquals(List.of("infino_get_docs_latest [d1]"), calls);
+            calls.clear();
+            Map<String, InfinoNative.Doc> docs = InfinoEngine.currentDocs("not_held_here", List.of("d1", "d2"));
+            assertEquals(Map.of("d1", new InfinoNative.Doc("{}", 3, "r")), docs);
+            assertEquals("one call for both ids", List.of("infino_get_docs_latest [d1, d2]"), calls);
+        } finally {
+            InfinoNative.useLib(null);
+        }
+    }
+
+    private static Pointer string(String s) {
+        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+        Memory m = new Memory(bytes.length + 1);
+        m.write(0, bytes, 0, bytes.length);
+        m.setByte(bytes.length, (byte) 0);
+        return m;
     }
 }

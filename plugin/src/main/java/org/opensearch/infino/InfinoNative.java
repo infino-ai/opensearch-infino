@@ -68,6 +68,14 @@ public final class InfinoNative {
     // URI, -Dinfino.uri=file:///abs/path or s3://bucket/prefix for tables that
     // survive restart. The default is in-process and non-persistent.
     private static final String NODE_URI = System.getProperty("infino.uri", "memory://");
+    /**
+     * For tests only: the read staleness window the node's connections read
+     * under, in milliseconds, in place of the engine's default (0 for that).
+     * A wide window makes a read that should have read the table's latest
+     * commit, and read the node's own connection instead, answer from the
+     * commit before every time rather than now and then.
+     */
+    private static final long READ_STALENESS_MS = Long.getLong("infino.engine.read.staleness.ms", 0L);
 
     /**
      * What a connection is opened to: the URI, its bearer key (null for none:
@@ -314,6 +322,10 @@ public final class InfinoNative {
                     // default is the platform encoding, which under LANG=C turns every
                     // non-ASCII character of a statement into '?'.
                     loaded = Native.load(LIB, InfinoLib.class, Map.of(Library.OPTION_STRING_ENCODING, StandardCharsets.UTF_8.name()));
+                    if (READ_STALENESS_MS > 0) {
+                        log.warn("[infino] connections read under a staleness window of {} ms, for tests", READ_STALENESS_MS);
+                        loaded.infino_set_read_staleness_ms(READ_STALENESS_MS);
+                    }
                     lib = loaded;
                 }
             }
@@ -1276,8 +1288,12 @@ public final class InfinoNative {
         lib.infino_release_latest(conn);
     }
 
-    /** One document as the table holds it: its source and the sequence number it was written under. */
-    public record Doc(String source, long seq) {}
+    /**
+     * One document as the table holds it: its source, the sequence number it
+     * was written under, and the routing value it was written with (null for
+     * none), which a get reports as {@code _routing}.
+     */
+    public record Doc(String source, long seq, String routing) {}
 
     /** One id's document from the table, never from the prefetch; null when the table holds no such id. */
     public static Doc getDoc(String name, String osid) {
@@ -1286,28 +1302,54 @@ public final class InfinoNative {
     }
 
     /**
-     * {@link #getDoc} as of the table's latest commit, as {@link #latestRows}
-     * reads: for a realtime get on a node that may not have read the last
-     * commit another node made. A lookup that fails throws rather than
-     * answering that the table holds no such id.
+     * The documents of these ids, by id, for a realtime get or multi-get: as
+     * of the table's latest commit when {@code latest} ({@link #latestRows}),
+     * for a node that may not have read the last commit another node made,
+     * else through the node's own connection. One open of the table serves
+     * every id. An id the table does not hold is absent; a lookup that fails
+     * throws rather than answering that the table holds no such id.
      */
-    public static Doc getDocLatest(String name, String osid) {
-        init();
-        Pointer p = lib.infino_get_doc_latest(conn, name, osid);
-        if (p == null) {
-            throw new InfinoException("reading " + osid + " from the latest commit of " + name + " failed", RestStatus.SERVICE_UNAVAILABLE);
+    @SuppressWarnings("unchecked")
+    public static Map<String, Doc> docsOf(String name, Collection<String> osids, boolean latest) {
+        Map<String, Doc> out = new HashMap<>();
+        if (osids.isEmpty()) {
+            return out;
         }
-        return doc(take(p));
+        init();
+        String[] ids = osids.toArray(new String[0]);
+        Pointer p = latest ? lib.infino_get_docs_latest(conn, name, ids, ids.length) : lib.infino_get_docs(conn, name, ids, ids.length);
+        if (p == null) {
+            String from = latest ? "the latest commit of " : "";
+            throw new InfinoException("reading " + ids.length + " ids from " + from + name + " failed", RestStatus.SERVICE_UNAVAILABLE);
+        }
+        Object docs = object(take(p)).get("docs");
+        if (!(docs instanceof Map<?, ?> byId)) {
+            throw new InfinoException("the bridge answered no documents", RestStatus.INTERNAL_SERVER_ERROR);
+        }
+        for (Map.Entry<?, ?> e : byId.entrySet()) {
+            out.put(e.getKey().toString(), doc((Map<String, Object>) e.getValue()));
+        }
+        return out;
+    }
+
+    /** Close the connection the latest reads go through, so the next opens it afresh without the table handles it held. */
+    public static void forgetLatest() {
+        init();
+        lib.infino_forget_latest(conn);
     }
 
     /** The document an {@code infino_get_doc} answer names; null for "", no such id. */
-    @SuppressWarnings("unchecked")
     private static Doc doc(String out) {
         if (out == null || out.isEmpty()) {
             return null;
         }
-        Map<String, Object> doc = object(out);
-        return new Doc((String) doc.get("source"), seq(doc.get("seq")));
+        return doc(object(out));
+    }
+
+    /** The document of one {@code {"source", "seq", "routing"}} answer. */
+    private static Doc doc(Map<String, Object> doc) {
+        Object routing = doc.get("routing");
+        return new Doc((String) doc.get("source"), seq(doc.get("seq")), routing == null ? null : routing.toString());
     }
 
     /**
@@ -1322,11 +1364,15 @@ public final class InfinoNative {
             return out;
         }
         String columns = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + ", " + InfinoQueryTranslator.SEQ;
+        if (columns(name).containsKey(InfinoQueryTranslator.ROUTING)) {
+            columns += ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING);
+        }
         for (Map<String, Object> row : sqlRows(byIds(name, columns, osids, where))) {
             Object id = row.get(InfinoQueryTranslator.OSID);
             Object source = row.get(InfinoQueryTranslator.SOURCE);
+            Object routing = row.get(InfinoQueryTranslator.ROUTING);
             if (id != null && source != null) {
-                out.put(id.toString(), new Doc(source.toString(), seq(row.get(InfinoQueryTranslator.SEQ))));
+                out.put(id.toString(), new Doc(source.toString(), seq(row.get(InfinoQueryTranslator.SEQ)), routing == null ? null : routing.toString()));
             }
         }
         return out;
@@ -1700,38 +1746,6 @@ public final class InfinoNative {
     /** Whether an id holds a letter or a digit, and so indexes as at least one term of the id column's term index. */
     static boolean hasTerm(String id) {
         return id.codePoints().anyMatch(Character::isLetterOrDigit);
-    }
-
-    /**
-     * The routing value the table's row for {@code id} was written with,
-     * through the id column's term index; null when the row was written with
-     * none, when there is no row, or when the table never took a routed write.
-     */
-    public static String routingOf(String name, String id) {
-        return routingOf(name, id, false);
-    }
-
-    /**
-     * {@link #routingOf}, as of the table's latest commit ({@link #latestRows})
-     * when {@code latest}: for a realtime get that reads the document so.
-     */
-    public static String routingOf(String name, String id, boolean latest) {
-        if (!columns(name).containsKey(InfinoQueryTranslator.ROUTING)) {
-            return null;
-        }
-        String columns = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING);
-        String sql = hasTerm(id)
-            ? "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
-                + InfinoQueryTranslator.literal(idTerms(List.of(id))) + ", 'and')"
-            : byIds(name, columns, List.of(id), null);
-        for (Map<String, Object> row : latest ? latestRows(sql) : sqlRows(sql)) {
-            Object rowId = row.get(InfinoQueryTranslator.OSID);
-            Object routing = row.get(InfinoQueryTranslator.ROUTING);
-            if (rowId != null && id.equals(rowId.toString())) {
-                return routing == null ? null : routing.toString();
-            }
-        }
-        return null;
     }
 
     /** Keep the sources of rows a hit statement returned (id and source columns), for the fetch phase. */
