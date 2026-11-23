@@ -59,9 +59,9 @@ use infino::arrow_array::{
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
 use infino::{
-    connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnEncoding, ColumnIndex,
-    ConnectOptions, Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric,
-    OptimizeOptions, SchemaError, SchemaPatch, Supertable,
+    connect_with, rows_to_batch, Bm25Params, Bm25SearchOptions, BoolMode, ColumnEncoding,
+    ColumnIndex, ConnectOptions, Connection, Consistency, FieldPatch, FtsField, IndexSpec,
+    InfinoError, Metric, OptimizeOptions, SchemaError, SchemaPatch, Stemmer, Stopwords, Supertable,
 };
 use rayon::prelude::*;
 
@@ -1663,6 +1663,19 @@ fn declare_table(
                         bm25: *bm25,
                     }),
                     _ => None,
+                })
+                // A time-series table's id column carries no index to model
+                // one on ([`TIMESERIES`]): a text field it gains (one a
+                // document adds, as `schemaUrl` in an OTel point) gets the
+                // engine's defaults, as at creation.
+                .or_else(|| {
+                    timeseries.then_some(ColumnIndex::Fts {
+                        stopwords: Stopwords::None,
+                        stemmer: Stemmer::None,
+                        positions: true,
+                        stored: true,
+                        bm25: Bm25Params::STANDARD,
+                    })
                 });
             // The index a keyword field added now gets: the same, without positions.
             let exact_index = text_index.clone().map(|index| match index {
