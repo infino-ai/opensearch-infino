@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.ActionListenerResponseHandler;
 import org.opensearch.action.ActionRequest;
@@ -40,11 +41,13 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
@@ -53,7 +56,10 @@ import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.engine.DocumentMissingException;
+import org.opensearch.index.engine.VersionConflictEngineException;
+import org.opensearch.index.get.GetResult;
 import org.opensearch.index.seqno.SequenceNumbers;
+import org.opensearch.index.shard.IndexShard;
 import org.opensearch.infino.InfinoWriter.Outcome;
 import org.opensearch.infino.InfinoWriter.Waiter;
 import org.opensearch.infino.InfinoWriter.Write;
@@ -67,15 +73,20 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
 /**
@@ -102,6 +113,12 @@ import java.util.function.Supplier;
  * and answers the bulk once they are committed; a document the declared
  * columns cannot hold comes back from that append as its own item with the
  * reason, as a mapping parse failure would be.
+ *
+ * <p>An update to an index in default mode is merged on the node that holds
+ * its shard's primary, the one copy whose pending writes and table reads are
+ * as new as the sequence numbers the shard hands out, and goes on to the
+ * shard as a write of the whole document conditioned on the sequence number
+ * it was merged against ({@link #toShards}).
  *
  * <p>Each Infino-backed index's table is written by one node, the one
  * holding its primary shard; a write that arrives elsewhere is sent there
@@ -130,6 +147,8 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
     private static final String DROPPED_GENERATED_ID = "auto-generated";
     /** The primary term stock answers a dropped document with: it was never written. */
     private static final long DROPPED_PRIMARY_TERM = 0L;
+    /** How long an update whose primary is not yet ready to take its writes waits before it is sent on again. */
+    private static final TimeValue MERGE_WAIT = TimeValue.timeValueMillis(100);
 
     private final Supplier<ClusterService> clusterService;
     private final InfinoTables tables;
@@ -172,9 +191,11 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
 
     /**
      * A bulk no item of which this node serves from a table, on to the shards:
-     * as it came, unless it carries updates to default-mode indices, which are
-     * turned into writes of the whole document first ({@link #engineUpdates})
-     * and their responses back into the ones the client's bulk expects.
+     * as it came, unless it carries updates to default-mode indices. The stock
+     * update reads the current document from Lucene, which keeps no source in
+     * default mode, so those updates are merged on the node holding their
+     * shard's primary ({@link #toPrimaries}) and their responses turned back into
+     * the ones the client's bulk expects.
      */
     private <Request extends ActionRequest, Response extends ActionResponse> void toShards(
         Task task,
@@ -186,22 +207,501 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
         ClusterService clusters,
         ActionListener<BulkResponse> cast
     ) {
-        EngineBulk routed;
+        ShardId[] merged;
         try {
-            routed = engineUpdates(clusters.state(), bulk, concreteIndices(clusters.state(), bulk), tables);
+            merged = mergedShards(clusters.state(), bulk, concreteIndices(clusters.state(), bulk));
         } catch (Exception e) {
             listener.onFailure(e);
             return;
         }
-        if (routed == null) {
+        if (merged == null) {
             chain.proceed(task, action, request, listener);
             return;
         }
-        @SuppressWarnings("unchecked")
-        Request next = (Request) routed.bulk();
-        @SuppressWarnings("unchecked")
-        ActionListener<Response> answer = (ActionListener<Response>) routed.answer(cast);
-        chain.proceed(task, action, next, answer);
+        // The chain goes on once per filter call: the first part of the bulk sent to the
+        // shards takes it, and any later one (a retried merge) runs as a bulk of its own.
+        AtomicBoolean proceeded = new AtomicBoolean();
+        BiConsumer<BulkRequest, ActionListener<BulkResponse>> proceed = (part, answer) -> {
+            if (proceeded.compareAndSet(false, true)) {
+                @SuppressWarnings("unchecked")
+                Request next = (Request) part;
+                @SuppressWarnings("unchecked")
+                ActionListener<Response> typed = (ActionListener<Response>) answer;
+                chain.proceed(task, action, next, typed);
+            } else {
+                InfinoClient.bulk(part, answer);
+            }
+        };
+        Map<UpdateRequest, Integer> retriesLeft = Collections.synchronizedMap(new IdentityHashMap<>());
+        toPrimaries(bulk, clusters, proceed, System.nanoTime() + bulk.timeout().nanos(), retriesLeft, cast);
+    }
+
+    /**
+     * For each item of a bulk over default-mode indices, the shard its update
+     * is merged on when the item is one an update's merge must be ordered
+     * with: an item with an id, in a default-mode index, whose shard takes
+     * at least one update of this bulk. Null at every other slot, and null
+     * in place of the whole when the bulk carries no such update (it goes to
+     * the shards as it came). Every item of such a shard goes where its
+     * updates merge, as the stock bulk would send it to that shard's primary
+     * anyway, so an update and the writes around it to one id keep the
+     * bulk's order.
+     */
+    static ShardId[] mergedShards(ClusterState state, BulkRequest bulk, List<String> concrete) {
+        List<DocWriteRequest<?>> items = bulk.requests();
+        ShardId[] shards = new ShardId[items.size()];
+        Set<ShardId> updated = new HashSet<>();
+        for (int slot = 0; slot < items.size(); slot++) {
+            DocWriteRequest<?> item = items.get(slot);
+            IndexMetadata md = concrete.get(slot) == null ? null : state.metadata().index(concrete.get(slot));
+            if (md == null || item.id() == null || !InfinoPlugin.inDefaultMode(md.getSettings())) {
+                continue;
+            }
+            shards[slot] = new ShardId(md.getIndex(), OperationRouting.generateShardId(md, item.id(), item.routing()));
+            if (item instanceof UpdateRequest) {
+                updated.add(shards[slot]);
+            }
+        }
+        if (updated.isEmpty()) {
+            return null;
+        }
+        for (int slot = 0; slot < shards.length; slot++) {
+            if (shards[slot] != null && !updated.contains(shards[slot])) {
+                shards[slot] = null;
+            }
+        }
+        return shards;
+    }
+
+    /**
+     * Send each item of a bulk over default-mode indices where its update is
+     * merged ({@link #mergedShards}), and answer the bulk with every item in
+     * its own slot once all are. The items of a shard whose primary is on
+     * another node go there as one bulk per node, marked forwarded, and that
+     * node merges them without sending them on unless the primary has moved
+     * on by its newer cluster state ({@link #forward}, as {@link #dispatch}
+     * sends proxy-mode writes); the items of a shard with no active primary
+     * wait for one, up to the bulk's timeout. Every other item, and every
+     * item of a shard whose primary is here, is merged and written here
+     * ({@link #mergeOnPrimary}), with no hop of its own. {@code proceed}
+     * sends a bulk of whole-document writes to the shards, and
+     * {@code deadline} (by {@link System#nanoTime}) is when an item still
+     * waiting for its primary is answered unavailable; a part sent to
+     * another node carries the time left as its timeout.
+     * {@code retriesLeft} holds how many more times each update that has
+     * conflicted may run ({@link #retries}).
+     */
+    private void toPrimaries(
+        BulkRequest bulk,
+        ClusterService clusters,
+        BiConsumer<BulkRequest, ActionListener<BulkResponse>> proceed,
+        long deadline,
+        Map<UpdateRequest, Integer> retriesLeft,
+        ActionListener<BulkResponse> listener
+    ) {
+        ClusterState state = clusters.state();
+        List<String> concrete;
+        ShardId[] merged;
+        try {
+            concrete = concreteIndices(state, bulk);
+            merged = mergedShards(state, bulk, concrete);
+        } catch (Exception e) {
+            listener.onFailure(e);
+            return;
+        }
+        if (merged == null) {
+            proceed.accept(bulk, listener);
+            return;
+        }
+        int forwards = forwards();
+        String local = state.nodes().getLocalNodeId();
+        Destination here = new Destination(local, null, false);
+        long start = System.nanoTime();
+        BulkItemResponse[] items = new BulkItemResponse[bulk.requests().size()];
+        Map<ShardId, Destination> byShard = new HashMap<>();
+        Map<Destination, List<Integer>> slotsByDestination = new LinkedHashMap<>();
+        boolean anyAnswered = false;
+        for (int slot = 0; slot < bulk.requests().size(); slot++) {
+            ShardId shard = merged[slot];
+            Destination destination = shard == null ? here : byShard.computeIfAbsent(shard, s -> shardDestination(state, s, local, forwards));
+            if (destination.moved()) {
+                items[slot] = failure(slot, bulk.requests().get(slot), concrete.get(slot), movedOn(shard));
+                anyAnswered = true;
+                continue;
+            }
+            slotsByDestination.computeIfAbsent(destination, k -> new ArrayList<>()).add(slot);
+        }
+        if (!anyAnswered && slotsByDestination.size() == 1 && slotsByDestination.containsKey(here)) {
+            mergeOnPrimary(bulk, clusters, proceed, deadline, retriesLeft, listener);
+            return;
+        }
+        if (slotsByDestination.isEmpty()) {
+            finish(items, start, listener);
+            return;
+        }
+        AtomicInteger pending = new AtomicInteger(slotsByDestination.size());
+        for (Map.Entry<Destination, List<Integer>> group : slotsByDestination.entrySet()) {
+            List<Integer> slots = group.getValue();
+            BulkRequest part = partOf(bulk, slots);
+            ActionListener<BulkResponse> partListener = slotted(bulk, concrete, slots, items, pending, start, listener);
+            Destination destination = group.getKey();
+            if (destination.waitingFor() != null) {
+                awaitWriter(
+                    destination.waitingFor(),
+                    timeLeft(deadline),
+                    clusters,
+                    partListener,
+                    () -> toPrimaries(part, clusters, proceed, deadline, retriesLeft, partListener)
+                );
+            } else if (destination.equals(here)) {
+                mergeOnPrimary(part, clusters, proceed, deadline, retriesLeft, partListener);
+            } else {
+                BulkRequest sent;
+                try {
+                    sent = withRetriesLeft(part, retriesLeft).timeout(timeLeft(deadline));
+                } catch (IOException e) {
+                    partListener.onFailure(e);
+                    continue;
+                }
+                forward(state.nodes().get(destination.node()), sent, partListener);
+            }
+        }
+    }
+
+    /**
+     * Merge and write, on the write pool, a bulk whose updates merge on this
+     * node ({@link #mergeRound}); a write pool whose queue is full refuses
+     * the bulk with 429, as a stock bulk's is.
+     */
+    private void mergeOnPrimary(
+        BulkRequest bulk,
+        ClusterService clusters,
+        BiConsumer<BulkRequest, ActionListener<BulkResponse>> proceed,
+        long deadline,
+        Map<UpdateRequest, Integer> retriesLeft,
+        ActionListener<BulkResponse> listener
+    ) {
+        InfinoServices.fork(ThreadPool.Names.WRITE, listener::onFailure, () -> mergeRound(bulk, clusters, proceed, deadline, retriesLeft, listener));
+    }
+
+    /**
+     * One round of a bulk whose updates merge on this node: each update to
+     * a default-mode index is merged into its document ({@link #mergedWrite})
+     * and the round's writes go to the shards together through
+     * {@code proceed}, the bulk's other items as they came. An item waits for
+     * the next round ({@link #afterRound}) when an earlier item of this round
+     * writes its id and either is an update: the merge reads the document
+     * before the round writes anything, so it would miss that write. So does
+     * an update whose merge conflicts with a write the shard took first,
+     * while it may run again ({@link #retries}), and one whose shard this
+     * node does not hold as a primary ready to merge
+     * ({@link InfinoEngine#mergesHere}) or whose table does not yet hold the
+     * write the shard has of its document ({@link NotYetMergeable}), which
+     * is sent on again shortly; the items after either to the same id wait
+     * with it. A round's writes the shards refuse as a whole are answered
+     * with that failure, and the items left for the next round go on.
+     */
+    private void mergeRound(
+        BulkRequest bulk,
+        ClusterService clusters,
+        BiConsumer<BulkRequest, ActionListener<BulkResponse>> proceed,
+        long deadline,
+        Map<UpdateRequest, Integer> retriesLeft,
+        ActionListener<BulkResponse> listener
+    ) {
+        long start = System.nanoTime();
+        ClusterState state = clusters.state();
+        List<String> concrete = concreteIndices(state, bulk);
+        List<DocWriteRequest<?>> requests = bulk.requests();
+        BulkItemResponse[] items = new BulkItemResponse[requests.size()];
+        List<Integer> later = new ArrayList<>();
+        Map<Integer, ShardId> notHere = new HashMap<>();
+        Set<String> waiting = new HashSet<>();
+        // Each id this round writes, and whether an update writes it.
+        Map<String, Boolean> written = new HashMap<>();
+        BulkRequest writes = like(bulk);
+        List<Integer> writeSlots = new ArrayList<>();
+        Set<Integer> mergedSlots = new HashSet<>();
+        for (int slot = 0; slot < requests.size(); slot++) {
+            DocWriteRequest<?> item = requests.get(slot);
+            String index = concrete.get(slot);
+            IndexMetadata md = index == null ? null : state.metadata().index(index);
+            boolean merges = item instanceof UpdateRequest && md != null && item.id() != null && InfinoPlugin.inDefaultMode(md.getSettings());
+            String key = item.id() == null ? null : index + "\0" + item.id();
+            if (key != null) {
+                Boolean updated = written.get(key);
+                if (waiting.contains(key) || (updated != null && (merges || updated))) {
+                    waiting.add(key);
+                    later.add(slot);
+                    continue;
+                }
+            }
+            if (!merges) {
+                if (key != null) {
+                    written.putIfAbsent(key, false);
+                }
+                writes.add(item);
+                writeSlots.add(slot);
+                continue;
+            }
+            UpdateRequest update = (UpdateRequest) item;
+            if (update.script() != null) {
+                items[slot] = failure(slot, update, index, new IllegalArgumentException("[infino] scripted updates are not served"), RestStatus.BAD_REQUEST);
+                continue;
+            }
+            try {
+                String table = tables.ensureForDocument(md, update.id(), update.routing());
+                if (!InfinoEngine.mergesHere(table)) {
+                    notHere.put(slot, new ShardId(md.getIndex(), OperationRouting.generateShardId(md, update.id(), update.routing())));
+                    waiting.add(key);
+                    later.add(slot);
+                    continue;
+                }
+                writes.add(mergedWrite(md, table, update));
+                writeSlots.add(slot);
+                mergedSlots.add(slot);
+                written.put(key, true);
+            } catch (NotYetMergeable e) {
+                notHere.put(slot, e.shard);
+                waiting.add(key);
+                later.add(slot);
+            } catch (Exception e) {
+                if (retries(update, e, retriesLeft)) {
+                    waiting.add(key);
+                    later.add(slot);
+                } else {
+                    items[slot] = failure(slot, update, index, e);
+                }
+            }
+        }
+        if (writes.requests().isEmpty()) {
+            afterRound(bulk, concrete, items, later, notHere, clusters, proceed, deadline, retriesLeft, start, listener);
+            return;
+        }
+        proceed.accept(writes, new ActionListener<>() {
+            @Override
+            public void onResponse(BulkResponse response) {
+                try {
+                    BulkItemResponse[] got = response.getItems();
+                    for (int i = 0; i < got.length; i++) {
+                        int slot = writeSlots.get(i);
+                        if (!mergedSlots.contains(slot)) {
+                            items[slot] = reslot(got[i], slot);
+                        } else if (got[i].isFailed() && retries((UpdateRequest) requests.get(slot), got[i].getFailure().getCause(), retriesLeft)) {
+                            later.add(slot);
+                        } else {
+                            items[slot] = asUpdate(got[i], slot);
+                        }
+                    }
+                    afterRound(bulk, concrete, items, later, notHere, clusters, proceed, deadline, retriesLeft, start, listener);
+                } catch (Exception e) {
+                    listener.onFailure(e);
+                }
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                try {
+                    for (int slot : writeSlots) {
+                        items[slot] = failure(slot, requests.get(slot), concrete.get(slot), e);
+                    }
+                    afterRound(bulk, concrete, items, later, notHere, clusters, proceed, deadline, retriesLeft, start, listener);
+                } catch (Exception inner) {
+                    inner.addSuppressed(e);
+                    listener.onFailure(inner);
+                }
+            }
+        });
+    }
+
+    /**
+     * After a round ({@link #mergeRound}), answer the bulk, or send on the items
+     * left for the next round, in the bulk's order, as a bulk of their own
+     * whose answers fill their slots. While an update waits for its primary
+     * to take its writes ({@code notHere}, by slot) the next round starts
+     * after {@link #MERGE_WAIT}, and past {@code deadline} such an update is
+     * answered with its primary unavailable, as a stock bulk answers a write
+     * whose primary is not active in time; so is every item left after it
+     * to the same id, which may not be written ahead of it. With no thread
+     * pool to wait on, that answer comes at once.
+     */
+    private void afterRound(
+        BulkRequest bulk,
+        List<String> concrete,
+        BulkItemResponse[] items,
+        List<Integer> later,
+        Map<Integer, ShardId> notHere,
+        ClusterService clusters,
+        BiConsumer<BulkRequest, ActionListener<BulkResponse>> proceed,
+        long deadline,
+        Map<UpdateRequest, Integer> retriesLeft,
+        long start,
+        ActionListener<BulkResponse> listener
+    ) {
+        boolean wait = !notHere.isEmpty();
+        ThreadPool pools = InfinoServices.threadPool();
+        if (wait && (pools == null || System.nanoTime() - deadline > 0)) {
+            Map<String, ShardId> unready = new HashMap<>();
+            for (Map.Entry<Integer, ShardId> e : notHere.entrySet()) {
+                unready.put(concrete.get(e.getKey()) + "\0" + bulk.requests().get(e.getKey()).id(), e.getValue());
+            }
+            for (Iterator<Integer> it = later.iterator(); it.hasNext();) {
+                int slot = it.next();
+                DocWriteRequest<?> item = bulk.requests().get(slot);
+                ShardId shard = item.id() == null ? null : unready.get(concrete.get(slot) + "\0" + item.id());
+                if (shard != null) {
+                    UnavailableShardsException unavailable = new UnavailableShardsException(shard, "the primary is not ready to take writes Timeout: [{}]", bulk.timeout());
+                    items[slot] = failure(slot, item, concrete.get(slot), unavailable);
+                    it.remove();
+                }
+            }
+            wait = false;
+        }
+        if (later.isEmpty()) {
+            finish(items, start, listener);
+            return;
+        }
+        Collections.sort(later);
+        BulkRequest rest = partOf(bulk, later);
+        ActionListener<BulkResponse> restListener = slotted(bulk, concrete, later, items, new AtomicInteger(1), start, listener);
+        if (!wait) {
+            toPrimaries(rest, clusters, proceed, deadline, retriesLeft, restListener);
+            return;
+        }
+        pools.schedule(() -> {
+            try {
+                toPrimaries(rest, clusters, proceed, deadline, retriesLeft, restListener);
+            } catch (Exception e) {
+                restListener.onFailure(e);
+            }
+        }, MERGE_WAIT, ThreadPool.Names.GENERIC);
+    }
+
+    /**
+     * {@code update} as a write of the whole document, merged on the primary
+     * that writes {@code table}. The document's sequence number is read
+     * first, checked against the update's own condition when it has one,
+     * then the source to merge into ({@link InfinoEngine#sourceForMerge}),
+     * which is at least as new; the write is conditioned on that number, so
+     * the shard refuses it with a conflict when another write took the
+     * document in between, and a document that did not exist is created,
+     * refused when another write has created it since. A document the
+     * shard holds but whose source neither its pending writes nor the table
+     * gives is a conflict when its sequence number has moved since (a write
+     * deleted it meanwhile), and otherwise not yet mergeable
+     * ({@link NotYetMergeable}): the table does not yet hold the write the
+     * shard counts.
+     */
+    private static IndexRequest mergedWrite(IndexMetadata md, String table, UpdateRequest update) {
+        ShardId shardId = new ShardId(md.getIndex(), OperationRouting.generateShardId(md, update.id(), update.routing()));
+        IndexShard shard = InfinoServices.indicesService().indexServiceSafe(md.getIndex()).getShard(shardId.id());
+        GetResult got = shard.getService().getForUpdate(update.id(), update.ifSeqNo(), update.ifPrimaryTerm());
+        String base = InfinoEngine.sourceForMerge(table, update.id(), got.isExists());
+        if (got.isExists() && (base == null || base.isEmpty())) {
+            GetResult now = shard.getService().getForUpdate(update.id(), SequenceNumbers.UNASSIGNED_SEQ_NO, SequenceNumbers.UNASSIGNED_PRIMARY_TERM);
+            if (now.isExists() && now.getSeqNo() == got.getSeqNo() && now.getPrimaryTerm() == got.getPrimaryTerm()) {
+                throw new NotYetMergeable(shardId);
+            }
+            throw new VersionConflictEngineException(shardId, update.id(), "[infino] the document changed while the update was merged into it");
+        }
+        String merged = merge(base, update);
+        if (merged == null) {
+            throw new DocumentMissingException(shardId, update.id());
+        }
+        IndexRequest write = new IndexRequest(md.getIndex().getName()).id(update.id()).routing(update.routing()).source(merged, MediaTypeRegistry.JSON);
+        if (got.isExists()) {
+            write.setIfSeqNo(got.getSeqNo()).setIfPrimaryTerm(got.getPrimaryTerm());
+        } else {
+            write.create(true);
+        }
+        return write;
+    }
+
+    /**
+     * Whether an update that failed with {@code e} runs again, as the stock
+     * update does: on a version conflict, while its {@code retry_on_conflict}
+     * allows. How many more times each update may run is kept in
+     * {@code retriesLeft}, which this takes one from, and the client's
+     * request is left as it came. An update the client conditioned on a
+     * sequence number never runs again (the stock request refuses that
+     * condition with {@code retry_on_conflict}).
+     */
+    private static boolean retries(UpdateRequest update, Throwable e, Map<UpdateRequest, Integer> retriesLeft) {
+        if (update.ifSeqNo() != SequenceNumbers.UNASSIGNED_SEQ_NO || !(ExceptionsHelper.unwrapCause(e) instanceof VersionConflictEngineException)) {
+            return false;
+        }
+        int left = retriesLeft.getOrDefault(update, update.retryOnConflict());
+        if (left <= 0) {
+            return false;
+        }
+        retriesLeft.put(update, left - 1);
+        return true;
+    }
+
+    /**
+     * {@code part} as it goes to another node: each update that has run
+     * before ({@code retriesLeft}) is copied with {@code retry_on_conflict}
+     * set to what it has left, so the node that merges it runs it no more
+     * often than here, and the client's request is left as it came.
+     */
+    private static BulkRequest withRetriesLeft(BulkRequest part, Map<UpdateRequest, Integer> retriesLeft) throws IOException {
+        BulkRequest sent = null;
+        List<DocWriteRequest<?>> requests = part.requests();
+        for (int i = 0; i < requests.size(); i++) {
+            UpdateRequest update = requests.get(i) instanceof UpdateRequest u ? u : null;
+            Integer left = update == null ? null : retriesLeft.get(update);
+            if (left != null && sent == null) {
+                sent = like(part);
+                for (int j = 0; j < i; j++) {
+                    sent.add(requests.get(j));
+                }
+            }
+            if (left != null) {
+                try (BytesStreamOutput out = new BytesStreamOutput()) {
+                    update.writeTo(out);
+                    try (StreamInput in = out.bytes().streamInput()) {
+                        sent.add(new UpdateRequest(in).retryOnConflict(left));
+                    }
+                }
+            } else if (sent != null) {
+                sent.add(requests.get(i));
+            }
+        }
+        return sent == null ? part : sent;
+    }
+
+    /**
+     * An update whose document the shard holds while the table does not yet
+     * hold the write it counts (as when this node's view of the table has
+     * not caught up with its latest commit): it waits and runs again, as an update whose
+     * primary is not ready to merge does.
+     */
+    private static final class NotYetMergeable extends RuntimeException {
+        final ShardId shard;
+
+        NotYetMergeable(ShardId shard) {
+            super("[infino] the table of " + shard + " does not yet hold the document's latest write", null, false, false);
+            this.shard = shard;
+        }
+    }
+
+    /** The time left until {@code deadline}, by {@link System#nanoTime}; zero once it has passed. */
+    private static TimeValue timeLeft(long deadline) {
+        return TimeValue.timeValueNanos(Math.max(0L, deadline - System.nanoTime()));
+    }
+
+    /** An empty bulk with {@code bulk}'s refresh policy, timeout and active-shard count, for a part of it. */
+    private static BulkRequest like(BulkRequest bulk) {
+        return new BulkRequest().setRefreshPolicy(bulk.getRefreshPolicy()).timeout(bulk.timeout()).waitForActiveShards(bulk.waitForActiveShards());
+    }
+
+    /** The items of {@code bulk} at {@code slots}, in that order, as a bulk of their own ({@link #like}). */
+    private static BulkRequest partOf(BulkRequest bulk, List<Integer> slots) {
+        BulkRequest part = like(bulk);
+        for (int slot : slots) {
+            part.add(bulk.requests().get(slot));
+        }
+        return part;
     }
 
     /**
@@ -288,31 +788,6 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
             }
             dispatch(bulk, concrete, infino, answered, writes, tables, clusters, listener);
         }, listener::onFailure));
-    }
-
-    /**
-     * A bulk over default-mode indices with its updates turned into writes of
-     * the whole document: {@code bulk} goes to the shards, and
-     * {@code answer} turns its response back into the one the client's bulk
-     * expects. {@code slots} is each item's slot in the client's bulk,
-     * {@code updates} the slots that were updates, {@code answered} the items
-     * answered before the shards (in slot order).
-     */
-    record EngineBulk(BulkRequest bulk, int[] slots, Set<Integer> updates, Map<Integer, BulkItemResponse> answered, int size) {
-        ActionListener<BulkResponse> answer(ActionListener<BulkResponse> listener) {
-            return ActionListener.wrap(response -> {
-                BulkItemResponse[] items = new BulkItemResponse[size];
-                for (Map.Entry<Integer, BulkItemResponse> e : answered.entrySet()) {
-                    items[e.getKey()] = e.getValue();
-                }
-                BulkItemResponse[] routed = response.getItems();
-                for (int i = 0; i < routed.length; i++) {
-                    int slot = slots[i];
-                    items[slot] = updates.contains(slot) ? asUpdate(routed[i], slot) : reslot(routed[i], slot);
-                }
-                listener.onResponse(new BulkResponse(items, response.getTook().millis(), response.getIngestTookInMillis()));
-            }, listener::onFailure);
-        }
     }
 
     /**
@@ -407,14 +882,10 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
         AtomicInteger pending = new AtomicInteger(slotsByDestination.size());
         for (Map.Entry<Destination, List<Integer>> group : slotsByDestination.entrySet()) {
             List<Integer> slots = group.getValue();
-            BulkRequest part = new BulkRequest();
-            part.setRefreshPolicy(bulk.getRefreshPolicy());
-            part.timeout(bulk.timeout());
-            part.waitForActiveShards(bulk.waitForActiveShards());
+            BulkRequest part = partOf(bulk, slots);
             List<String> partConcrete = new ArrayList<>(slots.size());
             Map<String, IndexMetadata> partInfino = new LinkedHashMap<>();
             for (int slot : slots) {
-                part.add(bulk.requests().get(slot));
                 partConcrete.add(concrete.get(slot));
                 IndexMetadata md = infino.get(concrete.get(slot));
                 if (md != null) {
@@ -426,8 +897,8 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
             if (destination.waitingFor() != null) {
                 // Its index has no active primary: once one is, the part goes where it is.
                 awaitWriter(
-                    part,
                     destination.waitingFor(),
+                    part.timeout(),
                     clusters,
                     partListener,
                     () -> dispatch(part, partConcrete, partInfino, new BulkItemResponse[slots.size()], writes, tables, clusters, partListener)
@@ -463,60 +934,6 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
         }
     }
 
-    /**
-     * The bulk to send to the shards of default-mode indices when it carries
-     * updates, or null when it carries none (it goes on as it is). The stock
-     * update reads the current document from Lucene, which keeps no source
-     * in default mode, so each update is merged here into the document as a
-     * read sees it now (the shard's write not yet committed, else the
-     * table), by proxy mode's rule ({@link #merge}), and goes on as a
-     * write of the whole document, carrying any sequence-number condition
-     * for the shard to check. An update the table cannot serve (a script) or
-     * whose document is missing is answered here.
-     */
-    static EngineBulk engineUpdates(ClusterState state, BulkRequest bulk, List<String> concrete, InfinoTables tables) {
-        List<DocWriteRequest<?>> items = bulk.requests();
-        Set<Integer> updates = new HashSet<>();
-        Map<Integer, BulkItemResponse> answered = new LinkedHashMap<>();
-        Map<Integer, DocWriteRequest<?>> writes = new HashMap<>();
-        for (int slot = 0; slot < items.size(); slot++) {
-            IndexMetadata md = concrete.get(slot) == null ? null : state.metadata().index(concrete.get(slot));
-            if (!(items.get(slot) instanceof UpdateRequest update) || md == null || !InfinoPlugin.inDefaultMode(md.getSettings())) {
-                continue;
-            }
-            updates.add(slot);
-            String index = md.getIndex().getName();
-            if (update.script() != null) {
-                answered.put(slot, failure(slot, update, index, new IllegalArgumentException("[infino] scripted updates are not served"), RestStatus.BAD_REQUEST));
-                continue;
-            }
-            String table = tables.ensureForDocument(md, update.id(), update.routing());
-            String merged = merge(InfinoEngine.currentSource(table, update.id()), update);
-            if (merged == null) {
-                ShardId shardId = new ShardId(md.getIndex(), OperationRouting.generateShardId(md, update.id(), update.routing()));
-                answered.put(slot, failure(slot, update, index, new DocumentMissingException(shardId, update.id()), RestStatus.NOT_FOUND));
-                continue;
-            }
-            IndexRequest write = new IndexRequest(index).id(update.id()).routing(update.routing()).source(merged, MediaTypeRegistry.JSON);
-            write.setIfSeqNo(update.ifSeqNo()).setIfPrimaryTerm(update.ifPrimaryTerm());
-            writes.put(slot, write);
-        }
-        if (updates.isEmpty()) {
-            return null;
-        }
-        BulkRequest routed = new BulkRequest().setRefreshPolicy(bulk.getRefreshPolicy()).timeout(bulk.timeout()).waitForActiveShards(bulk.waitForActiveShards());
-        int[] slots = new int[items.size() - answered.size()];
-        int at = 0;
-        for (int slot = 0; slot < items.size(); slot++) {
-            if (answered.containsKey(slot)) {
-                continue;
-            }
-            routed.add(writes.getOrDefault(slot, items.get(slot)));
-            slots[at++] = slot;
-        }
-        return new EngineBulk(routed, slots, updates, answered, items.size());
-    }
-
     /** A routed write's response as the update it was in the client's bulk. */
     private static BulkItemResponse asUpdate(BulkItemResponse r, int slot) {
         if (r.isFailed()) {
@@ -529,29 +946,39 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
     }
 
     /**
-     * Where a bulk's items for one index go: {@code node}, the one that
-     * writes its table ({@link #STOCK} for an index Infino does not back);
-     * or, while it has no active primary, {@code waitingFor} it; or nowhere
-     * when it has {@code moved} on from this node after the bulk was sent on
-     * as often as it may be.
+     * Where a bulk's items for one shard go: {@code node}, the one holding
+     * its primary ({@link #STOCK} for an index Infino does not back); or,
+     * while it has no active primary, {@code waitingFor} it; or nowhere when
+     * it has {@code moved} on from this node after the bulk was sent on as
+     * often as it may be.
      */
-    private record Destination(String node, Index waitingFor, boolean moved) {}
+    private record Destination(String node, ShardId waitingFor, boolean moved) {}
 
     /** Where the items for {@code md} (null for an index Infino does not back) go from this node, the bulk sent on {@code forwards} times so far. */
     private static Destination destination(ClusterState state, IndexMetadata md, String local, int forwards) {
         if (md == null) {
             return new Destination(STOCK, null, false);
         }
-        String node = writerNode(state, md.getIndex());
+        return shardDestination(state, new ShardId(md.getIndex(), 0), local, forwards);
+    }
+
+    /** Where the items for {@code shard} go from this node, the bulk sent on {@code forwards} times so far. */
+    private static Destination shardDestination(ClusterState state, ShardId shard, String local, int forwards) {
+        String node = writerNode(state, shard);
         if (node == null) {
-            return new Destination(null, md.getIndex(), false);
+            return new Destination(null, shard, false);
         }
         return new Destination(node, null, forwards == MAX_FORWARDS && !node.equals(local));
     }
 
     /** What an item of {@code index} is answered with when its primary moved on while the bulk was sent on to it twice: a client retries it. */
     private static UnavailableShardsException movedOn(Index index) {
-        return new UnavailableShardsException(new ShardId(index, 0), "the primary moved to another node while the bulk was sent on to this one");
+        return movedOn(new ShardId(index, 0));
+    }
+
+    /** What an item of {@code shard} is answered with when its primary moved on while the bulk was sent on to it twice: a client retries it. */
+    private static UnavailableShardsException movedOn(ShardId shard) {
+        return new UnavailableShardsException(shard, "the primary moved to another node while the bulk was sent on to this one");
     }
 
     /** How many times the bulk this thread serves was sent on to the node that writes its tables: 0 when it arrived here from its client. */
@@ -602,7 +1029,12 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
      * primary shard; null while it has none.
      */
     static String writerNode(ClusterState state, Index index) {
-        ShardRouting primary = primary(state, index);
+        return writerNode(state, new ShardId(index, 0));
+    }
+
+    /** The node holding {@code shard}'s active primary; null while it has none. */
+    static String writerNode(ClusterState state, ShardId shard) {
+        ShardRouting primary = primary(state, shard);
         return primary == null ? null : primary.currentNodeId();
     }
 
@@ -613,27 +1045,32 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
      * sequence numbers needs to know (see {@link InfinoWriter}).
      */
     static String writerAllocation(ClusterState state, Index index) {
-        ShardRouting primary = primary(state, index);
+        ShardRouting primary = primary(state, new ShardId(index, 0));
         return primary == null || primary.allocationId() == null ? null : primary.allocationId().getId();
     }
 
-    private static ShardRouting primary(ClusterState state, Index index) {
-        IndexRoutingTable routing = state.routingTable().index(index);
-        if (routing == null || routing.shard(0) == null) {
+    /** {@code shard}'s active primary; null while it has none. */
+    private static ShardRouting primary(ClusterState state, ShardId shard) {
+        IndexRoutingTable routing = state.routingTable().index(shard.getIndex());
+        if (routing == null || routing.shard(shard.id()) == null) {
             return null;
         }
-        ShardRouting primary = routing.shard(0).primaryShard();
+        ShardRouting primary = routing.shard(shard.id()).primaryShard();
         return primary != null && primary.active() ? primary : null;
     }
 
     /**
-     * Wait for {@code index} to have an active primary, then {@code retry};
-     * past the bulk's timeout, answer that it has none, as the stock bulk
+     * Wait up to {@code timeout} for {@code shard} to have an active primary,
+     * then {@code retry}; past it, answer that it has none, as the stock bulk
      * does.
      */
-    private static void awaitWriter(BulkRequest bulk, Index index, ClusterService clusters, ActionListener<BulkResponse> listener, Runnable retry) {
+    private static void awaitWriter(ShardId shard, TimeValue timeout, ClusterService clusters, ActionListener<BulkResponse> listener, Runnable retry) {
+        if (timeout.nanos() <= 0) {
+            listener.onFailure(new UnavailableShardsException(shard, "primary shard is not active Timeout: [{}]", timeout));
+            return;
+        }
         ThreadContext context = InfinoServices.threadContext();
-        ClusterStateObserver observer = new ClusterStateObserver(clusters, bulk.timeout(), log, context);
+        ClusterStateObserver observer = new ClusterStateObserver(clusters, timeout, log, context);
         observer.waitForNextChange(new ClusterStateObserver.Listener() {
             @Override
             public void onNewClusterState(ClusterState state) {
@@ -648,10 +1085,10 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
             @Override
             public void onTimeout(TimeValue timeout) {
                 listener.onFailure(
-                    new UnavailableShardsException(new ShardId(index, 0), "primary shard is not active Timeout: [{}]", timeout)
+                    new UnavailableShardsException(shard, "primary shard is not active Timeout: [{}]", timeout)
                 );
             }
-        }, state -> writerNode(state, index) != null);
+        }, state -> writerNode(state, shard) != null);
     }
 
     /**
