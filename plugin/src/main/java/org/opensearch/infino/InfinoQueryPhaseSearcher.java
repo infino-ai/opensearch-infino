@@ -272,6 +272,9 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         Long cut = InfinoEngine.visibleSeqNo(table, readerVersion(searcher));
         long generation = InfinoEngine.generation(context.indexShard().indexSettings().getUUID());
         InfinoSearch.Plan plan = visibleTo(InfinoSearch.plan(table, source, now, access), cut, generation);
+        if (scroll != null && plan.ranksByScore()) {
+            throw new IllegalArgumentException(InfinoSearch.SCORE_SORT_SCROLL);
+        }
 
         Collection<AggregationBuilder> builders = InfinoSearch.builders(source);
         // A cardinality or percentiles result is built from the engine's exact
@@ -545,6 +548,11 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         SortField[] out = new SortField[sorts.size()];
         for (int i = 0; i < out.length; i++) {
             SortSpec s = sorts.get(i);
+            if (s.isScore()) {
+                // As stock sorts by the score: greatest first unless reversed; every hit has one.
+                out[i] = new SortField(null, SortField.Type.SCORE, !s.desc());
+                continue;
+            }
             SortField.Type type = sortType(s.type());
             SortField f = new SortField(s.name(), type, s.desc());
             f.setMissingValue(missing(type, s));
@@ -564,15 +572,14 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
     /**
      * The value a missing sort value stands in as, so it sorts where the plan
      * puts it in its direction: the least value when that side comes last in
-     * a descending sort or first in an ascending one, else the greatest.
+     * a descending sort or first in an ascending one, else the greatest
+     * ({@link SortSpec#standIn} for a long or a double).
      */
     private static Object missing(SortField.Type type, SortSpec s) {
-        boolean least = s.desc() != s.nullsFirst();
-        return switch (type) {
-            case LONG -> least ? Long.MIN_VALUE : Long.MAX_VALUE;
-            case DOUBLE -> least ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY;
-            default -> least ? SortField.STRING_FIRST : SortField.STRING_LAST;
-        };
+        if (type == SortField.Type.STRING) {
+            return s.desc() != s.nullsFirst() ? SortField.STRING_FIRST : SortField.STRING_LAST;
+        }
+        return s.standIn();
     }
 
     /** A hit's sort values from the table as its sort fields compare them. */
@@ -581,6 +588,11 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         for (int i = 0; i < out.length; i++) {
             Object v = values != null && i < values.length ? values[i] : null;
             SortSpec s = sorts.get(i);
+            if (s.isScore()) {
+                // The score's comparator reads a float.
+                out[i] = v instanceof Number n ? n.floatValue() : v == null ? Float.NaN : Float.parseFloat(v.toString());
+                continue;
+            }
             SortField.Type type = sortType(s.type());
             if (v == null) {
                 out[i] = type == SortField.Type.STRING ? null : missing(type, s);
