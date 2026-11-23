@@ -96,7 +96,11 @@ const GEN: &str = "osgen";
 /// The columns every table keeps for itself. A document's field of the same
 /// name is kept in a column of its own, named [`OWN_COLUMN_PREFIX`] and the
 /// field's name: no mapping can name a field so.
-const RESERVED: [&str; 3] = [OSID, SOURCE, SEQ];
+/// A time-series table's series key ([`TIMESERIES`]): the row's dimension
+/// values joined ([`series_key`]), the column the table's rows are sorted
+/// on first, so each series' points sit together.
+const TSID: &str = "ostsid";
+const RESERVED: [&str; 4] = [OSID, SOURCE, SEQ, TSID];
 const OWN_COLUMN_PREFIX: &str = ".";
 /// Where a table's mapping declares, as `properties` declares fields, the
 /// columns the plugin's engine writes beside a document's fields in default
@@ -116,6 +120,56 @@ fn timeseries_encoding(data_type: &DataType) -> Option<ColumnEncoding> {
     [ColumnEncoding::Delta, ColumnEncoding::ByteStreamSplit]
         .into_iter()
         .find(|encoding| encoding.accepts(data_type))
+}
+
+/// A time-series table's dimensions: its string columns that are no text,
+/// list or engine column, the metric's `name` first and the rest by path.
+/// A point's values on them name its series ([`series_key`]).
+fn dimensions(mapped: &[MappedField], engine: &[String]) -> Vec<String> {
+    let mut dims: Vec<String> = mapped
+        .iter()
+        .filter(|f| {
+            matches!(f.data_type, DataType::Utf8 | DataType::LargeUtf8)
+                && !f.fts
+                && !f.path.ends_with(LIST_SUFFIX)
+                && !engine.contains(&f.path)
+        })
+        .map(|f| f.path.clone())
+        .collect();
+    dims.sort_by(|a, b| (a != "name", a).cmp(&(b != "name", b)));
+    dims.dedup();
+    dims
+}
+
+/// The time column a time-series table sorts each series by: the data
+/// stream's timestamp field, else `@timestamp`, else `time`, else the first
+/// date field the mapping declares.
+fn series_time(mapped: &[MappedField], stamp: Option<&str>) -> Option<String> {
+    let is_time = |f: &&MappedField| matches!(f.data_type, DataType::Timestamp(..) | DataType::Date32 | DataType::Date64);
+    let named = |name: &str| mapped.iter().filter(is_time).find(|f| f.path == name).map(|f| f.path.clone());
+    stamp
+        .and_then(named)
+        .or_else(|| named("@timestamp"))
+        .or_else(|| named("time"))
+        .or_else(|| mapped.iter().find(is_time).map(|f| f.path.clone()))
+}
+
+/// The series key of a row whose columns are `flat`: its value on each of
+/// `dims`, in order, joined by a unit separator (a missing value is empty).
+/// The points of one series share it.
+fn series_key(flat: &Map<String, Value>, dims: &[String]) -> String {
+    let mut key = String::new();
+    for (i, dim) in dims.iter().enumerate() {
+        if i > 0 {
+            key.push('\u{1f}');
+        }
+        match flat.get(dim) {
+            Some(Value::String(v)) => key.push_str(v),
+            Some(Value::Null) | None => {}
+            Some(other) => key.push_str(&other.to_string()),
+        }
+    }
+    key
 }
 /// Separator used when a multi-valued string field lands in a scalar string
 /// column: the values are joined so a text index sees every token. The
@@ -489,6 +543,9 @@ pub struct Bridge {
     /// one value at, from the mapping's `_data_stream_timestamp` (set with
     /// [`Bridge::kept`]).
     stamps: RwLock<HashMap<String, Arc<str>>>,
+    /// The dimension columns of each time-series table, in series-key order
+    /// ([`series_key`]), from the mapping it was last declared from.
+    series: RwLock<HashMap<String, Arc<Vec<String>>>>,
     /// The columns each table's engine writes, from the mapping it was last
     /// declared from ([`ENGINE_COLUMNS`]).
     engine: RwLock<HashMap<String, Arc<Vec<String>>>>,
@@ -559,6 +616,25 @@ impl Bridge {
         if let Ok(mut all) = self.stamps.write() {
             match stream_timestamp(mapping) {
                 Some(field) => all.insert(name.to_string(), field.into()),
+                None => all.remove(name),
+            };
+        }
+    }
+
+    /// The dimension columns of `name` when it is a time-series table,
+    /// whose rows each carry their series key ([`TSID`]).
+    fn series(&self, name: &str) -> Option<Arc<Vec<String>>> {
+        self.series
+            .read()
+            .ok()
+            .and_then(|all| all.get(name).cloned())
+    }
+
+    /// Record `name`'s dimension columns, or that it is no time-series table.
+    fn series_rule(&self, name: &str, dims: Option<Vec<String>>) {
+        if let Ok(mut all) = self.series.write() {
+            match dims {
+                Some(dims) => all.insert(name.to_string(), Arc::new(dims)),
                 None => all.remove(name),
             };
         }
@@ -922,6 +998,7 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
         hosted,
         kept: RwLock::new(HashMap::new()),
         stamps: RwLock::new(HashMap::new()),
+        series: RwLock::new(HashMap::new()),
         engine: RwLock::new(HashMap::new()),
         attached: RwLock::new(HashMap::new()),
         gates: Mutex::new(HashMap::new()),
@@ -1542,11 +1619,18 @@ fn declare_table(
         }
     }
     mapped.extend(engine);
+    let series_dims = timeseries.then(|| dimensions(&mapped, &engine_columns));
+    let series_by = if timeseries {
+        series_time(&mapped, stream_timestamp(mapping).as_deref())
+    } else {
+        None
+    };
     let conn = &bridge.conn;
     if !check_only {
         bridge.keep_rules(name, &mapped);
         bridge.engine_rule(name, engine_columns);
         bridge.stamp_rule(name, mapping);
+        bridge.series_rule(name, series_dims.clone());
         if !attached {
             bridge.attach_rule(name, None);
         }
@@ -1701,7 +1785,12 @@ fn declare_table(
                     if let Some(encoding) = encoding_of(&f.data_type) {
                         patch = patch.with_encoding(encoding);
                     }
-                    if f.range {
+                    // A time-series table's dimensions and numbers are read
+                    // through its sort order and Parquet's statistics: no
+                    // per-point index ([`TIMESERIES`]).
+                    if timeseries && !f.fts {
+                        patch
+                    } else if f.range {
                         patch.with_index(ColumnIndex::Range)
                     } else {
                         match (&text_index, &exact_index, f.fts, f.exact) {
@@ -1744,14 +1833,28 @@ fn declare_table(
             // lookup (`exact_match`) instead of a scan of the column, and the
             // manifest's per-superfile term bloom skips the files that cannot
             // hold the id. Scalar columns have only min/max per superfile.
-            let mut spec = IndexSpec::new().fts(FtsField::new(OSID.to_string()));
+            // A time-series table keeps no index per point: a GET by id
+            // reads the column ([`row_in`] falls back to an equality), and
+            // its rows are found by series and time through the sort order.
+            let mut spec = if timeseries {
+                IndexSpec::new()
+            } else {
+                IndexSpec::new().fts(FtsField::new(OSID.to_string()))
+            };
             if let Some(encoding) = encoding_of(&DataType::Int64) {
                 spec = spec.encoding(SEQ, encoding);
+            }
+            if timeseries {
+                fields.push(Field::new(TSID, DataType::LargeUtf8, true));
+                spec = spec.sort_by([Some(TSID.to_string()), series_by.clone()].into_iter().flatten());
             }
             for f in &mapped {
                 fields.push(Field::new(&f.path, f.data_type.clone(), true));
                 if let Some(encoding) = encoding_of(&f.data_type) {
                     spec = spec.encoding(f.path.clone(), encoding);
+                }
+                if timeseries && !f.fts && f.vector.is_none() {
+                    continue;
                 }
                 if f.fts {
                     // Positions let a quoted phrase match adjacent terms in
@@ -2871,6 +2974,7 @@ pub unsafe extern "C" fn infino_index_batch(
         let kept = conn.kept(name);
         let engine = conn.engine_columns(name);
         let stamp = conn.stamp(name);
+        let series = conn.series(name);
 
         let mut failed: Vec<Value> = Vec::new();
         let mut rows: Vec<(usize, Map<String, Value>)> = Vec::with_capacity(n);
@@ -2885,6 +2989,10 @@ pub unsafe extern "C" fn infino_index_batch(
                 }
             };
             flat.insert(OSID.into(), Value::String(osid.to_string()));
+            if let Some(dims) = series.as_deref() {
+                let key = series_key(&flat, dims);
+                flat.insert(TSID.into(), Value::String(key));
+            }
             rows.push((i, flat));
         }
 
@@ -3027,6 +3135,7 @@ unsafe fn prepare(
     let kept = conn.kept(name);
     let engine = conn.engine_columns(name);
     let stamp = conn.stamp(name);
+    let series = conn.series(name);
 
     // Each row's id, source and routing value as borrowed slices of the
     // buffer, with its stamp and operation.
@@ -3056,6 +3165,10 @@ unsafe fn prepare(
         .map(|(id, src, routing, seq, op)| {
             conform_doc(src, &schema, &kept, &engine, stamp.as_deref()).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
+                if let Some(dims) = series.as_deref() {
+                    let key = series_key(&flat, dims);
+                    flat.insert(TSID.into(), Value::String(key));
+                }
                 if !routing.is_empty() {
                     flat.insert(ROUTING.into(), Value::String((*routing).to_string()));
                 }
@@ -3635,7 +3748,7 @@ fn vector_type(dt: &DataType) -> bool {
 /// Whether a column is the plugin's or the engine's own rather than one a
 /// document's field is stored in.
 fn bookkeeping(name: &str) -> bool {
-    matches!(name, OSID | SEQ | ROUTING | OP | GEN | HIT_SCORE) || name.starts_with('_')
+    matches!(name, OSID | SEQ | TSID | ROUTING | OP | GEN | HIT_SCORE) || name.starts_with('_')
 }
 
 /// One cell as a JSON value: a list column's cell as an array of its
