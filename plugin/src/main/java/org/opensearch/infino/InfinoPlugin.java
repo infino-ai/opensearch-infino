@@ -154,6 +154,20 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         Setting.Property.Final
     );
 
+    /**
+     * Whether the index holds a time series, such as metrics: its table then
+     * stores each date and integer column delta-encoded and each float column
+     * byte-stream-split, which shrinks timestamps that arrive in order and
+     * values that change slowly. Searches and aggregations work as on any
+     * index. Fixed when the index is created.
+     */
+    public static final Setting<Boolean> INFINO_TIMESERIES = Setting.boolSetting(
+        "index.infino.timeseries",
+        false,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
     /** The table behind the index, when it is to be named explicitly (to reattach an index to its rows). */
     public static final Setting<String> INFINO_TABLE = Setting.simpleString(
         "index.infino.table",
@@ -668,6 +682,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             INFINO_REBUILT,
             InfinoSkeletonAdopter.PAUSED,
             INFINO_EDGES,
+            INFINO_TIMESERIES,
             INFINO_TABLE,
             INFINO_ATTACHED,
             InfinoSearchWindow.FIELD,

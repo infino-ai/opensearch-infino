@@ -58,9 +58,9 @@ use infino::arrow_array::{
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
 use infino::{
-    connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions,
-    Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions,
-    SchemaError, SchemaPatch, Supertable,
+    connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnEncoding, ColumnIndex,
+    ConnectOptions, Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric,
+    OptimizeOptions, SchemaError, SchemaPatch, Supertable,
 };
 use rayon::prelude::*;
 
@@ -98,6 +98,20 @@ const OWN_COLUMN_PREFIX: &str = ".";
 /// mode ([`ROUTING`], [`OP`], [`GEN`]). Like [`RESERVED`], they hold no
 /// field: a document's field of the same name gets a column of its own.
 const ENGINE_COLUMNS: &str = "_engine_columns";
+/// Set to `true` in a table's mapping when its index is a time series
+/// (`index.infino.timeseries`): each date and integer column is then
+/// delta-encoded and each float column byte-stream-split in the table's
+/// Parquet body ([`timeseries_encoding`]).
+const TIMESERIES: &str = "_timeseries";
+
+/// How a time-series table encodes a column of `data_type`: delta for the
+/// types that take it (integers, dates, timestamps), byte stream split for
+/// floats, none for the rest.
+fn timeseries_encoding(data_type: &DataType) -> Option<ColumnEncoding> {
+    [ColumnEncoding::Delta, ColumnEncoding::ByteStreamSplit]
+        .into_iter()
+        .find(|encoding| encoding.accepts(data_type))
+}
 /// Separator used when a multi-valued string field lands in a scalar string
 /// column: the values are joined so a text index sees every token. The
 /// original array is still in `source`.
@@ -1492,6 +1506,17 @@ fn declare_table(
     check_only: bool,
 ) -> Result<Value, String> {
     let mut mapped = mapped_fields(mapping);
+    let timeseries = mapping
+        .get(TIMESERIES)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let encoding_of = |data_type: &DataType| {
+        if timeseries {
+            timeseries_encoding(data_type)
+        } else {
+            None
+        }
+    };
     let mut engine = Vec::new();
     if let Some(props) = mapping.get(ENGINE_COLUMNS).and_then(Value::as_object) {
         walk_properties(props, "", &mut engine);
@@ -1656,9 +1681,12 @@ fn declare_table(
                 .iter()
                 .filter(|f| schema.field_with_name(&f.path).is_err())
                 .map(|f| {
-                    let patch = FieldPatch::named(f.path.clone())
+                    let mut patch = FieldPatch::named(f.path.clone())
                         .with_type(f.data_type.clone())
                         .with_nullable(true);
+                    if let Some(encoding) = encoding_of(&f.data_type) {
+                        patch = patch.with_encoding(encoding);
+                    }
                     if f.range {
                         patch.with_index(ColumnIndex::Range)
                     } else {
@@ -1673,11 +1701,13 @@ fn declare_table(
             // A table made before the plugin kept sequence numbers gains the
             // column; its rows read as written at 0.
             if schema.field_with_name(SEQ).is_err() {
-                patches.push(
-                    FieldPatch::named(SEQ.to_string())
-                        .with_type(DataType::Int64)
-                        .with_nullable(true),
-                );
+                let mut patch = FieldPatch::named(SEQ.to_string())
+                    .with_type(DataType::Int64)
+                    .with_nullable(true);
+                if let Some(encoding) = encoding_of(&DataType::Int64) {
+                    patch = patch.with_encoding(encoding);
+                }
+                patches.push(patch);
             }
             let added = patches.len();
             if added > 0 {
@@ -1702,8 +1732,14 @@ fn declare_table(
             // manifest's per-superfile term bloom skips the files that cannot
             // hold the id. Scalar columns have only min/max per superfile.
             let mut spec = IndexSpec::new().fts(FtsField::new(OSID.to_string()));
+            if let Some(encoding) = encoding_of(&DataType::Int64) {
+                spec = spec.encoding(SEQ, encoding);
+            }
             for f in &mapped {
                 fields.push(Field::new(&f.path, f.data_type.clone(), true));
+                if let Some(encoding) = encoding_of(&f.data_type) {
+                    spec = spec.encoding(f.path.clone(), encoding);
+                }
                 if f.fts {
                     // Positions let a quoted phrase match adjacent terms in
                     // order (match_phrase, quoted atoms of a query_string).

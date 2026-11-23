@@ -68,6 +68,8 @@ public final class InfinoTables {
     private static final String PROPERTIES = "properties";
     /** Where a table's mapping declares the columns its engine writes, which the bridge keeps apart from the fields. */
     private static final String ENGINE_COLUMNS = "_engine_columns";
+    /** Set in a time-series index's table mapping (see {@link InfinoPlugin#INFINO_TIMESERIES}). */
+    private static final String TIMESERIES = "_timeseries";
     private static final String TYPE = "type";
     private static final String KEYWORD = "keyword";
     private static final String LONG = "long";
@@ -349,14 +351,17 @@ public final class InfinoTables {
      * sequence number column every table has does. An edge index's table
      * declares its edge columns as the engine's graph walks read them,
      * whatever the mapping says of them: the tables as strings, the ids as
-     * the engine's id type.
+     * the engine's id type. A time-series index's says so
+     * ({@link #TIMESERIES}), so its table encodes its dates and numbers as a
+     * time series.
      */
     @SuppressWarnings("unchecked")
     private static String tableMapping(IndexMetadata md) {
         MappingMetadata mapping = md.mapping();
         boolean stamped = InfinoPlugin.inDefaultMode(md.getSettings());
         boolean edges = InfinoPlugin.INFINO_EDGES.get(md.getSettings());
-        if (!stamped && !edges) {
+        boolean timeseries = InfinoPlugin.INFINO_TIMESERIES.get(md.getSettings());
+        if (!stamped && !edges && !timeseries) {
             return mapping == null ? "{}" : mapping.source().string();
         }
         Map<String, Object> properties = new LinkedHashMap<>();
@@ -376,6 +381,9 @@ public final class InfinoTables {
             engine.put(InfinoQueryTranslator.OP, Map.of(TYPE, LONG));
             engine.put(InfinoQueryTranslator.GEN, Map.of(TYPE, LONG));
             table.put(ENGINE_COLUMNS, engine);
+        }
+        if (timeseries) {
+            table.put(TIMESERIES, true);
         }
         // A data stream's timestamp field, which the bridge requires of each document.
         Object stream = mapping == null ? null : mapping.sourceAsMap().get(DataStreamFieldMapper.NAME);
