@@ -10,7 +10,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * An unfiltered terms aggregation in the default order over a keyword field
@@ -27,12 +26,6 @@ import java.util.Set;
  * buckets), with an empty string counted as its own bucket, and when a
  * document gives the field two values, which the engine's value counts do
  * not describe.
- *
- * <p>One difference is allowed. Once a segment has deletes, a one-shard
- * Lucene index collects the buckets instead of reading term frequencies and
- * reports its last collected bucket's count as the error bound, where it
- * reported 0 before. An index served from one table counts every value
- * exactly and reports 0 either way.
  */
 public class InfinoKeywordTermsTopIT extends InfinoRestTestCase {
 
@@ -63,6 +56,13 @@ public class InfinoKeywordTermsTopIT extends InfinoRestTestCase {
     }
 
     private static final String ERROR = "doc_count_error_upper_bound";
+
+    /**
+     * A Lucene twin's settings. Concurrent segment search is off: with it,
+     * each slice of a shard's segments keeps only its own top terms, so the
+     * shard's answer depends on how its segments happen to be laid out.
+     */
+    private static final String LUCENE = "\"index.infino.enabled\":false,\"index.search.concurrent_segment_search.mode\":\"none\"";
 
     /** Documents without the field: in the total, in no bucket. */
     private static final int WITHOUT = 5;
@@ -96,12 +96,10 @@ public class InfinoKeywordTermsTopIT extends InfinoRestTestCase {
         String dflt = prefix + "_default";
         // Each served index and the Lucene index it answers as.
         Map<String, String> twins = Map.of(proxy, exact, dflt, lucene);
-        // The served indices that count over one table.
-        Set<String> oneTable = shards == 1 ? Set.of(proxy, dflt) : Set.of(proxy);
         List<String> all = new ArrayList<>(List.of(lucene, proxy, dflt));
-        create(lucene, "\"index.infino.enabled\":false", shards);
+        create(lucene, LUCENE, shards);
         if (shards > 1) {
-            create(exact, "\"index.infino.enabled\":false", 1);
+            create(exact, LUCENE, 1);
             all.add(exact);
         }
         create(proxy, "\"index.infino.enabled\":true,\"index.infino.mode\":\"proxy\"", shards);
@@ -110,7 +108,7 @@ public class InfinoKeywordTermsTopIT extends InfinoRestTestCase {
         for (String index : all) {
             bulk(index, docs);
         }
-        assertSameTerms(twins, Set.of(), "loaded");
+        assertSameTerms(twins, "loaded");
         if (shards > 1) {
             // The reduce's error bound is in play: some shard left a value out.
             assertTrue(((Number) terms(search(lucene, body(5))).get(ERROR)).longValue() > 0);
@@ -134,7 +132,7 @@ public class InfinoKeywordTermsTopIT extends InfinoRestTestCase {
             Map<String, Object> out = call("POST", "/_bulk?refresh=true", body.toString());
             assertEquals(index + ": every delete applied", false, out.get("errors"));
         }
-        assertSameTerms(twins, oneTable, "after deletes");
+        assertSameTerms(twins, "after deletes");
     }
 
     private void create(String index, String settings, int shards) throws IOException {
@@ -196,23 +194,14 @@ public class InfinoKeywordTermsTopIT extends InfinoRestTestCase {
         assertEquals(index + ": every document indexed", false, out.get("errors"));
     }
 
-    /**
-     * Each size's aggregation, and the total, are the same in each served
-     * index as in its Lucene twin. For an index in {@code exact}, an error
-     * bound of 0 stands for the one its one-shard twin reports.
-     */
-    private void assertSameTerms(Map<String, String> twins, Set<String> exact, String when) throws IOException {
+    /** Each size's aggregation, and the total, are the same in each served index as in its Lucene twin. */
+    private void assertSameTerms(Map<String, String> twins, String when) throws IOException {
         for (int size : SIZES) {
             for (Map.Entry<String, String> twin : twins.entrySet()) {
                 String what = twin.getKey() + " " + when + " size " + size;
                 Map<String, Object> want = search(twin.getValue(), body(size));
                 assertFalse(what + ": Lucene has buckets", buckets(want).isEmpty());
-                Map<String, Object> got = search(twin.getKey(), body(size));
-                if (exact.contains(twin.getKey())) {
-                    assertEquals(what + ": counted exactly", 0L, ((Number) terms(got).get(ERROR)).longValue());
-                    terms(got).put(ERROR, terms(want).get(ERROR));
-                }
-                assertEquals(what, want, got);
+                assertEquals(what, want, search(twin.getKey(), body(size)));
             }
         }
     }
