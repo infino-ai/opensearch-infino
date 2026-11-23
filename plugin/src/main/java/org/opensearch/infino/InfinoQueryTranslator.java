@@ -1333,9 +1333,11 @@ final class InfinoQueryTranslator {
     }
 
     /**
-     * Whether a predicate holds a subquery by id (a text clause read over
-     * its token index, or a field's list values): one the engine joins to
-     * the rows above any search it ranks.
+     * Whether a predicate holds a subquery by id (a text clause the token
+     * index answers, or a field's list values), which the engine plans as a
+     * join that reads the whole table before it returns a row, and joins to
+     * the rows above any search it ranks. A string literal that happens to
+     * hold the same text only costs a page an order by row id.
      */
     static boolean joinsById(String predicate) {
         return predicate.contains(ID_SUBQUERY);
