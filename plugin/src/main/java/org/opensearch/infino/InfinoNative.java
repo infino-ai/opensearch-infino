@@ -1240,6 +1240,40 @@ public final class InfinoNative {
         return take(lib.infino_get(conn, name, osid));
     }
 
+    /**
+     * {@link #getSourceFresh} as of the table's latest commit, as
+     * {@link #latestRows} reads: for a write that merges into the document
+     * when the last node to write the table may be another. A lookup that
+     * fails throws rather than answering that the table holds no such id.
+     */
+    public static String getSourceLatest(String name, String osid) {
+        init();
+        Pointer p = lib.infino_get_latest(conn, name, osid);
+        if (p == null) {
+            throw new InfinoException("reading " + osid + " from the latest commit of " + name + " failed", RestStatus.SERVICE_UNAVAILABLE);
+        }
+        return take(p);
+    }
+
+    /**
+     * Keep the connection the latest reads ({@link #latestRows},
+     * {@link #getSourceLatest}) go through open until {@link #releaseLatest},
+     * for a reader that reads the latest commit for each batch it writes.
+     * The connection holds a handle to each table it has read, each keeping
+     * that table's manifest in memory beside the one the node's own
+     * connection holds, so it closes after each read no one holds it for.
+     */
+    public static void holdLatest() {
+        init();
+        lib.infino_hold_latest(conn);
+    }
+
+    /** Let go of a hold {@link #holdLatest} took. */
+    public static void releaseLatest() {
+        init();
+        lib.infino_release_latest(conn);
+    }
+
     /** One document as the table holds it: its source and the sequence number it was written under. */
     public record Doc(String source, long seq) {}
 
@@ -1532,19 +1566,34 @@ public final class InfinoNative {
         return probe(name, osids, true, false);
     }
 
+    /** {@link #storedSeqs} as of the table's latest commit ({@link #latestRows}). */
+    public static Map<String, Long> storedSeqsLatest(String name, Collection<String> osids) {
+        return probe(name, osids, true, true);
+    }
+
     private static Map<String, Long> probe(String name, Collection<String> osids, boolean withSeqs, boolean latest) {
         Set<String> wanted = new HashSet<>(osids);
         Map<String, Long> found = new HashMap<>();
         List<String> batch = new ArrayList<>(PROBE_IDS_PER_STATEMENT);
-        for (String id : wanted) {
-            batch.add(id);
-            if (batch.size() == PROBE_IDS_PER_STATEMENT) {
-                probe(name, batch, withSeqs, latest, wanted, found);
-                batch.clear();
-            }
+        // A latest probe's statements share one connection.
+        if (latest) {
+            holdLatest();
         }
-        if (!batch.isEmpty()) {
-            probe(name, batch, withSeqs, latest, wanted, found);
+        try {
+            for (String id : wanted) {
+                batch.add(id);
+                if (batch.size() == PROBE_IDS_PER_STATEMENT) {
+                    probe(name, batch, withSeqs, latest, wanted, found);
+                    batch.clear();
+                }
+            }
+            if (!batch.isEmpty()) {
+                probe(name, batch, withSeqs, latest, wanted, found);
+            }
+        } finally {
+            if (latest) {
+                releaseLatest();
+            }
         }
         return found;
     }
