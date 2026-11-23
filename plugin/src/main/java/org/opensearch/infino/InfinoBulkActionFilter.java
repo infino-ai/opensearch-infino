@@ -175,6 +175,10 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
      * as it came, unless it carries updates to default-mode indices, which are
      * turned into writes of the whole document first ({@link #engineUpdates})
      * and their responses back into the ones the client's bulk expects.
+     * Merging an update reads its document from the table, which can wait on
+     * the hosted service, so a bulk carrying such updates is merged on the
+     * write pool, never on the thread that delivered it; a full queue
+     * refuses it with 429, as a stock bulk's is.
      */
     private <Request extends ActionRequest, Response extends ActionResponse> void toShards(
         Task task,
@@ -186,13 +190,40 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
         ClusterService clusters,
         ActionListener<BulkResponse> cast
     ) {
-        EngineBulk routed;
+        ClusterState state = clusters.state();
+        List<String> concrete;
         try {
-            routed = engineUpdates(clusters.state(), bulk, concreteIndices(clusters.state(), bulk), tables);
+            concrete = concreteIndices(state, bulk);
         } catch (Exception e) {
             listener.onFailure(e);
             return;
         }
+        if (!carriesEngineUpdates(state, bulk, concrete)) {
+            chain.proceed(task, action, request, listener);
+            return;
+        }
+        InfinoServices.fork(ThreadPool.Names.WRITE, listener::onFailure, () -> {
+            EngineBulk routed;
+            try {
+                routed = engineUpdates(state, bulk, concrete, tables);
+            } catch (Exception e) {
+                listener.onFailure(e);
+                return;
+            }
+            proceed(task, action, request, listener, chain, cast, routed);
+        });
+    }
+
+    /** {@code request} on down the chain, as {@code routed} turned it when it carried default-mode updates (null when it did not). */
+    private static <Request extends ActionRequest, Response extends ActionResponse> void proceed(
+        Task task,
+        String action,
+        Request request,
+        ActionListener<Response> listener,
+        ActionFilterChain<Request, Response> chain,
+        ActionListener<BulkResponse> cast,
+        EngineBulk routed
+    ) {
         if (routed == null) {
             chain.proceed(task, action, request, listener);
             return;
@@ -440,11 +471,13 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                 // The write lands on another node, which this node's request cache
                 // does not hear from: its responses over these tables move away here
                 // before the write, and once it is answered nothing read from them is
-                // kept until this node's reads are sure to see it.
+                // kept until this node's reads are sure to see it. The tables are only
+                // named here, not declared: declaring may wait on the hosted service, on
+                // the thread that delivered the bulk, and the node writing them declares them.
                 Map<String, IndexMetadata> written = new LinkedHashMap<>();
                 try {
                     for (IndexMetadata md : partInfino.values()) {
-                        written.put(tables.ensure(md), md);
+                        written.put(InfinoNative.tableFor(md.getIndex(), md.getSettings()), md);
                     }
                 } catch (Exception e) {
                     partListener.onFailure(e);
@@ -461,6 +494,23 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                 }));
             }
         }
+    }
+
+    /** Whether the bulk carries an update to a default-mode index, which {@link #engineUpdates} merges. */
+    static boolean carriesEngineUpdates(ClusterState state, BulkRequest bulk, List<String> concrete) {
+        List<DocWriteRequest<?>> items = bulk.requests();
+        for (int slot = 0; slot < items.size(); slot++) {
+            if (engineUpdate(state, items.get(slot), concrete.get(slot)) != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The index metadata of {@code item} when it is an update to a default-mode index; else null. */
+    private static IndexMetadata engineUpdate(ClusterState state, DocWriteRequest<?> item, String concrete) {
+        IndexMetadata md = concrete == null ? null : state.metadata().index(concrete);
+        return item instanceof UpdateRequest && md != null && InfinoPlugin.inDefaultMode(md.getSettings()) ? md : null;
     }
 
     /**
@@ -480,10 +530,11 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
         Map<Integer, BulkItemResponse> answered = new LinkedHashMap<>();
         Map<Integer, DocWriteRequest<?>> writes = new HashMap<>();
         for (int slot = 0; slot < items.size(); slot++) {
-            IndexMetadata md = concrete.get(slot) == null ? null : state.metadata().index(concrete.get(slot));
-            if (!(items.get(slot) instanceof UpdateRequest update) || md == null || !InfinoPlugin.inDefaultMode(md.getSettings())) {
+            IndexMetadata md = engineUpdate(state, items.get(slot), concrete.get(slot));
+            if (md == null) {
                 continue;
             }
+            UpdateRequest update = (UpdateRequest) items.get(slot);
             updates.add(slot);
             String index = md.getIndex().getName();
             if (update.script() != null) {

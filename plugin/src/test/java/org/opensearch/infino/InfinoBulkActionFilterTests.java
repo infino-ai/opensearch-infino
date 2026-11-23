@@ -7,30 +7,55 @@ package org.opensearch.infino;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.Version;
 import org.opensearch.action.DocWriteRequest;
+import org.opensearch.action.bulk.BulkAction;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
+import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.index.IndexRequest;
+import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.support.AutoCreateIndex;
+import org.opensearch.action.support.PlainActionFuture;
+import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.indices.SystemIndices;
+import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.threadpool.TestThreadPool;
+import org.opensearch.threadpool.ThreadPool;
 
+import com.sun.jna.Memory;
+import com.sun.jna.Pointer;
+
+import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** How a bulk's items that require their index be an alias are answered. */
 public class InfinoBulkActionFilterTests extends OpenSearchTestCase {
+
+    /** A writer's batch bounds, unused by a bulk that goes on to the shards. */
+    private static final int MAX_DOCS = 10;
+    private static final long MAX_BYTES = 1 << 20;
+    /** The name of the thread a test delivers a bulk on. */
+    private static final String CALLER = "bulk-caller";
+    /** How long a test waits for a step that should take moments. */
+    private static final long WAIT_SECONDS = 5;
 
     private static IndexRequest write(String index, boolean requireAlias) {
         return new IndexRequest(index).id("1").source(Map.of("f", 1)).setRequireAlias(requireAlias);
@@ -189,5 +214,91 @@ public class InfinoBulkActionFilterTests extends OpenSearchTestCase {
         String openEnded = "<logs-{now/d>";
         expectThrows(RuntimeException.class, () -> resolver.resolveDateMathExpression(openEnded));
         assertNull(InfinoBulkActionFilter.notCreated(write(openEnded, false), Set.of(openEnded), Metadata.EMPTY_METADATA, resolver));
+    }
+
+    /**
+     * A bulk updating a document of a default-mode index reads the document
+     * from the table to merge the update into it. That read can wait on the
+     * hosted service, so it runs on the write pool: the thread that delivered
+     * the bulk, a transport worker on a node, returns at once while the read
+     * waits, and the bulk goes on to the shards once the read answers.
+     */
+    public void testAnUpdateWaitingOnTheTableHoldsNotTheThreadThatDeliveredIt() throws Exception {
+        CountDownLatch reading = new CountDownLatch(1);
+        CountDownLatch answer = new CountDownLatch(1);
+        AtomicReference<String> readOn = new AtomicReference<>();
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        try {
+            IndexMetadata logs = IndexMetadata.builder("logs")
+                .settings(
+                    settings(Version.CURRENT).put(InfinoPlugin.INFINO_ENABLED.getKey(), true)
+                        .put(InfinoPlugin.INFINO_MODE.getKey(), InfinoPlugin.MODE_DEFAULT)
+                        .put(IndexMetadata.SETTING_INDEX_UUID, "logs-uuid")
+                )
+                .numberOfShards(1)
+                .numberOfReplicas(0)
+                .build();
+            ClusterServiceUtils.setState(
+                clusterService,
+                ClusterState.builder(clusterService.state()).metadata(Metadata.builder(clusterService.state().metadata()).put(logs, false))
+            );
+            InfinoServices.bind(clusterService, threadPool);
+            InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> {
+                switch (method.getName()) {
+                    case "infino_open_with":
+                        return new Memory(1);
+                    case "infino_ensure_table":
+                        return nativeString("{}");
+                    case "infino_get":
+                        readOn.set(Thread.currentThread().getName());
+                        reading.countDown();
+                        answer.await();
+                        return nativeString("{\"f\":1}");
+                    default:
+                        return null;
+                }
+            }));
+            InfinoBulkActionFilter filter = new InfinoBulkActionFilter(
+                () -> clusterService,
+                new InfinoTables(),
+                () -> new InfinoWriter(() -> Runnable::run, MAX_DOCS, MAX_BYTES)
+            );
+            BulkRequest bulk = new BulkRequest().add(new UpdateRequest("logs", "1").doc(Map.of("f", 2)));
+            AtomicReference<BulkRequest> proceeded = new AtomicReference<>();
+            CountDownLatch onToShards = new CountDownLatch(1);
+            ActionFilterChain<BulkRequest, BulkResponse> chain = (task, action, request, listener) -> {
+                proceeded.set(request);
+                onToShards.countDown();
+            };
+            PlainActionFuture<BulkResponse> answered = new PlainActionFuture<>();
+            // The thread that delivers the bulk, as a transport worker would.
+            Thread caller = new Thread(() -> filter.filter(null, BulkAction.NAME, bulk, answered, chain), CALLER);
+            caller.start();
+            assertTrue("the read reached the bridge", reading.await(WAIT_SECONDS, TimeUnit.SECONDS));
+            caller.join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+            assertFalse("the caller returned while the read waits", caller.isAlive());
+            assertNotEquals(CALLER, readOn.get());
+            assertTrue(readOn.get(), readOn.get().contains("[" + ThreadPool.Names.WRITE + "]"));
+            assertNull("nothing went on to the shards before the read answered", proceeded.get());
+            answer.countDown();
+            assertTrue(onToShards.await(WAIT_SECONDS, TimeUnit.SECONDS));
+            IndexRequest merged = (IndexRequest) proceeded.get().requests().get(0);
+            assertEquals(Map.of("f", 2), merged.sourceAsMap());
+        } finally {
+            answer.countDown();
+            InfinoServices.bind(null, null);
+            InfinoNative.useLib(null);
+            clusterService.close();
+            terminate(threadPool);
+        }
+    }
+
+    private static Pointer nativeString(String s) {
+        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+        Memory m = new Memory(bytes.length + 1);
+        m.write(0, bytes, 0, bytes.length);
+        m.setByte(bytes.length, (byte) 0);
+        return m;
     }
 }
