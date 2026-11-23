@@ -20,9 +20,10 @@ crate-type = ["cdylib", "rlib"]
 # filtered `ORDER BY col NULLS LAST, _id LIMIT k` in the column's index order
 # and stops at k, which the sorted pages' statements rely on for speed; 0.11.33
 # reads a top-k on _id by id block and skips the row groups its bound rules
-# out; 0.11.36 reads a limited scan of at most two batches in file order, which
-# the unsorted pages rely on. Since 0.11.26 the engine writes the manifest list
-# format 4.0, which builds before 0.11.26 cannot read.
+# out; 0.11.36 adds `bm25_search_fields`, which ranks a query string across its
+# text columns, and reads a limited scan of at most two batches in file order,
+# which the unsorted pages rely on. Since 0.11.26 the engine writes the manifest
+# list format 4.0, which builds before 0.11.26 cannot read.
 infino = { version = "=0.11.36", features = ["remote", "graph-index"] }
 # serde_json comes re-exported from infino, so the two never disagree.
 # Same major as infino so the delete-predicate Expr is the same type infino expects.

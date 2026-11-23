@@ -198,8 +198,9 @@ public final class InfinoSearch {
 
         /**
          * Whether the hits' scores differ by the query's text: a ranked text
-         * clause, scoring clauses that reorder it, or text the table cannot
-         * rank ({@link Scoring#unrankable}). Every hit of another query
+         * clause, scoring clauses that reorder it, a query string across
+         * several text columns ({@link Scoring#across}), or text the table
+         * cannot rank ({@link Scoring#unrankable}). Every hit of another query
          * scores the same constant ({@link #constantScore}).
          */
         boolean scored() {
@@ -656,7 +657,7 @@ public final class InfinoSearch {
     /** Whether the hits of {@code query} score by its text ({@link Plan#scored}). */
     private static boolean scored(Translation query) {
         Scoring scoring = query.scoring();
-        return query.ranked() != null || scoring.reorders() || scoring.unrankable();
+        return query.ranked() != null || scoring.reorders() || scoring.unrankable() || scoring.across() != null;
     }
 
     /**
@@ -665,7 +666,9 @@ public final class InfinoSearch {
      * by the fields alone, which is served. A scored query is read ranked by
      * its score, best first, the fields ordering hits that tie on it
      * ({@link #scoredStatement}): the score must be the first sort, and
-     * descending, and the query's score one the table ranks. A collapse picks
+     * descending, and the query's score one the table ranks beside fields
+     * (not a query string across several text columns, which only its own
+     * ranked search scores, {@link #acrossStatement}). A collapse picks
      * each group's first by a score its statement does not compute, a
      * search_after resumes from a score no keyset can compare against, a
      * field named {@code score} would share the score's column, and a vector
@@ -688,6 +691,9 @@ public final class InfinoSearch {
         }
         if (scoring.unrankable()) {
             throw new IllegalArgumentException(what + " is not served for a query whose score the table does not rank");
+        }
+        if (scoring.across() != null) {
+            throw new IllegalArgumentException(what + " is not served for a query string scored across several text columns");
         }
         if (source.collapse() != null) {
             throw new IllegalArgumentException(what + " is not served with collapse on a scored query");
@@ -1076,9 +1082,14 @@ public final class InfinoSearch {
         return source.trackScores() && plan.scored() && !plan.sorts().isEmpty() && !plan.ranksByScore();
     }
 
-    /** Whether the hit statement of {@code q} unsorted selects each hit's score: a ranked text clause, or scoring clauses that reorder it. */
-    private static boolean readsScore(Translation q) {
-        return q.ranked() != null || q.scoring().reorders();
+    /**
+     * Whether the hit statement of {@code plan}, unsorted, selects each hit's
+     * score: a ranked text clause, scoring clauses that reorder it, or a
+     * query string ranked across several text columns ({@link #ranksAcross}).
+     */
+    private static boolean readsScore(Plan plan) {
+        Translation q = plan.query();
+        return q.ranked() != null || q.scoring().reorders() || ranksAcross(plan);
     }
 
     /**
@@ -1090,7 +1101,7 @@ public final class InfinoSearch {
      * predicate keeps the document-level rule and the read's visibility cut,
      * so each id is read as the page read it; the engine ranks within the ids
      * (a plain predicate it applies before ranking), so none falls past the
-     * window. Null when that statement reads no score ({@link #readsScore}):
+     * window. Null when the unsorted page, post_filter and all, reads no score ({@link #readsScore}):
      * every hit then scores the constant, as the unsorted page's do. An id
      * deleted since the page was read has no score.
      */
@@ -1103,7 +1114,7 @@ public final class InfinoSearch {
                 ids.add(id.toString());
             }
         }
-        if (!readsScore(q)) {
+        if (!readsScore(plan.unsorted(q, plan.postWhere()))) {
             return null;
         }
         Map<String, Object> scores = new HashMap<>();
@@ -1601,9 +1612,13 @@ public final class InfinoSearch {
         return !plan.sorts().isEmpty() && plan.collapse() == null;
     }
 
-    /** Whether {@link #hitRows} reads this page's sources by id ({@link #sourcesById}) after its rows. */
+    /**
+     * Whether {@link #hitRows} reads this page's sources by id after its
+     * rows: a sorted page's ({@link #sourcesById}), or a page ranked across
+     * text columns, whose ranked search returns no source ({@link #ranksAcross}).
+     */
     private static boolean readsSourcesById(Plan plan, SearchSourceBuilder source, boolean resumed) {
-        return plan.vector() == null && !readsUnsorted(plan, resumed) && sourcesById(plan) && wantsSource(source);
+        return plan.vector() == null && !readsUnsorted(plan, resumed) && (sourcesById(plan) || ranksAcross(plan)) && wantsSource(source);
     }
 
     /** Whether a hit's response carries its source. */
@@ -1883,6 +1898,9 @@ public final class InfinoSearch {
             where = "(" + where + ") AND " + keysetPredicate(plan, part);
         }
         boolean sorted = !plan.sorts().isEmpty();
+        if (ranksAcross(plan)) {
+            return acrossStatement(plan, fetch, withSeq);
+        }
         if (scoredPage(plan) || plan.ranksByScore()) {
             return scoredStatement(plan, hit.toString(), where, fetch, withSeq, window, withSource);
         }
@@ -1925,6 +1943,49 @@ public final class InfinoSearch {
         return "SELECT " + hit + " FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY " + within
             + ") AS " + rank + " FROM " + from + " t WHERE " + where + ") WHERE " + rank + " = 1"
             + " ORDER BY " + within + " LIMIT " + fetch;
+    }
+
+    /**
+     * Whether the page is a query string's BM25 across several text columns
+     * ({@link InfinoQueryTranslator.Across}), in no other order, read by
+     * {@link #acrossStatement}: no sort, collapse, search_after or scripted
+     * field, and every other predicate one the ranked searches take as their
+     * filter (none joined by id after the ranking).
+     */
+    static boolean ranksAcross(Plan plan) {
+        InfinoQueryTranslator.Across across = plan.query().scoring().across();
+        if (across == null
+            || plan.query().principal() != null
+            || !plan.sorts().isEmpty()
+            || plan.collapse() != null
+            || plan.searchAfter() != null
+            || !plan.scriptFields().isEmpty()) {
+            return false;
+        }
+        String where = plan.hitWhere();
+        return where.contains(across.match()) && !InfinoQueryTranslator.joinsAfterRanking(acrossFilter(plan));
+    }
+
+    /** The hits' predicate without the query string's own: the filter each ranked search takes. */
+    private static String acrossFilter(Plan plan) {
+        return plan.hitWhere().replace(plan.query().scoring().across().match(), InfinoQueryTranslator.ALL);
+    }
+
+    /**
+     * The page of a query string ranked across several text columns, as
+     * stock scores it: the engine's {@code bm25_search_fields} ranks within
+     * the rows the other predicates keep, each clause by its best column
+     * (dis_max) and the sum over the clauses a document matches. The
+     * engine's top-k is exact for any number of clauses and matches, and
+     * ties go in the order the documents were written. The sources are read
+     * by id after.
+     */
+    static String acrossStatement(Plan plan, int fetch, boolean withSeq) {
+        Translation q = plan.query();
+        String filter = acrossFilter(plan);
+        return "SELECT " + InfinoQueryTranslator.OSID + ", score, " + InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID) + " AS infino_row"
+            + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "") + " FROM " + q.rankedFrom(q.scoring().across(), fetch)
+            + (InfinoQueryTranslator.ALL.equals(filter) ? "" : " WHERE " + filter) + " ORDER BY score DESC, infino_row ASC LIMIT " + fetch;
     }
 
     /**
