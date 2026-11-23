@@ -745,7 +745,7 @@ public final class InfinoSearch {
     static String filteredKnnStatement(String table, VectorRequest v) {
         String csv = floatsToJson(v.vector());
         csv = csv.substring(1, csv.length() - 1);
-        return "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + ", score FROM vector_search("
+        return "SELECT " + InfinoQueryTranslator.OSID + ", score FROM vector_search("
             + InfinoQueryTranslator.literal(table)
             + ", "
             + InfinoQueryTranslator.literal(v.vectorColumn())
@@ -954,9 +954,11 @@ public final class InfinoSearch {
     static final int SOURCE_REREADS = 2;
 
     /**
-     * The page's rows from its hit statement, with their sources when they
-     * are read by id; {@code resumed} as {@link #page} takes it. How many rows
-     * the statement chose goes in {@code chosen}.
+     * The page's rows from its hit statement, each with its document when the
+     * hits need it: read in the same call as the page ({@link InfinoNative#sqlDocs}),
+     * or by id once the rows are chosen ({@link #readsSourcesById});
+     * {@code resumed} as {@link #page} takes it. How many rows the statement
+     * chose goes in {@code chosen}.
      */
     private static List<Map<String, Object>> hitRows(
         Plan plan,
@@ -1019,39 +1021,45 @@ public final class InfinoSearch {
         boolean seqNoAndPrimaryTerm,
         boolean resumed
     ) {
-        if (readsUnsorted(plan, resumed)) {
-            return InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm, wantsSource(source)));
+        // Main read a page's documents in its statement unless a sorted page
+        // reads them by id afterwards (readsSourcesById); they now come with
+        // the page from its columns in the same call.
+        boolean unsorted = readsUnsorted(plan, resumed);
+        boolean docs = wantsSource(source) && (unsorted || !sourcesById(plan));
+        if (unsorted) {
+            return pageRows(plan, unsortedStatement(plan, fetch, seqNoAndPrimaryTerm), fetch, docs);
         }
         List<Map<String, Object>> rows;
         if (splitsMissingTail(plan)) {
             // The rows past a present first sort value come first; the
             // rows missing it follow them all, so they are read only
             // when the first part leaves the page short.
-            rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
+            rows = pageRows(plan, hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT), fetch, docs);
             if (rows.size() < fetch) {
+                int rest = fetch - rows.size();
                 rows = new ArrayList<>(rows);
-                rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
+                rows.addAll(pageRows(plan, hitStatement(plan, rest, seqNoAndPrimaryTerm, Keyset.MISSING), rest, docs));
             }
         } else {
-            rows = windowedRows(plan, fetch, seqNoAndPrimaryTerm, !sourcesById(plan));
+            rows = windowedRows(plan, fetch, seqNoAndPrimaryTerm, docs);
         }
         return rows;
     }
 
     /**
-     * The rows of {@code plan}'s hit statement, each with its source when
-     * {@code withSource}: every candidate ranked when a ranked window could
+     * The rows of {@code plan}'s hit statement, each with its document when
+     * {@code docs} ({@link #pageRows}): every candidate ranked when a ranked window could
      * have cut off one that belongs among them ({@link #windowCutsPage}), so
      * the rows are the ones stock returns.
      */
-    private static List<Map<String, Object>> windowedRows(Plan plan, int fetch, boolean withSeq, boolean withSource) {
-        List<Map<String, Object>> rows = InfinoNative.sqlRows(hitStatement(plan, fetch, withSeq, Keyset.WHOLE, RANK_WINDOW, withSource));
+    private static List<Map<String, Object>> windowedRows(Plan plan, int fetch, boolean withSeq, boolean docs) {
+        List<Map<String, Object>> rows = pageRows(plan, hitStatement(plan, fetch, withSeq, Keyset.WHOLE, RANK_WINDOW), fetch, docs);
         if (windowCutsPage(plan, rows, fetch)) {
             TextClause text = rankedText(plan);
             long candidates = InfinoNative.count(plan.table(), text.column(), text.query(), text.mode());
             if (candidates > RANK_WINDOW) {
                 int window = (int) Math.min(Integer.MAX_VALUE, candidates);
-                rows = InfinoNative.sqlRows(hitStatement(plan, fetch, withSeq, Keyset.WHOLE, window, withSource));
+                rows = pageRows(plan, hitStatement(plan, fetch, withSeq, Keyset.WHOLE, window), fetch, docs);
             }
         }
         return rows;
@@ -1111,7 +1119,7 @@ public final class InfinoSearch {
         String where = InfinoQueryTranslator.ALL.equals(q.where()) ? idsIn : idsIn + " AND (" + q.where() + ")";
         Plan byId = plan.unsorted(q.withWhere(where), null);
         int n = ids.size();
-        for (Map<String, Object> row : InfinoNative.sqlRows(hitStatement(byId, n, false, Keyset.WHOLE, Math.max(RANK_WINDOW, n), false))) {
+        for (Map<String, Object> row : InfinoNative.sqlRows(hitStatement(byId, n, false, Keyset.WHOLE, Math.max(RANK_WINDOW, n)))) {
             Object id = row.get(InfinoQueryTranslator.OSID);
             if (id != null) {
                 scores.put(id.toString(), row.get(SCORE));
@@ -1148,6 +1156,14 @@ public final class InfinoSearch {
             return InfinoNative.sortedRows(plan.table(), first.name(), first.desc(), fetch, withSource);
         }
         return null;
+    }
+
+    /**
+     * The rows of a page's statement, each of the first {@code fetch} with its
+     * document when {@code docs}: the statement and the documents in one call.
+     */
+    private static List<Map<String, Object>> pageRows(Plan plan, String sql, int fetch, boolean docs) {
+        return docs ? InfinoNative.sqlDocs(plan.table(), sql, fetch) : InfinoNative.sqlRows(sql);
     }
 
     /**
@@ -1229,7 +1245,7 @@ public final class InfinoSearch {
                 // back with its id, score and source.
                 int want = stockKnn ? v.k() : Math.max(fetch, 1);
                 if (v.filter() != null) {
-                    rows = InfinoNative.sqlRows(filteredKnnStatement(plan.table(), v));
+                    rows = InfinoNative.sqlDocs(plan.table(), filteredKnnStatement(plan.table(), v), InfinoNative.ALL_ROWS);
                 } else {
                     String json = v.hybrid()
                         ? InfinoNative.hybrid(plan.table(), v.textColumn(), v.textQuery(), v.vectorColumn(), emb, want)
@@ -1664,8 +1680,7 @@ public final class InfinoSearch {
     }
 
     /**
-     * The statement that fetches the page's hits: each hit's id, its source
-     * unless {@link #sourcesById} reads it afterwards, sort values, its
+     * The statement that fetches the page's hits: each hit's id, sort values, its
      * sequence number when {@code withSeq} (the request asks for
      * {@code seq_no_primary_term}) and, under a collapse, its collapse value.
      * A sorted request
@@ -1706,18 +1721,15 @@ public final class InfinoSearch {
     /**
      * The statement {@link #readsUnsorted} reads a page with: the sorted
      * statement's rows ({@link #hitStatement}, unranked, as a field sort
-     * selects them) with no order, each with its source when
-     * {@code withSource} (the hit returns it or reads requested fields from
-     * it). A text query is neither ranked by BM25 nor scored, so the page is
+     * selects them) with no order; {@link #pageRows} reads their documents
+     * with them when the hits need them. A text query is neither ranked by BM25 nor scored, so the page is
      * the rows the sorted read would select, not the best-scoring ones. With
      * no order the read stops at its LIMIT; ordering by the row id would read
      * the id of every row the filter keeps. Two pages of one search can then
      * start from different files (#107).
      */
-    static String unsortedStatement(Plan plan, int fetch, boolean withSeq, boolean withSource) {
-        String hit = InfinoQueryTranslator.OSID
-            + (withSource ? ", " + InfinoQueryTranslator.SOURCE : "")
-            + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "");
+    static String unsortedStatement(Plan plan, int fetch, boolean withSeq) {
+        String hit = InfinoQueryTranslator.OSID + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "");
         Unranked read = unranked(plan.query(), plan.hitWhere());
         return "SELECT " + hit + " FROM " + read.from() + " WHERE " + read.where() + " LIMIT " + fetch;
     }
@@ -1817,19 +1829,8 @@ public final class InfinoSearch {
      * {@code window} candidates where a step removes rows after the ranking.
      */
     static String hitStatement(Plan plan, int fetch, boolean withSeq, Keyset part, int window) {
-        return hitStatement(plan, fetch, withSeq, part, window, !sourcesById(plan));
-    }
-
-    /**
-     * As {@link #hitStatement(Plan, int, boolean, Keyset, int)}, each hit
-     * with its source when {@code withSource}.
-     */
-    static String hitStatement(Plan plan, int fetch, boolean withSeq, Keyset part, int window, boolean withSource) {
         Translation q = plan.query();
         StringBuilder hit = new StringBuilder(InfinoQueryTranslator.OSID);
-        if (withSource) {
-            hit.append(", ").append(InfinoQueryTranslator.SOURCE);
-        }
         if (withSeq) {
             hit.append(", ").append(InfinoQueryTranslator.SEQ);
         }
@@ -1855,7 +1856,7 @@ public final class InfinoSearch {
         }
         boolean sorted = !plan.sorts().isEmpty();
         if (scoredPage(plan) || plan.ranksByScore()) {
-            return scoredStatement(plan, hit.toString(), where, fetch, withSeq, window, withSource);
+            return scoredStatement(plan, hit.toString(), where, fetch, withSeq, window);
         }
         boolean ranked = !sorted && q.ranked() != null;
         String from;
@@ -1932,20 +1933,12 @@ public final class InfinoSearch {
      * when the page reaches it ({@link #windowCutsPage}).
      */
     static String scoredStatement(Plan plan, String hit, String where, int fetch, boolean withSeq, int window) {
-        return scoredStatement(plan, hit, where, fetch, withSeq, window, !sourcesById(plan));
-    }
-
-    /** As {@link #scoredStatement(Plan, String, String, int, boolean, int)}, {@code hit} selecting each hit's source when {@code withSource}. */
-    static String scoredStatement(Plan plan, String hit, String where, int fetch, boolean withSeq, int window, boolean withSource) {
         Translation q = plan.query();
         Scoring scoring = q.scoring();
         boolean sorted = !plan.sorts().isEmpty();
         String rowId = InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID);
         List<String> names = new ArrayList<>();
         names.add(InfinoQueryTranslator.OSID);
-        if (withSource) {
-            names.add(InfinoQueryTranslator.SOURCE);
-        }
         if (withSeq) {
             names.add(InfinoQueryTranslator.SEQ);
         }

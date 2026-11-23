@@ -493,7 +493,7 @@ public class InfinoAggregationProcessor {
                 total = counter.get();
             }
             if (spec instanceof TopHits th) {
-                byName.put(spec.name(), th.build(topHitRows(th, relation, where), total, index));
+                byName.put(spec.name(), th.build(topHitRows(tables, th, relation, where), total, index));
                 continue;
             }
             byName.put(spec.name(), evalBucket((BucketSpec) spec, relation, where, total));
@@ -3017,16 +3017,21 @@ public class InfinoAggregationProcessor {
     private List<InternalAggregation> bucketHits(BucketSpec spec, String from, String where, long docCount) {
         List<InternalAggregation> out = new ArrayList<>();
         for (TopHits th : spec.hits) {
-            out.add(th.build(topHitRows(th, from, where), docCount, index));
+            out.add(th.build(topHitRows(tables, th, from, where), docCount, index));
         }
         return out;
     }
 
-    /** The first rows of {@code from WHERE where} in the top_hits' order, each with its id, source and sort values. */
-    private static List<Map<String, Object>> topHitRows(TopHits th, String from, String where) {
-        List<String> cols = new ArrayList<>(List.of(InfinoQueryTranslator.OSID, InfinoQueryTranslator.SOURCE));
+    /**
+     * The first rows of {@code from WHERE where} in the top_hits' order, each
+     * with its id, sort values and document, the document read in the same
+     * call from whichever of {@code tables} holds the row.
+     */
+    private static List<Map<String, Object>> topHitRows(List<String> tables, TopHits th, String from, String where) {
+        List<String> cols = new ArrayList<>(List.of(InfinoQueryTranslator.OSID));
         cols.addAll(th.rowColumns());
-        return InfinoNative.sqlRows("SELECT " + String.join(", ", cols) + " FROM " + from + " WHERE " + where + " ORDER BY " + th.order() + " LIMIT " + th.fetch());
+        String sql = "SELECT " + String.join(", ", cols) + " FROM " + from + " WHERE " + where + " ORDER BY " + th.order() + " LIMIT " + th.fetch();
+        return InfinoNative.sqlDocs(String.join(",", tables), sql, InfinoNative.ALL_ROWS);
     }
 
     /**
@@ -3563,7 +3568,7 @@ public class InfinoAggregationProcessor {
                 }
                 kept.add(tuple);
             }
-            hitsByLevel.add(levelHits(chain, i, kept, from, where));
+            hitsByLevel.add(levelHits(tables, chain, i, kept, from, where));
             if (rows.isEmpty()) {
                 break;
             }
@@ -4393,7 +4398,14 @@ public class InfinoAggregationProcessor {
      * request's order. Keyed by the bucket's key tuple, one row list per
      * top_hits in spec order.
      */
-    private static Map<String, List<List<Map<String, Object>>>> levelHits(List<Grouped> chain, int i, List<List<Object>> kept, String from, String where) {
+    private static Map<String, List<List<Map<String, Object>>>> levelHits(
+        List<String> tables,
+        List<Grouped> chain,
+        int i,
+        List<List<Object>> kept,
+        String from,
+        String where
+    ) {
         Grouped level = chain.get(i);
         Map<String, List<List<Map<String, Object>>>> out = new HashMap<>();
         if (level.hits.isEmpty() || kept.isEmpty()) {
@@ -4415,12 +4427,11 @@ public class InfinoAggregationProcessor {
             TopHits th = level.hits.get(h);
             List<String> cols = new ArrayList<>(aliases);
             cols.add(InfinoQueryTranslator.OSID);
-            cols.add(InfinoQueryTranslator.SOURCE);
             cols.addAll(th.rowColumns());
             String sql = "SELECT " + String.join(", ", cols) + " FROM (SELECT t.*, " + String.join(", ", keyCols) + ", ROW_NUMBER() OVER (PARTITION BY "
                 + String.join(", ", keyExprs) + " ORDER BY " + th.order() + ") AS hit_rank FROM " + from + " t WHERE (" + where + ") AND " + restriction
                 + ") WHERE hit_rank <= " + th.fetch() + " ORDER BY " + String.join(", ", aliases) + ", hit_rank";
-            for (Map<String, Object> row : InfinoNative.sqlRows(sql)) {
+            for (Map<String, Object> row : InfinoNative.sqlDocs(String.join(",", tables), sql, InfinoNative.ALL_ROWS)) {
                 List<Object> tuple = new ArrayList<>();
                 for (int j = 0; j <= i; j++) {
                     tuple.add(row.get("k" + j));

@@ -190,23 +190,6 @@
       catch: forbidden
       infino.sql:
         body: { query: "SELECT osid FROM token_match('sec_sql1', 'ip', '10.0.0.1')" }
-  # The source holds the hidden and masked fields as written: under a field or masking
-  # rule a search may not match on it either.
-  - do:
-      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
-      catch: forbidden
-      infino.sql:
-        body: { query: "SELECT osid FROM token_match('sec_sql1', 'source', 'alpha')" }
-  - do:
-      headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
-      catch: forbidden
-      infino.sql:
-        body: { query: "SELECT osid FROM exact_match('sec_sql1', 'source', 'alpha')" }
-  - do:
-      headers: { Authorization: "Basic bWFza191c2VyOmFkbWlu" }
-      catch: forbidden
-      infino.sql:
-        body: { query: "SELECT osid FROM token_match('sec_sql1', 'source', '10.0.0.1')" }
   # A column's name as a search's query text is only text, not the column.
   - do:
       headers: { Authorization: "Basic ZmxzX3VzZXI6YWRtaW4=" }
@@ -375,7 +358,9 @@
   - is_false: rows.0.osop
   - is_false: rows.0.osgen
   - is_false: rows.0.osrouting
-  - is_true: rows.0.source
+  # No column holds a document: its fields are the row's columns.
+  - is_false: rows.0.source
+  - match: { rows.0.n: 1 }
   - do:
       catch: bad_request
       infino.sql:

@@ -363,14 +363,18 @@ final class InfinoSql {
                 unsearchable.add(c.name());
             }
         }
-        // The source holds every field as written, the hidden and masked ones
-        // too: under either rule a search may not match on it, as it is not read.
-        if (restricted && columns.containsKey(InfinoQueryTranslator.SOURCE)) {
-            unsearchable.add(InfinoQueryTranslator.SOURCE);
+        // The columns of values as written hold fields as written, the hidden and
+        // masked ones too: under either rule a search may not match on them, as they are not read.
+        if (restricted) {
+            for (String name : columns.keySet()) {
+                if (InfinoQueryTranslator.holdsWritten(name)) {
+                    unsearchable.add(name);
+                }
+            }
         }
         for (Column c : visible.values()) {
             String quoted = InfinoQueryTranslator.quoteIdent(c.name());
-            if (projected.containsKey(c.name()) || STAMPS.contains(c.name()) || (restricted && c.name().equals(InfinoQueryTranslator.SOURCE))) {
+            if (projected.containsKey(c.name()) || STAMPS.contains(c.name()) || (restricted && InfinoQueryTranslator.holdsWritten(c.name()))) {
                 continue;
             }
             if (!c.masked()) {

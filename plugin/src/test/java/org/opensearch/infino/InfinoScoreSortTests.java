@@ -405,12 +405,10 @@ public class InfinoScoreSortTests extends OpenSearchTestCase {
         }
     }
 
-    /** The hit statement leaves out each hit's source when asked to, as the score reads under track_scores do. */
-    public void testAHitStatementWithoutSources() {
+    /** The hit statement selects no source: no column holds one, and a page reads its documents from their columns. */
+    public void testAHitStatementSelectsNoSource() {
         InfinoSearch.Plan plan = plan(disk());
-        String with = InfinoSearch.hitStatement(plan, 3, false, InfinoSearch.Keyset.WHOLE, 4, true);
-        String without = InfinoSearch.hitStatement(plan, 3, false, InfinoSearch.Keyset.WHOLE, 4, false);
-        assertTrue(with, with.contains(InfinoQueryTranslator.SOURCE));
+        String without = InfinoSearch.hitStatement(plan, 3, false, InfinoSearch.Keyset.WHOLE, 4);
         assertFalse(without, without.contains(InfinoQueryTranslator.SOURCE));
         List<Map<String, Object>> rows = InfinoNative.sqlRows(without);
         assertEquals(3, rows.size());

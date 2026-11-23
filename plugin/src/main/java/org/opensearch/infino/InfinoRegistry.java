@@ -393,13 +393,11 @@ final class InfinoRegistry {
         return InfinoNative.object(source).get(VERSION) instanceof Number n ? n.longValue() : UNVERSIONED;
     }
 
-    /** Every row of the registry table, each its id and source, after what moved is written. */
+    /** Every row of the registry table, each its id and document, after what moved is written. */
     static List<Map<String, Object>> rawRows() {
         drain();
         declareToRead();
-        return InfinoNative.sqlRows(
-            "SELECT " + InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + " FROM " + InfinoQueryTranslator.quoteIdent(TABLE)
-        );
+        return InfinoNative.sqlRebuilt("SELECT * FROM " + InfinoQueryTranslator.quoteIdent(TABLE));
     }
 
     /** What became of a registered index when the registry was restored. */

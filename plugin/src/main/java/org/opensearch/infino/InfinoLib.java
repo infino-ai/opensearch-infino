@@ -91,7 +91,7 @@ public interface InfinoLib extends Library {
     /** {@link #infino_get} as of the table's latest commit; null when the lookup fails. */
     Pointer infino_get_latest(Pointer h, String name, String osid);
 
-    /** The sources of several osids at once, as a JSON object from each id the table holds to its source. */
+    /** The documents of several osids at once, rebuilt from their columns, as a JSON object from each id the table holds to its document. */
     Pointer infino_get_many(Pointer h, String name, String[] osids, int count);
 
     /** One id's document as {@code {"source", "seq"}}; "" when the table holds no such id. */
@@ -113,6 +113,16 @@ public interface InfinoLib extends Library {
 
     /** Let go of a hold {@link #infino_hold_latest} took. */
     void infino_release_latest(Pointer h);
+
+    /**
+     * A statement's rows, each of the first {@code limit} (every row when negative) carrying its
+     * document, rebuilt from its columns, under "source": a page and its documents in one call.
+     * {@code names} is the table the statement reads, or the tables, comma-separated.
+     */
+    Pointer infino_sql_docs(Pointer h, String names, String sql, int limit);
+
+    /** A scan's rows ({@code SELECT *}), each its bookkeeping columns and its document rebuilt from its own columns, under "source". */
+    Pointer infino_sql_rebuilt(Pointer h, String sql);
 
     /** The indices a caller's read-only statement reads, as {@code {"indices": [..]}}, or an error with its status. */
     Pointer infino_sql_indices(String sql);
