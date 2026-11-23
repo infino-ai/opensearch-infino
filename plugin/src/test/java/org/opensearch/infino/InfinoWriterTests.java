@@ -19,6 +19,11 @@ import org.opensearch.index.engine.DocumentMissingException;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.test.OpenSearchTestCase;
 
+import com.sun.jna.Memory;
+import com.sun.jna.Pointer;
+
+import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -275,5 +280,78 @@ public class InfinoWriterTests extends OpenSearchTestCase {
         Exception e = InfinoWriter.rejection(SHARD, index("1", -1, true), 0L);
         assertTrue(e.toString(), e instanceof VersionConflictEngineException);
         assertNull(InfinoWriter.rejection(SHARD, index("1", -1, true), null));
+    }
+
+    /**
+     * A bulk whose batch cannot be prepared because the hosted service could
+     * not be reached or did not answer in time is answered with 503 and the
+     * bridge's reason, which a client retries; before, it was a 500 that
+     * named no cause.
+     */
+    public void testABulkTheUnreachableServiceCannotPrepareIsAnswered503WithTheCause() {
+        String reason = "the hosted service could not be reached or did not answer in time; try again later: "
+            + "unavailable: schema(t): schema: transport error: timeout: per read";
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with" -> new Memory(1);
+            case "infino_prepare_error" -> nativeString("{\"error\":\"" + reason + "\",\"status\":503}");
+            default -> null; // the prepare itself returns null, and the frees
+        }));
+        try {
+            InfinoWriter writer = new InfinoWriter(() -> task -> fail("an unprepared bulk started an append"), 10, Long.MAX_VALUE);
+            AtomicReference<Exception> failure = new AtomicReference<>();
+            InfinoWriter.Write index = new InfinoWriter.Write("d1", "{\"n\":1}", false, false);
+            InfinoWriter.Waiter bulk = new InfinoWriter.Waiter(
+                new ShardId("i", "_na_", 0),
+                "i",
+                List.of(new InfinoWriter.Outcome(0, new IndexRequest("i").id("d1"), index, null)),
+                new BulkItemResponse[1],
+                System.nanoTime(),
+                ActionListener.wrap(r -> fail("an unprepared bulk answered"), failure::set)
+            );
+
+            writer.submit("t", bulk);
+
+            Exception e = failure.get();
+            assertNotNull("the bulk was not answered", e);
+            assertEquals(RestStatus.SERVICE_UNAVAILABLE, ExceptionsHelper.status(e));
+            assertTrue(e.getMessage(), e.getMessage().contains("the batch for t could not be prepared"));
+            assertTrue(e.getMessage(), e.getMessage().contains("did not answer in time"));
+        } finally {
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /**
+     * An append the hosted service did not answer fails as a whole with 503,
+     * which a client retries, and not as documents refused with 400. (That
+     * the bridge stops at the first such write, without splitting the batch,
+     * is checked by the bridge's own tests.)
+     */
+    public void testAnAppendTheServiceDidNotAnswerFailsWhole503() {
+        String reason = "the hosted service could not be reached or did not answer in time; try again later: "
+            + "unavailable: append(t): transport error: timeout: per read";
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with" -> new Memory(1);
+            case "infino_append_prepared" -> nativeString("{\"error\":\"" + reason + "\",\"status\":503}");
+            default -> null; // the frees
+        }));
+        try {
+            InfinoNative.InfinoException e = expectThrows(
+                InfinoNative.InfinoException.class,
+                () -> InfinoNative.appendPrepared("t", List.of(new Memory(1)), List.of(), null)
+            );
+            assertEquals(RestStatus.SERVICE_UNAVAILABLE, ExceptionsHelper.status(e));
+            assertTrue(e.getMessage(), e.getMessage().contains("did not answer in time"));
+        } finally {
+            InfinoNative.useLib(null);
+        }
+    }
+
+    private static Pointer nativeString(String s) {
+        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+        Memory m = new Memory(bytes.length + 1);
+        m.write(0, bytes, 0, bytes.length);
+        m.setByte(bytes.length, (byte) 0);
+        return m;
     }
 }

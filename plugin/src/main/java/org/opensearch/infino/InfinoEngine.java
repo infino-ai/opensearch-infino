@@ -1466,9 +1466,6 @@ public class InfinoEngine extends InternalEngine {
             // field gets its text index, where the append would add a plain column.
             InfinoPlugin.tables().ensure(config().getIndexSettings().getIndexMetadata(), config().getShardId().id());
             Pointer prepared = InfinoNative.prepare(table, ids, sources, routings, seqs, opSeqs, generation);
-            if (prepared == null) {
-                throw new IllegalStateException("[infino] the bridge could not prepare a batch for " + table);
-            }
             // The batch carries each row's sequence number from prepare, so the append names none.
             InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced, null);
             retry = notTaken(result.failed(), ids, written);

@@ -51,7 +51,7 @@ public interface InfinoLib extends Library {
     /** One buffer of ids and sources with their end offsets: three native arrays instead of one allocation per string. */
     Pointer infino_index_batch_buf(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
 
-    /** Parse and convert a batch ahead of its append; null when the table is unknown. */
+    /** Parse and convert a batch ahead of its append; null when it could not be, with the reason in {@link #infino_prepare_error()}. */
     Pointer infino_prepare_batch(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
 
     /**
@@ -72,6 +72,9 @@ public interface InfinoLib extends Library {
         long gen,
         int count
     );
+
+    /** Why the last prepare on this thread returned null, as {@code {"error", "status"?}}; null when it did not fail. */
+    Pointer infino_prepare_error();
 
     /**
      * Append prepared batches in one commit and release them; the rows whose ids

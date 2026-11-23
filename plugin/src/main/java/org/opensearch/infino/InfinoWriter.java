@@ -301,9 +301,12 @@ public final class InfinoWriter {
                 updates++;
             }
         }
-        Pointer prepared = ids.isEmpty() ? null : InfinoNative.prepare(table, ids, sources);
-        if (!ids.isEmpty() && prepared == null) {
-            waiter.listener().onFailure(new IllegalStateException("[infino] the bridge could not prepare the batch for " + table));
+        Pointer prepared;
+        try {
+            prepared = ids.isEmpty() ? null : InfinoNative.prepare(table, ids, sources);
+        } catch (InfinoNative.InfinoException e) {
+            // With its status: a 503 when the hosted service could not be reached or did not answer in time.
+            waiter.listener().onFailure(e);
             return;
         }
         Staged staged = new Staged(waiter, prepared, ids, ids.size() + updates, bytes, named);
@@ -861,9 +864,6 @@ public final class InfinoWriter {
             return new Appended(refused, false);
         }
         Pointer prepared = InfinoNative.prepare(table, ids, sources);
-        if (prepared == null) {
-            throw new IllegalStateException("[infino] the bridge could not prepare the folded batch for " + table);
-        }
         long[] numbers = seqs.stream().mapToLong(Long::longValue).toArray();
         InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced, numbers);
         for (InfinoNative.PreparedFailure f : result.failed()) {

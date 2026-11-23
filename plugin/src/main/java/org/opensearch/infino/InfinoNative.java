@@ -1082,12 +1082,37 @@ public final class InfinoNative {
     /**
      * Parse and convert a batch ahead of its append, so the work overlaps the
      * append that is running. The handle must go to {@link #appendPrepared}
-     * or {@link #freePrepared}. Null when the table is unknown.
+     * or {@link #freePrepared}. Throws {@link InfinoException} with the
+     * bridge's reason when the batch could not be prepared (see
+     * {@link #prepareFailure}).
      */
     public static Pointer prepare(String name, List<String> osids, List<String> sources) {
         init();
         Packed p = Packed.of(osids, sources);
-        return lib.infino_prepare_batch(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), osids.size());
+        return prepared(name, lib.infino_prepare_batch(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), osids.size()));
+    }
+
+    /** The prepared handle, or the reason there is none thrown. */
+    private static Pointer prepared(String name, Pointer handle) {
+        if (handle == null) {
+            throw prepareFailure(name);
+        }
+        return handle;
+    }
+
+    /**
+     * Why a prepare returned null, as the exception the caller gets: the
+     * bridge's reason, with the status it gives. A hosted service that could
+     * not be reached or did not answer in time is a 503, which a client
+     * retries; anything else is an internal error.
+     */
+    private static InfinoException prepareFailure(String name) {
+        String why = take(lib.infino_prepare_error());
+        if (why == null) {
+            return new InfinoException("[infino] the bridge could not prepare the batch for " + name);
+        }
+        Map<String, Object> error = object(why);
+        return new InfinoException("[infino] the batch for " + name + " could not be prepared: " + error.get("error"), statusOf(error));
     }
 
     /**
@@ -1108,7 +1133,7 @@ public final class InfinoNative {
     ) {
         init();
         Packed p = Packed.of(osids, sources, routings);
-        return lib.infino_prepare_batch_meta(
+        return prepared(name, lib.infino_prepare_batch_meta(
             conn,
             name,
             p.buf(),
@@ -1120,7 +1145,7 @@ public final class InfinoNative {
             ops,
             gen,
             osids.size()
-        );
+        ));
     }
 
     /**
