@@ -122,4 +122,16 @@ public class InfinoNativeTests extends OpenSearchTestCase {
         assertEquals(0L, InfinoNative.highestSeq(0L, () -> { throw new AssertionError("a stored number needs no row check"); }));
         assertEquals(41L, InfinoNative.highestSeq(41, () -> { throw new AssertionError("a stored number needs no row check"); }));
     }
+
+    /** A float, half float or scaled float field keeps its values at a precision; another number keeps them whole. */
+    public void testMappingReadsEachFieldsPrecision() {
+        Mapping m = Mapping.of("""
+            {"properties":{"f":{"type":"float"},"h":{"type":"half_float"},"s":{"type":"scaled_float","scaling_factor":100},
+             "d":{"type":"double"},"o":{"properties":{"g":{"type":"float"}}}}}""");
+        assertEquals(new InfinoNative.Precision("float", 0), m.precisions().get("f"));
+        assertEquals(new InfinoNative.Precision("half_float", 0), m.precisions().get("h"));
+        assertEquals(new InfinoNative.Precision("scaled_float", 100), m.precisions().get("s"));
+        assertEquals(new InfinoNative.Precision("float", 0), m.precisions().get("o.g"));
+        assertNull(m.precisions().get("d"));
+    }
 }

@@ -10,6 +10,7 @@ import com.sun.jna.Pointer;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.sandbox.document.HalfFloatPoint;
 import org.opensearch.OpenSearchException;
 import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
@@ -166,7 +167,9 @@ public final class InfinoNative {
      * {@code use_similarity}, whose terms Lucene scores by BM25.
      * {@code otherSimilarity} is whether its field scores by a similarity
      * other than the default BM25: its mapping names one, or the index's
-     * default is another.
+     * default is another. {@code precision} is the precision a
+     * {@code float}, {@code half_float} or {@code scaled_float} field keeps
+     * its values at (null for any other column).
      */
     public record Column(
         String name,
@@ -177,8 +180,23 @@ public final class InfinoNative {
         String dateFormat,
         String elem,
         boolean similarity,
-        boolean otherSimilarity
+        boolean otherSimilarity,
+        Precision precision
     ) {
+        public Column(
+            String name,
+            String type,
+            boolean fts,
+            boolean vector,
+            UnaryOperator<String> mask,
+            String dateFormat,
+            String elem,
+            boolean similarity,
+            boolean otherSimilarity
+        ) {
+            this(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, null);
+        }
+
         public Column(
             String name,
             String type,
@@ -207,22 +225,27 @@ public final class InfinoNative {
 
         /** This column as the request sees it, its values masked by {@code mask}. */
         Column masked(UnaryOperator<String> mask) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, precision);
         }
 
         /** This column with the date format its mapping declares. */
         Column dated(String dateFormat) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, precision);
+        }
+
+        /** This column with the precision its mapping keeps its values at. */
+        Column precise(Precision precision) {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, precision);
         }
 
         /** This column as a keyword field with {@code use_similarity} maps it. */
         Column scoredBySimilarity() {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, true, otherSimilarity);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, true, otherSimilarity, precision);
         }
 
         /** This column as a field scored by a similarity other than the default BM25. */
         Column scoredByOtherSimilarity() {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, true);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, true, precision);
         }
 
         /**
@@ -245,12 +268,12 @@ public final class InfinoNative {
          * mapping's, not its field's: neither here.
          */
         Column exact() {
-            return fts || similarity || otherSimilarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false, false) : this;
+            return fts || similarity || otherSimilarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false, false, precision) : this;
         }
 
         /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */
         Column element() {
-            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null, similarity, otherSimilarity) : this;
+            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null, similarity, otherSimilarity, precision) : this;
         }
 
         public boolean isList() {
@@ -275,6 +298,119 @@ public final class InfinoNative {
 
         public boolean isBoolean() {
             return "bool".equals(type);
+        }
+    }
+
+    /**
+     * The precision a {@code float}, {@code half_float} or
+     * {@code scaled_float} field keeps its values at. The bridge stores each
+     * value as the field keeps it (a 32-bit float, a 16-bit one, or a long
+     * over the scaling factor) and reads it back as a double, so a value a
+     * query compares with it is taken to the same precision first, as
+     * stock's field type parses a query's value before it compares.
+     * {@code scalingFactor} is a {@code scaled_float}'s factor (0 for the
+     * others).
+     */
+    public record Precision(String type, double scalingFactor) {
+        static final String FLOAT = "float";
+        static final String HALF_FLOAT = "half_float";
+        static final String SCALED_FLOAT = "scaled_float";
+        private static final String SCALING_FACTOR = "scaling_factor";
+
+        /** The precision a mapped field of {@code type} keeps, or null for a type kept whole. */
+        static Precision of(String type, Map<?, ?> field) {
+            return switch (type) {
+                case FLOAT, HALF_FLOAT -> new Precision(type, 0);
+                case SCALED_FLOAT -> {
+                    Object f = field.get(SCALING_FACTOR);
+                    double factor = f instanceof Number n ? n.doubleValue() : f == null ? 0 : parseOr(f.toString());
+                    yield factor > 0 && Double.isFinite(factor) ? new Precision(type, factor) : null;
+                }
+                default -> null;
+            };
+        }
+
+        private static double parseOr(String s) {
+            try {
+                return Double.parseDouble(s.trim());
+            } catch (NumberFormatException e) {
+                return 0;
+            }
+        }
+
+        /**
+         * {@code value} as the field holds it, for an equality: the 32-bit
+         * float stock parses it as, that float rounded to the nearest 16-bit
+         * one, or the long nearest the value times the factor, over the
+         * factor. Null when the field's type holds it only as an infinity,
+         * which stock refuses.
+         */
+        Double exact(Object value) {
+            return switch (type) {
+                case SCALED_FLOAT -> {
+                    double scaled = asDouble(value) * scalingFactor;
+                    yield Double.isFinite(scaled) ? Math.round(scaled) / scalingFactor : null;
+                }
+                case HALF_FLOAT -> {
+                    float f = asFloat(value);
+                    float half = HalfFloatPoint.sortableShortToHalfFloat(HalfFloatPoint.halfFloatToSortableShort(f));
+                    yield Float.isFinite(half) ? (double) half : null;
+                }
+                default -> {
+                    float f = asFloat(value);
+                    yield Float.isFinite(f) ? (double) f : null;
+                }
+            };
+        }
+
+        /**
+         * A range bound on the field: the comparison and the value, as
+         * stock's range query reads it. A float or half-float bound is the
+         * 32-bit float stock parses, compared as written: every value the
+         * field holds is such a float, so the comparison is stock's (which
+         * steps an exclusive bound to the next float, and a half-float's to
+         * the next half-float in its direction). A scaled float's bound is
+         * stock's long over the factor, inclusive: the lower one rounded up
+         * (past an exclusive bound first), the upper one down. Null when
+         * the field's type holds the bound only as an infinity.
+         */
+        Bound bound(Object value, boolean lower, boolean inclusive) {
+            String op = lower ? (inclusive ? " >= " : " > ") : (inclusive ? " <= " : " < ");
+            switch (type) {
+                case SCALED_FLOAT -> {
+                    double scaled = asDouble(value) * scalingFactor;
+                    if (Double.isFinite(scaled) == false) {
+                        return null;
+                    }
+                    if (inclusive == false) {
+                        scaled = lower ? Math.nextUp(scaled) : Math.nextDown(scaled);
+                    }
+                    long l = Math.round(lower ? Math.ceil(scaled) : Math.floor(scaled));
+                    return new Bound(lower ? " >= " : " <= ", l / scalingFactor);
+                }
+                case HALF_FLOAT -> {
+                    float f = asFloat(value);
+                    float half = HalfFloatPoint.sortableShortToHalfFloat(HalfFloatPoint.halfFloatToSortableShort(f));
+                    return Float.isFinite(half) ? new Bound(op, (double) f) : null;
+                }
+                default -> {
+                    float f = asFloat(value);
+                    return Float.isFinite(f) ? new Bound(op, (double) f) : null;
+                }
+            }
+        }
+
+        /** A comparison ({@code " >= "} and the like) and the value it compares with. */
+        record Bound(String op, double value) {}
+
+        /** The 32-bit float stock parses a query value of a float field as. */
+        private static float asFloat(Object value) {
+            return value instanceof Number n ? n.floatValue() : Float.parseFloat(value.toString().trim());
+        }
+
+        /** The double stock parses a query value of a scaled float field as. */
+        private static double asDouble(Object value) {
+            return value instanceof Number n ? n.doubleValue() : Double.parseDouble(value.toString().trim());
         }
     }
 
@@ -725,6 +861,7 @@ public final class InfinoNative {
         Set<String> intFields,
         Set<String> multiFields,
         Set<String> normalized,
+        Map<String, Precision> precisions,
         boolean defaultBm25
     ) {
         /** {@link #of(String, boolean)} under the default BM25 similarity. */
@@ -751,6 +888,7 @@ public final class InfinoNative {
                 new HashSet<>(),
                 new HashSet<>(),
                 new HashSet<>(),
+                new LinkedHashMap<>(),
                 defaultBm25
             );
             Object root = object(mappingJson);
@@ -784,6 +922,9 @@ public final class InfinoNative {
                 }
                 if (field.get(TYPE) instanceof String type && INT_TYPES.contains(type)) {
                     intFields.add(path);
+                }
+                if (field.get(TYPE) instanceof String type && Precision.of(type, field) instanceof Precision precision) {
+                    precisions.put(path, precision);
                 }
                 if (scoresBySimilarity(field)) {
                     similarityFields.add(path);
@@ -936,6 +1077,11 @@ public final class InfinoNative {
                 described = described.scoredByOtherSimilarity();
             }
             Column kept = format == null ? described : described.dated(format);
+            // A list column of a mapped field keeps its values at the field's precision too.
+            Precision precision = mapping == null ? null : mapping.precisions().get(InfinoQueryTranslator.fieldOf(column));
+            if (precision != null && (kept.isNumeric() || kept.isList())) {
+                kept = kept.precise(precision);
+            }
             // A field named like a reserved column is looked up by its name, in place of the reserved column.
             if (key.equals(column)) {
                 out.putIfAbsent(key, kept);

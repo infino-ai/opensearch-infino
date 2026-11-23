@@ -63,6 +63,50 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
     }
 
+    /** Columns of fields that keep their values at a precision: a float, a half float, a scaled float and a double. */
+    private static Map<String, Column> preciseColumns() {
+        Map<String, Column> cols = columns();
+        cols.put("f", new Column("f", "f64", false, false).precise(new InfinoNative.Precision("float", 0)));
+        cols.put("h", new Column("h", "f64", false, false).precise(new InfinoNative.Precision("half_float", 0)));
+        cols.put("s", new Column("s", "f64", false, false).precise(new InfinoNative.Precision("scaled_float", 100)));
+        cols.put("d", new Column("d", "f64", false, false));
+        return cols;
+    }
+
+    private static String preciseWhere(org.opensearch.index.query.QueryBuilder qb) {
+        return InfinoQueryTranslator.translate(qb, preciseColumns(), TABLE, NOW).where();
+    }
+
+    /**
+     * A value compared with a float, half float or scaled float field is taken
+     * to the precision the field keeps its values at, as stock parses it: the
+     * column holds 0.3 as the 32-bit float 0.30000001192092896, so a term on
+     * 0.3 compares with that, and so does a range bound.
+     */
+    public void testAValueComparedWithAFloatFieldIsAtItsPrecision() {
+        assertEquals("\"f\" = 0.30000001192092896", preciseWhere(QueryBuilders.termQuery("f", 0.3)));
+        assertEquals("\"f\" = 0.30000001192092896", preciseWhere(QueryBuilders.termQuery("f", "0.3")));
+        assertEquals("\"f\" IN (0.30000001192092896, 2.700000047683716)", preciseWhere(QueryBuilders.termsQuery("f", List.of(0.3, 2.7))));
+        assertEquals("(\"f\" > 0.30000001192092896)", preciseWhere(QueryBuilders.rangeQuery("f").gt(0.3)));
+        assertEquals("(\"f\" <= 2.700000047683716)", preciseWhere(QueryBuilders.rangeQuery("f").lte(2.7)));
+        // A value the float holds exactly is unchanged.
+        assertEquals("\"f\" = 1.5", preciseWhere(QueryBuilders.termQuery("f", 1.5)));
+        // The half float nearest 0.3 is 0.300048828125; a range bound is the 32-bit float, compared as written.
+        assertEquals("\"h\" = 0.300048828125", preciseWhere(QueryBuilders.termQuery("h", 0.3)));
+        assertEquals("(\"h\" >= 2.700000047683716)", preciseWhere(QueryBuilders.rangeQuery("h").gte(2.7)));
+        // A scaled float compares at its factor: a term rounds to the nearest hundredth, a range rounds
+        // its lower bound up and its upper bound down, both then inclusive, as stock's long range.
+        assertEquals("\"s\" = 1.23", preciseWhere(QueryBuilders.termQuery("s", 1.234)));
+        assertEquals("(\"s\" >= 1.24 AND \"s\" <= 2.5)", preciseWhere(QueryBuilders.rangeQuery("s").gt(1.23).lte(2.509)));
+        assertEquals("(\"s\" <= 1.22)", preciseWhere(QueryBuilders.rangeQuery("s").lt(1.23)));
+        assertEquals("(\"s\" >= 1.24)", preciseWhere(QueryBuilders.rangeQuery("s").gte(1.231)));
+        // A double keeps the value as written.
+        assertEquals("\"d\" = 0.3", preciseWhere(QueryBuilders.termQuery("d", 0.3)));
+        assertEquals("(\"d\" > 0.3)", preciseWhere(QueryBuilders.rangeQuery("d").gt(0.3)));
+        // A value a half float holds only as an infinity is not served, as stock refuses it.
+        expectThrows(Exception.class, () -> preciseWhere(QueryBuilders.termQuery("h", 70000.0)));
+    }
+
     public void testMatchAllAndFilters() {
         assertEquals("1=1", translate(QueryBuilders.matchAllQuery()).where());
         assertEquals("\"level\" = 'error'", translate(QueryBuilders.termQuery("level", "error")).where());

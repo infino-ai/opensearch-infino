@@ -3120,19 +3120,35 @@ final class InfinoQueryTranslator {
         // A date bound is read as OpenSearch reads it: in the request's format, else the field's own.
         String format = r.format() != null ? r.format() : typed.dateFormat();
         if (r.from() != null) {
-            // An exclusive lower date bound rounds up (gt 2026-10-24 means after that day).
-            String lit = typed.isTimestamp() ? dateBound(r.from(), format, !r.includeLower(), zone) : scalar(typed, r.from(), false);
-            if (lit == null) {
-                return null;
+            if (typed.isNumeric()) {
+                String bound = numericBound(typed, r.from(), true, r.includeLower());
+                if (bound == null) {
+                    return null;
+                }
+                bounds.add(bound);
+            } else {
+                // An exclusive lower date bound rounds up (gt 2026-10-24 means after that day).
+                String lit = typed.isTimestamp() ? dateBound(r.from(), format, !r.includeLower(), zone) : scalar(typed, r.from(), false);
+                if (lit == null) {
+                    return null;
+                }
+                bounds.add((r.includeLower() ? " >= " : " > ") + lit);
             }
-            bounds.add((r.includeLower() ? " >= " : " > ") + lit);
         }
         if (r.to() != null) {
-            String lit = typed.isTimestamp() ? dateBound(r.to(), format, r.includeUpper(), zone) : scalar(typed, r.to(), false);
-            if (lit == null) {
-                return null;
+            if (typed.isNumeric()) {
+                String bound = numericBound(typed, r.to(), false, r.includeUpper());
+                if (bound == null) {
+                    return null;
+                }
+                bounds.add(bound);
+            } else {
+                String lit = typed.isTimestamp() ? dateBound(r.to(), format, r.includeUpper(), zone) : scalar(typed, r.to(), false);
+                if (lit == null) {
+                    return null;
+                }
+                bounds.add((r.includeUpper() ? " <= " : " < ") + lit);
             }
-            bounds.add((r.includeUpper() ? " <= " : " < ") + lit);
         }
         if (bounds.isEmpty()) {
             return ALL;
@@ -3277,12 +3293,45 @@ final class InfinoQueryTranslator {
             return Boolean.parseBoolean(value.toString()) ? "true" : "false";
         }
         if (c.isNumeric()) {
+            if (c.precision() != null) {
+                // The value at the precision the field keeps, as stock parses it before it compares.
+                Double kept;
+                try {
+                    kept = c.precision().exact(value);
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+                return kept == null ? null : number(kept);
+            }
             return number(value);
         }
         if (c.isTimestamp()) {
             return dateLiteral(value, c.dateFormat(), roundUp, null);
         }
         return null;
+    }
+
+    /**
+     * A numeric range bound on {@code c}: the comparison and its literal, at
+     * the precision the field keeps its values at when it has one. Null when
+     * the value cannot be a bound.
+     */
+    private String numericBound(Column c, Object value, boolean lower, boolean inclusive) {
+        if (c.precision() == null) {
+            String lit = scalar(c, value, false);
+            return lit == null ? null : (lower ? (inclusive ? " >= " : " > ") : (inclusive ? " <= " : " < ")) + lit;
+        }
+        InfinoNative.Precision.Bound b;
+        try {
+            b = c.precision().bound(value, lower, inclusive);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        if (b == null) {
+            return null;
+        }
+        String lit = number(b.value());
+        return lit == null ? null : b.op() + lit;
     }
 
     private static String number(Object v) {
