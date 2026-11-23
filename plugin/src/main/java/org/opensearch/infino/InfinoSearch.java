@@ -947,11 +947,32 @@ public final class InfinoSearch {
     /**
      * Whether a page's exact total is counted beside its rows: an exact
      * total the request counts, not counted first, for a page whose short
-     * read cannot be the total ({@link #shortPageIsTotal}). Where it can, the
-     * total is counted after the rows, and only when the page is full.
+     * read cannot be the total ({@link #shortPageIsTotal}), or whose total is
+     * counted from the token index under a cap ({@link #countsTokenIndex}).
+     * Otherwise the total is counted after the rows, and only when the page
+     * is full. A capped count from the token index costs little and stops at
+     * its cap, so it runs beside the page even where a short page would make
+     * it needless.
      */
-    static boolean countsBeside(Plan plan, boolean exact, boolean count, int size, boolean firstCount) {
-        return plan.vector() == null && exact && count && size > 0 && !firstCount && !shortPageIsTotal(plan);
+    static boolean countsBeside(Plan plan, boolean exact, boolean count, int size, boolean firstCount, long cap) {
+        return plan.vector() == null
+            && exact
+            && count
+            && size > 0
+            && !firstCount
+            && (!shortPageIsTotal(plan) || countsTokenIndex(plan.query(), cap));
+    }
+
+    /**
+     * Whether {@link #count} counts {@code q}'s rows from the token index:
+     * under a cap, filters and one OR of plain-words text clauses
+     * ({@link InfinoQueryTranslator#textCountStatement}).
+     */
+    static boolean countsTokenIndex(Translation q, long cap) {
+        return cap != Long.MAX_VALUE
+            && q.principal() == null
+            && InfinoQueryTranslator.readsTextIndex(q.where())
+            && InfinoQueryTranslator.textCountStatement(q.table(), q.where(), cap) != null;
     }
 
     /**
@@ -1225,10 +1246,11 @@ public final class InfinoSearch {
             && size > 0
             && !(bareRanked(plan) && !seqNoAndPrimaryTerm)
             && countsFirst(source, count, scoredPage(plan));
-        // Otherwise, when a short page cannot be its own total, the exact total
-        // and the page are separate engine calls, neither waiting on the other:
-        // the total is counted on another thread while the page is read.
-        CompletableFuture<Long> beside = countsBeside(plan, exact, count, size, firstCount)
+        // Otherwise, when a short page cannot be its own total, or the total is
+        // a capped count from the token index, the exact total and the page are
+        // separate engine calls, neither waiting on the other: the total is
+        // counted on another thread while the page is read.
+        CompletableFuture<Long> beside = countsBeside(plan, exact, count, size, firstCount, cap)
             ? InfinoServices.beside(() -> total(plan, cap))
             : null;
         // The exact total, when it is read before the page.
@@ -1297,8 +1319,10 @@ public final class InfinoSearch {
         } else if (exact && counted != null) {
             total = counted;
         } else if (exact && beside != null) {
-            // Already counting: it is not left running past the request.
-            total = besideTotal(InfinoServices.await(beside), rows.size());
+            // Already counting: it is not left running past the request. A
+            // short page is its own total, as when nothing counts beside it.
+            long besides = InfinoServices.await(beside);
+            total = shortPage ? rows.size() : besideTotal(besides, rows.size());
         } else if (exact && shortPage) {
             total = rows.size();
         } else if (exact) {

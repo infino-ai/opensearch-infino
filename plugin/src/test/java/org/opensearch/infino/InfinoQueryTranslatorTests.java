@@ -944,6 +944,46 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         return InfinoQueryTranslator.textCountStatement(TABLE, t.where(), 10001);
     }
 
+    /** A query string beside a time range, in filter context: an unscored text OR. */
+    private static Translation filteredTextOr() {
+        return translateWithTitle(
+            QueryBuilders.boolQuery()
+                .filter(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-03T00:00:00Z").lt("2023-01-03T10:00:00Z"))
+                .filter(QueryBuilders.queryStringQuery("message: monkey jackal bear"))
+        );
+    }
+
+    private static InfinoSearch.Plan planWithTitle(Translation t) {
+        Map<String, Column> cols = columns();
+        cols.put("title", new Column("title", "str", true, false));
+        return new InfinoSearch.Plan(TABLE, cols, t, java.util.List.of(), null, null, null, null, java.util.List.of(), InfinoAccess.NONE, NOW);
+    }
+
+    /**
+     * A capped total counted from the token index runs beside the page even
+     * where a short page would be the total: it costs little and stops at
+     * its cap. Uncapped, or any other count, waits for the page as before.
+     */
+    public void testATokenIndexCountRunsBesideThePage() {
+        InfinoSearch.Plan plan = planWithTitle(filteredTextOr());
+        assertTrue(InfinoSearch.shortPageIsTotal(plan));
+        assertTrue(InfinoSearch.countsTokenIndex(plan.query(), 10001));
+        assertTrue(InfinoSearch.countsBeside(plan, true, true, 10, false, 10001));
+        assertFalse(InfinoSearch.countsBeside(plan, true, true, 10, false, Long.MAX_VALUE));
+        assertFalse(InfinoSearch.countsBeside(plan, true, true, 0, false, 10001));
+        InfinoSearch.Plan filtered = plan(translate(QueryBuilders.termQuery("level", "error")));
+        assertFalse(InfinoSearch.countsBeside(filtered, true, true, 10, false, 10001));
+        // big5's own request: the query string a must, ranked across its text
+        // columns. Its total is the same capped count, beside the ranked page.
+        Translation must = translateWithTitle(
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-03T00:00:00Z").lt("2023-01-03T10:00:00Z"))
+                .must(QueryBuilders.queryStringQuery("message: monkey jackal bear"))
+        );
+        assertNotNull(must.scoring().across());
+        assertTrue(InfinoSearch.countsBeside(planWithTitle(must), true, true, 10, false, 10001));
+    }
+
     public void testTextUnderShouldIsARowPredicate() {
         BoolQueryBuilder b = QueryBuilders.boolQuery()
             .should(QueryBuilders.matchQuery("message", "disk"))
@@ -1834,13 +1874,13 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
      */
     public void testAPageCountsBesideOnlyWhenAShortPageCannotBeItsTotal() {
         InfinoSearch.Plan filtered = plan(translate(QueryBuilders.termQuery("level", "error")));
-        assertFalse(InfinoSearch.countsBeside(filtered, true, true, 10, false));
+        assertFalse(InfinoSearch.countsBeside(filtered, true, true, 10, false, Long.MAX_VALUE));
         InfinoSearch.Plan ranked = plan(translate(QueryBuilders.matchQuery("message", "disk")));
-        assertTrue(InfinoSearch.countsBeside(ranked, true, true, 10, false));
-        assertFalse(InfinoSearch.countsBeside(ranked, true, true, 10, true));
-        assertFalse(InfinoSearch.countsBeside(ranked, false, true, 10, false));
-        assertFalse(InfinoSearch.countsBeside(ranked, true, false, 10, false));
-        assertFalse(InfinoSearch.countsBeside(ranked, true, true, 0, false));
+        assertTrue(InfinoSearch.countsBeside(ranked, true, true, 10, false, Long.MAX_VALUE));
+        assertFalse(InfinoSearch.countsBeside(ranked, true, true, 10, true, Long.MAX_VALUE));
+        assertFalse(InfinoSearch.countsBeside(ranked, false, true, 10, false, Long.MAX_VALUE));
+        assertFalse(InfinoSearch.countsBeside(ranked, true, false, 10, false, Long.MAX_VALUE));
+        assertFalse(InfinoSearch.countsBeside(ranked, true, true, 0, false, Long.MAX_VALUE));
     }
 
     // ---- nested ----
