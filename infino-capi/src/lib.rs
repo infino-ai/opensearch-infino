@@ -845,6 +845,15 @@ fn err_json(e: &str) -> *mut c_char {
     out_json(error_value(e))
 }
 
+/// The error object of a failed read of one id: the message names the
+/// call and the id, but the status is read off the engine's message alone,
+/// so an id that spells `server returned 200` cannot set it.
+fn read_err_json(call: &str, osid: &str, e: &str) -> *mut c_char {
+    let mut v = error_value(e);
+    v["error"] = json!(format!("{call} {osid}: {e}"));
+    out_json(v)
+}
+
 // ---------------------------------------------------------------------------
 // Connection lifecycle
 // ---------------------------------------------------------------------------
@@ -3703,7 +3712,7 @@ pub unsafe extern "C" fn infino_get(
         };
         match get_row(conn, name, osid) {
             Ok(row) => out_json(json!({ "source": row.map(|(source, _)| source) })),
-            Err(e) => err_json(&format!("get {osid}: {e}")),
+            Err(e) => read_err_json("get", osid, &e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -3795,7 +3804,7 @@ pub unsafe extern "C" fn infino_get_many(
                         found.insert((*id).to_owned(), Value::String(source));
                     }
                     Ok(_) => {}
-                    Err(e) => return err_json(&format!("get_many {id}: {e}")),
+                    Err(e) => return read_err_json("get_many", id, &e),
                 }
             }
         }
@@ -3824,7 +3833,7 @@ pub unsafe extern "C" fn infino_get_doc(
             Ok(row) => out_json(json!({
                 "doc": row.map(|(source, seq)| json!({ "source": source, "seq": seq }))
             })),
-            Err(e) => err_json(&format!("get_doc {osid}: {e}")),
+            Err(e) => read_err_json("get_doc", osid, &e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -5840,6 +5849,31 @@ mod tests {
         assert_eq!(absent, r#"{"source":null}"#);
         let absent = take(unsafe { infino_get_doc(h, c("logs").as_ptr(), c("zz").as_ptr()) });
         assert_eq!(absent, r#"{"doc":null}"#);
+        close(h);
+    }
+
+    /// A failed read by id takes its status from the engine's error alone:
+    /// an id that spells a status names itself in the message but does not
+    /// set the status the plugin answers with.
+    #[test]
+    fn an_id_does_not_set_the_status_of_a_failed_read() {
+        let h = open_logs();
+        let id = c("x server returned 200");
+        let many = [id.as_ptr()];
+        for out in [
+            take(unsafe { infino_get(h, c("no_such_table").as_ptr(), id.as_ptr()) }),
+            take(unsafe { infino_get_doc(h, c("no_such_table").as_ptr(), id.as_ptr()) }),
+            take(unsafe { infino_get_many(h, c("no_such_table").as_ptr(), many.as_ptr(), 1) }),
+        ] {
+            let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+            assert!(
+                v["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("x server returned 200")),
+                "{out}"
+            );
+            assert!(v.get("status").is_none(), "{out}");
+        }
         close(h);
     }
 

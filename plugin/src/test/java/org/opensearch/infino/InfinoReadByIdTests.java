@@ -68,15 +68,19 @@ public class InfinoReadByIdTests extends OpenSearchTestCase {
         }
     }
 
-    /** A get of an index in proxy mode fails rather than answering found: false. */
+    /** A get fails rather than answering found: false, in proxy mode and in default mode, realtime or not. */
     public void testAGetFailsRatherThanAnsweringMissing() {
         InfinoNative.useLib(new FakeBridge(FAILED).lib());
-        IndexMetadata md = index(InfinoPlugin.MODE_PROXY);
-        InfinoNative.InfinoException e = expectThrows(
-            InfinoNative.InfinoException.class,
-            () -> InfinoGetActionFilter.docOf(md, "os_logs", "1", true)
-        );
-        assertEquals(RestStatus.SERVICE_UNAVAILABLE, e.status());
+        for (String mode : new String[] { InfinoPlugin.MODE_PROXY, InfinoPlugin.MODE_DEFAULT }) {
+            IndexMetadata md = index(mode);
+            for (boolean realtime : new boolean[] { true, false }) {
+                InfinoNative.InfinoException e = expectThrows(
+                    InfinoNative.InfinoException.class,
+                    () -> InfinoGetActionFilter.docOf(md, "os_logs", "1", realtime)
+                );
+                assertEquals(mode + " realtime=" + realtime, RestStatus.SERVICE_UNAVAILABLE, e.status());
+            }
+        }
     }
 
     /**
