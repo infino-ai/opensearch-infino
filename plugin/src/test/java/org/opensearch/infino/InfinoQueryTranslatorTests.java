@@ -10,12 +10,14 @@ import org.opensearch.index.query.MultiMatchQueryBuilder;
 import org.opensearch.index.query.Operator;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.QueryShardException;
+import org.opensearch.index.query.QueryStringQueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /** The SQL a query-DSL tree translates to, over a log table's columns. */
@@ -526,6 +528,72 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("SELECT osid, osseq FROM \"os_logs_0\" WHERE 1=1 LIMIT 5", InfinoSearch.unsortedStatement(afterPlan(null, null), 5, true, false));
     }
 
+    public void testAPageWithNoOrderLeavesTheOrderToTheEngine() {
+        // A page with no sort and no score carries no ORDER BY: the engine
+        // reads a scan under a LIMIT with no order in file order, so each page
+        // of one search starts where the last one ended. Its source is read
+        // in the same scan.
+        assertEquals(
+            "SELECT osid, source FROM \"os_logs_0\" WHERE \"level\" = 'error' LIMIT 10",
+            hits(translate(QueryBuilders.termQuery("level", "error")), null, 10)
+        );
+    }
+
+    public void testAPageWithNoOrderThatIsNotAPlainScanIsReadInRowIdOrder() {
+        // A filter joined by id, or rows read from the token index, come out
+        // of the engine in no fixed order once it has read them all, so the
+        // page orders them by the row id. A plain scan, a plain-words
+        // text_match included, keeps no order.
+        String byRowId = " ORDER BY " + InfinoSearch.ROW_ID_ORDER + " LIMIT 10";
+        String noSort = hits(translate(QueryBuilders.boolQuery().mustNot(QueryBuilders.matchPhraseQuery("message", "disk full"))), null, 10);
+        assertTrue(noSort, noSort.contains("osid IN (SELECT osid FROM token_match("));
+        assertTrue(noSort, noSort.endsWith(byRowId));
+        // A sort on a field no row holds reads the same way.
+        String phraseOut = unsortedHits(QueryBuilders.boolQuery().mustNot(QueryBuilders.matchPhraseQuery("message", "disk full")), columns());
+        assertTrue(phraseOut, phraseOut.contains("osid IN (SELECT osid FROM token_match("));
+        assertTrue(phraseOut, phraseOut.endsWith(byRowId));
+        Map<String, Column> cols = columns();
+        cols.put("level[]", Column.list("level[]", "str"));
+        String listed = unsortedHits(QueryBuilders.termQuery("level", "error"), cols);
+        assertTrue(listed, listed.contains("osid IN (SELECT list_rows.list_id FROM "));
+        assertTrue(listed, listed.endsWith(byRowId));
+        String phrase = unsortedHits(QueryBuilders.matchPhraseQuery("message", "disk full"), columns());
+        assertTrue(phrase, phrase.startsWith("SELECT osid, source FROM token_match("));
+        assertTrue(phrase, phrase.endsWith(byRowId));
+        assertEquals(
+            "SELECT osid, source FROM \"os_logs_0\" WHERE (1=1) AND text_match(\"message\", 'disk', 'or') LIMIT 10",
+            unsortedHits(QueryBuilders.matchQuery("message", "disk"), columns())
+        );
+        assertEquals("SELECT osid, source FROM \"os_logs_0\" WHERE \"level\" = 'error' LIMIT 10", unsortedHits(QueryBuilders.termQuery("level", "error"), columns()));
+    }
+
+    /** The unsorted statement for {@code qb} over {@code cols}, sorted on a field no row holds. */
+    private static String unsortedHits(org.opensearch.index.query.QueryBuilder qb, Map<String, Column> cols) {
+        InfinoSearch.Plan plan = new InfinoSearch.Plan(
+            TABLE,
+            cols,
+            InfinoQueryTranslator.translate(qb, cols, TABLE, NOW),
+            java.util.List.of(InfinoSearch.SortSpec.of(cols.get("status"), true), InfinoSearch.SortSpec.rowId()),
+            null,
+            null,
+            null,
+            null,
+            java.util.List.of(),
+            InfinoAccess.NONE,
+            NOW
+        );
+        return InfinoSearch.unsortedStatement(plan, 10, false, true);
+    }
+
+    public void testACollapseWithNoOrderKeepsTheRowIdOrder() {
+        // The window's rows come out grouped by value, so the first row of
+        // each value and the page's rows both follow the row id's order.
+        String collapsed = hits(translate(QueryBuilders.matchAllQuery()), columns().get("level"), 10);
+        assertTrue(collapsed, collapsed.contains("PARTITION BY \"level\" ORDER BY " + InfinoSearch.ROW_ID_ORDER + ")"));
+        assertTrue(collapsed, collapsed.endsWith(" = 1 ORDER BY " + InfinoSearch.ROW_ID_ORDER + " LIMIT 10"));
+        assertEquals("\"_id\" ASC NULLS LAST", InfinoSearch.ROW_ID_ORDER);
+    }
+
     public void testTiesBreakByTheEngineRowId() {
         // Rows sharing the sort value are ordered by the engine's row id, which
         // the engine answers from its range index; a page continuing from a row
@@ -612,6 +680,151 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertTrue(hits(translate(QueryBuilders.matchQuery("message", "disk")), level, 10).contains(", 10, 'or')"));
         // A plain filter has no subquery.
         assertFalse(InfinoQueryTranslator.joinsAfterRanking("\"level\" = 'error'"));
+    }
+
+    public void testQueryStringOverSeveralTextColumnsRanksAcrossThem() {
+        // Stock: message:monkey is one clause, the run "jackal bear" one dis_max over the default fields; summed.
+        Map<String, Column> cols = columns();
+        cols.put("title", new Column("title", "str", true, false));
+        Translation t = InfinoQueryTranslator.translate(
+            QueryBuilders.queryStringQuery("message: monkey jackal bear").field("message").field("title"),
+            cols,
+            TABLE,
+            NOW
+        );
+        assertNull(t.principal());
+        InfinoQueryTranslator.Across across = t.scoring().across();
+        assertNotNull(across);
+        assertEquals(
+            List.of(
+                List.of(new InfinoQueryTranslator.TextClause("message", "monkey", "or")),
+                List.of(new InfinoQueryTranslator.TextClause("message", "jackal bear", "or"), new InfinoQueryTranslator.TextClause("title", "jackal bear", "or"))
+            ),
+            across.clauses()
+        );
+        assertEquals(t.where(), across.match());
+        String sql = hits(t, null, 10);
+        // One engine search ranks every clause by its best column and sums them, for the page alone: the match is no filter of its.
+        assertEquals(
+            "SELECT osid, score, \"_id\" AS infino_row FROM bm25_search_fields('os_logs_0', "
+                + "'[{\"query\":\"monkey\",\"fields\":[\"message\"]},{\"query\":\"jackal bear\",\"fields\":[\"message\",\"title\"]}]', 10, 'or')"
+                + " ORDER BY score DESC, infino_row ASC LIMIT 10",
+            sql
+        );
+
+        // One run alone: one clause, scored by its best column.
+        Translation one = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").field("message").field("title"), cols, TABLE, NOW);
+        assertEquals(1, one.scoring().across().clauses().size());
+        assertTrue(
+            hits(one, null, 10).contains("bm25_search_fields('os_logs_0', '[{\"query\":\"jackal bear\",\"fields\":[\"message\",\"title\"]}]', 10, 'or')")
+        );
+
+        // A must range beside it adds its constant and filters the engine's ranking.
+        BoolQueryBuilder b = QueryBuilders.boolQuery()
+            .must(QueryBuilders.rangeQuery("status").gte(500))
+            .must(QueryBuilders.queryStringQuery("jackal bear").field("message").field("title"));
+        Translation filtered = InfinoQueryTranslator.translate(b, cols, TABLE, NOW);
+        assertNotNull(filtered.scoring().across());
+        assertEquals(1.0, filtered.scoring().offset(), 0);
+        String filteredSql = hits(filtered, null, 10);
+        assertTrue(
+            filteredSql,
+            filteredSql.contains("\"fields\":[\"message\",\"title\"]}]', 10, 'or') WHERE ((\"status\" >= 500) AND 1=1) ORDER BY score DESC")
+        );
+
+        // Forms read otherwise are left unranked, as before.
+        for (QueryStringQueryBuilder qs : List.of(
+            QueryBuilders.queryStringQuery("jackal AND bear").field("message").field("title"),
+            QueryBuilders.queryStringQuery("\"jackal bear\"").field("message").field("title"),
+            QueryBuilders.queryStringQuery("jack*").field("message").field("title"),
+            QueryBuilders.queryStringQuery("jackal bear").field("message").field("title").defaultOperator(Operator.AND),
+            QueryBuilders.queryStringQuery("jackal bear").field("message", 2f).field("title"),
+            QueryBuilders.queryStringQuery("jackal bear").field("message").field("level"),
+            QueryBuilders.queryStringQuery("jackal jackal").field("message").field("title")
+        )) {
+            assertNull(qs.toString(), InfinoQueryTranslator.translate(qs, cols, TABLE, NOW).scoring().across());
+        }
+        // Beside another scoring text clause, or on one column, it is not ranked across.
+        BoolQueryBuilder two = QueryBuilders.boolQuery()
+            .must(QueryBuilders.queryStringQuery("jackal bear").field("message").field("title"))
+            .should(QueryBuilders.matchQuery("title", "owl"));
+        assertNull(InfinoQueryTranslator.translate(two, cols, TABLE, NOW).scoring().across());
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").defaultField("message"), cols, TABLE, NOW).scoring().across());
+        // An ascending score sort reads it unscored.
+        assertNull(one.ascending().scoring().across());
+    }
+
+    public void testTheWordAfterAnOrIsAClauseOfItsOwn() {
+        // Stock: jackal OR bear owl cat is jackal | bear | (owl cat); a run starts only at the word after the OR's.
+        Map<String, Column> cols = columns();
+        cols.put("title", new Column("title", "str", true, false));
+        InfinoQueryTranslator.Across across = InfinoQueryTranslator.translate(
+            QueryBuilders.queryStringQuery("jackal OR bear owl cat").field("message").field("title"),
+            cols,
+            TABLE,
+            NOW
+        ).scoring().across();
+        assertNotNull(across);
+        assertEquals(
+            List.of(List.of("jackal"), List.of("bear"), List.of("owl cat")),
+            across.clauses().stream().map(c -> c.stream().map(InfinoQueryTranslator.TextClause::query).distinct().toList()).toList()
+        );
+        for (List<InfinoQueryTranslator.TextClause> clause : across.clauses()) {
+            assertEquals(List.of("message", "title"), clause.stream().map(InfinoQueryTranslator.TextClause::column).toList());
+        }
+        // A field:word after an OR is its own clause, and the word after it may start a run.
+        InfinoQueryTranslator.Across fielded = InfinoQueryTranslator.translate(
+            QueryBuilders.queryStringQuery("jackal OR message:bear owl cat").field("message").field("title"),
+            cols,
+            TABLE,
+            NOW
+        ).scoring().across();
+        assertNotNull(fielded);
+        assertEquals(
+            List.of(List.of("jackal"), List.of("bear"), List.of("owl cat")),
+            fielded.clauses().stream().map(c -> c.stream().map(InfinoQueryTranslator.TextClause::query).distinct().toList()).toList()
+        );
+        assertEquals(List.of(new InfinoQueryTranslator.TextClause("message", "bear", "or")), fielded.clauses().get(1));
+        assertEquals(
+            List.of(new InfinoQueryTranslator.TextClause("message", "owl cat", "or"), new InfinoQueryTranslator.TextClause("title", "owl cat", "or")),
+            fielded.clauses().get(2)
+        );
+    }
+
+    public void testAFieldTheMappingDoesNotHaveAddsNothing() {
+        // Stock's dis_max has no clause for an unmapped field: the others still rank the page.
+        Map<String, Column> cols = columns();
+        cols.put("title", new Column("title", "str", true, false));
+        InfinoQueryTranslator.Across across = InfinoQueryTranslator.translate(
+            QueryBuilders.queryStringQuery("jackal bear").field("message").field("title").field("nosuch"),
+            cols,
+            TABLE,
+            NOW
+        ).scoring().across();
+        assertNotNull(across);
+        assertEquals(
+            List.of(List.of(new InfinoQueryTranslator.TextClause("message", "jackal bear", "or"), new InfinoQueryTranslator.TextClause("title", "jackal bear", "or"))),
+            across.clauses()
+        );
+        // Nor does a field:word on such a field: it matches nothing, and the other clauses rank.
+        InfinoQueryTranslator.Across fielded = InfinoQueryTranslator.translate(
+            QueryBuilders.queryStringQuery("jackal OR nosuch:bear owl").field("message").field("title"),
+            cols,
+            TABLE,
+            NOW
+        ).scoring().across();
+        assertNotNull(fielded);
+        assertEquals(
+            List.of(List.of("jackal"), List.of("owl")),
+            fielded.clauses().stream().map(c -> c.stream().map(InfinoQueryTranslator.TextClause::query).distinct().toList()).toList()
+        );
+        // A mapped column with no text index, or a field pattern, which stock expands over the mapping, still leaves it unranked.
+        for (QueryStringQueryBuilder qs : List.of(
+            QueryBuilders.queryStringQuery("jackal bear").field("message").field("title").field("level"),
+            QueryBuilders.queryStringQuery("jackal bear").field("title").field("mess*")
+        )) {
+            assertNull(qs.toString(), InfinoQueryTranslator.translate(qs, cols, TABLE, NOW).scoring().across());
+        }
     }
 
     private static Translation translateWithTitle(org.opensearch.index.query.QueryBuilder qb) {
