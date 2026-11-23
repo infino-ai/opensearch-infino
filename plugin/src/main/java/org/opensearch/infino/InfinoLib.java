@@ -27,9 +27,10 @@ public interface InfinoLib extends Library {
     int infino_hosted(Pointer h);
 
     /**
-     * Check once that the connection's own storage answers, by listing its
-     * tables, within a bounded wait: "" when it does, else
-     * {@code {"error", "status"?}} with the reason.
+     * Check once that the node can use the connection's own storage: for
+     * local storage, write a small file in the root and delete it; then list
+     * the tables. "" when both work, else {@code {"error", "permanent"}},
+     * where {@code permanent} says the failure will not pass on its own.
      */
     Pointer infino_check_storage(Pointer h);
 
