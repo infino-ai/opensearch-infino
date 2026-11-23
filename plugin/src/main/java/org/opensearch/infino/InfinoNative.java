@@ -394,6 +394,19 @@ public final class InfinoNative {
             }
         }
 
+        /**
+         * {@code value} encoded as the field's points hold it: the value the
+         * field keeps for it ({@link #exact}), an infinite or unrepresentable
+         * one left as it is.
+         */
+        double encoded(double value) {
+            if (Double.isFinite(value) == false) {
+                return value;
+            }
+            Double kept = exact(value);
+            return kept == null ? value : kept;
+        }
+
         /** A comparison ({@code " >= "} and the like) and the value it compares with. */
         record Bound(String op, double value) {}
 

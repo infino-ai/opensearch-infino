@@ -108,6 +108,53 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         expectThrows(Exception.class, () -> preciseWhere(QueryBuilders.termQuery("h", 70000.0)));
     }
 
+    private static List<String> rangePredicates(org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder r, boolean pointRanges) {
+        InfinoAggregationProcessor.Explicit e = InfinoAggregationProcessor.Explicit.range(
+            r,
+            preciseColumns(),
+            TABLE,
+            new InfinoAggregationProcessor.Leaves(List.of(), List.of()),
+            null,
+            NOW,
+            pointRanges
+        );
+        return e.buckets.stream().map(InfinoAggregationProcessor.ExplicitBucket::predicate).toList();
+    }
+
+    /**
+     * Where stock answers a range aggregation from a float field's points (a
+     * top-level aggregation of a search matching every document, ranges that do
+     * not overlap), it encodes each bound at the field's precision, so the
+     * float 33.8 the column holds counts from 33.8. Elsewhere the bounds stay
+     * as written, as stock compares them there; a bucket's bounds stay as
+     * written either way.
+     */
+    public void testARangeAggregationOnAFloatFieldEncodesItsBoundsWhereStockReadsPoints() {
+        org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder r = new org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder("a")
+            .field("f")
+            .addUnboundedTo(0.5)
+            .addRange(0.5, 33.8)
+            .addUnboundedFrom(33.8);
+        assertEquals(
+            List.of("(\"f\" < 0.5)", "(\"f\" >= 0.5 AND \"f\" < 33.79999923706055)", "(\"f\" >= 33.79999923706055)"),
+            rangePredicates(r, true).stream().map(p -> p.replace("(\"f\")", "\"f\"")).toList()
+        );
+        assertEquals(
+            List.of("(\"f\" < 0.5)", "(\"f\" >= 0.5 AND \"f\" < 33.8)", "(\"f\" >= 33.8)"),
+            rangePredicates(r, false).stream().map(p -> p.replace("(\"f\")", "\"f\"")).toList()
+        );
+        // Overlapping ranges are compared as written, as stock does not read the points for them.
+        org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder overlapping = new org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder("a")
+            .field("f")
+            .addRange(0, 33.8)
+            .addRange(2.7, 40);
+        assertTrue(rangePredicates(overlapping, true).get(0).contains("33.8)"));
+        // A half float and a scaled float encode at their own precision; a double keeps the bound.
+        assertTrue(rangePredicates(new org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder("a").field("h").addUnboundedFrom(0.3), true).get(0).contains("0.300048828125"));
+        assertTrue(rangePredicates(new org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder("a").field("s").addUnboundedFrom(1.234), true).get(0).contains(">= 1.23)"));
+        assertTrue(rangePredicates(new org.opensearch.search.aggregations.bucket.range.RangeAggregationBuilder("a").field("d").addUnboundedFrom(0.3), true).get(0).contains(">= 0.3)"));
+    }
+
     public void testMatchAllAndFilters() {
         assertEquals("1=1", translate(QueryBuilders.matchAllQuery()).where());
         assertEquals("\"level\" = 'error'", translate(QueryBuilders.termQuery("level", "error")).where());

@@ -465,7 +465,9 @@ public class InfinoAggregationProcessor {
         List<Spec> specs = new ArrayList<>();
         int position = 0;
         for (AggregationBuilder b : builders) {
-            specs.add(Spec.of(b, plan.cols(), plan.table(), predicates, plan.access(), position++, shardSized, plan.nowMillis()));
+            specs.add(
+                Spec.of(b, plan.cols(), plan.table(), predicates, plan.access(), position++, shardSized, plan.nowMillis(), InfinoQueryTranslator.ALL.equals(where))
+            );
         }
         // A metric over a field some document gives several values reads each
         // document's figures over them, joined in once for the whole request.
@@ -753,6 +755,26 @@ public class InfinoAggregationProcessor {
             boolean shardOfMany,
             long now
         ) {
+            return of(b, cols, table, predicates, access, index, shardOfMany, now, false);
+        }
+
+        /**
+         * {@link #of(AggregationBuilder, Map, String, Function, InfinoAccess, int, boolean, long)}
+         * for a builder that is {@code pointRanges}: a top-level aggregation of a
+         * search whose query matches every document, where stock answers a range
+         * aggregation from the field's points (see {@link Explicit#range}).
+         */
+        static Spec of(
+            AggregationBuilder b,
+            Map<String, Column> cols,
+            String table,
+            Function<QueryBuilder, String> predicates,
+            InfinoAccess access,
+            int index,
+            boolean shardOfMany,
+            long now,
+            boolean pointRanges
+        ) {
             if (Metric.handles(b)) {
                 if (!b.getSubAggregations().isEmpty()) {
                     throw new Unsupported("metric aggregation [" + b.getName() + "] cannot have sub-aggregations");
@@ -801,7 +823,7 @@ public class InfinoAggregationProcessor {
                 return Explicit.filters(f, predicates, leaves, child);
             }
             if (b instanceof RangeAggregationBuilder r) {
-                return Explicit.range(r, cols, table, leaves, child, now);
+                return Explicit.range(r, cols, table, leaves, child, now, pointRanges);
             }
             if (b instanceof DateRangeAggregationBuilder dr) {
                 return Explicit.dateRange(dr, cols, table, leaves, child, now);
@@ -2224,17 +2246,68 @@ public class InfinoAggregationProcessor {
         }
 
         static Explicit range(RangeAggregationBuilder r, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child, long now) {
+            return range(r, cols, table, leaves, child, now, false);
+        }
+
+        /**
+         * A {@code range} aggregation. Stock compares each document's value
+         * with the bounds as written, except where it answers the aggregation
+         * from the field's points: a top-level aggregation of a search whose
+         * query matches every document ({@code pointRanges}), on a field with
+         * one value per document, no script and no {@code missing}, whose
+         * ranges do not overlap. There each bound is encoded as the field
+         * keeps its values (a 32-bit float, a 16-bit one, a long over a
+         * scaling factor), so a float field's 33.8 counts in a range from
+         * 33.8. The table holds the values at that precision, so here the
+         * bounds are taken to it too. A bucket's key and bounds stay as
+         * written.
+         */
+        static Explicit range(
+            RangeAggregationBuilder r,
+            Map<String, Column> cols,
+            String table,
+            Leaves leaves,
+            BucketSpec child,
+            long now,
+            boolean pointRanges
+        ) {
             Source c = sourceOf(r, cols, table, now);
             if (!c.isNumeric()) {
                 throw new Unsupported("aggregation [" + r.getName() + "] needs a numeric value, " + c.label() + " is " + c.typeName());
             }
+            InfinoNative.Precision precision = pointRanges ? pointPrecision(r, c, cols) : null;
             List<ExplicitBucket> buckets = new ArrayList<>();
             for (RangeAggregator.Range range : r.ranges()) {
                 double from = range.getFrom();
                 double to = range.getTo();
-                buckets.add(new ExplicitBucket(range.getKey(), between(c, from, to), from, to));
+                String predicate = precision == null ? between(c, from, to) : between(c, precision.encoded(from), precision.encoded(to));
+                buckets.add(new ExplicitBucket(range.getKey(), predicate, from, to));
             }
             return new Explicit(r, leaves, child, ExplicitKind.RANGE, buckets, r.keyed(), DocValueFormat.RAW);
+        }
+
+        /**
+         * The precision a range aggregation's bounds are encoded at where stock
+         * reads them from the field's points, or null where it compares the
+         * values with the bounds as written: see {@link #range}.
+         */
+        private static InfinoNative.Precision pointPrecision(RangeAggregationBuilder r, Source c, Map<String, Column> cols) {
+            if (r.script() != null || r.missing() != null || c.multi() || c.column() == null) {
+                return null;
+            }
+            Column column = cols.get(c.column());
+            if (column == null || column.isList() || column.precision() == null) {
+                return null;
+            }
+            // Stock sorts the ranges by their bounds and reads the points only when none overlaps the next.
+            List<RangeAggregator.Range> sorted = new ArrayList<>(r.ranges());
+            sorted.sort(Comparator.comparingDouble(RangeAggregator.Range::getFrom).thenComparingDouble(RangeAggregator.Range::getTo));
+            for (int i = 1; i < sorted.size(); i++) {
+                if (sorted.get(i - 1).getTo() > sorted.get(i).getFrom()) {
+                    return null;
+                }
+            }
+            return column.precision();
         }
 
         static Explicit dateRange(DateRangeAggregationBuilder r, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child, long now) {
