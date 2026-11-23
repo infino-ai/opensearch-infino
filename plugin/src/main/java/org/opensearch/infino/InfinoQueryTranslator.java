@@ -613,6 +613,10 @@ final class InfinoQueryTranslator {
     ) {
         // A bool with no clause is a match_all: it scores its boost (constantScore).
         if (qb instanceof BoolQueryBuilder b && b.hasClauses()) {
+            if (b.boost() != 1f) {
+                // A boosted bool weighs its clauses' sum, which no sum of them keeps.
+                summed.add(null);
+            }
             // A filter or must_not clause scores nothing.
             for (QueryBuilder c : b.must()) {
                 required(c, offset, bonuses, texts, summed, unscored, stray);
@@ -622,11 +626,15 @@ final class InfinoQueryTranslator {
                 if (!optional(c, bonuses, texts)) {
                     unscored[0] = true;
                     stray[0] = true;
-                } else if (texts.size() > known) {
+                } else if (texts.size() == known + 1) {
                     // An optional clause scores where it matches: all its words
                     // under operator and, which a sum over any of them would not keep.
                     TextClause t = texts.get(known);
                     summed.add(summable(c) && "or".equals(t.mode()) ? t : null);
+                } else if (texts.size() > known) {
+                    // A clause that reads as several text clauses scores as their
+                    // combination, which no plain sum of them keeps.
+                    summed.add(null);
                 }
             }
             return;
@@ -1317,6 +1325,8 @@ final class InfinoQueryTranslator {
      * on such a column: one the engine applies above a ranked search, so the
      * rows it removes go after the ranking. A string literal that happens to
      * hold the same text only costs that search a wider candidate window.
+     * The summed search of several text clauses ({@link Across}) takes a
+     * text_match into the rows it ranks; only {@link #joinsById} falls after it.
      */
     static boolean joinsAfterRanking(String predicate) {
         return joinsById(predicate) || predicate.contains(TEXT_PREDICATE);

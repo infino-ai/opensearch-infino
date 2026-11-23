@@ -2437,7 +2437,13 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
                 .must(QueryBuilders.matchQuery("title", "full"))
                 .should(QueryBuilders.termQuery("level", "error")),
             // A must query string, which is no one-column clause.
-            QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(QueryBuilders.queryStringQuery("full").field("title"))
+            QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(QueryBuilders.queryStringQuery("full").field("title")),
+            // A boosted inner bool, which weighs its clause's BM25.
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.matchQuery("message", "disk"))
+                .must(QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("title", "full")).boost(3f)),
+            // A boosted bool, which weighs the whole sum.
+            QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(QueryBuilders.matchQuery("title", "full")).boost(2f)
         )) {
             Translation t = InfinoQueryTranslator.translate(b, cols, TABLE, NOW);
             assertNull(b.toString(), t.scoring().across());
