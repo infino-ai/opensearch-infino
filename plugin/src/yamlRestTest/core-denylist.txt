@@ -50,17 +50,7 @@ delete/50_refresh/Refresh  # [bug:default] a delete sent without refresh hides t
 # --- Requests stock rejects are accepted, or answered with another status
 search/260_sort_mixed/*  # [bug] a sort across long, double and unsigned_long indices stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
 
-# --- Write responses and checks in proxy mode
-delete/20_cas/Internal version  # [bug:proxy] proxy mode numbers writes from 1, not 0, so _seq_no is one too high (https://github.com/infino-ai/opensearch-infino/issues/57)
-search/300_sequence_numbers/sequence numbers are returned if requested from body  # [bug:proxy] proxy mode numbers writes from 1, not 0, so _seq_no is one too high (https://github.com/infino-ai/opensearch-infino/issues/57)
-search/300_sequence_numbers/sequence numbers are returned if requested from url  # [bug:proxy] proxy mode numbers writes from 1, not 0, so _seq_no is one too high (https://github.com/infino-ai/opensearch-infino/issues/57)
-update/35_if_seq_no/Update with if_seq_no  # [bug:proxy] if_seq_no on a missing document returns 409, not 404 (https://github.com/infino-ai/opensearch-infino/issues/57)
-mget/14_alias_to_multiple_indices/*  # [bug:proxy] an mget through an alias of several indices is not rejected (https://github.com/infino-ai/opensearch-infino/issues/57)
-
 # --- Write responses
-bulk/10_basic/When setting require_alias flag  # [bug] require_alias on an index that is not an alias creates the index (https://github.com/infino-ai/opensearch-infino/issues/57)
-bulk/10_basic/When setting require_alias flag per request  # [bug] require_alias on an index that is not an alias creates the index (https://github.com/infino-ai/opensearch-infino/issues/57)
-index/70_require_alias/Set require_alias flag  # [bug] require_alias on an index that is not an alias creates the index (https://github.com/infino-ai/opensearch-infino/issues/57)
 update/12_result/Update result field  # [bug] an update reports the wrong result or _version
 update/16_noop/Noop  # [bug] an update that changes nothing is not a noop: it takes a new _seq_no
 update/40_routing/Routing  # [bug] an update with routing returns no get._source (default) or no _routing (proxy)

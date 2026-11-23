@@ -11,8 +11,10 @@ import org.opensearch.search.internal.SearchContext;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 
 /** The hits.total a proxy search reports, as a coordinator reports it under track_total_hits. */
 public class InfinoSearchTotalsTests extends OpenSearchTestCase {
@@ -125,6 +127,133 @@ public class InfinoSearchTotalsTests extends OpenSearchTestCase {
             rows.add(Map.of(InfinoQueryTranslator.OSID, id));
         }
         return rows;
+    }
+
+    /** A source lookup over {@code held}: the ids the table still holds, each with a source naming it. */
+    private static Function<List<Map<String, Object>>, List<Map<String, Object>>> holding(
+        List<String> held,
+        List<List<String>> asked
+    ) {
+        return rows -> InfinoSearch.withSources(rows, 0, 10, ids -> {
+            asked.add(List.copyOf(ids));
+            Map<String, String> out = new HashMap<>();
+            for (String id : ids) {
+                if (held.contains(id)) {
+                    out.put(id, "{\"id\":\"" + id + "\"}");
+                }
+            }
+            return out;
+        });
+    }
+
+    private static List<Object> ids(List<Map<String, Object>> rows) {
+        return rows.stream().map(r -> r.get(InfinoQueryTranslator.OSID)).toList();
+    }
+
+    public void testAPageWhoseSourcesAreAllThereIsReadOnce() {
+        List<List<String>> asked = new ArrayList<>();
+        int[] reads = { 0 };
+        int[] chosen = { 0 };
+        List<Map<String, Object>> page = InfinoSearch.sourcedRows(() -> {
+            reads[0]++;
+            return idRows("d1", "d2");
+        }, holding(List.of("d1", "d2"), asked), 10, chosen);
+        assertEquals(List.of("d1", "d2"), ids(page));
+        assertEquals(1, reads[0]);
+        assertEquals(2, chosen[0]);
+    }
+
+    public void testARowDeletedBetweenTheReadsIsReadAgainAndTheNextRowTakesItsPlace() {
+        // The first read chooses d1 d2 d3; d2 is deleted before its source is
+        // read. The page is read again and chooses d1 d3 d4, all still held.
+        List<List<String>> asked = new ArrayList<>();
+        List<List<Map<String, Object>>> choices = new ArrayList<>(List.of(idRows("d1", "d2", "d3"), idRows("d1", "d3", "d4")));
+        int[] chosen = { 0 };
+        List<Map<String, Object>> page = InfinoSearch.sourcedRows(
+            () -> choices.remove(0),
+            holding(List.of("d1", "d3", "d4"), asked),
+            3,
+            chosen
+        );
+        assertEquals(List.of("d1", "d3", "d4"), ids(page));
+        assertEquals("{\"id\":\"d4\"}", page.get(2).get(InfinoQueryTranslator.SOURCE));
+        assertEquals(2, asked.size());
+        assertEquals(3, chosen[0]);
+    }
+
+    public void testARowThatKeepsVanishingLeavesAFullPageShortAndStillCountsAsChosen() {
+        // Every read chooses d2, which has no source: after the last re-read the
+        // page goes without it, and the count of rows chosen stays 3, so the page
+        // is not taken for the last one.
+        List<List<String>> asked = new ArrayList<>();
+        int[] chosen = { 0 };
+        List<Map<String, Object>> page = InfinoSearch.sourcedRows(
+            () -> idRows("d1", "d2", "d3"),
+            holding(List.of("d1", "d3"), asked),
+            3,
+            chosen
+        );
+        assertEquals(List.of("d1", "d3"), ids(page));
+        assertEquals(InfinoSearch.SOURCE_REREADS + 1, asked.size());
+        assertEquals(3, chosen[0]);
+    }
+
+    public void testAShortChoiceIsNotReadAgain() {
+        // Two rows chosen for a page of three: the table ran out, nothing vanished.
+        List<List<String>> asked = new ArrayList<>();
+        int[] chosen = { 0 };
+        List<Map<String, Object>> page = InfinoSearch.sourcedRows(
+            () -> idRows("d1", "d2"),
+            holding(List.of("d1", "d2"), asked),
+            3,
+            chosen
+        );
+        assertEquals(List.of("d1", "d2"), ids(page));
+        assertEquals(1, asked.size());
+        assertEquals(2, chosen[0]);
+    }
+
+    public void testAScrollRoundEndsOnlyWhenTheTableRunsOut() {
+        // A full page that lost a hit to a delete pages on.
+        assertFalse(InfinoQueryPhaseSearcher.scrollRoundDone(1, 2, 3, 3));
+        // A page that chose fewer rows than asked is the last.
+        assertTrue(InfinoQueryPhaseSearcher.scrollRoundDone(1, 2, 2, 3));
+        // Enough known rows ends the round.
+        assertTrue(InfinoQueryPhaseSearcher.scrollRoundDone(3, 3, 3, 3));
+        // A page left with no hit has nothing to page on from.
+        assertTrue(InfinoQueryPhaseSearcher.scrollRoundDone(0, 0, 3, 3));
+    }
+
+    public void testADocumentWithTheIdErrorIsASource() {
+        // The ids sit under "sources", so an id spelling "error" is a document, not a failed read.
+        Map<String, String> sources = InfinoNative.sourcesOf("{\"sources\":{\"error\":\"{\\\"a\\\":1}\",\"zz\":\"{}\"}}");
+        assertEquals(Map.of("error", "{\"a\":1}", "zz", "{}"), sources);
+        assertEquals(Map.of(), InfinoNative.sourcesOf("{\"sources\":{}}"));
+        expectThrows(InfinoNative.InfinoException.class, () -> InfinoNative.sourcesOf("{\"error\":\"{}\"}"));
+    }
+
+    public void testARowDeletedBeforeItsSourceIsReadLeavesThePage() {
+        // d2 was deleted between the page's two reads: it is left out, never shown with no source.
+        List<Map<String, Object>> page = InfinoSearch.withSources(
+            idRows("d1", "d2", "d3"),
+            0,
+            10,
+            ids -> Map.of("d1", "{\"a\":1}", "d3", "{\"a\":3}")
+        );
+        assertEquals(2, page.size());
+        assertEquals("d1", page.get(0).get(InfinoQueryTranslator.OSID));
+        assertEquals("{\"a\":1}", page.get(0).get(InfinoQueryTranslator.SOURCE));
+        assertEquals("d3", page.get(1).get(InfinoQueryTranslator.OSID));
+        assertEquals("{\"a\":3}", page.get(1).get(InfinoQueryTranslator.SOURCE));
+    }
+
+    public void testARowDeletedInTheWindowLeavesItAndTheRowsBeforeItStay() {
+        // from 1: d1 is before the window and keeps no source; d3 was deleted between the reads.
+        List<Map<String, Object>> page = InfinoSearch.withSources(idRows("d1", "d2", "d3"), 1, 10, ids -> Map.of("d2", "{}"));
+        assertEquals(2, page.size());
+        assertEquals("d1", page.get(0).get(InfinoQueryTranslator.OSID));
+        assertFalse(page.get(0).containsKey(InfinoQueryTranslator.SOURCE));
+        assertEquals("d2", page.get(1).get(InfinoQueryTranslator.OSID));
     }
 
     public void testOnlyTheWindowsSourcesAreRead() {

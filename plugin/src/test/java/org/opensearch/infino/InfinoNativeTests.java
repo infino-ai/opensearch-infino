@@ -4,6 +4,7 @@
 
 package org.opensearch.infino;
 
+import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.infino.InfinoNative.Mapping;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -108,5 +109,17 @@ public class InfinoNativeTests extends OpenSearchTestCase {
         assertFalse(InfinoNative.hasTerm("+/-"));
         assertTrue(InfinoNative.hasTerm("+1"));
         assertTrue(InfinoNative.hasTerm("é"));
+    }
+
+    /**
+     * A table with no row has performed no operation, so its first write is
+     * given 0 as stock's first is; one whose rows were all written without a
+     * number reports them at the untracked number, so the next is past it.
+     */
+    public void testTheHighestSequenceNumberTellsAnEmptyTableFromOneAtZero() {
+        assertEquals(SequenceNumbers.NO_OPS_PERFORMED, InfinoNative.highestSeq(null, () -> false));
+        assertEquals(InfinoDocumentVersion.UNTRACKED_SEQ_NO, InfinoNative.highestSeq(null, () -> true));
+        assertEquals(0L, InfinoNative.highestSeq(0L, () -> { throw new AssertionError("a stored number needs no row check"); }));
+        assertEquals(41L, InfinoNative.highestSeq(41, () -> { throw new AssertionError("a stored number needs no row check"); }));
     }
 }
