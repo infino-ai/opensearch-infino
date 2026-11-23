@@ -1894,7 +1894,10 @@ public final class InfinoSearch {
             boolean narrowedAfterRanking = InfinoQueryTranslator.joinsAfterRanking(where) || (filtered && plan.collapse() != null);
             from = q.rankedFrom(narrowedAfterRanking ? window : fetch);
             hit.append(", score");
-            order = "score DESC";
+            // Hits that tie on the score come in the order they were written,
+            // as stock orders them by their place in the index: the ranked
+            // search keeps that order, but a sort by the score alone need not.
+            order = "score DESC, " + InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID) + " ASC";
         } else {
             from = q.from();
             order = null;

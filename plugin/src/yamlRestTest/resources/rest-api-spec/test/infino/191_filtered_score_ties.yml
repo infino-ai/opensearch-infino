@@ -1,0 +1,579 @@
+# On a scored page with a filter or a must_not, hits with equal scores come
+# in the order they were written, as a Lucene twin orders them by their place
+# in the index, in proxy and in default mode. Every document holds disk in
+# message once, or fan, and disk in title, so every hit of a query on disk
+# scores the same. Each test is one shape of scored statement a filter or a
+# must_not can produce.
+setup:
+  - do:
+      indices.create:
+        index: ft_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { message: { type: text }, title: { type: text }, grp: { type: keyword } } }
+  - do:
+      indices.create:
+        index: ft_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { message: { type: text }, title: { type: text }, grp: { type: keyword } } }
+  - do:
+      indices.create:
+        index: ft_default
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { message: { type: text }, title: { type: text }, grp: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ft_luc
+        body:
+          - index: { _id: "t01" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t02" }
+          - {"message": "disk", "title": "disk", "grp": "g1"}
+          - index: { _id: "t03" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t04" }
+          - {"message": "fan", "title": "disk", "grp": "g0"}
+          - index: { _id: "t05" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t06" }
+          - {"message": "disk", "title": "disk", "grp": "g1"}
+          - index: { _id: "t07" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t08" }
+          - {"message": "fan", "title": "disk", "grp": "g1"}
+          - index: { _id: "t09" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t10" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+  - do:
+      bulk:
+        refresh: true
+        index: ft_proxy
+        body:
+          - index: { _id: "t01" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t02" }
+          - {"message": "disk", "title": "disk", "grp": "g1"}
+          - index: { _id: "t03" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t04" }
+          - {"message": "fan", "title": "disk", "grp": "g0"}
+          - index: { _id: "t05" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t06" }
+          - {"message": "disk", "title": "disk", "grp": "g1"}
+          - index: { _id: "t07" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t08" }
+          - {"message": "fan", "title": "disk", "grp": "g1"}
+          - index: { _id: "t09" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t10" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+  - do:
+      bulk:
+        refresh: true
+        index: ft_default
+        body:
+          - index: { _id: "t01" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t02" }
+          - {"message": "disk", "title": "disk", "grp": "g1"}
+          - index: { _id: "t03" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t04" }
+          - {"message": "fan", "title": "disk", "grp": "g0"}
+          - index: { _id: "t05" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t06" }
+          - {"message": "disk", "title": "disk", "grp": "g1"}
+          - index: { _id: "t07" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t08" }
+          - {"message": "fan", "title": "disk", "grp": "g1"}
+          - index: { _id: "t09" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+          - index: { _id: "t10" }
+          - {"message": "disk", "title": "disk", "grp": "g0"}
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: ft_luc,ft_proxy,ft_default
+        ignore_unavailable: true
+
+---
+"A match beside a filter pages through its ties in the order they were written":
+  - do:
+      search:
+        index: ft_luc
+        body: {"from": 0, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"from": 0, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"from": 0, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_luc
+        body: {"from": 2, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t05" }
+  - match: { hits.hits.1._id: "t07" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"from": 2, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t05" }
+  - match: { hits.hits.1._id: "t07" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"from": 2, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t05" }
+  - match: { hits.hits.1._id: "t07" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_luc
+        body: {"from": 4, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t09" }
+  - match: { hits.hits.1._id: "t10" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"from": 4, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t09" }
+  - match: { hits.hits.1._id: "t10" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"from": 4, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t09" }
+  - match: { hits.hits.1._id: "t10" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+
+---
+"A match beside a must_not pages through its ties in the order they were written":
+  - do:
+      search:
+        index: ft_luc
+        body: {"from": 0, "size": 3, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - match: { hits.hits.2._id: "t05" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.2._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"from": 0, "size": 3, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - match: { hits.hits.2._id: "t05" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.2._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"from": 0, "size": 3, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - match: { hits.hits.2._id: "t05" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.2._score: $first_score }
+  - do:
+      search:
+        index: ft_luc
+        body: {"from": 3, "size": 3, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "t07" }
+  - match: { hits.hits.1._id: "t09" }
+  - match: { hits.hits.2._id: "t10" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.2._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"from": 3, "size": 3, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "t07" }
+  - match: { hits.hits.1._id: "t09" }
+  - match: { hits.hits.2._id: "t10" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.2._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"from": 3, "size": 3, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "t07" }
+  - match: { hits.hits.1._id: "t09" }
+  - match: { hits.hits.2._id: "t10" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.2._score: $first_score }
+
+---
+"A match beside a text filter, which the engine joins after its ranking, orders its ties as written":
+  - do:
+      search:
+        index: ft_luc
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"match": {"title": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - match: { hits.hits.2._id: "t05" }
+  - match: { hits.hits.3._id: "t07" }
+  - match: { hits.hits.4._id: "t09" }
+  - match: { hits.hits.5._id: "t10" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.5._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"match": {"title": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - match: { hits.hits.2._id: "t05" }
+  - match: { hits.hits.3._id: "t07" }
+  - match: { hits.hits.4._id: "t09" }
+  - match: { hits.hits.5._id: "t10" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.5._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"match": {"title": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - match: { hits.hits.2._id: "t05" }
+  - match: { hits.hits.3._id: "t07" }
+  - match: { hits.hits.4._id: "t09" }
+  - match: { hits.hits.5._id: "t10" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.5._score: $first_score }
+  - do:
+      search:
+        index: ft_luc
+        body: {"from": 3, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"match": {"title": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t07" }
+  - match: { hits.hits.1._id: "t09" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"from": 3, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"match": {"title": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t07" }
+  - match: { hits.hits.1._id: "t09" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"from": 3, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"match": {"title": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t07" }
+  - match: { hits.hits.1._id: "t09" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+
+---
+"Two match clauses beside a filter order the ties of their summed score as written":
+  - do:
+      search:
+        index: ft_luc
+        body: {"from": 2, "size": 3, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"title": "disk"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "t05" }
+  - match: { hits.hits.1._id: "t07" }
+  - match: { hits.hits.2._id: "t09" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.2._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"from": 2, "size": 3, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"title": "disk"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "t05" }
+  - match: { hits.hits.1._id: "t07" }
+  - match: { hits.hits.2._id: "t09" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.2._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"from": 2, "size": 3, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"title": "disk"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "t05" }
+  - match: { hits.hits.1._id: "t07" }
+  - match: { hits.hits.2._id: "t09" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.2._score: $first_score }
+  - do:
+      search:
+        index: ft_luc
+        body: {"from": 0, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"title": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"from": 0, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"title": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"from": 0, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"title": "disk"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+
+---
+"A query string across two text columns beside a filter orders its ties as written":
+  # t04 holds disk in title alone, which scores less: the others tie ahead of it.
+  - do:
+      search:
+        index: ft_luc
+        body: {"from": 1, "size": 4, "query": {"bool": {"must": [{"query_string": {"query": "disk", "fields": ["message", "title"]}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 7 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "t03" }
+  - match: { hits.hits.1._id: "t05" }
+  - match: { hits.hits.2._id: "t07" }
+  - match: { hits.hits.3._id: "t09" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.3._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"from": 1, "size": 4, "query": {"bool": {"must": [{"query_string": {"query": "disk", "fields": ["message", "title"]}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 7 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "t03" }
+  - match: { hits.hits.1._id: "t05" }
+  - match: { hits.hits.2._id: "t07" }
+  - match: { hits.hits.3._id: "t09" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.3._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"from": 1, "size": 4, "query": {"bool": {"must": [{"query_string": {"query": "disk", "fields": ["message", "title"]}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 7 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "t03" }
+  - match: { hits.hits.1._id: "t05" }
+  - match: { hits.hits.2._id: "t07" }
+  - match: { hits.hits.3._id: "t09" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.3._score: $first_score }
+  - do:
+      search:
+        index: ft_luc
+        body: {"from": 0, "size": 2, "query": {"bool": {"must": [{"query_string": {"query": "disk", "fields": ["message", "title"]}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 7 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"from": 0, "size": 2, "query": {"bool": {"must": [{"query_string": {"query": "disk", "fields": ["message", "title"]}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 7 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"from": 0, "size": 2, "query": {"bool": {"must": [{"query_string": {"query": "disk", "fields": ["message", "title"]}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 7 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+
+---
+"A should clause beside a filter adds the same to every hit, which keep the order they were written":
+  - do:
+      search:
+        index: ft_luc
+        body: {"from": 2, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "should": [{"term": {"grp": "g0"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t05" }
+  - match: { hits.hits.1._id: "t07" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"from": 2, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "should": [{"term": {"grp": "g0"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t05" }
+  - match: { hits.hits.1._id: "t07" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"from": 2, "size": 2, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "should": [{"term": {"grp": "g0"}}], "filter": [{"term": {"grp": "g0"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t05" }
+  - match: { hits.hits.1._id: "t07" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_luc
+        body: {"from": 0, "size": 3, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "should": [{"term": {"grp": "g0"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - match: { hits.hits.2._id: "t05" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.2._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"from": 0, "size": 3, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "should": [{"term": {"grp": "g0"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - match: { hits.hits.2._id: "t05" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.2._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"from": 0, "size": 3, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "should": [{"term": {"grp": "g0"}}], "must_not": [{"term": {"grp": "g1"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t03" }
+  - match: { hits.hits.2._id: "t05" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.2._score: $first_score }
+
+---
+"A collapse beside a filter keeps the first written of each group's ties, the groups in that order too":
+  - do:
+      search:
+        index: ft_luc
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"terms": {"grp": ["g0", "g1"]}}]}}, "collapse": {"field": "grp"}}
+  - match: { hits.total.value: 8 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t02" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_proxy
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"terms": {"grp": ["g0", "g1"]}}]}}, "collapse": {"field": "grp"}}
+  - match: { hits.total.value: 8 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t02" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
+  - do:
+      search:
+        index: ft_default
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}], "filter": [{"terms": {"grp": ["g0", "g1"]}}]}}, "collapse": {"field": "grp"}}
+  - match: { hits.total.value: 8 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "t01" }
+  - match: { hits.hits.1._id: "t02" }
+  - set: { hits.hits.0._score: first_score }
+  - match: { hits.hits.1._score: $first_score }
