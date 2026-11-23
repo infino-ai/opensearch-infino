@@ -45,6 +45,10 @@ services:
       infino.default_mode.enabled: ${INFINO_DEFAULT_MODE_ENABLED:-}
       infino.sql.max_result_size: ${INFINO_SQL_MAX_RESULT_SIZE:-}
 
+      # Optional HTTPS cert for port 9200 (TLS_CERT/TLS_KEY in .env); the demo cert otherwise.
+      plugins.security.ssl.http.pemcert_filepath: ${TLS_CERT:+tls/cert.pem}
+      plugins.security.ssl.http.pemkey_filepath: ${TLS_KEY:+tls/key.pem}
+
       # Not read yet: S3 uses the EC2 instance role only. Passed through for when keys are read.
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
@@ -56,6 +60,12 @@ services:
     volumes:
       - opensearch-data:/usr/share/opensearch/data
       - infino-data:/usr/share/opensearch/infino/data
+      # /dev/null when unset, so the mounts can stay unconditional.
+      - ${TLS_CERT:-/dev/null}:/usr/share/opensearch/config/tls/cert.pem:ro
+      - ${TLS_KEY:-/dev/null}:/usr/share/opensearch/config/tls/key.pem:ro
+    # A stopping node commits its pending writes to the Infino tables; Docker's default 10s
+    # can kill it mid-commit. Override with OPENSEARCH_STOP_GRACE_PERIOD.
+    stop_grace_period: ${OPENSEARCH_STOP_GRACE_PERIOD:-2m}
     ports:
       - "${OPENSEARCH_PORT:-9200}:9200"
     healthcheck:
@@ -71,6 +81,13 @@ services:
     container_name: opensearch-infino-dashboards
     environment:
       OPENSEARCH_HOSTS: '["https://opensearch:9200"]'
+      # Serve HTTPS with the same cert when TLS_CERT is set (empty values are ignored).
+      SERVER_SSL_ENABLED: ${TLS_CERT:+true}
+      SERVER_SSL_CERTIFICATE: ${TLS_CERT:+/usr/share/opensearch-dashboards/config/tls/cert.pem}
+      SERVER_SSL_KEY: ${TLS_KEY:+/usr/share/opensearch-dashboards/config/tls/key.pem}
+    volumes:
+      - ${TLS_CERT:-/dev/null}:/usr/share/opensearch-dashboards/config/tls/cert.pem:ro
+      - ${TLS_KEY:-/dev/null}:/usr/share/opensearch-dashboards/config/tls/key.pem:ro
     ports:
       - "${DASHBOARDS_PORT:-5601}:5601"
     depends_on:

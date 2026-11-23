@@ -41,6 +41,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -58,8 +59,8 @@ use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
 use infino::{
     connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions,
-    Connection, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaError,
-    SchemaPatch, Supertable,
+    Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions,
+    SchemaError, SchemaPatch, Supertable,
 };
 use rayon::prelude::*;
 
@@ -475,6 +476,23 @@ pub struct Bridge {
     /// Each table's [`Gate`], by name: the order in which this node's
     /// writes take the table's writer.
     gates: Mutex<HashMap<String, Arc<Gate>>>,
+    /// How [`Bridge::latest`] connects: the storage, key and cache
+    /// directory `conn` was opened with. None where `conn` already reads
+    /// every commit there is to read: a hosted service, which answers from
+    /// its own copy, and `memory://`, which no other process writes.
+    latest_from: Option<LatestFrom>,
+    /// The connection [`Bridge::latest`] opened, while a reader holds it.
+    latest: Mutex<Option<Connection>>,
+    /// The readers holding [`Bridge::latest`]'s connection open
+    /// ([`Bridge::hold_latest`]); it is closed when the last lets it go.
+    latest_holds: AtomicUsize,
+}
+
+/// What [`Bridge::latest`] opens its connection from.
+struct LatestFrom {
+    uri: String,
+    api_key: Option<String>,
+    cache_dir: Option<String>,
 }
 
 impl Bridge {
@@ -634,16 +652,62 @@ impl Bridge {
     /// table's columns have changed since, it runs once more over the
     /// columns the table holds now.
     fn query_viewed(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
+        self.query_viewed_on(&self.conn, sql)
+    }
+
+    /// [`Bridge::query_viewed`] on `conn`, which may be [`Bridge::latest`].
+    fn query_viewed_on(
+        &self,
+        conn: &Connection,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
         let Some(viewed) = self.attached_sql(sql) else {
-            return self.conn.query_sql(sql);
+            return conn.query_sql(sql);
         };
-        match self.conn.query_sql(&viewed) {
+        match conn.query_sql(&viewed) {
             Err(_) if self.refresh_attached() => {
                 let viewed = self.attached_sql(sql);
-                self.conn.query_sql(viewed.as_deref().unwrap_or(sql))
+                conn.query_sql(viewed.as_deref().unwrap_or(sql))
             }
             other => other,
         }
+    }
+
+    /// A connection that reads a table's latest commit on every statement,
+    /// for reads that decide what a write does: whether a replayed
+    /// operation's id is already a row (and so is replaced, not appended
+    /// again), and where a replay starts. `conn` reads under the engine's
+    /// default staleness bound, so for up to its window after another node
+    /// commits it can answer from the commit before; a shard taking over
+    /// from another node replays that node's operations within that window
+    /// and would append each again. The engine's own update and delete read
+    /// the latest commit to find their rows; it offers a caller no way to
+    /// do so on a connection opened under the bound, so these reads go
+    /// through a connection opened for it. It shares `conn`'s cache
+    /// directory, which the engine supports for two connections, so it reads
+    /// the blocks the node already holds. Opened on the first such read and
+    /// closed when no reader holds it ([`Bridge::hold_latest`]): it holds a
+    /// handle to each table it has read, as `conn` does, and each handle
+    /// keeps that table's manifest in memory, which a node needs twice only
+    /// while a shard catches up with the copy before it.
+    fn latest(&self) -> Result<Connection, InfinoError> {
+        let Some(from) = &self.latest_from else {
+            return Ok(self.conn.clone());
+        };
+        let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = latest.as_ref() {
+            return Ok(conn.clone());
+        }
+        let mut options = ConnectOptions::new().with_read_consistency(Consistency::Strong);
+        if let Some(key) = &from.api_key {
+            options = options.with_api_key(key);
+        }
+        if let Some(dir) = &from.cache_dir {
+            options = options.with_cache_dir(dir);
+        }
+        let conn = connect_with(&from.uri, options)?;
+        *latest = Some(conn.clone());
+        Ok(conn)
     }
 
     fn table(&self, name: &str) -> Result<Supertable, InfinoError> {
@@ -664,10 +728,84 @@ impl Bridge {
         }
     }
 
+    /// Keep [`Bridge::latest`]'s connection open until the hold is let go
+    /// ([`Bridge::release_latest`]), for a reader that reads the latest
+    /// commit several times: a shard catching up with the copy before it
+    /// reads it for each batch it writes until its own first commit. Each
+    /// latest read holds it while it runs, so a read no one holds for closes
+    /// it when done.
+    fn hold_latest(&self) {
+        self.latest_holds.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Let go of a hold [`Bridge::hold_latest`] took, closing
+    /// [`Bridge::latest`]'s connection when it was the last. The count is
+    /// read again under the connection's lock, so a reader that took a hold
+    /// meanwhile keeps the connection it may already be reading through.
+    fn release_latest(&self) {
+        let held = self
+            .latest_holds
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if held.is_err() {
+            return;
+        }
+        let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.latest_holds.load(Ordering::SeqCst) == 0 {
+            *latest = None;
+        }
+    }
+
+    /// `read` on [`Bridge::latest`]'s connection, held while it runs. A read
+    /// that fails is read once more on a connection opened afresh: the one
+    /// before may hold a handle to a table another node has dropped and made
+    /// again under its name, which answers "not found" until the engine
+    /// notices the drop, and a search reports that as a failed query.
+    fn on_latest<T>(
+        &self,
+        read: impl Fn(&Connection) -> Result<T, InfinoError>,
+    ) -> Result<T, InfinoError> {
+        self.hold_latest();
+        let _held = LatestHold(self);
+        self.latest()
+            .and_then(|conn| read(&conn))
+            .or_else(|e| match e {
+                // Where `conn` is the connection there is no other to open.
+                _ if self.latest_from.is_some() => {
+                    self.forget_latest();
+                    self.latest().and_then(|conn| read(&conn))
+                }
+                e => Err(e),
+            })
+    }
+
+    /// [`Bridge::query_viewed`] on [`Bridge::latest`] ([`Bridge::on_latest`]).
+    fn query_latest(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
+        self.on_latest(|conn| self.query_viewed_on(conn, sql))
+    }
+
+    /// Close [`Bridge::latest`]'s connection, so the next latest read opens
+    /// one afresh. It holds a handle to each table it has read, and a handle
+    /// to a table dropped here would answer the next read of a table made
+    /// again under its name with "not found" ([`Bridge::forget`] does the same
+    /// for `conn`'s handles, which this bridge holds itself).
+    fn forget_latest(&self) {
+        *self.latest.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
     /// The [`Gate`] of `name`'s writes on this node.
     fn gate(&self, name: &str) -> Arc<Gate> {
         let mut gates = self.gates.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(gates.entry(name.to_string()).or_default())
+    }
+}
+
+/// A hold on [`Bridge::latest`]'s connection for one read
+/// ([`Bridge::on_latest`]), let go however the read ends.
+struct LatestHold<'a>(&'a Bridge);
+
+impl Drop for LatestHold<'_> {
+    fn drop(&mut self) {
+        self.0.release_latest();
     }
 }
 
@@ -738,6 +876,11 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
         options = options.with_cache_dir(dir);
     }
     let conn = connect_with(uri, options)?;
+    let latest_from = (!hosted && !uri.starts_with(MEMORY_SCHEME)).then(|| LatestFrom {
+        uri: uri.to_string(),
+        api_key: api_key.map(str::to_string),
+        cache_dir: cache_dir.map(str::to_string),
+    });
     if hosted {
         match conn.list_tables() {
             Ok(_) => {}
@@ -754,8 +897,14 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
         engine: RwLock::new(HashMap::new()),
         attached: RwLock::new(HashMap::new()),
         gates: Mutex::new(HashMap::new()),
+        latest_from,
+        latest: Mutex::new(None),
+        latest_holds: AtomicUsize::new(0),
     })
 }
+
+/// The scheme of a catalog held in this process's memory.
+const MEMORY_SCHEME: &str = "memory://";
 
 #[no_mangle]
 pub unsafe extern "C" fn infino_open(uri: *const c_char) -> *mut Bridge {
@@ -772,7 +921,7 @@ pub unsafe extern "C" fn infino_open_with(
     cache_dir: *const c_char,
 ) -> *mut Bridge {
     catch_unwind(AssertUnwindSafe(|| {
-        let uri = unsafe { cstr(uri) }.unwrap_or("memory://");
+        let uri = unsafe { cstr(uri) }.unwrap_or(MEMORY_SCHEME);
         let api_key = unsafe { cstr(api_key) }.filter(|k| !k.is_empty());
         let cache_dir = unsafe { cstr(cache_dir) }.filter(|d| !d.is_empty());
         match open(uri, api_key, cache_dir) {
@@ -3393,27 +3542,22 @@ fn ranked_columns(conn: &Bridge, name: &str) -> Vec<String> {
 
 /// The row of an attached table read under `osid`, its row id's digits, as
 /// [`get_row`] gives a row: its columns as the source, and no sequence
-/// number. None when `osid` is no row id or the table holds no such row.
-fn attached_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
+/// number. None when `osid` is no row id or the table holds no such row; an
+/// error when the read fails.
+fn attached_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String, i64)>, String> {
     if !attached::is_row_id(osid) {
-        return None;
+        return Ok(None);
     }
     let sql = format!(
         "SELECT * FROM \"{}\" WHERE \"{}\" = {osid} LIMIT 1",
         name.replace('"', "\"\""),
         attached::ROW_ID
     );
-    let batches = match conn.conn.query_sql(&sql) {
-        Ok(batches) => batches,
-        Err(e) => {
-            eprintln!("[capi] get: {e}");
-            return None;
-        }
-    };
-    batches
+    let batches = conn.conn.query_sql(&sql).map_err(|e| e.to_string())?;
+    Ok(batches
         .iter()
         .find(|b| b.num_rows() > 0)
-        .map(|b| (attached::source_json(b, 0), 0))
+        .map(|b| (attached::source_json(b, 0), 0)))
 }
 
 /// Most rows of an attached table one statement of [`attached_rows`] asks
@@ -3424,8 +3568,13 @@ const ATTACHED_ROWS_PER_STATEMENT: usize = 500;
 /// as [`attached_row`] gives it; an id that is no row id, or names no row,
 /// is absent. A page of a search reads its sources this way once its ids are
 /// chosen: the table has no lookup by id but the row id itself, so the page
-/// is read in one statement over its ids rather than one a row.
-fn attached_rows(conn: &Bridge, name: &str, osids: &[&str]) -> serde_json::Map<String, Value> {
+/// is read in one statement over its ids rather than one a row. An error
+/// when a read fails.
+fn attached_rows(
+    conn: &Bridge,
+    name: &str,
+    osids: &[&str],
+) -> Result<serde_json::Map<String, Value>, String> {
     let mut found = serde_json::Map::new();
     let ids: Vec<&str> = osids
         .iter()
@@ -3439,13 +3588,7 @@ fn attached_rows(conn: &Bridge, name: &str, osids: &[&str]) -> serde_json::Map<S
             attached::ROW_ID,
             chunk.join(", ")
         );
-        let batches = match conn.conn.query_sql(&sql) {
-            Ok(batches) => batches,
-            Err(e) => {
-                eprintln!("[capi] get_many: {e}");
-                continue;
-            }
-        };
+        let batches = conn.conn.query_sql(&sql).map_err(|e| e.to_string())?;
         for batch in &batches {
             for r in 0..batch.num_rows() {
                 if let Some(id) = attached::id_of(batch, r) {
@@ -3454,34 +3597,56 @@ fn attached_rows(conn: &Bridge, name: &str, osids: &[&str]) -> serde_json::Map<S
             }
         }
     }
-    found
+    Ok(found)
 }
 
 /// The source of the row under `osid` and the sequence number it was
-/// written under (0 for a row written without one), or None when the table
-/// holds no such row.
-fn get_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
+/// written under (0 for a row written without one), None when the table
+/// holds no such row, or an error when the read fails.
+fn get_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String, i64)>, String> {
     if conn.is_attached(name) {
         return attached_row(conn, name, osid);
     }
-    let table = conn.table(name).ok()?;
+    let table = conn.table(name).map_err(|e| e.to_string())?;
+    row_in(&table, &conn.conn, name, osid).map_err(|e| e.to_string())
+}
+
+/// [`get_row`] as of the table's latest commit, read through
+/// [`Bridge::on_latest`]: for a write that merges into the document it
+/// finds. A lookup that fails is an error rather than no row, so the write
+/// fails instead of finding nothing to merge into.
+fn get_row_latest(
+    conn: &Bridge,
+    name: &str,
+    osid: &str,
+) -> Result<Option<(String, i64)>, InfinoError> {
+    if conn.is_attached(name) {
+        return attached_row(conn, name, osid).map_err(InfinoError::Query);
+    }
+    if conn.latest_from.is_none() {
+        // `conn` reads every commit already; its cached handle saves a
+        // hosted service the describe each open asks of it.
+        return row_in(&conn.table(name)?, &conn.conn, name, osid);
+    }
+    conn.on_latest(|latest| row_in(&latest.open_table(name)?, latest, name, osid))
+}
+
+/// The source and sequence number of the row under `osid` in `table`,
+/// which `sql` (the connection it was opened on) holds; None when it holds
+/// no such row.
+fn row_in(
+    table: &Supertable,
+    sql: &Connection,
+    name: &str,
+    osid: &str,
+) -> Result<Option<(String, i64)>, InfinoError> {
     // A term lookup through the id column's FTS index, projected to the
     // source and the sequence number. A table declared before the id column
     // carried that index refuses the lookup; it falls back to an equality on
     // the column.
     let batches = match table.exact_match(OSID, osid, Some(&[SOURCE, SEQ])) {
         Ok(batches) => batches,
-        Err(_) => {
-            let esc = osid.replace('\'', "''");
-            let sql = format!("SELECT {SOURCE}, {SEQ} FROM {name} WHERE {OSID} = '{esc}' LIMIT 1");
-            match conn.conn.query_sql(&sql) {
-                Ok(batches) => batches,
-                Err(e) => {
-                    eprintln!("[capi] get: {e}");
-                    return None;
-                }
-            }
-        }
+        Err(_) => sql.query_sql(&row_by_osid_sql(name, osid))?,
     };
     for b in &batches {
         if b.num_rows() == 0 {
@@ -3501,9 +3666,29 @@ fn get_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
             .filter(|a| !a.is_null(0))
             .map_or(0, |a| a.value(0));
-        return Some((source.value(0).to_string(), seq));
+        return Ok(Some((source.value(0).to_string(), seq)));
     }
-    None
+    Ok(None)
+}
+
+/// The statement [`row_in`] falls back to: the source and sequence number
+/// of the row under `osid`, by an equality on the id column. The table name
+/// is quoted as every other statement over a table quotes it, so an index
+/// whose name holds a `-` reads as one name.
+fn row_by_osid_sql(name: &str, osid: &str) -> String {
+    format!(
+        "SELECT {SOURCE}, {SEQ} FROM \"{}\" WHERE {OSID} = '{}' LIMIT 1",
+        name.replace('"', "\"\""),
+        osid.replace('\'', "''")
+    )
+}
+
+/// [`get_row`], a failed read logged and answered as absent.
+fn found_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
+    get_row(conn, name, osid).unwrap_or_else(|e| {
+        eprintln!("[capi] get: {e}");
+        None
+    })
 }
 
 /// The raw `_source` JSON for one osid, or "" if absent.
@@ -3519,7 +3704,35 @@ pub unsafe extern "C" fn infino_get(
         else {
             return ptr::null_mut();
         };
-        out_string(get_row(conn, name, osid).map_or_else(String::new, |(source, _)| source))
+        out_string(found_row(conn, name, osid).map_or_else(String::new, |(source, _)| source))
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// [`infino_get`] as of the table's latest commit ([`get_row_latest`]): for
+/// a write that merges into the document it finds, when the last node to
+/// write the table may be another. A lookup that fails answers null rather
+/// than "": a source is any JSON object, so no error object can stand for
+/// the failure.
+#[no_mangle]
+pub unsafe extern "C" fn infino_get_latest(
+    h: *mut Bridge,
+    name: *const c_char,
+    osid: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(osid)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(osid) })
+        else {
+            return ptr::null_mut();
+        };
+        match get_row_latest(conn, name, osid) {
+            Ok(row) => out_string(row.map_or_else(String::new, |(source, _)| source)),
+            Err(e) => {
+                eprintln!("[capi] get_latest: {e}");
+                ptr::null_mut()
+            }
+        }
     }))
     .unwrap_or(ptr::null_mut())
 }
@@ -3527,8 +3740,11 @@ pub unsafe extern "C" fn infino_get(
 /// Most lookups [`infino_get_many`] runs at once.
 const GET_MANY_THREADS: usize = 16;
 
-/// The raw `_source` JSON of several osids, as one JSON object from each id
-/// the table holds to its source; an id it does not hold is absent.
+/// The raw `_source` JSON of several osids, as `{"sources": {..}}`, an
+/// object from each id the table holds to its source; an id it does not hold
+/// is absent, and a lookup that fails answers `{"error":..}` for the whole
+/// call. The ids sit one level down so that no id, `error` included, can
+/// make the answer read as an error.
 ///
 /// Each id is looked up as [`infino_get`] looks it up, through the id
 /// column's index. A page of a sorted search reads its sources this way once
@@ -3555,29 +3771,34 @@ pub unsafe extern "C" fn infino_get_many(
                 .collect()
         };
         if conn.is_attached(name) {
-            return out_json(Value::Object(attached_rows(conn, name, &ids)));
+            return match attached_rows(conn, name, &ids) {
+                Ok(found) => out_json(json!({ "sources": found })),
+                Err(e) => err_json(&format!("get_many: {e}")),
+            };
         }
         let mut found = serde_json::Map::new();
         for chunk in ids.chunks(GET_MANY_THREADS) {
-            let sources: Vec<Option<String>> = std::thread::scope(|scope| {
+            let sources: Vec<Result<Option<(String, i64)>, String>> = std::thread::scope(|scope| {
                 let lookups: Vec<_> = chunk
                     .iter()
-                    .map(|id| {
-                        scope.spawn(move || get_row(conn, name, id).map(|(source, _)| source))
-                    })
+                    .map(|id| scope.spawn(move || get_row(conn, name, id)))
                     .collect();
                 lookups
                     .into_iter()
-                    .map(|lookup| lookup.join().ok().flatten())
+                    .map(|lookup| lookup.join().unwrap_or_else(|_| Err("a lookup panicked".into())))
                     .collect()
             });
             for (id, source) in chunk.iter().zip(sources) {
-                if let Some(source) = source.filter(|s| !s.is_empty()) {
-                    found.insert((*id).to_owned(), Value::String(source));
+                match source {
+                    Ok(Some((source, _))) if !source.is_empty() => {
+                        found.insert((*id).to_owned(), Value::String(source));
+                    }
+                    Ok(_) => {}
+                    Err(e) => return err_json(&format!("get_many {id}: {e}")),
                 }
             }
         }
-        out_json(Value::Object(found))
+        out_json(json!({ "sources": found }))
     }))
     .unwrap_or(ptr::null_mut())
 }
@@ -3596,7 +3817,7 @@ pub unsafe extern "C" fn infino_get_doc(
         else {
             return ptr::null_mut();
         };
-        match get_row(conn, name, osid) {
+        match found_row(conn, name, osid) {
             Some((source, seq)) => out_json(json!({ "source": source, "seq": seq })),
             None => out_string(String::new()),
         }
@@ -3616,14 +3837,16 @@ pub unsafe extern "C" fn infino_drop(h: *mut Bridge, name: *const c_char) -> c_i
             return -2;
         }
         conn.forget(name);
-        match conn.conn.drop_table(name, true) {
+        let dropped = match conn.conn.drop_table(name, true) {
             Ok(_) => 0,
             Err(InfinoError::NotFound(_)) => 0,
             Err(e) => {
                 eprintln!("[capi] drop_table: {e}");
                 -2
             }
-        }
+        };
+        conn.forget_latest();
+        dropped
     }))
     .unwrap_or(-99)
 }
@@ -3687,6 +3910,42 @@ pub unsafe extern "C" fn infino_sql(h: *mut Bridge, sql: *const c_char) -> *mut 
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// Run `sql` as [`infino_sql`] does, reading each table's latest commit
+/// ([`Bridge::latest`]): for a read whose answer decides what a write does.
+#[no_mangle]
+pub unsafe extern "C" fn infino_sql_latest(h: *mut Bridge, sql: *const c_char) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(bridge), Some(sql)) = (bridge_ref(h), unsafe { cstr(sql) }) else {
+            return ptr::null_mut();
+        };
+        match bridge.query_latest(sql) {
+            Ok(b) => out_string(batches_to_json(&b)),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Keep the connection [`infino_sql_latest`] and [`infino_get_latest`] read
+/// through open across calls until [`infino_release_latest`]
+/// ([`Bridge::hold_latest`]): for a shard that reads the latest commit for
+/// each batch it writes until its own first commit. Without a hold, the
+/// connection closes after each such read.
+#[no_mangle]
+pub unsafe extern "C" fn infino_hold_latest(h: *mut Bridge) {
+    if let Some(bridge) = bridge_ref(h) {
+        bridge.hold_latest();
+    }
+}
+
+/// Let go of a hold [`infino_hold_latest`] took ([`Bridge::release_latest`]).
+#[no_mangle]
+pub unsafe extern "C" fn infino_release_latest(h: *mut Bridge) {
+    if let Some(bridge) = bridge_ref(h) {
+        bridge.release_latest();
+    }
 }
 
 /// The indices a caller's read-only statement reads, as
@@ -4627,7 +4886,9 @@ mod tests {
         let out = take(unsafe {
             infino_get_many(h, c("logs").as_ptr(), idp.as_ptr(), osids.len() as c_int)
         });
-        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+        let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert!(v["sources"].is_object(), "{out}");
+        v["sources"].clone()
     }
 
     fn delete(h: *mut Bridge, osids: &[&str]) -> c_int {
@@ -5089,6 +5350,7 @@ mod tests {
             infino_get_many(h, c("plain").as_ptr(), ptrs.as_ptr(), ptrs.len() as c_int)
         }))
         .unwrap();
+        let many = &many["sources"];
         assert_eq!(many.as_object().unwrap().len(), 2, "{many}");
         let source: Value = serde_json::from_str(many[&ids[0]].as_str().unwrap()).unwrap();
         assert_eq!(source["title"], "India", "{many}");
@@ -5502,6 +5764,84 @@ mod tests {
         assert_eq!(many["b"].as_str(), Some(get(h, "b").as_str()), "{many}");
         assert_eq!(many.as_object().map(|o| o.len()), Some(2), "{many}");
         assert_eq!(get_many(h, &[]), json!({}));
+        // A read that fails is an error, never an absent id; one get still
+        // answers it as absent.
+        let id = c("a");
+        let failed = take(unsafe { infino_get_many(h, c("no_such_table").as_ptr(), &id.as_ptr(), 1) });
+        assert!(failed.starts_with("{\"error\""), "{failed}");
+        assert_eq!(take(unsafe { infino_get(h, c("no_such_table").as_ptr(), id.as_ptr()) }), "");
+        close(h);
+    }
+
+    /// A document whose id is `error` is read as a document. The answer
+    /// keeps its ids under `sources`, so an id that sorts first and spells
+    /// `error` cannot make it start as an error object does.
+    #[test]
+    fn a_document_with_the_id_error_is_read_as_a_document() {
+        let h = open_logs();
+        let out = index(
+            h,
+            &[
+                ("error", r#"{"level":"info","message":"named error"}"#),
+                ("zz", r#"{"level":"warn","message":"after error"}"#),
+            ],
+        );
+        assert_eq!(out["ok"], 2, "{out}");
+        for ids in [&["error"][..], &["error", "zz"][..]] {
+            let idc: Vec<CString> = ids.iter().map(|x| c(x)).collect();
+            let idp: Vec<*const c_char> = idc.iter().map(|x| x.as_ptr()).collect();
+            let raw = take(unsafe {
+                infino_get_many(h, c("logs").as_ptr(), idp.as_ptr(), ids.len() as c_int)
+            });
+            assert!(raw.starts_with("{\"sources\""), "{raw}");
+            assert!(!raw.starts_with("{\"error\""), "{raw}");
+        }
+        let many = get_many(h, &["error", "zz"]);
+        assert_eq!(
+            many["error"].as_str(),
+            Some(get(h, "error").as_str()),
+            "{many}"
+        );
+        assert!(
+            many["error"].as_str().unwrap().contains("named error"),
+            "{many}"
+        );
+        assert_eq!(many.as_object().map(|o| o.len()), Some(2), "{many}");
+        close(h);
+    }
+
+    /// The equality [`get_row`] falls back to quotes the table name, so an
+    /// index whose name holds a `-` (or a `"`) reads as one name rather than
+    /// failing to parse.
+    #[test]
+    fn the_fallback_lookup_quotes_the_table_name() {
+        assert_eq!(
+            row_by_osid_sql("my-logs", "it's"),
+            format!("SELECT {SOURCE}, {SEQ} FROM \"my-logs\" WHERE {OSID} = 'it''s' LIMIT 1")
+        );
+        assert!(row_by_osid_sql("a\"b", "x").contains("FROM \"a\"\"b\" WHERE"));
+        let h = open_logs();
+        let made =
+            take(unsafe { infino_ensure_table(h, c("my-logs").as_ptr(), c(MAPPING).as_ptr()) });
+        assert!(made.contains("\"created\":true"), "{made}");
+        let ids = [c("a")];
+        let srcs = [c(r#"{"level":"info","message":"dashed"}"#)];
+        let out = take(unsafe {
+            infino_index_batch(
+                h,
+                c("my-logs").as_ptr(),
+                &ids[0].as_ptr(),
+                &srcs[0].as_ptr(),
+                1,
+            )
+        });
+        assert!(out.contains("\"ok\":1"), "{out}");
+        let bridge = bridge_ref(h).unwrap();
+        let batches = bridge
+            .conn
+            .query_sql(&row_by_osid_sql("my-logs", "a"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         close(h);
     }
 
@@ -6836,6 +7176,221 @@ mod tests {
                     .sum()
             })
             .unwrap_or(0)
+    }
+
+    /// A node taking a shard over reads the rows the node before it
+    /// committed through `infino_sql_latest` and `infino_get_latest` at
+    /// once, where `infino_sql` and `infino_get` may still answer from the
+    /// commit they last read: the probe that keeps a replayed operation from
+    /// appending its row again, and the document an update merges into. The
+    /// reading node shares its cache directory with that connection.
+    #[test]
+    fn a_latest_read_sees_another_nodes_commit_at_once() {
+        let root = std::env::temp_dir().join(format!(
+            "infino-capi-latest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let uri = c(&format!("file://{}", data.display()));
+        let cache_dir = c(&root.join("cache").display().to_string());
+
+        let writer = unsafe { infino_open(uri.as_ptr()) };
+        assert!(!writer.is_null());
+        assert!(ensure(writer, MAPPING).contains("\"created\":true"));
+        index(writer, &[("a", r#"{"level":"info"}"#)]);
+
+        let reader = unsafe { infino_open_with(uri.as_ptr(), ptr::null(), cache_dir.as_ptr()) };
+        assert!(!reader.is_null());
+        let count = "SELECT count(*) AS n FROM logs";
+        let probe = "SELECT osid FROM token_match('logs', 'osid', 'b', 'or')";
+        let latest = |q: &str| -> Value {
+            let out = take(unsafe { infino_sql_latest(reader, c(q).as_ptr()) });
+            serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+        };
+        // Taken before the read, so the window it measures starts no later
+        // than the one the reader's connection opens when it reads.
+        let read_at = Instant::now();
+        assert_eq!(sql(reader, count)[0]["n"], 1);
+
+        index(writer, &[("b", r#"{"level":"warn"}"#)]);
+        let stale = sql(reader, count)[0]["n"].clone();
+        let get =
+            |id: &str| take(unsafe { infino_get(reader, c("logs").as_ptr(), c(id).as_ptr()) });
+        let get_latest = |id: &str| {
+            take(unsafe { infino_get_latest(reader, c("logs").as_ptr(), c(id).as_ptr()) })
+        };
+        let stale_get = get("b");
+        // Within the engine's default window of the reader's last read, the
+        // reader's own connection still answers from the first commit: what
+        // makes the latest reads below more than reads like any other.
+        if read_at.elapsed() < Duration::from_millis(900) {
+            assert_eq!(
+                stale, 1,
+                "the default read answers from the commit it last read"
+            );
+            assert_eq!(
+                stale_get, "",
+                "the default get answers from the commit it last read"
+            );
+        }
+        let cached = bytes_under(&root.join("cache"));
+        assert_eq!(latest(count)[0]["n"], 2);
+        assert_eq!(latest(probe), json!([{ "osid": "b" }]));
+        let found: Value = serde_json::from_str(&get_latest("b")).unwrap();
+        assert_eq!(
+            found,
+            json!({ "level": "warn" }),
+            "the latest get finds the new id"
+        );
+        assert_eq!(get_latest("c"), "", "an id the table does not hold is \"\"");
+        // Only the latest connection has read the second commit, when the
+        // reader's own read was stale; the blocks it read land in the cache.
+        if stale == 1 {
+            assert!(
+                bytes_under(&root.join("cache")) > cached,
+                "the latest read went through the node's cache directory"
+            );
+        }
+
+        close(reader);
+        close(writer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A latest read of a table dropped and made again under its name reads
+    /// the table made again, whether the drop was this node's or another's:
+    /// the first write to a recreated index probes it before it holds a row.
+    #[test]
+    fn a_latest_read_finds_a_table_made_again_after_a_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "infino-capi-latest-drop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let uri = c(&format!("file://{}", data.display()));
+        let cache_dir = c(&root.join("cache").display().to_string());
+        let open = || unsafe { infino_open_with(uri.as_ptr(), ptr::null(), cache_dir.as_ptr()) };
+        let sql = |h: *mut Bridge, q: &str| -> Value {
+            let out = take(unsafe { infino_sql_latest(h, c(q).as_ptr()) });
+            serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+        };
+        let latest = |h: *mut Bridge| sql(h, "SELECT count(*) AS n FROM logs");
+        // The probe for ids a write may replace reads through a search.
+        let probe = |h: *mut Bridge| {
+            sql(
+                h,
+                "SELECT osid FROM token_match('logs', 'osid', 'a b', 'or')",
+            )
+        };
+        let node = open();
+        let other = open();
+        // Held, as a shard catching up holds them, so each keeps the handle
+        // it read the first table through.
+        unsafe {
+            infino_hold_latest(node);
+            infino_hold_latest(other);
+        }
+        assert!(ensure(node, MAPPING).contains("\"created\":true"));
+        index(node, &[("a", r#"{"level":"info"}"#)]);
+        assert_eq!(latest(node)[0]["n"], 1);
+        assert_eq!(latest(other)[0]["n"], 1);
+        assert_eq!(probe(other).as_array().map(Vec::len), Some(1));
+        assert!(latest_open(other), "a held connection stays open");
+
+        assert_eq!(unsafe { infino_drop(node, c("logs").as_ptr()) }, 0);
+        assert!(ensure(node, MAPPING).contains("\"created\":true"));
+        assert_eq!(latest(node)[0]["n"], 0, "this node's drop");
+        assert_eq!(latest(other)[0]["n"], 0, "another node's drop");
+        index(node, &[("b", r#"{"level":"info"}"#)]);
+        assert_eq!(latest(other)[0]["n"], 1);
+        // Dropped again: the other node's latest connection holds a handle
+        // to the table from before, which a search must not answer from.
+        assert_eq!(unsafe { infino_drop(node, c("logs").as_ptr()) }, 0);
+        assert!(ensure(node, MAPPING).contains("\"created\":true"));
+        index(node, &[("b", r#"{"level":"info"}"#)]);
+        assert_eq!(
+            probe(other)[0]["osid"],
+            "b",
+            "a search after another node's drop"
+        );
+
+        unsafe {
+            infino_release_latest(other);
+            infino_release_latest(node);
+        }
+        close(other);
+        close(node);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whether `h`'s latest connection is open.
+    fn latest_open(h: *mut Bridge) -> bool {
+        unsafe { &*h }
+            .latest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// The latest connection stays open while a reader holds it and closes
+    /// when the last hold goes, so a node keeps its second handle to a table
+    /// only while a shard catches up; a read no one holds for closes it.
+    #[test]
+    fn the_latest_connection_closes_when_no_reader_holds_it() {
+        let root = std::env::temp_dir().join(format!(
+            "infino-capi-latest-hold-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let uri = c(&format!("file://{}", data.display()));
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        assert!(ensure(h, MAPPING).contains("\"created\":true"));
+        index(h, &[("a", r#"{"level":"info"}"#)]);
+        let read = || {
+            let out =
+                take(unsafe { infino_sql_latest(h, c("SELECT count(*) AS n FROM logs").as_ptr()) });
+            let rows: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+            assert_eq!(rows[0]["n"], 1);
+        };
+        let get = || take(unsafe { infino_get_latest(h, c("logs").as_ptr(), c("a").as_ptr()) });
+
+        read();
+        assert!(!latest_open(h), "a read no one holds for closes it");
+        unsafe { infino_hold_latest(h) };
+        read();
+        assert!(latest_open(h));
+        unsafe { infino_hold_latest(h) };
+        unsafe { infino_release_latest(h) };
+        assert_eq!(get(), r#"{"level":"info"}"#);
+        assert!(latest_open(h), "open while one hold is left");
+        unsafe { infino_release_latest(h) };
+        assert!(!latest_open(h), "closed with the last hold");
+        // A release with no hold to let go counts nothing, so the next hold
+        // still keeps the connection open.
+        unsafe { infino_release_latest(h) };
+        unsafe { infino_hold_latest(h) };
+        read();
+        assert!(latest_open(h));
+        unsafe { infino_release_latest(h) };
+        assert!(!latest_open(h));
+
+        close(h);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A catalog reopened with a cache directory, as a node is after a

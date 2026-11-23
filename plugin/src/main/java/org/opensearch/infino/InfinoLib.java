@@ -88,6 +88,9 @@ public interface InfinoLib extends Library {
 
     Pointer infino_get(Pointer h, String name, String osid);
 
+    /** {@link #infino_get} as of the table's latest commit; null when the lookup fails. */
+    Pointer infino_get_latest(Pointer h, String name, String osid);
+
     /** The sources of several osids at once, as a JSON object from each id the table holds to its source. */
     Pointer infino_get_many(Pointer h, String name, String[] osids, int count);
 
@@ -101,6 +104,15 @@ public interface InfinoLib extends Library {
     int infino_optimize_edges(Pointer h, String name);
 
     Pointer infino_sql(Pointer h, String sql);
+
+    /** {@link #infino_sql} reading each table's latest commit: for a read whose answer decides what a write does. */
+    Pointer infino_sql_latest(Pointer h, String sql);
+
+    /** Keep the connection the latest reads go through open until {@link #infino_release_latest}; without a hold it closes after each. */
+    void infino_hold_latest(Pointer h);
+
+    /** Let go of a hold {@link #infino_hold_latest} took. */
+    void infino_release_latest(Pointer h);
 
     /** The indices a caller's read-only statement reads, as {@code {"indices": [..]}}, or an error with its status. */
     Pointer infino_sql_indices(String sql);
