@@ -14,6 +14,7 @@ import org.opensearch.action.DocWriteResponse;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.delete.DeleteResponse;
+import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.support.replication.ReplicationResponse;
 import org.opensearch.action.update.UpdateRequest;
@@ -305,6 +306,9 @@ public final class InfinoWriter {
         if (!ids.isEmpty() && prepared == null) {
             waiter.listener().onFailure(new IllegalStateException("[infino] the bridge could not prepare the batch for " + table));
             return;
+        }
+        if (ids.contains("")) {
+            ids = named(waiter, InfinoNative.preparedIds(prepared));
         }
         Staged staged = new Staged(waiter, prepared, ids, ids.size() + updates, bytes, named);
 
@@ -871,6 +875,32 @@ public final class InfinoWriter {
         }
         log.debug("[infino] appended {} of {} documents to {} (folded: an id appeared twice in the batch, or a write met a conflict)", result.ok(), ids.size(), table);
         return new Appended(refused, result.ok() > 0);
+    }
+
+    /**
+     * The ids the bridge wrote {@code waiter}'s rows under, in row order, put
+     * on the writes that went to it with none (a time-series index's point
+     * given no id, named by the bridge from its series and time), and on
+     * their requests, so the response names each point as the table does.
+     */
+    private static List<String> named(Waiter waiter, List<String> written) {
+        List<Outcome> outcomes = waiter.outcomes();
+        int row = 0;
+        for (int i = 0; i < outcomes.size(); i++) {
+            Outcome o = outcomes.get(i);
+            if (!carriesRow(o)) {
+                continue;
+            }
+            String id = written.get(row++);
+            if (o.write().id().isEmpty()) {
+                Write w = o.write();
+                outcomes.set(i, new Outcome(o.slot(), o.item(), new Write(id, w.source(), w.lookup(), w.create(), w.update()), o.answered()));
+                if (o.item() instanceof IndexRequest index) {
+                    index.id(id);
+                }
+            }
+        }
+        return written;
     }
 
     /** One bulk's response from what its batch did. */

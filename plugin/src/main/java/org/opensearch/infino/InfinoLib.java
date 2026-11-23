@@ -84,6 +84,9 @@ public interface InfinoLib extends Library {
 
     void infino_free_prepared(Pointer prepared);
 
+    /** The ids a prepared batch's rows are written under, in row order, as a JSON array of strings. */
+    Pointer infino_prepared_ids(Pointer prepared);
+
     int infino_delete_osids(Pointer h, String name, String[] osids, int count);
 
     Pointer infino_get(Pointer h, String name, String osid);

@@ -624,6 +624,26 @@ public final class InfinoNative {
         }
     }
 
+    /**
+     * The ids {@code prepared}'s rows are written under, in the order they
+     * were given: each as given, and for a point of a time-series index
+     * given none (an empty id), the one the bridge made from its series and
+     * time.
+     */
+    public static List<String> preparedIds(Pointer prepared) {
+        init();
+        String json = takeOrThrow(lib.infino_prepared_ids(prepared));
+        try (XContentParser p = parser(json)) {
+            List<String> ids = new ArrayList<>();
+            for (Object id : p.list()) {
+                ids.add(String.valueOf(id));
+            }
+            return ids;
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
     private static XContentParser parser(String json) throws IOException {
         return JsonXContent.jsonXContent.createParser(
             NamedXContentRegistry.EMPTY,

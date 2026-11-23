@@ -154,6 +154,39 @@ fn series_time(mapped: &[MappedField], stamp: Option<&str>) -> Option<String> {
         .or_else(|| mapped.iter().find(is_time).map(|f| f.path.clone()))
 }
 
+/// How a time-series table names its points: the dimension columns its
+/// series key joins ([`dimensions`]) and the time column its points are
+/// sorted and named by ([`series_time`]).
+#[derive(Debug, Clone)]
+struct SeriesRule {
+    dims: Vec<String>,
+    time: Option<String>,
+}
+
+/// 64-bit FNV-1a of `bytes`: fixed by its definition, so an id made from it
+/// is the same on every build and every node.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// The id of a time-series point given none: its series key's hash and its
+/// time, as a time-series index names its points. A point sent twice (a
+/// client's retry) gets the same id, and the table keeps one row of it
+/// ([`IndexSpec::dedup_on_sort_key`]).
+fn series_id(key: &str, time: Option<&Value>) -> String {
+    let time = match time {
+        Some(Value::String(t)) => t.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    };
+    format!("{:016x}-{time}", fnv1a64(key.as_bytes()))
+}
+
 /// The series key of a row whose columns are `flat`: its value on each of
 /// `dims`, in order, joined by a unit separator (a missing value is empty).
 /// The points of one series share it.
@@ -545,7 +578,7 @@ pub struct Bridge {
     stamps: RwLock<HashMap<String, Arc<str>>>,
     /// The dimension columns of each time-series table, in series-key order
     /// ([`series_key`]), from the mapping it was last declared from.
-    series: RwLock<HashMap<String, Arc<Vec<String>>>>,
+    series: RwLock<HashMap<String, Arc<SeriesRule>>>,
     /// The columns each table's engine writes, from the mapping it was last
     /// declared from ([`ENGINE_COLUMNS`]).
     engine: RwLock<HashMap<String, Arc<Vec<String>>>>,
@@ -621,20 +654,20 @@ impl Bridge {
         }
     }
 
-    /// The dimension columns of `name` when it is a time-series table,
-    /// whose rows each carry their series key ([`TSID`]).
-    fn series(&self, name: &str) -> Option<Arc<Vec<String>>> {
+    /// The series rule of `name` when it is a time-series table, whose rows
+    /// each carry their series key ([`TSID`]).
+    fn series(&self, name: &str) -> Option<Arc<SeriesRule>> {
         self.series
             .read()
             .ok()
             .and_then(|all| all.get(name).cloned())
     }
 
-    /// Record `name`'s dimension columns, or that it is no time-series table.
-    fn series_rule(&self, name: &str, dims: Option<Vec<String>>) {
+    /// Record `name`'s series rule, or that it is no time-series table.
+    fn series_rule(&self, name: &str, rule: Option<SeriesRule>) {
         if let Ok(mut all) = self.series.write() {
-            match dims {
-                Some(dims) => all.insert(name.to_string(), Arc::new(dims)),
+            match rule {
+                Some(rule) => all.insert(name.to_string(), Arc::new(rule)),
                 None => all.remove(name),
             };
         }
@@ -1619,18 +1652,21 @@ fn declare_table(
         }
     }
     mapped.extend(engine);
-    let series_dims = timeseries.then(|| dimensions(&mapped, &engine_columns));
     let series_by = if timeseries {
         series_time(&mapped, stream_timestamp(mapping).as_deref())
     } else {
         None
     };
+    let series_rule = timeseries.then(|| SeriesRule {
+        dims: dimensions(&mapped, &engine_columns),
+        time: series_by.clone(),
+    });
     let conn = &bridge.conn;
     if !check_only {
         bridge.keep_rules(name, &mapped);
         bridge.engine_rule(name, engine_columns);
         bridge.stamp_rule(name, mapping);
-        bridge.series_rule(name, series_dims.clone());
+        bridge.series_rule(name, series_rule.clone());
         if !attached {
             bridge.attach_rule(name, None);
         }
@@ -1859,7 +1895,9 @@ fn declare_table(
             }
             if timeseries {
                 fields.push(Field::new(TSID, DataType::LargeUtf8, true));
-                spec = spec.sort_by([Some(TSID.to_string()), series_by.clone()].into_iter().flatten());
+                spec = spec
+                    .sort_by([Some(TSID.to_string()), series_by.clone()].into_iter().flatten())
+                    .dedup_on_sort_key();
             }
             for f in &mapped {
                 fields.push(Field::new(&f.path, f.data_type.clone(), true));
@@ -3002,8 +3040,12 @@ pub unsafe extern "C" fn infino_index_batch(
                 }
             };
             flat.insert(OSID.into(), Value::String(osid.to_string()));
-            if let Some(dims) = series.as_deref() {
-                let key = series_key(&flat, dims);
+            if let Some(rule) = series.as_deref() {
+                let key = series_key(&flat, &rule.dims);
+                if osid.is_empty() {
+                    let id = series_id(&key, rule.time.as_deref().and_then(|t| flat.get(t)));
+                    flat.insert(OSID.into(), Value::String(id));
+                }
                 flat.insert(TSID.into(), Value::String(key));
             }
             rows.push((i, flat));
@@ -3098,6 +3140,9 @@ pub unsafe extern "C" fn infino_index_batch_buf(
 /// conversion refused the batch) or in `failed`.
 pub struct Prepared {
     n: usize,
+    /// Each row's id as written: the one it was given, or for a point of a
+    /// time-series table given none, the one made for it ([`series_id`]).
+    osids: Vec<String>,
     batch: Option<RecordBatch>,
     values: Vec<Value>,
     index_of: Vec<usize>,
@@ -3178,8 +3223,12 @@ unsafe fn prepare(
         .map(|(id, src, routing, seq, op)| {
             conform_doc(src, &schema, &kept, &engine, stamp.as_deref()).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
-                if let Some(dims) = series.as_deref() {
-                    let key = series_key(&flat, dims);
+                if let Some(rule) = series.as_deref() {
+                    let key = series_key(&flat, &rule.dims);
+                    if id.is_empty() {
+                        let id = series_id(&key, rule.time.as_deref().and_then(|t| flat.get(t)));
+                        flat.insert(OSID.into(), Value::String(id));
+                    }
                     flat.insert(TSID.into(), Value::String(key));
                 }
                 if !routing.is_empty() {
@@ -3201,9 +3250,13 @@ unsafe fn prepare(
     let mut failed: Vec<(usize, String)> = Vec::new();
     let mut index_of: Vec<usize> = Vec::with_capacity(n);
     let mut rows: Vec<Map<String, Value>> = Vec::with_capacity(n);
+    let mut osids: Vec<String> = rows_in.iter().map(|r| r.0.to_string()).collect();
     for (i, r) in parsed.into_iter().enumerate() {
         match r {
             Ok(flat) => {
+                if let Some(Value::String(id)) = flat.get(OSID) {
+                    osids[i] = id.clone();
+                }
                 index_of.push(i);
                 rows.push(flat);
             }
@@ -3229,11 +3282,26 @@ unsafe fn prepare(
     };
     Ok(Prepared {
         n,
+        osids,
         batch,
         values,
         index_of,
         failed,
     })
+}
+
+/// The ids a prepared batch's rows are written under, in row order, as a
+/// JSON array: those given, and for a point of a time-series table given
+/// none, the one made for it. Null for a null handle.
+#[no_mangle]
+pub unsafe extern "C" fn infino_prepared_ids(p: *const Prepared) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(prepared) = (unsafe { p.as_ref() }) else {
+            return ptr::null_mut();
+        };
+        out_json(json!(prepared.osids))
+    }))
+    .unwrap_or(ptr::null_mut())
 }
 
 /// The batch's rows whose `osid` is in `ids`, and the rest, as two batches;

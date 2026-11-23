@@ -1127,7 +1127,8 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                 IndexMetadata md = infino.values().iterator().next();
                 String table = tables.ensure(md);
                 ShardId shardId = new ShardId(md.getIndex(), 0);
-                Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(shardId, bulk.requests(), answered), items, start, listener);
+                boolean series = InfinoPlugin.INFINO_TIMESERIES.get(md.getSettings());
+                Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(shardId, bulk.requests(), answered, series), items, start, listener);
                 writes.submit(table, waiter);
                 return;
             }
@@ -1150,7 +1151,8 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                 try {
                     String table = tables.ensure(md);
                     ShardId shardId = new ShardId(md.getIndex(), 0);
-                    Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(shardId, requests, partAnswered), part, start, partListener);
+                    boolean series = InfinoPlugin.INFINO_TIMESERIES.get(md.getSettings());
+                    Waiter waiter = new Waiter(shardId, md.getIndex().getName(), stage(shardId, requests, partAnswered, series), part, start, partListener);
                     writes.submit(table, waiter);
                 } catch (Exception e) {
                     log.warn("[infino] bulk items for {} failed", group.getKey(), e);
@@ -1176,9 +1178,13 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
      * Turn every item into a write, or answer it now when it cannot be
      * written or {@code answered} already holds its answer (by slot, as
      * {@code requests}). A data stream's timestamp is checked where the
-     * bridge parses the document, for every write path.
+     * bridge parses the document, for every write path. In a time-series
+     * index ({@code series}) a document given no id is named by the bridge
+     * from its series and time, so a point sent twice gets the same id: it
+     * goes to the bridge with an empty one, filled in once prepared
+     * ({@link InfinoWriter#submit}).
      */
-    private static List<Outcome> stage(ShardId shardId, List<DocWriteRequest<?>> requests, BulkItemResponse[] answered) {
+    private static List<Outcome> stage(ShardId shardId, List<DocWriteRequest<?>> requests, BulkItemResponse[] answered, boolean series) {
         String indexName = shardId.getIndexName();
         List<Outcome> outcomes = new ArrayList<>(requests.size());
         for (int slot = 0; slot < requests.size(); slot++) {
@@ -1197,7 +1203,7 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
             if (item instanceof IndexRequest index) {
                 boolean generated = index.id() == null;
                 if (generated) {
-                    index.id(UUIDs.base64UUID());
+                    index.id(series ? "" : UUIDs.base64UUID());
                 }
                 // The document is checked against the declared columns when its batch is
                 // appended, and a refused one comes back as its own item then; checking it
