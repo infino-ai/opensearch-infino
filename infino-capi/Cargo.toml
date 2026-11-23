@@ -20,11 +20,12 @@ crate-type = ["cdylib", "rlib"]
 # filtered `ORDER BY col NULLS LAST, _id LIMIT k` in the column's index order
 # and stops at k, which the sorted pages' statements rely on for speed; 0.11.33
 # reads a top-k on _id by id block and skips the row groups its bound rules
-# out. Since 0.11.26 the engine writes the manifest list format 4.0, which
-# builds before 0.11.26 cannot read.
-# Until the next release: an engine commit with the `keyword` analyzer (one
-# term per value, and value counts of such a column read from its term index).
-# Replaced by that release, pinned exactly, before merge.
+# out; 0.11.36 adds `bm25_search_fields`, which ranks a query string across its
+# text columns. Since 0.11.26 the engine writes the manifest list format 4.0,
+# which builds before 0.11.26 cannot read.
+# Until the next release: an engine commit past 0.11.36 with the `keyword`
+# analyzer (one term per value, and value counts of such a column read from its
+# term index). Replaced by that release, pinned exactly, before merge.
 infino = { git = "https://github.com/infino-ai/infino", rev = "19b88a5eb25117994c1dbfce61ff5edb0f1987ae", features = ["remote", "graph-index"] }
 # serde_json comes re-exported from infino, so the two never disagree.
 # Same major as infino so the delete-predicate Expr is the same type infino expects.
