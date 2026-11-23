@@ -254,6 +254,9 @@ public final class InfinoServices extends AbstractLifecycleComponent {
 
     @Override
     protected void doStart() {
+        // A node that cannot use its storage stops here, saying why, rather
+        // than waiting forever on the first index it would serve from it.
+        InfinoNative.checkStorage();
         InfinoScrolls.start(threadPool);
     }
 

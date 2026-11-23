@@ -8,6 +8,11 @@ import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.infino.InfinoNative.Mapping;
 import org.opensearch.test.OpenSearchTestCase;
 
+import com.sun.jna.Memory;
+import com.sun.jna.Pointer;
+
+import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -121,5 +126,50 @@ public class InfinoNativeTests extends OpenSearchTestCase {
         assertEquals(InfinoDocumentVersion.UNTRACKED_SEQ_NO, InfinoNative.highestSeq(null, () -> true));
         assertEquals(0L, InfinoNative.highestSeq(0L, () -> { throw new AssertionError("a stored number needs no row check"); }));
         assertEquals(41L, InfinoNative.highestSeq(41, () -> { throw new AssertionError("a stored number needs no row check"); }));
+    }
+
+    /**
+     * A node whose own storage does not answer stops at start with one
+     * message that names the storage, the reason and what to check.
+     */
+    public void testANodeThatCannotUseItsStorageStopsSayingWhy() {
+        String uri = "file:///var/lib/infino/data";
+        String reason = "list_tables: Permission denied (os error 13)";
+        InfinoLib bridge = (InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (p, m, a) -> switch (m.getName()) {
+            case "infino_open_with" -> new Memory(1);
+            case "infino_check_storage" -> cString("{\"error\":\"" + reason + "\"}");
+            default -> null;
+        });
+        InfinoNative.useLib(bridge);
+        InfinoNative.configure(new InfinoNative.Target(uri, null, false, uri));
+        try {
+            IllegalStateException e = expectThrows(IllegalStateException.class, InfinoNative::checkStorage);
+            assertTrue(e.getMessage(), e.getMessage().contains("cannot use its storage at " + uri + ": " + reason));
+            assertTrue(e.getMessage(), e.getMessage().contains("may read and write it"));
+        } finally {
+            InfinoNative.configure(InfinoNative.Target.node());
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /** What a stopped node says to check depends on its storage, and never shows a password in its URI. */
+    public void testWhatToCheckFollowsTheStorage() {
+        InfinoNative.Target s3 = new InfinoNative.Target("s3://bucket/prefix", null, false, "s3://bucket/prefix");
+        assertTrue(InfinoNative.storageHint(s3, "no credentials").contains("hop limit to 2"));
+        InfinoNative.Target hosted = InfinoNative.Target.hosted("https://service.example", "db", "ik_x");
+        String refused = InfinoNative.unusableStorage(hosted, "cannot open: list_tables: server returned 401");
+        assertTrue(refused, refused.contains("A key belongs to one platform URL"));
+        assertTrue(refused, refused.contains(InfinoPlugin.PLATFORM_URL.getKey()));
+        assertFalse(refused, refused.contains("ik_x"));
+        assertEquals("s3://***@host/bucket", InfinoNative.redacted("s3://user:secret@host/bucket"));
+        assertEquals("file:///data", InfinoNative.redacted("file:///data"));
+    }
+
+    private static Pointer cString(String s) {
+        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+        Memory m = new Memory(bytes.length + 1);
+        m.write(0, bytes, 0, bytes.length);
+        m.setByte(bytes.length, (byte) 0);
+        return m;
     }
 }

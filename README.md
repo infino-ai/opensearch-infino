@@ -146,7 +146,9 @@ bin/opensearch-plugin install -b file:///path/infino-engine.zip
 
 When both a URI and an account are set, the account is used. A key belongs to one platform: set `infino.platform.url` to the one that issued it.
 
-In Docker on EC2, the container reaches the instance role only when the instance's metadata hop limit is 2 (`aws ec2 modify-instance-metadata-options --http-put-response-hop-limit 2`). With the default of 1 the node finds no credentials and does not become ready.
+In Docker on EC2, the container reaches the instance role only when the instance's metadata hop limit is 2 (`aws ec2 modify-instance-metadata-options --http-put-response-hop-limit 2`). With the default of 1 the node finds no credentials.
+
+When the node starts, it checks once that it can use its storage: it lists the tables, and waits at most 30 seconds for an answer. If it cannot, it logs one `ERROR` that names the storage, the reason and what to check, and the node stops.
 
 **4. Start the node.** Every index is Infino-backed unless its settings say `index.infino.enabled: false`. To make the default off, set `infino.index.default_enabled: false` on the node. Give an index one shard and no replicas: the engine scales reads itself.
 

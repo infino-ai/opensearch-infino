@@ -42,7 +42,7 @@ use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
@@ -119,6 +119,10 @@ const TRIAL_PATH: &str = "/v1/trial";
 /// How long the trial call waits: a person is waiting on it, and a service
 /// that cannot provision an account in this time is a failure to report.
 const TRIAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the node's startup check of its storage waits for an answer
+/// ([`infino_check_storage`]): a store that has not answered by then is a
+/// failure to report, not one to wait out inside the client's retries.
+const STORAGE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// What the engine's hosted client puts before the HTTP status in the message
 /// of a refused call; the status is read back off it (see `status_in`).
 const STATUS_MARKER: &str = "server returned ";
@@ -948,6 +952,48 @@ pub unsafe extern "C" fn infino_open_error() -> *mut c_char {
     match OPEN_ERROR.with(|slot| slot.borrow_mut().take()) {
         Some(json) => out_string(json),
         None => ptr::null_mut(),
+    }
+}
+
+/// Check once that the connection's storage answers: list its tables, as
+/// the node does before it serves any. Opening a connection to the node's
+/// own storage reads nothing, so a store the node cannot use (no
+/// credentials, a refused key, a directory it may not read) would otherwise
+/// fail each table operation on its own, the first of them while the node
+/// starts. Answers "" when the storage answers, else `{"error", "status"?}`
+/// with the reason; a store that does not answer within
+/// [`STORAGE_CHECK_TIMEOUT`] is a failure, since the client's own retries
+/// can outlast a node's start.
+#[no_mangle]
+pub unsafe extern "C" fn infino_check_storage(h: *mut Bridge) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(bridge) = bridge_ref(h) else {
+            return err_json("null argument");
+        };
+        match check_storage(&bridge.conn, STORAGE_CHECK_TIMEOUT) {
+            Ok(()) => out_string(String::new()),
+            Err(e) => err_json(&e),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// [`infino_check_storage`]'s listing, on a thread of its own so that a
+/// store that never answers is reported after `timeout`. A catalog with no
+/// tables yet counts as an answer.
+fn check_storage(conn: &Connection, timeout: Duration) -> Result<(), String> {
+    let conn = conn.clone();
+    let (answered, answer) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = answered.send(conn.list_tables().map(|_| ()));
+    });
+    match answer.recv_timeout(timeout) {
+        Ok(Ok(())) | Ok(Err(InfinoError::NotFound(_))) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "the storage did not answer within {}s",
+            timeout.as_secs()
+        )),
     }
 }
 
@@ -4701,6 +4747,7 @@ fn cell_json(col: &dyn Array, r: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     const MAPPING: &str = r#"{"properties":{
         "@timestamp":{"type":"date"},
@@ -7470,6 +7517,58 @@ mod tests {
             "{why}"
         );
         assert!(unsafe { infino_open_error() }.is_null(), "read once");
+    }
+
+    /// The startup check of a node's own storage answers "" when the
+    /// storage answers, and the reason when the node may not read it: the
+    /// open itself reads nothing, so only the check finds out.
+    #[test]
+    fn the_storage_check_says_why_a_directory_cannot_be_used() {
+        let root = std::env::temp_dir().join(format!(
+            "infino-capi-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let uri = c(&format!("file://{}", root.display()));
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        assert!(!h.is_null());
+        assert_eq!(take(unsafe { infino_check_storage(h) }), "", "a usable directory");
+        assert!(ensure(h, MAPPING).contains("\"created\":true"));
+        close(h);
+
+        let unreadable = std::fs::Permissions::from_mode(0o000);
+        std::fs::set_permissions(&root, unreadable).unwrap();
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        let why = if h.is_null() {
+            take(unsafe { infino_open_error() })
+        } else {
+            let why = take(unsafe { infino_check_storage(h) });
+            close(h);
+            why
+        };
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let why: Value = serde_json::from_str(&why).unwrap_or_else(|_| panic!("{why:?}"));
+        let message = why["error"].as_str().unwrap_or_else(|| panic!("{why}"));
+        assert!(
+            message.to_lowercase().contains("permission denied"),
+            "the reason names the cause: {message}"
+        );
+    }
+
+    /// A URI that names no store the engine knows fails to open, with the
+    /// reason.
+    #[test]
+    fn a_uri_no_store_serves_fails_to_open_with_the_reason() {
+        let uri = c("nosuchscheme://bucket/prefix");
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        assert!(h.is_null());
+        let why: Value = serde_json::from_str(&take(unsafe { infino_open_error() })).unwrap();
+        assert!(why["error"].as_str().is_some_and(|e| !e.is_empty()), "{why}");
     }
 
     /// A result's JSON is built up to the bound and no further, and within

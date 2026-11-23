@@ -68,6 +68,8 @@ public final class InfinoNative {
     // URI, -Dinfino.uri=file:///abs/path or s3://bucket/prefix for tables that
     // survive restart. The default is in-process and non-persistent.
     private static final String NODE_URI = System.getProperty("infino.uri", "memory://");
+    /** The scheme of a catalog held in the node's memory, which has no storage to check. */
+    private static final String MEMORY_URI = "memory://";
 
     /**
      * What a connection is opened to: the URI, its bearer key (null for none:
@@ -415,6 +417,86 @@ public final class InfinoNative {
     /** The target the node is configured for. */
     static Target target() {
         return wanted;
+    }
+
+    /**
+     * Open the storage the node is configured for and check once that it
+     * answers, as the node starts. Opening the node's own storage reads
+     * nothing, so a store it cannot use would otherwise fail each table
+     * operation on its own, the security plugin's index first, and the node
+     * would never become ready with nothing in its log naming the cause.
+     * Logs one ERROR naming the storage, the reason and what to check, and
+     * throws, which stops the node. A node in memory has nothing to check.
+     */
+    static void checkStorage() {
+        Target target = wanted;
+        if (target.uri().startsWith(MEMORY_URI)) {
+            return;
+        }
+        String why;
+        try {
+            init();
+            why = target.hosted() ? null : errorOf(lib().infino_check_storage(conn));
+        } catch (InfinoException e) {
+            why = e.getMessage();
+        }
+        if (why == null) {
+            log.info("[infino] the storage at {} answers", redacted(target.name()));
+            return;
+        }
+        String message = unusableStorage(target, why);
+        log.error(message);
+        throw new IllegalStateException(message);
+    }
+
+    /** The reason in a bridge answer that is "" or {@code {"error": ..}}; null for "". */
+    private static String errorOf(Pointer p) {
+        String out = take(p);
+        if (out == null || out.isEmpty()) {
+            return null;
+        }
+        Object error = object(out).get("error");
+        return error == null ? out : error.toString();
+    }
+
+    /**
+     * The message a node that cannot use its storage stops with: the
+     * storage, the reason, and what to check for its kind.
+     */
+    static String unusableStorage(Target target, String why) {
+        return "[infino] this node cannot use its storage at "
+            + redacted(target.name())
+            + ": "
+            + why
+            + ". "
+            + storageHint(target, why)
+            + " The node stops: every Infino-backed index it serves, the security plugin's included, lives there.";
+    }
+
+    /** What to check for a storage of {@code target}'s kind that failed with {@code why}. */
+    static String storageHint(Target target, String why) {
+        String uri = target.uri();
+        if (target.hosted()) {
+            if (why.contains("401") || why.contains("403")) {
+                return "The service refused the key. A key belongs to one platform URL: check that "
+                    + InfinoPlugin.PLATFORM_URL.getKey()
+                    + " is the one the key was made on.";
+            }
+            return "Check that the node can reach the service.";
+        }
+        if (uri.startsWith("s3://")) {
+            return "Check the node's AWS credentials and that they may list the bucket. On Docker on EC2 with an instance role, "
+                + "set the instance metadata hop limit to 2: at 1 the container gets no credentials.";
+        }
+        if (uri.startsWith("file://")) {
+            return "Check that the directory exists and that the user the node runs as may read and write it.";
+        }
+        return "Check the node's credentials for this storage and that they may list it.";
+    }
+
+    /** {@code uri} without any user or password it carries. */
+    static String redacted(String uri) {
+        return uri.replaceFirst("://[^/@]*@", "://***@");
     }
 
     /** Whether the tables are served from the hosted service rather than the node's own storage. */
