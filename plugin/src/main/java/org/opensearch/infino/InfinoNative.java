@@ -1279,31 +1279,34 @@ public final class InfinoNative {
      * The sources of these ids, by id, each looked up through the id
      * column's index: a page's worth costs what its ids do, whatever the
      * table holds, where one statement over the ids would read the whole id
-     * column. An id the table does not hold is absent.
+     * column. An id the table does not hold is absent; a lookup that fails
+     * throws, so a failed read is never taken for a deleted document.
      */
     public static Map<String, String> sources(String name, Collection<String> osids) {
         Map<String, String> out = new HashMap<>();
-        if (osids.size() > 1) {
-            // One call for the page: the bridge runs its lookups side by side.
-            init();
-            String json = take(lib.infino_get_many(conn, name, osids.toArray(new String[0]), osids.size()));
-            if (json != null && !json.isEmpty()) {
-                try (XContentParser parser = parser(json)) {
-                    for (Map.Entry<String, Object> entry : parser.map().entrySet()) {
-                        if (entry.getValue() instanceof String source && !source.isEmpty()) {
-                            out.put(entry.getKey(), source);
-                        }
-                    }
-                    return out;
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
-                }
-            }
+        if (osids.isEmpty()) {
+            return out;
         }
-        for (String id : osids) {
-            String source = getSourceFresh(name, id);
-            if (source != null && !source.isEmpty()) {
-                out.put(id, source);
+        // One call for the page: the bridge runs its lookups side by side.
+        init();
+        String json = takeOrThrow(lib.infino_get_many(conn, name, osids.toArray(new String[0]), osids.size()));
+        return sourcesOf(json);
+    }
+
+    /**
+     * The sources of a {@code get_many} answer, {@code {"sources":{id: source}}}.
+     * The ids sit under {@code sources}, never at the top, so an id such as
+     * {@code error} cannot make the answer read as an error object.
+     */
+    static Map<String, String> sourcesOf(String json) {
+        Object found = object(json).get("sources");
+        if (!(found instanceof Map<?, ?> byId)) {
+            throw new InfinoException("the bridge answered no sources", RestStatus.INTERNAL_SERVER_ERROR);
+        }
+        Map<String, String> out = new HashMap<>();
+        for (Map.Entry<?, ?> entry : byId.entrySet()) {
+            if (entry.getValue() instanceof String source && !source.isEmpty()) {
+                out.put(entry.getKey().toString(), source);
             }
         }
         return out;

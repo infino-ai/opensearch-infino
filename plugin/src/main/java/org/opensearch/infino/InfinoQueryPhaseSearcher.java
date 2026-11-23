@@ -334,7 +334,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
 
         List<SearchHit> rows = page.hits();
         if (laterRound) {
-            rows = scrollRows(searcher, carried.source(), source, plan, index, rows, cut, generation);
+            rows = scrollRows(searcher, carried.source(), source, plan, index, page, cut, generation);
         }
         boolean sorted = !plan.sorts().isEmpty();
         boolean collapsed = plan.collapse() != null;
@@ -482,27 +482,41 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         SearchSourceBuilder round,
         InfinoSearch.Plan plan,
         Index index,
-        List<SearchHit> first,
+        InfinoSearch.Page first,
         Long cut,
         long generation
     ) throws IOException {
         int size = round.size() < 0 ? InfinoSearch.DEFAULT_SIZE : round.size();
         List<SearchHit> known = new ArrayList<>();
-        List<SearchHit> page = first;
+        List<SearchHit> page = first.hits();
+        int chosen = first.chosen();
         for (int pages = 1;; pages++) {
             for (SearchHit h : page) {
                 if (known.size() < size && docId(searcher, h.getId()) >= 0) {
                     known.add(h);
                 }
             }
-            if (known.size() >= size || page.size() < size || pages == MAX_SCROLL_PAGES) {
+            if (scrollRoundDone(known.size(), page.size(), chosen, size) || pages == MAX_SCROLL_PAGES) {
                 return known;
             }
             SearchHit last = page.get(page.size() - 1);
             SearchSourceBuilder next = InfinoSearch.scrollSource(written).searchAfter(searchAfter(sortValues(last.getSortValues(), plan.sorts())));
             InfinoSearch.Plan nextPlan = visibleTo(InfinoSearch.plan(plan.table(), next, plan.nowMillis(), plan.access()), cut, generation);
-            page = InfinoSearch.page(index, nextPlan, next, false).hits();
+            InfinoSearch.Page read = InfinoSearch.page(index, nextPlan, next, false);
+            page = read.hits();
+            chosen = read.chosen();
         }
+    }
+
+    /**
+     * Whether a later scroll round stops paging: it holds the rows it asks
+     * for, or the table ran out. The table ran out when the page's statement
+     * chose fewer rows than asked, counted before a row deleted since dropped
+     * out (a page that lost a hit that way is not the last). A page left with
+     * no hit at all has no last hit to page on from, so it stops too.
+     */
+    static boolean scrollRoundDone(int known, int hits, int chosen, int size) {
+        return known >= size || chosen < size || hits == 0;
     }
 
     /** Whether the request asks for the exact total (the default). */
