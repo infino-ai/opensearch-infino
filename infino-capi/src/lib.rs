@@ -57,9 +57,9 @@ use infino::arrow_array::{
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
 use infino::{
-    connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions,
-    Connection, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaError,
-    SchemaPatch, Supertable,
+    connect_with, rows_to_batch, Analyzer, Bm25SearchOptions, BoolMode, ColumnIndex,
+    ConnectOptions, Connection, FieldPatch, FtsField, IndexSpec, InfinoError, Metric,
+    OptimizeOptions, SchemaError, SchemaPatch, Supertable,
 };
 use rayon::prelude::*;
 
@@ -1377,37 +1377,34 @@ fn declare_table(
                 .iter()
                 .find(|c| c.name == OSID)
                 .and_then(|c| match &c.index {
-                    Some(ColumnIndex::Fts {
-                        stopwords,
-                        stemmer,
-                        stored,
-                        bm25,
-                        ..
-                    }) => Some(ColumnIndex::Fts {
-                        stopwords: *stopwords,
-                        stemmer: *stemmer,
-                        positions: true,
-                        stored: *stored,
-                        bm25: *bm25,
-                    }),
+                    Some(index @ ColumnIndex::Fts { .. }) => {
+                        let mut index = index.clone();
+                        if let ColumnIndex::Fts { positions, .. } = &mut index {
+                            *positions = true;
+                        }
+                        Some(index)
+                    }
                     _ => None,
                 });
-            // The index a keyword field added now gets: the same, without positions.
-            let exact_index = text_index.clone().map(|index| match index {
-                ColumnIndex::Fts {
-                    stopwords,
-                    stemmer,
-                    stored,
-                    bm25,
-                    ..
-                } => ColumnIndex::Fts {
-                    stopwords,
-                    stemmer,
-                    positions: false,
-                    stored,
-                    bm25,
-                },
-                other => other,
+            // The index a keyword field added now gets: the `keyword`
+            // analyzer, each value one term exactly as written, so `=` and
+            // `IN` look a value up whole and the column's term counts are its
+            // value counts. It takes no stopwords or stemmer, and no positions.
+            let exact_index = text_index.as_ref().map(|index| {
+                let mut exact = ColumnIndex::fts(Analyzer::Keyword);
+                if let (
+                    ColumnIndex::Fts { stored, bm25, .. },
+                    ColumnIndex::Fts {
+                        stored: from_stored,
+                        bm25: from_bm25,
+                        ..
+                    },
+                ) = (&mut exact, index)
+                {
+                    *stored = *from_stored;
+                    *bm25 = *from_bm25;
+                }
+                exact
             });
             let mut conflicts: Vec<String> = Vec::new();
             for f in &mapped {
@@ -1560,7 +1557,8 @@ fn declare_table(
                     // order (match_phrase, quoted atoms of a query_string).
                     spec = spec.fts(FtsField::new(f.path.clone()).positions(true));
                 } else if f.exact {
-                    spec = spec.fts(FtsField::new(f.path.clone()));
+                    // One term per value (see `exact_index` above).
+                    spec = spec.fts(FtsField::new(f.path.clone()).analyzer("keyword"));
                 }
                 if let Some((dim, metric)) = f.vector {
                     spec = spec.vector(f.path.clone(), dim, metric);
@@ -5548,6 +5546,7 @@ mod tests {
                 matches!(
                     index_of(name),
                     Some(ColumnIndex::Fts {
+                        analyzer: Analyzer::Keyword,
                         positions: false,
                         ..
                     })

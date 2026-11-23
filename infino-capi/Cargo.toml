@@ -22,7 +22,10 @@ crate-type = ["cdylib", "rlib"]
 # reads a top-k on _id by id block and skips the row groups its bound rules
 # out. Since 0.11.26 the engine writes the manifest list format 4.0, which
 # builds before 0.11.26 cannot read.
-infino = { version = "=0.11.33", features = ["remote", "graph-index"] }
+# Until the next release: an engine commit with the `keyword` analyzer (one
+# term per value, and value counts of such a column read from its term index).
+# Replaced by that release, pinned exactly, before merge.
+infino = { git = "https://github.com/infino-ai/infino", rev = "3b572c039011032a7cec73cd5d2df61bbe038642", features = ["remote", "graph-index"] }
 # serde_json comes re-exported from infino, so the two never disagree.
 # Same major as infino so the delete-predicate Expr is the same type infino expects.
 datafusion = "54"
