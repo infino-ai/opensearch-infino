@@ -3,7 +3,8 @@
 processor writes them, into the nodes bench/local-nodes.sh starts, then time
 the searches a metrics dashboard sends and compare each answer with stock's.
 
-    python3 bench/metrics.py load --hosts 200 --points 500
+    python3 bench/metrics.py gen --hosts 200 --points 1080 --dir ./points
+    python3 bench/metrics.py load --dir ./points --threads 8
     python3 bench/metrics.py run --calls 20 --out result.json
     python3 bench/metrics.py sizes --nodes ./nodes
 
@@ -60,7 +61,7 @@ METRICS = [
     ("db.client.connections.usage", "GAUGE", "{connection}", ["idle", "used"]),
 ]
 TARGETS = {"stock": ("stock", "metrics"), "infino": ("default", "metrics"), "infino-ts": ("default", "metrics-ts")}
-PORTS = {"default": 0, "stock": 1}
+PORTS = {"default": 0, "stock": 1, "proxy": 2}
 BULK_TRIES = 20
 
 MAPPING = {
@@ -171,11 +172,14 @@ def create(base, node, index, timeseries):
 
 
 def bulk(port, index, docs):
-    lines = []
-    for doc in docs:
-        lines.append(b'{"index":{}}')
-        lines.append(json.dumps(doc, separators=(",", ":")).encode())
-    body = b"\n".join(lines) + b"\n"
+    if isinstance(docs, bytes):
+        body = docs
+    else:
+        lines = []
+        for doc in docs:
+            lines.append(b'{"index":{}}')
+            lines.append(json.dumps(doc, separators=(",", ":")).encode())
+        body = b"\n".join(lines) + b"\n"
     for _ in range(BULK_TRIES):
         status, resp = call(port, "POST", f"/{index}/_bulk", body, ndjson=True)
         if status == 429:
@@ -188,31 +192,53 @@ def bulk(port, index, docs):
     sys.exit(f"bulk into {index}: still 429 after {BULK_TRIES} tries")
 
 
-def load(args):
-    for target, (node, index) in TARGETS.items():
-        create(args.base_port, node, index, target == "infino-ts")
-    batch = []
-    loaded = 0
-    started = time.time()
+def gen(args):
+    """Write the points as _bulk bodies of `--batch` points each, in arrival
+    order, so every index is loaded with the same bytes."""
+    os.makedirs(args.dir, exist_ok=True)
+    batch, n, total = [], 0, 0
+    def flush():
+        nonlocal batch, n
+        with open(os.path.join(args.dir, f"{n:06d}.ndjson"), "wb") as f:
+            for doc in batch:
+                f.write(b'{"index":{}}\n')
+                f.write(json.dumps(doc, separators=(",", ":")).encode() + b"\n")
+        n += 1
+        batch = []
     for doc in points(args.hosts, args.points, args.seed):
         batch.append(doc)
+        total += 1
         if len(batch) == args.batch:
-            for node, index in TARGETS.values():
-                bulk(port_of(args.base_port, node), index, batch)
-            loaded += len(batch)
-            batch = []
-            if loaded % (args.batch * 50) == 0:
-                print(f"  {loaded} points, {loaded / (time.time() - started):.0f}/s", file=sys.stderr)
+            flush()
     if batch:
-        for node, index in TARGETS.values():
-            bulk(port_of(args.base_port, node), index, batch)
-        loaded += len(batch)
-    for node, index in TARGETS.values():
-        call(port_of(args.base_port, node), "POST", f"/{index}/_refresh")
-    print(f"loaded {loaded} points into each index in {time.time() - started:.0f}s", file=sys.stderr)
-    meta = {"hosts": args.hosts, "points": args.points, "series": len(series_of(args.hosts)), "total": loaded}
-    with open(args.meta, "w") as f:
+        flush()
+    meta = {"hosts": args.hosts, "points": args.points, "series": len(series_of(args.hosts)), "total": total}
+    with open(os.path.join(args.dir, "meta.json"), "w") as f:
         json.dump(meta, f)
+    print(f"wrote {total} points in {n} bodies", file=sys.stderr)
+
+
+def load(args):
+    """Create each index and load every body into it from `--threads`
+    clients at once, one index after another, timing each: the seconds from
+    the first body sent to the last point searchable."""
+    import concurrent.futures
+    bodies = sorted(glob.glob(os.path.join(args.dir, "*.ndjson")))
+    meta = json.load(open(os.path.join(args.dir, "meta.json")))
+    rates = {}
+    for target, (node, index) in TARGETS.items():
+        create(args.base_port, node, index, target == "infino-ts")
+        port = port_of(args.base_port, node)
+        started = time.time()
+        with concurrent.futures.ThreadPoolExecutor(args.threads) as pool:
+            list(pool.map(lambda path: bulk(port, index, open(path, "rb").read()), bodies))
+        call(port, "POST", f"/{index}/_refresh")
+        _, count = call(port, "GET", f"/{index}/_count")
+        took = time.time() - started
+        rates[target] = {"points": count.get("count"), "seconds": round(took, 1), "points_per_s": round(meta["total"] / took)}
+        print(f"{target:10s} {count.get('count')} points in {took:.1f}s = {meta['total'] / took:,.0f} points/s", file=sys.stderr)
+    with open(args.meta, "w") as f:
+        json.dump(dict(meta, load=rates), f)
 
 
 def searches(meta):
@@ -384,12 +410,18 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--base-port", type=int, default=9250, help="http port of the default-mode node (stock is one above)")
     p.add_argument("--meta", default="metrics-meta.json", help="where load records what it loaded, for run and sizes")
+    p.add_argument("--infino-node", choices=["default", "proxy"], default="default",
+                   help="the node that holds the Infino indices: the default-mode one, or the proxy-mode one two above it")
     sub = p.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("gen")
+    g.add_argument("--hosts", type=int, default=200)
+    g.add_argument("--points", type=int, default=1080, help="points per series, 10 seconds apart")
+    g.add_argument("--batch", type=int, default=5000)
+    g.add_argument("--seed", type=int, default=1)
+    g.add_argument("--dir", default="points")
     l = sub.add_parser("load")
-    l.add_argument("--hosts", type=int, default=200)
-    l.add_argument("--points", type=int, default=500, help="points per series, 10 seconds apart")
-    l.add_argument("--batch", type=int, default=5000)
-    l.add_argument("--seed", type=int, default=1)
+    l.add_argument("--dir", default="points")
+    l.add_argument("--threads", type=int, default=8)
     r = sub.add_parser("run")
     r.add_argument("--calls", type=int, default=20)
     r.add_argument("--searches", default="")
@@ -398,7 +430,9 @@ def main():
     s.add_argument("--nodes", default="./nodes")
     s.add_argument("--out", default="")
     args = p.parse_args()
-    {"load": load, "run": run, "sizes": sizes}[args.cmd](args)
+    for target in ("infino", "infino-ts"):
+        TARGETS[target] = (args.infino_node, TARGETS[target][1])
+    {"gen": gen, "load": load, "run": run, "sizes": sizes}[args.cmd](args)
 
 
 if __name__ == "__main__":
