@@ -24,6 +24,7 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.seqno.SequenceNumbers;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -39,6 +40,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 
@@ -1355,13 +1357,30 @@ public final class InfinoNative {
 
     /**
      * The highest sequence number the table holds as of its latest commit
-     * ({@link #latestRows}), {@link InfinoDocumentVersion#UNTRACKED_SEQ_NO}
-     * when it holds none: a writer's numbering starts after it.
+     * ({@link #latestRows}; see {@link #highestSeq}):
+     * {@link SequenceNumbers#NO_OPS_PERFORMED} when it holds no row, so its
+     * first write is given 0, as stock gives a new shard's first operation.
      */
     public static long maxSeq(String name) {
-        String sql = "SELECT MAX(" + InfinoQueryTranslator.SEQ + ") AS " + InfinoQueryTranslator.SEQ + " FROM " + InfinoQueryTranslator.quoteIdent(name);
+        String table = InfinoQueryTranslator.quoteIdent(name);
+        String sql = "SELECT MAX(" + InfinoQueryTranslator.SEQ + ") AS " + InfinoQueryTranslator.SEQ + " FROM " + table;
         List<Map<String, Object>> rows = latestRows(sql);
-        return rows.isEmpty() ? InfinoDocumentVersion.UNTRACKED_SEQ_NO : seq(rows.get(0).get(InfinoQueryTranslator.SEQ));
+        Object max = rows.isEmpty() ? null : rows.get(0).get(InfinoQueryTranslator.SEQ);
+        return highestSeq(max, () -> !latestRows("SELECT " + InfinoQueryTranslator.OSID + " FROM " + table + " LIMIT 1").isEmpty());
+    }
+
+    /**
+     * The highest sequence number of a table whose rows' highest stored one
+     * is {@code max} (null when no row stores one): that number, else
+     * {@link InfinoDocumentVersion#UNTRACKED_SEQ_NO} when the table holds rows
+     * written without one (those report it, so the next write is given a
+     * number past it), else {@link SequenceNumbers#NO_OPS_PERFORMED}.
+     */
+    static long highestSeq(Object max, BooleanSupplier holdsRows) {
+        if (max instanceof Number n) {
+            return n.longValue();
+        }
+        return holdsRows.getAsBoolean() ? InfinoDocumentVersion.UNTRACKED_SEQ_NO : SequenceNumbers.NO_OPS_PERFORMED;
     }
 
     /** Drop the prefetched sources of ids a write just changed, so a read after the write sees the table. */

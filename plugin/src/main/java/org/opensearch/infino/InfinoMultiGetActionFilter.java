@@ -35,9 +35,10 @@ import java.util.function.Supplier;
  * Serves {@code _mget} for Infino-backed indices from their tables: the ids of
  * each index are looked up through the id column's term index in one
  * statement, and each item comes back as a get response. An index may be
- * named through an alias. A request that also names an index the plugin
- * does not back goes on to the shards as it is. Each document carries the
- * sequence number it was written under, as for a single get.
+ * named through an alias; an item whose name resolves to no single index
+ * fails alone, as it does on the shards. A request that also names an index
+ * the plugin does not back goes on to the shards as it is. Each document
+ * carries the sequence number it was written under, as for a single get.
  */
 public class InfinoMultiGetActionFilter implements ActionFilter {
 
@@ -76,23 +77,55 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             chain.proceed(task, action, request, listener);
             return;
         }
-        // Every item must be on an Infino-backed index for the table to answer the request whole.
-        ClusterState state = clusters.state();
-        IndexNameExpressionResolver names = resolver.get();
-        Map<String, IndexMetadata> indices = new HashMap<>();
-        for (MultiGetRequest.Item item : mget.getItems()) {
-            IndexMetadata index = indices.computeIfAbsent(item.index(), name -> InfinoGetActionFilter.infinoIndex(state, names, name));
-            if (index == null) {
-                chain.proceed(task, action, request, listener);
-                return;
-            }
+        Layout layout = layout(clusters.state(), resolver.get(), mget.getItems());
+        if (layout == null) {
+            chain.proceed(task, action, request, listener);
+            return;
         }
         // The tables are read on the get pool, never on the thread that took the request.
-        InfinoServices.fork(ThreadPool.Names.GET, listener::onFailure, () -> serve(mget, indices, listener));
+        InfinoServices.fork(ThreadPool.Names.GET, listener::onFailure, () -> serve(mget, layout, listener));
     }
 
-    /** Answer a multi-get whose every item is on an Infino-backed index from the tables. */
-    private <Response extends ActionResponse> void serve(MultiGetRequest mget, Map<String, IndexMetadata> indices, ActionListener<Response> listener) {
+    /**
+     * How the tables answer a multi-get: the Infino-backed index each served
+     * name stands for, and by slot the failure of each item whose name
+     * resolves to no single index (null for the others).
+     */
+    record Layout(Map<String, IndexMetadata> indices, Exception[] failed) {}
+
+    /**
+     * The layout of a multi-get's items, or null when it goes on to the
+     * shards as it is: an item names an index the plugin does not back, or
+     * no item names one it does. An item whose name resolves to no single
+     * index, such as an alias of several or a missing index, fails alone
+     * with what the resolution threw, as the stock multi-get fails it before
+     * it reaches any shard; the other items are served.
+     */
+    static Layout layout(ClusterState state, IndexNameExpressionResolver names, List<MultiGetRequest.Item> items) {
+        Map<String, IndexMetadata> indices = new HashMap<>();
+        Exception[] failed = new Exception[items.size()];
+        for (int i = 0; i < items.size(); i++) {
+            MultiGetRequest.Item item = items.get(i);
+            if (names != null) {
+                try {
+                    names.concreteSingleIndex(state, item);
+                } catch (Exception e) {
+                    failed[i] = e;
+                    continue;
+                }
+            }
+            IndexMetadata index = indices.computeIfAbsent(item.index(), name -> InfinoGetActionFilter.infinoIndex(state, names, name));
+            if (index == null) {
+                return null;
+            }
+        }
+        return indices.isEmpty() ? null : new Layout(indices, failed);
+    }
+
+    /** Answer a multi-get from the tables as {@code layout} has it. */
+    private <Response extends ActionResponse> void serve(MultiGetRequest mget, Layout layout, ActionListener<Response> listener) {
+        Map<String, IndexMetadata> indices = layout.indices();
+        Exception[] failed = layout.failed();
         try {
             // One fetch per table, over all of its ids: through the document
             // rule when the security plugin has one for this user. An index in
@@ -108,6 +141,9 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             Map<String, String> indexOfTable = new HashMap<>();
             Set<String> refreshed = new HashSet<>();
             for (int i = 0; i < tableOfItem.length; i++) {
+                if (failed[i] != null) {
+                    continue;
+                }
                 MultiGetRequest.Item item = mget.getItems().get(i);
                 String table = tables.ensureForDocument(indices.get(item.index()), item.id(), item.routing());
                 tableOfItem[i] = table;
@@ -133,6 +169,10 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             MultiGetItemResponse[] responses = new MultiGetItemResponse[mget.getItems().size()];
             for (int i = 0; i < responses.length; i++) {
                 MultiGetRequest.Item item = mget.getItems().get(i);
+                if (failed[i] != null) {
+                    responses[i] = new MultiGetItemResponse(null, new MultiGetResponse.Failure(item.index(), item.id(), failed[i]));
+                    continue;
+                }
                 IndexMetadata md = indices.get(item.index());
                 Map<String, InfinoNative.Doc> byId = docsOf.get(tableOfItem[i]);
                 InfinoNative.Doc doc = byId != null ? byId.get(item.id()) : InfinoGetActionFilter.docOf(md, tableOfItem[i], item.id(), mget.realtime());
