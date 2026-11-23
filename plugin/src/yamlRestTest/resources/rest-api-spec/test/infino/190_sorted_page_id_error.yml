@@ -1,0 +1,96 @@
+---
+# A sorted page reads its hits' sources by id after it chooses them. A
+# document whose _id is "error" is a document like any other: its source is
+# shown, and the search does not fail as if the read had.
+setup:
+  - do:
+      indices.create:
+        index: sid_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              k: { type: keyword }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: sid_default
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              k: { type: keyword }
+              n: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sid_proxy, _id: "error" }
+          - { k: "first", n: 10 }
+          - index: { _index: sid_proxy, _id: "zz" }
+          - { k: "second", n: 5 }
+          - index: { _index: sid_default, _id: "error" }
+          - { k: "first", n: 10 }
+          - index: { _index: sid_default, _id: "zz" }
+          - { k: "second", n: 5 }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: sid_proxy,sid_default
+        ignore_unavailable: true
+
+---
+"proxy mode: the top hit of a sorted page has the id error":
+  - do:
+      search:
+        index: sid_proxy
+        body:
+          size: 1
+          query: { range: { n: { gte: 0 } } }
+          sort: [ { n: desc } ]
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "error" }
+  - match: { hits.hits.0._source.k: "first" }
+
+  # Every id of the page sorts at or after "error".
+  - do:
+      search:
+        index: sid_proxy
+        body:
+          size: 2
+          query: { range: { n: { gte: 0 } } }
+          sort: [ { n: desc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "error" }
+  - match: { hits.hits.0._source.k: "first" }
+  - match: { hits.hits.1._id: "zz" }
+  - match: { hits.hits.1._source.k: "second" }
+
+---
+"default mode: the top hit of a sorted page has the id error":
+  - do:
+      search:
+        index: sid_default
+        body:
+          size: 1
+          query: { range: { n: { gte: 0 } } }
+          sort: [ { n: desc } ]
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "error" }
+  - match: { hits.hits.0._source.k: "first" }
+
+  - do:
+      search:
+        index: sid_default
+        body:
+          size: 2
+          query: { range: { n: { gte: 0 } } }
+          sort: [ { n: desc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "error" }
+  - match: { hits.hits.1._id: "zz" }
+  - match: { hits.hits.1._source.k: "second" }
