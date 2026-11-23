@@ -102,10 +102,20 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
         assertGreen(index);
         write(index, 0, DOCS);
         call("POST", "/" + index + "/_refresh", null);
-        for (String preference : new String[] { "_primary", "_replica" }) {
-            for (int i = 0; i < 3; i++) {
-                assertEquals(preference, DOCS, total(index, preference));
+        for (int i = 0; i < 3; i++) {
+            assertEquals("_primary", DOCS, total(index, "_primary"));
+        }
+        // The replica may see the refresh up to the staleness window late;
+        // it keeps none of these searches, so the waiting adds no stats.
+        assertBusy(() -> {
+            try {
+                assertEquals("_replica", DOCS, total(index, "_replica"));
+            } catch (IOException e) {
+                throw new AssertionError(e);
             }
+        }, STALENESS_WAIT_SECONDS, TimeUnit.SECONDS);
+        for (int i = 0; i < 2; i++) {
+            assertEquals("_replica", DOCS, total(index, "_replica"));
         }
         assertEquals("the primary: one miss, two hits", List.of(1, 2), requestCache(index, true));
         assertEquals("the replica: never kept", List.of(0, 0), requestCache(index, false));
