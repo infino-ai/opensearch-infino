@@ -135,6 +135,13 @@ public final class InfinoSearch {
     private static final String EPOCH_MILLIS_FORMAT = "epoch_millis";
     /** Digits of the engine's row id: its type is {@code DECIMAL(38, 0)}. */
     private static final int ROW_ID_DIGITS = 38;
+    /**
+     * The order a page with no order of its own is read in where the
+     * engine's file order does not hold (a collapse, a read that is not a
+     * plain scan of the table): the engine's row id, ascending
+     * ({@link SortSpec#rowId}).
+     */
+    static final String ROW_ID_ORDER = orderBy(List.of(SortSpec.rowId())).get(0);
     /** The sort a scroll without one pages by: the document id, which {@link #columnFor} resolves to the id column. */
     private static final String ID_SORT_FIELD = "_id";
     /** The alias the hit statement selects a collapsed hit's own value under, unless the plan has a name of that kind ({@link #freeAlias}). */
@@ -1685,7 +1692,11 @@ public final class InfinoSearch {
      * {@code seq_no_primary_term}) and, under a collapse, its collapse value.
      * A sorted request
      * orders the filtered relation; a text-ranked one orders the engine's
-     * ranked candidates by score; anything else is a filtered scan. A
+     * ranked candidates by score; anything else is a filtered scan with no
+     * order, which the engine reads in file order under a page's
+     * {@code LIMIT}, so pages at growing offsets follow one another, or,
+     * where the filter is joined by id or the rows come from the token index,
+     * the same rows ordered by the row id (see {@link #unsortedStatement}). A
      * search_after narrows the relation to the rows past the given sort values
      * (a keyset, so no earlier page is scanned), and a collapse keeps the first
      * row of each collapse value in the request's order, through a window.
@@ -1707,9 +1718,10 @@ public final class InfinoSearch {
     /**
      * Whether the page is read as the unsorted search reads it: its sort
      * orders nothing ({@link #sortsNothing}), so every hit's sort value is
-     * missing and the page is the predicate's rows in no order, as stock
-     * reads a sort on a field no document has. The hits still carry the
-     * sort. Not when a later page resumes from the hits' sort values
+     * missing and the page is the predicate's rows in file order (in row id
+     * order where the read is not a plain scan, see {@link #unsortedStatement}),
+     * as stock reads a sort on a field no document has in its index's order. The hits
+     * still carry the sort. Not when a later page resumes from the hits' sort values
      * ({@code resumed}, a scroll): the unsorted read selects no row id, so
      * every value would be missing and the keyset past them would keep no
      * row; that page is read in the sort's order, the row id's.
@@ -1724,21 +1736,38 @@ public final class InfinoSearch {
      * selects them) with no order, each with its source when
      * {@code withSource} (the hit returns it or reads requested fields from
      * it). A text query is neither ranked by BM25 nor scored, so the page is
-     * the rows the sorted read would select, not the best-scoring ones. With
-     * no order the read stops at its LIMIT; ordering by the row id would read
-     * the id of every row the filter keeps. Two pages of one search can then
-     * start from different files (#107).
+     * the rows the sorted read would select, not the best-scoring ones.
+     *
+     * <p>A plain scan of the table has no order: the engine reads a scan
+     * under a {@code LIMIT} with no order in file order, so while the
+     * table's files stay the same, two pages of one search start where the
+     * last one ended, and the read stops at its LIMIT, where ordering by the
+     * row id would read the id of every row the filter keeps. Any other read
+     * (a filter joined by id, rows from the token index) is ordered by the
+     * row id ({@link #ROW_ID_ORDER}): the engine builds the join from every
+     * row of the table before the first comes out, and emits them in no
+     * fixed order, so the order costs a top-{@code LIMIT} sort of rows it
+     * has already read and no further read.
      */
     static String unsortedStatement(Plan plan, int fetch, boolean withSeq, boolean withSource) {
         String hit = InfinoQueryTranslator.OSID
             + (withSource ? ", " + InfinoQueryTranslator.SOURCE : "")
             + (withSeq ? ", " + InfinoQueryTranslator.SEQ : "");
         Unranked read = unranked(plan.query(), plan.hitWhere());
-        return "SELECT " + hit + " FROM " + read.from() + " WHERE " + read.where() + " LIMIT " + fetch;
+        String order = read.scansTable(plan.query().table()) ? "" : " ORDER BY " + ROW_ID_ORDER;
+        return "SELECT " + hit + " FROM " + read.from() + " WHERE " + read.where() + order + " LIMIT " + fetch;
     }
 
     /** The relation and predicate a page with no score reads its rows from. */
-    record Unranked(String from, String where) {}
+    record Unranked(String from, String where) {
+        /**
+         * Whether this is a plain scan of {@code table}: the table itself,
+         * filtered with no subquery by id ({@link InfinoQueryTranslator#joinsById}).
+         */
+        boolean scansTable(String table) {
+            return from.equals(InfinoQueryTranslator.quoteIdent(table)) && !InfinoQueryTranslator.joinsById(where);
+        }
+    }
 
     /**
      * What a page with no score (a sorted or an unsorted one) reads: a
@@ -1895,20 +1924,25 @@ public final class InfinoSearch {
             hit.append(", score");
             order = "score DESC";
         } else {
+            // No sort and no score: a plain scan is left in the engine's file
+            // order, a read joined by id is ordered by the row id (see
+            // unsortedStatement).
             from = q.from();
-            order = null;
+            order = new Unranked(from, where).scansTable(q.table()) ? null : ROW_ID_ORDER;
         }
         if (plan.collapse() == null) {
             return "SELECT " + hit + " FROM " + from + " WHERE " + where + (order == null ? "" : " ORDER BY " + order) + " LIMIT " + fetch;
         }
-        // One row per collapse value: the first in the request's order (the
-        // id's order when the request names none, so the page is stable).
-        String within = order == null ? InfinoQueryTranslator.OSID + " ASC" : order;
+        // One row per collapse value: the first in the request's order, or in
+        // the row id's when the request names none. The window's rows come
+        // out grouped by value, not in file order, so the page orders them
+        // the same way, and pages at growing offsets follow one another.
+        String within = order == null ? ROW_ID_ORDER : order;
         String partition = InfinoQueryTranslator.quoteIdent(plan.collapse().name());
         String rank = InfinoQueryTranslator.quoteIdent(freeAlias(plan, COLLAPSE_RANK));
         return "SELECT " + hit + " FROM (SELECT t.*, ROW_NUMBER() OVER (PARTITION BY " + partition + " ORDER BY " + within
             + ") AS " + rank + " FROM " + from + " t WHERE " + where + ") WHERE " + rank + " = 1"
-            + (order == null ? "" : " ORDER BY " + order) + " LIMIT " + fetch;
+            + " ORDER BY " + within + " LIMIT " + fetch;
     }
 
     /**
