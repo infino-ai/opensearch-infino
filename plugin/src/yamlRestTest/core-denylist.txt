@@ -51,8 +51,8 @@ delete/50_refresh/Refresh  # [bug:default] a delete sent without refresh hides t
 search/260_sort_mixed/*  # [bug] a sort across long, double and unsigned_long indices stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
 
 # --- Write responses
-update/12_result/Update result field  # [bug] an update reports the wrong result or _version (https://github.com/infino-ai/opensearch-infino/issues/57)
-update/16_noop/Noop  # [bug] an update that changes nothing is not a noop: it takes a new _seq_no (https://github.com/infino-ai/opensearch-infino/issues/57)
+update/12_result/Update result field  # [bug] an update that changes nothing answers updated, not noop, and takes a new _version (https://github.com/infino-ai/opensearch-infino/issues/229, https://github.com/infino-ai/opensearch-infino/issues/57)
+update/16_noop/Noop  # [bug] an update that changes nothing is not a noop: it writes and takes a new _seq_no (https://github.com/infino-ai/opensearch-infino/issues/229, https://github.com/infino-ai/opensearch-infino/issues/57)
 update/40_routing/Routing  # [bug] an update with routing returns no get._source (default) or no _routing (proxy) (https://github.com/infino-ai/opensearch-infino/issues/57, https://github.com/infino-ai/opensearch-infino/issues/203)
 update/80_source_filtering/Source filtering  # [bug] an update with _source filtering returns no get._source (https://github.com/infino-ai/opensearch-infino/issues/203)
 bulk/40_source/Source filtering  # [bug] an update with _source filtering returns no get._source (https://github.com/infino-ai/opensearch-infino/issues/203)
@@ -92,6 +92,7 @@ search/380_bitmap_filtering/Terms lookup on a binary field with bitmap  # [bug] 
 search/380_bitmap_filtering/Boolean must bitmap filtering  # [bug] terms lookup returns 500 (a null pointer) instead of the clear refusal the filter aggregation gives (https://github.com/infino-ai/opensearch-infino/issues/198)
 search/380_bitmap_filtering/Boolean should bitmap filtering  # [bug] terms lookup returns 500 (a null pointer) instead of the clear refusal the filter aggregation gives (https://github.com/infino-ai/opensearch-infino/issues/198)
 search/381_bitmap_filtering_long/Terms lookup on a binary field with bitmap (long)  # [bug] terms lookup returns 500 (a null pointer) instead of the clear refusal the filter aggregation gives (https://github.com/infino-ai/opensearch-infino/issues/198)
+search/150_rewrite_on_coordinator/*  # [bug] terms lookup returns 500 (a null pointer) instead of the clear refusal the filter aggregation gives (https://github.com/infino-ai/opensearch-infino/issues/198)
 
 # --- An index named "index" never starts
 search/260_sort_geopoint/*  # [bug] an index named index is refused at create: its table would be the registry's (https://github.com/infino-ai/opensearch-infino/issues/171)
@@ -221,7 +222,6 @@ search/110_field_collapsing/field collapsing on a field alias  # [gap] not serve
 search/110_field_collapsing/field collapsing, inner_hits and seq_no  # [gap] not served: collapse with inner_hits
 search/115_multiple_field_collapsing/*  # [gap] not served: collapse with inner_hits
 search/140_pre_filter_search_shards/pre_filter_shard_size with shards that have no hit  # [gap] not served: aggregation global
-search/150_rewrite_on_coordinator/*  # [gap] not served: terms lookup (https://github.com/infino-ai/opensearch-infino/issues/198)
 search/190_index_prefix_search/search index prefixes with span_multi  # [gap] not served: query span_near
 search/190_index_prefix_search/search index prefixes with multiple values  # [gap] not served: query match_phrase_prefix
 search/190_index_prefix_search/search index prefixes with multiple values and custom position_increment_gap  # [gap] not served: query match_phrase_prefix
