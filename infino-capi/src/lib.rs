@@ -62,9 +62,9 @@ use infino::arrow_array::{
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
 use infino::{
-    connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions,
-    Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions,
-    SchemaError, SchemaPatch, Supertable, TableSchema,
+    connect_with, rows_to_batch, Analyzer, Bm25SearchOptions, BoolMode, ColumnIndex,
+    ConnectOptions, Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric,
+    OptimizeOptions, SchemaError, SchemaPatch, Supertable, TableSchema,
 };
 use rayon::prelude::*;
 
@@ -1935,8 +1935,26 @@ fn declare_table(
                     }
                     _ => None,
                 });
-            // The index a keyword field added now gets: the same, without positions.
-            let exact_index = text_index.clone().map(|index| with_positions(index, false));
+            // The index a keyword field added now gets: the `keyword`
+            // analyzer, each value one term exactly as written, so `=` and
+            // `IN` look a value up whole and the column's term counts are its
+            // value counts. It takes no stopwords or stemmer, and no positions.
+            let exact_index = text_index.as_ref().map(|index| {
+                let mut exact = ColumnIndex::fts(Analyzer::Keyword);
+                if let (
+                    ColumnIndex::Fts { stored, bm25, .. },
+                    ColumnIndex::Fts {
+                        stored: from_stored,
+                        bm25: from_bm25,
+                        ..
+                    },
+                ) = (&mut exact, index)
+                {
+                    *stored = *from_stored;
+                    *bm25 = *from_bm25;
+                }
+                exact
+            });
             let mut conflicts: Vec<String> = Vec::new();
             for f in &mapped {
                 let present = schema.field_with_name(&f.path).is_ok();
@@ -2093,7 +2111,8 @@ fn declare_table(
                     // order (match_phrase, quoted atoms of a query_string).
                     spec = spec.fts(FtsField::new(f.path.clone()).positions(true));
                 } else if f.exact {
-                    spec = spec.fts(FtsField::new(f.path.clone()));
+                    // One term per value (see `exact_index` above).
+                    spec = spec.fts(FtsField::new(f.path.clone()).analyzer("keyword"));
                 }
                 if let Some((dim, metric)) = f.vector {
                     spec = spec.vector(f.path.clone(), dim, metric);
@@ -5667,7 +5686,7 @@ pub unsafe extern "C" fn infino_value_counts(
             // Where the engine's own count fails (the hosted service's does,
             // on a count it declares non-null and gives null), the grouped
             // count as a statement gives the same rows.
-            Err(e) => match conn.conn.query_sql(&grouped_count(name, column, max)) {
+            Err(e) => match conn.conn.query_sql(&grouped_count(name, column, Some(max))) {
                 Ok(b) if b.iter().map(RecordBatch::num_rows).sum::<usize>() > max => {
                     out_string("null".to_string())
                 }
@@ -5679,17 +5698,144 @@ pub unsafe extern "C" fn infino_value_counts(
     .unwrap_or(ptr::null_mut())
 }
 
+/// The `top` most frequent values of a keyword column over the whole table,
+/// by count and then by value (its UTF-8 bytes), with what a terms
+/// aggregation needs to count the rest: `{"rows":[{column, "count(*)"}...],
+/// "keyed_total":n, "nulls":n, "groups":n}`, where `keyed_total` is the rows
+/// with a value, `nulls` the rows without one and `groups` how many values
+/// the column has. One call: the engine reads a keyword column's counts from
+/// its term index, so only `top` rows cross, however many values it has.
+/// `null`, for the caller's own statement to run, for a column without the
+/// `keyword` analyzer (the engine would run the grouped count there, which
+/// the statement runs as well), and where the engine's count fails. The
+/// engine counts every value in memory before the top `n` are picked;
+/// bounding that is infino-ai/infino#1459.
+#[no_mangle]
+pub unsafe extern "C" fn infino_value_counts_top(
+    h: *mut Bridge,
+    name: *const c_char,
+    column: *const c_char,
+    top: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(column)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(column)
+            })
+        else {
+            return ptr::null_mut();
+        };
+        match value_counts_top(conn, name, column, top.max(0) as usize) {
+            Ok(Some(out)) => out_string(out.to_string()),
+            Ok(None) => out_string("null".to_string()),
+            Err(e) => err_json(&e),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// [`infino_value_counts_top`]'s answer, None for a column without the
+/// `keyword` analyzer or where the engine's count fails.
+fn value_counts_top(
+    conn: &Bridge,
+    name: &str,
+    column: &str,
+    top: usize,
+) -> Result<Option<Value>, String> {
+    let keyword = conn
+        .conn
+        .schema(name)
+        .map_err(|e| e.to_string())?
+        .fields()
+        .iter()
+        .any(|f| {
+            f.name == column
+                && matches!(
+                    f.index,
+                    Some(ColumnIndex::Fts {
+                        analyzer: Analyzer::Keyword,
+                        ..
+                    })
+                )
+        });
+    if !keyword {
+        return Ok(None);
+    }
+    let table = conn.table(name).map_err(|e| e.to_string())?;
+    // Where the engine's own count fails, decline: the caller's bounded
+    // statement gives the same answer, where a grouped count here would
+    // bring every value of the column across the bridge.
+    match table.value_counts(column) {
+        Ok(b) => Ok(top_values(&[b], column, top)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// [`infino_value_counts_top`]'s answer from a column's value counts
+/// (`batches`, each the value then its count). None when the values are not
+/// strings or the counts not integers.
+fn top_values(batches: &[RecordBatch], column: &str, top: usize) -> Option<Value> {
+    let is_text =
+        |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+    let mut values: Vec<LargeStringArray> = Vec::with_capacity(batches.len());
+    let mut counts: Vec<Int64Array> = Vec::with_capacity(batches.len());
+    for b in batches {
+        if b.num_columns() < 2 {
+            return None;
+        }
+        let text = match b.column(0).data_type() {
+            DataType::Dictionary(_, v) => is_text(v),
+            t => is_text(t),
+        };
+        if !text {
+            return None;
+        }
+        let v = datafusion::arrow::compute::cast(b.column(0), &DataType::LargeUtf8).ok()?;
+        let n = datafusion::arrow::compute::cast(b.column(1), &DataType::Int64).ok()?;
+        values.push(v.as_any().downcast_ref::<LargeStringArray>()?.clone());
+        counts.push(n.as_any().downcast_ref::<Int64Array>()?.clone());
+    }
+    let groups: usize = values.iter().map(|v| v.len() - v.null_count()).sum();
+    let (mut nulls, mut keyed_total) = (0i64, 0i64);
+    let mut keyed: Vec<(i64, &str)> = Vec::with_capacity(groups);
+    for (v, n) in values.iter().zip(&counts) {
+        for i in 0..v.len() {
+            let count = if n.is_null(i) { 0 } else { n.value(i) };
+            if v.is_null(i) {
+                nulls += count;
+            } else {
+                keyed_total += count;
+                keyed.push((count, v.value(i)));
+            }
+        }
+    }
+    let top = top.min(groups);
+    // Count descending, then the value's bytes ascending: a terms
+    // aggregation's default order, as the plugin's window statement ranks.
+    let order = |a: &(i64, &str), b: &(i64, &str)| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1));
+    if top > 0 && top < groups {
+        keyed.select_nth_unstable_by(top - 1, order);
+    }
+    keyed.truncate(top);
+    keyed.sort_unstable_by(order);
+    let rows: Vec<Value> = keyed
+        .into_iter()
+        .map(|(n, v)| json!({ column: v, "count(*)": n }))
+        .collect();
+    Some(json!({ "rows": rows, "keyed_total": keyed_total, "nulls": nulls, "groups": groups }))
+}
+
 /// The grouped count [`infino_value_counts`] gives, as a statement: each
 /// value of `column` in `name` and its rows, under the names the engine's
-/// own count gives them. It stops one group past `max`, which is all the
-/// caller needs to know the column holds too many values to carry.
-fn grouped_count(name: &str, column: &str, max: usize) -> String {
+/// own count gives them. With a `max`, it stops one group past it, which is
+/// all the caller needs to know the column holds too many values to carry.
+fn grouped_count(name: &str, column: &str, max: Option<usize>) -> String {
     let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
     let (table, column) = (quote(name), quote(column));
-    let limit = max.saturating_add(1);
-    format!(
-        "SELECT {column}, count(*) AS \"count(*)\" FROM {table} GROUP BY {column} LIMIT {limit}"
-    )
+    let limit = max.map_or(String::new(), |max| {
+        format!(" LIMIT {}", max.saturating_add(1))
+    });
+    format!("SELECT {column}, count(*) AS \"count(*)\" FROM {table} GROUP BY {column}{limit}")
 }
 
 /// Unranked full-text match set: the osids of every row matching `query` on
@@ -6568,6 +6714,82 @@ mod tests {
         close(h);
     }
 
+    fn value_counts_top(h: *mut Bridge, column: &str, top: c_int) -> Value {
+        let out = take(unsafe {
+            infino_value_counts_top(h, c("logs").as_ptr(), c(column).as_ptr(), top)
+        });
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
+    /// `(value, count)` pairs of a top answer's rows, in its order.
+    fn top_rows(out: &Value) -> Vec<(String, i64)> {
+        out["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["level"].as_str().unwrap().to_string(),
+                    r["count(*)"].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn value_counts_top_ranks_by_count_then_value_and_counts_the_rest() {
+        let h = open_logs();
+        // b and a tie at 2, e, c and d at 1; two rows have no level.
+        index(
+            h,
+            &[
+                ("1", r#"{"level":"b"}"#),
+                ("2", r#"{"level":"a"}"#),
+                ("3", r#"{"level":"e"}"#),
+                ("4", r#"{"level":"b"}"#),
+                ("5", r#"{"level":"c"}"#),
+                ("6", r#"{"level":"a"}"#),
+                ("7", r#"{"level":"d"}"#),
+                ("8", r#"{"message":"no level"}"#),
+                ("9", r#"{"message":"no level"}"#),
+            ],
+        );
+        let pairs = |v: &[(&str, i64)]| -> Vec<(String, i64)> {
+            v.iter().map(|(k, n)| (k.to_string(), *n)).collect()
+        };
+        let out = value_counts_top(h, "level", 3);
+        // Ties break by value ascending, as a terms aggregation orders them.
+        assert_eq!(top_rows(&out), pairs(&[("a", 2), ("b", 2), ("c", 1)]));
+        assert_eq!(out["keyed_total"], json!(7));
+        assert_eq!(out["nulls"], json!(2));
+        assert_eq!(out["groups"], json!(5));
+        // More asked for than there are values: every value, in order.
+        let all = value_counts_top(h, "level", 50);
+        assert_eq!(
+            top_rows(&all),
+            pairs(&[("a", 2), ("b", 2), ("c", 1), ("d", 1), ("e", 1)])
+        );
+        assert_eq!(all["keyed_total"], json!(7));
+        // None asked for: no rows, the counts still whole.
+        let none = value_counts_top(h, "level", 0);
+        assert!(top_rows(&none).is_empty());
+        assert_eq!(none["keyed_total"], json!(7));
+        assert_eq!(none["groups"], json!(5));
+        // A column without the keyword analyzer declines too: a number, and
+        // a text field (its own analyzer splits values into words).
+        index(h, &[("10", r#"{"status":200,"message":"no level here"}"#)]);
+        assert_eq!(value_counts_top(h, "status", 3), Value::Null);
+        assert_eq!(value_counts_top(h, "message", 3), Value::Null);
+        // After a delete the engine's term counts leave the deleted row out
+        // themselves; same ranking.
+        assert_eq!(delete(h, &["1"]), 0);
+        let out = value_counts_top(h, "level", 2);
+        assert_eq!(top_rows(&out), pairs(&[("a", 2), ("b", 1)]));
+        assert_eq!(out["keyed_total"], json!(6));
+        assert_eq!(out["nulls"], json!(3));
+        close(h);
+    }
+
     #[test]
     fn count_where_counts_each_predicate_as_a_filtered_count() {
         let h = open_logs();
@@ -7071,12 +7293,12 @@ mod tests {
     #[test]
     fn the_grouped_count_stops_one_group_past_what_the_caller_carries() {
         assert_eq!(
-            grouped_count("t", "a\"b", 10),
+            grouped_count("t", "a\"b", Some(10)),
             "SELECT \"a\"\"b\", count(*) AS \"count(*)\" FROM \"t\" GROUP BY \"a\"\"b\" LIMIT 11"
         );
         let h = open_logs();
         plain_table(bridge_ref(h).unwrap());
-        let groups = sql(h, &grouped_count("plain", "status", 1));
+        let groups = sql(h, &grouped_count("plain", "status", Some(1)));
         assert_eq!(groups.as_array().unwrap().len(), 2, "one past the two a caller of 1 carries");
         close(h);
     }
@@ -7490,6 +7712,7 @@ mod tests {
                 matches!(
                     index_of(name),
                     Some(ColumnIndex::Fts {
+                        analyzer: Analyzer::Keyword,
                         positions: false,
                         ..
                     })

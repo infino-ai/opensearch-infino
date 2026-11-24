@@ -2059,6 +2059,30 @@ public final class InfinoNative {
     }
 
     /**
+     * A keyword column's {@code top} most frequent values over the whole
+     * table, by count and then by value (its UTF-8 bytes), in one call:
+     * {@code rows} (each value under the column's name, its count under
+     * {@link #VALUE_COUNT}), {@code keyed_total} (rows with a value),
+     * {@code nulls} (rows without one) and {@code groups} (how many values).
+     * The engine counts a keyword column from its term index, so only
+     * {@code top} rows cross however many values it has. Null, for the
+     * caller's own statement to run, for a column without the keyword
+     * analyzer (a table made before it, or a field that is not a keyword).
+     */
+    public static Map<String, Object> valueCountsTop(String n, String column, int top) {
+        init();
+        String out = takeOrThrow(lib.infino_value_counts_top(conn, n, column, top)).trim();
+        if (out.equals("null")) {
+            return null;
+        }
+        try (XContentParser parser = parser(out)) {
+            return parser.map();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
      * Sources for one page of ids in one statement, kept for the fetch phase
      * that follows the query phase. The table has no index on ids, so this
      * scans the id column; the SQL hit paths carry the source in the hit
