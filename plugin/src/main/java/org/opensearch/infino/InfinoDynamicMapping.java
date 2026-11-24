@@ -323,7 +323,8 @@ final class InfinoDynamicMapping {
                 String name = entry.getValue().name();
                 boolean reserved = name.equals(InfinoQueryTranslator.OSID)
                     || name.equals(InfinoQueryTranslator.SOURCE)
-                    || name.equals(InfinoQueryTranslator.SEQ);
+                    || name.equals(InfinoQueryTranslator.SEQ)
+                    || name.equals(InfinoQueryTranslator.IGNORED);
                 if (reserved || mappers.fieldType(column) != null) {
                     continue;
                 }
