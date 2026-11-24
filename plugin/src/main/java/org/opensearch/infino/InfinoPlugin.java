@@ -553,10 +553,14 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         });
     }
 
-    /** Rebuild the skeleton of a primary of a default-mode index the registry recreated (see {@link InfinoSkeletonAdopter}). */
+    /**
+     * Rebuild the skeleton of a primary of a default-mode index whose
+     * skeleton started empty over a table holding rows: one the registry
+     * recreated, or a primary allocated empty (see {@link InfinoSkeletonAdopter}).
+     */
     private static void adoptIfRebuilt(IndexShard shard) {
         Settings settings = shard.indexSettings().getSettings();
-        if (!inDefaultMode(settings) || !INFINO_REBUILT.get(settings)) {
+        if (!inDefaultMode(settings) || !(INFINO_REBUILT.get(settings) || InfinoEngine.rebuilt(shard.shardId()))) {
             return;
         }
         try {

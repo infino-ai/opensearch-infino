@@ -25,7 +25,7 @@ Come here when you want to:
 | `index.infino.optimize_interval` | `60s` | How often the table is compacted (5 seconds at least; off for a hosted account, which compacts its own tables). |
 | `index.infino.edges` | `false` | The index holds a graph's edges, for `graph_walk` and `graph_rank` in [SQL](../README.md#sql). Fixed at creation. |
 
-Two more index settings belong to the plugin, and no request sets them: `index.infino.rebuilt` marks an index a node recreated from the registry over a table that already held rows (see [Stateless nodes](../README.md#hosted-account-and-stateless-nodes)), and the private `index.infino.table_claimed` records whether the index was given its table when it was created (see the next paragraph).
+Two more index settings belong to the plugin, and no request sets them: `index.infino.rebuilt` marks an index a node recreated from the registry over a table that already held rows (see [Stateless nodes](../README.md#hosted-account-and-stateless-nodes)); a primary that starts empty over such a table, as one allocated empty after its copies were lost does, is rebuilt the same way without it, and the private `index.infino.table_claimed` records whether the index was given its table when it was created (see the next paragraph).
 
 A table backs one live index. If two indices name the same table (explicitly, or by names that map to one table, such as `logs.app` and `logs_app`), the older one is served from it and the other is refused, even after the older one is deleted. With the security plugin, setting `index.infino.table` in a create, resize, rollover or template request needs the right to manage the cluster.
 
@@ -42,7 +42,7 @@ A table backs one live index. If two indices name the same table (explicitly, or
 | `infino.platform.read_window` | `1s` | How long a read on the hosted service may be answered from a snapshot taken before a write. A refresh waits this long after the last write it covers, so the search after it sees the writes. `0` waits for nothing. Not used with the node's own storage. |
 | `infino.cache.dir` | `infino-cache` under the node's first data path | Where the engine keeps a local copy of what it reads from the node's storage. Not used with a hosted account. |
 | `infino.sql.max_result_size` | `http.max_content_length` | The largest SQL result, as JSON; a statement whose result is larger is refused with a 400. |
-| `infino.skeleton_rebuild.paused` | `false` | Dynamic (`PUT _cluster/settings`). Holds the skeleton rebuild of an index recreated over a table that has rows, until it is cleared. Meanwhile the index's searches miss those rows, and writes look ids up in the table. |
+| `infino.skeleton_rebuild.paused` | `false` | Dynamic (`PUT _cluster/settings`). Holds the skeleton rebuild of an index recreated over a table that has rows, until it is cleared. Meanwhile the index's searches answer 503, and writes look ids up in the table. |
 
 ## JVM properties (`config/jvm.options` or `OPENSEARCH_JAVA_OPTS`)
 

@@ -39,9 +39,11 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Rebuilds the Lucene skeleton of a default-mode index the registry
- * recreated over a table that holds rows ({@link InfinoPlugin#INFINO_REBUILT}).
- * A search hit names a document of the skeleton, so until every row has
- * one, the index's searches miss the rows written before the rebuild.
+ * recreated over a table that holds rows ({@link InfinoPlugin#INFINO_REBUILT}),
+ * or of a primary that started empty over such a table. A search hit names a
+ * document of the skeleton, so until every row has one, the index's searches
+ * answer 503 ({@link InfinoEngine#answersSearches}) rather than a page that
+ * leaves out the rows written before the rebuild.
  *
  * <p>When the shard's primary starts (or a replica takes over as primary),
  * the shard's table is read a page at a time in id order, and every row the
@@ -58,8 +60,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * ({@link InfinoEngine#skeletonComplete}).
  *
  * <p>While {@link #PAUSED} is set, a rebuild waits before it reads the
- * table: the index's searches miss the rows written before the rebuild, and
- * its engine goes on looking ids up in the table.
+ * table: the index's searches answer 503, and its engine goes on looking
+ * ids up in the table.
  */
 final class InfinoSkeletonAdopter {
 
@@ -204,7 +206,7 @@ final class InfinoSkeletonAdopter {
     private record Row(String source, String routing) {}
 
     /** The table's rows. */
-    private static long tableRows(String table) {
+    static long tableRows(String table) {
         List<Map<String, Object>> out = InfinoNative.sqlRows("SELECT COUNT(*) AS " + COUNT_ALIAS + " FROM " + InfinoQueryTranslator.quoteIdent(table));
         return out.isEmpty() ? 0 : InfinoAggregationProcessor.asLong(out.get(0).get(COUNT_ALIAS));
     }

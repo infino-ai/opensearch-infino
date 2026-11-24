@@ -27,6 +27,7 @@ import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.mapper.IdFieldMapper;
 import org.opensearch.index.fieldvisitor.FieldsVisitor;
 import org.opensearch.index.mapper.Uid;
@@ -97,6 +98,14 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
     private static final String SORT_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
     /** Pages one later scroll round reads at most while it looks for rows its reader knows (see scrollRows). */
     private static final int MAX_SCROLL_PAGES = 100;
+    /**
+     * The refusal of a search of a copy whose skeleton is being rebuilt
+     * ({@link InfinoEngine#answersSearches}), followed by the shard: its page
+     * would leave out rows its total counts, so it answers 503, as a shard
+     * that is not ready does, until the rebuild is done.
+     */
+    static final String SKELETON_INCOMPLETE = "[infino] the index is rebuilding its documents from its table and answers "
+        + "searches once every row has one; try again shortly: ";
 
     /** The hits of each shard's query phase, by search, shard and id, until its fetch phase takes them. */
     private static final Cache<String, SearchHit> KEPT = CacheBuilder.<String, SearchHit>builder()
@@ -255,6 +264,9 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
         ShardId shardId = context.indexShard().shardId();
         Index index = shardId.getIndex();
         String table = InfinoPlugin.tables().ensure(context.indexShard().indexSettings().getIndexMetadata(), shardId.id());
+        if (!InfinoEngine.answersSearches(shardId, table, searcher.getIndexReader().numDocs())) {
+            throw new InfinoNative.InfinoException(SKELETON_INCOMPLETE + shardId, RestStatus.SERVICE_UNAVAILABLE);
+        }
         // What the security plugin lets the user see, narrowed to what a filtering
         // alias the search reached the index through keeps: the cluster resolved
         // it for this shard, as it does for a stock shard (null: the index whole).

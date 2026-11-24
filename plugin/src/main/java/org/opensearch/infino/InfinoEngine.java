@@ -14,6 +14,7 @@ import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.util.BytesRef;
+import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.common.unit.TimeValue;
@@ -137,7 +138,12 @@ import java.util.function.Predicate;
  * it is done the skeleton cannot say which ids exist: a write the skeleton
  * takes as new is looked up in the table, and a delete the skeleton does
  * not find deletes the table's row and reports it found. A row written with
- * a routing value keeps it, so the rebuilt document is routed as it was.
+ * a routing value keeps it, so the rebuilt document is routed as it was. A
+ * search of the shard answers 503 until then ({@link #answersSearches}): its
+ * hits name skeleton documents, so its page would leave out rows its total
+ * counts. A primary that starts from an empty store over a table holding
+ * rows (one allocated empty after its copies were lost) is rebuilt the same
+ * way.
  *
  * <p>The table holds a retention lease on the shard's history from the first
  * operation it may not hold, which the primary moves forward as commits
@@ -403,16 +409,22 @@ public class InfinoEngine extends InternalEngine {
 
     /**
      * Which copy of a shard this node holds: whether it is the primary, its
-     * allocation, and whether it is recovering as the target of the
-     * primary's move to this node.
+     * allocation, whether it is recovering as the target of the primary's
+     * move to this node, and whether it is a primary starting from an empty
+     * store (a new index, or a primary allocated empty after its copies were
+     * lost).
      */
-    record Copy(boolean primary, String allocationId, boolean relocationTarget) {}
+    record Copy(boolean primary, String allocationId, boolean relocationTarget, boolean emptyStore) {}
 
     private final String table;
     private final ShardId shardId;
     /** The index's generation, which this engine's stamped rows name (see {@link #generation}). */
     private final long generation;
-    /** Whether the skeleton started empty over a table holding rows (see the class comment). */
+    /**
+     * Whether the skeleton started empty over a table holding rows (see the
+     * class comment): an index the registry recreated, or a primary that
+     * started from an empty store over a table that kept its rows.
+     */
     private final boolean rebuilt;
     private final Object batchLock = new Object();
     /** Serializes commits, so one batch reaches the table before the next. */
@@ -529,11 +541,25 @@ public class InfinoEngine extends InternalEngine {
     /** The shards of rebuilt indices whose skeleton holds every row of the table again (see {@link InfinoSkeletonAdopter}). */
     private static final Set<ShardId> SKELETON_COMPLETE = ConcurrentHashMap.newKeySet();
 
+    /**
+     * The shards of rebuilt indices whose copy on this node a search found
+     * holding a document for every row of its table ({@link #answersSearches}),
+     * so later searches, which read that reader or a newer one, skip the
+     * count.
+     */
+    private static final Set<ShardId> SEEN_WHOLE = ConcurrentHashMap.newKeySet();
+
     /** Record which copy of {@code shard} this node holds, as {@code routing} says. */
     static void copyOf(ShardId shard, ShardRouting routing) {
+        RecoverySource source = routing.recoverySource();
         COPIES.put(
             shard,
-            new Copy(routing.primary(), routing.allocationId() == null ? null : routing.allocationId().getId(), routing.isRelocationTarget())
+            new Copy(
+                routing.primary(),
+                routing.allocationId() == null ? null : routing.allocationId().getId(),
+                routing.isRelocationTarget(),
+                routing.primary() && source != null && source.getType() == RecoverySource.Type.EMPTY_STORE
+            )
         );
     }
 
@@ -571,6 +597,54 @@ public class InfinoEngine extends InternalEngine {
         COPIES.remove(shard);
         TOOK_OVER.remove(shard);
         SKELETON_COMPLETE.remove(shard);
+        SEEN_WHOLE.remove(shard);
+    }
+
+    /**
+     * Whether {@code table} holds a row; a count that fails says no, as before
+     * an empty primary was checked at all, rather than failing the shard.
+     */
+    private static boolean holdsRows(String table) {
+        try {
+            return InfinoSkeletonAdopter.tableRows(table) > 0;
+        } catch (RuntimeException e) {
+            log.warn("[infino] could not count the rows of {} under a primary starting empty; its skeleton is not rebuilt", table, e);
+            return false;
+        }
+    }
+
+    /** Whether this node's engine for {@code shard} started with an empty skeleton over a table holding rows. */
+    static boolean rebuilt(ShardId shard) {
+        for (InfinoEngine engine : BY_TABLE.values()) {
+            if (engine.shardId.equals(shard)) {
+                return engine.rebuilt;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether a search may be answered from this node's copy of
+     * {@code shard}, whose search reader holds {@code skeletonDocs}
+     * documents. A hit names a document of the skeleton, so a skeleton being
+     * rebuilt (see the class comment) would answer a page that leaves out the
+     * rows it has no document for yet, beside a total and aggregations read
+     * from the table, which hold them. Such a copy answers once the reader
+     * the search holds has a document for every row of {@code table}. The
+     * reader is what counts, not the rebuild being done: the rebuild's last
+     * documents reach searches only with the refresh after it, on a replica
+     * as on the primary.
+     */
+    static boolean answersSearches(ShardId shard, String table, long skeletonDocs) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine == null || !engine.rebuilt || SEEN_WHOLE.contains(shard)) {
+            return true;
+        }
+        if (skeletonDocs >= InfinoSkeletonAdopter.tableRows(table)) {
+            SEEN_WHOLE.add(shard);
+            return true;
+        }
+        return false;
     }
 
     /** Whether this node's copy of the shard is its primary. */
@@ -615,12 +689,17 @@ public class InfinoEngine extends InternalEngine {
         super(config);
         this.shardId = config.getShardId();
         this.generation = generation(config.getIndexSettings().getUUID());
-        this.rebuilt = InfinoPlugin.INFINO_REBUILT.get(config.getIndexSettings().getSettings());
+        boolean recreated = InfinoPlugin.INFINO_REBUILT.get(config.getIndexSettings().getSettings());
         for (int i = 0; i < idLocks.length; i++) {
             idLocks[i] = new Object();
         }
         try {
             this.table = InfinoPlugin.tables().ensure(config.getIndexSettings().getIndexMetadata(), config.getShardId().id());
+            // A primary starting from an empty store over a table that kept its
+            // rows (one allocated empty after every copy was lost) has a skeleton
+            // that knows none of them, as a recreated index has.
+            Copy starting = COPIES.get(shardId);
+            this.rebuilt = recreated || (starting != null && starting.emptyStore() && holdsRows(table));
         } catch (Throwable t) {
             // A bridge that cannot load or a table that cannot be declared fails
             // this shard; as an Error it would take the node down.
@@ -2012,7 +2091,7 @@ public class InfinoEngine extends InternalEngine {
         int gaps = super.fillSeqNoGaps(primaryTerm);
         if (commitLock != null) {
             Copy copy = COPIES.get(shardId);
-            COPIES.put(shardId, new Copy(true, copy == null ? null : copy.allocationId(), false));
+            COPIES.put(shardId, new Copy(true, copy == null ? null : copy.allocationId(), false, false));
             readsLatest = true;
             fillTable(getSeqNoStats(SequenceNumbers.UNASSIGNED_SEQ_NO).getMaxSeqNo());
             filled = true;

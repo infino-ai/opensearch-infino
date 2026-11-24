@@ -19,7 +19,8 @@ import java.util.concurrent.TimeUnit;
  * new Lucene skeleton gets a document for each row, so its searches find
  * the rows written before; a rewrite of an existing id replaces its row, and
  * a delete of one deletes it and reports it found, whether the skeleton has
- * the id yet or not.
+ * the id yet or not. Until every row has its document, a search answers 503
+ * rather than a page short of the total.
  */
 public class InfinoEngineRebuildIT extends InfinoRestTestCase {
 
@@ -42,8 +43,13 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     private static final String HELD_TABLE = "emr3_rows";
     private static final int HELD_ROWS = 20;
     private static final String HELD_DELETED = "h1";
+    /** The table of the empty-primary test's indices and its rows. */
+    private static final String EMPTY_TABLE = "emr4_rows";
+    private static final int EMPTY_ROWS = 30;
     /** The cluster setting that holds skeleton rebuilds. */
     private static final String PAUSED = "infino.skeleton_rebuild.paused";
+    /** The status a search of an index rebuilding its skeleton answers. */
+    private static final int UNAVAILABLE = 503;
 
     @SuppressWarnings("unchecked")
     public void testARebuiltIndexGetsItsRowsBackAndKeepsThemOnce() throws Exception {
@@ -65,10 +71,7 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         assertEquals("the delete finds the row", "deleted", deleted.get("result"));
 
         // Every row but the deleted one, each once, as hits of a search.
-        assertBusy(() -> {
-            Map<String, Object> hits = (Map<String, Object>) call("POST", "/emr/_search", "{\"size\":" + (ROWS + 1) + "}").get("hits");
-            assertEquals(ROWS - 1, ((List<?>) hits.get("hits")).size());
-        }, REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertBusy(() -> assertEquals(ROWS - 1, hitsOnceRebuilt("emr", ROWS + 1).size()), REBUILD_SECONDS, TimeUnit.SECONDS);
         Map<String, Object> hits = (Map<String, Object>) call("POST", "/emr/_search", "{\"size\":" + (ROWS + 1) + "}").get("hits");
         Set<Object> ids = new HashSet<>();
         for (Object h : (List<?>) hits.get("hits")) {
@@ -106,10 +109,7 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         call("DELETE", "/emr2_old", null);
 
         createIndex("emr2", true, ROUTED_TABLE, ROUTED_SHARDS);
-        assertBusy(() -> {
-            Map<String, Object> hits = (Map<String, Object>) call("POST", "/emr2/_search", "{\"size\":" + (ROUTED_ROWS + 1) + "}").get("hits");
-            assertEquals(ROUTED_ROWS, ((List<?>) hits.get("hits")).size());
-        }, REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertBusy(() -> assertEquals(ROUTED_ROWS, hitsOnceRebuilt("emr2", ROUTED_ROWS + 1).size()), REBUILD_SECONDS, TimeUnit.SECONDS);
         for (int i = 0; i < ROUTED_ROWS; i++) {
             Map<String, Object> doc = call("GET", "/emr2/_doc/d" + i + "?routing=" + routing(i), null);
             assertEquals("d" + i + " is found by its routing", true, doc.get("found"));
@@ -139,8 +139,17 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         call("PUT", "/_cluster/settings", "{\"persistent\":{\"" + PAUSED + "\":true}}");
         try {
             createIndex("emr3", true, HELD_TABLE, 1);
-            // The rebuild is held: the skeleton has no document yet.
-            assertEquals("the rebuild is held", 0, heldHits().size());
+            // The rebuild is held: the skeleton has no document yet, so a search,
+            // a count and an aggregation answer 503 rather than leave rows out
+            // of the hits their total counts.
+            for (String[] search : new String[][] {
+                { "POST", "/emr3/_search", "{\"size\":" + (HELD_ROWS + 1) + "}" },
+                { "GET", "/emr3/_count", null },
+                { "POST", "/emr3/_search", "{\"size\":0,\"aggs\":{\"top\":{\"max\":{\"field\":\"n\"}}}}" } }) {
+                ResponseException held = expectThrows(ResponseException.class, () -> call(search[0], search[1], search[2]));
+                assertEquals(search[1], UNAVAILABLE, held.getResponse().getStatusLine().getStatusCode());
+                assertTrue(held.getMessage(), held.getMessage().contains("rebuilding its documents"));
+            }
 
             String delete = "{\"delete\":{\"_index\":\"emr3\",\"_id\":\"" + HELD_DELETED + "\"}}\n";
             Map<String, Object> bulk = call("POST", "/_bulk?refresh=true", delete);
@@ -153,18 +162,54 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         }
 
         // Released, the rebuild brings back every row but the deleted one.
-        assertBusy(() -> assertEquals(HELD_ROWS - 1, heldHits().size()), REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertBusy(() -> assertEquals(HELD_ROWS - 1, hitsOnceRebuilt("emr3", HELD_ROWS + 1).size()), REBUILD_SECONDS, TimeUnit.SECONDS);
         assertEquals(HELD_ROWS - 1, ((Number) call("GET", "/emr3/_count", null).get("count")).intValue());
         ResponseException gone = expectThrows(ResponseException.class, () -> call("GET", "/emr3/_doc/" + HELD_DELETED, null));
         assertEquals(404, gone.getResponse().getStatusLine().getStatusCode());
         call("DELETE", "/emr3", null);
     }
 
-    /** The hits of a search of the held-rebuild test's index, room left for every row. */
+    /**
+     * A new primary over a table that already holds rows, as one allocated
+     * empty after its copies were lost starts, though the index is not marked
+     * rebuilt: its skeleton is rebuilt all the same, so every row is a hit,
+     * and a write of an id the table holds replaces its row rather than
+     * appending a second one.
+     */
+    public void testAnEmptyPrimaryOverATableWithRowsRebuildsItsSkeleton() throws Exception {
+        createIndex("emr4_old", false, EMPTY_TABLE, 1);
+        StringBuilder rows = new StringBuilder();
+        for (int i = 0; i < EMPTY_ROWS; i++) {
+            rows.append("{\"index\":{\"_index\":\"emr4_old\",\"_id\":\"e").append(i).append("\"}}\n");
+            rows.append("{\"n\":").append(i).append("}\n");
+        }
+        assertEquals(false, call("POST", "/_bulk?refresh=true", rows.toString()).get("errors"));
+        call("DELETE", "/emr4_old", null);
+
+        createIndex("emr4", false, EMPTY_TABLE, 1);
+        assertBusy(() -> assertEquals(EMPTY_ROWS, hitsOnceRebuilt("emr4", EMPTY_ROWS + 1).size()), REBUILD_SECONDS, TimeUnit.SECONDS);
+        Map<String, Object> rewritten = call("PUT", "/emr4/_doc/e0?refresh=true", "{\"n\":" + REWRITTEN_VALUE + "}");
+        assertEquals("the write finds the row", "updated", rewritten.get("result"));
+        assertEquals(EMPTY_ROWS, ((Number) call("GET", "/emr4/_count", null).get("count")).intValue());
+        call("DELETE", "/emr4", null);
+    }
+
+    /**
+     * The hits of a search of {@code index}, room left for {@code size} rows;
+     * a 503 while its skeleton is rebuilt fails as an assertion, so a busy
+     * wait tries again.
+     */
     @SuppressWarnings("unchecked")
-    private List<?> heldHits() throws IOException {
-        Map<String, Object> hits = (Map<String, Object>) call("POST", "/emr3/_search", "{\"size\":" + (HELD_ROWS + 1) + "}").get("hits");
-        return (List<?>) hits.get("hits");
+    private List<?> hitsOnceRebuilt(String index, int size) throws IOException {
+        try {
+            Map<String, Object> hits = (Map<String, Object>) call("POST", "/" + index + "/_search", "{\"size\":" + size + "}").get("hits");
+            return (List<?>) hits.get("hits");
+        } catch (ResponseException e) {
+            if (e.getResponse().getStatusLine().getStatusCode() == UNAVAILABLE) {
+                throw new AssertionError("still rebuilding: " + e.getMessage(), e);
+            }
+            throw e;
+        }
     }
 
     /** The routing value document {@code i} of the routed test is written with. */

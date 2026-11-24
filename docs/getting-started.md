@@ -360,7 +360,7 @@ events green      100000
 {"count":100000,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0}}
 ```
 
-The node answered within seconds of starting. `docs.count` can read low for a few seconds while the node rebuilds its own record of each index's ids from the table; `_count` and searches read the table and are complete at once. `errors` is yellow because `_reindex` created it from the default template, with one replica that a single node cannot place.
+The node answered within seconds of starting. While the node rebuilds its own record of each index's ids from the table, which takes a few seconds per hundred thousand documents, `docs.count` reads low and that index's searches and `_count` answer 503; once it is done they answer in full. `errors` is yellow because `_reindex` created it from the default template, with one replica that a single node cannot place.
 
 The new node read the registry at boot and created each index, with its mapping and aliases, over the table already on the account. Every search above runs again unchanged. The security plugin's users and roles live in a table on the account too, so they come back the same way: the same `admin` password works on the new node.
 
