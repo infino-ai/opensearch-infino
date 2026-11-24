@@ -87,6 +87,15 @@ public final class InfinoTables {
     /** The connection {@link #declared} was filled over, as {@link InfinoNative#opens} counts them. */
     private volatile long declaredOver = -1;
 
+    /**
+     * One lock per table, held while the table is declared. A declaration
+     * can wait on the hosted service, so it holds its own table's lock and
+     * never one every table shares: a service that does not answer holds
+     * back the declarations of that table alone, each until its own call
+     * gives up, and not every shard starting on the node one after another.
+     */
+    private final Map<String, Object> declaring = new ConcurrentHashMap<>();
+
     /** The live Infino-backed indices naming each table, as one cluster metadata holds them. */
     private record Naming(Metadata metadata, Map<String, List<IndexMetadata>> byTable) {}
 
@@ -314,19 +323,33 @@ public final class InfinoTables {
         if (last != null && last == version) {
             return table;
         }
-        synchronized (this) {
+        synchronized (declaring.computeIfAbsent(table, t -> new Object())) {
             // Declaring opens the connection if none is open, which counts as one more.
             InfinoNative.init();
-            forgetOver(InfinoNative.opens());
+            long over = InfinoNative.opens();
+            forgetOver(over);
             last = declared.get(table);
             if (last != null && last == version) {
                 return table;
             }
             InfinoNative.ensureTable(table, tableMapping(md), defaultBm25(md.getSettings()), InfinoPlugin.INFINO_ATTACHED.get(md.getSettings()));
-            declared.put(table, version);
+            noteDeclared(table, version, over);
             log.info("[infino] table {} declared from mapping version {} of {}", table, version, md.getIndex().getName());
         }
         return table;
+    }
+
+    /**
+     * Note the table as declared from mapping {@code version} over the
+     * {@code over}-th connection, unless another has opened since: the
+     * declaration is then not on the connection in use, and the table's
+     * next use declares it again. Under the lock {@link #forgetOver} clears
+     * under, so no declaration over an old connection is kept past a clear.
+     */
+    private synchronized void noteDeclared(String table, long version, long over) {
+        if (declaredOver == over && InfinoNative.opens() == over) {
+            declared.put(table, version);
+        }
     }
 
     /**
