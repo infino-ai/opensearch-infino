@@ -776,6 +776,192 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertNull(one.ascending().scoring().across());
     }
 
+    /**
+     * A multi_match over several text columns ranks across them as stock's
+     * dis_max does: best_fields (tie_breaker 0) by the best column, most_fields
+     * (tie_breaker 1) by their sum, each column's BM25 times its field's boost
+     * and the query's.
+     */
+    public void testMultiMatchOverSeveralTextColumnsRanksAcrossThem() {
+        Map<String, Column> cols = columns();
+        cols.put("title", new Column("title", "str", true, false));
+        InfinoQueryTranslator.TextClause title = new InfinoQueryTranslator.TextClause("title", "disk error", "or");
+        InfinoQueryTranslator.TextClause message = new InfinoQueryTranslator.TextClause("message", "disk error", "or");
+
+        // best_fields, the default: one clause, scored by its best weighted column.
+        Translation best = InfinoQueryTranslator.translate(
+            QueryBuilders.multiMatchQuery("disk error").field("title", 3f).field("message"),
+            cols,
+            TABLE,
+            NOW
+        );
+        assertNull(best.principal());
+        InfinoQueryTranslator.Across across = best.scoring().across();
+        assertNotNull(across);
+        assertEquals(List.of(List.of(message, title)), across.clauses());
+        assertEquals(best.where(), across.match());
+        assertEquals(Map.of("title", 3f), across.weights());
+        assertEquals(
+            "SELECT osid, score, \"_id\" AS infino_row FROM bm25_search_fields('os_logs_0', "
+                + "'[{\"query\":\"disk error\",\"fields\":[\"message\",\"title\"]}]', 10, 'or', '{\"title\":3.0}')"
+                + " ORDER BY score DESC, infino_row ASC LIMIT 10",
+            hits(best, null, 10)
+        );
+
+        // most_fields: a clause per column, summed; the query's boost weighs every column.
+        Translation most = InfinoQueryTranslator.translate(
+            QueryBuilders.multiMatchQuery("disk error", "title", "message").type(MultiMatchQueryBuilder.Type.MOST_FIELDS).boost(2f),
+            cols,
+            TABLE,
+            NOW
+        );
+        assertEquals(List.of(List.of(message), List.of(title)), most.scoring().across().clauses());
+        assertEquals(Map.of("title", 2f, "message", 2f), most.scoring().across().weights());
+        assertTrue(
+            hits(most, null, 10),
+            hits(most, null, 10).contains(
+                "'[{\"query\":\"disk error\",\"fields\":[\"message\"]},{\"query\":\"disk error\",\"fields\":[\"title\"]}]', 10, 'or', '{\"message\":2.0,\"title\":2.0}')"
+            )
+        );
+
+        // best_fields with tie_breaker 1 sums as most_fields does; most_fields with tie_breaker 0 takes the best.
+        assertEquals(
+            2,
+            InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk error", "title", "message").tieBreaker(1f), cols, TABLE, NOW)
+                .scoring()
+                .across()
+                .clauses()
+                .size()
+        );
+        assertEquals(
+            1,
+            InfinoQueryTranslator.translate(
+                QueryBuilders.multiMatchQuery("disk error", "title", "message").type(MultiMatchQueryBuilder.Type.MOST_FIELDS).tieBreaker(0f),
+                cols,
+                TABLE,
+                NOW
+            ).scoring().across().clauses().size()
+        );
+
+        // Operator and: one column must hold every word, which one clause in mode and reads.
+        Translation and = InfinoQueryTranslator.translate(
+            QueryBuilders.multiMatchQuery("disk error", "title", "message").operator(Operator.AND),
+            cols,
+            TABLE,
+            NOW
+        );
+        assertEquals("and", and.scoring().across().mode());
+        assertTrue(hits(and, null, 10), hits(and, null, 10).contains("\"fields\":[\"message\",\"title\"]}]', 10, 'and')"));
+
+        // phrase: one clause of the phrase, scored by its best column.
+        Translation phrase = InfinoQueryTranslator.translate(
+            QueryBuilders.multiMatchQuery("disk error", "title", "message").type(MultiMatchQueryBuilder.Type.PHRASE),
+            cols,
+            TABLE,
+            NOW
+        );
+        assertEquals(
+            List.of(
+                List.of(new InfinoQueryTranslator.TextClause("message", "\"disk error\"", "or"), new InfinoQueryTranslator.TextClause("title", "\"disk error\"", "or"))
+            ),
+            phrase.scoring().across().clauses()
+        );
+        // A phrase is one run of words: operator and changes nothing, summed or not.
+        Translation phraseAnd = InfinoQueryTranslator.translate(
+            QueryBuilders.multiMatchQuery("disk error", "title", "message").type(MultiMatchQueryBuilder.Type.PHRASE).operator(Operator.AND).tieBreaker(1f),
+            cols,
+            TABLE,
+            NOW
+        );
+        assertEquals("or", phraseAnd.scoring().across().mode());
+        assertEquals(
+            List.of(List.of(new InfinoQueryTranslator.TextClause("message", "\"disk error\"", "or")), List.of(new InfinoQueryTranslator.TextClause("title", "\"disk error\"", "or"))),
+            phraseAnd.scoring().across().clauses()
+        );
+
+        // A field the mapping does not have adds nothing; one text column left is the principal, ranked alone.
+        Translation alone = InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk error", "title", "nosuch"), cols, TABLE, NOW);
+        assertNull(alone.scoring().across());
+        assertEquals(new InfinoQueryTranslator.TextClause("title", "disk error", "or"), alone.principal());
+        assertEquals(
+            List.of(List.of(message, title)),
+            InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk error", "title", "nosuch", "message"), cols, TABLE, NOW)
+                .scoring()
+                .across()
+                .clauses()
+        );
+
+        // Left unranked: a keyword field beside the text ones, a pattern, options that change the words read,
+        // and a sum of fields that must each hold every word.
+        for (MultiMatchQueryBuilder unranked : List.of(
+            QueryBuilders.multiMatchQuery("disk error", "title", "message", "level"),
+            QueryBuilders.multiMatchQuery("disk error", "title", "mess*"),
+            QueryBuilders.multiMatchQuery("disk error", "title", "message").minimumShouldMatch("2"),
+            QueryBuilders.multiMatchQuery("disk error", "title", "message").type(MultiMatchQueryBuilder.Type.PHRASE).slop(1),
+            QueryBuilders.multiMatchQuery("disk error", "title", "message").type(MultiMatchQueryBuilder.Type.MOST_FIELDS).operator(Operator.AND)
+        )) {
+            assertNull(unranked.toString(), InfinoQueryTranslator.translate(unranked, cols, TABLE, NOW).scoring().across());
+        }
+    }
+
+    /**
+     * A multi_match over several text columns that would rank the hits, with
+     * a score the table cannot give, is refused rather than answered
+     * unranked: cross_fields, and a tie_breaker between 0 and 1. In filter
+     * context it scores nothing and is served, except cross_fields under
+     * operator and, which matches other rows.
+     */
+    public void testMultiMatchScoresTheTableCannotGiveAreRefused() {
+        Map<String, Column> cols = columns();
+        cols.put("title", new Column("title", "str", true, false));
+        MultiMatchQueryBuilder cross = QueryBuilders.multiMatchQuery("red", "title", "message").type(MultiMatchQueryBuilder.Type.CROSS_FIELDS);
+        String crossRefused = "[infino] multi_match of type [cross_fields] on [message, title] is not served: "
+            + "the table matches and scores each text field apart, not as one field";
+        for (org.opensearch.index.query.QueryBuilder q : List.<org.opensearch.index.query.QueryBuilder>of(
+            cross,
+            QueryBuilders.boolQuery().must(cross),
+            QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error")).must(cross),
+            QueryBuilders.boolQuery().filter(QueryBuilders.multiMatchQuery("red", "title", "message").type(MultiMatchQueryBuilder.Type.CROSS_FIELDS).operator(Operator.AND))
+        )) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> InfinoQueryTranslator.translate(q, cols, TABLE, NOW));
+            assertEquals(q.toString(), crossRefused, e.getMessage());
+        }
+        // A pattern names every text column it matches: over title and message, cross_fields under operator and keeps other rows.
+        org.opensearch.index.query.QueryBuilder crossPattern = QueryBuilders.boolQuery()
+            .filter(QueryBuilders.multiMatchQuery("red", "title", "mess*").type(MultiMatchQueryBuilder.Type.CROSS_FIELDS).operator(Operator.AND));
+        IllegalArgumentException patternRefused = expectThrows(IllegalArgumentException.class, () -> InfinoQueryTranslator.translate(crossPattern, cols, TABLE, NOW));
+        assertTrue(patternRefused.getMessage(), patternRefused.getMessage().startsWith("[infino] multi_match of type [cross_fields] on [mess*, title] is not served"));
+        // Where the multi_match would not rank the hits it is served as a multi_match of any type is there: in
+        // should, left unranked; beside a ranked text clause, which alone ranks the hits.
+        for (org.opensearch.index.query.QueryBuilder q : List.<org.opensearch.index.query.QueryBuilder>of(
+            QueryBuilders.boolQuery().should(cross),
+            QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error")).should(cross)
+        )) {
+            assertTrue(q.toString(), InfinoQueryTranslator.translate(q, cols, TABLE, NOW).scoring().unrankable());
+        }
+        Translation beside = InfinoQueryTranslator.translate(QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(cross), cols, TABLE, NOW);
+        assertEquals(new InfinoQueryTranslator.TextClause("message", "disk", "or"), beside.principal());
+        assertNull(beside.scoring().across());
+        MultiMatchQueryBuilder tie = QueryBuilders.multiMatchQuery("red", "title", "message").tieBreaker(0.3f);
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> InfinoQueryTranslator.translate(tie, cols, TABLE, NOW));
+        assertEquals(
+            "[infino] multi_match on [message, title] with tie_breaker [0.3] is not served: "
+                + "the table scores several text fields by the best one (tie_breaker 0) or by their sum (tie_breaker 1)",
+            e.getMessage()
+        );
+        // In filter context neither scores; cross_fields under operator or matches the rows best_fields does.
+        assertNotNull(InfinoQueryTranslator.translate(QueryBuilders.boolQuery().filter(cross), cols, TABLE, NOW));
+        assertNotNull(InfinoQueryTranslator.translate(QueryBuilders.boolQuery().filter(tie), cols, TABLE, NOW));
+        // On one text column there is nothing to blend or break ties between: it is a match on that column.
+        Translation one = InfinoQueryTranslator.translate(
+            QueryBuilders.multiMatchQuery("red", "message", "level").type(MultiMatchQueryBuilder.Type.CROSS_FIELDS).tieBreaker(0.3f),
+            cols,
+            TABLE,
+            NOW
+        );
+        assertNotNull(one);
+    }
+
     public void testTheWordAfterAnOrIsAClauseOfItsOwn() {
         // Stock: jackal OR bear owl cat is jackal | bear | (owl cat); a run starts only at the word after the OR's.
         Map<String, Column> cols = columns();

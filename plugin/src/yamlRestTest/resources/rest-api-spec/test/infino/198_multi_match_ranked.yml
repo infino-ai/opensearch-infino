@@ -1,0 +1,573 @@
+---
+"A multi_match over several text fields ranks as a Lucene twin ranks it":
+  # Stock scores a multi_match as a dis_max over its fields: best_fields and
+  # phrase by the best field, most_fields (or a tie_breaker of 1) by their
+  # sum, each field weighted by its boost and the query's. Proxy and default
+  # mode rank the same way. Every document is under 16 tokens, so the engine
+  # keeps the same lengths as Lucene and the scores agree.
+  - do:
+      indices.create:
+        index: mm_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { title: { type: text }, body: { type: text } } }
+  - do:
+      indices.create:
+        index: mm_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { title: { type: text }, body: { type: text } } }
+  - do:
+      indices.create:
+        index: mm_default
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { title: { type: text }, body: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        index: mm_luc
+        body:
+          - index: { _id: "d1" }
+          - {"title": "disk", "body": "error on the old disk"}
+          - index: { _id: "d2" }
+          - {"title": "disk error", "body": "fan noise"}
+          - index: { _id: "d3" }
+          - {"title": "cpu", "body": "disk error disk"}
+          - index: { _id: "d4" }
+          - {"title": "error report", "body": "error log"}
+          - index: { _id: "d5" }
+          - {"title": "fan", "body": "noise"}
+          - index: { _id: "d6" }
+          - {"title": "disk full", "body": "disk error now gone"}
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: mm_proxy
+        body:
+          - index: { _id: "d1" }
+          - {"title": "disk", "body": "error on the old disk"}
+          - index: { _id: "d2" }
+          - {"title": "disk error", "body": "fan noise"}
+          - index: { _id: "d3" }
+          - {"title": "cpu", "body": "disk error disk"}
+          - index: { _id: "d4" }
+          - {"title": "error report", "body": "error log"}
+          - index: { _id: "d5" }
+          - {"title": "fan", "body": "noise"}
+          - index: { _id: "d6" }
+          - {"title": "disk full", "body": "disk error now gone"}
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: mm_default
+        body:
+          - index: { _id: "d1" }
+          - {"title": "disk", "body": "error on the old disk"}
+          - index: { _id: "d2" }
+          - {"title": "disk error", "body": "fan noise"}
+          - index: { _id: "d3" }
+          - {"title": "cpu", "body": "disk error disk"}
+          - index: { _id: "d4" }
+          - {"title": "error report", "body": "error log"}
+          - index: { _id: "d5" }
+          - {"title": "fan", "body": "noise"}
+          - index: { _id: "d6" }
+          - {"title": "disk full", "body": "disk error now gone"}
+  - match: { errors: false }
+  # best_fields by default: the best field scores, its boost applied; d04 leads d01 on its title alone.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title^3", "body"]}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 2.0663 }
+  - lt: { hits.hits.0._score: 2.0683 }
+  - match: { hits.hits.1._id: "d4" }
+  - gt: { hits.hits.1._score: 1.2345 }
+  - lt: { hits.hits.1._score: 1.2365 }
+  - match: { hits.hits.2._id: "d1" }
+  - gt: { hits.hits.2._score: 1.0934 }
+  - lt: { hits.hits.2._score: 1.0954 }
+  - match: { hits.hits.3._id: "d6" }
+  - gt: { hits.hits.3._score: 0.8308 }
+  - lt: { hits.hits.3._score: 0.8328 }
+  - match: { hits.hits.4._id: "d3" }
+  - gt: { hits.hits.4._score: 0.6213 }
+  - lt: { hits.hits.4._score: 0.6233 }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title^3", "body"]}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 2.0663 }
+  - lt: { hits.hits.0._score: 2.0683 }
+  - match: { hits.hits.1._id: "d4" }
+  - gt: { hits.hits.1._score: 1.2345 }
+  - lt: { hits.hits.1._score: 1.2365 }
+  - match: { hits.hits.2._id: "d1" }
+  - gt: { hits.hits.2._score: 1.0934 }
+  - lt: { hits.hits.2._score: 1.0954 }
+  - match: { hits.hits.3._id: "d6" }
+  - gt: { hits.hits.3._score: 0.8308 }
+  - lt: { hits.hits.3._score: 0.8328 }
+  - match: { hits.hits.4._id: "d3" }
+  - gt: { hits.hits.4._score: 0.6213 }
+  - lt: { hits.hits.4._score: 0.6233 }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title^3", "body"]}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 2.0663 }
+  - lt: { hits.hits.0._score: 2.0683 }
+  - match: { hits.hits.1._id: "d4" }
+  - gt: { hits.hits.1._score: 1.2345 }
+  - lt: { hits.hits.1._score: 1.2365 }
+  - match: { hits.hits.2._id: "d1" }
+  - gt: { hits.hits.2._score: 1.0934 }
+  - lt: { hits.hits.2._score: 1.0954 }
+  - match: { hits.hits.3._id: "d6" }
+  - gt: { hits.hits.3._score: 0.8308 }
+  - lt: { hits.hits.3._score: 0.8328 }
+  - match: { hits.hits.4._id: "d3" }
+  - gt: { hits.hits.4._score: 0.6213 }
+  - lt: { hits.hits.4._score: 0.6233 }
+  # Without boosts d03's body beats d06's title.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"]}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 0.6881 }
+  - lt: { hits.hits.0._score: 0.6901 }
+  - match: { hits.hits.1._id: "d3" }
+  - gt: { hits.hits.1._score: 0.6213 }
+  - lt: { hits.hits.1._score: 0.6233 }
+  - match: { hits.hits.2._id: "d6" }
+  - gt: { hits.hits.2._score: 0.4405 }
+  - lt: { hits.hits.2._score: 0.4425 }
+  - match: { hits.hits.3._id: "d4" }
+  - gt: { hits.hits.3._score: 0.4108 }
+  - lt: { hits.hits.3._score: 0.4128 }
+  - match: { hits.hits.4._id: "d1" }
+  - gt: { hits.hits.4._score: 0.3920 }
+  - lt: { hits.hits.4._score: 0.3940 }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"]}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 0.6881 }
+  - lt: { hits.hits.0._score: 0.6901 }
+  - match: { hits.hits.1._id: "d3" }
+  - gt: { hits.hits.1._score: 0.6213 }
+  - lt: { hits.hits.1._score: 0.6233 }
+  - match: { hits.hits.2._id: "d6" }
+  - gt: { hits.hits.2._score: 0.4405 }
+  - lt: { hits.hits.2._score: 0.4425 }
+  - match: { hits.hits.3._id: "d4" }
+  - gt: { hits.hits.3._score: 0.4108 }
+  - lt: { hits.hits.3._score: 0.4128 }
+  - match: { hits.hits.4._id: "d1" }
+  - gt: { hits.hits.4._score: 0.3920 }
+  - lt: { hits.hits.4._score: 0.3940 }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"]}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 0.6881 }
+  - lt: { hits.hits.0._score: 0.6901 }
+  - match: { hits.hits.1._id: "d3" }
+  - gt: { hits.hits.1._score: 0.6213 }
+  - lt: { hits.hits.1._score: 0.6233 }
+  - match: { hits.hits.2._id: "d6" }
+  - gt: { hits.hits.2._score: 0.4405 }
+  - lt: { hits.hits.2._score: 0.4425 }
+  - match: { hits.hits.3._id: "d4" }
+  - gt: { hits.hits.3._score: 0.4108 }
+  - lt: { hits.hits.3._score: 0.4128 }
+  - match: { hits.hits.4._id: "d1" }
+  - gt: { hits.hits.4._score: 0.3920 }
+  - lt: { hits.hits.4._score: 0.3940 }
+  # most_fields sums the fields, each with its boost.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title^2", "body"], "type": "most_fields"}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 1.3772 }
+  - lt: { hits.hits.0._score: 1.3792 }
+  - match: { hits.hits.1._id: "d1" }
+  - gt: { hits.hits.1._score: 1.1216 }
+  - lt: { hits.hits.1._score: 1.1236 }
+  - match: { hits.hits.2._id: "d4" }
+  - gt: { hits.hits.2._score: 1.0510 }
+  - lt: { hits.hits.2._score: 1.0530 }
+  - match: { hits.hits.3._id: "d6" }
+  - gt: { hits.hits.3._score: 0.9950 }
+  - lt: { hits.hits.3._score: 0.9970 }
+  - match: { hits.hits.4._id: "d3" }
+  - gt: { hits.hits.4._score: 0.6213 }
+  - lt: { hits.hits.4._score: 0.6233 }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title^2", "body"], "type": "most_fields"}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 1.3772 }
+  - lt: { hits.hits.0._score: 1.3792 }
+  - match: { hits.hits.1._id: "d1" }
+  - gt: { hits.hits.1._score: 1.1216 }
+  - lt: { hits.hits.1._score: 1.1236 }
+  - match: { hits.hits.2._id: "d4" }
+  - gt: { hits.hits.2._score: 1.0510 }
+  - lt: { hits.hits.2._score: 1.0530 }
+  - match: { hits.hits.3._id: "d6" }
+  - gt: { hits.hits.3._score: 0.9950 }
+  - lt: { hits.hits.3._score: 0.9970 }
+  - match: { hits.hits.4._id: "d3" }
+  - gt: { hits.hits.4._score: 0.6213 }
+  - lt: { hits.hits.4._score: 0.6233 }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title^2", "body"], "type": "most_fields"}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 1.3772 }
+  - lt: { hits.hits.0._score: 1.3792 }
+  - match: { hits.hits.1._id: "d1" }
+  - gt: { hits.hits.1._score: 1.1216 }
+  - lt: { hits.hits.1._score: 1.1236 }
+  - match: { hits.hits.2._id: "d4" }
+  - gt: { hits.hits.2._score: 1.0510 }
+  - lt: { hits.hits.2._score: 1.0530 }
+  - match: { hits.hits.3._id: "d6" }
+  - gt: { hits.hits.3._score: 0.9950 }
+  - lt: { hits.hits.3._score: 0.9970 }
+  - match: { hits.hits.4._id: "d3" }
+  - gt: { hits.hits.4._score: 0.6213 }
+  - lt: { hits.hits.4._score: 0.6233 }
+  # A tie_breaker of 1 sums the fields as most_fields does: d01 and d06 lead on two fields.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "tie_breaker": 1}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d1" }
+  - gt: { hits.hits.0._score: 0.7568 }
+  - lt: { hits.hits.0._score: 0.7588 }
+  - match: { hits.hits.1._id: "d6" }
+  - gt: { hits.hits.1._score: 0.7178 }
+  - lt: { hits.hits.1._score: 0.7198 }
+  - match: { hits.hits.2._id: "d2" }
+  - gt: { hits.hits.2._score: 0.6881 }
+  - lt: { hits.hits.2._score: 0.6901 }
+  - match: { hits.hits.3._id: "d4" }
+  - gt: { hits.hits.3._score: 0.6392 }
+  - lt: { hits.hits.3._score: 0.6412 }
+  - match: { hits.hits.4._id: "d3" }
+  - gt: { hits.hits.4._score: 0.6213 }
+  - lt: { hits.hits.4._score: 0.6233 }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "tie_breaker": 1}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d1" }
+  - gt: { hits.hits.0._score: 0.7568 }
+  - lt: { hits.hits.0._score: 0.7588 }
+  - match: { hits.hits.1._id: "d6" }
+  - gt: { hits.hits.1._score: 0.7178 }
+  - lt: { hits.hits.1._score: 0.7198 }
+  - match: { hits.hits.2._id: "d2" }
+  - gt: { hits.hits.2._score: 0.6881 }
+  - lt: { hits.hits.2._score: 0.6901 }
+  - match: { hits.hits.3._id: "d4" }
+  - gt: { hits.hits.3._score: 0.6392 }
+  - lt: { hits.hits.3._score: 0.6412 }
+  - match: { hits.hits.4._id: "d3" }
+  - gt: { hits.hits.4._score: 0.6213 }
+  - lt: { hits.hits.4._score: 0.6233 }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "tie_breaker": 1}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d1" }
+  - gt: { hits.hits.0._score: 0.7568 }
+  - lt: { hits.hits.0._score: 0.7588 }
+  - match: { hits.hits.1._id: "d6" }
+  - gt: { hits.hits.1._score: 0.7178 }
+  - lt: { hits.hits.1._score: 0.7198 }
+  - match: { hits.hits.2._id: "d2" }
+  - gt: { hits.hits.2._score: 0.6881 }
+  - lt: { hits.hits.2._score: 0.6901 }
+  - match: { hits.hits.3._id: "d4" }
+  - gt: { hits.hits.3._score: 0.6392 }
+  - lt: { hits.hits.3._score: 0.6412 }
+  - match: { hits.hits.4._id: "d3" }
+  - gt: { hits.hits.4._score: 0.6213 }
+  - lt: { hits.hits.4._score: 0.6233 }
+  # Operator and: one field must hold both words; d04 holds error alone.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "operator": "and"}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 0.6881 }
+  - lt: { hits.hits.0._score: 0.6901 }
+  - match: { hits.hits.1._id: "d3" }
+  - gt: { hits.hits.1._score: 0.6213 }
+  - lt: { hits.hits.1._score: 0.6233 }
+  - match: { hits.hits.2._id: "d6" }
+  - gt: { hits.hits.2._score: 0.4405 }
+  - lt: { hits.hits.2._score: 0.4425 }
+  - match: { hits.hits.3._id: "d1" }
+  - gt: { hits.hits.3._score: 0.3920 }
+  - lt: { hits.hits.3._score: 0.3940 }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "operator": "and"}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 0.6881 }
+  - lt: { hits.hits.0._score: 0.6901 }
+  - match: { hits.hits.1._id: "d3" }
+  - gt: { hits.hits.1._score: 0.6213 }
+  - lt: { hits.hits.1._score: 0.6233 }
+  - match: { hits.hits.2._id: "d6" }
+  - gt: { hits.hits.2._score: 0.4405 }
+  - lt: { hits.hits.2._score: 0.4425 }
+  - match: { hits.hits.3._id: "d1" }
+  - gt: { hits.hits.3._score: 0.3920 }
+  - lt: { hits.hits.3._score: 0.3940 }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "operator": "and"}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 0.6881 }
+  - lt: { hits.hits.0._score: 0.6901 }
+  - match: { hits.hits.1._id: "d3" }
+  - gt: { hits.hits.1._score: 0.6213 }
+  - lt: { hits.hits.1._score: 0.6233 }
+  - match: { hits.hits.2._id: "d6" }
+  - gt: { hits.hits.2._score: 0.4405 }
+  - lt: { hits.hits.2._score: 0.4425 }
+  - match: { hits.hits.3._id: "d1" }
+  - gt: { hits.hits.3._score: 0.3920 }
+  - lt: { hits.hits.3._score: 0.3940 }
+  # phrase scores the phrase in its best field.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "phrase"}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 0.6881 }
+  - lt: { hits.hits.0._score: 0.6901 }
+  - match: { hits.hits.1._id: "d3" }
+  - gt: { hits.hits.1._score: 0.5028 }
+  - lt: { hits.hits.1._score: 0.5048 }
+  - match: { hits.hits.2._id: "d6" }
+  - gt: { hits.hits.2._score: 0.4405 }
+  - lt: { hits.hits.2._score: 0.4425 }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "phrase"}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 0.6881 }
+  - lt: { hits.hits.0._score: 0.6901 }
+  - match: { hits.hits.1._id: "d3" }
+  - gt: { hits.hits.1._score: 0.5028 }
+  - lt: { hits.hits.1._score: 0.5048 }
+  - match: { hits.hits.2._id: "d6" }
+  - gt: { hits.hits.2._score: 0.4405 }
+  - lt: { hits.hits.2._score: 0.4425 }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "phrase"}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 0.6881 }
+  - lt: { hits.hits.0._score: 0.6901 }
+  - match: { hits.hits.1._id: "d3" }
+  - gt: { hits.hits.1._score: 0.5028 }
+  - lt: { hits.hits.1._score: 0.5048 }
+  - match: { hits.hits.2._id: "d6" }
+  - gt: { hits.hits.2._score: 0.4405 }
+  - lt: { hits.hits.2._score: 0.4425 }
+  # The query's boost weighs every field.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "boost": 2}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 1.3772 }
+  - lt: { hits.hits.0._score: 1.3792 }
+  - match: { hits.hits.1._id: "d3" }
+  - gt: { hits.hits.1._score: 1.2436 }
+  - lt: { hits.hits.1._score: 1.2456 }
+  - match: { hits.hits.2._id: "d6" }
+  - gt: { hits.hits.2._score: 0.8821 }
+  - lt: { hits.hits.2._score: 0.8841 }
+  - match: { hits.hits.3._id: "d4" }
+  - gt: { hits.hits.3._score: 0.8227 }
+  - lt: { hits.hits.3._score: 0.8247 }
+  - match: { hits.hits.4._id: "d1" }
+  - gt: { hits.hits.4._score: 0.7849 }
+  - lt: { hits.hits.4._score: 0.7869 }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "boost": 2}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 1.3772 }
+  - lt: { hits.hits.0._score: 1.3792 }
+  - match: { hits.hits.1._id: "d3" }
+  - gt: { hits.hits.1._score: 1.2436 }
+  - lt: { hits.hits.1._score: 1.2456 }
+  - match: { hits.hits.2._id: "d6" }
+  - gt: { hits.hits.2._score: 0.8821 }
+  - lt: { hits.hits.2._score: 0.8841 }
+  - match: { hits.hits.3._id: "d4" }
+  - gt: { hits.hits.3._score: 0.8227 }
+  - lt: { hits.hits.3._score: 0.8247 }
+  - match: { hits.hits.4._id: "d1" }
+  - gt: { hits.hits.4._score: 0.7849 }
+  - lt: { hits.hits.4._score: 0.7869 }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "boost": 2}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d2" }
+  - gt: { hits.hits.0._score: 1.3772 }
+  - lt: { hits.hits.0._score: 1.3792 }
+  - match: { hits.hits.1._id: "d3" }
+  - gt: { hits.hits.1._score: 1.2436 }
+  - lt: { hits.hits.1._score: 1.2456 }
+  - match: { hits.hits.2._id: "d6" }
+  - gt: { hits.hits.2._score: 0.8821 }
+  - lt: { hits.hits.2._score: 0.8841 }
+  - match: { hits.hits.3._id: "d4" }
+  - gt: { hits.hits.3._score: 0.8227 }
+  - lt: { hits.hits.3._score: 0.8247 }
+  - match: { hits.hits.4._id: "d1" }
+  - gt: { hits.hits.4._score: 0.7849 }
+  - lt: { hits.hits.4._score: 0.7869 }
+  # cross_fields blends the fields' statistics into one field and a
+  # tie_breaker between 0 and 1 adds part of the other fields: the table
+  # scores neither, so it refuses them rather than rank otherwise.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}
+  - match: { hits.total.value: 5 }
+  - do:
+      catch: /multi_match of type \[cross_fields\] on \[body, title\] is not served/
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}
+  - do:
+      catch: /multi_match of type \[cross_fields\] on \[body, title\] is not served/
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "tie_breaker": 0.3}}}
+  - match: { hits.total.value: 5 }
+  - do:
+      catch: /multi_match on \[body, title\] with tie_breaker \[0.3\] is not served/
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "tie_breaker": 0.3}}}
+  - do:
+      catch: /multi_match on \[body, title\] with tie_breaker \[0.3\] is not served/
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "tie_breaker": 0.3}}}
+  # The refusal does not depend on whether the request reads the scores.
+  - do:
+      catch: /multi_match of type \[cross_fields\] on \[body, title\] is not served/
+      count:
+        index: mm_default
+        body: {"query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}
+  # In should, the multi_match is served as any multi_match over several
+  # fields is there: it matches as stock, and is left unranked.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"bool": {"should": [{"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}]}}}
+  - match: { hits.total.value: 5 }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"bool": {"should": [{"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}]}}}
+  - match: { hits.total.value: 5 }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"bool": {"should": [{"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}]}}}
+  - match: { hits.total.value: 5 }
+  # In filter context nothing is scored, and cross_fields under operator or
+  # matches the rows any field matches.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"bool": {"filter": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}}}
+  - match: { hits.total.value: 5 }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"bool": {"filter": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}}}
+  - match: { hits.total.value: 5 }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"bool": {"filter": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}}}
+  - match: { hits.total.value: 5 }
