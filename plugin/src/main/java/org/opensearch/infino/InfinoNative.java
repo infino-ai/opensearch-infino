@@ -87,6 +87,13 @@ public final class InfinoNative {
         }
     }
 
+    /**
+     * The status a read by id that fails is answered with: 503, as a stock
+     * read that no copy of its shard could serve is, so the client may try
+     * it again. Never the answer of a missing document.
+     */
+    private static final RestStatus READ_FAILED = RestStatus.SERVICE_UNAVAILABLE;
+
     private static volatile InfinoLib lib;
     /** Where the engine caches what it reads from the node's own storage (see {@link InfinoPlugin#CACHE_DIR}); null for none. */
     private static volatile String cacheDir;
@@ -1226,20 +1233,45 @@ public final class InfinoNative {
         }
     }
 
-    /** The source of one id: the page prefetch when the query phase ran one, else a lookup. */
+    /**
+     * The source of one id: the page prefetch when the query phase ran one,
+     * else a lookup; null when the table holds no such id. A lookup that
+     * fails throws ({@link #READ_FAILED}), so a failed read is never taken
+     * for a missing document.
+     */
     public static String getSource(String name, String osid) {
         init();
         String prefetched = SOURCES.get(name + "\u0000" + osid);
         if (prefetched != null) {
             return prefetched;
         }
-        return take(lib.infino_get(conn, name, osid));
+        return getSourceFresh(name, osid);
     }
 
-    /** The source of one id from the table, never from the prefetch: for a write that merges into it. */
+    /**
+     * The source of one id from the table, never from the prefetch: for a
+     * write that merges into it. Null when the table holds no such id; a
+     * lookup that fails throws, so the write fails rather than creating or
+     * overwriting the document.
+     */
     public static String getSourceFresh(String name, String osid) {
         init();
-        return take(lib.infino_get(conn, name, osid));
+        return sourceOf(takeOrThrow(lib.infino_get(conn, name, osid), READ_FAILED));
+    }
+
+    /**
+     * The source of a {@code get} answer, {@code {"source": ..}}; null when
+     * the table holds no such id. The source sits under {@code source},
+     * never at the top, so a document whose first field is {@code error}
+     * cannot make the answer read as an error object.
+     */
+    static String sourceOf(String json) {
+        Map<String, Object> answer = object(json);
+        if (!answer.containsKey("source")) {
+            throw new InfinoException("the bridge answered no source", RestStatus.INTERNAL_SERVER_ERROR);
+        }
+        Object source = answer.get("source");
+        return source == null ? null : source.toString();
     }
 
     /**
@@ -1279,16 +1311,28 @@ public final class InfinoNative {
     /** One document as the table holds it: its source and the sequence number it was written under. */
     public record Doc(String source, long seq) {}
 
-    /** One id's document from the table, never from the prefetch; null when the table holds no such id. */
-    @SuppressWarnings("unchecked")
+    /**
+     * One id's document from the table, never from the prefetch; null when
+     * the table holds no such id. A lookup that fails throws
+     * ({@link #READ_FAILED}), so a failed read is never taken for a missing
+     * document.
+     */
     public static Doc getDoc(String name, String osid) {
         init();
-        String out = take(lib.infino_get_doc(conn, name, osid));
-        if (out == null || out.isEmpty()) {
+        return docOf(takeOrThrow(lib.infino_get_doc(conn, name, osid), READ_FAILED));
+    }
+
+    /** The document of a {@code get_doc} answer, {@code {"doc": {"source": .., "seq": n}}}; null when the table holds no such id. */
+    static Doc docOf(String json) {
+        Map<String, Object> answer = object(json);
+        if (!answer.containsKey("doc")) {
+            throw new InfinoException("the bridge answered no document", RestStatus.INTERNAL_SERVER_ERROR);
+        }
+        if (!(answer.get("doc") instanceof Map<?, ?> doc)) {
             return null;
         }
-        Map<String, Object> doc = object(out);
-        return new Doc((String) doc.get("source"), seq(doc.get("seq")));
+        Object source = doc.get("source");
+        return new Doc(source == null ? null : source.toString(), seq(doc.get("seq")));
     }
 
     /**

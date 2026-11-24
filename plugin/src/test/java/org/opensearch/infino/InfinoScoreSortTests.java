@@ -304,6 +304,11 @@ public class InfinoScoreSortTests extends OpenSearchTestCase {
                 .should(QueryBuilders.termQuery("status", "ok"))
         );
         assertRefused(unrankable.sort(new ScoreSortBuilder()).sort("seq", SortOrder.ASC), "whose score the table does not rank");
+        // Two match clauses sum their BM25 only on an unsorted page.
+        SearchSourceBuilder summed = new SearchSourceBuilder().query(
+            QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(QueryBuilders.matchQuery("message", "full"))
+        );
+        assertRefused(summed.sort(new ScoreSortBuilder()).sort("seq", SortOrder.ASC), "whose text clauses' scores are summed");
         // The score alone, or beside _doc, is no sort beside a field.
         assertFalse(plan(disk().sort(new ScoreSortBuilder().order(SortOrder.ASC))).ranksByScore());
         assertTrue(plan(disk().sort(new ScoreSortBuilder()).sort("_doc")).sorts().isEmpty());
