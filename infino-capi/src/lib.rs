@@ -460,12 +460,19 @@ fn out_json(v: Value) -> *mut c_char {
 pub struct Bridge {
     conn: Connection,
     tables: RwLock<HashMap<String, Supertable>>,
-    /// The schema document of each table [`Bridge::tables`] holds a handle
-    /// to, on a hosted connection, where reading it is a request to the
-    /// service ([`Bridge::table_schema`]). Kept and dropped with the handle,
-    /// whose own Arrow schema is fixed when it is opened, so the two always
-    /// describe the same version of the table.
+    /// The schema document of each table, on a hosted connection, where
+    /// reading it is a request to the service ([`Bridge::table_schema`]).
+    /// Dropped with the table's handle ([`Bridge::forget`]), and on its own
+    /// after a write that added a column ([`Bridge::reread_schema`]), so it
+    /// may hold columns the handle's Arrow schema, fixed when the handle is
+    /// opened, lacks.
     schemas: RwLock<HashMap<String, TableSchema>>,
+    /// How many times each table's kept handle or schema document has been
+    /// dropped. A read on a miss keeps what it read only if the count has
+    /// not moved meanwhile ([`Bridge::kept_or_read`]). Never reset, not even
+    /// when a table is dropped: a read from before the drop must not find
+    /// the count it started from again.
+    forgets: Mutex<HashMap<String, u64>>,
     /// Whether the connection forwards to the hosted service (an `http(s)://`
     /// URI) rather than running the engine over storage of its own.
     hosted: bool,
@@ -729,45 +736,100 @@ impl Bridge {
     }
 
     fn table(&self, name: &str) -> Result<Supertable, InfinoError> {
-        if let Some(t) = self.tables.read().map_err(poisoned)?.get(name) {
-            return Ok(t.clone());
-        }
-        let t = self.conn.open_table(name)?;
-        self.tables
-            .write()
-            .map_err(poisoned)?
-            .insert(name.to_string(), t.clone());
-        Ok(t)
+        self.kept_or_read(name, &self.tables, || self.conn.open_table(name))
     }
 
     /// The schema document of `name`. On a hosted connection, reading it is
     /// a request to the service, so it is kept until the table's handle is
     /// dropped ([`Bridge::forget`], which every change to the table's schema
-    /// here makes): preparing a batch then waits on the service only right
-    /// after such a change, not for each batch. A connection over storage
-    /// answers from the handle it holds open, and is asked each time.
+    /// here makes) or a write adds a column to it
+    /// ([`Bridge::reread_schema`]): preparing a batch then waits on the
+    /// service only right after such a change, not for each batch. A
+    /// connection over storage answers from the handle it holds open, and is
+    /// asked each time.
     fn table_schema(&self, name: &str) -> Result<TableSchema, InfinoError> {
         if !self.hosted {
             return self.conn.schema(name);
         }
-        if let Some(s) = self.schemas.read().map_err(poisoned)?.get(name) {
-            return Ok(s.clone());
+        self.kept_or_read(name, &self.schemas, || self.conn.schema(name))
+    }
+
+    /// What `kept` holds for `name`, or else what `read` gives, which is
+    /// kept unless `name` was forgotten while `read` ran. A read that began
+    /// before a schema change and ends after the change's forget would
+    /// otherwise keep the table as it was before, until the next forget.
+    fn kept_or_read<T: Clone>(
+        &self,
+        name: &str,
+        kept: &RwLock<HashMap<String, T>>,
+        read: impl FnOnce() -> Result<T, InfinoError>,
+    ) -> Result<T, InfinoError> {
+        if let Some(v) = kept.read().map_err(poisoned)?.get(name) {
+            return Ok(v.clone());
         }
-        let s = self.conn.schema(name)?;
-        self.schemas
-            .write()
-            .map_err(poisoned)?
-            .insert(name.to_string(), s.clone());
-        Ok(s)
+        let seen = self.forgets_of(name);
+        let v = read()?;
+        // Held while the value is kept, so a forget runs wholly before the
+        // check or wholly after the insert.
+        let forgets = self.forgets.lock().unwrap_or_else(PoisonError::into_inner);
+        if forgets.get(name).copied().unwrap_or(0) == seen {
+            kept.write()
+                .map_err(poisoned)?
+                .insert(name.to_string(), v.clone());
+        }
+        Ok(v)
+    }
+
+    /// How many times `name`'s kept handle or schema document has been
+    /// dropped ([`Bridge::forgets`]).
+    fn forgets_of(&self, name: &str) -> u64 {
+        self.forgets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Count a forget of `name` and run `drop`, the dropping of what is kept
+    /// for it, under the count's lock ([`Bridge::kept_or_read`]).
+    fn forgetting(&self, name: &str, drop: impl FnOnce()) {
+        let mut forgets = self.forgets.lock().unwrap_or_else(PoisonError::into_inner);
+        *forgets.entry(name.to_string()).or_default() += 1;
+        drop();
     }
 
     fn forget(&self, name: &str) {
-        if let Ok(mut tables) = self.tables.write() {
-            tables.remove(name);
+        self.forgetting(name, || {
+            if let Ok(mut tables) = self.tables.write() {
+                tables.remove(name);
+            }
+            if let Ok(mut schemas) = self.schemas.write() {
+                schemas.remove(name);
+            }
+        });
+    }
+
+    /// Read `name`'s schema document again after a write that added a
+    /// column to it: the engine adds one during an append as well as during
+    /// a declaration (a geo_point's first values, a flat_object's members, a
+    /// path the mapping does not declare), and the kept document would
+    /// otherwise lack it until the next declaration. Read on the writing
+    /// thread, which has just been answered by the service, so a thread
+    /// that stages a bulk keeps reading the kept document; a read that fails
+    /// leaves none kept, and the next reader asks. The handle is kept: a
+    /// path its Arrow schema lacks is converted to the column this document
+    /// holds ([`rows_to_batch`]).
+    fn reread_schema(&self, name: &str) {
+        if !self.hosted {
+            return;
         }
-        if let Ok(mut schemas) = self.schemas.write() {
-            schemas.remove(name);
-        }
+        self.forgetting(name, || {
+            if let Ok(mut schemas) = self.schemas.write() {
+                schemas.remove(name);
+            }
+        });
+        let _ = self.table_schema(name);
     }
 
     /// Keep [`Bridge::latest`]'s connection open until the hold is let go
@@ -950,6 +1012,7 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
         conn,
         tables: RwLock::new(HashMap::new()),
         schemas: RwLock::new(HashMap::new()),
+        forgets: Mutex::new(HashMap::new()),
         hosted,
         kept: RwLock::new(HashMap::new()),
         stamps: RwLock::new(HashMap::new()),
@@ -1761,7 +1824,8 @@ fn declare_table(
                 let _pass = gate.whole();
                 let applied = waiting(|| table.apply_schema(&patch, None));
                 // A batch prepared while this ran may have cached the handle (and
-                // schema) from before the change; drop it either way.
+                // schema) from before the change; drop it either way. A read
+                // still in flight then keeps nothing ([`Bridge::kept_or_read`]).
                 bridge.forget(name);
                 applied.map_err(|e| e.to_string())?;
             }
@@ -2293,6 +2357,13 @@ fn unify_new_paths(rows: &mut [Map<String, Value>], schema: &Schema) {
             };
         }
     }
+}
+
+/// Whether `rows` hold a path `schema` has no column for: one the engine
+/// adds as a column when they land.
+fn adds_columns(schema: &TableSchema, rows: &[Map<String, Value>]) -> bool {
+    rows.iter()
+        .any(|row| row.keys().any(|path| schema.id_of(path).is_none()))
 }
 
 /// Check one document against the declared columns without indexing it:
@@ -2894,6 +2965,10 @@ pub unsafe extern "C" fn infino_index_batch(
             Err(why) => return err_json(&why),
         };
         unify_new_paths(&mut maps, &schema);
+        let adds_columns = conn.hosted
+            && conn
+                .table_schema(name)
+                .is_ok_and(|doc| adds_columns(&doc, &maps));
         let indexed: Vec<(usize, Value)> = rows
             .iter()
             .zip(maps)
@@ -2901,6 +2976,9 @@ pub unsafe extern "C" fn infino_index_batch(
             .collect();
         append_checked(&table, &conn.gate(name), &indexed, &mut failed);
         let ok = n - failed.len();
+        if adds_columns && ok > 0 {
+            conn.reread_schema(name);
+        }
         out_json(json!({ "ok": ok, "failed": failed }))
     }))
     .unwrap_or(ptr::null_mut())
@@ -2951,6 +3029,7 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             Err(e) => return err_json(&e.to_string()),
         };
         let n = prepared.n;
+        let adds_columns = prepared.adds_columns;
         let failed = append_prepared(&table, &conn.gate(name), vec![prepared], &[], &[]);
         let failed: Vec<Value> = failed
             .into_iter()
@@ -2959,6 +3038,9 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             })
             .collect();
         let ok = n - failed.len();
+        if adds_columns && ok > 0 {
+            conn.reread_schema(name);
+        }
         out_json(json!({ "ok": ok, "failed": failed }))
     }))
     .unwrap_or(ptr::null_mut())
@@ -2974,6 +3056,10 @@ pub struct Prepared {
     values: Vec<Value>,
     index_of: Vec<usize>,
     failed: Vec<(usize, String)>,
+    /// Whether the rows hold a path the kept schema document lacks, so the
+    /// append adds a column to it ([`Bridge::reread_schema`]). Only a hosted
+    /// connection keeps a document; over storage this is false.
+    adds_columns: bool,
 }
 
 /// Each row's routing value and sequence numbers, beside the buffer of ids
@@ -3089,6 +3175,7 @@ unsafe fn prepare(
         (table_schema, schema)
     };
     unify_new_paths(&mut rows, &schema);
+    let adds_columns = conn.hosted && adds_columns(&table_schema, &rows);
     let values: Vec<Value> = rows.into_iter().map(Value::Object).collect();
     let batch = if values.is_empty() {
         None
@@ -3101,6 +3188,7 @@ unsafe fn prepare(
         values,
         index_of,
         failed,
+        adds_columns,
     })
 }
 
@@ -3536,8 +3624,14 @@ pub unsafe extern "C" fn infino_append_prepared(
                 })
                 .collect()
         };
+        let adds_columns = owned.iter().any(|p| p.adds_columns);
         let failed = append_prepared(&table, &conn.gate(name), owned, &replaced, &per_batch);
         let ok = n.saturating_sub(failed.len());
+        // A write adds its columns only when it lands, so one that landed
+        // nothing changed nothing, and asks the service nothing more.
+        if adds_columns && ok > 0 {
+            conn.reread_schema(name);
+        }
         let failed: Vec<Value> = failed
             .into_iter()
             .map(|(b, i, reason, permanent)| {
@@ -5046,6 +5140,84 @@ mod tests {
         let after = names(&bridge.table_schema("logs").unwrap());
         assert!(after.contains(&"added".to_string()), "{after:?}");
         assert!(after.contains(&"behind".to_string()), "{after:?}");
+    }
+
+    /// The engine adds columns during an append as well as during a
+    /// declaration: a geo_point's first values, a flat_object's members, a
+    /// path the mapping does not declare. On a hosted table the kept schema
+    /// document is read again after an append that added one, so the
+    /// table's columns hold it right away, as they do over storage; an
+    /// append that adds none keeps the document, so staging the next batch
+    /// still asks the service nothing.
+    #[test]
+    fn a_column_an_append_adds_is_among_the_columns_right_after_it() {
+        let names = |cols: &Value| -> Vec<String> {
+            cols.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|col| col["name"].as_str().map(str::to_owned))
+                .collect()
+        };
+        for hosted in [false, true] {
+            let h = open_logs();
+            unsafe { (*h).hosted = hosted };
+            let out = ensure(h, r#"{"properties":{"fo":{"type":"flat_object"}}}"#);
+            assert!(!out.contains("error"), "{out}");
+            let doc = r#"{"level":"info","geo":[1.0,2.0],"fo":{"a":1},"un":7}"#;
+            let p = prepared(h, &[("y", doc)]);
+            assert_eq!(append_replacing(h, p, &[])["ok"], 1);
+            let cols = names(&columns(h));
+            for added in ["geo", "fo.a", "un"] {
+                assert!(
+                    cols.contains(&added.to_string()),
+                    "hosted = {hosted}: {added} missing from {cols:?}"
+                );
+            }
+            if hosted {
+                // A column added behind the bridge stays unseen through an
+                // append that adds none: that append kept the document.
+                let behind = SchemaPatch::new(vec![FieldPatch::named("behind".to_string())
+                    .with_type(DataType::Int64)
+                    .with_nullable(true)]);
+                let table = unsafe { &*h }.conn.open_table("logs").unwrap();
+                table.apply_schema(&behind, None).unwrap();
+                let p = prepared(h, &[("z", r#"{"level":"warn","un":8}"#)]);
+                assert_eq!(append_replacing(h, p, &[])["ok"], 1);
+                let cols = names(&columns(h));
+                assert!(!cols.contains(&"behind".to_string()), "{cols:?}");
+            }
+            close(h);
+        }
+    }
+
+    /// A read of a hosted table's schema document that begins before a
+    /// declaration changes the table and ends after the declaration's last
+    /// forget returns what it read, but keeps nothing: the next read asks
+    /// again and finds the declared column.
+    #[test]
+    fn a_schema_read_a_declaration_overtakes_keeps_nothing() {
+        let h = open_logs();
+        let names = |s: &TableSchema| {
+            s.fields()
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>()
+        };
+        unsafe { (*h).hosted = true };
+        let bridge = unsafe { &*h };
+        let read = bridge
+            .kept_or_read("logs", &bridge.schemas, || {
+                let before = bridge.conn.schema("logs");
+                // The declaration runs wholly between the read and its keep.
+                let out = ensure(h, r#"{"properties":{"added":{"type":"long"}}}"#);
+                assert!(out.contains("\"added\":1"), "{out}");
+                before
+            })
+            .unwrap();
+        assert!(!names(&read).contains(&"added".to_string()));
+        let now = names(&bridge.table_schema("logs").unwrap());
+        assert!(now.contains(&"added".to_string()), "{now:?}");
+        close(h);
     }
 
     /// An array of arrays at a path without a column (a geo_point given
