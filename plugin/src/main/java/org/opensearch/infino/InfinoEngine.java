@@ -11,6 +11,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.Term;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.util.BytesRef;
@@ -28,10 +29,12 @@ import org.opensearch.index.engine.EngineCreationFailureException;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.FlushFailedEngineException;
 import org.opensearch.index.engine.InternalEngine;
+import org.opensearch.index.mapper.IdFieldMapper;
 import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.ParseContext.Document;
 import org.opensearch.index.mapper.SourceFieldMapper;
+import org.opensearch.index.mapper.Uid;
 import org.opensearch.index.seqno.ReplicationTracker;
 import org.opensearch.index.seqno.RetentionLease;
 import org.opensearch.index.seqno.SequenceNumbers;
@@ -1172,6 +1175,50 @@ public class InfinoEngine extends InternalEngine {
     /** The lock that orders the writes of {@code id}. */
     private Object idLock(String id) {
         return idLocks[Math.floorMod(id.hashCode(), ID_LOCK_STRIPES)];
+    }
+
+    /**
+     * Wait until every write of {@code id} that {@code table}'s shard has
+     * applied on this node is recorded for the table. A write holds the id's
+     * lock from its apply to its record, so once the lock is free, a read of
+     * the document sees every write that a get of the shard made before this
+     * call found. A node that holds no copy of the shard has nothing to wait for.
+     */
+    /**
+     * The version, sequence number and primary term of a document's latest
+     * write, as its shard's skeleton holds them and a stock get reports them.
+     */
+    record Written(long version, long seqNo, long primaryTerm) {}
+
+    /**
+     * {@code id}'s {@link Written} in {@code table}'s shard on this node, as
+     * a stock get reads it: realtime, from the shard's live version map and
+     * translog, or from what the latest refresh made visible; null when the
+     * shard holds no such document. Read through the engine's own searcher,
+     * not the shard's: the security plugin wraps the shard's searcher with
+     * the user's document rule, which the skeleton cannot answer (it holds no
+     * user field); the plugin applies that rule to the table's row instead.
+     */
+    static Written written(String table, String id, boolean realtime) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine == null) {
+            throw new IllegalStateException("[infino] the shard of " + table + " is not open on this node");
+        }
+        Get get = new Get(realtime, true, id, new Term(IdFieldMapper.NAME, Uid.encodeId(id)));
+        try (GetResult got = engine.get(get, engine::acquireSearcher)) {
+            return got.exists() ? new Written(got.version(), got.docIdAndVersion().seqNo, got.docIdAndVersion().primaryTerm) : null;
+        }
+    }
+
+    static void awaitRecorded(String table, String id) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine == null) {
+            return;
+        }
+        synchronized (engine.idLock(id)) {
+            // Taken and let go: a write that held it has recorded itself by now.
+            assert Thread.holdsLock(engine.idLock(id));
+        }
     }
 
     /**
