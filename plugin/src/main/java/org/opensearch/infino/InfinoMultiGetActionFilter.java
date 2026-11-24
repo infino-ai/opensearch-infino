@@ -130,8 +130,10 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             // One fetch per table, over all of its ids: through the document
             // rule when the security plugin has one for this user. An index in
             // default mode with several shards has a table per shard, so each
-            // id goes to its shard's; a default-mode table is read item by item,
-            // as a write its shard has not committed yet counts.
+            // id goes to its shard's; a realtime read of a default-mode table
+            // counts a write its shard has not committed yet, and reads the rest
+            // in one call, from the table's latest commit when this node may be
+            // behind it. A read that is not realtime is read item by item.
             Map<String, InfinoAccess> accessOf = new HashMap<>();
             for (Map.Entry<String, IndexMetadata> e : indices.entrySet()) {
                 accessOf.put(e.getKey(), InfinoAccess.reading(e.getValue().getIndex().getName(), "mget"));
@@ -162,6 +164,8 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                     docsOf.put(e.getKey(), InfinoGetActionFilter.restrictedDocs(e.getKey(), e.getValue(), access));
                 } else if (!InfinoPlugin.inDefaultMode(md.getSettings())) {
                     docsOf.put(e.getKey(), InfinoNative.docs(e.getKey(), e.getValue(), null));
+                } else if (mget.realtime()) {
+                    docsOf.put(e.getKey(), InfinoEngine.currentDocs(e.getKey(), e.getValue()));
                 }
             }
             // The ignored fields of each table's ids, read once per table,
@@ -185,7 +189,7 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                 IndexMetadata md = indices.get(item.index());
                 Map<String, InfinoNative.Doc> byId = docsOf.get(tableOfItem[i]);
                 InfinoNative.Doc doc = byId != null ? byId.get(item.id()) : InfinoGetActionFilter.docOf(md, tableOfItem[i], item.id(), mget.realtime());
-                String routing = InfinoGetActionFilter.routingOf(md, tableOfItem[i], item.id(), doc, mget.realtime());
+                String routing = InfinoGetActionFilter.routingOf(md, doc);
                 GetResponse get = new GetResponse(
                     InfinoGetActionFilter.result(
                         md.getIndex().getName(),
