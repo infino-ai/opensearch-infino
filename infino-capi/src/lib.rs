@@ -2773,17 +2773,80 @@ impl Drop for Pass<'_> {
 /// than its column's, an array of arrays, a path beneath a live column),
 /// except a schema that changed under the write, a column still converting,
 /// or a field cap that raising the table's limit lifts, which a later try
-/// can pass.
+/// can pass. The local engine returns the refusal typed; the hosted service
+/// answers it as a 400 whose body carries the same text
+/// ([`hosted_schema_refusal`]).
 fn refuses_content(e: &InfinoError) -> bool {
-    matches!(
-        e,
-        InfinoError::Schema(s) if !matches!(
+    match e {
+        InfinoError::Schema(s) => !matches!(
             s,
             SchemaError::SchemaConflict { .. }
                 | SchemaError::ConversionInProgress { .. }
                 | SchemaError::FieldCapExceeded { .. }
-        )
-    )
+        ),
+        _ => hosted_schema_refusal(e).is_some_and(|reason| {
+            !HOSTED_RETRYABLE_SCHEMA
+                .iter()
+                .any(|&shape| says(reason, shape))
+        }),
+    }
+}
+
+/// Whether the engine refused a write for taking the table over its cap of
+/// fields, typed by the local engine or in the text of the hosted service's
+/// 400.
+fn over_field_cap(e: &InfinoError) -> bool {
+    matches!(e, InfinoError::Schema(SchemaError::FieldCapExceeded { .. }))
+        || hosted_schema_refusal(e).is_some_and(|reason| says(reason, HOSTED_FIELD_CAP))
+}
+
+/// The shape of an engine message, as the text it starts with and the text
+/// it ends with: the parts between carry names and values from the
+/// documents, so a message is matched by its two ends, never by what it
+/// contains.
+type Shape = (&'static str, &'static str);
+
+/// The hosted service's schema errors that a later try can pass, in the
+/// engine's wording: the schema changed under the write, a column is still
+/// converting, or the write would take the table over its field cap.
+const HOSTED_RETRYABLE_SCHEMA: [Shape; 3] = [
+    ("the schema is at version ", "; re-read it and resubmit"),
+    (
+        "column `",
+        "` is still converting; run optimize before changing its type again",
+    ),
+    HOSTED_FIELD_CAP,
+];
+
+/// A field-cap refusal, in the engine's wording.
+const HOSTED_FIELD_CAP: Shape = (
+    "adding [",
+    "; raise `max_fields` in the schema or fix the producer",
+);
+
+/// Whether `reason` has the shape `(starts, ends)`.
+fn says(reason: &str, (starts, ends): Shape) -> bool {
+    let reason = reason.trim_end();
+    reason.len() >= starts.len() + ends.len()
+        && reason.starts_with(starts)
+        && reason.ends_with(ends)
+}
+
+/// The reason of a schema refusal the hosted service answered: it passes an
+/// engine error on as a 400 whose body is `<op> error: schema: <reason>`,
+/// which reaches the bridge as an untyped backend error
+/// (`<op>: server returned 400: <body>`). None for any other error.
+fn hosted_schema_refusal(e: &InfinoError) -> Option<&str> {
+    let InfinoError::Backend(message) = e else {
+        return None;
+    };
+    if status_in(message) != Some(STATUS_BAD_REQUEST) {
+        return None;
+    }
+    let (_, rest) = message.split_once(STATUS_MARKER)?;
+    let body = rest.get(STATUS_DIGITS..)?.strip_prefix(": ")?;
+    let (_, error) = body.split_once(" error: ")?;
+    error.strip_prefix("schema: ")
 }
 
 /// Write rows with `write`, isolating the ones the engine refuses: a refused
@@ -2870,7 +2933,7 @@ fn replace_rows_checked(
     let Err(e) = replace else {
         return;
     };
-    let over_cap = matches!(e, InfinoError::Schema(SchemaError::FieldCapExceeded { .. }));
+    let over_cap = over_field_cap(&e);
     if counts_may_explain(&e) {
         if let Ok(counts) = rows_under(table, &ids) {
             let single: HashSet<&str> = ids
@@ -2909,7 +2972,7 @@ fn replace_rows_checked(
 /// engine names a miscount ([`InfinoError::Cardinality`]); the hosted
 /// service answers it as a status the engine passes on untyped.
 fn counts_may_explain(e: &InfinoError) -> bool {
-    !refuses_content(e) && !matches!(e, InfinoError::Schema(SchemaError::FieldCapExceeded { .. }))
+    !refuses_content(e) && !over_field_cap(e)
 }
 
 /// Ids whose rows one call to [`rows_under`] counts.
@@ -7630,6 +7693,145 @@ mod tests {
         assert_eq!(rows[1]["items.price"], 1.0, "{rows}");
         assert_eq!(rows[2]["items.price"], Value::Null, "{rows}");
         assert_eq!(rows[2]["prices"], "5.5,7", "{rows}");
+    /// The hosted service in front of a typed schema refusal: a 400 whose
+    /// body is the engine's error under the operation's name.
+    fn hosted(typed: SchemaError) -> InfinoError {
+        InfinoError::Backend(format!(
+            "append: server returned 400: append error: {}",
+            InfinoError::Schema(typed)
+        ))
+    }
+
+    /// The hosted service answers a schema refusal untyped; it is read as
+    /// the local engine's typed refusal is: a value the column cannot hold
+    /// is a refusal of the row's content, while a schema that changed under
+    /// the write, a column still converting and the field cap are for a
+    /// later try, and the field cap is told apart.
+    #[test]
+    fn a_hosted_schema_refusal_is_read_as_the_local_one() {
+        let cases = [
+            SchemaError::TypeMismatch {
+                column: "tags".into(),
+                frozen: DataType::LargeUtf8,
+                offered: DataType::List(std::sync::Arc::new(Field::new(
+                    "item",
+                    DataType::LargeUtf8,
+                    true,
+                ))),
+            },
+            SchemaError::NestedArray { path: "a.b".into() },
+            SchemaError::PathShadowsColumn {
+                path: "rec.n".into(),
+                column: "rec".into(),
+            },
+            SchemaError::SchemaConflict {
+                expected: 3,
+                current: 4,
+            },
+            SchemaError::ConversionInProgress { column: "n".into() },
+            SchemaError::FieldCapExceeded {
+                cap: 10,
+                current: 10,
+                fields: vec!["x".into()],
+            },
+        ];
+        for typed in cases {
+            let local = InfinoError::Schema(typed.clone());
+            let remote = hosted(typed);
+            assert_eq!(
+                refuses_content(&remote),
+                refuses_content(&local),
+                "{remote}"
+            );
+            assert_eq!(over_field_cap(&remote), over_field_cap(&local), "{remote}");
+            assert_eq!(
+                counts_may_explain(&remote),
+                counts_may_explain(&local),
+                "{remote}"
+            );
+        }
+        // What the service answered for an array into a string column.
+        let seen = InfinoError::Backend(
+            "append: server returned 400: append error: schema: column `tags` is `LargeUtf8` \
+             but the batch carries `List(LargeUtf8)`; apply the schema with the column's type \
+             changed to store it"
+                .into(),
+        );
+        assert!(refuses_content(&seen));
+        // A name from the document that repeats a retryable message's words
+        // leaves the refusal what its shape says it is.
+        for named in [
+            "a; re-read it and resubmit",
+            "x` is still converting; run optimize before changing its type again",
+            "y would take the table over its cap of 1 fields",
+        ] {
+            let remote = hosted(SchemaError::TypeMismatch {
+                column: named.into(),
+                frozen: DataType::LargeUtf8,
+                offered: DataType::Int64,
+            });
+            assert!(refuses_content(&remote), "{remote}");
+            assert!(!over_field_cap(&remote), "{remote}");
+        }
+        let capped = hosted(SchemaError::FieldCapExceeded {
+            cap: 1,
+            current: 1,
+            fields: vec!["a; re-read it and resubmit`".into()],
+        });
+        assert!(!refuses_content(&capped), "{capped}");
+        assert!(over_field_cap(&capped), "{capped}");
+        // Not a schema refusal, or not a 400: a later try may pass.
+        for other in [
+            "update: server returned 400: mutation error: cardinality: update: cardinality \
+             mismatch: predicate matched 72 rows; new_rows has 64",
+            "append: server returned 500: append error: schema: column `tags` is `LargeUtf8`",
+            "append: server returned 503: upstream unavailable",
+            "update: server returned 400: mutation error: query: no row under osid 'k error: \
+             schema: column `x` is `Int64` but the batch carries `LargeUtf8`; apply the schema \
+             with the column's type changed to store it'",
+        ] {
+            let e = InfinoError::Backend(other.into());
+            assert!(!refuses_content(&e), "{e}");
+            assert!(!over_field_cap(&e), "{e}");
+        }
+    }
+
+    /// One document the hosted service refuses for its content stands
+    /// alone, reported permanent, and the rest of its append is written.
+    #[test]
+    fn a_document_the_hosted_service_refuses_is_isolated_and_permanent() {
+        let rows: Vec<(usize, Value)> = vec![
+            (0, json!({"osid": "1", "tags": "x"})),
+            (1, json!({"osid": "2", "tags": ["x", "y"]})),
+            (2, json!({"osid": "3", "tags": "z"})),
+            (3, json!({"osid": "4", "tags": "w"})),
+        ];
+        let written = std::cell::RefCell::new(Vec::new());
+        let mut failed = Vec::new();
+        write_checked(&rows, &mut failed, &|values| {
+            if values.iter().any(|v| v["tags"].is_array()) {
+                return Err(InfinoError::Backend(
+                    "append: server returned 400: append error: schema: column `tags` is \
+                     `LargeUtf8` but the batch carries `List(LargeUtf8)`; apply the schema with \
+                     the column's type changed to store it"
+                        .into(),
+                ));
+            }
+            written.borrow_mut().extend(
+                values
+                    .iter()
+                    .map(|v| v["osid"].as_str().unwrap().to_string()),
+            );
+            Ok(())
+        });
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0]["i"], 1);
+        assert_eq!(failed[0]["permanent"], true);
+        let mut written = written.into_inner();
+        written.sort();
+        assert_eq!(written, ["1", "3", "4"]);
+    }
+
         let hits = sql(h, r#"SELECT osid FROM logs WHERE array_has("n[]", 2)"#);
         assert_eq!(hits, json!([{ "osid": "m1" }]), "{hits}");
         close(h);
