@@ -1013,13 +1013,18 @@ public final class InfinoSearch {
                 return indexed;
             }
         }
-        Supplier<List<Map<String, Object>>> choose = () -> chosenRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed);
+        // How many leading rows the last statement read with their sources.
+        int[] inStatement = { 0 };
+        Supplier<List<Map<String, Object>>> choose = () -> chosenRows(plan, source, fetch, seqNoAndPrimaryTerm, resumed, inStatement);
         if (!readsSourcesById(plan, source, resumed)) {
             List<Map<String, Object>> rows = choose.get();
             chosen[0] = rows.size();
             return rows;
         }
-        return sourcedRows(choose, rows -> withSources(plan.table(), rows, sourceFrom, fetch), fetch, chosen);
+        // The rows before the window are not shown, and the leading rows the
+        // statement read with their sources need no lookup: they cannot lose
+        // their sources between reads, but still count as the page's rows.
+        return sourcedRows(choose, rows -> withSources(plan.table(), rows, Math.max(inStatement[0], sourceFrom), fetch), fetch, chosen);
     }
 
     /**
@@ -1046,30 +1051,48 @@ public final class InfinoSearch {
         }
     }
 
-    /** The rows the page's hit statement chooses, without the sources read by id. */
+    /**
+     * The rows the page's hit statement chooses, without the sources read by
+     * id. How many leading rows it read with their sources
+     * ({@link #sourceInSortedStatement}) goes in {@code inStatement}.
+     */
     private static List<Map<String, Object>> chosenRows(
         Plan plan,
         SearchSourceBuilder source,
         int fetch,
         boolean seqNoAndPrimaryTerm,
-        boolean resumed
+        boolean resumed,
+        int[] inStatement
     ) {
+        inStatement[0] = 0;
         if (readsUnsorted(plan, resumed)) {
             return InfinoNative.sqlRows(unsortedStatement(plan, fetch, seqNoAndPrimaryTerm, wantsSource(source)));
         }
+        boolean withSource = wantsSource(source);
         List<Map<String, Object>> rows;
+        // The leading rows that carry their sources from the hit statement.
+        int sourced;
         if (splitsMissingTail(plan)) {
             // The rows past a present first sort value come first; the
             // rows missing it follow them all, so they are read only
             // when the first part leaves the page short.
-            rows = InfinoNative.sqlRows(hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT));
+            rows = InfinoNative.sqlRows(
+                hitStatement(plan, fetch, seqNoAndPrimaryTerm, Keyset.PRESENT, RANK_WINDOW, selectsSource(plan, fetch, Keyset.PRESENT, withSource))
+            );
+            sourced = sourceInSortedStatement(plan, fetch, Keyset.PRESENT) ? rows.size() : 0;
             if (rows.size() < fetch) {
                 rows = new ArrayList<>(rows);
-                rows.addAll(InfinoNative.sqlRows(hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING)));
+                rows.addAll(
+                    InfinoNative.sqlRows(
+                        hitStatement(plan, fetch - rows.size(), seqNoAndPrimaryTerm, Keyset.MISSING, RANK_WINDOW, selectsSource(plan, fetch, Keyset.MISSING, withSource))
+                    )
+                );
             }
         } else {
-            rows = windowedRows(plan, fetch, seqNoAndPrimaryTerm, !sourcesById(plan));
+            rows = windowedRows(plan, fetch, seqNoAndPrimaryTerm, selectsSource(plan, fetch, Keyset.WHOLE, withSource));
+            sourced = sourceInSortedStatement(plan, fetch, Keyset.WHOLE) ? rows.size() : 0;
         }
+        inStatement[0] = sourced;
         return rows;
     }
 
@@ -1636,6 +1659,89 @@ public final class InfinoSearch {
      */
     static boolean sourcesById(Plan plan) {
         return !plan.sorts().isEmpty() && plan.collapse() == null;
+    }
+
+    /** Most rows a sorted page reads with their sources in its hit statement ({@link #sourceInSortedStatement}). */
+    static final int SORTED_SOURCE_ROWS = 100;
+
+    /**
+     * Whether a sorted page's hit statement reads its rows' sources itself
+     * rather than by id ({@link #sourcesById}). That pays only when the
+     * engine's range index alone picks the page's rows, so the statement
+     * reads the source of those rows and no others. The index answers alone
+     * for a sort on one numeric or date field's own column that has a range
+     * index ({@link Column#ranged}), then on the row id ascending, missing
+     * values last, when nothing else narrows the rows: no predicate at all,
+     * or one bounded range on the sort column ({@link Translation#span}),
+     * and at most a search_after of the sort's value alone
+     * ({@link #keysetIsARange}). Any other predicate, a text clause or a
+     * keyset that also breaks ties by id among them, has the engine walk the
+     * index checking each row, and a walk that finds too few rows gives up
+     * and has the statement read every matching row; with the source
+     * selected, that would read every matching row's source where the by-id
+     * read takes only the page's. Not past
+     * {@link #SORTED_SOURCE_ROWS} rows either, nor for a scripted field or a
+     * vector query.
+     */
+    static boolean sourceInSortedStatement(Plan plan, int fetch, Keyset part) {
+        List<SortSpec> sorts = plan.sorts();
+        if (!sourcesById(plan)
+            || !keysetIsARange(plan, part)
+            || fetch > SORTED_SOURCE_ROWS
+            || plan.vector() != null
+            || !plan.scriptFields().isEmpty()
+            || plan.query().principal() != null
+            || sorts.size() != 2) {
+            return false;
+        }
+        SortSpec first = sorts.get(0);
+        SortSpec tie = sorts.get(1);
+        Column c = plan.cols().get(first.name());
+        return tie.name().equals(InfinoSql.ROW_ID)
+            && !tie.desc()
+            && !first.nullsFirst()
+            && first.expr().equals(InfinoQueryTranslator.quoteIdent(first.name()))
+            && c != null
+            && !c.isList()
+            && c.ranged()
+            && (c.isNumeric() || c.isTimestamp())
+            && rangeOnlyOn(plan, first.name());
+    }
+
+    /**
+     * Whether {@code part} of {@code plan}'s rows adds at most a range on the
+     * first sort's column: the whole of a page with no search_after, or the
+     * present part of one after the first sort's value alone
+     * ({@code s < v}). A search_after that also carries the row id adds an
+     * {@code OR} of the two ({@link #keysetPredicate}), and the rows missing
+     * the value are in no range index.
+     */
+    private static boolean keysetIsARange(Plan plan, Keyset part) {
+        Object[] after = plan.searchAfter();
+        return part == Keyset.WHOLE ? after == null : part == Keyset.PRESENT && after != null && after.length == 1;
+    }
+
+    /**
+     * Whether the only predicate on {@code plan}'s hits is, at most, one
+     * bounded range on {@code column}: none at all, or a range query on it
+     * alone (no post_filter, no security rule).
+     */
+    private static boolean rangeOnlyOn(Plan plan, String column) {
+        if (InfinoQueryTranslator.ALL.equals(plan.hitWhere())) {
+            return true;
+        }
+        InfinoQueryTranslator.Span span = plan.query().span();
+        return plan.postWhere() == null && span != null && span.column().equals(column);
+    }
+
+    /**
+     * Whether {@code plan}'s hit statement for {@code part} selects each hit's
+     * source: always when the page reads no source by id ({@link #sourcesById}),
+     * and for a sorted page the range index picks ({@link #sourceInSortedStatement})
+     * when its hits need their sources ({@code wanted}).
+     */
+    static boolean selectsSource(Plan plan, int fetch, Keyset part, boolean wanted) {
+        return !sourcesById(plan) || (wanted && sourceInSortedStatement(plan, fetch, part));
     }
 
     /**

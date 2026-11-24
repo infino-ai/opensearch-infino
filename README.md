@@ -1,6 +1,6 @@
 # Infino for OpenSearch
 
-![Status: experimental](https://img.shields.io/badge/status-experimental-orange) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+![Status: beta](https://img.shields.io/badge/status-beta-yellow) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 An OpenSearch plugin that stores your indices in [Infino](https://github.com/infino-ai/infino) tables instead of Lucene. Infino is an Apache-2.0 retrieval engine, written in Rust, that keeps its tables on object storage and runs SQL, full-text and vector search over them. The documents live on storage you choose (a local disk, an S3 or GCS bucket, or a hosted Infino account), and OpenSearch's REST API, Dashboards, security plugin and cluster management work unchanged.
 
@@ -9,9 +9,9 @@ An OpenSearch plugin that stores your indices in [Infino](https://github.com/inf
 - **Stateless nodes.** A node with an empty data directory brings every index back from storage, with its mapping and aliases.
 - **Not a fork.** The plugin installs into a released OpenSearch: 2.19.6, 3.0.0, 3.3.2, 3.6.0 or 3.9.0.
 
-**Status: experimental.** Not ready for production data, and settings and behaviour may change between versions without a migration path. Of the 895 tests in OpenSearch's own YAML REST suite, 421 pass in default mode and 378 in proxy mode ([#51](https://github.com/infino-ai/opensearch-infino/issues/51)). Most of the rest use features the table does not serve yet, which it refuses with an error; about 120 in default mode and 145 in proxy mode return a different answer from stock OpenSearch with no error ([#56](https://github.com/infino-ai/opensearch-infino/issues/56)). The plugin is tested on the releases above with local storage and Dashboards; cloud buckets are not tested yet. CI runs `gradle check` on 3.9.0 only; the other releases are checked by running `check-all.sh` by hand. Known gaps are tracked in [the issues](https://github.com/infino-ai/opensearch-infino/issues). Try it on data you can rebuild before relying on it.
+**Status: beta.** Until general availability, settings and behaviour may change between versions without a migration path: try it on data you can rebuild before relying on it. A query the table does not serve yet is refused with an error that names it, though some searches it does serve can still answer differently from stock OpenSearch with no error. OpenSearch's own YAML REST suite runs against the plugin in both modes, and the tests it does not pass yet are listed, each with its reason, in `plugin/src/yamlRestTest/core-denylist.txt`. The plugin is tested on the releases above with local storage and Dashboards; cloud buckets are not tested yet. CI runs `gradle check` on 3.9.0 only; the other releases are checked by running `check-all.sh` by hand.
 
-**Contents:** [Quick start](#quick-start) · [How it works](#how-it-works) · [Install on a cluster](#install-on-a-cluster) · [Hosted account and stateless nodes](#hosted-account-and-stateless-nodes) · [Settings](#settings) · [SQL](#sql) · [What is supported](#what-is-supported) · [Writes](#writes) · [Build and test](#build-and-test) · [Repository layout](#repository-layout) · [License](#license) · [Contributing and security](#contributing-and-security)
+**Contents:** [Quick start](#quick-start) · [Getting started guide](docs/getting-started.md) · [How it works](#how-it-works) · [Install on a cluster](#install-on-a-cluster) · [Hosted account and stateless nodes](#hosted-account-and-stateless-nodes) · [Settings](#settings) · [Configuration](docs/configuration.md) · [SQL](#sql) · [What is supported](#what-is-supported) · [Writes](#writes) · [Build and test](#build-and-test) · [Repository layout](#repository-layout) · [License](#license) · [Contributing and security](#contributing-and-security)
 
 ## Quick start
 
@@ -41,6 +41,16 @@ The node's data volume belongs to the storage it was first started with, so to c
 
 You need a Rust toolchain (the Docker build uses 1.95.0), a JDK 21, Gradle 9, and an [OpenSearch 3.9.0 distribution](https://opensearch.org/downloads/) to run it in. For another release, set `OPENSEARCH_VERSION` and use the Gradle that release wants (see [Build and test](#build-and-test)).
 
+**Using the full OpenSearch bundle.** The standard 3.9.0 download includes the security plugin. With an empty `opensearch.yml`, the security plugin stops the node at startup with `No SSL configuration found`. For a local node that answers plain HTTP, turn security off in `$DISTRO/config/opensearch.yml`:
+
+```yaml
+plugins.security.disabled: true
+```
+
+To keep security on, run `$DISTRO/opensearch-tar-install.sh` once with `OPENSEARCH_INITIAL_ADMIN_PASSWORD` set. It installs demo certificates, and requests then need `-k -u admin:<password> https://localhost:9200/...`, as in the guide.
+
+The bundle also includes neural search, so the node creates its indices in proxy mode (see [Neural search](#neural-search)).
+
 ```bash
 ./scripts/build.sh                                      # the native bridge and the plugin zip
 DISTRO=/path/to/opensearch-3.9.0 ./scripts/run.sh       # install the plugin and start the node
@@ -50,41 +60,9 @@ OpenSearch 3.3 and later need Gradle 9.4.1 or later: an older Gradle stops with 
 
 `run.sh` keeps the tables in `data/` at the repository's root. Set `INFINO_URI=s3://bucket/prefix` or `gs://bucket/prefix` to keep them in a bucket instead; see [where the tables live](#install-on-a-cluster) for the credentials it uses.
 
-**Using the full OpenSearch bundle.** The standard 3.9.0 download includes the security plugin. With an empty `opensearch.yml`, the security plugin stops the node at startup with `No SSL configuration found`. For a local node that answers the plain-HTTP requests below, turn security off in `$DISTRO/config/opensearch.yml`:
-
-```yaml
-plugins.security.disabled: true
-```
-
-To keep security on, run `$DISTRO/opensearch-tar-install.sh` once with `OPENSEARCH_INITIAL_ADMIN_PASSWORD` set. It installs demo certificates, and the requests below then need `-k -u admin:<password> https://localhost:9200/...`.
-
-The bundle also includes neural search, so the node creates its indices in proxy mode (see [Neural search](#neural-search)). The example below works in either mode.
-
 ### Try it
 
-Create an index, write a document and search it. On the Docker node, use `https://` and add `-k -u "admin:<password>"` to each command.
-
-```bash
-curl -XPUT localhost:9200/logs -H 'Content-Type: application/json' -d '{
-  "settings": {"number_of_shards": 1, "number_of_replicas": 0},
-  "mappings": {"properties": {
-    "@timestamp": {"type": "date"}, "level": {"type": "keyword"},
-    "message": {"type": "text"}, "status": {"type": "long"}}}}'
-
-printf '{"index":{"_index":"logs","_id":"1"}}\n{"@timestamp":"%s","level":"error","message":"disk full on node-3","status":500}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" |
-  curl -XPOST 'localhost:9200/_bulk?refresh=true' -H 'Content-Type: application/x-ndjson' --data-binary @-
-
-curl localhost:9200/logs/_search -H 'Content-Type: application/json' -d '{
-  "query": {"bool": {"must": [{"match": {"message": "disk"}}],
-                     "filter": [{"range": {"@timestamp": {"gte": "now-1d"}}}]}},
-  "sort": [{"@timestamp": "desc"}],
-  "aggs": {"over_time": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1h"},
-                         "aggs": {"by_level": {"terms": {"field": "level"}}}}}}'
-```
-
-The document is stamped with the current time, so the search's last-day range (`"gte": "now-1d"`) keeps it.
-
-Every index the cluster creates is backed by Infino, so the index above needs no setting of its own.
+[Getting started](docs/getting-started.md) walks through the rest: create an index, load 100,000 sample log events (or your own data), and search them with full-text queries, aggregations, vector and hybrid search, and SQL. It keeps the tables on a hosted Infino account; to keep them on the node's own storage instead, skip its step 2. Every index the cluster creates is backed by Infino, so an index needs no setting of its own.
 
 ## How it works
 
@@ -177,6 +155,8 @@ PUT _ingest/pipeline/embed
 
 With an Infino account, the tables live on the hosted service. It runs the engine, compacts the tables, and serves Infino's own SQL and search APIs over the same data. The account stores the tables in an Infino bucket or in your own bucket, with customer-managed encryption keys (CMEK) supported. The node holds no table data.
 
+[Getting started](docs/getting-started.md) walks through it end to end on the Docker node: an account, data loaded and searched, and a new node with an empty data volume bringing every index back. This section is the reference.
+
 The account is node configuration, read at startup:
 
 ```yaml
@@ -189,18 +169,18 @@ infino.platform.database: logs        # optional: the cluster's name when unset
 bin/opensearch-keystore add infino.platform.api_key    # or INFINO_API_KEY in the node's environment
 ```
 
-**Getting an account.** Start the node without these settings and ask for a free account. Sending `"accept": true` accepts Infino's [Terms of Service](https://www.infino.ai/terms), and from then on every document the cluster writes is sent to the hosted service:
+**Getting an account.** Start the node without these settings and ask for a trial account. Sending `"accept": true` accepts Infino's [Terms of Service](https://www.infino.ai/terms), and from then on every document the cluster writes is sent to the hosted service:
 
 ```bash
 curl -XPOST localhost:9200/_plugins/_infino/account/trial -H 'Content-Type: application/json' -d '{"accept": true}'
 ```
 
-An account is created only when the request says `"accept": true`. The trial creates a free account with credit, with no email, password or card. It registers one database, named after the cluster (or `database` in the body), and answers with the key, exactly once, along with the configuration lines above. The node uses the account from then on, and those lines keep it after a restart. If the service gives out no free accounts, it answers 501; if the cluster's address has already had one, it answers 409. Either way the response names the next step. `infino.platform.default_url` names the service a trial is asked from.
+An account is created only when the request says `"accept": true`. The trial creates an account with starting credit, with no email, password or card. It registers one database, named after the cluster (or `database` in the body), and answers with the key, exactly once, along with the configuration lines above. The node uses the account from then on, and those lines keep it after a restart. If the service gives out no trial accounts, it answers 501; if the cluster's address has already had one, it answers 409. Either way the response names the next step ([errors](docs/getting-started.md#7-limits-and-errors)). `infino.platform.default_url` names the service a trial is asked from.
 
 | Request | |
 |---|---|
 | `GET /_plugins/_infino/account` | What the tables are served from |
-| `POST /_plugins/_infino/account/trial` | Create a free account (`{"accept": true}`) |
+| `POST /_plugins/_infino/account/trial` | Create a trial account (`{"accept": true}`) |
 | `PUT /_plugins/_infino/account` | Use an account you have: `{"api_key": "..."}`, with optional `platform` (`infino.platform.default_url` when unset) and `database` (the cluster's name when unset). The key is tried once first, so a wrong key fails here. |
 | `DELETE /_plugins/_infino/account` | Stop using the account on this node; the tables stay on the service |
 | `GET /_plugins/_infino/account/indices` | What would come back on a fresh cluster (`?name=<index>` for one) |
@@ -214,78 +194,7 @@ The security plugin's index is Infino-backed too, so its roles, users and passwo
 
 ## Settings
 
-**Index settings**
-
-| Setting | Default | |
-|---|---|---|
-| `index.infino.enabled` | on (`infino.index.default_enabled`) | Whether the index is Infino-backed. |
-| `index.infino.mode` | `default` | `default` or `proxy`; fixed at creation. See [How it works](#how-it-works). |
-| `index.infino.table` | derived from the index's name | The table behind the index, named explicitly, to reattach a recreated index to its rows. A named table is kept when its index is deleted. |
-| `index.infino.attached` | `false` | The table named in `index.infino.table` was made outside the plugin: it is read as it is and never changed. Fixed at creation. See [Attaching to an existing table](#attaching-to-an-existing-table). |
-| `index.infino.search.window.field` | none | The date field a search's span of time is read from, for `index.infino.search.window.max`. Dynamic. |
-| `index.infino.search.window.max` | none | The widest span of that field one search may list documents or break them into groups over, such as `1d`. A wider search, or one that names no range with both ends, is refused at once with a 400, and the table is not sent it. A count, and a sum, average, minimum, maximum, value count or stats with no hits beside them, are answered over any span. The span is measured as the statement reads it: each end in the range's format or the field's, an inclusive upper end to the last instant of what it names (`now/y` to `now/y` is a year). `_delete_by_query`, `_update_by_query` and `_reindex` search first, so on such an index they need the same range. The SQL routes are not held to it. For a table too large to read whole on a visitor's request, where such a search would run for minutes and hold a search thread of the node until it ends. Dynamic. |
-| `index.infino.search.phrases` | `true` | Whether a search may ask for a phrase on a text field (`match_phrase`, `match_phrase_prefix`, a `multi_match` of the phrase kinds, a quoted run of a query string), in its query, its post filter, a filter aggregation or a rescore. Words reach the table as a filter beside the search's other clauses; a phrase reaches it as a lookup of its own over every row, which no range narrows, and on a very large table that lookup does not finish. Set to `false`, such a search is refused at once with a 400, a count included. A phrase query on a keyword, number or date is a comparison and is always served. Independent of the window settings. Dynamic. |
-| `index.infino.optimize_interval` | `60s` | How often the table is compacted (5 seconds at least; off for a hosted account, which compacts its own tables). |
-| `index.infino.edges` | `false` | The index holds a graph's edges, for `graph_walk` and `graph_rank` in [SQL](#sql). |
-
-A table backs one live index. If two indices name the same table (explicitly, or by names that map to one table, such as `logs.app` and `logs_app`), the older one is served from it and the other is refused, even after the older one is deleted. With the security plugin, setting `index.infino.table` in a create, resize, rollover or template request needs the right to manage the cluster.
-
-### Attaching to an existing table
-
-An index can read a table that was made and filled outside the plugin, such as one loaded through the engine or the hosted service:
-
-```bash
-curl -sk -u "admin:$OPENSEARCH_ADMIN_PASSWORD" -X PUT https://localhost:9200/pageviews -H 'Content-Type: application/json' -d '{
-  "settings": { "index.infino.table": "pageviews", "index.infino.attached": true },
-  "mappings": { "properties": {
-    "time":  { "type": "date" },
-    "title": { "type": "text" },
-    "hits":  { "type": "long" }
-  } }
-}'
-```
-
-The mapping names the table's columns and the field type each is read as. It is checked against the table when the index is created: a table that does not exist, a field the table has no column for, or a column of another type, is refused with a 400 and no index is created. The settings and mappings of the templates the index's name matches are judged with the request's, as the cluster merges them. A table that cannot be read at that moment is not judged: the index is created, and answers each request with the reason once its shard has read the table.
-
-- **The table is never changed.** Nothing is added to it when the index is created, it is not compacted, and it stays when the index is deleted.
-- **Every write is refused** with a 403: index, update, delete, a write by query, and a document an ingest pipeline sends to the index from another one. A bulk request with an item for an attached index is refused as a whole, its items for other indices included; send those in a bulk of their own.
-- **A template may set `index.infino.attached` and leave the table to the request** that creates the index. The two are checked together when the index is created.
-- **The mapping is fixed when the index is created.** A mapping update is refused with a 400. For a different mapping, delete the index and create it again: it holds no data of its own.
-- **A document is a row.** Its `_id` is the engine's row id, and its `_source` is the row's columns; a null column is left out. A date column is read as the instant its day starts at.
-- **The index is served in proxy mode.** A request or a template that asks for default mode is refused.
-- **A `text` field needs a full-text index on its column.** One without positions matches and ranks terms; a phrase query needs positions. A column with a full-text index is searched as text only when its field is mapped as `text`: mapped as `keyword`, or left out of the mapping, it is compared whole.
-- **A table with a column named `score`, `osid`, `source` or `osseq` is not attached to.** A search gives each row's score under the first, and the plugin reads a document through the others.
-- **A column the table's owner removes later** is noticed by a statement that fails on it, which then runs again over the columns the table holds now. A ranked search (`match`, k-NN, hybrid) does not: create the index again after such a change.
-- A table the plugin wrote is not attached to. Name it in `index.infino.table` without this setting.
-
-**Node settings** (`opensearch.yml`)
-
-| Setting | Default | |
-|---|---|---|
-| `infino.index.default_enabled` | `true` | Whether new indices are Infino-backed unless their settings say otherwise. |
-| `infino.default_mode.enabled` | `true` (`false` when neural search is installed) | Whether this node serves default-mode indices. Off: its indices are created in proxy mode. |
-| `infino.platform.url` | none | The hosted service the tables live on. |
-| `infino.platform.database` | the cluster's name | The account's database. |
-| `infino.platform.api_key` | none | The account's key, in the keystore. `INFINO_API_KEY` in the environment is read when it is unset. |
-| `infino.platform.default_url` | `https://api.platform.infino.ws` | The service a trial or a `PUT` of the account is sent to when the request names none. |
-| `infino.platform.read_window` | `1s` | How long a read on the hosted service may be answered from a snapshot taken before a write. A refresh waits this long after the last write it covers, so the search after it sees the writes. `0` waits for nothing. Not used with the node's own storage. |
-| `infino.cache.dir` | `infino-cache` under the node's first data path | Where the engine keeps a local copy of what it reads from the node's storage. Not used with a hosted account. |
-| `infino.sql.max_result_size` | `http.max_content_length` | The largest SQL result, as JSON; a statement whose result is larger is refused with a 400. |
-| `infino.skeleton_rebuild.paused` | `false` | Dynamic (`PUT _cluster/settings`). Holds the skeleton rebuild of an index recreated over a table that has rows, until it is cleared. Meanwhile the index's searches miss those rows, and writes look ids up in the table. |
-
-**JVM properties** (`config/jvm.options` or `OPENSEARCH_JAVA_OPTS`)
-
-| Property | Default | |
-|---|---|---|
-| `infino.lib` | `libinfino_capi.so` on the library path | The native bridge. On macOS, name the `.dylib`. |
-| `infino.uri` | `memory://` | Where the tables live without an account: `file://`, `s3://` or `gs://`. |
-| `infino.engine.batch.docs` | `50000` | Default mode: the most documents a shard's batch holds before it commits on its own, between refreshes. |
-| `infino.engine.batch.bytes` | 64 MiB | Default mode: the most source bytes a shard's batch holds before it commits on its own. |
-| `infino.engine.copies.wait.ms` | `60000` | Default mode: how long a refresh, flush or hand-off waits for the shard's copies to hold the operations it covers. |
-| `infino.batch.docs` | `50000` | Proxy mode: the most documents one write batch holds. |
-| `infino.batch.bytes` | 64 MiB | Proxy mode: the most bytes one write batch holds. |
-| `infino.batch.concurrency` | half the `write` pool | Proxy mode: the most appends to one table that run at once. Appends that name the same document id never run at once. |
-| `infino.nested.candidates.max` | `10000` | The most documents a `nested` query may leave to check entry by entry; past it the query is refused. |
+None of the settings has to change for a default run: each has a default that works as it is, and the quick start and the [getting-started guide](docs/getting-started.md) don't ask you to set any. [Configuration](docs/configuration.md) lists every index setting, node setting and JVM property, and covers [attaching an index to an existing table](docs/configuration.md#attaching-to-an-existing-table) and [limits for very large tables](docs/configuration.md#very-large-tables).
 
 ## SQL
 
@@ -293,10 +202,10 @@ The mapping names the table's columns and the field type each is read as. It is 
 
 ```bash
 curl -XPOST localhost:9200/_plugins/_infino/sql -H 'Content-Type: application/json' -d '{
-  "query": "SELECT level, count(*) AS n FROM logs GROUP BY level ORDER BY n DESC"}'
+  "query": "SELECT service, count(*) AS n FROM errors GROUP BY service ORDER BY n DESC"}'
 ```
 
-The answer is `{"schema": [{"name", "type"}], "rows": [...]}`. A statement names indices (an index, an alias, or a pattern in quotes), never tables. The security plugin authorizes the caller for each index as it would for a search, and the statement sees each index as the caller does: hidden fields left out, masked fields masked, and only the rows the caller's document rules and filtering aliases allow. System indices are refused.
+`errors` is the index the [guide](docs/getting-started.md#sql) makes. The answer is `{"schema": [{"name", "type"}], "rows": [...]}`. A statement names indices (an index, an alias, or a pattern in quotes), never tables. The security plugin authorizes the caller for each index as it would for a search, and the statement sees each index as the caller does: hidden fields left out, masked fields masked, and only the rows the caller's document rules and filtering aliases allow. System indices are refused.
 
 An index with `index.infino.edges: true` holds a graph's edges: each document is one edge, `{src_table, src_id, dst_table, dst_id}`, naming two rows by the `_table` and `_id` a SQL read gives each row. `graph_walk` and `graph_rank` walk the edges; each compaction (and, in default mode, a force merge) builds the index they read.
 
@@ -332,7 +241,7 @@ A `nested` query (Dashboards' `has_reference` on saved objects' `references` is 
 - **Where `knn` goes.** `knn` is the whole query, not a clause inside `bool`.
 - **Refused, with the parameter named:** radial search (`max_distance`, `min_score`), `method_parameters`, `rescore`, `expand_nested_docs`, `ignore_unmapped`, a boost or query name. With a `knn` query, aggregations, field sorts, `post_filter`, `collapse`, `search_after` and scroll are refused too.
 
-**Not supported:** HDR percentiles; `fuzzy`, `function_score` and geo queries; `suggest`; sliced search (sliced scroll, reindex or update by query); and a search across Infino-backed and other indices together. A request using any of these fails with a 400 that names the clause (`[infino] query not served by the table: ...`); it does not return an empty answer instead. Some searches the plugin does serve still answer differently from stock with no error ([#56](https://github.com/infino-ai/opensearch-infino/issues/56)).
+**Not supported:** HDR percentiles; `fuzzy`, `function_score` and geo queries; `suggest`; sliced search (sliced scroll, reindex or update by query); and a search across Infino-backed and other indices together. A request using any of these fails with a 400 that names the clause (`[infino] query not served by the table: ...`); it does not return an empty answer instead.
 
 ## Writes
 
