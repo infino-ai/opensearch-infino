@@ -630,12 +630,12 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             .filter(QueryBuilders.rangeQuery("status").gte(500));
         assertEquals(
             "SELECT osid, source, score FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') "
-                + "WHERE (1=1 AND \"level\" = 'error' AND (\"status\" >= 500)) ORDER BY score DESC LIMIT 10",
+                + "WHERE (1=1 AND \"level\" = 'error' AND (\"status\" >= 500)) ORDER BY score DESC, \"_id\" ASC LIMIT 10",
             hits(translate(b), null, 10)
         );
         // No filter: the page, as before.
         assertEquals(
-            "SELECT osid, source, score FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') WHERE 1=1 ORDER BY score DESC LIMIT 10",
+            "SELECT osid, source, score FROM bm25_search('os_logs_0', 'message', 'disk', 10, 'or') WHERE 1=1 ORDER BY score DESC, \"_id\" ASC LIMIT 10",
             hits(translate(QueryBuilders.matchQuery("message", "disk")), null, 10)
         );
         // Every filter shape the translator writes over the table's columns (a
@@ -657,6 +657,28 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             assertFalse(filter.toString(), InfinoQueryTranslator.joinsAfterRanking(t.where()));
             assertTrue(filter.toString(), hits(t, null, 10).contains("bm25_search('os_logs_0', 'message', 'disk', 10, 'or')"));
         }
+    }
+
+    public void testRankedSearchOrdersItsTiesAsWritten() {
+        // Stock orders hits that tie on the score by their place in the index,
+        // the first written first. The engine's row id holds that order, so
+        // every ranked statement breaks its ties on it: a filtered page, one
+        // narrowed after the ranking, and a collapse's window and its groups.
+        String tie = "score DESC, \"_id\" ASC";
+        BoolQueryBuilder filtered = QueryBuilders.boolQuery()
+            .must(QueryBuilders.matchQuery("message", "disk"))
+            .mustNot(QueryBuilders.termQuery("level", "info"));
+        assertTrue(hits(translate(filtered), null, 10).endsWith("ORDER BY " + tie + " LIMIT 10"));
+        Map<String, Column> cols = columns();
+        cols.put("title", new Column("title", "str", true, false));
+        BoolQueryBuilder joined = QueryBuilders.boolQuery()
+            .must(QueryBuilders.matchQuery("message", "disk"))
+            .filter(QueryBuilders.matchQuery("title", "outage"));
+        String joinedSql = hits(InfinoQueryTranslator.translate(joined, cols, TABLE, NOW), null, 10);
+        assertTrue(joinedSql, joinedSql.endsWith("ORDER BY " + tie + " LIMIT 10"));
+        String collapsed = hits(translate(filtered), columns().get("level"), 10);
+        assertTrue(collapsed, collapsed.contains("ORDER BY " + tie + ")"));
+        assertTrue(collapsed, collapsed.endsWith("ORDER BY " + tie + " LIMIT 10"));
     }
 
     public void testRankedSearchKeepsTheWindowWhereRowsGoAfterTheRanking() {

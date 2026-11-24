@@ -1925,7 +1925,14 @@ public final class InfinoSearch {
             boolean narrowedAfterRanking = InfinoQueryTranslator.joinsAfterRanking(where) || (filtered && plan.collapse() != null);
             from = q.rankedFrom(narrowedAfterRanking ? window : fetch);
             hit.append(", score");
-            order = "score DESC";
+            // Hits that tie on the score come in the order they were written.
+            // Stock orders them by segment, then by place in the segment,
+            // which is the order they were written only until its segments
+            // merge: a force-merge can reorder its ties, where the row id
+            // keeps them in write order, a re-indexed document last. The
+            // ranked search keeps that order, but a sort by the score alone
+            // need not.
+            order = "score DESC, " + InfinoQueryTranslator.quoteIdent(InfinoSql.ROW_ID) + " ASC";
         } else {
             // No sort and no score: a plain scan is left in the engine's file
             // order, a read joined by id is ordered by the row id (see
