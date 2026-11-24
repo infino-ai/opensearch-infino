@@ -63,9 +63,7 @@ search/330_fetch_fields/Test disable _source loading  # [bug] fields returns not
 search/330_fetch_fields/Test token count  # [bug] fields returns the wrong token_count
 search/190_index_prefix_search/search with index prefixes  # [bug] max_score differs from stock scoring
 search/210_rescore_explain/Score should match explanation in rescore  # [bug] max_score differs from stock scoring
-search/50_multi_match/Cross fields do not return negative scores  # [bug] multi_match cross_fields orders hits differently from stock on some runs
-search/270_wildcard_fieldtype_queries/case insensitive query on wildcard field  # [bug] hits with equal scores come back in a different order from stock, so the first _id differs on some runs
-search/270_wildcard_fieldtype_queries/case insensitive regexp query on wildcard field  # [bug] hits with equal scores come back in a different order from stock, so the first _id differs on some runs
+search/50_multi_match/Cross fields do not return negative scores  # [bug] multi_match over several text fields is answered unranked: field boosts, tie_breaker and the cross_fields type are ignored, so hits come back in write order, not by score
 
 # --- Aggregation results
 search.aggregation/10_histogram/Deprecated _time order  # [bug] date_histogram ignores order: a descending key order comes back ascending
