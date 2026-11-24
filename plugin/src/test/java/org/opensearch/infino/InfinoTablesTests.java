@@ -18,8 +18,10 @@ import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.MetadataCreateIndexService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.indices.InvalidIndexNameException;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;
@@ -80,9 +82,7 @@ public class InfinoTablesTests extends OpenSearchTestCase {
     }
 
     public void testTheRegistrysTableBacksNoIndex() {
-        // An index named "index" maps to the registry's table by its name alone.
-        IndexMetadata named = index("index", "u1", 1);
-        assertEquals(InfinoRegistry.TABLE, InfinoTables.tablesOf(named).get(0));
+        IndexMetadata named = index("reg1", "u1", 1, Settings.builder().put(InfinoPlugin.INFINO_TABLE.getKey(), InfinoRegistry.TABLE).build());
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
             () -> InfinoTables.claim(InfinoRegistry.TABLE, named, InfinoTables.naming(List.of(named)))
@@ -90,15 +90,54 @@ public class InfinoTablesTests extends OpenSearchTestCase {
         assertTrue(e.getMessage(), e.getMessage().contains("holds the registry"));
     }
 
-    public void testAnIndexWhoseTableWouldBeTheRegistrysIsRefusedAtCreate() {
+    public void testAnIndexNamedIndexIsServedFromATableNoOtherIndexNameMapsTo() {
+        Settings oneShard = Settings.builder()
+            .put(InfinoPlugin.INFINO_ENABLED.getKey(), true)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .build();
         for (String mode : List.of(InfinoPlugin.MODE_PROXY, InfinoPlugin.MODE_DEFAULT)) {
-            Settings settings = Settings.builder().put(InfinoPlugin.INFINO_MODE.getKey(), mode).build();
+            Settings settings = Settings.builder().put(oneShard).put(InfinoPlugin.INFINO_MODE.getKey(), mode).build();
+            assertEquals(List.of("os_-index"), InfinoTables.tablesOf("index", settings));
+            InfinoTables.refuseRegistryTable("index", settings);
+            // Every other name keeps the table it maps to, the registry's neighbours included.
+            for (String name : List.of("logs", ".index", "index_", "index-1", "os_index", "index_shard0")) {
+                String table = InfinoTables.tablesOf(name, settings).get(0);
+                assertNotEquals(name, "os_-index", table);
+                assertNotEquals(name, InfinoRegistry.TABLE, table);
+                assertEquals(name, InfinoNative.tableFor(name), table);
+            }
+        }
+        // A default-mode index of several shards keeps the shard tables it always had: none is the registry's.
+        Settings sharded = Settings.builder()
+            .put(oneShard)
+            .put(InfinoPlugin.INFINO_MODE.getKey(), InfinoPlugin.MODE_DEFAULT)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 2)
+            .build();
+        assertEquals(List.of("os_index_shard0", "os_index_shard1"), InfinoTables.tablesOf("index", sharded));
+        // Beside an older index whose name differs only by a character a table name may not hold, the index is served from its own
+        // table, and no index is named for the registry's.
+        IndexMetadata index = index("index", "u2", 2);
+        IndexMetadata dotted = index(".index", "u1", 1);
+        Map<String, List<IndexMetadata>> naming = InfinoTables.naming(List.of(dotted, index));
+        assertEquals(index.getIndex(), InfinoTables.owner(naming.get("os_-index")));
+        InfinoTables.claim("os_-index", index, naming);
+        assertNull(naming.get(InfinoRegistry.TABLE));
+        // The one name that would map to the same table is one OpenSearch refuses.
+        expectThrows(InvalidIndexNameException.class, () -> MetadataCreateIndexService.validateIndexOrAliasName("-index", InvalidIndexNameException::new));
+    }
+
+    public void testAnIndexWhoseTableWouldBeTheRegistrysIsRefusedAtCreate() {
+        // Only a table named explicitly can be the registry's, as a template may name it.
+        for (String mode : List.of(InfinoPlugin.MODE_PROXY, InfinoPlugin.MODE_DEFAULT)) {
+            Settings settings = Settings.builder()
+                .put(InfinoPlugin.INFINO_MODE.getKey(), mode)
+                .put(InfinoPlugin.INFINO_TABLE.getKey(), InfinoRegistry.TABLE)
+                .build();
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> InfinoTables.refuseRegistryTable("index", settings)
+                () -> InfinoTables.refuseRegistryTable("logs", settings)
             );
-            assertTrue(e.getMessage(), e.getMessage().contains("index [index] would be served from table [os_index]"));
-            InfinoTables.refuseRegistryTable("logs", settings);
+            assertTrue(e.getMessage(), e.getMessage().contains("index [logs] would be served from table [os_index]"));
         }
         Settings named = Settings.builder().put(InfinoPlugin.INFINO_TABLE.getKey(), "os_other").build();
         InfinoTables.refuseRegistryTable("index", named);

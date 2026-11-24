@@ -43,7 +43,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * index's name maps to its table with every character a table name may not
  * hold turned into {@code _} ({@code logs.app} and {@code logs_app} both
  * read {@code os_logs_app}), and {@code index.infino.table} names any table
- * at all. Of the live indices naming a table, the oldest is served from it
+ * at all. The one name the registry's table could be reached by, an index
+ * named {@code index} served from one table, maps to {@code os_-index}
+ * instead, which no other index name maps to. Of the live indices naming a table, the oldest is served from it
  * and every other one is refused, so an index never reads or writes rows
  * that belong to another, whatever the security plugin lets its user do
  * with the index itself. No index is served from the registry's table.
@@ -124,10 +126,10 @@ public final class InfinoTables {
     /** Every table that would hold the rows of an index of this name and these settings, as {@link #tablesOf(IndexMetadata)} names them. */
     static List<String> tablesOf(String name, Settings settings) {
         String table = InfinoNative.tableFor(name, settings);
-        int shards = IndexMetadata.INDEX_NUMBER_OF_SHARDS_SETTING.get(settings);
-        if (!InfinoPlugin.inDefaultMode(settings) || shards == 1) {
+        if (oneTable(settings)) {
             return List.of(table);
         }
+        int shards = IndexMetadata.INDEX_NUMBER_OF_SHARDS_SETTING.get(settings);
         List<String> out = new ArrayList<>(shards);
         for (int shard = 0; shard < shards; shard++) {
             out.add(shardTable(table, shard, settings));
@@ -177,7 +179,11 @@ public final class InfinoTables {
         return oldest == null ? null : oldest.getIndex();
     }
 
-    /** Refuse an index of this name and these settings when one of its tables would be the registry's. */
+    /**
+     * Refuse an index of this name and these settings when one of its tables
+     * would be the registry's, which only {@code index.infino.table} can name
+     * (no index name maps to it), as a template may.
+     */
     static void refuseRegistryTable(String name, Settings settings) {
         for (String table : tablesOf(name, settings)) {
             if (InfinoRegistry.TABLE.equals(table)) {
@@ -293,7 +299,7 @@ public final class InfinoTables {
 
     /** The table holding the document {@code id} (routed by {@code routing} when given), as its shard is chosen for a write. */
     public String ensureForDocument(IndexMetadata md, String id, String routing) {
-        if (!InfinoPlugin.inDefaultMode(md.getSettings()) || md.getNumberOfShards() == 1) {
+        if (oneTable(md.getSettings())) {
             return ensure(md);
         }
         return ensure(md, OperationRouting.generateShardId(md, id, routing));
@@ -301,8 +307,12 @@ public final class InfinoTables {
 
     /** The name of one shard's table, from the index's table name and settings. */
     static String shardTable(String indexTable, int shard, Settings indexSettings) {
-        int shards = IndexMetadata.INDEX_NUMBER_OF_SHARDS_SETTING.get(indexSettings);
-        return InfinoPlugin.inDefaultMode(indexSettings) && shards > 1 ? indexTable + SHARD_SUFFIX + shard : indexTable;
+        return oneTable(indexSettings) ? indexTable : indexTable + SHARD_SUFFIX + shard;
+    }
+
+    /** Whether an index with these settings keeps its rows in one table: in proxy mode, or of a single shard. */
+    static boolean oneTable(Settings indexSettings) {
+        return !InfinoPlugin.inDefaultMode(indexSettings) || IndexMetadata.INDEX_NUMBER_OF_SHARDS_SETTING.get(indexSettings) == 1;
     }
 
     private String declare(String table, IndexMetadata md) {
