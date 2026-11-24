@@ -77,7 +77,6 @@ search.aggregation/200_top_hits_metric/top_hits aggregation with sequence number
 search.aggregation/230_composite/date_histogram with time_zone  # [bug] composite date_histogram with time_zone splits one day into two buckets (https://github.com/infino-ai/opensearch-infino/issues/208)
 search.aggregation/30_sig_terms/Default index  # [bug] significant_terms on a text field returns no buckets (https://github.com/infino-ai/opensearch-infino/issues/209)
 search.aggregation/30_sig_terms_field_match_only_text/Default index  # [bug] significant_terms on a text field returns no buckets (https://github.com/infino-ai/opensearch-infino/issues/209)
-search.aggregation/40_range/Date Range Missing  # [bug] date_range with missing returns 500 (https://github.com/infino-ai/opensearch-infino/issues/210)
 
 # --- Errors that differ from stock
 search.aggregation/230_composite/Composite aggregation and array size  # [bug] the error message differs from stock (https://github.com/infino-ai/opensearch-infino/issues/211)
