@@ -11,20 +11,19 @@ import org.opensearch.ExceptionsHelper;
 import org.opensearch.Version;
 import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.bulk.BulkItemResponse;
-import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.update.UpdateRequest;
-import org.opensearch.cluster.ClusterName;
-import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -84,27 +83,39 @@ public class InfinoReadByIdTests extends OpenSearchTestCase {
     }
 
     /**
-     * An update in default mode whose document cannot be read fails with 503
-     * and writes nothing: neither a partial document as the upsert
-     * ({@code doc_as_upsert}) nor the upsert body, either of which would
-     * create the document or overwrite the one the table holds.
+     * An update in default mode whose document cannot be read on the primary
+     * that merges it fails with 503 and writes nothing: neither a partial
+     * document as the upsert ({@code doc_as_upsert}) nor the upsert body,
+     * either of which would create the document or overwrite the one the
+     * table holds. The source to merge into is read from the table, from
+     * its latest commit, or not at all when the shard is not open here;
+     * each failure is the update's answer, and the update does not run
+     * again, as it would on a version conflict.
      */
     public void testAnUpdateWhoseDocumentCannotBeReadFailsRatherThanWrites() {
         InfinoNative.useLib(new FakeBridge(FAILED).lib());
-        IndexMetadata md = index(InfinoPlugin.MODE_DEFAULT);
-        ClusterState state = ClusterState.builder(ClusterName.DEFAULT).metadata(Metadata.builder().put(md, false)).build();
-        BulkRequest bulk = new BulkRequest().add(new UpdateRequest("logs", "1").doc(Map.of("f", 2)).docAsUpsert(true))
-            .add(new UpdateRequest("logs", "2").doc(Map.of("f", 2)).upsert(Map.of("f", 1)));
-        InfinoBulkActionFilter.EngineBulk routed = InfinoBulkActionFilter.engineUpdates(state, bulk, List.of("logs", "logs"), new InfinoTables());
-        assertNotNull(routed);
-        assertTrue(routed.bulk().requests().toString(), routed.bulk().requests().isEmpty());
-        assertEquals(2, routed.answered().size());
-        for (BulkItemResponse item : routed.answered().values()) {
-            assertTrue(item.isFailed());
-            assertEquals(DocWriteRequest.OpType.UPDATE, item.getOpType());
-            assertEquals(RestStatus.SERVICE_UNAVAILABLE, item.status());
-            assertEquals(RestStatus.SERVICE_UNAVAILABLE, ExceptionsHelper.status(item.getFailure().getCause()));
+        List<Exception> failedReads = List.of(
+            expectThrows(InfinoNative.InfinoException.class, () -> InfinoNative.getSourceFresh("os_logs", "1")),
+            expectThrows(InfinoNative.InfinoException.class, () -> InfinoNative.getSourceLatest("os_logs", "1")),
+            expectThrows(InfinoNative.InfinoException.class, () -> InfinoEngine.sourceForMerge("os_logs", "1", true))
+        );
+        List<UpdateRequest> updates = List.of(
+            new UpdateRequest("logs", "1").doc(Map.of("f", 2)).docAsUpsert(true).retryOnConflict(3),
+            new UpdateRequest("logs", "2").doc(Map.of("f", 2)).upsert(Map.of("f", 1)).retryOnConflict(3)
+        );
+        for (Exception read : failedReads) {
+            for (UpdateRequest update : updates) {
+                BulkItemResponse item = InfinoBulkActionFilter.unmerged(0, update, "logs", read, new HashMap<>());
+                assertNotNull(read.getMessage(), item);
+                assertTrue(item.isFailed());
+                assertEquals(DocWriteRequest.OpType.UPDATE, item.getOpType());
+                assertEquals(RestStatus.SERVICE_UNAVAILABLE, item.status());
+                assertEquals(RestStatus.SERVICE_UNAVAILABLE, ExceptionsHelper.status(item.getFailure().getCause()));
+            }
         }
+        // A conflict, unlike a failed read, runs the update again.
+        Exception conflict = new VersionConflictEngineException(new ShardId("logs", "logs-uuid", 0), "1", "moved");
+        assertNull(InfinoBulkActionFilter.unmerged(0, updates.get(0), "logs", conflict, new HashMap<>()));
     }
 
     private static IndexMetadata index(String mode) {
