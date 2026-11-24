@@ -150,6 +150,12 @@ public final class InfinoSearch {
     private static final String COLLAPSE_RANK = "collapse_rank";
     /** Why a scroll sorted by {@code _score} then fields over a scored query is refused: its pages resume from a score no keyset can compare against. */
     static final String SCORE_SORT_SCROLL = "[infino] a sort mixing _score with a field is not served with scroll on a scored query";
+    /**
+     * Why a scroll with {@code terminate_after} is refused: its rounds are
+     * read from a cursor over the table, with no shard collecting toward the
+     * limit as a stock scroll's rounds do.
+     */
+    static final String TERMINATE_AFTER_SCROLL = "[infino] terminate_after is not served with a scroll";
     /** The column a ranked or scored statement gives each hit's score under. */
     static final String SCORE = "score";
     /**
@@ -520,6 +526,21 @@ public final class InfinoSearch {
     static Plan plan(String table, SearchSourceBuilder source, long nowMillis, InfinoAccess access) {
         if (source.suggest() != null) {
             throw new IllegalArgumentException("[infino] suggest is not served by the table");
+        }
+        // Each changes which documents match or how they rank, so answering without it would be a
+        // wrong answer: min_score drops documents scored under it from the hits, total and
+        // aggregations (a score is never negative, so one of 0 or less drops none), and rescore
+        // reranks the top documents by another query. terminate_after is served once the total
+        // is known (see terminated).
+        if (source.minScore() != null && source.minScore() > 0) {
+            throw new IllegalArgumentException("[infino] min_score is not served by the table");
+        }
+        if (source.rescores() != null && !source.rescores().isEmpty()) {
+            if (source.collapse() != null) {
+                // Stock refuses the pair before it would rescore, with this message.
+                throw new IllegalArgumentException("cannot use `collapse` in conjunction with `rescore`");
+            }
+            throw new IllegalArgumentException("[infino] rescore is not served by the table");
         }
         Map<String, Column> fullCols = InfinoNative.columns(table);
         if (fullCols.isEmpty()) {
@@ -2300,6 +2321,13 @@ public final class InfinoSearch {
         return upTo == null || upTo != SearchContext.TRACK_TOTAL_HITS_DISABLED;
     }
 
+    /** The index's number of shards from the cluster state, or 0 when it cannot be read there. */
+    private static int shards(Index index) {
+        ClusterService clusters = InfinoServices.clusterService();
+        IndexMetadata md = clusters == null ? null : clusters.state().metadata().index(index);
+        return md == null ? 0 : md.getNumberOfShards();
+    }
+
     /** The index's mapping from the cluster state, or null when it cannot be read there. */
     private static MappingMetadata mapping(Index index) {
         ClusterService clusters = InfinoServices.clusterService();
@@ -2591,6 +2619,8 @@ public final class InfinoSearch {
      * {@link #reported} turns any count past the limit into the limit, as a
      * lower bound. A default-mode shard's total reaches its coordinator the
      * same way: one past the limit stays past it when shards' totals add up.
+     * One past {@code terminate_after} when that is larger, to tell whether
+     * more documents match than it names (see {@link #terminated}).
      * Unlimited when the request tracks every hit or none.
      */
     static long countCap(SearchSourceBuilder source) {
@@ -2599,7 +2629,51 @@ public final class InfinoSearch {
         if (limit == SearchContext.TRACK_TOTAL_HITS_DISABLED || limit == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
             return Long.MAX_VALUE;
         }
-        return (long) limit + 1;
+        return Math.max((long) limit, (long) source.terminateAfter()) + 1;
+    }
+
+    /** What a search with {@code terminate_after} reports: its total, and whether a shard stopped early. */
+    record Terminated(long total, boolean early) {}
+
+    /**
+     * What a search of an index held by {@code shards} stock shards
+     * reports for its {@code terminate_after}, from the page's {@code total}
+     * (exact up to {@link #countCap} when the request tracks it); null when
+     * the request sets none.
+     *
+     * <p>A stock shard stops collecting once more documents than {@code
+     * terminate_after} match its query and post_filter, and says so. When no
+     * more match, the answer is the full one, reported as not stopped early.
+     * Past it, the shard's hits are whichever documents it collected first,
+     * which only its segment order decides, so a request for hits is refused.
+     * A request for no hits (size 0: a count, aggregations or both) is served
+     * with the full answer: stock's totals and buckets past the limit are some
+     * subset of the matches, which is all a client can count on, and its
+     * count is the full one whenever Lucene counts the query from the index.
+     * Such a request is reported as stopped early when one of its shards
+     * holds more than {@code terminate_after} documents, which is certain
+     * once more than {@code shards} times that many match, and as not stopped
+     * early otherwise.
+     */
+    static Terminated terminated(Plan plan, SearchSourceBuilder source, long total, int shards) {
+        int after = source.terminateAfter();
+        if (after <= 0) {
+            return null;
+        }
+        if (plan.vector() != null) {
+            throw new IllegalArgumentException("[infino] terminate_after is not served by the table with a vector query");
+        }
+        long matched = trackTotal(source) ? total : total(plan, (long) after + 1);
+        if (matched <= after) {
+            return new Terminated(total, false);
+        }
+        if (source.size() != 0) {
+            throw new IllegalArgumentException(
+                "[infino] terminate_after is not served by the table when more than [" + after + "] documents match"
+            );
+        }
+        long beyondEveryShard = (long) after * Math.max(shards, 1) + 1;
+        return new Terminated(total, shards <= 1 || total(plan, beyondEveryShard) >= beyondEveryShard);
     }
 
     /**
@@ -2737,6 +2811,7 @@ public final class InfinoSearch {
         List<InternalAggregations> aggs = new ArrayList<>();
         Collection<AggregationBuilder> builders = builders(source);
         List<SortSpec> sorts = List.of();
+        boolean terminatedEarly = false;
         for (Index index : indices) {
             SearchSourceBuilder perIndex = after == null || after.get(index) == null ? source : withSearchAfter(source, after.get(index));
             Plan plan = plan(tableOf.apply(index), perIndex, now, accessOf.apply(index));
@@ -2766,6 +2841,12 @@ public final class InfinoSearch {
                 if (countWithAggs) {
                     page = new Page(page.hits(), counted.total(), page.exact(), page.maxScore(), page.unsourced(), page.chosen());
                 }
+            }
+            // The index's table holds every shard's rows.
+            Terminated terminated = terminated(plan, perIndex, page.total(), shards(index));
+            if (terminated != null) {
+                terminatedEarly |= terminated.early();
+                page = new Page(page.hits(), terminated.total(), page.exact(), page.maxScore(), page.unsourced(), page.chosen());
             }
             pages.add(page);
         }
@@ -2797,7 +2878,9 @@ public final class InfinoSearch {
             );
             reduced = InternalAggregations.topLevelReduce(aggs, ctx);
         }
-        SearchResponseSections sections = new SearchResponseSections(hits, reduced, null, false, null, null, 1);
+        // As stock, a search with terminate_after says whether a shard stopped early, and one without says nothing.
+        Boolean early = source.terminateAfter() > 0 ? terminatedEarly : null;
+        SearchResponseSections sections = new SearchResponseSections(hits, reduced, null, false, early, null, 1);
         long tookMillis = (System.nanoTime() - startNanos) / 1_000_000L;
         SearchResponse response = new SearchResponse(
             sections,

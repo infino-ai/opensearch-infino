@@ -195,6 +195,14 @@ thread_local! {
 
 /// Arrow type of a mapped `date`: epoch milliseconds in UTC, which is what
 /// OpenSearch stores and what its date queries compare against.
+/// `index` with token positions recorded or not; any other kind of index as it is.
+fn with_positions(mut index: ColumnIndex, on: bool) -> ColumnIndex {
+    if let ColumnIndex::Fts { positions, .. } = &mut index {
+        *positions = on;
+    }
+    index
+}
+
 fn date_type() -> DataType {
     DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
 }
@@ -1797,38 +1805,13 @@ fn declare_table(
                 .iter()
                 .find(|c| c.name == OSID)
                 .and_then(|c| match &c.index {
-                    Some(ColumnIndex::Fts {
-                        stopwords,
-                        stemmer,
-                        stored,
-                        bm25,
-                        ..
-                    }) => Some(ColumnIndex::Fts {
-                        stopwords: *stopwords,
-                        stemmer: *stemmer,
-                        positions: true,
-                        stored: *stored,
-                        bm25: *bm25,
-                    }),
+                    Some(index @ ColumnIndex::Fts { .. }) => {
+                        Some(with_positions(index.clone(), true))
+                    }
                     _ => None,
                 });
             // The index a keyword field added now gets: the same, without positions.
-            let exact_index = text_index.clone().map(|index| match index {
-                ColumnIndex::Fts {
-                    stopwords,
-                    stemmer,
-                    stored,
-                    bm25,
-                    ..
-                } => ColumnIndex::Fts {
-                    stopwords,
-                    stemmer,
-                    positions: false,
-                    stored,
-                    bm25,
-                },
-                other => other,
-            });
+            let exact_index = text_index.clone().map(|index| with_positions(index, false));
             let mut conflicts: Vec<String> = Vec::new();
             for f in &mapped {
                 let present = schema.field_with_name(&f.path).is_ok();
@@ -8317,6 +8300,11 @@ mod tests {
         assert_eq!(rows[1]["items.price"], 1.0, "{rows}");
         assert_eq!(rows[2]["items.price"], Value::Null, "{rows}");
         assert_eq!(rows[2]["prices"], "5.5,7", "{rows}");
+        let hits = sql(h, r#"SELECT osid FROM logs WHERE array_has("n[]", 2)"#);
+        assert_eq!(hits, json!([{ "osid": "m1" }]), "{hits}");
+        close(h);
+    }
+
     /// The hosted service in front of a typed schema refusal: a 400 whose
     /// body is the engine's error under the operation's name.
     fn hosted(typed: SchemaError) -> InfinoError {
@@ -8454,11 +8442,6 @@ mod tests {
         let mut written = written.into_inner();
         written.sort();
         assert_eq!(written, ["1", "3", "4"]);
-    }
-
-        let hits = sql(h, r#"SELECT osid FROM logs WHERE array_has("n[]", 2)"#);
-        assert_eq!(hits, json!([{ "osid": "m1" }]), "{hits}");
-        close(h);
     }
 
     /// An `unsigned_long` past the largest signed 64-bit integer, and a

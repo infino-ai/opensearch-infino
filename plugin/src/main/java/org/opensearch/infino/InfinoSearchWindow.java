@@ -19,9 +19,6 @@ import org.opensearch.index.query.QueryStringQueryBuilder;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.SimpleQueryStringBuilder;
 import org.opensearch.search.aggregations.AggregationBuilder;
-import org.opensearch.search.aggregations.bucket.filter.FilterAggregationBuilder;
-import org.opensearch.search.aggregations.bucket.filter.FiltersAggregationBuilder;
-import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator;
 import org.opensearch.search.aggregations.metrics.AvgAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.MaxAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.MinAggregationBuilder;
@@ -29,12 +26,9 @@ import org.opensearch.search.aggregations.metrics.StatsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.SumAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.ValueCountAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
-import org.opensearch.search.rescore.QueryRescorerBuilder;
-import org.opensearch.search.rescore.RescorerBuilder;
 
 import java.time.ZoneId;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -252,43 +246,11 @@ final class InfinoSearchWindow {
 
     /**
      * Whether the search asks for a phrase on a text field anywhere the
-     * table would look one up: its query, its post filter, the query of a
-     * filter or filters aggregation at any depth, or a rescore's query.
+     * table would look one up: any query it holds (see
+     * {@link InfinoSearchChecks#queries}).
      */
     static boolean phrase(SearchSourceBuilder source, Map<String, Object> properties) {
-        if (phrase(source.query(), properties) || phrase(source.postFilter(), properties)) {
-            return true;
-        }
-        if (source.aggregations() != null && phrase(source.aggregations().getAggregatorFactories(), properties)) {
-            return true;
-        }
-        if (source.rescores() != null) {
-            for (RescorerBuilder<?> rescore : source.rescores()) {
-                if (rescore instanceof QueryRescorerBuilder query && phrase(query.getRescoreQuery(), properties)) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    private static boolean phrase(Collection<AggregationBuilder> aggregations, Map<String, Object> properties) {
-        for (AggregationBuilder agg : aggregations) {
-            if (agg instanceof FilterAggregationBuilder filter && phrase(filter.getFilter(), properties)) {
-                return true;
-            }
-            if (agg instanceof FiltersAggregationBuilder filters) {
-                for (FiltersAggregator.KeyedFilter keyed : filters.filters()) {
-                    if (phrase(keyed.filter(), properties)) {
-                        return true;
-                    }
-                }
-            }
-            if (phrase(agg.getSubAggregations(), properties)) {
-                return true;
-            }
-        }
-        return false;
+        return InfinoSearchChecks.queries(source).stream().anyMatch(q -> phrase(q, properties));
     }
 
     /**
