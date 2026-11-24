@@ -980,6 +980,17 @@ impl Bridge {
         }
     }
 
+    /// Whether a keyword field's index takes the engine's `keyword`
+    /// analyzer, one term per value. Not on the hosted service, which
+    /// refuses a table that declares it: there a keyword field keeps the
+    /// default analyzer without positions, and a terms aggregation counts
+    /// its values with a statement ([`infino_value_counts_top`] declines).
+    /// Drop this once the hosted service takes the analyzer (#274); hosted
+    /// tables made before then keep the default analyzer until reloaded.
+    fn keyword_analyzer(&self) -> bool {
+        !self.hosted
+    }
+
     /// The [`Gate`] of `name`'s writes on this node.
     fn gate(&self, name: &str) -> Arc<Gate> {
         let mut gates = self.gates.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1939,7 +1950,12 @@ fn declare_table(
             // analyzer, each value one term exactly as written, so `=` and
             // `IN` look a value up whole and the column's term counts are its
             // value counts. It takes no stopwords or stemmer, and no positions.
+            // Where the connection cannot declare that analyzer
+            // ([`Bridge::keyword_analyzer`]), the text index without positions.
             let exact_index = text_index.as_ref().map(|index| {
+                if !bridge.keyword_analyzer() {
+                    return with_positions(index.clone(), false);
+                }
                 let mut exact = ColumnIndex::fts(Analyzer::Keyword);
                 if let (
                     ColumnIndex::Fts { stored, bm25, .. },
@@ -2111,8 +2127,14 @@ fn declare_table(
                     // order (match_phrase, quoted atoms of a query_string).
                     spec = spec.fts(FtsField::new(f.path.clone()).positions(true));
                 } else if f.exact {
-                    // One term per value (see `exact_index` above).
-                    spec = spec.fts(FtsField::new(f.path.clone()).analyzer("keyword"));
+                    // One term per value where the connection can declare
+                    // it (see `exact_index` above).
+                    let field = FtsField::new(f.path.clone());
+                    spec = spec.fts(if bridge.keyword_analyzer() {
+                        field.analyzer("keyword")
+                    } else {
+                        field
+                    });
                 }
                 if let Some((dim, metric)) = f.vector {
                     spec = spec.vector(f.path.clone(), dim, metric);
@@ -5707,7 +5729,8 @@ pub unsafe extern "C" fn infino_value_counts(
 /// its term index, so only `top` rows cross, however many values it has.
 /// `null`, for the caller's own statement to run, for a column without the
 /// `keyword` analyzer (the engine would run the grouped count there, which
-/// the statement runs as well), and where the engine's count fails. The
+/// the statement runs as well; every column on a hosted connection, see
+/// [`Bridge::keyword_analyzer`]), and where the engine's count fails. The
 /// engine counts every value in memory before the top `n` are picked;
 /// bounding that is infino-ai/infino#1459.
 #[no_mangle]
@@ -5742,6 +5765,11 @@ fn value_counts_top(
     column: &str,
     top: usize,
 ) -> Result<Option<Value>, String> {
+    // No column over this connection has the analyzer: decline without
+    // asking the hosted service for the table's schema.
+    if !conn.keyword_analyzer() {
+        return Ok(None);
+    }
     let keyword = conn
         .conn
         .schema(name)
@@ -6117,6 +6145,14 @@ mod tests {
     /// A fresh catalog on local disk: `memory://` tables have no durable
     /// storage, and delete / update need one.
     fn open_logs() -> *mut Bridge {
+        let h = open_storage();
+        let out = ensure(h, MAPPING);
+        assert!(out.contains("\"created\":true"), "{out}");
+        h
+    }
+
+    /// A connection over a fresh directory, with no table declared yet.
+    fn open_storage() -> *mut Bridge {
         let dir = std::env::temp_dir().join(format!(
             "infino-capi-test-{}-{}-{}",
             std::process::id(),
@@ -6130,8 +6166,6 @@ mod tests {
         let uri = format!("file://{}", dir.display());
         let h = unsafe { infino_open(c(&uri).as_ptr()) };
         assert!(!h.is_null());
-        let out = ensure(h, MAPPING);
-        assert!(out.contains("\"created\":true"), "{out}");
         h
     }
 
@@ -6787,6 +6821,70 @@ mod tests {
         assert_eq!(top_rows(&out), pairs(&[("a", 2), ("b", 1)]));
         assert_eq!(out["keyed_total"], json!(6));
         assert_eq!(out["nulls"], json!(3));
+        close(h);
+    }
+
+    /// The hosted service refuses a table that declares the `keyword`
+    /// analyzer, so a hosted connection declares keyword fields as it did
+    /// before that analyzer: the default analyzer, without positions, at
+    /// creation and when mapped later. The top call then declines and the
+    /// value counts still answer. Such a table read over storage of its own
+    /// declines too, since its columns lack the analyzer.
+    #[test]
+    fn a_hosted_connection_declares_keyword_fields_without_the_keyword_analyzer() {
+        let h = open_storage();
+        // Storage answers as the hosted service would; the flag picks the path.
+        unsafe { (*h).hosted = true };
+        let out = ensure(h, MAPPING);
+        assert!(out.contains("\"created\":true"), "{out}");
+        let out = ensure(h, r#"{"properties":{"host":{"type":"keyword"}}}"#);
+        assert!(out.contains("\"added\":1"), "{out}");
+        let schema = unsafe { &*h }.conn.schema("logs").unwrap();
+        for name in ["level", "http.method", "host"] {
+            let index = schema
+                .fields()
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.index.clone())
+                .unwrap();
+            assert!(
+                matches!(
+                    &index,
+                    Some(ColumnIndex::Fts {
+                        positions: false,
+                        analyzer,
+                        ..
+                    }) if !matches!(analyzer, Analyzer::Keyword)
+                ),
+                "{name}: {index:?}"
+            );
+        }
+        index(
+            h,
+            &[
+                ("1", r#"{"level":"b","host":"x"}"#),
+                ("2", r#"{"level":"a","host":"x"}"#),
+                ("3", r#"{"level":"b","host":"y"}"#),
+                ("4", r#"{"message":"no level"}"#),
+            ],
+        );
+        assert_eq!(value_counts_top(h, "level", 5), Value::Null);
+        assert_eq!(value_counts_top(h, "host", 5), Value::Null);
+        assert_eq!(
+            counted(&value_counts(h, "level", 10), "level", "count(*)"),
+            [
+                ("\"a\"".to_string(), 1),
+                ("\"b\"".to_string(), 2),
+                ("null".to_string(), 1)
+            ]
+        );
+        // `=` still matches a whole value.
+        let hits = sql(h, "SELECT osid FROM logs WHERE level = 'b' ORDER BY osid");
+        assert_eq!(hits, json!([{"osid":"1"},{"osid":"3"}]));
+        // Over storage of its own, the table's keyword columns still lack the
+        // analyzer: the top call declines rather than read empty term counts.
+        unsafe { (*h).hosted = false };
+        assert_eq!(value_counts_top(h, "level", 5), Value::Null);
         close(h);
     }
 

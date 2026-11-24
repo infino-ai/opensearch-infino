@@ -485,8 +485,8 @@ public final class InfinoNative {
 
     private InfinoNative() {}
 
-    /** The bridge library, loaded once per node. */
-    private static InfinoLib lib() {
+    /** The bridge library, loaded once per node (tests wrap it with {@link #useLib}). */
+    static InfinoLib lib() {
         InfinoLib loaded = lib;
         if (loaded == null) {
             synchronized (InfinoNative.class) {
