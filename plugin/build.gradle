@@ -159,6 +159,15 @@ def knnData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog
 def replicaTask = 'engineReplicaTest'
 def replicaTests = 'org.opensearch.infino.InfinoEngineReplicaIT'
 def replicaData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-replica"
+// The same tests with each node's own reads of a table trailing another
+// node's commit by up to this long, rather than the engine's one second. A
+// read that must see the latest commit (a realtime get, or a read that
+// decides a write) and goes through the node's own view instead then answers
+// from the commit before every time, where at one second it would only now
+// and then.
+def replicaStaleTask = 'engineReplicaStaleReadTest'
+def replicaStaleData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-replica-stale"
+def replicaStaleWindowMs = '30000'
 // The YAML suites' runner, which the knn task runs over its own suite.
 def yamlSuiteRunner = 'org.opensearch.infino.InfinoClientYamlTestSuiteIT'
 // Writes that arrive at every node of a cluster need more than one node: a
@@ -323,6 +332,16 @@ testClusters.matching { it.name == replicaTask }.all {
     systemProperty 'infino.engine.copies.wait.ms', '3000'
 }
 
+testClusters.maybeCreate(replicaStaleTask)
+testClusters.matching { it.name == replicaStaleTask }.all {
+    numberOfNodes = 2
+    plugin(tasks.named('bundlePlugin').flatMap { it.archiveFile })
+    systemProperty 'infino.uri', System.getProperty('infino.uri', "file://${replicaStaleData}")
+    systemProperty 'infino.data', System.getProperty('infino.data', replicaStaleData)
+    systemProperty 'infino.engine.copies.wait.ms', '3000'
+    systemProperty 'infino.engine.read.staleness.ms', replicaStaleWindowMs
+}
+
 testClusters.maybeCreate(multiNodeTask)
 testClusters.matching { it.name == multiNodeTask }.all {
     numberOfNodes = 2
@@ -426,6 +445,21 @@ def engineReplicaTest = tasks.register(replicaTask, RestIntegTestTask) {
     }
 }
 
+def engineReplicaStaleReadTest = tasks.register(replicaStaleTask, RestIntegTestTask) {
+    description = 'Runs the default-mode replica tests on a two-node cluster whose reads trail other nodes\' commits by up to 30s.'
+    group = 'verification'
+    testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
+    classpath = sourceSets.yamlRestTest.runtimeClasspath
+    // The searches' retries wait out the wider window.
+    systemProperty 'tests.infino.read.staleness.ms', replicaStaleWindowMs
+    filter {
+        includeTestsMatching replicaTests
+    }
+    doFirst {
+        delete replicaStaleData
+    }
+}
+
 def multiNodeTest = tasks.register(multiNodeTask, RestIntegTestTask) {
     description = 'Runs the multi-node write tests on a two-node cluster.'
     group = 'verification'
@@ -441,5 +475,6 @@ def multiNodeTest = tasks.register(multiNodeTask, RestIntegTestTask) {
 tasks.named('check').configure {
     dependsOn knnYamlRestTest
     dependsOn engineReplicaTest
+    dependsOn engineReplicaStaleReadTest
     dependsOn multiNodeTest
 }

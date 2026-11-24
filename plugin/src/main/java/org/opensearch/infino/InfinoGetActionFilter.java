@@ -117,7 +117,7 @@ public class InfinoGetActionFilter implements ActionFilter {
                         access,
                         InfinoMappingSource.of(index.mapping()),
                         get.fetchSourceContext(),
-                        routingOf(index, table, get.id(), doc, get.realtime())
+                        routingOf(index, doc)
                     )
                 );
                 listener.onResponse(response);
@@ -178,14 +178,12 @@ public class InfinoGetActionFilter implements ActionFilter {
 
     /**
      * The routing value a found default-mode document was written with, which
-     * a stock get reports as {@code _routing}; null when it was written with
-     * none, when it was not found, or in proxy mode, which routes nothing.
+     * a stock get reports as {@code _routing} and the document was read with;
+     * null when it was written with none, when it was not found, or in proxy
+     * mode, which routes nothing.
      */
-    static String routingOf(IndexMetadata index, String table, String id, InfinoNative.Doc doc, boolean realtime) {
-        if (doc == null || !InfinoPlugin.inDefaultMode(index.getSettings())) {
-            return null;
-        }
-        return realtime ? InfinoEngine.currentRouting(table, id) : InfinoNative.routingOf(table, id);
+    static String routingOf(IndexMetadata index, InfinoNative.Doc doc) {
+        return doc == null || !InfinoPlugin.inDefaultMode(index.getSettings()) ? null : doc.routing();
     }
 
     /**

@@ -23,6 +23,7 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,6 +55,59 @@ public class InfinoReadByIdTests extends OpenSearchTestCase {
         // An answer without its key is not taken for a missing document.
         expectThrows(InfinoNative.InfinoException.class, () -> InfinoNative.sourceOf("{}"));
         expectThrows(InfinoNative.InfinoException.class, () -> InfinoNative.docOf("{}"));
+    }
+
+    /**
+     * The documents of a read of many ids are read from under {@code docs}:
+     * an id {@code error}, or a source whose first field is {@code error},
+     * is a document; an answer without {@code docs} is not taken for ids the
+     * table does not hold.
+     */
+    public void testADocumentIdErrorReadsAsADocumentFromManyIds() {
+        Map<String, InfinoNative.Doc> docs = InfinoNative.docsFrom(
+            "{\"docs\":{\"error\":{\"source\":\"{\\\"error\\\":\\\"boom\\\"}\",\"seq\":4,\"routing\":\"r\"},\"b\":{\"source\":\"{}\",\"seq\":1}}}"
+        );
+        assertEquals(Map.of("error", new InfinoNative.Doc("{\"error\":\"boom\"}", 4, "r"), "b", new InfinoNative.Doc("{}", 1, null)), docs);
+        assertEquals(Map.of(), InfinoNative.docsFrom("{\"docs\":{}}"));
+        expectThrows(InfinoNative.InfinoException.class, () -> InfinoNative.docsFrom("{}"));
+    }
+
+    /**
+     * A read of many ids that fails, from the latest commit or through the
+     * node's own connection, throws with 503 rather than answering the ids
+     * as missing.
+     */
+    public void testAFailedReadOfManyIdsThrowsARetryableStatus() {
+        for (String answer : new String[] { FAILED, null }) {
+            for (boolean latest : new boolean[] { true, false }) {
+                FakeBridge bridge = new FakeBridge(answer);
+                InfinoNative.useLib(bridge.lib());
+                InfinoNative.InfinoException e = expectThrows(
+                    InfinoNative.InfinoException.class,
+                    () -> InfinoNative.docsOf("os_logs", List.of("1", "2"), latest)
+                );
+                assertEquals(RestStatus.SERVICE_UNAVAILABLE, e.status());
+                assertEquals(List.of(latest ? "infino_get_docs_latest" : "infino_get_docs"), bridge.reads);
+            }
+        }
+    }
+
+    /**
+     * A realtime get in default mode on a node that may not have read the
+     * last commit reads the latest commit; when that read fails the get
+     * fails with 503, never 404.
+     */
+    public void testAFailedLatestReadIsUnavailableNotMissing() {
+        FakeBridge bridge = new FakeBridge(FAILED);
+        InfinoNative.useLib(bridge.lib());
+        IndexMetadata md = index(InfinoPlugin.MODE_DEFAULT);
+        InfinoNative.InfinoException e = expectThrows(
+            InfinoNative.InfinoException.class,
+            () -> InfinoGetActionFilter.docOf(md, "os_logs", "1", true)
+        );
+        assertEquals(RestStatus.SERVICE_UNAVAILABLE, e.status());
+        assertNotEquals(RestStatus.NOT_FOUND, e.status());
+        assertEquals(List.of("infino_get_docs_latest"), bridge.reads);
     }
 
     /** A lookup the bridge fails, or answers with nothing at all, throws with 503 from both reads. */
@@ -132,9 +186,11 @@ public class InfinoReadByIdTests extends OpenSearchTestCase {
             .build();
     }
 
-    /** A bridge that opens and declares tables, and answers every lookup by id with {@code answer} (null for none). */
+    /** A bridge that opens and declares tables, and answers every read by id, of one id or many, with {@code answer} (null for none). */
     private static final class FakeBridge implements InvocationHandler {
         private final String answer;
+        /** The reads by id asked of the bridge, in order. */
+        final List<String> reads = new ArrayList<>();
 
         FakeBridge(String answer) {
             this.answer = answer;
@@ -153,6 +209,9 @@ public class InfinoReadByIdTests extends OpenSearchTestCase {
                     return string("{}");
                 case "infino_get":
                 case "infino_get_doc":
+                case "infino_get_docs":
+                case "infino_get_docs_latest":
+                    reads.add(method.getName());
                     return answer == null ? null : string(answer);
                 default:
                     return null; // the frees
