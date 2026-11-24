@@ -220,9 +220,21 @@ public class InfinoEngine extends InternalEngine {
      * delete), routing value and stamp, the operation that made it, and the
      * paths of the source's fields the mapper ignored ({@link InfinoIgnored}),
      * left out of its row. A write the copies need not hold first (a replay
-     * of the shard's own history) is not gated.
+     * of the shard's own history) is not gated. {@code mapped} holds the
+     * values OpenSearch's mapper read from the source's date and integer
+     * fields, for a document the table's columns refuse without them
+     * ({@link InfinoMappedValues}); null for any other.
      */
-    private record Version(long seq, boolean gated, String source, String routing, long stamp, List<String> ignored) {
+    private record Version(long seq, boolean gated, String source, String routing, long stamp, List<String> ignored, String mapped) {
+        Version(long seq, boolean gated, String source, String routing, long stamp, List<String> ignored) {
+            this(seq, gated, source, routing, stamp, ignored, null);
+        }
+
+        /** The source as the bridge takes it, with the mapper's values when it has them. */
+        String forTable() {
+            return InfinoMappedValues.framed(source, mapped);
+        }
+
         /** Whether the table may take this write once the copies hold every operation up to {@code through}. */
         boolean takenBy(long through) {
             return !gated || seq <= through;
@@ -1213,12 +1225,27 @@ public class InfinoEngine extends InternalEngine {
         // or by a put-mapping) has its column, so the check reads the document
         // as the commit will. A failure to declare or check is no verdict on the
         // document: this write alone fails, and the bridge's failures answer 503,
-        // so it may be tried again.
+        // so it may be tried again. A document the columns refuse is checked
+        // again with the values the mapper read from its date and integer
+        // fields (a date in a format of the field's own, a fraction an integer
+        // field coerces), which its row then holds.
+        String mapped = null;
         if (source != null && !index.origin().isRecovery()) {
             String why;
             try {
                 InfinoPlugin.tables().ensure(config().getIndexSettings().getIndexMetadata(), config().getShardId().id());
                 why = InfinoNative.checkDoc(table, source, ignored);
+                if (why != null) {
+                    try {
+                        mapped = InfinoMappedValues.of(index.parsedDoc(), config().getMapperService());
+                    } catch (RuntimeException e) {
+                        // Values the mapper's document does not yield are no values: the bridge's refusal stands.
+                        mapped = null;
+                    }
+                    if (mapped != null) {
+                        why = InfinoNative.checkDoc(table, InfinoMappedValues.framed(source, mapped), ignored);
+                    }
+                }
             } catch (InfinoNative.InfinoException e) {
                 return new IndexResult(
                     e.status() == RestStatus.INTERNAL_SERVER_ERROR ? new InfinoNative.InfinoException(e.getMessage(), RestStatus.SERVICE_UNAVAILABLE) : e,
@@ -1277,7 +1304,7 @@ public class InfinoEngine extends InternalEngine {
                     Base base = recovery || (!skeletonKnowsIds() && result.isCreated())
                         ? Base.UNKNOWN
                         : result.isCreated() ? Base.ABSENT : Base.PRESENT;
-                    batch.add(id, base, new Version(result.getSeqNo(), !recovery, source, index.routing(), stamp, ignored));
+                    batch.add(id, base, new Version(result.getSeqNo(), !recovery, source, index.routing(), stamp, ignored, mapped));
                     full = batchFull();
                 }
             }
@@ -1704,7 +1731,7 @@ public class InfinoEngine extends InternalEngine {
             }
             ids.add(id);
             written.add(last);
-            sources.add(last.source());
+            sources.add(last.forTable());
             routings.add(last.routing());
             ignored.add(last.ignored());
             stamps.add(last.stamp());
@@ -1796,10 +1823,28 @@ public class InfinoEngine extends InternalEngine {
             String refused = f.permanent() ? f.reason() : null;
             if (refused == null && checkable) {
                 try {
-                    refused = InfinoNative.checkDoc(table, v.source(), v.ignored());
+                    refused = InfinoNative.checkDoc(table, v.forTable(), v.ignored());
                 } catch (InfinoNative.InfinoException e) {
                     // No verdict on this document or the ones after it: each is tried again.
                     checkable = false;
+                }
+            }
+            if (refused != null && checkable && v.mapped() == null) {
+                // A write that reached the commit unchecked (a replay of the shard's history) may
+                // need the values the mapper reads: with them, the next commit takes it.
+                try {
+                    Version withValues = withMapped(id, v);
+                    if (withValues != null && InfinoNative.checkDoc(table, withValues.forTable(), withValues.ignored()) == null) {
+                        log.debug("[infino] table {} takes document {} (operation {}) at the next commit, with the values the mapper read", table, id, v.seq());
+                        retry.add(id, Base.UNKNOWN, withValues);
+                        continue;
+                    }
+                } catch (InfinoNative.InfinoException e) {
+                    log.warn("[infino] table {} did not take document {} (operation {}); the next commit tries again: {}", table, id, v.seq(), e.getMessage());
+                    retry.add(id, Base.UNKNOWN, v);
+                    continue;
+                } catch (RuntimeException e) {
+                    log.debug("[infino] the mapper refuses document {} of {} on replay: {}", id, shardId, e.getMessage());
                 }
             }
             if (refused != null) {
@@ -1816,6 +1861,19 @@ public class InfinoEngine extends InternalEngine {
             retry.add(id, Base.UNKNOWN, v);
         }
         return retry;
+    }
+
+    /**
+     * {@code v} with the values the index's mapper reads from its source
+     * ({@link InfinoMappedValues}); null when it has none. Throws what the
+     * mapper throws for a source it refuses.
+     */
+    private Version withMapped(String id, Version v) {
+        if (v.source() == null) {
+            return null;
+        }
+        String mapped = InfinoMappedValues.parse(config().getMapperService(), shardId.getIndexName(), id, v.source(), v.routing());
+        return mapped == null ? null : new Version(v.seq(), v.gated(), v.source(), v.routing(), v.stamp(), v.ignored(), mapped);
     }
 
     /**

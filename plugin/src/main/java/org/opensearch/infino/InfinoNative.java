@@ -1443,6 +1443,23 @@ public final class InfinoNative {
     }
 
     /**
+     * The rows of a prepared batch the table refuses, each by its place in
+     * the batch and why; empty for a null handle. The handle stays the
+     * caller's.
+     */
+    public static List<Failure> preparedFailed(Pointer prepared) {
+        if (prepared == null) {
+            return List.of();
+        }
+        init();
+        List<Failure> failed = new ArrayList<>();
+        for (Map<String, Object> f : rows(takeOrThrow(lib.infino_prepared_failed(prepared)))) {
+            failed.add(new Failure(((Number) f.get("i")).intValue(), (String) f.get("reason")));
+        }
+        return failed;
+    }
+
+    /**
      * Index many documents in one append (parallel arrays of length n). The
      * ids and sources cross to the bridge as one UTF-8 buffer with end
      * offsets, so the call marshals three arrays rather than one native
