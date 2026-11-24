@@ -492,7 +492,14 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                 continue;
             }
             String table = tables.ensureForDocument(md, update.id(), update.routing());
-            String merged = merge(InfinoEngine.currentSource(table, update.id()), update);
+            String merged;
+            try {
+                merged = merge(InfinoEngine.currentSource(table, update.id()), update);
+            } catch (InfinoNative.InfinoException e) {
+                // Not read: this update alone fails, with a status that says it may be tried again, and writes nothing.
+                answered.put(slot, failure(slot, update, index, e));
+                continue;
+            }
             if (merged == null) {
                 ShardId shardId = new ShardId(md.getIndex(), OperationRouting.generateShardId(md, update.id(), update.routing()));
                 answered.put(slot, failure(slot, update, index, new DocumentMissingException(shardId, update.id()), RestStatus.NOT_FOUND));
