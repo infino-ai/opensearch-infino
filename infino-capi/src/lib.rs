@@ -8029,6 +8029,11 @@ mod tests {
         assert_eq!(rows[1]["items.price"], 1.0, "{rows}");
         assert_eq!(rows[2]["items.price"], Value::Null, "{rows}");
         assert_eq!(rows[2]["prices"], "5.5,7", "{rows}");
+        let hits = sql(h, r#"SELECT osid FROM logs WHERE array_has("n[]", 2)"#);
+        assert_eq!(hits, json!([{ "osid": "m1" }]), "{hits}");
+        close(h);
+    }
+
     /// The hosted service in front of a typed schema refusal: a 400 whose
     /// body is the engine's error under the operation's name.
     fn hosted(typed: SchemaError) -> InfinoError {
@@ -8166,11 +8171,6 @@ mod tests {
         let mut written = written.into_inner();
         written.sort();
         assert_eq!(written, ["1", "3", "4"]);
-    }
-
-        let hits = sql(h, r#"SELECT osid FROM logs WHERE array_has("n[]", 2)"#);
-        assert_eq!(hits, json!([{ "osid": "m1" }]), "{hits}");
-        close(h);
     }
 
     /// An `unsigned_long` past the largest signed 64-bit integer, and a
