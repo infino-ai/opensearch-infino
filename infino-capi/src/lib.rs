@@ -3231,6 +3231,15 @@ fn landed<T>(result: Result<T, InfinoError>) -> Result<bool, InfinoError> {
 /// nothing more is tried. The caller then retries every document, as it
 /// does after any write that timed out: one a write of this call landed
 /// before the service stopped answering is written again.
+///
+/// So a bulk can be answered 503 after some of its rows landed: the joined
+/// batch's replace lands before its append finds the service gone; the
+/// joined rows land as Arrow before the documents of a batch that could not
+/// be converted find it gone; or the joined write is refused for its
+/// content and its documents land in parts until a later part finds it
+/// gone. A retry looks its ids up and replaces those rows, so they are not
+/// stored twice; a retry with `op_type=create` is answered 409 for them, as
+/// they exist.
 fn append_prepared(
     table: &Supertable,
     gate: &Gate,
@@ -3371,6 +3380,9 @@ pub unsafe extern "C" fn infino_prepare_batch(
     src_ends: *const u32,
     count: c_int,
 ) -> *mut Prepared {
+    // Cleared first, so a null this call returns before it records a reason
+    // (null arguments, a panic) never reports an earlier call's.
+    PREPARE_ERROR.with(|slot| *slot.borrow_mut() = None);
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return ptr::null_mut();
@@ -3390,10 +3402,7 @@ pub unsafe extern "C" fn infino_prepare_batch(
                 count as usize,
             )
         } {
-            Ok(p) => {
-                PREPARE_ERROR.with(|slot| *slot.borrow_mut() = None);
-                Box::into_raw(Box::new(p))
-            }
+            Ok(p) => Box::into_raw(Box::new(p)),
             Err(why) => {
                 eprintln!("[capi] prepare: {why}");
                 PREPARE_ERROR.with(|slot| *slot.borrow_mut() = Some(why.to_string()));
@@ -3425,6 +3434,9 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
     gen: i64,
     count: c_int,
 ) -> *mut Prepared {
+    // Cleared first, so a null this call returns before it records a reason
+    // (null arguments, a panic) never reports an earlier call's.
+    PREPARE_ERROR.with(|slot| *slot.borrow_mut() = None);
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return ptr::null_mut();
@@ -3456,10 +3468,7 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
                 count as usize,
             )
         } {
-            Ok(p) => {
-                PREPARE_ERROR.with(|slot| *slot.borrow_mut() = None);
-                Box::into_raw(Box::new(p))
-            }
+            Ok(p) => Box::into_raw(Box::new(p)),
             Err(why) => {
                 eprintln!("[capi] prepare: {why}");
                 PREPARE_ERROR.with(|slot| *slot.borrow_mut() = Some(why.to_string()));
@@ -7975,24 +7984,7 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
-                let mut head = Vec::new();
-                let mut byte = [0u8; 1];
-                while !head.ends_with(b"\r\n\r\n") {
-                    if std::io::Read::read(&mut stream, &mut byte).unwrap_or(0) == 0 {
-                        break;
-                    }
-                    head.push(byte[0]);
-                }
-                // Read the body too: closing a socket with unread bytes
-                // resets it, and the client sees no answer at all.
-                let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
-                let body = text
-                    .lines()
-                    .find_map(|l| l.strip_prefix("content-length:"))
-                    .and_then(|n| n.trim().parse::<usize>().ok())
-                    .unwrap_or(0);
-                let mut rest = vec![0u8; body];
-                let _ = std::io::Read::read_exact(&mut stream, &mut rest);
+                let (text, _) = read_request(&mut stream);
                 if text.contains("/v1/list_tables/") {
                     let _ = std::io::Write::write_all(
                         &mut stream,
@@ -8030,6 +8022,229 @@ mod tests {
             "{message}"
         );
         assert!(unsafe { infino_prepare_error() }.is_null(), "read once");
+        unsafe { infino_close(h) };
+    }
+
+    /// One HTTP request off `stream`: its head, lowercased, and its body.
+    /// The body is read too: closing a socket with unread bytes resets it,
+    /// and the client sees no answer at all.
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if std::io::Read::read(stream, &mut byte).unwrap_or(0) == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        let len = text
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|n| n.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        let _ = std::io::Read::read_exact(stream, &mut body);
+        (text, body)
+    }
+
+    /// The writes a [`dropping_service`] was sent and never answered.
+    #[derive(Default)]
+    struct Dropped {
+        appends: AtomicUsize,
+        updates: AtomicUsize,
+    }
+
+    /// A hosted service that serves the table `logs` (as [`open_logs`]
+    /// declares it) to the open and to a prepare, and reads every other
+    /// request, an append or an update included, and closes the connection
+    /// without an answer: a service that took the write, or not, and whose
+    /// answer never arrived. Returns the bridge open on it and what it
+    /// dropped.
+    fn dropping_service() -> (*mut Bridge, Arc<Dropped>) {
+        let local = open_logs();
+        let bridge = unsafe { &*local };
+        let document = bridge.conn.schema("logs").unwrap().to_json().to_string();
+        let mut ipc = Vec::new();
+        {
+            let schema = bridge.table("logs").unwrap().schema();
+            let mut w =
+                datafusion::arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &schema).unwrap();
+            w.finish().unwrap();
+        }
+        unsafe { infino_close(local) };
+
+        let dropped = Arc::new(Dropped::default());
+        let seen = Arc::clone(&dropped);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let (text, body) = read_request(&mut stream);
+                let request = text.lines().next().unwrap_or("").to_string();
+                let answer: Option<(&str, Vec<u8>)> = if request.contains("/v1/list_tables/") {
+                    Some(("application/json", b"[]".to_vec()))
+                } else if request.contains("/v1/schema/") {
+                    if String::from_utf8_lossy(&body).contains("\"document\"") {
+                        Some(("application/json", document.clone().into_bytes()))
+                    } else {
+                        Some(("application/vnd.apache.arrow.stream", ipc.clone()))
+                    }
+                } else {
+                    if request.contains("/v1/append/") {
+                        seen.appends.fetch_add(1, Ordering::SeqCst);
+                    } else if request.contains("/v1/update/") {
+                        seen.updates.fetch_add(1, Ordering::SeqCst);
+                    }
+                    None
+                };
+                if let Some((kind, bytes)) = answer {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    );
+                    let _ = std::io::Write::write_all(&mut stream, head.as_bytes());
+                    let _ = std::io::Write::write_all(&mut stream, &bytes);
+                }
+            }
+        });
+        let uri = c(&format!("http://{addr}/db"));
+        let key = c("ik_test");
+        let h = unsafe { infino_open_with(uri.as_ptr(), key.as_ptr(), ptr::null()) };
+        assert!(!h.is_null(), "the open lists the tables");
+        (h, dropped)
+    }
+
+    /// A prepared batch of `ids` for `logs`, each document `{"level":"info"}`.
+    fn prepare_logs(h: *mut Bridge, ids: &[&str]) -> *mut Prepared {
+        let mut buf = Vec::new();
+        let mut id_ends = Vec::new();
+        let mut src_ends = Vec::new();
+        for id in ids {
+            buf.extend_from_slice(id.as_bytes());
+            id_ends.push(buf.len() as u32);
+            buf.extend_from_slice(br#"{"level":"info"}"#);
+            src_ends.push(buf.len() as u32);
+        }
+        let name = c("logs");
+        let p = unsafe {
+            infino_prepare_batch(
+                h,
+                name.as_ptr(),
+                buf.as_ptr(),
+                buf.len(),
+                id_ends.as_ptr(),
+                src_ends.as_ptr(),
+                ids.len() as c_int,
+            )
+        };
+        assert!(!p.is_null(), "the service answers the prepare");
+        p
+    }
+
+    /// An append the hosted service took no answer back from fails whole
+    /// with 503, after one append request: the batch is not tried again in
+    /// halves or a document at a time, which would wait out a timeout for
+    /// each and could write the rows the first append landed again. The
+    /// same holds for the joined batch's replace of the rows it replaces.
+    #[test]
+    fn an_append_the_service_does_not_answer_is_sent_once_and_answers_503() {
+        let (h, dropped) = dropping_service();
+        let name = c("logs");
+        let ids = ["a", "b", "c", "d"];
+
+        let p = prepare_logs(h, &ids);
+        let out = take(unsafe {
+            infino_append_prepared(h, name.as_ptr(), &p, 1, ptr::null(), 0, ptr::null(), 0)
+        });
+        let out: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["status"], 503, "{out}");
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap()
+                .contains("did not answer in time"),
+            "{out}"
+        );
+        assert_eq!(
+            dropped.appends.load(Ordering::SeqCst),
+            1,
+            "one append request"
+        );
+
+        let p = prepare_logs(h, &ids);
+        let replaced: Vec<CString> = ids.iter().map(|id| c(id)).collect();
+        let replaced: Vec<*const c_char> = replaced.iter().map(|id| id.as_ptr()).collect();
+        let out = take(unsafe {
+            infino_append_prepared(
+                h,
+                name.as_ptr(),
+                &p,
+                1,
+                replaced.as_ptr(),
+                replaced.len() as c_int,
+                ptr::null(),
+                0,
+            )
+        });
+        let out: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["status"], 503, "{out}");
+        assert_eq!(
+            dropped.updates.load(Ordering::SeqCst),
+            1,
+            "one update request"
+        );
+        assert_eq!(
+            dropped.appends.load(Ordering::SeqCst),
+            1,
+            "no append for the replaced rows"
+        );
+        unsafe { infino_close(h) };
+    }
+
+    /// A replace a document at a time ([`replace_rows_checked`]) that the
+    /// hosted service does not answer ends with that error after one
+    /// request: its rows are not counted, split, or reported as refused.
+    #[test]
+    fn a_replace_the_service_does_not_answer_is_sent_once_and_is_unavailable() {
+        let (h, dropped) = dropping_service();
+        let bridge = unsafe { &*h };
+        let table = bridge.table("logs").unwrap();
+        let rows: Vec<(usize, Value)> = ["a", "b", "c", "d"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (i, json!({ OSID: id, SOURCE: "{}", "level": "info" })))
+            .collect();
+        let mut failed = Vec::new();
+        let out = replace_rows_checked(&table, &bridge.gate("logs"), &rows, &mut failed);
+        assert!(matches!(out, Err(InfinoError::Unavailable(_))), "{out:?}");
+        assert!(failed.is_empty(), "no document is blamed: {failed:?}");
+        assert_eq!(
+            dropped.updates.load(Ordering::SeqCst),
+            1,
+            "one update request"
+        );
+        unsafe { infino_close(h) };
+    }
+
+    /// A read by id the hosted service does not answer is a 503 the caller
+    /// can retry, naming the call and the id, not an error with no status.
+    #[test]
+    fn a_read_by_id_the_service_does_not_answer_is_503() {
+        let (h, _) = dropping_service();
+        let name = c("logs");
+        let id = c("a");
+        for out in [
+            take(unsafe { infino_get(h, name.as_ptr(), id.as_ptr()) }),
+            take(unsafe { infino_get_doc(h, name.as_ptr(), id.as_ptr()) }),
+        ] {
+            let out: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(out["status"], 503, "{out}");
+            let message = out["error"].as_str().unwrap();
+            assert!(message.contains(" a: "), "{message}");
+            assert!(message.contains("did not answer in time"), "{message}");
+        }
         unsafe { infino_close(h) };
     }
 }

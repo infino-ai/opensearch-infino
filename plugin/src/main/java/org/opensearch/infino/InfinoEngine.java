@@ -55,6 +55,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
 /**
@@ -90,8 +91,12 @@ import java.util.function.LongSupplier;
  * lose: a crash between the two leaves writes the translog's replay looks up
  * in the table. A commit that fails keeps its batch for the next one and
  * fails what asked for it: the write's sync, or the flush, so the translog
- * keeps the writes the table lacks. Writes wait rather than pile up past a
- * bound while commits fail.
+ * keeps the writes the table lacks. A hosted service that could not be
+ * reached or did not answer fails neither: the batch is kept for the next
+ * commit, as a write the table did not take is, so the write is
+ * acknowledged and the table's hold on the shard's history stays below it
+ * (see {@link #commitBeforeSync} and {@link #holdHistoryThrough}).
+ * Writes wait rather than pile up past a bound while commits fail.
  *
  * <p>A search sees what the skeleton's reader sees, as on a stock index: a
  * write is visible after the refresh that follows it. A row a write creates
@@ -218,7 +223,7 @@ public class InfinoEngine extends InternalEngine {
      * A write the copies need not hold first (a replay of the shard's own
      * history) is not gated.
      */
-    private record Version(long seq, boolean gated, String source, String routing, long stamp) {
+    record Version(long seq, boolean gated, String source, String routing, long stamp) {
         /** Whether the table may take this write once the copies hold every operation up to {@code through}. */
         boolean takenBy(long through) {
             return !gated || seq <= through;
@@ -226,7 +231,7 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /** What the table holds under an id before the first of its waiting writes. */
-    private enum Base {
+    enum Base {
         /** No row: the id is new, or was deleted. */
         ABSENT,
         /** A row, which a write replaces. */
@@ -236,7 +241,7 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /** The writes of one id waiting for a commit, oldest first. */
-    private static final class Entry {
+    static final class Entry {
         Base base;
         final List<Version> versions = new ArrayList<>(1);
 
@@ -250,7 +255,7 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /** The writes waiting for a commit, by id in the arrival order of each id's first. */
-    private static final class Batch {
+    static final class Batch {
         final Map<String, Entry> entries = new LinkedHashMap<>();
         int versions = 0;
         long bytes = 0;
@@ -1236,7 +1241,11 @@ public class InfinoEngine extends InternalEngine {
      * fails the sync, and so the write; a wait that runs out, or a commit
      * that leaves writes the table did not take, acknowledges the write all
      * the same, as its copies hold it, and leaves it to a later commit or to
-     * the primary that takes over.
+     * the primary that takes over. A hosted service that could not be
+     * reached or did not answer is such a commit, not a failure (see
+     * {@link #write}): failing the sync with 503 would have a client retry a
+     * write the next commit takes anyway, and an auto-id write retried is
+     * stored twice.
      */
     protected void commitBeforeSync() {
         if (commitLock == null) {
@@ -1522,10 +1531,46 @@ public class InfinoEngine extends InternalEngine {
     /**
      * Commit {@code b}'s writes to the table; the writes the table did not
      * take and may take on a later try, to be retried (see
-     * {@link #notTaken}). A failure that takes nothing is thrown.
+     * {@link #notTaken} and {@link #write}). A failure that takes nothing is
+     * thrown.
      */
     private Batch commit(Batch b) {
         long start = System.nanoTime();
+        Written w = write(
+            table,
+            generation,
+            b,
+            this::holdLatestWhileLookingUp,
+            () -> InfinoPlugin.tables().ensure(config().getIndexSettings().getIndexMetadata(), config().getShardId().id())
+        );
+        InfinoNative.forgetSources(table, w.touched());
+        if (!w.touched().isEmpty() && readsLatest) {
+            // This node's connection has read the table at its own commit, the latest.
+            readsLatest = false;
+            holdLatestWhileLookingUp(false);
+        }
+        log.debug("[infino] engine committed {} writes and {} deletes to {} in {} ms", w.writes(), w.deletes(), table, (System.nanoTime() - start) / 1_000_000L);
+        return w.retry();
+    }
+
+    /** What {@link #write} did: the writes to retry, the ids it wrote or deleted, and how many of each. */
+    record Written(Batch retry, Set<String> touched, int writes, int deletes) {}
+
+    /**
+     * Write {@code b} to {@code table}: its deletes, then its rows in one
+     * append. {@code holdLatest} is told, before the rows are looked up,
+     * whether any is; {@code declare} runs before the rows are prepared, so
+     * a field mapped since the table was declared gets its index.
+     *
+     * <p>When the hosted service could not be reached or did not answer (a
+     * 503 from the lookup, the prepare or the append), the whole batch is
+     * returned to retry rather than the failure thrown: the write's sync is
+     * acknowledged and the next commit writes the batch, looking each row up
+     * first since the service may have committed the append and only its
+     * answer was lost, so a retried row replaces the one already there
+     * rather than being added again.
+     */
+    static Written write(String table, long generation, Batch b, Consumer<Boolean> holdLatest, Runnable declare) {
         List<String> ids = new ArrayList<>();
         List<Version> written = new ArrayList<>();
         List<String> sources = new ArrayList<>();
@@ -1557,58 +1602,64 @@ public class InfinoEngine extends InternalEngine {
                 lookedUp.add(id);
             }
         }
-        // An id this node has no record of may be a row another node wrote:
-        // a replayed operation, after a takeover, of a write that node
-        // committed. The table's latest commit says, so the write replaces
-        // the row rather than appending it again.
-        holdLatestWhileLookingUp(!lookedUp.isEmpty());
-        if (!lookedUp.isEmpty()) {
-            replaced.addAll(InfinoNative.existingOsidsLatest(table, lookedUp));
-        }
         Batch retry = new Batch();
-        // Deletes go first: until a commit's rows are in, the highest operation the
-        // table records is an earlier commit's, from which a new primary writes on.
-        if (!deleted.isEmpty()) {
-            int rc = InfinoNative.deleteOsids(table, deleted.toArray(new String[0]), deleted.size());
-            if (rc != 0) {
-                throw new IllegalStateException("[infino] delete of " + deleted.size() + " ids from " + table + " returned " + rc);
+        try {
+            // An id this node has no record of may be a row another node wrote:
+            // a replayed operation, after a takeover, of a write that node
+            // committed. The table's latest commit says, so the write replaces
+            // the row rather than appending it again.
+            holdLatest.accept(!lookedUp.isEmpty());
+            if (!lookedUp.isEmpty()) {
+                replaced.addAll(InfinoNative.existingOsidsLatest(table, lookedUp));
             }
-        }
-        if (!ids.isEmpty()) {
-            // The newest write's row alone records its operation: the commit holds every
-            // operation up to it, so the highest any row records is how far the table holds
-            // every write. A later delete of that row lowers it, which only widens what a
-            // new primary writes again.
-            long[] seqs = new long[ids.size()];
-            long[] opSeqs = new long[ids.size()];
-            int newest = 0;
-            for (int i = 0; i < ids.size(); i++) {
-                seqs[i] = stamps.get(i);
-                opSeqs[i] = UNSTAMPED;
-                if (ops.get(i) > ops.get(newest)) {
-                    newest = i;
+            // Deletes go first: until a commit's rows are in, the highest operation the
+            // table records is an earlier commit's, from which a new primary writes on.
+            if (!deleted.isEmpty()) {
+                int rc = InfinoNative.deleteOsids(table, deleted.toArray(new String[0]), deleted.size());
+                if (rc != 0) {
+                    throw new IllegalStateException("[infino] delete of " + deleted.size() + " ids from " + table + " returned " + rc);
                 }
             }
-            opSeqs[newest] = ops.get(newest);
-            // The mapping may have grown since the table was declared (a dynamic field
-            // is mapped before its document is applied): declared first, a new text
-            // field gets its text index, where the append would add a plain column.
-            InfinoPlugin.tables().ensure(config().getIndexSettings().getIndexMetadata(), config().getShardId().id());
-            Pointer prepared = InfinoNative.prepare(table, ids, sources, routings, seqs, opSeqs, generation);
-            // The batch carries each row's sequence number from prepare, so the append names none.
-            InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced, null);
-            retry = notTaken(result.failed(), ids, written);
+            if (!ids.isEmpty()) {
+                // The newest write's row alone records its operation: the commit holds every
+                // operation up to it, so the highest any row records is how far the table holds
+                // every write. A later delete of that row lowers it, which only widens what a
+                // new primary writes again.
+                long[] seqs = new long[ids.size()];
+                long[] opSeqs = new long[ids.size()];
+                int newest = 0;
+                for (int i = 0; i < ids.size(); i++) {
+                    seqs[i] = stamps.get(i);
+                    opSeqs[i] = UNSTAMPED;
+                    if (ops.get(i) > ops.get(newest)) {
+                        newest = i;
+                    }
+                }
+                opSeqs[newest] = ops.get(newest);
+                // The mapping may have grown since the table was declared (a dynamic field
+                // is mapped before its document is applied): declared first, a new text
+                // field gets its text index, where the append would add a plain column.
+                declare.run();
+                Pointer prepared = InfinoNative.prepare(table, ids, sources, routings, seqs, opSeqs, generation);
+                // The batch carries each row's sequence number from prepare, so the append names none.
+                InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced, null);
+                retry = notTaken(table, result.failed(), ids, written);
+            }
+        } catch (InfinoNative.InfinoException e) {
+            if (e.status() != RestStatus.SERVICE_UNAVAILABLE) {
+                throw e;
+            }
+            // The hosted service could not be reached or did not answer. The whole
+            // batch is kept for the next commit, which looks each row up, since the
+            // service may have committed the append and only its answer was lost.
+            // The write's sync is not failed for it (see commitBeforeSync): a
+            // client that retried an auto-id bulk would get its documents twice.
+            log.warn("[infino] the hosted service did not take a commit of {} writes and {} deletes to {}; the next commit tries again: {}", ids.size(), deleted.size(), table, e.getMessage());
+            retry = b;
         }
         Set<String> touched = new HashSet<>(ids);
         touched.addAll(deleted);
-        InfinoNative.forgetSources(table, touched);
-        if (!touched.isEmpty() && readsLatest) {
-            // This node's connection has read the table at its own commit, the latest.
-            readsLatest = false;
-            holdLatestWhileLookingUp(false);
-        }
-        log.debug("[infino] engine committed {} writes and {} deletes to {} in {} ms", ids.size(), deleted.size(), table, (System.nanoTime() - start) / 1_000_000L);
-        return retry;
+        return new Written(retry, touched, ids.size(), deleted.size());
     }
 
     /**
@@ -1626,7 +1677,7 @@ public class InfinoEngine extends InternalEngine {
      * hold on the shard's history stays below it until a commit takes it
      * (see {@link #holdHistoryThrough}), so a new primary writes it too.
      */
-    private Batch notTaken(List<InfinoNative.PreparedFailure> failed, List<String> ids, List<Version> written) {
+    private static Batch notTaken(String table, List<InfinoNative.PreparedFailure> failed, List<String> ids, List<Version> written) {
         Batch retry = new Batch();
         boolean checkable = true;
         for (InfinoNative.PreparedFailure f : failed) {
