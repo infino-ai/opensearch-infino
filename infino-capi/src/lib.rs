@@ -1904,7 +1904,10 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
         // field, or none, a column whose index has no positions is a
         // keyword, as it is in a table of the plugin's own.
         let attached = conn.is_attached(name);
-        match conn.conn.schema(name) {
+        // The plugin asks for the columns again after each append, on the
+        // thread that stages a bulk: on a hosted table, the kept document
+        // answers ([`Bridge::table_schema`]) rather than the service.
+        match conn.table_schema(name) {
             Ok(schema) => {
                 let mut cols: Vec<Value> = schema
                     .fields()
