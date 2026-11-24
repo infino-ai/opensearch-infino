@@ -146,7 +146,9 @@ bin/opensearch-plugin install -b file:///path/infino-engine.zip
 
 When both a URI and an account are set, the account is used. A key belongs to one platform: set `infino.platform.url` to the one that issued it.
 
-In Docker on EC2, the container reaches the instance role only when the instance's metadata hop limit is 2 (`aws ec2 modify-instance-metadata-options --http-put-response-hop-limit 2`). With the default of 1 the node finds no credentials and does not become ready.
+In Docker on EC2, the container reaches the instance role only when the instance's metadata hop limit is 2 (`aws ec2 modify-instance-metadata-options --http-put-response-hop-limit 2`). With the default of 1 the node finds no credentials.
+
+When the node starts, it checks once that it can use its storage, and waits at most 30 seconds, a hosted account included. For a local directory it writes a small file there and deletes it. For `s3://` it first asks the instance metadata service for a token, waiting 2 seconds, so a node with no credentials (the hop limit of 1 above) says so at once. For any storage it then lists the tables. If the check fails, the node logs one `ERROR` that names the storage, the reason and what to check. The node stops only when the failure will not pass on its own: the key or the credentials were refused, or the directory may not be written. On a timeout, a server error or a dropped connection it keeps starting, and each index tries the storage again when it is used. If a hosted open is still running when the 30 seconds are up, an index first waits for that open to return, which can take as long as the client's read timeout, and then tries again. The check does not yet catch a bucket or container that does not exist, or object-store credentials that may read but not write.
 
 **4. Start the node.** Every index is Infino-backed unless its settings say `index.infino.enabled: false`. To make the default off, set `infino.index.default_enabled: false` on the node. Give an index one shard and no replicas: the engine scales reads itself.
 
