@@ -98,8 +98,19 @@ public interface InfinoLib extends Library {
     /** The sources of several osids at once, as a JSON object from each id the table holds to its source. */
     Pointer infino_get_many(Pointer h, String name, String[] osids, int count);
 
-    /** One id's document as {@code {"doc": {"source", "seq"}}}, null when the table holds no such id; {@code {"error": ..}} when the lookup fails. */
+    /** One id's document as {@code {"doc": {"source", "seq", "routing"}}} ({@code routing} left out for none), null when the table holds no such id; {@code {"error": ..}} when the lookup fails. */
     Pointer infino_get_doc(Pointer h, String name, String osid);
+
+    /**
+     * The documents of several osids, as {@code {"docs": {id: doc}}} with each
+     * doc {@code {"source", "seq", "routing"}} as {@link #infino_get_doc} gives
+     * it; an id the table does not hold is absent. {@code {"error": ..}} when a
+     * lookup fails.
+     */
+    Pointer infino_get_docs(Pointer h, String name, String[] osids, int count);
+
+    /** {@link #infino_get_docs} as of the table's latest commit. */
+    Pointer infino_get_docs_latest(Pointer h, String name, String[] osids, int count);
 
     int infino_drop(Pointer h, String name);
 
@@ -117,6 +128,12 @@ public interface InfinoLib extends Library {
 
     /** Let go of a hold {@link #infino_hold_latest} took. */
     void infino_release_latest(Pointer h);
+
+    /** Close the connection the latest reads go through, held or not, so the next opens it afresh without the table handles it held. */
+    void infino_forget_latest(Pointer h);
+
+    /** For tests: open the connections from here on under a read staleness window of {@code ms} milliseconds (0 for the engine's default). */
+    void infino_set_read_staleness_ms(long ms);
 
     /** The indices a caller's read-only statement reads, as {@code {"indices": [..]}}, or an error with its status. */
     Pointer infino_sql_indices(String sql);
