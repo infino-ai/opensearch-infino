@@ -931,13 +931,14 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             List.of(List.of("jackal"), List.of("owl")),
             fielded.clauses().stream().map(c -> c.stream().map(InfinoQueryTranslator.TextClause::query).distinct().toList()).toList()
         );
-        // A mapped column with no text index, or a field pattern, which stock expands over the mapping, still leaves it unranked.
-        for (QueryStringQueryBuilder qs : List.of(
-            QueryBuilders.queryStringQuery("jackal bear").field("message").field("title").field("level"),
-            QueryBuilders.queryStringQuery("jackal bear").field("title").field("mess*")
-        )) {
-            assertNull(qs.toString(), InfinoQueryTranslator.translate(qs, cols, TABLE, NOW).scoring().across());
-        }
+        // A mapped column with no text index still leaves it unranked.
+        QueryStringQueryBuilder keyword = QueryBuilders.queryStringQuery("jackal bear").field("message").field("title").field("level");
+        assertNull(InfinoQueryTranslator.translate(keyword, cols, TABLE, NOW).scoring().across());
+        // A field pattern is the fields it matches, as stock expands it over the mapping: here the two text columns.
+        assertEquals(
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").field("title").field("message"), cols, TABLE, NOW).scoring().across(),
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").field("title").field("mess*"), cols, TABLE, NOW).scoring().across()
+        );
     }
 
     private static Translation translateWithTitle(org.opensearch.index.query.QueryBuilder qb) {
@@ -958,7 +959,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
     public void testTextOrIsCountedFromTheTokenIndex() {
         BoolQueryBuilder b = QueryBuilders.boolQuery()
             .must(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-03T00:00:00Z").lt("2023-01-03T10:00:00Z"))
-            .must(QueryBuilders.queryStringQuery("message: monkey jackal bear"));
+            .must(QueryBuilders.queryStringQuery("message: monkey jackal bear").field("message").field("title"));
         Translation t = translateWithTitle(b);
         assertNull(t.principal());
         assertEquals(
@@ -1079,12 +1080,12 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
      * required clause keep the clauses apart.
      */
     public void testOptionalWordsOnOneTextColumnAreOneRankedClause() {
-        Translation t = translate(QueryBuilders.queryStringQuery("message: monkey jackal bear"));
+        Translation t = translate(QueryBuilders.queryStringQuery("message: monkey jackal bear").defaultField("message"));
         assertEquals("token_match('os_logs_0', 'message', 'monkey jackal bear', 'or')", t.from());
         assertEquals(InfinoQueryTranslator.ALL, t.where());
-        Translation phrase = translate(QueryBuilders.queryStringQuery("message: monkey \"jackal bear\""));
+        Translation phrase = translate(QueryBuilders.queryStringQuery("message: monkey \"jackal bear\"").defaultField("message"));
         assertFalse(phrase.from(), phrase.from().contains("'monkey jackal bear'"));
-        Translation required = translate(QueryBuilders.queryStringQuery("message:monkey AND jackal"));
+        Translation required = translate(QueryBuilders.queryStringQuery("message:monkey AND jackal").defaultField("message"));
         assertFalse(required.from(), required.from().contains("'monkey jackal'"));
     }
 
@@ -1383,24 +1384,216 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertNotNull(translate(QueryBuilders.queryStringQuery("foo-bar").defaultField("message")));
     }
 
-    public void testQueryStringOverEveryTextColumn() {
+    /** What a word typed into Discover's search bar searches: every field, each as stock reads the word on it. */
+    private static final String DISK_ON_EVERY_FIELD = "(\"level\" = 'disk' OR \"host.name\" = 'disk' OR text_match(\"message\", 'disk', 'or'))";
+
+    /**
+     * A multi_match or a query string naming no field searches the index's
+     * default fields, every field unless index.query.default_field says
+     * otherwise, as stock does: a text field by its words, a keyword field by
+     * its whole value, and a number or date field by the value read as its
+     * type, skipped where it cannot be (lenient, which a query over every
+     * field is unless it says not). Before, a multi_match naming no field
+     * matched nothing and a query string searched the text fields alone.
+     */
+    public void testAQueryNamingNoFieldSearchesEveryField() {
         assertEquals("1=1", translate(QueryBuilders.queryStringQuery("*")).where());
-        Translation t = translate(QueryBuilders.queryStringQuery("disk"));
-        assertEquals("token_match('os_logs_0', 'message', 'disk', 'or')", t.from());
+        // Discover's search bar: a multi_match naming no field.
+        assertEquals(DISK_ON_EVERY_FIELD, translate(QueryBuilders.multiMatchQuery("disk").lenient(true)).where());
+        assertEquals(DISK_ON_EVERY_FIELD, translate(QueryBuilders.multiMatchQuery("disk")).where());
+        assertEquals(DISK_ON_EVERY_FIELD, translate(QueryBuilders.multiMatchQuery("disk", "*")).where());
+        assertEquals(DISK_ON_EVERY_FIELD, translate(QueryBuilders.queryStringQuery("disk")).where());
+        assertEquals(DISK_ON_EVERY_FIELD, translate(QueryBuilders.queryStringQuery("disk").defaultField("*")).where());
+        assertEquals(DISK_ON_EVERY_FIELD, translate(QueryBuilders.simpleQueryStringQuery("disk")).where());
+        // As Discover wraps it, beside its time filter.
+        assertEquals(
+            "(" + DISK_ON_EVERY_FIELD + " AND (\"@timestamp\" >= '2026-10-24T00:00:00Z'))",
+            translate(
+                QueryBuilders.boolQuery()
+                    .must(QueryBuilders.multiMatchQuery("disk").type(MultiMatchQueryBuilder.Type.BEST_FIELDS).lenient(true))
+                    .filter(QueryBuilders.rangeQuery("@timestamp").gte("2026-10-24T00:00:00Z"))
+            ).where()
+        );
+        // A number is a value of a number field too, and a date of a date field: the whole day it names.
+        assertEquals(
+            "((\"@timestamp\" >= '1970-01-01T00:00:00.500Z' AND \"@timestamp\" <= '1970-01-01T00:00:00.500Z') OR \"level\" = '500' OR \"status\" = 500 "
+                + "OR \"host.name\" = '500' OR text_match(\"message\", '500', 'or'))",
+            translate(QueryBuilders.multiMatchQuery("500")).where()
+        );
+        assertEquals(
+            "((\"@timestamp\" >= '2026-10-24T00:00:00Z' AND \"@timestamp\" <= '2026-10-24T23:59:59.999Z') OR \"level\" = '2026-10-24' "
+                + "OR \"host.name\" = '2026-10-24' OR text_match(\"message\", '2026-10-24', 'or'))",
+            translate(QueryBuilders.queryStringQuery("2026-10-24")).where()
+        );
+        // Not lenient, a field the word is no value of fails the request, as stock's does.
+        IllegalArgumentException strict = expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.multiMatchQuery("disk").lenient(false)));
+        assertTrue(strict.getMessage(), strict.getMessage().contains("is no value of the field"));
+        expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.multiMatchQuery("disk", "status")));
+        assertEquals("1=0", translate(QueryBuilders.multiMatchQuery("disk", "status").lenient(true)).where());
+        expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("disk").defaultField("*").lenient(false)));
+        // A pattern is the fields it matches.
+        assertEquals("\"host.name\" = 'disk'", translate(QueryBuilders.multiMatchQuery("disk", "host.*")).where());
+        assertEquals("token_match('os_logs_0', 'message', 'disk', 'or')", translate(QueryBuilders.multiMatchQuery("disk", "mess*")).from());
+        // Stock refuses a query string naming both.
+        IllegalArgumentException both = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.queryStringQuery("disk").field("message").defaultField("message"))
+        );
+        assertEquals("cannot use [fields] parameter in conjunction with [default_field]", both.getMessage());
+    }
+
+    /**
+     * A keyword multi-field is a field of its own, its whole value; the
+     * table's own columns, a list column, a vector field and an alias's
+     * second name are not.
+     */
+    public void testEveryFieldIsEachFieldOnce() {
+        Map<String, Column> cols = columns();
+        cols.put("message.keyword", cols.get("message").exact());
+        cols.put("msg", cols.get("message"));
+        cols.put("tags[]", Column.list("tags[]", "str"));
+        cols.put("embedding", new Column("embedding", "vec", false, true));
+        cols.put("source", new Column("source", "str", false, false));
+        assertEquals(
+            "(\"level\" = 'disk' OR \"host.name\" = 'disk' OR \"message\" = 'disk' OR text_match(\"message\", 'disk', 'or'))",
+            InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk"), cols, TABLE, NOW).where()
+        );
+    }
+
+    /**
+     * A wildcard or regular expression a query string's {@code fields} name a
+     * keyword field for matches its whole value, as the same pattern written
+     * {@code field:pattern} does (Dashboards sends {@code host:pay*} that
+     * way); before, it matched nothing. On a number field stock reads no
+     * pattern: refused, or skipped when lenient.
+     */
+    public void testAPatternOnAKeywordFieldMatchesItsValue() {
+        assertEquals("\"host.name\" LIKE 'n%'", translate(QueryBuilders.queryStringQuery("n*").field("host.name")).where());
+        assertEquals(
+            translate(QueryBuilders.queryStringQuery("host.name:n*")).where(),
+            translate(QueryBuilders.queryStringQuery("n*").field("host.name")).where()
+        );
+        assertEquals("regexp_like(\"host.name\", '^(?:n.*)$')", translate(QueryBuilders.queryStringQuery("/n.*/").field("host.name")).where());
+        assertEquals(
+            "(\"level\" LIKE 'n%' OR regexp_like(\"message\", '\\bn[^\\s]*', 'i') OR \"host.name\" LIKE 'n%')",
+            translate(QueryBuilders.queryStringQuery("n*")).where()
+        );
+        IllegalArgumentException number = expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("5*").field("status")));
+        assertTrue(number.getMessage(), number.getMessage().contains("not a text or keyword field"));
+        assertEquals("1=0", translate(QueryBuilders.queryStringQuery("5*").field("status").lenient(true)).where());
+    }
+
+    /**
+     * Stock's query string reads a run of words with no operator between them
+     * as one clause, one value on a keyword field. Over keyword fields the
+     * plugin serves such a run when it is the whole query (a multi_match of
+     * it) and refuses one beside other clauses, which its tree, a clause per
+     * word, cannot tell apart. A word right before OR ends a run, so
+     * {@code disk full OR x} is three clauses; simple_query_string has no runs.
+     */
+    public void testARunOfWordsOverKeywordFields() {
+        assertEquals(
+            "(\"level\" = 'disk full' OR \"host.name\" = 'disk full' OR text_match(\"message\", 'disk full', 'or'))",
+            translate(QueryBuilders.queryStringQuery("disk full")).where()
+        );
+        assertEquals(
+            translate(QueryBuilders.multiMatchQuery("disk full").operator(Operator.AND)).where(),
+            translate(QueryBuilders.queryStringQuery("disk full").defaultOperator(Operator.AND)).where()
+        );
+        IllegalArgumentException run = expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("disk full error OR x")));
+        assertTrue(run.getMessage(), run.getMessage().contains("no operator between them"));
+        expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("level:error disk full")));
+        String each = translate(QueryBuilders.queryStringQuery("disk full OR x")).where();
+        assertTrue(each, each.contains("\"level\" = 'disk'") && each.contains("\"level\" = 'full'") && each.contains("\"level\" = 'x'"));
+        assertNotNull(translate(QueryBuilders.queryStringQuery("disk AND full")));
+        String simple = translate(QueryBuilders.simpleQueryStringQuery("disk full")).where();
+        assertTrue(simple, simple.contains("\"level\" = 'disk'") && simple.contains("\"level\" = 'full'"));
+        // A number or date field matches no word that is not a number or a date: beside it a run is the words, as before.
+        Map<String, Column> dated = new LinkedHashMap<>();
+        dated.put("@timestamp", columns().get("@timestamp"));
+        dated.put("status", columns().get("status"));
+        dated.put("message", columns().get("message"));
+        assertEquals(
+            "token_match('os_logs_0', 'message', 'monkey jackal bear', 'or')",
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("message: monkey jackal bear"), dated, TABLE, NOW).from()
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("message:monkey jackal 500"), dated, TABLE, NOW)
+        );
+        // Over text fields alone a run is the words, as before.
+        assertEquals("token_match('os_logs_0', 'message', 'disk full', 'or')", translate(QueryBuilders.queryStringQuery("disk full").defaultField("message")).from());
+    }
+
+    public void testRunsAreReadAsLucenesParserReadsThem() {
+        assertTrue(InfinoLuceneQuery.hasRun("disk full"));
+        assertTrue(InfinoLuceneQuery.hasRun("level:error disk full"));
+        assertTrue(InfinoLuceneQuery.hasRun("a OR b c d"));
+        assertTrue(InfinoLuceneQuery.hasRun("(disk full) OR x"));
+        assertFalse(InfinoLuceneQuery.hasRun("disk"));
+        assertFalse(InfinoLuceneQuery.hasRun("disk full OR x"));
+        assertFalse(InfinoLuceneQuery.hasRun("disk AND full"));
+        assertFalse(InfinoLuceneQuery.hasRun("+disk full"));
+        assertFalse(InfinoLuceneQuery.hasRun("disk level:full"));
+        assertFalse(InfinoLuceneQuery.hasRun("disk^2 full"));
+        assertFalse(InfinoLuceneQuery.hasRun("disk ful*"));
+        assertFalse(InfinoLuceneQuery.hasRun("\"disk full\""));
+        assertTrue(InfinoLuceneQuery.isOneRun("disk full error"));
+        assertFalse(InfinoLuceneQuery.isOneRun("disk"));
+        assertFalse(InfinoLuceneQuery.isOneRun("disk full OR x"));
+        assertFalse(InfinoLuceneQuery.isOneRun("disk\\-full x"));
+    }
+
+    /**
+     * index.query.default_field names the fields a query naming none
+     * searches; the query string's own default_field or fields come first.
+     */
+    public void testTheIndexsDefaultFieldIsSearched() {
+        String index = "dflt";
+        String table = InfinoNative.tableFor(index);
+        org.opensearch.cluster.metadata.IndexMetadata md = org.opensearch.cluster.metadata.IndexMetadata.builder(index)
+            .settings(
+                org.opensearch.common.settings.Settings.builder()
+                    .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_VERSION_CREATED, org.opensearch.Version.CURRENT)
+                    .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                    .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                    .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_INDEX_UUID, "dflt-uuid")
+                    .put(InfinoPlugin.INFINO_ENABLED.getKey(), true)
+                    .put(InfinoPlugin.INFINO_MODE.getKey(), InfinoPlugin.MODE_PROXY)
+                    .putList(org.opensearch.index.IndexSettings.DEFAULT_FIELD_SETTING.getKey(), "level", "mess*")
+            )
+            .build();
+        InfinoPlugin.tables().observe(org.opensearch.cluster.metadata.Metadata.builder().put(md, false).build());
+        try {
+            String levelOrMessage = "(\"level\" = 'disk' OR text_match(\"message\", 'disk', 'or'))";
+            assertEquals(levelOrMessage, InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk"), columns(), table, NOW).where());
+            assertEquals(levelOrMessage, InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("disk"), columns(), table, NOW).where());
+            // Not every field, so not lenient: a field the word is no value of fails, as stock's does.
+            Map<String, Column> cols = columns();
+            cols.put("level", cols.get("status"));
+            expectThrows(IllegalArgumentException.class, () -> InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk"), cols, table, NOW));
+            // The query's own fields come first.
+            assertEquals(
+                "\"host.name\" = 'disk'",
+                InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("disk").defaultField("host.name"), columns(), table, NOW).where()
+            );
+        } finally {
+            InfinoPlugin.tables().observe(org.opensearch.cluster.metadata.Metadata.EMPTY_METADATA);
+        }
     }
 
     public void testQueryStringClausesReadAsLuceneReadsThem() {
         // Terms on the default fields go to the engine as one query with Lucene's occurrences as sigils.
-        assertEquals("token_match('os_logs_0', 'message', '+disk +cache', 'or')", translate(QueryBuilders.queryStringQuery("disk AND cache")).from());
-        assertEquals("token_match('os_logs_0', 'message', 'disk cache -full', 'or')", translate(QueryBuilders.queryStringQuery("disk cache -full")).from());
+        assertEquals("token_match('os_logs_0', 'message', '+disk +cache', 'or')", translate(QueryBuilders.queryStringQuery("disk AND cache").defaultField("message")).from());
+        assertEquals("token_match('os_logs_0', 'message', 'disk cache -full', 'or')", translate(QueryBuilders.queryStringQuery("disk cache -full").defaultField("message")).from());
         assertEquals(
             "token_match('os_logs_0', 'message', '+disk +cache', 'or')",
-            translate(QueryBuilders.queryStringQuery("disk cache").defaultOperator(org.opensearch.index.query.Operator.AND)).from()
+            translate(QueryBuilders.queryStringQuery("disk cache").defaultField("message").defaultOperator(org.opensearch.index.query.Operator.AND)).from()
         );
         // Field clauses are predicates; AND makes both sides required.
         assertEquals("(\"level\" = 'error' AND \"status\" = 500)", translate(QueryBuilders.queryStringQuery("level:error AND status:500")).where());
         // A group of terms stays one engine query; a prohibited field clause is a NOT.
-        Translation t = translate(QueryBuilders.queryStringQuery("(disk OR cache) AND NOT level:info"));
+        Translation t = translate(QueryBuilders.queryStringQuery("(disk OR cache) AND NOT level:info").defaultField("message"));
         assertEquals("token_match('os_logs_0', 'message', 'disk cache', 'or')", t.from());
         assertEquals("(1=1 AND NOT COALESCE((\"level\" = 'info'), FALSE))", t.where());
         // Ranges and comparisons, with date math on a date column.
@@ -1414,12 +1607,12 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("(\"status\" >= -10 AND \"status\" <= 3)", translate(QueryBuilders.queryStringQuery("status:[-10 TO 3]")).where());
         // Wildcards and regular expressions: a term of a text column, the whole value of an exact one.
         assertEquals("regexp_like(\"message\", '\\bdis[^\\s]*', 'i')", translate(QueryBuilders.queryStringQuery("message:dis*")).where());
-        assertEquals("regexp_like(\"message\", '\\bdis[^\\s]*', 'i')", translate(QueryBuilders.queryStringQuery("dis*")).where());
+        assertEquals("regexp_like(\"message\", '\\bdis[^\\s]*', 'i')", translate(QueryBuilders.queryStringQuery("dis*").defaultField("message")).where());
         assertEquals("\"host.name\" LIKE 'n%'", translate(QueryBuilders.queryStringQuery("host.name:n*")).where());
         assertEquals("regexp_like(\"message\", '\\b(?:d.sk)\\b', 'i')", translate(QueryBuilders.queryStringQuery("message:/d.sk/")).where());
         assertEquals("regexp_like(\"level\", '^(?:err.*)$')", translate(QueryBuilders.queryStringQuery("level:/err.*/")).where());
         // Boosts change nothing; fuzziness and proximity are refused with the clause named; so is a bad string.
-        assertEquals("token_match('os_logs_0', 'message', '+disk +cache', 'or')", translate(QueryBuilders.queryStringQuery("disk^2 AND cache")).from());
+        assertEquals("token_match('os_logs_0', 'message', '+disk +cache', 'or')", translate(QueryBuilders.queryStringQuery("disk^2 AND cache").defaultField("message")).from());
         assertTrue(expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("disk~1"))).getMessage().contains("fuzziness"));
         assertTrue(expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("\"disk full\"~2"))).getMessage().contains("proximity"));
         assertTrue(expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("(disk"))).getMessage().contains("parenthesis"));
@@ -2705,11 +2898,13 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("d", "abc"), typedColumns(), TABLE, NOW));
         assertNull(InfinoQueryTranslator.translate(QueryBuilders.rangeQuery("f").gte("abc"), typedColumns(), TABLE, NOW));
         assertNull(InfinoQueryTranslator.translate(QueryBuilders.rangeQuery("s").lt("abc"), typedColumns(), TABLE, NOW));
-        // Text across a text and a float field reads the float field as it reads a double one.
+        // Text across a text and a float field reads the float field as it reads a double one: a
+        // lenient query skips it, another is refused, as stock fails it.
         assertEquals(
-            typedWhere(QueryBuilders.multiMatchQuery("disk", "message", "d")).replace("\"d\"", "\"f\""),
-            typedWhere(QueryBuilders.multiMatchQuery("disk", "message", "f"))
+            typedWhere(QueryBuilders.multiMatchQuery("disk", "message", "d").lenient(true)).replace("\"d\"", "\"f\""),
+            typedWhere(QueryBuilders.multiMatchQuery("disk", "message", "f").lenient(true))
         );
+        expectThrows(IllegalArgumentException.class, () -> typedWhere(QueryBuilders.multiMatchQuery("disk", "message", "f")));
         assertEquals("\"d\" = 0.3", typedWhere(QueryBuilders.termQuery("d", 0.3)));
         assertEquals("(\"d\" > 0.3)", typedWhere(QueryBuilders.rangeQuery("d").gt(0.3)));
     }

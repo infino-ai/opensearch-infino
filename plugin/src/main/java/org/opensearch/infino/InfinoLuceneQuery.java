@@ -87,6 +87,56 @@ final class InfinoLuceneQuery {
         return new Parsed(n, p.requiredAlone);
     }
 
+    /**
+     * Whether {@code query} holds a run: two or more plain words with no
+     * operator between them, which Lucene's parser (splitting on operators,
+     * not on white space) reads as one clause, its words analyzed together.
+     * A run starts at a word that no sigil, {@code AND}, {@code OR} or field
+     * prefix comes right before (the word right after an {@code OR} is a
+     * clause of its own), and a word right before a field prefix, an
+     * {@code AND} or an {@code OR}, or one with a boost or a fuzziness, is
+     * no part of it. The tree ({@link #parse}) has a clause per word either
+     * way.
+     */
+    static boolean hasRun(String query) {
+        List<Token> tokens = tokenize(query);
+        for (int i = 0; i + 2 < tokens.size(); i++) {
+            Kind before = i == 0 ? null : tokens.get(i - 1).kind();
+            if (before == Kind.PLUS || before == Kind.MINUS || before == Kind.NOT || before == Kind.COLON || before == Kind.AND || before == Kind.OR) {
+                continue;
+            }
+            Kind after = tokens.get(i + 2).kind();
+            if (plainWord(tokens.get(i)) && plainWord(tokens.get(i + 1)) && after != Kind.COLON && after != Kind.AND && after != Kind.OR) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether {@code query} is one run ({@link #hasRun}) and nothing else: plain words only, with no escape. */
+    static boolean isOneRun(String query) {
+        if (query.indexOf('\\') >= 0) {
+            return false;
+        }
+        List<Token> tokens = tokenize(query);
+        // At least two words, then the end.
+        if (tokens.size() < 3) {
+            return false;
+        }
+        for (int i = 0; i < tokens.size() - 1; i++) {
+            if (!plainWord(tokens.get(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Whether a token is a plain word, one a run may hold: no pattern, comparison, boost or fuzziness. */
+    private static boolean plainWord(Token t) {
+        String w = t.text();
+        return t.kind() == Kind.WORD && t.suffix() == null && w.indexOf('*') < 0 && w.indexOf('?') < 0 && !w.startsWith(">") && !w.startsWith("<");
+    }
+
     // ---- tokens ----
 
     private enum Kind {

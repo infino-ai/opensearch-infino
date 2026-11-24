@@ -12,6 +12,7 @@ import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.common.network.InetAddresses;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateMathParser;
 import org.opensearch.common.unit.Fuzziness;
@@ -22,6 +23,7 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ExistsQueryBuilder;
 import org.opensearch.index.query.IdsQueryBuilder;
@@ -70,6 +72,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -162,6 +165,19 @@ final class InfinoQueryTranslator {
     private static final String KEYWORD_SUFFIX = ".keyword";
     /** How a date range or histogram bound is read when the request names no format. */
     private static final String DEFAULT_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
+    /** The table's own columns, which hold no field of the documents: a field pattern never names one. */
+    private static final Set<String> RESERVED_COLUMNS = Set.of(OSID, SOURCE, SEQ, OP, GEN, IGNORED, ROUTING);
+    /** The pattern naming every field ({@code index.query.default_field}'s default). */
+    private static final String ALL_FIELDS = "*";
+    /** What starts the name of a metadata field, which the pattern naming every field leaves out, as stock does. */
+    private static final String METADATA_PREFIX = "_";
+    /**
+     * How a multi_match's or simple_query_string's JSON names {@code lenient}
+     * when the request set it: neither builder has a getter that tells an
+     * unset value from false, and stock reads them differently over every
+     * field (unset is lenient there).
+     */
+    private static final Pattern LENIENT_SET = Pattern.compile("\"lenient\"\\s*:");
     /**
      * How a clause joins the relation by id, through a subquery: a text
      * clause other than the ranked one over its token index, or a field's
@@ -450,6 +466,13 @@ final class InfinoQueryTranslator {
     private boolean principalRanks;
     /** How many filter clauses enclose the clause being translated: within any, a clause scores nothing. */
     private int filtering;
+    /**
+     * Whether the full-text query being translated (a multi_match or a query
+     * string) is lenient: a field its value cannot be read on (a word on a
+     * number field) adds nothing to it, where it would otherwise fail the
+     * request, as stock's does.
+     */
+    private boolean lenient;
     /**
      * Whether a text clause in filter context is a predicate rather than the
      * principal: so when another text clause scores the hits, which must
@@ -779,7 +802,7 @@ final class InfinoQueryTranslator {
         }
         List<String> defaults = new ArrayList<>();
         try {
-            for (String f : queryTargets(new ArrayList<>(qs.fields().keySet()), qs.defaultField())) {
+            for (String f : searchedFields(namedFields(new ArrayList<>(qs.fields().keySet()), qs.defaultField()))) {
                 Column c = column(f);
                 if (c == null && f.indexOf('*') < 0) {
                     continue; // stock's dis_max has no clause for a field the mapping does not have
@@ -1475,13 +1498,26 @@ final class InfinoQueryTranslator {
             }
             unfuzzy("multi_match", String.join(", ", mm.fields().keySet()), mm.fuzziness());
             boolean asPhrase = mm.type() == MultiMatchQueryBuilder.Type.PHRASE;
-            return textOnFields(new ArrayList<>(mm.fields().keySet()), String.valueOf(mm.value()), mm.operator(), positive, asPhrase, true);
+            // No fields: the index's default ones (index.query.default_field), as stock reads it.
+            List<String> named = mm.fields().isEmpty() ? defaultFields() : new ArrayList<>(mm.fields().keySet());
+            boolean was = lenient;
+            lenient = lenient(LENIENT_SET.matcher(mm.toString()).find() ? mm.lenient() : null, named, false);
+            try {
+                return textOnFields(searchedFields(named), String.valueOf(mm.value()), mm.operator(), positive, asPhrase, true);
+            } finally {
+                lenient = was;
+            }
         }
         if (qb instanceof QueryStringQueryBuilder qs) {
-            return queryString(qs.queryString(), qs.defaultField(), new ArrayList<>(qs.fields().keySet()), qs.defaultOperator(), qs.minimumShouldMatch(), false, positive);
+            if (!qs.fields().isEmpty() && qs.defaultField() != null) {
+                // Stock refuses the pair, with this message.
+                throw new IllegalArgumentException("cannot use [fields] parameter in conjunction with [default_field]");
+            }
+            return queryString(qs.queryString(), qs.defaultField(), new ArrayList<>(qs.fields().keySet()), qs.defaultOperator(), qs.minimumShouldMatch(), false, qs.lenient(), positive);
         }
         if (qb instanceof SimpleQueryStringBuilder sqs) {
-            return queryString(sqs.value(), null, new ArrayList<>(sqs.fields().keySet()), sqs.defaultOperator(), sqs.minimumShouldMatch(), true, positive);
+            Boolean asked = LENIENT_SET.matcher(sqs.toString()).find() ? sqs.lenient() : null;
+            return queryString(sqs.value(), null, new ArrayList<>(sqs.fields().keySet()), sqs.defaultOperator(), sqs.minimumShouldMatch(), true, asked, positive);
         }
         if (qb instanceof BoolQueryBuilder b) {
             return bool(b, positive);
@@ -2549,10 +2585,11 @@ final class InfinoQueryTranslator {
     /**
      * A clause over several {@code fields}: any of the text columns matching
      * the query (as a phrase when {@code asPhrase}), or, with
-     * {@code exactToo}, any of the exact columns equal to the value as
-     * given (a multi_match or a bare query-string term reaches keyword
-     * fields that way; a composed engine query does not). A field the table
-     * has no column for matches nothing.
+     * {@code exactToo}, any of the other columns holding the value as given
+     * ({@link #exactValue}: a multi_match or a bare query-string term
+     * reaches keyword, number, date and boolean fields that way; a composed
+     * engine query does not). A field the table has no column for matches
+     * nothing.
      */
     private String textOnFields(List<String> fields, String value, Operator op, boolean positive, boolean asPhrase, boolean exactToo) {
         return textOnFields(fields, value, op, positive, asPhrase, exactToo, false);
@@ -2574,7 +2611,10 @@ final class InfinoQueryTranslator {
             if (c.fts()) {
                 indexed.add(c.name());
             } else if (exactToo) {
-                exact.add(equality(f, value));
+                String p = exactValue(f, c, value);
+                if (p != null) {
+                    exact.add(p);
+                }
             }
         }
         if (indexed.isEmpty() && exact.isEmpty()) {
@@ -2606,6 +2646,9 @@ final class InfinoQueryTranslator {
 
     /** A closed phrase of a simple_query_string with no escape in it, whose words are no operators in either syntax. */
     private static final Pattern SIMPLE_PHRASE = Pattern.compile("\"[^\"\\\\]*\"");
+
+    /** A query string word's syntax around its text: sigils, parentheses and quotes, which no value holds. */
+    private static final Pattern QUERY_WORD_EDGES = Pattern.compile("^[-+!(\"]+|[)\"]+$");
 
     /** What separates the runs of an engine text query: Unicode white space, as the engine splits it. */
     private static final Pattern QUERY_WHITESPACE = Pattern.compile("(?U)\\s+");
@@ -2658,6 +2701,7 @@ final class InfinoQueryTranslator {
      * cannot tell that list's clauses as stock counts them, it is refused
      * (see {@link #refuseUncountedClauses}). {@code simple} is a
      * simple_query_string, which has no default field of its own.
+     * {@code asked} is the query's {@code lenient}, null when it sets none.
      */
     private String queryString(
         String query,
@@ -2666,19 +2710,57 @@ final class InfinoQueryTranslator {
         Operator op,
         String minimumShouldMatch,
         boolean simple,
+        Boolean asked,
         boolean positive
     ) {
         String q = query == null ? "" : query.trim();
         if (q.isEmpty() || "*".equals(q) || "*:*".equals(q)) {
             return ALL;
         }
-        List<String> targets = queryTargets(fields, defaultField);
+        List<String> named = namedFields(fields, defaultField);
+        boolean was = lenient;
+        lenient = lenient(asked, named, !simple && IndexSettings.QUERY_STRING_LENIENT_SETTING.get(indexSettings()));
+        try {
+            return queryString(q, named, op, minimumShouldMatch, simple, positive);
+        } finally {
+            lenient = was;
+        }
+    }
+
+    /** {@link #queryString(String, String, List, Operator, String, boolean, Boolean, boolean)} over the fields {@code named}, its leniency set. */
+    private String queryString(String q, List<String> named, Operator op, String minimumShouldMatch, boolean simple, boolean positive) {
+        List<String> targets = searchedFields(named);
         InfinoLuceneQuery.Parsed top = InfinoLuceneQuery.parseTop(q, op);
         Node parsed = top.node();
+        if (!simple && valueTargets(targets, q) && InfinoLuceneQuery.hasRun(q)) {
+            // Stock's parser splits on operators, not on white space: a run of
+            // words with no operator between them is one clause, its words read
+            // together, which on a keyword, number or date field is one value
+            // ("disk full" is the keyword "disk full", not "disk" or "full").
+            // The tree has a clause per word, so a run is served only when it is
+            // the whole query: then it is a multi_match of the text.
+            if (minimumShouldMatch == null && InfinoLuceneQuery.isOneRun(q)) {
+                return textOnFields(targets, q, op, positive, false, true);
+            }
+            if (minimumShouldMatch != null) {
+                // The cases it names are refused with its reasons.
+                refuseUncountedClauses(top, q, minimumShouldMatch, simple, oneField(named), targets);
+            }
+            throw new InfinoLuceneQuery.Malformed(
+                "["
+                    + q
+                    + "] searches keyword, number or date fields ("
+                    + String.join(", ", named)
+                    + ") with words that have no operator between them"
+                    + (minimumShouldMatch == null ? " beside other clauses" : " and minimum_should_match [" + minimumShouldMatch + "]")
+                    + ": stock reads such a run of words as one value on those fields, which the plugin does not tell apart from a clause per word; "
+                    + "put AND or OR between the words, or name only text fields"
+            );
+        }
         if (minimumShouldMatch == null) {
             return node(parsed, targets, positive, q, op);
         }
-        refuseUncountedClauses(top, q, minimumShouldMatch, simple, oneField(fields, simple ? null : defaultField), targets);
+        refuseUncountedClauses(top, q, minimumShouldMatch, simple, oneField(named), targets);
         // Stock applies the value only to a clause list; a lone clause with +
         // is a list of that one required clause, with no optional one.
         Bool b = top.requiredAlone() ? new Bool(List.of(parsed), List.of(), List.of()) : parsed instanceof Bool list ? list : null;
@@ -2711,32 +2793,188 @@ final class InfinoQueryTranslator {
         return node(parsed, targets, positive, q, op);
     }
 
-    /** The fields a query string's clauses without a field search: those named, the default field, or every text field. */
-    private List<String> queryTargets(List<String> fields, String defaultField) {
-        List<String> targets = new ArrayList<>(fields);
-        if (targets.isEmpty() && defaultField != null && !"*".equals(defaultField)) {
-            targets.add(defaultField);
+    /**
+     * The fields or patterns a query string's clauses without a field
+     * search, as stock picks them: its {@code default_field}, else its
+     * {@code fields}, else the index's default ones
+     * ({@code index.query.default_field}, every field unless set).
+     */
+    private List<String> namedFields(List<String> fields, String defaultField) {
+        if (defaultField != null) {
+            return List.of(defaultField);
         }
-        if (targets.isEmpty() || targets.contains("*")) {
-            targets.clear();
-            // Every text field once: an alias names a column already here. The id
-            // column carries a term index but is no field of the documents, and a
-            // field masked for the user is left out rather than matched by its
-            // clear values.
+        return fields.isEmpty() ? defaultFields() : fields;
+    }
+
+    /** The fields a query naming none searches: the index's {@code index.query.default_field}. */
+    private List<String> defaultFields() {
+        return IndexSettings.DEFAULT_FIELD_SETTING.get(indexSettings());
+    }
+
+    /** The settings of the index the table backs, as the node last saw them; empty (every setting its default) when it knows none. */
+    private Settings indexSettings() {
+        return InfinoPlugin.tables().indexSettings(table);
+    }
+
+    /**
+     * Whether a full-text query over the fields {@code named} is lenient, as
+     * stock decides it: as the query asks ({@code asked}), else always over
+     * every field ({@code *}), else {@code byDefault}.
+     */
+    private static boolean lenient(Boolean asked, List<String> named, boolean byDefault) {
+        if (asked != null) {
+            return asked;
+        }
+        return named.contains(ALL_FIELDS) || byDefault;
+    }
+
+    /**
+     * The fields a full-text query over {@code named} searches, each once, as
+     * stock expands them: a name is that field (one the table has no column
+     * of matches nothing there); a pattern is every field it matches, other
+     * than the table's own columns, a list column, a vector field (stock
+     * cannot search one by its value) and a field masked for the user, which
+     * is left out rather than matched by its clear values; {@code *} leaves
+     * out the metadata fields too. A field and an alias of it are one field.
+     * A keyword multi-field ({@code message.keyword}) is a field of its own,
+     * its whole value. A multi-field the table keeps no column of (a text
+     * one with its own analyzer, or a normalized keyword) that a pattern
+     * matches is refused, as a query naming it is: stock would search it.
+     */
+    private List<String> searchedFields(List<String> named) {
+        List<String> out = new ArrayList<>();
+        List<Column> seen = new ArrayList<>();
+        for (String f : named) {
+            // OpenSearch's own field-pattern matcher, named in full: this class's Regex is a query node.
+            if (!org.opensearch.common.regex.Regex.isSimpleMatchPattern(f)) {
+                if (!out.contains(f)) {
+                    out.add(f);
+                }
+                continue;
+            }
+            boolean every = ALL_FIELDS.equals(f);
+            for (String sub : InfinoNative.multiFields(table)) {
+                if (!cols.containsKey(sub) && org.opensearch.common.regex.Regex.simpleMatch(f, sub)) {
+                    refuseColumnless(sub);
+                }
+            }
             for (Map.Entry<String, Column> entry : cols.entrySet()) {
+                String key = entry.getKey();
                 Column c = entry.getValue();
-                if (c.fts() && !InfinoNative.isAlias(entry.getKey(), c) && !c.name().equals(OSID) && (trusted || !c.masked())) {
-                    targets.add(entry.getKey());
+                if (RESERVED_COLUMNS.contains(c.name())
+                    || c.isList()
+                    || c.vector()
+                    || (c.masked() && !trusted)
+                    || (every && key.startsWith(METADATA_PREFIX))
+                    || !org.opensearch.common.regex.Regex.simpleMatch(f, key)) {
+                    continue;
+                }
+                // An alias reads its field's column as the field does: the same field.
+                boolean again = seen.stream().anyMatch(s -> s.name().equals(c.name()) && s.fts() == c.fts());
+                if (!again && !out.contains(key)) {
+                    seen.add(c);
+                    out.add(key);
                 }
             }
         }
-        return targets;
+        return out;
+    }
+
+    /**
+     * The {@code targets} a bare {@code word} may match: every text and
+     * keyword column, and a number, date or boolean column only where the
+     * word reads as its type ({@link #readable}); the others add nothing.
+     */
+    private List<String> reaching(List<String> targets, String word) {
+        List<String> out = new ArrayList<>();
+        for (String f : targets) {
+            Column c = column(f);
+            if (c == null || c.fts() || c.element().isString() || readable(c.element(), word)) {
+                out.add(f);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Whether a word of the query string {@code q} may match one of
+     * {@code targets} that has no text index, which reads a value whole: a
+     * keyword column always may, a number, date or boolean column when a word
+     * reads as its type ({@link #readable}). A run of words (white space
+     * inside) is never a number, date or boolean, so only a column that may
+     * match a word tells a run apart from a clause per word.
+     */
+    private boolean valueTargets(List<String> targets, String q) {
+        String[] words = QUERY_WHITESPACE.split(q.trim());
+        for (String f : targets) {
+            Column c = column(f);
+            if (c == null || c.fts()) {
+                continue;
+            }
+            if (c.element().isString()) {
+                return true;
+            }
+            for (String w : words) {
+                if (readable(c.element(), QUERY_WORD_EDGES.matcher(w).replaceAll(""))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Whether a column with no text index reads {@code value} as one of its values, as stock's term query on its field would. */
+    private boolean readable(Column t, String value) {
+        if (t.isString()) {
+            // A CIDR block is a value of an ip field too, the addresses in it.
+            boolean ip = t.fieldType() != null && t.fieldType().isIp();
+            return !ip || value.indexOf('/') >= 0 || InetAddresses.isInetAddress(value);
+        }
+        if (t.isNumeric()) {
+            String n = number(value);
+            return n != null && Double.isFinite(Double.parseDouble(n));
+        }
+        if (t.isBoolean()) {
+            return Boolean.TRUE.toString().equals(value) || Boolean.FALSE.toString().equals(value);
+        }
+        if (t.isTimestamp()) {
+            return dateLiteral(value, t.dateFormat(), false, null) != null && dateLiteral(value, t.dateFormat(), true, null) != null;
+        }
+        return false;
+    }
+
+    /**
+     * A full-text query's value on {@code field}, a column with no text
+     * index, as stock reads it there (the field's own term query): a keyword
+     * field holding the whole value, an ip field the address, a number field
+     * the number, a boolean field {@code true} or {@code false}, and a date
+     * field the date, which covers every instant it names
+     * ({@code 2026-10-24} is the whole day), read in the field's format.
+     * A value the field's type cannot read ({@code timeout} on a number
+     * field) is null when the query is {@link #lenient}, so the field adds
+     * nothing, and otherwise refused, as stock fails the request.
+     */
+    private String exactValue(String field, Column c, String value) {
+        Column t = c.element();
+        if (readable(t, value)) {
+            if (t.isTimestamp()) {
+                String from = dateLiteral(value, t.dateFormat(), false, null);
+                String to = dateLiteral(value, t.dateFormat(), true, null);
+                return anyValue(c, v -> "(" + v + " >= " + from + " AND " + v + " <= " + to + ")");
+            }
+            return equality(field, value);
+        }
+        if (lenient) {
+            return null;
+        }
+        throw new IllegalArgumentException(
+            "[infino] [" + value + "] is no value of the field [" + field + "]; a query that should skip such fields sets lenient: true"
+        );
     }
 
     /** Whether stock reads a query string over exactly one field: one named, with no pattern. */
-    private static boolean oneField(List<String> fields, String defaultField) {
-        String only = fields.size() == 1 ? fields.get(0) : fields.isEmpty() ? defaultField : null;
-        return only != null && only.indexOf('*') < 0;
+    private static boolean oneField(List<String> named) {
+        return named.size() == 1 && named.get(0).indexOf('*') < 0;
     }
 
     /**
@@ -2949,7 +3187,8 @@ final class InfinoQueryTranslator {
             optional.add(p);
         }
         String count = atLeast(optional, required);
-        String engine = engineQuery(b);
+        // A composed engine query reads the text columns alone: beside another column it would drop that column's matches.
+        String engine = valueTargets(targets, query) ? null : engineQuery(b);
         if (engine != null) {
             String ranked = textOnFields(targets, engine, Operator.OR, positive, false, false, true);
             return ranked == null ? null : "(" + ranked + " AND " + count + ")";
@@ -2993,7 +3232,7 @@ final class InfinoQueryTranslator {
             if (!oneToken(word)) {
                 return null;
             }
-            String reached = t.field() == null ? onlyTextColumn(targets) : onlyTextColumn(List.of(t.field()));
+            String reached = t.field() == null ? onlyTextColumn(reaching(targets, word)) : onlyTextColumn(List.of(t.field()));
             if (reached == null || (column != null && !column.equals(reached))) {
                 return null;
             }
@@ -3058,7 +3297,9 @@ final class InfinoQueryTranslator {
             return ALL;
         }
         if (n instanceof Bool b) {
-            String engine = engineQuery(b);
+            // A composed engine query reads the text columns alone; beside another
+            // column each clause is its own predicate, which reaches that column too.
+            String engine = valueTargets(targets, query) ? null : engineQuery(b);
             if (engine != null) {
                 return textOnFields(targets, engine, Operator.OR, positive, false, false, true);
             }
@@ -3116,7 +3357,12 @@ final class InfinoQueryTranslator {
         }
         if (n instanceof Wildcard w) {
             if (w.field() == null) {
-                return anyOf(targets, c -> termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*")));
+                return anyOf(
+                    targets,
+                    c -> termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*")),
+                    c -> like(c, wildcardToLike(w.pattern())),
+                    "the wildcard [" + w.pattern() + "]"
+                );
             }
             Column c = column(w.field());
             if (c == null) {
@@ -3129,7 +3375,14 @@ final class InfinoQueryTranslator {
         }
         if (n instanceof Regex r) {
             if (r.field() == null) {
-                return anyOf(targets, c -> termPattern(c, "(?:" + r.pattern() + ")", false));
+                // A Lucene regexp is anchored to a keyword field's whole value.
+                String anchored = literal("^(?:" + r.pattern() + ")$");
+                return anyOf(
+                    targets,
+                    c -> termPattern(c, "(?:" + r.pattern() + ")", false),
+                    c -> anyValue(c, v -> "regexp_like(" + v + ", " + anchored + ")"),
+                    "the regular expression [/" + r.pattern() + "/]"
+                );
             }
             Column c = column(r.field());
             if (c == null) {
@@ -3199,18 +3452,39 @@ final class InfinoQueryTranslator {
         return out.toString();
     }
 
-    /** The predicate over the text columns named, any of them matching; none matches nothing. */
-    private String anyOf(List<String> targets, Function<Column, String> perColumn) {
+    /**
+     * The predicate of a pattern ({@code what}) over the fields named, any of
+     * them matching: {@code onText} on a text column, matching a term of its
+     * text, and {@code onValue} on a keyword column, matching its whole value,
+     * as stock reads a pattern on each. Stock reads a pattern on no other
+     * field (a number, a date, an ip address): such a field adds nothing when
+     * the query is {@link #lenient} and is refused otherwise, as stock fails
+     * the request. None matches nothing.
+     */
+    private String anyOf(List<String> targets, Function<Column, String> onText, Function<Column, String> onValue, String what) {
         List<String> or = new ArrayList<>();
         for (String f : targets) {
             Column c = column(f);
-            if (c != null && c.fts()) {
-                String p = perColumn.apply(c);
-                if (p == null) {
-                    return null;
-                }
-                or.add(p);
+            if (c == null) {
+                continue;
             }
+            Column t = c.element();
+            String p;
+            if (c.fts()) {
+                p = onText.apply(c);
+            } else if (t.isString() && (t.fieldType() == null || !t.fieldType().isIp())) {
+                p = onValue.apply(c);
+            } else if (lenient) {
+                continue;
+            } else {
+                throw new IllegalArgumentException(
+                    "[infino] query_string " + what + " on [" + f + "], which is not a text or keyword field, is not served; a query that should skip such fields sets lenient: true"
+                );
+            }
+            if (p == null) {
+                return null;
+            }
+            or.add(p);
         }
         if (or.isEmpty()) {
             return NONE;

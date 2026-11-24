@@ -1,0 +1,839 @@
+# A query naming no field (a multi_match with no fields, as Dashboards'
+# Discover sends a word typed into its search bar, or a query string with no
+# fields or default_field) searches the index's default fields
+# (index.query.default_field, every field unless set), as stock does: a text
+# field by its words, a keyword field by its whole value, a number or date
+# field by the value read as its type, skipped where it cannot be read
+# (lenient, which a query over every field is unless it says not). A
+# wildcard a query string's fields point at a keyword field matches its
+# whole value, as host:pay* written in the query does. Each query runs on a
+# Lucene twin too, so the counts are stock's. Before, the first matched
+# nothing, the second searched the text fields alone, and the wildcard
+# matched nothing.
+setup:
+  - do:
+      indices.create:
+        index: dfs_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text, fields: { keyword: { type: keyword, ignore_above: 256 } } }
+              host: { type: keyword }
+              service: { type: keyword }
+              level: { type: keyword }
+              status: { type: integer }
+              "@timestamp": { type: date }
+  - do:
+      indices.create:
+        index: dfs_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text, fields: { keyword: { type: keyword, ignore_above: 256 } } }
+              host: { type: keyword }
+              service: { type: keyword }
+              level: { type: keyword }
+              status: { type: integer }
+              "@timestamp": { type: date }
+  - do:
+      indices.create:
+        index: dfs_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text, fields: { keyword: { type: keyword, ignore_above: 256 } } }
+              host: { type: keyword }
+              service: { type: keyword }
+              level: { type: keyword }
+              status: { type: integer }
+              "@timestamp": { type: date }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: dfs_luc
+        body:
+          - index: { _id: "1" }
+          - { "message": "request timeout on upstream", "host": "pay-1", "service": "payments", "level": "error", "status": 504, "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _id: "2" }
+          - { "message": "payment accepted", "host": "pay-2", "service": "payments", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:02:00Z" }
+          - index: { _id: "3" }
+          - { "message": "timeout waiting for lock", "host": "db-1", "service": "storage", "level": "warn", "status": 500, "@timestamp": "2026-10-24T10:03:00Z" }
+          - index: { _id: "4" }
+          - { "message": "user login", "host": "web-1", "service": "auth", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:04:00Z" }
+          - index: { _id: "5" }
+          - { "message": "payments queue drained", "host": "web-2", "service": "checkout", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:05:00Z" }
+          - index: { _id: "6" }
+          - { "message": "disk full", "host": "db-2", "service": "timeout", "level": "error", "status": 507, "@timestamp": "2026-10-24T10:06:00Z" }
+          - index: { _id: "7" }
+          - { "message": "cache miss", "host": "payments", "service": "cache", "level": "debug", "status": 404, "@timestamp": "2026-10-24T10:07:00Z" }
+          - index: { _id: "8" }
+          - { "message": "500 errors rising", "host": "mon-1", "service": "monitor", "level": "warn", "status": 200, "@timestamp": "2026-10-25T10:08:00Z" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfs_prx
+        body:
+          - index: { _id: "1" }
+          - { "message": "request timeout on upstream", "host": "pay-1", "service": "payments", "level": "error", "status": 504, "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _id: "2" }
+          - { "message": "payment accepted", "host": "pay-2", "service": "payments", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:02:00Z" }
+          - index: { _id: "3" }
+          - { "message": "timeout waiting for lock", "host": "db-1", "service": "storage", "level": "warn", "status": 500, "@timestamp": "2026-10-24T10:03:00Z" }
+          - index: { _id: "4" }
+          - { "message": "user login", "host": "web-1", "service": "auth", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:04:00Z" }
+          - index: { _id: "5" }
+          - { "message": "payments queue drained", "host": "web-2", "service": "checkout", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:05:00Z" }
+          - index: { _id: "6" }
+          - { "message": "disk full", "host": "db-2", "service": "timeout", "level": "error", "status": 507, "@timestamp": "2026-10-24T10:06:00Z" }
+          - index: { _id: "7" }
+          - { "message": "cache miss", "host": "payments", "service": "cache", "level": "debug", "status": 404, "@timestamp": "2026-10-24T10:07:00Z" }
+          - index: { _id: "8" }
+          - { "message": "500 errors rising", "host": "mon-1", "service": "monitor", "level": "warn", "status": 200, "@timestamp": "2026-10-25T10:08:00Z" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfs_def
+        body:
+          - index: { _id: "1" }
+          - { "message": "request timeout on upstream", "host": "pay-1", "service": "payments", "level": "error", "status": 504, "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _id: "2" }
+          - { "message": "payment accepted", "host": "pay-2", "service": "payments", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:02:00Z" }
+          - index: { _id: "3" }
+          - { "message": "timeout waiting for lock", "host": "db-1", "service": "storage", "level": "warn", "status": 500, "@timestamp": "2026-10-24T10:03:00Z" }
+          - index: { _id: "4" }
+          - { "message": "user login", "host": "web-1", "service": "auth", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:04:00Z" }
+          - index: { _id: "5" }
+          - { "message": "payments queue drained", "host": "web-2", "service": "checkout", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:05:00Z" }
+          - index: { _id: "6" }
+          - { "message": "disk full", "host": "db-2", "service": "timeout", "level": "error", "status": 507, "@timestamp": "2026-10-24T10:06:00Z" }
+          - index: { _id: "7" }
+          - { "message": "cache miss", "host": "payments", "service": "cache", "level": "debug", "status": 404, "@timestamp": "2026-10-24T10:07:00Z" }
+          - index: { _id: "8" }
+          - { "message": "500 errors rising", "host": "mon-1", "service": "monitor", "level": "warn", "status": 200, "@timestamp": "2026-10-25T10:08:00Z" }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: dfs_luc,dfs_prx,dfs_def
+        ignore_unavailable: true
+
+---
+"A multi_match naming no field searches every field, each as stock reads the word on it":
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout, fields: [ "*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout, fields: [ "*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout, fields: [ "*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { type: best_fields, query: timeout, lenient: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { type: best_fields, query: timeout, lenient: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { type: best_fields, query: timeout, lenient: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { bool: { must: [ { multi_match: { type: best_fields, query: timeout, lenient: true } } ], filter: [ { range: { "@timestamp": { gte: "2026-10-24T00:00:00Z", lte: "2026-10-24T23:59:59Z" } } } ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { bool: { must: [ { multi_match: { type: best_fields, query: timeout, lenient: true } } ], filter: [ { range: { "@timestamp": { gte: "2026-10-24T00:00:00Z", lte: "2026-10-24T23:59:59Z" } } } ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { bool: { must: [ { multi_match: { type: best_fields, query: timeout, lenient: true } } ], filter: [ { range: { "@timestamp": { gte: "2026-10-24T00:00:00Z", lte: "2026-10-24T23:59:59Z" } } } ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { bool: { should: [ { multi_match: { type: best_fields, query: payments, lenient: true } } ], minimum_should_match: 1 } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { bool: { should: [ { multi_match: { type: best_fields, query: payments, lenient: true } } ], minimum_should_match: 1 } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { bool: { should: [ { multi_match: { type: best_fields, query: payments, lenient: true } } ], minimum_should_match: 1 } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: "500" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "8" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: "500" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "8" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: "500" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "8" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: "2026-10-25" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "8" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: "2026-10-25" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "8" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: "2026-10-25" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "8" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: "disk full" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: "disk full" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: "disk full" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: "disk full", type: phrase } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: "disk full", type: phrase } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: "disk full", type: phrase } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+
+---
+"A query string with no fields searches every field, keyword fields by their whole value":
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: payments, default_field: "*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: payments, default_field: "*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: payments, default_field: "*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "500" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "8" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "500" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "8" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "500" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "8" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "payments OR timeout" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "6" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "3" }
+  - match: { hits.hits.4._id: "2" }
+  - match: { hits.hits.5._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "payments OR timeout" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "6" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "3" }
+  - match: { hits.hits.4._id: "2" }
+  - match: { hits.hits.5._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "payments OR timeout" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "6" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "3" }
+  - match: { hits.hits.4._id: "2" }
+  - match: { hits.hits.5._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "payments AND level:info" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "payments AND level:info" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "payments AND level:info" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "disk full" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "disk full" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "disk full" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { simple_query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { simple_query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { simple_query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+
+---
+"A wildcard a query string's fields point at a keyword field matches its whole value":
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "pay*", fields: [ host ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "pay*", fields: [ host ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "pay*", fields: [ host ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "pay*", fields: [ host ], analyze_wildcard: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "pay*", fields: [ host ], analyze_wildcard: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "pay*", fields: [ host ], analyze_wildcard: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "host:pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "host:pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "host:pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "/pay-[0-9]/", fields: [ host ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "/pay-[0-9]/", fields: [ host ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "/pay-[0-9]/", fields: [ host ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "pay*", fields: [ "ho*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "pay*", fields: [ "ho*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "pay*", fields: [ "ho*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+
+---
+"index.query.default_field names the fields a query naming none searches":
+  - do:
+      indices.put_settings:
+        index: dfs_luc,dfs_prx,dfs_def
+        body: { index.query.default_field: [ message ] }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "5" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "5" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "5" }
+  - do:
+      indices.put_settings:
+        index: dfs_luc,dfs_prx,dfs_def
+        body: { index.query.default_field: [ message, service ] }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      indices.put_settings:
+        index: dfs_luc,dfs_prx,dfs_def
+        body: { index.query.default_field: [ message, status ] }
+  - do:
+      catch: bad_request
+      search: { index: dfs_luc, body: { query: { multi_match: { query: timeout } } } }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout, lenient: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      catch: bad_request
+      search: { index: dfs_prx, body: { query: { multi_match: { query: timeout } } } }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout, lenient: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      catch: bad_request
+      search: { index: dfs_def, body: { query: { multi_match: { query: timeout } } } }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout, lenient: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+
+---
+"What the table cannot tell apart is refused, never answered differently":
+  # A run of words beside another clause: stock reads "disk full" as one value on
+  # the keyword fields, which the plugin's tree (a clause per word) does not keep.
+  - do:
+      search: { index: dfs_luc, body: { query: { query_string: { query: "level:error disk full" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      catch: bad_request
+      search: { index: dfs_prx, body: { query: { query_string: { query: "level:error disk full" } } } }
+  - match: { error.root_cause.0.reason: "/.*with.words.that.have.no.operator.between.them.*/" }
+  - do:
+      catch: bad_request
+      search: { index: dfs_def, body: { query: { query_string: { query: "level:error disk full" } } } }
+  - match: { error.root_cause.0.reason: "/.*with.words.that.have.no.operator.between.them.*/" }
+  # A word on a number field the query names, not lenient: stock fails it too.
+  - do:
+      catch: bad_request
+      search: { index: dfs_luc, body: { query: { multi_match: { query: timeout, fields: [ message, status ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfs_luc, body: { query: { query_string: { query: "5*", fields: [ status ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfs_prx, body: { query: { multi_match: { query: timeout, fields: [ message, status ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfs_prx, body: { query: { query_string: { query: "5*", fields: [ status ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfs_def, body: { query: { multi_match: { query: timeout, fields: [ message, status ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfs_def, body: { query: { query_string: { query: "5*", fields: [ status ] } } } }

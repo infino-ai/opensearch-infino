@@ -131,13 +131,15 @@
           - {"k": "d12", "n": 12, "message": "emu fox", "title": "fox jackal monkey bear"}
   - match: { errors: false }
 
-  # A run of words is one clause: each document's best field for the run.
+  # A run of words is one clause: each document's best field for the run. The
+  # text fields are named: with no fields stock searches every field, k and n
+  # too, which the table matches but does not rank beside the text.
   - do:
       search:
         index: qa_luc
         body:
           size: 5
-          query: { query_string: { query: "monkey jackal bear" } }
+          query: { query_string: { query: "monkey jackal bear", fields: [ message, title ] } }
   - match: { hits.total.value: 12 }
   - match: { hits.hits.0._id: "d04" }
   - match: { hits.hits.1._id: "d02" }
@@ -149,7 +151,7 @@
         index: qa_proxy
         body:
           size: 5
-          query: { query_string: { query: "monkey jackal bear" } }
+          query: { query_string: { query: "monkey jackal bear", fields: [ message, title ] } }
   - match: { hits.total.value: 12 }
   - match: { hits.hits.0._id: "d04" }
   - match: { hits.hits.1._id: "d02" }
@@ -161,7 +163,7 @@
         index: qa_default
         body:
           size: 5
-          query: { query_string: { query: "monkey jackal bear" } }
+          query: { query_string: { query: "monkey jackal bear", fields: [ message, title ] } }
   - match: { hits.total.value: 12 }
   - match: { hits.hits.0._id: "d04" }
   - match: { hits.hits.1._id: "d02" }
@@ -169,13 +171,36 @@
   - match: { hits.hits.3._id: "d06" }
   - match: { hits.hits.4._id: "d05" }
 
+  # With no fields the run searches every field: the same documents.
+  - do:
+      search:
+        index: qa_luc
+        body:
+          size: 0
+          query: { query_string: { query: "monkey jackal bear" } }
+  - match: { hits.total.value: 12 }
+  - do:
+      search:
+        index: qa_proxy
+        body:
+          size: 0
+          query: { query_string: { query: "monkey jackal bear" } }
+  - match: { hits.total.value: 12 }
+  - do:
+      search:
+        index: qa_default
+        body:
+          size: 0
+          query: { query_string: { query: "monkey jackal bear" } }
+  - match: { hits.total.value: 12 }
+
   # A field's word is a clause of its own, summed with the run after it.
   - do:
       search:
         index: qa_luc
         body:
           size: 5
-          query: { query_string: { query: "message: monkey jackal bear" } }
+          query: { query_string: { query: "message: monkey jackal bear", fields: [ message, title ] } }
   - match: { hits.total.value: 11 }
   - match: { hits.hits.0._id: "d04" }
   - match: { hits.hits.1._id: "d02" }
@@ -187,7 +212,7 @@
         index: qa_proxy
         body:
           size: 5
-          query: { query_string: { query: "message: monkey jackal bear" } }
+          query: { query_string: { query: "message: monkey jackal bear", fields: [ message, title ] } }
   - match: { hits.total.value: 11 }
   - match: { hits.hits.0._id: "d04" }
   - match: { hits.hits.1._id: "d02" }
@@ -199,7 +224,7 @@
         index: qa_default
         body:
           size: 5
-          query: { query_string: { query: "message: monkey jackal bear" } }
+          query: { query_string: { query: "message: monkey jackal bear", fields: [ message, title ] } }
   - match: { hits.total.value: 11 }
   - match: { hits.hits.0._id: "d04" }
   - match: { hits.hits.1._id: "d02" }
@@ -436,7 +461,7 @@
         body:
           from: 2
           size: 3
-          query: { query_string: { query: "monkey jackal bear" } }
+          query: { query_string: { query: "monkey jackal bear", fields: [ message, title ] } }
   - match: { hits.total.value: 12 }
   - match: { hits.hits.0._id: "d12" }
   - match: { hits.hits.1._id: "d06" }
@@ -449,7 +474,7 @@
         body:
           from: 2
           size: 3
-          query: { query_string: { query: "monkey jackal bear" } }
+          query: { query_string: { query: "monkey jackal bear", fields: [ message, title ] } }
   - match: { hits.total.value: 12 }
   - match: { hits.hits.0._id: "d12" }
   - match: { hits.hits.1._id: "d06" }
@@ -462,7 +487,7 @@
         body:
           from: 2
           size: 3
-          query: { query_string: { query: "monkey jackal bear" } }
+          query: { query_string: { query: "monkey jackal bear", fields: [ message, title ] } }
   - match: { hits.total.value: 12 }
   - match: { hits.hits.0._id: "d12" }
   - match: { hits.hits.1._id: "d06" }
@@ -477,7 +502,7 @@
         body:
           post_filter: { range: { n: { lte: 6 } } }
           size: 3
-          query: { query_string: { query: "monkey jackal bear" } }
+          query: { query_string: { query: "monkey jackal bear", fields: [ message, title ] } }
   - match: { hits.total.value: 6 }
   - match: { hits.hits.0._id: "d04" }
   - match: { hits.hits.1._id: "d02" }
@@ -492,7 +517,7 @@
         body:
           post_filter: { range: { n: { lte: 6 } } }
           size: 3
-          query: { query_string: { query: "monkey jackal bear" } }
+          query: { query_string: { query: "monkey jackal bear", fields: [ message, title ] } }
   - match: { hits.total.value: 6 }
   - match: { hits.hits.0._id: "d04" }
   - match: { hits.hits.1._id: "d02" }
@@ -507,7 +532,7 @@
         body:
           post_filter: { range: { n: { lte: 6 } } }
           size: 3
-          query: { query_string: { query: "monkey jackal bear" } }
+          query: { query_string: { query: "monkey jackal bear", fields: [ message, title ] } }
   - match: { hits.total.value: 6 }
   - match: { hits.hits.0._id: "d04" }
   - match: { hits.hits.1._id: "d02" }
@@ -523,7 +548,7 @@
         index: qa_default
         body:
           size: 1
-          query: { query_string: { query: "monkey jackal bear" } }
+          query: { query_string: { query: "monkey jackal bear", fields: [ message, title ] } }
   - gt: { hits.hits.0._score: 1.5 }
   - lt: { hits.hits.0._score: 1.55 }
   - do:
