@@ -257,14 +257,14 @@ public class InfinoEngineTests extends OpenSearchTestCase {
                 batch.add(ids.get(i), InfinoEngine.Base.ABSENT, new InfinoEngine.Version(i, true, "{\"n\":" + i + "}", null, -1, null));
             }
 
-            InfinoEngine.Written first = InfinoEngine.write("t", 1, batch, held -> {}, () -> {});
+            InfinoEngine.Written first = InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null);
 
             assertEquals(1, appends.get());
             assertEquals("every write comes back to retry after a " + status, Set.copyOf(ids), first.retry().entries.keySet());
 
             InfinoEngine.Batch open = new InfinoEngine.Batch();
             open.putBack(first.retry()); // as the commit puts back what it did not take
-            InfinoEngine.Written second = InfinoEngine.write("t", 1, open, held -> {}, () -> {});
+            InfinoEngine.Written second = InfinoEngine.write("t", 1, open, held -> {}, () -> {}, (id, v) -> null);
 
             assertTrue("the next commit takes every write", second.retry().isEmpty());
             assertEquals(2, appends.get());
@@ -375,7 +375,7 @@ public class InfinoEngineTests extends OpenSearchTestCase {
             batch.add("a", InfinoEngine.Base.ABSENT, new InfinoEngine.Version(0, true, "{}", null, -1, null));
             InfinoNative.InfinoException e = expectThrows(
                 InfinoNative.InfinoException.class,
-                () -> InfinoEngine.write("t", 1, batch, held -> {}, () -> {})
+                () -> InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null)
             );
             assertTrue(e.getMessage(), e.getMessage().contains("storage failed"));
         } finally {
