@@ -153,6 +153,39 @@ teardown:
         body: { query: { terms: { user: { index: tl_no_such_index, id: u1, path: followers } } } }
 
 ---
+"A lookup in an aggregation counts toward index.max_terms_count":
+  - do:
+      indices.put_settings:
+        index: tl_proxy,tl_default
+        body: { index.max_terms_count: 1 }
+  - do:
+      search:
+        index: tl_proxy
+        body: { size: 0, aggs: { f: { filter: { terms: { user: { index: tl_users, id: u2, path: profile.follows } } } } } }
+  - match: { aggregations.f.doc_count: 1 }
+  - do:
+      catch: /The number of terms \[2\] used in the Terms Query request has exceeded the allowed maximum of \[1\]/
+      search:
+        index: tl_proxy
+        body: { size: 0, aggs: { f: { filter: { terms: { user: { index: tl_users, id: u1, path: followers } } } } } }
+  - match: { status: 400 }
+  - do:
+      catch: bad_request
+      search:
+        index: tl_default
+        body: { size: 0, aggs: { f: { filter: { terms: { user: { index: tl_users, id: u1, path: followers } } } } } }
+
+---
+"A search mixing a proxy index with a stock one is refused before its lookup is read":
+  # The lookup's index does not exist, so reading it first would answer not found.
+  - do:
+      catch: /a search mixing Infino-backed indices with others is not served/
+      search:
+        index: tl_proxy,tl_users_luc
+        body: { query: { terms: { user: { index: tl_no_such_index, id: u1, path: followers } } } }
+  - match: { status: 400 }
+
+---
 "A lookup of a stored field from a table, and a bitmap of terms, are refused as bad requests":
   # The table keeps each document's source, not a stored field's values apart from it.
   - do:
