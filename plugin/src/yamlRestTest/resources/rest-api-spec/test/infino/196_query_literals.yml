@@ -1,0 +1,432 @@
+# A float, half_float or scaled_float field keeps each value rounded to its
+# precision, and a term, terms, match or range literal on it is rounded the
+# same way, as stock reads it: 0.3 on a float field is the float nearest 0.3.
+# A CIDR block in a term or terms on an ip field is the addresses it covers.
+# A search option the table cannot serve (fuzzy matching, min_score,
+# terminate_after, rescore) is refused, naming it, rather than ignored. Each
+# literal query runs on a Lucene twin too, so the counts are stock's.
+setup:
+  - do:
+      indices.create:
+        index: lit_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            dynamic: strict
+            properties:
+              f: { type: float }
+              h: { type: half_float }
+              s: { type: scaled_float, scaling_factor: 100 }
+              d: { type: double }
+              a: { type: ip }
+              m: { type: text }
+  - do:
+      indices.create:
+        index: lit_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            dynamic: strict
+            properties:
+              f: { type: float }
+              h: { type: half_float }
+              s: { type: scaled_float, scaling_factor: 100 }
+              d: { type: double }
+              a: { type: ip }
+              m: { type: text }
+  - do:
+      indices.create:
+        index: lit_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            dynamic: strict
+            properties:
+              f: { type: float }
+              h: { type: half_float }
+              s: { type: scaled_float, scaling_factor: 100 }
+              d: { type: double }
+              a: { type: ip }
+              m: { type: text }
+  - do:
+      bulk:
+        refresh: true
+        index: lit_luc
+        body:
+          - index: { _id: "1" }
+          - { "f": 0.3, "h": 0.3, "s": 1.234, "d": 0.3, "a": "10.0.0.1", "m": "disk" }
+          - index: { _id: "2" }
+          - { "f": 1.5, "h": 1.5, "s": 1.5, "d": 1.5, "a": "192.168.1.9", "m": "fan" }
+          - index: { _id: "3" }
+          - { "f": 2.7, "h": 2.7, "s": 2.7, "d": 2.7, "a": "2001:db8::1", "m": "disk fan" }
+  - do:
+      bulk:
+        refresh: true
+        index: lit_prx
+        body:
+          - index: { _id: "1" }
+          - { "f": 0.3, "h": 0.3, "s": 1.234, "d": 0.3, "a": "10.0.0.1", "m": "disk" }
+          - index: { _id: "2" }
+          - { "f": 1.5, "h": 1.5, "s": 1.5, "d": 1.5, "a": "192.168.1.9", "m": "fan" }
+          - index: { _id: "3" }
+          - { "f": 2.7, "h": 2.7, "s": 2.7, "d": 2.7, "a": "2001:db8::1", "m": "disk fan" }
+  - do:
+      bulk:
+        refresh: true
+        index: lit_def
+        body:
+          - index: { _id: "1" }
+          - { "f": 0.3, "h": 0.3, "s": 1.234, "d": 0.3, "a": "10.0.0.1", "m": "disk" }
+          - index: { _id: "2" }
+          - { "f": 1.5, "h": 1.5, "s": 1.5, "d": 1.5, "a": "192.168.1.9", "m": "fan" }
+          - index: { _id: "3" }
+          - { "f": 2.7, "h": 2.7, "s": 2.7, "d": 2.7, "a": "2001:db8::1", "m": "disk fan" }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: lit_luc,lit_prx,lit_def
+        ignore_unavailable: true
+
+---
+"A float literal is read as the float the field keeps":
+  - do:
+      search: { index: lit_luc, body: { query: { term: { f: 0.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { f: 0.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { f: 0.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { terms: { f: [ 0.3, 2.7 ] } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_prx, body: { query: { terms: { f: [ 0.3, 2.7 ] } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_def, body: { query: { terms: { f: [ 0.3, 2.7 ] } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_luc, body: { query: { match: { f: 0.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { match: { f: 0.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { match: { f: 0.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { range: { f: { gt: 0.3 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_prx, body: { query: { range: { f: { gt: 0.3 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_def, body: { query: { range: { f: { gt: 0.3 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_luc, body: { query: { range: { f: { gte: 0.3, lte: 0.3 } } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { range: { f: { gte: 0.3, lte: 0.3 } } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { range: { f: { gte: 0.3, lte: 0.3 } } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { range: { f: { lte: 2.7 } } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search: { index: lit_prx, body: { query: { range: { f: { lte: 2.7 } } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search: { index: lit_def, body: { query: { range: { f: { lte: 2.7 } } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search: { index: lit_luc, body: { query: { range: { f: { lt: 2.7 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_prx, body: { query: { range: { f: { lt: 2.7 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_def, body: { query: { range: { f: { lt: 2.7 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_luc, body: { query: { term: { d: 0.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { d: 0.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { d: 0.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { range: { d: { gt: 0.3 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_prx, body: { query: { range: { d: { gt: 0.3 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_def, body: { query: { range: { d: { gt: 0.3 } } } } }
+  - match: { hits.total.value: 2 }
+
+---
+"A half_float literal is read as the half float the field keeps":
+  - do:
+      search: { index: lit_luc, body: { query: { term: { h: 0.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { h: 0.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { h: 0.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { range: { h: { lte: 0.3 } } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: lit_prx, body: { query: { range: { h: { lte: 0.3 } } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: lit_def, body: { query: { range: { h: { lte: 0.3 } } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: lit_luc, body: { query: { range: { h: { gt: 0.3 } } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search: { index: lit_prx, body: { query: { range: { h: { gt: 0.3 } } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search: { index: lit_def, body: { query: { range: { h: { gt: 0.3 } } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search: { index: lit_luc, body: { query: { range: { h: { lte: 2.7 } } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search: { index: lit_prx, body: { query: { range: { h: { lte: 2.7 } } } } }
+  - match: { hits.total.value: 3 }
+  - do:
+      search: { index: lit_def, body: { query: { range: { h: { lte: 2.7 } } } } }
+  - match: { hits.total.value: 3 }
+
+---
+"A scaled_float literal is read as the multiple of 1/scaling_factor the field keeps":
+  - do:
+      search: { index: lit_luc, body: { query: { term: { s: 1.234 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { s: 1.234 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { s: 1.234 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { term: { s: 1.23 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { s: 1.23 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { s: 1.23 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { terms: { s: [ 1.234, 2.7 ] } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_prx, body: { query: { terms: { s: [ 1.234, 2.7 ] } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_def, body: { query: { terms: { s: [ 1.234, 2.7 ] } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_luc, body: { query: { range: { s: { gte: 1.234, lte: 1.234 } } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { range: { s: { gte: 1.234, lte: 1.234 } } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { range: { s: { gte: 1.234, lte: 1.234 } } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { range: { s: { gt: 1.23 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_prx, body: { query: { range: { s: { gt: 1.23 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_def, body: { query: { range: { s: { gt: 1.23 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_luc, body: { query: { range: { s: { gt: 1.234, lt: 1.504 } } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: lit_prx, body: { query: { range: { s: { gt: 1.234, lt: 1.504 } } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: lit_def, body: { query: { range: { s: { gt: 1.234, lt: 1.504 } } } } }
+  - match: { hits.total.value: 0 }
+
+---
+"A CIDR block in a term on an ip field matches the addresses it covers":
+  - do:
+      search: { index: lit_luc, body: { query: { term: { a: "10.0.0.0/8" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { a: "10.0.0.0/8" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { a: "10.0.0.0/8" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { term: { a: "10.9.9.9/8" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { a: "10.9.9.9/8" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { a: "10.9.9.9/8" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { term: { a: "192.168.0.0/16" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { a: "192.168.0.0/16" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { a: "192.168.0.0/16" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { term: { a: "192.168.1.8/30" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { a: "192.168.1.8/30" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { a: "192.168.1.8/30" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { term: { a: "192.168.1.0/29" } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { a: "192.168.1.0/29" } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { a: "192.168.1.0/29" } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: lit_luc, body: { query: { term: { a: "192.168.1.9/32" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { a: "192.168.1.9/32" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { a: "192.168.1.9/32" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_luc, body: { query: { term: { a: "0.0.0.0/0" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { a: "0.0.0.0/0" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { a: "0.0.0.0/0" } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_luc, body: { query: { terms: { a: [ "10.0.0.0/8", "192.168.1.9" ] } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_prx, body: { query: { terms: { a: [ "10.0.0.0/8", "192.168.1.9" ] } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_def, body: { query: { terms: { a: [ "10.0.0.0/8", "192.168.1.9" ] } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_luc, body: { query: { term: { a: "10.0.0.1" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_prx, body: { query: { term: { a: "10.0.0.1" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      search: { index: lit_def, body: { query: { term: { a: "10.0.0.1" } } } }
+  - match: { hits.total.value: 1 }
+
+---
+"An IPv6 CIDR block is refused":
+  - do:
+      search: { index: lit_luc, body: { query: { term: { a: "2001:db8::/32" } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      catch: bad_request
+      search: { index: lit_prx, body: { query: { term: { a: "2001:db8::/32" } } } }
+  - match: { error.root_cause.0.reason: "/.*a.term.with.the.IPv6.CIDR.block..2001:db8::.32..on..a..is.not.served.*/" }
+  - do:
+      catch: bad_request
+      search: { index: lit_def, body: { query: { term: { a: "2001:db8::/32" } } } }
+  - match: { error.root_cause.0.reason: "/.*a.term.with.the.IPv6.CIDR.block..2001:db8::.32..on..a..is.not.served.*/" }
+
+---
+"A search option the table cannot serve is refused, naming it":
+  - do:
+      catch: bad_request
+      search: { index: lit_prx, body: { query: { match: { m: { query: dsk, fuzziness: AUTO } } } } }
+  - match: { error.root_cause.0.reason: "/.*match.on..m..asks.for.fuzziness..AUTO..*/" }
+  - do:
+      catch: bad_request
+      search: { index: lit_def, body: { query: { match: { m: { query: dsk, fuzziness: AUTO } } } } }
+  - match: { error.root_cause.0.reason: "/.*match.on..m..asks.for.fuzziness..AUTO..*/" }
+  - do:
+      catch: bad_request
+      search: { index: lit_prx, body: { query: { multi_match: { query: dsk, fields: [ m ], fuzziness: 1 } } } }
+  - match: { error.root_cause.0.reason: "/.*multi_match.on..m..asks.for.fuzziness..1..*/" }
+  - do:
+      catch: bad_request
+      search: { index: lit_def, body: { query: { multi_match: { query: dsk, fields: [ m ], fuzziness: 1 } } } }
+  - match: { error.root_cause.0.reason: "/.*multi_match.on..m..asks.for.fuzziness..1..*/" }
+  - do:
+      catch: bad_request
+      search: { index: lit_prx, body: { query: { match: { m: disk } }, min_score: 0.5 } }
+  - match: { error.root_cause.0.reason: "/.*min_score.is.not.served.*/" }
+  - do:
+      catch: bad_request
+      search: { index: lit_def, body: { query: { match: { m: disk } }, min_score: 0.5 } }
+  - match: { error.root_cause.0.reason: "/.*min_score.is.not.served.*/" }
+  - do:
+      catch: bad_request
+      search: { index: lit_prx, body: { query: { match_all: {} }, terminate_after: 1 } }
+  - match: { error.root_cause.0.reason: "/.*terminate_after.is.not.served.*/" }
+  - do:
+      catch: bad_request
+      search: { index: lit_def, body: { query: { match_all: {} }, terminate_after: 1 } }
+  - match: { error.root_cause.0.reason: "/.*terminate_after.is.not.served.*/" }
+  - do:
+      catch: bad_request
+      search: { index: lit_prx, body: { query: { match: { m: disk } }, rescore: [ { window_size: 10, query: { rescore_query: { match: { m: fan } } } } ] } }
+  - match: { error.root_cause.0.reason: "/.*rescore.is.not.served.*/" }
+  - do:
+      catch: bad_request
+      search: { index: lit_def, body: { query: { match: { m: disk } }, rescore: [ { window_size: 10, query: { rescore_query: { match: { m: fan } } } } ] } }
+  - match: { error.root_cause.0.reason: "/.*rescore.is.not.served.*/" }
+
+---
+"A fuzziness of 0, or a min_score of 0, asks for nothing and is served":
+  - do:
+      search: { index: lit_luc, body: { query: { match: { m: { query: disk, fuzziness: 0 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_luc, body: { query: { match: { m: disk } }, min_score: 0 } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_prx, body: { query: { match: { m: { query: disk, fuzziness: 0 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_prx, body: { query: { match: { m: disk } }, min_score: 0 } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_def, body: { query: { match: { m: { query: disk, fuzziness: 0 } } } } }
+  - match: { hits.total.value: 2 }
+  - do:
+      search: { index: lit_def, body: { query: { match: { m: disk } }, min_score: 0 } }
+  - match: { hits.total.value: 2 }

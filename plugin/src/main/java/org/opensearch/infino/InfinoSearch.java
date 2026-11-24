@@ -521,6 +521,24 @@ public final class InfinoSearch {
         if (source.suggest() != null) {
             throw new IllegalArgumentException("[infino] suggest is not served by the table");
         }
+        // Each changes which documents match or how they rank, so answering without it would be a
+        // wrong answer: min_score drops documents scored under it from the hits, total and
+        // aggregations (a score is never negative, so one of 0 or less drops none),
+        // terminate_after stops each shard after that many documents, and rescore reranks the top
+        // documents by another query.
+        if (source.minScore() != null && source.minScore() > 0) {
+            throw new IllegalArgumentException("[infino] min_score is not served by the table");
+        }
+        if (source.terminateAfter() > 0) {
+            throw new IllegalArgumentException("[infino] terminate_after is not served by the table");
+        }
+        if (source.rescores() != null && !source.rescores().isEmpty()) {
+            if (source.collapse() != null) {
+                // Stock refuses the pair before it would rescore, with this message.
+                throw new IllegalArgumentException("cannot use `collapse` in conjunction with `rescore`");
+            }
+            throw new IllegalArgumentException("[infino] rescore is not served by the table");
+        }
         Map<String, Column> fullCols = InfinoNative.columns(table);
         if (fullCols.isEmpty()) {
             throw new IllegalStateException("[infino] table " + table + " has not been declared");
