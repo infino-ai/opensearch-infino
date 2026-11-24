@@ -281,6 +281,7 @@ scroll/10_basic/Basic scroll with 1 shard  # [gap:proxy] a scroll is not a point
 get/20_stored_fields/Stored fields  # [gap] not served: stored_fields; the table keeps no stored fields
 mget/20_stored_fields/Stored fields  # [gap] not served: stored_fields; the table keeps no stored fields
 get/70_source_filtering/Source filtering  # [gap] not served: stored_fields; the table keeps no stored fields
+search/200_ignore_malformed/_ignored is still returned with explicit list of stored fields  # [gap] not served: stored_fields; the table keeps no stored fields
 search/330_fetch_fields/Test basic field retrieval  # [gap] fields on a range field, which has no column
 search/350_matched_queries/*  # [gap] not served: matched_queries
 search/40_indices_boost/Indices boost using object  # [gap] not served: indices_boost
