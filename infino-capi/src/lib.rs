@@ -2099,9 +2099,11 @@ fn is_text_index(column: &str, index: &Option<ColumnIndex>) -> bool {
     }
 }
 
-/// Columns of a table as JSON `[{"name","type","elem","fts","vector"}]`,
+/// Columns of a table as JSON `[{"name","type","elem","fts","vector","range"}]`,
 /// type in {i64,f64,bool,str,ts,vec,list,other}, `elem` a list column's
-/// element type (null for any other). `""` if the table is absent.
+/// element type (null for any other), `range` whether the column has a range
+/// index (a numeric or date field mapped `"index": false` has none). `""` if
+/// the table is absent.
 #[no_mangle]
 pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
@@ -2136,6 +2138,7 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                                     && matches!(f.index, Some(ColumnIndex::Fts { .. }))
                                     && conn.attached_text(name, &f.name)),
                             "vector": matches!(f.index, Some(ColumnIndex::Vector { .. })),
+                            "range": matches!(f.index, Some(ColumnIndex::Range)),
                         })
                     })
                     .collect();
@@ -2151,6 +2154,7 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                             "elem": null,
                             "fts": false,
                             "vector": false,
+                            "range": false,
                         }));
                     }
                 }
@@ -5844,10 +5848,13 @@ mod tests {
             assert_eq!(out["ok"], 1, "{doc}: {out}");
         }
         // Those writes gave geo and fo.a list columns typed from their values.
-        let cols = take(unsafe { infino_columns(h, c("logs").as_ptr()) });
+        let cols = columns(h);
         for path in ["geo", "fo.a"] {
             assert!(
-                cols.contains(&format!("\"name\":\"{path}\",\"type\":\"list\"")),
+                cols.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|cc| cc["name"] == path && cc["type"] == "list"),
                 "{path}: {cols}"
             );
         }
@@ -6749,6 +6756,33 @@ mod tests {
             .collect();
         ranged.sort();
         assert_eq!(ranged, ["@timestamp", "http.code", "status", "took"]);
+    }
+
+    /// The columns say which have a range index, at creation and when a
+    /// later mapping adds a field: an unindexed numeric field has none.
+    #[test]
+    fn the_columns_say_which_have_a_range_index() {
+        let h = open_logs();
+        let out = ensure(
+            h,
+            r#"{"properties":{"added":{"type":"long"},"unread":{"type":"long","index":false}}}"#,
+        );
+        assert!(!out.contains("error"), "{out}");
+        let cols = columns(h);
+        let range = |n: &str| {
+            cols.as_array()
+                .unwrap()
+                .iter()
+                .find(|cc| cc["name"] == n)
+                .unwrap_or_else(|| panic!("no column {n} in {cols}"))["range"]
+                .clone()
+        };
+        assert_eq!(range("@timestamp"), true);
+        assert_eq!(range("status"), true);
+        assert_eq!(range("added"), true);
+        assert_eq!(range("unread"), false);
+        assert_eq!(range("level"), false);
+        close(h);
     }
 
     #[test]
