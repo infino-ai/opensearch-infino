@@ -74,7 +74,6 @@ search.aggregation/20_terms/Unmapped longs  # [bug] terms on an unmapped field w
 search.aggregation/20_terms/Unmapped unsigned longs  # [bug] terms on an unmapped field with value_type and missing returns a string key (https://github.com/infino-ai/opensearch-infino/issues/206)
 search.aggregation/20_terms/Date test  # [bug] terms on a date field returns no key_as_string. The test then uses terms include/exclude, which is not served (https://github.com/infino-ai/opensearch-infino/issues/205)
 search.aggregation/200_top_hits_metric/top_hits aggregation with sequence numbers  # [bug] top_hits returns the wrong hit (https://github.com/infino-ai/opensearch-infino/issues/207)
-search.aggregation/230_composite/date_histogram with time_zone  # [bug] composite date_histogram with time_zone splits one day into two buckets (https://github.com/infino-ai/opensearch-infino/issues/208)
 search.aggregation/30_sig_terms/Default index  # [bug] significant_terms on a text field returns no buckets (https://github.com/infino-ai/opensearch-infino/issues/209)
 search.aggregation/30_sig_terms_field_match_only_text/Default index  # [bug] significant_terms on a text field returns no buckets (https://github.com/infino-ai/opensearch-infino/issues/209)
 search.aggregation/40_range/Date Range Missing  # [bug] date_range with missing returns 500 (https://github.com/infino-ai/opensearch-infino/issues/210)
