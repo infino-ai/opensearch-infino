@@ -693,7 +693,8 @@ public final class InfinoSearch {
             throw new IllegalArgumentException(what + " is not served for a query whose score the table does not rank");
         }
         if (scoring.across() != null) {
-            throw new IllegalArgumentException(what + " is not served for a query string scored across several text columns");
+            // The summed BM25 ranks only an unsorted page, so the hits would score apart from the max_score.
+            throw new IllegalArgumentException(what + " is not served for a query whose text clauses' scores are summed");
         }
         if (source.collapse() != null) {
             throw new IllegalArgumentException(what + " is not served with collapse on a scored query");
@@ -1465,6 +1466,7 @@ public final class InfinoSearch {
             && plan.sorts().isEmpty()
             && !scoredPage(plan)
             && plan.query().ranked() != null
+            && !ranksAcross(plan)
             && (InfinoQueryTranslator.joinsAfterRanking(where) || (!InfinoQueryTranslator.ALL.equals(where) && plan.collapse() != null));
     }
 
@@ -1564,6 +1566,7 @@ public final class InfinoSearch {
     static boolean bareRanked(Plan plan) {
         return plan.query().ranked() != null
             && !plan.query().scoring().reorders()
+            && plan.query().scoring().across() == null
             && InfinoQueryTranslator.ALL.equals(plan.hitWhere())
             && plan.sorts().isEmpty()
             && plan.searchAfter() == null
@@ -1946,35 +1949,62 @@ public final class InfinoSearch {
     }
 
     /**
-     * Whether the page is a query string's BM25 across several text columns
-     * ({@link InfinoQueryTranslator.Across}), in no other order, read by
-     * {@link #acrossStatement}: no sort, collapse, search_after or scripted
-     * field, and every other predicate one the ranked searches take as their
-     * filter (none joined by id after the ranking).
+     * Whether the page is the summed BM25 of several text clauses
+     * ({@link InfinoQueryTranslator.Across}: a query string across several
+     * text columns, or a bool's match clauses beside its principal), in no
+     * other order, read by {@link #acrossStatement}: no sort, collapse,
+     * search_after or scripted field, and every other predicate one the
+     * ranked searches take as their filter (none joined by id after the
+     * ranking). Otherwise a ranked principal ranks the page alone.
      */
     static boolean ranksAcross(Plan plan) {
         InfinoQueryTranslator.Across across = plan.query().scoring().across();
         if (across == null
-            || plan.query().principal() != null
+            || (across.match() == null) != (plan.query().principal() != null)
             || !plan.sorts().isEmpty()
             || plan.collapse() != null
             || plan.searchAfter() != null
             || !plan.scriptFields().isEmpty()) {
             return false;
         }
-        String where = plan.hitWhere();
-        return where.contains(across.match()) && !InfinoQueryTranslator.joinsAfterRanking(acrossFilter(plan));
-    }
-
-    /** The hits' predicate without the query string's own: the filter each ranked search takes. */
-    private static String acrossFilter(Plan plan) {
-        return plan.hitWhere().replace(plan.query().scoring().across().match(), InfinoQueryTranslator.ALL);
+        if (across.match() != null && !plan.hitWhere().contains(across.match())) {
+            return false;
+        }
+        String filter = acrossFilter(plan);
+        if (filter == null) {
+            return false;
+        }
+        // The summed search takes a text_match filter into the rows it ranks,
+        // so beside a principal only a join by id falls after the ranking.
+        return across.match() == null ? !InfinoQueryTranslator.joinsById(filter) : !InfinoQueryTranslator.joinsAfterRanking(filter);
     }
 
     /**
-     * The page of a query string ranked across several text columns, as
-     * stock scores it: the engine's {@code bm25_search_fields} ranks within
-     * the rows the other predicates keep, each clause by its best column
+     * The filter each ranked search takes: the hits' predicate without the
+     * query string's own, or, beside a principal, the hits' predicate and
+     * the principal's own ({@link Translation#principalPredicate}), which
+     * the summed search does not keep by itself. Null when the principal
+     * has no such predicate.
+     */
+    private static String acrossFilter(Plan plan) {
+        Translation q = plan.query();
+        String where = plan.hitWhere();
+        String match = q.scoring().across().match();
+        if (match != null) {
+            return where.replace(match, InfinoQueryTranslator.ALL);
+        }
+        String principal = q.principalPredicate();
+        if (principal == null) {
+            return null;
+        }
+        return InfinoQueryTranslator.ALL.equals(where) ? principal : "(" + principal + ") AND (" + where + ")";
+    }
+
+    /**
+     * The page of a query string ranked across several text columns, or of
+     * a bool's match clauses beside its principal, as stock scores it: the
+     * engine's {@code bm25_search_fields} ranks within the rows the filter
+     * keeps ({@link #acrossFilter}), each clause by its best column
      * (dis_max) and the sum over the clauses a document matches. The
      * engine's top-k is exact for any number of clauses and matches, and
      * ties go in the order the documents were written. The sources are read
