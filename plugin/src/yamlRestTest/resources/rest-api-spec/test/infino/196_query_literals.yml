@@ -5,10 +5,11 @@
 # A search option the table cannot serve (fuzzy matching, min_score,
 # rescore) is refused, naming it, rather than ignored. terminate_after is
 # served while no more documents match than it names, as no stock shard stops
-# early then; past it, a count of every document is served, as stock counts it
-# from the index, and anything else, which stock answers from whichever
-# documents a shard collected first, is refused. Each literal query runs on a
-# Lucene twin too, so the counts are stock's.
+# early then; past it, a request for no hits (a count, aggregations or both) is
+# served with the full answer, of which stock's is some subset, and a request
+# for hits, which stock answers from whichever documents a shard collected
+# first, is refused. Each literal query runs on a Lucene twin too, so the
+# counts are stock's.
 setup:
   - do:
       indices.create:
@@ -516,19 +517,27 @@ teardown:
   - match: { count: 3 }
   - match: { terminated_early: false }
 
-  # Past the limit stock counts a term from the index only on segments with no deletes, and collects it otherwise.
+  # An existence check: a query counted past the limit is its full count.
   - do:
       count: { index: lit_luc, terminate_after: 1, body: { query: { match: { m: fan } } } }
   - match: { count: 2 }
   - match: { terminated_early: true }
   - do:
-      catch: bad_request
       count: { index: lit_prx, terminate_after: 1, body: { query: { match: { m: fan } } } }
-  - match: { error.root_cause.0.reason: "/.*terminate_after.is.not.served.by.the.table.when.more.than..1..documents.match.*/" }
+  - match: { count: 2 }
+  - match: { terminated_early: true }
   - do:
-      catch: bad_request
       count: { index: lit_def, terminate_after: 1, body: { query: { match: { m: fan } } } }
-  - match: { error.root_cause.0.reason: "/.*terminate_after.is.not.served.by.the.table.when.more.than..1..documents.match.*/" }
+  - match: { count: 2 }
+  - match: { terminated_early: true }
+  - do:
+      search: { index: lit_prx, body: { query: { match: { m: fan } }, size: 0, terminate_after: 1 } }
+  - match: { hits.total.value: 2 }
+  - match: { terminated_early: true }
+  - do:
+      search: { index: lit_def, body: { query: { match: { m: fan } }, size: 0, terminate_after: 1 } }
+  - match: { hits.total.value: 2 }
+  - match: { terminated_early: true }
 
   # A search that asks for no hits and no aggregations is a count too.
   - do:
@@ -657,8 +666,9 @@ teardown:
   - match: { count: 4 }
   - match: { terminated_early: true }
   # Whether a shard holds more than three hangs on how the documents are routed:
-  # a default-mode shard holds the documents a stock shard does, and a
-  # proxy-mode index's table holds every shard's, so it cannot tell.
+  # a default-mode shard holds the documents a stock shard does; a proxy-mode
+  # index's table holds every shard's, so it cannot tell, and says it did not
+  # stop early.
   - do:
       count: { index: lit_luc2, terminate_after: 3 }
   - match: { count: 4 }
@@ -668,9 +678,9 @@ teardown:
   - match: { count: 4 }
   - match: { terminated_early: $early }
   - do:
-      catch: bad_request
       count: { index: lit_prx2, terminate_after: 3 }
-  - match: { error.root_cause.0.reason: "/.*terminate_after.is.not.served.by.the.table.when.more.than..3..documents.match.*/" }
+  - match: { count: 4 }
+  - match: { terminated_early: false }
   # Within the limit, every shard counts all it holds.
   - do:
       count: { index: lit_luc2, terminate_after: 4 }
@@ -686,7 +696,7 @@ teardown:
   - match: { terminated_early: false }
 
 ---
-"terminate_after over more documents than it names is refused unless the request counts every document":
+"terminate_after over more documents than it names refuses hits and serves the full count and aggregations":
   # Stock stops each shard at whichever documents it collected first.
   - do:
       search: { index: lit_luc, body: { query: { match_all: {} }, terminate_after: 1 } }
@@ -702,19 +712,39 @@ teardown:
       search: { index: lit_def, body: { query: { match_all: {} }, terminate_after: 1 } }
   - match: { error.root_cause.0.reason: "/.*terminate_after.is.not.served.by.the.table.when.more.than..1..documents.match.*/" }
 
-  # Aggregations see only the documents collected before the shard stopped.
+  # Stock's aggregations see only the documents collected before the shard
+  # stopped; the table's see every match, a dashboard list control's or value
+  # suggestions' full set of buckets.
   - do:
-      search: { index: lit_luc, body: { size: 0, terminate_after: 2, aggs: { v: { terms: { field: d } } } } }
+      search: { index: lit_luc, body: { size: 0, terminate_after: 1, aggs: { v: { terms: { field: d } } } } }
   - match: { terminated_early: true }
   - match: { hits.total.value: 3 }
   - do:
-      catch: bad_request
-      search: { index: lit_prx, body: { size: 0, terminate_after: 2, aggs: { v: { terms: { field: d } } } } }
-  - match: { error.root_cause.0.reason: "/.*terminate_after.is.not.served.by.the.table.when.more.than..2..documents.match.*/" }
+      search: { index: lit_prx, body: { size: 0, terminate_after: 1, aggs: { v: { terms: { field: d } } } } }
+  - match: { terminated_early: true }
+  - match: { hits.total.value: 3 }
+  - length: { aggregations.v.buckets: 3 }
+  - match: { aggregations.v.buckets.0.key: 0.3 }
+  - match: { aggregations.v.buckets.2.key: 2.7 }
   - do:
-      catch: bad_request
-      search: { index: lit_def, body: { size: 0, terminate_after: 2, aggs: { v: { terms: { field: d } } } } }
-  - match: { error.root_cause.0.reason: "/.*terminate_after.is.not.served.by.the.table.when.more.than..2..documents.match.*/" }
+      search: { index: lit_def, body: { size: 0, terminate_after: 1, aggs: { v: { terms: { field: d } } } } }
+  - match: { terminated_early: true }
+  - match: { hits.total.value: 3 }
+  - length: { aggregations.v.buckets: 3 }
+  - match: { aggregations.v.buckets.0.key: 0.3 }
+  - match: { aggregations.v.buckets.2.key: 2.7 }
+  - do:
+      search: { index: lit_prx, body: { query: { match: { m: fan } }, size: 0, terminate_after: 1, aggs: { v: { terms: { field: d } } } } }
+  - match: { hits.total.value: 2 }
+  - length: { aggregations.v.buckets: 2 }
+  - match: { aggregations.v.buckets.0.key: 1.5 }
+  - match: { aggregations.v.buckets.1.key: 2.7 }
+  - do:
+      search: { index: lit_def, body: { query: { match: { m: fan } }, size: 0, terminate_after: 1, aggs: { v: { terms: { field: d } } } } }
+  - match: { hits.total.value: 2 }
+  - length: { aggregations.v.buckets: 2 }
+  - match: { aggregations.v.buckets.0.key: 1.5 }
+  - match: { aggregations.v.buckets.1.key: 2.7 }
 
   # A scroll's rounds are read from a cursor, not collected toward the limit.
   - do:

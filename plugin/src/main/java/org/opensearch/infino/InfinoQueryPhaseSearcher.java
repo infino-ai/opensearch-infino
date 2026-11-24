@@ -332,7 +332,7 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             context.queryResult().aggregations(InternalAggregations.from(ordered));
         }
         // This shard's table holds this shard's rows alone.
-        InfinoSearch.Terminated terminated = InfinoSearch.terminated(index, plan, source, total, 1);
+        InfinoSearch.Terminated terminated = InfinoSearch.terminated(plan, source, total, 1);
         if (terminated != null) {
             total = terminated.total();
             context.queryResult().terminatedEarly(terminated.early());

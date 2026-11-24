@@ -34,7 +34,6 @@ import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.mapper.SourceFieldMapper;
-import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Bonus;
@@ -2598,7 +2597,7 @@ public final class InfinoSearch {
     record Terminated(long total, boolean early) {}
 
     /**
-     * What a search of {@code index}, held by {@code shards} stock shards,
+     * What a search of an index held by {@code shards} stock shards
      * reports for its {@code terminate_after}, from the page's {@code total}
      * (exact up to {@link #countCap} when the request tracks it); null when
      * the request sets none.
@@ -2606,19 +2605,18 @@ public final class InfinoSearch {
      * <p>A stock shard stops collecting once more documents than {@code
      * terminate_after} match its query and post_filter, and says so. When no
      * more match, the answer is the full one, reported as not stopped early.
-     * Past it, the hits and aggregations are whichever documents the shard
-     * collected first, which only its segment order decides, so the search is
-     * refused. A stock shard's total, past it, is its full count when Lucene
-     * counts the query from the index without collecting it (a query that
-     * matches every document, a term on a segment with no deletes, ...), and
-     * the documents it collected otherwise. Only the first does not hang on
-     * the shard's segments: a request that only counts every document
-     * ({@link #countsEveryDocument}) is served with its full count, stopped
-     * early when one of its shards holds more than {@code terminate_after}
-     * documents, which is certain once more than {@code shards} times that
-     * many match. Any other is refused.
+     * Past it, the shard's hits are whichever documents it collected first,
+     * which only its segment order decides, so a request for hits is refused.
+     * A request for no hits (size 0: a count, aggregations or both) is served
+     * with the full answer: stock's totals and buckets past the limit are some
+     * subset of the matches, which is all a client can count on, and its
+     * count is the full one whenever Lucene counts the query from the index.
+     * Such a request is reported as stopped early when one of its shards
+     * holds more than {@code terminate_after} documents, which is certain
+     * once more than {@code shards} times that many match, and as not stopped
+     * early otherwise.
      */
-    static Terminated terminated(Index index, Plan plan, SearchSourceBuilder source, long total, int shards) {
+    static Terminated terminated(Plan plan, SearchSourceBuilder source, long total, int shards) {
         int after = source.terminateAfter();
         if (after <= 0) {
             return null;
@@ -2630,57 +2628,13 @@ public final class InfinoSearch {
         if (matched <= after) {
             return new Terminated(total, false);
         }
+        if (source.size() != 0) {
+            throw new IllegalArgumentException(
+                "[infino] terminate_after is not served by the table when more than [" + after + "] documents match"
+            );
+        }
         long beyondEveryShard = (long) after * Math.max(shards, 1) + 1;
-        if (shards >= 1
-            && countsEveryDocument(index, plan, source)
-            && (shards == 1 || total(plan, beyondEveryShard) >= beyondEveryShard)) {
-            return new Terminated(total, true);
-        }
-        throw new IllegalArgumentException(
-            "[infino] terminate_after is not served by the table when more than [" + after + "] documents match"
-        );
-    }
-
-    /**
-     * Whether a request only counts, and counts every document of the index:
-     * no hits, no aggregations, no query other than match_all, no
-     * post_filter or slice, and nothing that narrows the documents (a
-     * filtering alias, a document rule, or nested documents a stock shard
-     * leaves out). A stock shard counts such a request from its index.
-     */
-    private static boolean countsEveryDocument(Index index, Plan plan, SearchSourceBuilder source) {
-        if (source.size() != 0 || source.aggregations() != null && source.aggregations().count() > 0) {
-            return false;
-        }
-        if (source.query() != null && !(source.query() instanceof MatchAllQueryBuilder)) {
-            return false;
-        }
-        if (source.postFilter() != null || source.slice() != null) {
-            return false;
-        }
-        if (plan.access() != null && plan.access().restrictsDocuments()) {
-            return false;
-        }
-        MappingMetadata mapping = mapping(index);
-        return mapping != null && !hasNested(mapping.sourceAsMap());
-    }
-
-    /** Whether a mapping, or an object within it, declares a nested field. */
-    private static boolean hasNested(Map<String, Object> mapping) {
-        Object properties = mapping.get("properties");
-        if (!(properties instanceof Map<?, ?> fields)) {
-            return false;
-        }
-        for (Object field : fields.values()) {
-            if (field instanceof Map<?, ?> f) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> def = (Map<String, Object>) f;
-                if ("nested".equals(def.get("type")) || hasNested(def)) {
-                    return true;
-                }
-            }
-        }
-        return false;
+        return new Terminated(total, shards <= 1 || total(plan, beyondEveryShard) >= beyondEveryShard);
     }
 
     /**
@@ -2850,7 +2804,7 @@ public final class InfinoSearch {
                 }
             }
             // The index's table holds every shard's rows.
-            Terminated terminated = terminated(index, plan, perIndex, page.total(), shards(index));
+            Terminated terminated = terminated(plan, perIndex, page.total(), shards(index));
             if (terminated != null) {
                 terminatedEarly |= terminated.early();
                 page = new Page(page.hits(), terminated.total(), page.exact(), page.maxScore(), page.unsourced(), page.chosen());
