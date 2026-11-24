@@ -1380,6 +1380,7 @@ final class InfinoQueryTranslator {
             return equality(t.fieldName(), t.value());
         }
         if (qb instanceof TermsQueryBuilder ts) {
+            refuseBitmap(ts);
             if (ts.termsLookup() != null) {
                 if (!trusted) {
                     throw new IllegalArgumentException("[infino] a terms lookup into [" + ts.termsLookup().index() + "] is not served by the table");
@@ -1805,6 +1806,7 @@ final class InfinoQueryTranslator {
             return scoring(entryValue(t.fieldName(), qb, path, scope, (c, v) -> sameValue(c, v, q)), qb.boost());
         }
         if (qb instanceof TermsQueryBuilder ts) {
+            refuseBitmap(ts);
             if (ts.termsLookup() != null) {
                 throw notInNested(qb, path, "a terms lookup");
             }
@@ -1897,6 +1899,13 @@ final class InfinoQueryTranslator {
             return e -> combined(mode, entries(e, sub), score) * boost;
         }
         throw notInNested(qb, path, null);
+    }
+
+    /** Refuse a terms query whose one value is a serialized bitmap of the terms, which the table does not decode. */
+    private static void refuseBitmap(TermsQueryBuilder ts) {
+        if (ts.valueType() == TermsQueryBuilder.ValueType.BITMAP) {
+            throw new IllegalArgumentException("[infino] a terms query on [" + ts.fieldName() + "] with value_type [bitmap] is not served by the table");
+        }
     }
 
     /** The refusal of a clause inside a nested query the entry check does not read. */

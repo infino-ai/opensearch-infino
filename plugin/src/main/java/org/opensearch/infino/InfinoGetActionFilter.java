@@ -30,6 +30,7 @@ import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
@@ -80,6 +81,11 @@ public class InfinoGetActionFilter implements ActionFilter {
             chain.proceed(task, action, request, listener);
             return;
         }
+        String stored = storedFieldAsked(index, get.storedFields());
+        if (stored != null) {
+            listener.onFailure(InfinoSearchChecks.storedFieldRefused(stored, index.getIndex().getName()));
+            return;
+        }
         // The table is read on the get pool, never on the thread that took the request.
         InfinoServices.fork(ThreadPool.Names.GET, listener::onFailure, () -> {
             try {
@@ -126,6 +132,14 @@ public class InfinoGetActionFilter implements ActionFilter {
                 listener.onFailure(e);
             }
         });
+    }
+
+    /** The first of {@code names} that {@code index} maps with {@code store: true}, or null when none is. */
+    static String storedFieldAsked(IndexMetadata index, String[] names) {
+        if (names == null || names.length == 0) {
+            return null;
+        }
+        return InfinoSearchChecks.storedField(InfinoSearchChecks.properties(index.mapping()), Arrays.asList(names));
     }
 
     /**

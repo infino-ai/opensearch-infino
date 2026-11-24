@@ -12,6 +12,7 @@ import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.action.support.ActionFilterChain;
+import org.opensearch.action.support.ContextPreservingActionListener;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -24,6 +25,8 @@ import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.Rewriteable;
+import org.opensearch.indices.IndicesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -122,6 +125,65 @@ public class InfinoSearchActionFilter extends InfinoActionFilter {
             listener.onFailure(new IllegalArgumentException("[infino] a sliced search is not served by the table; send it as one slice"));
             return;
         }
+        if (engine > 0 && engine != concrete.length) {
+            listener.onFailure(new IllegalArgumentException("[infino] a search mixing default-mode indices with others is not served"));
+            return;
+        }
+        if (served.isEmpty() || search.source() == null) {
+            serveFetched(task, action, request, search, listener, chain, clusters, names, state, concrete, infino, metadata, served, engine);
+            return;
+        }
+        // What the search reads from other documents is read first, as the
+        // stock coordinator reads it before any shard runs the search: a
+        // terms lookup's document (or the documents its query matches)
+        // becomes the terms it holds. The read runs as the user, through the
+        // cluster's own get and search, so what they may read of the lookup
+        // index decides what they get, and one into an index this plugin
+        // backs is served by its table like any other get or search.
+        IndicesService indices = InfinoServices.indicesService();
+        if (indices == null) {
+            serveFetched(task, action, request, search, listener, chain, clusters, names, state, concrete, infino, metadata, served, engine);
+            return;
+        }
+        int engineIndices = engine;
+        // Answered once, whatever the serving throws after it has answered.
+        ActionListener<Response> once = ActionListener.notifyOnce(listener);
+        Thread caller = Thread.currentThread();
+        ActionListener<SearchSourceBuilder> fetched = ActionListener.wrap(source -> {
+            search.source(source);
+            Runnable serve = () -> serveFetched(task, action, request, search, once, chain, clusters, names, state, concrete, infino, metadata, served, engineIndices);
+            if (Thread.currentThread() == caller) {
+                serve.run(); // nothing was read, or what was read was at hand
+            } else {
+                // The read answered on another thread (the get pool, or a response from another node); the search goes on on the search pool.
+                InfinoServices.fork(ThreadPool.Names.SEARCH, once::onFailure, serve);
+            }
+        }, once::onFailure);
+        ThreadPool pools = InfinoServices.threadPool();
+        if (pools != null) {
+            // The read may answer on another thread; the search goes on under the user's context.
+            fetched = ContextPreservingActionListener.wrapPreservingContext(fetched, pools.getThreadContext());
+        }
+        Rewriteable.rewriteAndFetch(search.source(), indices.getRewriteContext(System::currentTimeMillis), fetched);
+    }
+
+    /** Serve a search over the indices this plugin backs, once what it reads from other documents is in it. */
+    private <Request extends ActionRequest, Response extends ActionResponse> void serveFetched(
+        Task task,
+        String action,
+        Request request,
+        SearchRequest search,
+        ActionListener<Response> listener,
+        ActionFilterChain<Request, Response> chain,
+        ClusterService clusters,
+        IndexNameExpressionResolver names,
+        ClusterState state,
+        String[] concrete,
+        List<Index> infino,
+        List<IndexMetadata> metadata,
+        List<IndexMetadata> served,
+        int engine
+    ) {
         // The shards never see the search as written, so they cannot make their checks of it.
         try {
             InfinoSearchChecks.check(search.source(), served, clusters.getClusterSettings().get(SearchService.ALLOW_EXPENSIVE_QUERIES));
@@ -130,10 +192,6 @@ public class InfinoSearchActionFilter extends InfinoActionFilter {
             return;
         }
         if (engine > 0) {
-            if (engine != concrete.length) {
-                listener.onFailure(new IllegalArgumentException("[infino] a search mixing default-mode indices with others is not served"));
-                return;
-            }
             // Served by the shards, which plan from the source as written (see
             // InfinoQueryExt): the cluster routes it as it routes any search,
             // a scroll included, and merges the shards' results.

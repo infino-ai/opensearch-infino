@@ -59,6 +59,12 @@ final class InfinoSearchChecks {
             }
             checkRescores(source, settings);
             checkFields(source, settings);
+            if (source.storedFields() != null) {
+                String stored = storedField(properties, source.storedFields().fieldNames());
+                if (stored != null) {
+                    throw storedFieldRefused(stored, index.getIndex().getName());
+                }
+            }
             int maxTerms = IndexSettings.MAX_TERMS_COUNT_SETTING.get(settings);
             checkQuery(source.query(), maxTerms, allowExpensive, properties);
             checkQuery(source.postFilter(), maxTerms, allowExpensive, properties);
@@ -194,6 +200,30 @@ final class InfinoSearchChecks {
     static Map<String, Object> properties(MappingMetadata mapping) {
         Object properties = mapping == null ? null : mapping.sourceAsMap().get("properties");
         return properties instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
+    }
+
+    /**
+     * The first of {@code names} that {@code properties} maps with {@code store: true},
+     * or null when none is. A pattern is not matched: a request for every stored
+     * field, as a dashboard's search sends, reads the source as it always has.
+     */
+    static String storedField(Map<String, Object> properties, List<String> names) {
+        if (names == null) {
+            return null;
+        }
+        for (String name : names) {
+            Map<String, Object> field = Regex.isSimpleMatchPattern(name) ? null : field(properties, name);
+            if (field != null && Boolean.parseBoolean(String.valueOf(field.get("store")))) {
+                return name;
+            }
+        }
+        return null;
+    }
+
+    /** The refusal of a request for the values of {@code field}, which {@code index} stores apart from the source. */
+    static IllegalArgumentException storedFieldRefused(String field, String index) {
+        // The table keeps the source, not the values a stored field holds apart from it.
+        return new IllegalArgumentException("[infino] the stored field [" + field + "] of [" + index + "] is not served by the table; read it from _source");
     }
 
     /** A field's mapping by its full name, through objects and multi-fields, an alias followed; null when it is not mapped. */

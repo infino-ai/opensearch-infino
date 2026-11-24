@@ -89,7 +89,8 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
     /**
      * How the tables answer a multi-get: the Infino-backed index each served
      * name stands for, and by slot the failure of each item whose name
-     * resolves to no single index (null for the others).
+     * resolves to no single index or that asks for a stored field (null for
+     * the others).
      */
     record Layout(Map<String, IndexMetadata> indices, Exception[] failed) {}
 
@@ -99,7 +100,9 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
      * no item names one it does. An item whose name resolves to no single
      * index, such as an alias of several or a missing index, fails alone
      * with what the resolution threw, as the stock multi-get fails it before
-     * it reaches any shard; the other items are served.
+     * it reaches any shard; the other items are served. So does an item asking
+     * for a field its index stores apart from the source, which the table does
+     * not keep.
      */
     static Layout layout(ClusterState state, IndexNameExpressionResolver names, List<MultiGetRequest.Item> items) {
         Map<String, IndexMetadata> indices = new HashMap<>();
@@ -117,6 +120,10 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             IndexMetadata index = indices.computeIfAbsent(item.index(), name -> InfinoGetActionFilter.infinoIndex(state, names, name));
             if (index == null) {
                 return null;
+            }
+            String stored = InfinoGetActionFilter.storedFieldAsked(index, item.storedFields());
+            if (stored != null) {
+                failed[i] = InfinoSearchChecks.storedFieldRefused(stored, index.getIndex().getName());
             }
         }
         return indices.isEmpty() ? null : new Layout(indices, failed);
