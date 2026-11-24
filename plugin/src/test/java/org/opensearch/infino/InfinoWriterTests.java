@@ -18,7 +18,13 @@ import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.engine.DocumentMissingException;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.threadpool.TestThreadPool;
+import org.opensearch.common.settings.Settings;
 
+import com.sun.jna.Memory;
+
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -32,6 +38,9 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /** How the writer admits a bulk while appends for its table are running. */
 public class InfinoWriterTests extends OpenSearchTestCase {
+
+    /** How long a test waits for a step that should take moments. */
+    private static final long WAIT_SECONDS = 5;
 
     /** A bulk with no rows to append: it stages without the native bridge. */
     private static InfinoWriter.Waiter emptyBulk(ActionListener<BulkResponse> listener) {
@@ -97,6 +106,42 @@ public class InfinoWriterTests extends OpenSearchTestCase {
         assertEquals("the REST layer answers it with 429", RestStatus.TOO_MANY_REQUESTS, ExceptionsHelper.status(e));
         assertTrue(e.getMessage(), e.getMessage().contains("table t"));
         assertEquals("a refused bulk starts no append", 1, appendsStarted.get());
+    }
+
+    /**
+     * A table's appends run on the plugin's append pool, not the write pool.
+     * An append to the hosted service can wait for minutes, and appends held
+     * on the write pool took every thread of it, so a write to any index on
+     * the node, a stock one included, waited behind them.
+     */
+    public void testAnAppendRunsOnTheAppendPoolNotTheWritePool() throws Exception {
+        ThreadPool threadPool = new TestThreadPool(getTestName(), InfinoPlugin.appendPool(Settings.EMPTY));
+        // A bridge that opens and answers nothing else: the append has no rows to write.
+        InfinoNative.useLib(
+            (InfinoLib) Proxy.newProxyInstance(
+                InfinoLib.class.getClassLoader(),
+                new Class<?>[] { InfinoLib.class },
+                (proxy, method, args) -> "infino_open_with".equals(method.getName()) ? new Memory(1) : null
+            )
+        );
+        try {
+            InfinoWriter writer = new InfinoWriter(threadPool);
+            CompletableFuture<String> answeredOn = new CompletableFuture<>();
+            writer.submit(
+                "t",
+                emptyBulk(
+                    ActionListener.wrap(
+                        r -> answeredOn.complete(Thread.currentThread().getName()),
+                        e -> answeredOn.complete(Thread.currentThread().getName())
+                    )
+                )
+            );
+            String thread = answeredOn.get(WAIT_SECONDS, TimeUnit.SECONDS);
+            assertTrue(thread, thread.contains("[" + InfinoPlugin.APPEND_POOL + "]"));
+        } finally {
+            InfinoNative.useLib(null);
+            terminate(threadPool);
+        }
     }
 
     /** Under its bound, a bulk joins the batch behind a running append, and starts no second one. */
