@@ -461,8 +461,16 @@ public final class InfinoNative {
      * (throws) only for a failure that will not pass on its own: the key was
      * refused, the storage refused the node's credentials or its user. On any
      * other failure (a timeout, a 5xx, a dropped connection) the node keeps
-     * starting and each index tries the storage again when it is used. A node
-     * in memory has nothing to check.
+     * starting and each index tries the storage again when it is used. While
+     * a hosted open that outlived the wait is still running, it holds the lock
+     * {@link #init} opens under, so an index's {@code init()} waits for that
+     * open to return (up to the client's read timeout) rather than trying
+     * again at once. A node in memory has nothing to check.
+     *
+     * <p>The bridge library is loaded here, on the starting thread, before the
+     * check: a library that cannot be loaded (a wrong {@code -Dinfino.lib})
+     * stops the node with the loader's own error, as an {@link Error} raised
+     * on the check's thread does.
      *
      * @return the ERROR it logged and the node did not stop for; null when the storage is usable
      */
@@ -471,6 +479,7 @@ public final class InfinoNative {
     }
 
     static String checkStorage(TimeValue timeout) {
+        lib();
         Target target = wanted;
         if (MEMORY_URIS.contains(target.uri())) {
             return null;
@@ -492,6 +501,8 @@ public final class InfinoNative {
      * Run {@code check} on a thread of its own and wait at most {@code timeout}
      * for it: the hosted open and a store's own retries can take minutes, and
      * the node's start should not. A check still running is left to finish.
+     * An {@link Error} the check raised (a library that does not link, say) is
+     * thrown again here: no retry fixes it, so it stops the node.
      */
     private static StorageFailure within(TimeValue timeout, Callable<StorageFailure> check) {
         FutureTask<StorageFailure> task = new FutureTask<>(check);
@@ -506,6 +517,9 @@ public final class InfinoNative {
             Thread.currentThread().interrupt();
             return new StorageFailure("the check was interrupted", false);
         } catch (ExecutionException e) {
+            if (e.getCause() instanceof Error error) {
+                throw error;
+            }
             return new StorageFailure(String.valueOf(e.getCause()), false);
         }
     }
@@ -560,7 +574,8 @@ public final class InfinoNative {
     static String unusableStorage(Target target, StorageFailure failure) {
         String then = failure.permanent()
             ? " The node stops: every Infino-backed index it serves, the security plugin's included, lives there."
-            : " The node keeps starting, and each index tries the storage again when it is used.";
+            : " The node keeps starting, and each index tries the storage again when it is used,"
+                + " after any open still in progress returns.";
         return scrubbed(
             target,
             "[infino] this node cannot use its storage at "

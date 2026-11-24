@@ -240,6 +240,20 @@ public class InfinoNativeTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A bridge that does not link (a wrong {@code -Dinfino.lib}) stops the
+     * node with the loader's error: no retry fixes it, so it is not logged as
+     * a storage that may recover.
+     */
+    public void testABridgeThatDoesNotLinkStopsTheNode() {
+        String why = "Unable to load library '/wrong/libinfino_capi.so'";
+        Supplier<Object> unlinked = () -> { throw new UnsatisfiedLinkError(why); };
+        withBridge(new InfinoNative.Target(LOCAL, null, false, LOCAL), Map.of("infino_open_with", unlinked), () -> {
+            UnsatisfiedLinkError e = expectThrows(UnsatisfiedLinkError.class, InfinoNative::checkStorage);
+            assertEquals(why, e.getMessage());
+        });
+    }
+
     /** A node in memory has nothing to check, however its URI is spelled. */
     public void testANodeInMemoryChecksNothing() {
         for (String uri : List.of("memory://", "memory:", "memory")) {
