@@ -30,7 +30,7 @@ teardown:
             search.allow_expensive_queries: null
   - do:
       indices.delete:
-        index: chk_proxy,chk_default,chk_no_such
+        index: chk_proxy,chk_default,chk_no_such,chk_rvp_new
         ignore_unavailable: true
 
 ---
@@ -50,6 +50,58 @@ teardown:
       search:
         index: chk_default
         body: { query: { bool: { filter: [ { terms: { user: [ u1, u2, u3 ] } } ] } } }
+
+---
+"A terms query over index.max_terms_count is refused wherever in the search it sits":
+  - do:
+      search:
+        index: chk_proxy
+        body: { size: 0, aggs: { f: { filter: { terms: { user: [ u1, u2 ] } } } } }
+  - match: { aggregations.f.doc_count: 1 }
+  - do:
+      catch: /The number of terms \[3\] used in the Terms Query request has exceeded the allowed maximum of \[2\]/
+      search:
+        index: chk_proxy
+        body: { size: 0, aggs: { f: { filter: { terms: { user: [ u1, u2, u3 ] } } } } }
+  - match: { status: 400 }
+  - do:
+      catch: bad_request
+      search:
+        index: chk_default
+        body: { size: 0, aggs: { f: { filter: { terms: { user: [ u1, u2, u3 ] } } } } }
+  - do:
+      catch: bad_request
+      search:
+        index: chk_proxy
+        body: { size: 0, aggs: { by: { terms: { field: user }, aggs: { fs: { filters: { filters: { many: { terms: { user: [ u1, u2, u3 ] } } } } } } } } }
+  - do:
+      catch: bad_request
+      search:
+        index: chk_proxy
+        body: { size: 0, aggs: { sig: { significant_terms: { field: user, background_filter: { terms: { user: [ u1, u2, u3 ] } } } } } }
+  - do:
+      catch: bad_request
+      search:
+        index: chk_default
+        body:
+          query: { match_all: {} }
+          rescore: [ { window_size: 10, query: { rescore_query: { terms: { user: [ u1, u2, u3 ] } } } } ]
+  - do:
+      catch: bad_request
+      search:
+        index: chk_proxy
+        body: { query: { match: { text: cold } }, highlight: { highlight_query: { terms: { user: [ u1, u2, u3 ] } }, fields: { text: {} } } }
+  # A field the index does not map matches nothing, however many terms ask for it.
+  - do:
+      search:
+        index: chk_proxy
+        body: { query: { terms: { unmapped: [ u1, u2, u3 ] } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: chk_default
+        body: { query: { terms: { unmapped: [ u1, u2, u3 ] } } }
+  - match: { hits.total.value: 0 }
 
 ---
 "A rescore window over index.max_rescore_window is refused":
@@ -161,6 +213,23 @@ teardown:
         index: chk_default
         body: { query: { range: { n: { gte: 1 } } } }
   - match: { hits.total.value: 1 }
+  # So is one inside an aggregation, as a shard builds that query too.
+  - do:
+      catch: /\[wildcard\] queries cannot be executed/
+      search:
+        index: chk_proxy
+        body: { size: 0, aggs: { f: { filter: { wildcard: { user: { value: "u*" } } } } } }
+  - match: { status: 400 }
+  - do:
+      catch: /\[wildcard\] queries cannot be executed/
+      search:
+        index: chk_default
+        body: { size: 0, aggs: { f: { filter: { wildcard: { user: { value: "u*" } } } } } }
+  - do:
+      catch: /\[wildcard\] queries cannot be executed/
+      search:
+        index: chk_proxy
+        body: { query: { match: { text: cold } }, highlight: { fields: { text: { highlight_query: { wildcard: { user: { value: "u*" } } } } } } }
 
 ---
 "A get with a version the document is not at is a conflict":
@@ -211,3 +280,95 @@ teardown:
         id: "1"
         require_alias: true
         body: { doc: { foo: bar } }
+
+---
+"A write with require_alias to a name that is not an alias is missing, and no index is created for it":
+  - do:
+      indices.put_alias:
+        index: chk_proxy
+        name: chk_proxy_alias
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: chk_no_such, _id: "1", require_alias: true }
+          - { user: u1 }
+          - index: { _index: chk_proxy, _id: "2", require_alias: true }
+          - { user: u2 }
+          - index: { _index: chk_default, _id: "2", require_alias: true }
+          - { user: u2 }
+          - index: { _index: chk_proxy_alias, _id: "3", require_alias: true }
+          - { user: u3 }
+  - match: { errors: true }
+  - match: { items.0.index.status: 404 }
+  - match: { items.0.index.error.type: index_not_found_exception }
+  - match: { items.0.index.error.reason: "no such index [chk_no_such] and [require_alias] request flag is [true] and [chk_no_such] is not an alias" }
+  - match: { items.1.index.status: 404 }
+  - match: { items.1.index.error.reason: "no such index [chk_proxy] and [require_alias] request flag is [true] and [chk_proxy] is not an alias" }
+  - match: { items.2.index.status: 404 }
+  - match: { items.2.index.error.reason: "no such index [chk_default] and [require_alias] request flag is [true] and [chk_default] is not an alias" }
+  - match: { items.3.index.result: created }
+  - match: { items.3.index._index: chk_proxy }
+  - do:
+      catch: missing
+      indices.get:
+        index: chk_no_such
+  - do:
+      count:
+        index: chk_proxy
+  - match: { count: 2 }
+  - do:
+      catch: missing
+      index:
+        index: chk_proxy
+        id: "4"
+        require_alias: true
+        body: { user: u4 }
+
+---
+"A write with no require_alias to a name another item of the bulk requires be an alias finds no index, and none is created":
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: chk_proxy, _id: "5" }
+          - { user: u5 }
+          - index: { _index: chk_rvp_new, _id: "1", require_alias: true }
+          - { user: u1 }
+          - index: { _index: chk_rvp_new, _id: "2" }
+          - { user: u2 }
+  - match: { errors: true }
+  - match: { items.0.index.result: created }
+  - match: { items.1.index.status: 404 }
+  - match: { items.1.index.error.reason: "no such index [chk_rvp_new] and [require_alias] request flag is [true] and [chk_rvp_new] is not an alias" }
+  - match: { items.2.index.status: 404 }
+  - match: { items.2.index.error.type: index_not_found_exception }
+  - match: { items.2.index.error.reason: "no such index [chk_rvp_new]" }
+  - do:
+      catch: missing
+      indices.get:
+        index: chk_rvp_new
+
+---
+"An mget item through an alias of several indices fails alone and the others are served":
+  - do:
+      indices.put_alias:
+        index: chk_proxy,chk_default
+        name: chk_both
+  - do:
+      mget:
+        body:
+          docs:
+            - { _index: chk_proxy, _id: "1" }
+            - { _index: chk_both, _id: "1" }
+            - { _index: chk_no_such, _id: "1" }
+  - is_true: docs.0.found
+  - match: { docs.0._index: chk_proxy }
+  - match: { docs.0._source.user: u1 }
+  - is_false: docs.1.found
+  - match: { docs.1._index: chk_both }
+  - match: { docs.1._id: "1" }
+  - match: { docs.1.error.root_cause.0.type: illegal_argument_exception }
+  - match: { docs.1.error.root_cause.0.reason: "/[aA]lias.\\[chk_both\\].has.more.than.one.index.associated.with.it.\\[chk_(proxy|default),.chk_(proxy|default)\\],.can't.execute.a.single.index.op/" }
+  - match: { docs.2._index: chk_no_such }
+  - match: { docs.2.error.root_cause.0.type: index_not_found_exception }

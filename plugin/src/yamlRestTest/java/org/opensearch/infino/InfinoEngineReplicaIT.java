@@ -7,6 +7,7 @@ package org.opensearch.infino;
 import org.opensearch.client.ResponseException;
 
 import java.io.IOException;
+import java.time.Instant;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -14,6 +15,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 /**
@@ -32,14 +34,28 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
     private static final int LATER = 5;
     /** How long a copy may take to recover. */
     private static final String GREEN_TIMEOUT = "60s";
-    /** How long a node's reads may take to see another node's commit: well past the table's read staleness window. */
-    private static final long STALENESS_WAIT_SECONDS = 10;
+    /**
+     * How long a node's reads may take to see another node's commit: well past
+     * the table's read staleness window, which a run may widen to make a read
+     * that should have read the latest commit fail every time.
+     */
+    private static final long STALENESS_WAIT_SECONDS = 10 + TimeUnit.MILLISECONDS.toSeconds(Long.getLong("tests.infino.read.staleness.ms", 0L));
     /** The retention lease a default-mode table holds on its shard's history (the engine's {@code TABLE_LEASE}). */
     private static final String TABLE_LEASE = "infino_table";
     /** Distinct users among the documents written before the refresh. */
     private static final int USERS = 20;
     /** Searches sent in turn, so that each node of the two coordinates at least one. */
     private static final int COORDINATOR_ROUNDS = 4;
+    /**
+     * Settings that keep a write out of the table: the copies sync their
+     * translogs only hourly, so the replica never holds a write durably and
+     * the shard's global checkpoint does not move.
+     */
+    private static final String HELD = ",\"index.translog.durability\":\"async\",\"index.translog.sync_interval\":\"1h\"";
+    /** A date format of a field's own, which the table does not read without the mapper's values. */
+    private static final String CUSTOM_DATE = "yyyy/MM/dd HH:mm:ss";
+    /** Documents written with a date in {@link #CUSTOM_DATE}, a second apart. */
+    private static final int DATED = 5;
 
     public void testAReplicaAddedAfterUnflushedWritesRecoversFromThePrimarysHistory() throws IOException {
         String index = "eng_rep_recover";
@@ -78,7 +94,7 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
         String index = "eng_rep_held";
         // The copies sync their translogs only hourly, so the replica never holds
         // a write durably and the shard's global checkpoint does not move.
-        createIndex(index, 1, ",\"index.translog.durability\":\"async\",\"index.translog.sync_interval\":\"1h\"");
+        createIndex(index, 1, HELD);
         assertGreen(index);
         write(index, 0, DOCS);
         call("POST", "/" + index + "/_refresh", null);
@@ -88,6 +104,95 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
         assertGreen(index);
         call("POST", "/" + index + "/_refresh", null);
         assertServesEvery(index, DOCS);
+        call("DELETE", "/" + index, null);
+    }
+
+    /**
+     * A write the copies held when the replica takes over reaches the table
+     * from the new primary's history, which is not checked as it is
+     * replayed: a date in a format of its field's own mapping is read by the
+     * mapper at the commit that meets it, so the table holds the document at
+     * its instant rather than logging it as lost.
+     */
+    @SuppressWarnings("unchecked")
+    public void testATakenOverWriteOfADateInItsFieldsOwnFormatIsCommittedAtItsInstant() throws Exception {
+        String index = "eng_rep_date";
+        createIndex(index, 1, HELD, "\"n\":{\"type\":\"long\"},\"when\":{\"type\":\"date\",\"format\":\"" + CUSTOM_DATE + "\"}");
+        assertGreen(index);
+        for (int i = 0; i < DATED; i++) {
+            call("PUT", "/" + index + "/_doc/d" + i, "{\"n\":" + i + ",\"when\":\"2026/11/23 10:30:0" + i + "\"}");
+        }
+        call("POST", "/" + index + "/_refresh", null);
+        assertEquals("no write reaches the table ahead of its copies", Set.of(), hitIds(index, "_primary"));
+        cancelPrimary(index);
+        assertGreen(index);
+        call("POST", "/" + index + "/_refresh", null);
+        assertEquals(Set.copyOf(ids(0, DATED)), hitIds(index, "_primary"));
+
+        // Sorted by the field, each document at the instant the mapper read.
+        Map<String, Object> sorted = (Map<String, Object>) call(
+            "POST",
+            "/" + index + "/_search?preference=_primary",
+            "{\"sort\":[{\"when\":\"asc\"}]}"
+        ).get("hits");
+        List<Object> hits = (List<Object>) sorted.get("hits");
+        assertEquals(DATED, hits.size());
+        for (int i = 0; i < DATED; i++) {
+            Map<String, Object> hit = (Map<String, Object>) hits.get(i);
+            assertEquals("d" + i, hit.get("_id"));
+            long instant = Instant.parse("2026-11-23T10:30:0" + i + "Z").toEpochMilli();
+            assertEquals("d" + i, instant, ((Number) ((List<Object>) hit.get("sort")).get(0)).longValue());
+        }
+        // A range in the field's own format matches by those instants.
+        Map<String, Object> ranged = (Map<String, Object>) call(
+            "POST",
+            "/" + index + "/_search?preference=_primary",
+            "{\"size\":" + DATED + ",\"query\":{\"range\":{\"when\":{\"gte\":\"2026/11/23 10:30:02\"}}}}"
+        ).get("hits");
+        Set<Object> later = new HashSet<>();
+        for (Object h : (List<?>) ranged.get("hits")) {
+            later.add(((Map<String, Object>) h).get("_id"));
+        }
+        assertEquals(Set.copyOf(ids(2, DATED - 2)), later);
+        // The source is kept as it was written.
+        Map<String, Object> doc = call("GET", "/" + index + "/_doc/d0", null);
+        assertEquals("2026/11/23 10:30:00", ((Map<String, Object>) doc.get("_source")).get("when"));
+        call("DELETE", "/" + index, null);
+    }
+
+    /**
+     * A taken-over write the table refuses even with the values the mapper
+     * reads is logged and dropped, not tried again: here a fractional number
+     * its long field coerced when the write was acknowledged, and no longer
+     * coerces when the new primary replays it. The writes around it land,
+     * those written after the takeover too, and the table's hold on the
+     * shard's history moves past it, as it would not while a commit still
+     * meant to try it.
+     */
+    public void testATakenOverWriteTheTableRefusesIsDroppedAndTheWritesAfterItLand() throws Exception {
+        String index = "eng_rep_refused";
+        createIndex(index, 1, HELD, "\"n\":{\"type\":\"long\"}");
+        assertGreen(index);
+        write(index, 0, 2);
+        Map<String, Object> fraction = call("PUT", "/" + index + "/_doc/frac", "{\"n\":2.5}");
+        assertEquals("created", fraction.get("result"));
+        long fractionOp = ((Number) fraction.get("_seq_no")).longValue();
+        write(index, 2, 1);
+        call("PUT", "/" + index + "/_mapping", "{\"properties\":{\"n\":{\"type\":\"long\",\"coerce\":false}}}");
+        call("POST", "/" + index + "/_refresh", null);
+        assertEquals("no write reaches the table ahead of its copies", Set.of(), hitIds(index, "_primary"));
+        cancelPrimary(index);
+        // The new primary goes on alone, so a later write reaches the table at
+        // its own translog sync; the cancelled copy, rebuilt from the history,
+        // may read the fraction through the mapping that now refuses it.
+        call("PUT", "/" + index + "/_settings", "{\"index\":{\"number_of_replicas\":0,\"translog.durability\":\"request\"}}");
+        assertGreen(index);
+        write(index, 3, 2);
+        call("POST", "/" + index + "/_refresh", null);
+        assertEquals(Set.copyOf(ids(0, 5)), hitIds(index, "_primary"));
+        Long lease = tableLease(index, true);
+        assertNotNull("the table holds a lease on the shard's history", lease);
+        assertTrue("the table's lease " + lease + " is past the dropped write's operation " + fractionOp, lease > fractionOp);
         call("DELETE", "/" + index, null);
     }
 
@@ -102,10 +207,20 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
         assertGreen(index);
         write(index, 0, DOCS);
         call("POST", "/" + index + "/_refresh", null);
-        for (String preference : new String[] { "_primary", "_replica" }) {
-            for (int i = 0; i < 3; i++) {
-                assertEquals(preference, DOCS, total(index, preference));
+        for (int i = 0; i < 3; i++) {
+            assertEquals("_primary", DOCS, total(index, "_primary"));
+        }
+        // The replica may see the refresh up to the staleness window late;
+        // it keeps none of these searches, so the waiting adds no stats.
+        assertBusy(() -> {
+            try {
+                assertEquals("_replica", DOCS, total(index, "_replica"));
+            } catch (IOException e) {
+                throw new AssertionError(e);
             }
+        }, STALENESS_WAIT_SECONDS, TimeUnit.SECONDS);
+        for (int i = 0; i < 2; i++) {
+            assertEquals("_replica", DOCS, total(index, "_replica"));
         }
         assertEquals("the primary: one miss, two hits", List.of(1, 2), requestCache(index, true));
         assertEquals("the replica: never kept", List.of(0, 0), requestCache(index, false));
@@ -332,20 +447,29 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
     /**
      * The primary serves documents {@code d0} to {@code d<docs - 1>}, each
      * once, by search, count and get. A count may run on the other node's
-     * copy, and a get is answered by the node it is sent to, each from that
-     * node's own view of the table, which takes up another node's commit
-     * within the table's read staleness window; so those retry.
+     * copy, from that node's own view of the table, which takes up another
+     * node's commit within the table's read staleness window; so it retries.
+     * A get, a multi-get and a source get are realtime: whichever node they
+     * are sent to answers with the latest acknowledged write at once, so
+     * they do not.
      */
     @SuppressWarnings("unchecked")
     private void assertServesEvery(String index, int docs) throws Exception {
         assertEquals(Set.copyOf(ids(0, docs)), hitIds(index, "_primary"));
+        for (int i = 0; i < docs; i++) {
+            Map<String, Object> doc = call("GET", "/" + index + "/_doc/d" + i, null);
+            assertEquals("d" + i, i, ((Map<String, Object>) doc.get("_source")).get("n"));
+            assertEquals("d" + i, i, call("GET", "/" + index + "/_source/d" + i, null).get("n"));
+        }
+        String idList = ids(0, docs).stream().map(id -> "\"" + id + "\"").collect(Collectors.joining(","));
+        List<Object> found = (List<Object>) call("POST", "/" + index + "/_mget", "{\"ids\":[" + idList + "]}").get("docs");
+        for (int i = 0; i < docs; i++) {
+            Map<String, Object> doc = (Map<String, Object>) found.get(i);
+            assertEquals("mget d" + i, i, ((Map<String, Object>) doc.get("_source")).get("n"));
+        }
         assertBusy(() -> {
             try {
                 assertEquals(docs, count(index));
-                for (int i = 0; i < docs; i++) {
-                    Map<String, Object> doc = call("GET", "/" + index + "/_doc/d" + i, null);
-                    assertEquals("d" + i, i, ((Map<String, Object>) doc.get("_source")).get("n"));
-                }
             } catch (ResponseException e) {
                 throw new AssertionError(e);
             }
@@ -354,6 +478,11 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
 
     /** A default-mode index of one shard, with {@code extra} settings after the others. */
     private void createIndex(String index, int replicas, String extra) throws IOException {
+        createIndex(index, replicas, extra, "\"n\":{\"type\":\"long\"}");
+    }
+
+    /** A default-mode index of one shard, with {@code extra} settings after the others and the field mappings {@code properties}. */
+    private void createIndex(String index, int replicas, String extra, String properties) throws IOException {
         // Refresh off: only a write's own translog sync commits it to the table.
         call(
             "PUT",
@@ -362,7 +491,9 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
                 + "\"number_of_shards\":1,\"number_of_replicas\":"
                 + replicas
                 + extra
-                + "},\"mappings\":{\"properties\":{\"n\":{\"type\":\"long\"}}}}"
+                + "},\"mappings\":{\"properties\":{"
+                + properties
+                + "}}}"
         );
     }
 

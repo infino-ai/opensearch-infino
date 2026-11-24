@@ -250,7 +250,10 @@ final class InfinoSkeletonAdopter {
         if (created.isEmpty()) {
             return 0;
         }
-        Set<String> kept = InfinoNative.existingOsids(table, created);
+        // As of the table's latest commit: a row another node deleted within the
+        // engine's staleness window would otherwise read as kept, and its
+        // skeleton stay.
+        Set<String> kept = InfinoNative.existingOsidsLatest(table, created);
         BulkRequest deletes = new BulkRequest();
         for (String id : created) {
             if (!kept.contains(id)) {

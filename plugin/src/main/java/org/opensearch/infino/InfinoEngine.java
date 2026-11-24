@@ -29,6 +29,7 @@ import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.FlushFailedEngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.mapper.MapperParsingException;
+import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.ParseContext.Document;
 import org.opensearch.index.mapper.SourceFieldMapper;
 import org.opensearch.index.seqno.ReplicationTracker;
@@ -42,6 +43,7 @@ import org.opensearch.threadpool.ThreadPool;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -56,6 +58,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 
 /**
  * The engine of an index in default mode ({@code index.infino.mode: default}):
@@ -214,11 +217,24 @@ public class InfinoEngine extends InternalEngine {
 
     /**
      * One write of an id waiting for its commit: its source (null for a
-     * delete), routing value and stamp, and the operation that made it.
-     * A write the copies need not hold first (a replay of the shard's own
-     * history) is not gated.
+     * delete), routing value and stamp, the operation that made it, and the
+     * paths of the source's fields the mapper ignored ({@link InfinoIgnored}),
+     * left out of its row. A write the copies need not hold first (a replay
+     * of the shard's own history) is not gated. {@code mapped} holds the
+     * values OpenSearch's mapper read from the source's date and integer
+     * fields, for a document the table's columns refuse without them
+     * ({@link InfinoMappedValues}); null for any other.
      */
-    private record Version(long seq, boolean gated, String source, String routing, long stamp) {
+    private record Version(long seq, boolean gated, String source, String routing, long stamp, List<String> ignored, String mapped) {
+        Version(long seq, boolean gated, String source, String routing, long stamp, List<String> ignored) {
+            this(seq, gated, source, routing, stamp, ignored, null);
+        }
+
+        /** The source as the bridge takes it, with the mapper's values when it has them. */
+        String forTable() {
+            return InfinoMappedValues.framed(source, mapped);
+        }
+
         /** Whether the table may take this write once the copies hold every operation up to {@code through}. */
         boolean takenBy(long through) {
             return !gated || seq <= through;
@@ -385,8 +401,12 @@ public class InfinoEngine extends InternalEngine {
         }
     }
 
-    /** Which copy of a shard this node holds: whether it is the primary, and its allocation. */
-    private record Copy(boolean primary, String allocationId) {}
+    /**
+     * Which copy of a shard this node holds: whether it is the primary, its
+     * allocation, and whether it is recovering as the target of the
+     * primary's move to this node.
+     */
+    record Copy(boolean primary, String allocationId, boolean relocationTarget) {}
 
     private final String table;
     private final ShardId shardId;
@@ -411,6 +431,58 @@ public class InfinoEngine extends InternalEngine {
     /** The next renewal of the table's lease where it is, until the engine closes. */
     private volatile Scheduler.ScheduledCancellable leaseRefresh;
     private volatile boolean leaseRefreshStopped;
+
+    /**
+     * Whether this engine holds open the connection the latest reads go
+     * through ({@link InfinoNative#holdLatest}). While a rebuilt index's
+     * skeleton is rebuilt, each commit with a write the skeleton took as new,
+     * and each delete it did not find, reads the table's latest commit, as
+     * each commit of a replay does; without a hold, each would open the table
+     * again. Under {@link #latestHoldLock}.
+     */
+    private boolean holdsLatest;
+
+    /**
+     * Whether an update's merge on this primary reads the table's latest
+     * commit ({@link #sourceForMerge}): set as the engine opens and as a
+     * replica takes over, and cleared once this engine's own commit has
+     * appended or deleted. Until then this node's connection may answer from
+     * a commit before the last one the copy before it made, for up to the
+     * table's staleness window; its own commit brings it to the latest.
+     * While set, a primary holds the latest connection open
+     * ({@link #holdLatestWhileLookingUp}).
+     */
+    private volatile boolean readsLatest = true;
+
+    /**
+     * Whether the table holds this copy's history, so an update may merge
+     * into what it reads there: true for a copy that opens as primary, for
+     * a replica once its takeover has written into the table the writes its
+     * old primary had not committed ({@link #fillSeqNoGaps}), and for the
+     * target of a move once it has done the same after the hand-off
+     * ({@link #fillAfterHandOff}).
+     */
+    private volatile boolean filled;
+
+    /**
+     * Whether this copy opened as the target of the primary's move to this
+     * node. The primary it takes over from commits its writes as it hands
+     * the shard off, and a commit that fails then leaves them to this copy,
+     * so it writes its history into the table ({@link #fillAfterHandOff})
+     * before its first commit as primary and before an update merges here.
+     */
+    private final boolean movedHere;
+
+    /** Whether {@link #fillAfterHandOff} runs on this thread, under {@link #commitLock}. */
+    private boolean fillingAfterHandOff;
+
+    /** Whether a fill after the hand-off is queued for an update waiting on it ({@link #mergesHere}). */
+    private final AtomicBoolean handOffFillQueued = new AtomicBoolean();
+
+    /** Whether an update was refused a merge here while the table did not yet hold this copy's history, already logged. */
+    private final AtomicBoolean unfilledLogged = new AtomicBoolean();
+
+    private final Object latestHoldLock = new Object();
     private final Object[] idLocks = new Object[ID_LOCK_STRIPES];
     private Batch batch = new Batch();
     /** The batch being committed, until the table has it; a read still sees its writes meanwhile. */
@@ -459,7 +531,10 @@ public class InfinoEngine extends InternalEngine {
 
     /** Record which copy of {@code shard} this node holds, as {@code routing} says. */
     static void copyOf(ShardId shard, ShardRouting routing) {
-        COPIES.put(shard, new Copy(routing.primary(), routing.allocationId() == null ? null : routing.allocationId().getId()));
+        COPIES.put(
+            shard,
+            new Copy(routing.primary(), routing.allocationId() == null ? null : routing.allocationId().getId(), routing.isRelocationTarget())
+        );
     }
 
     /**
@@ -484,6 +559,11 @@ public class InfinoEngine extends InternalEngine {
     /** {@code shard}'s skeleton holds a document for every row of its table: ids need no lookup. */
     static void skeletonComplete(ShardId shard) {
         SKELETON_COMPLETE.add(shard);
+        for (InfinoEngine engine : BY_TABLE.values()) {
+            if (engine.shardId.equals(shard)) {
+                engine.holdLatestWhileLookingUp(false);
+            }
+        }
     }
 
     /** This node no longer holds a copy of {@code shard}. */
@@ -502,6 +582,28 @@ public class InfinoEngine extends InternalEngine {
     /** Whether the skeleton can say which ids the table holds: not while a rebuilt index's skeleton is rebuilt. */
     private boolean skeletonKnowsIds() {
         return !rebuilt || SKELETON_COMPLETE.contains(shardId);
+    }
+
+    /**
+     * Hold the latest connection open ({@link #holdsLatest}) while the
+     * skeleton cannot say which ids the table holds, while a primary's
+     * update merges read the latest commit ({@link #readsLatest}) or, as
+     * {@code lookingUp} says, the commits look ids up; let it go once none
+     * holds or the engine closes.
+     */
+    private void holdLatestWhileLookingUp(boolean lookingUp) {
+        synchronized (latestHoldLock) {
+            boolean wanted = (lookingUp || !skeletonKnowsIds() || (readsLatest && primaryCopy())) && !leaseRefreshStopped;
+            if (wanted == holdsLatest) {
+                return;
+            }
+            holdsLatest = wanted;
+            if (wanted) {
+                InfinoNative.holdLatest();
+            } else {
+                InfinoNative.releaseLatest();
+            }
+        }
     }
 
     /** Whether the write being applied is a skeleton-only one, whose row the table holds already. */
@@ -556,6 +658,9 @@ public class InfinoEngine extends InternalEngine {
             }
         });
         readers.addListener(refreshRelease);
+        Copy copy = COPIES.get(shardId);
+        this.movedHere = copy != null && copy.relocationTarget();
+        this.filled = primaryCopy() && !movedHere;
         BY_TABLE.put(table, this);
         scheduleLeaseRefresh();
         log.info("[infino] engine attached to table {} for {}", table, config.getShardId());
@@ -751,6 +856,81 @@ public class InfinoEngine extends InternalEngine {
         }
     }
 
+    /**
+     * Whether an update to {@code table} merges here: this node holds the
+     * shard's primary, which has not handed the shard off, and the table
+     * holds its history ({@link #filled}). Only that copy's pending writes
+     * and its reads of the table are as new as the sequence numbers its
+     * shard gives. A primary that moved here and has not yet written its
+     * history into the table starts doing so ({@link #fillAfterHandOff}),
+     * and the update waits for it.
+     */
+    static boolean mergesHere(String table) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine == null || !engine.primaryCopy()) {
+            return false;
+        }
+        ReplicationTracker tracker = engine.config().getGlobalCheckpointSupplier() instanceof ReplicationTracker t ? t : null;
+        if (tracker != null && tracker.isRelocated()) {
+            return false;
+        }
+        if (engine.filled) {
+            return true;
+        }
+        if (engine.unfilledLogged.compareAndSet(false, true)) {
+            log.info("[infino] updates to {} wait until its table holds the history of {}, which this node now holds as primary", table, engine.shardId);
+        }
+        if (engine.movedHere && tracker != null && tracker.isPrimaryMode() && engine.handOffFillQueued.compareAndSet(false, true)) {
+            engine.config().getThreadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
+                try {
+                    synchronized (engine.commitLock) {
+                        engine.fillAfterHandOff();
+                    }
+                } catch (RuntimeException e) {
+                    log.debug("[infino] the history of {} was not written into {} for a waiting update", engine.shardId, table, e);
+                } finally {
+                    engine.handOffFillQueued.set(false);
+                }
+            });
+        }
+        return false;
+    }
+
+    /**
+     * {@code id}'s source for an update to merge into, on the primary that
+     * writes {@code table} ({@link #mergesHere}); null when it is deleted or
+     * missing. Read after the caller has read the document's sequence
+     * number, it is at least as new as that number: a write holds the id's
+     * lock from its apply to its record in the batch, so once that lock is
+     * taken here, a write the number counts is in the batch, the batch
+     * committing, or the table. A write the shard has not committed is read
+     * from its batch; otherwise the table is read, from its latest commit
+     * while another copy may have written it last ({@link #readsLatest}).
+     * {@code shardHoldsId} is whether the shard found the id: when it did
+     * not and the skeleton knows every id, the table holds none either.
+     */
+    static String sourceForMerge(String table, String id, boolean shardHoldsId) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine == null) {
+            throw new InfinoNative.InfinoException("the shard of " + table + " is not open on this node", RestStatus.SERVICE_UNAVAILABLE);
+        }
+        Version pending;
+        synchronized (engine.idLock(id)) {
+            pending = latestPending(table, id);
+        }
+        if (pending != null) {
+            return pending.source();
+        }
+        if (!shardHoldsId && engine.skeletonKnowsIds()) {
+            return null;
+        }
+        if (engine.readsLatest) {
+            engine.holdLatestWhileLookingUp(false);
+            return InfinoNative.getSourceLatest(table, id);
+        }
+        return InfinoNative.getSourceFresh(table, id);
+    }
+
     /** {@code id}'s source as a read sees it now: a pending write's, else the table's; null when it is deleted or missing. */
     static String currentSource(String table, String id) {
         Pending p = pending(table, id);
@@ -758,16 +938,167 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /**
-     * {@code id}'s document as a read sees it now, with the sequence number
-     * it was written under: a pending write's, else the table's; null when it
-     * is deleted or missing.
+     * {@code id}'s document as a realtime read sees it now ({@link #currentDocs});
+     * null when it is deleted or missing.
      */
     static InfinoNative.Doc currentDoc(String table, String id) {
-        Version v = latestPending(table, id);
-        if (v != null) {
-            return v.source() == null ? null : new InfinoNative.Doc(v.source(), v.seq());
+        return currentDocs(table, List.of(id)).get(id);
+    }
+
+    /**
+     * The documents of {@code ids} as a realtime read sees them now, by id,
+     * each with the sequence number and routing it was written with: a
+     * pending write's, else the table's; an id deleted or missing is absent.
+     * The ids with no pending write are read from the table in one call,
+     * through this node's own connection when it has read every commit
+     * ({@link #readsEveryCommit(String)}), else from the table's latest commit.
+     */
+    static Map<String, InfinoNative.Doc> currentDocs(String table, Collection<String> ids) {
+        Map<String, InfinoNative.Doc> out = new HashMap<>();
+        List<String> committed = new ArrayList<>();
+        for (String id : ids) {
+            Version v = latestPending(table, id);
+            if (v == null) {
+                committed.add(id);
+            } else if (v.source() != null) {
+                out.put(id, new InfinoNative.Doc(v.source(), v.seq(), v.routing()));
+            }
         }
-        return InfinoNative.getDoc(table, id);
+        if (committed.isEmpty()) {
+            return out;
+        }
+        boolean latest = readsEveryCommit(table) == false;
+        if (latest) {
+            holdLatestForRealtime(table);
+        }
+        out.putAll(InfinoNative.docsOf(table, committed, latest));
+        return out;
+    }
+
+    /**
+     * How long the latest connection stays held after this node's last
+     * realtime read through it, and how long it keeps a table's handle that
+     * no realtime read has read. Unheld, each such read opens the connection
+     * and the table again (a catalog read and the manifest); held, it costs
+     * one pointer read.
+     */
+    private static final TimeValue REALTIME_LATEST_LINGER = TimeValue.timeValueSeconds(30);
+    private static final Object REALTIME_HOLD_LOCK = new Object();
+    /** Whether realtime reads hold the latest connection open; under {@link #REALTIME_HOLD_LOCK}. */
+    private static boolean realtimeHolds;
+    /**
+     * When a realtime read last read each table through the latest connection
+     * ({@link System#nanoTime}), while realtime reads hold it. The connection
+     * keeps a handle (and the manifest) of each table it has read; once a
+     * table goes {@link #REALTIME_LATEST_LINGER} unread, the connection is
+     * opened afresh, so it holds only the tables read within about twice
+     * that, not every table the node has served a realtime read for.
+     */
+    private static final Map<String, Long> REALTIME_TABLES = new ConcurrentHashMap<>();
+
+    /**
+     * Hold the latest connection open for realtime reads of {@code table}
+     * until {@link #REALTIME_LATEST_LINGER} passes with none. Without a
+     * thread pool to time the release (a unit test), each read opens it alone.
+     */
+    private static void holdLatestForRealtime(String table) {
+        ThreadPool pool = InfinoServices.threadPool();
+        if (pool == null) {
+            return;
+        }
+        REALTIME_TABLES.put(table, System.nanoTime());
+        synchronized (REALTIME_HOLD_LOCK) {
+            if (realtimeHolds) {
+                return;
+            }
+            InfinoNative.holdLatest();
+            realtimeHolds = true;
+        }
+        releaseWhenIdle(pool);
+    }
+
+    /**
+     * Each {@link #REALTIME_LATEST_LINGER}: forget the tables no realtime read
+     * has read for that long, opening the connection afresh so it lets go of
+     * their handles when realtime reads still hold it, and letting go of the
+     * hold when none is left.
+     */
+    private static void releaseWhenIdle(ThreadPool pool) {
+        try {
+            pool.schedule(() -> {
+                boolean idle;
+                boolean forgot;
+                synchronized (REALTIME_HOLD_LOCK) {
+                    long now = System.nanoTime();
+                    // Removed only when still that old: a read since keeps its table.
+                    forgot = REALTIME_TABLES.values().removeIf(read -> now - read >= REALTIME_LATEST_LINGER.nanos());
+                    idle = REALTIME_TABLES.isEmpty();
+                    if (idle) {
+                        realtimeHolds = false;
+                    } else {
+                        releaseWhenIdle(pool);
+                    }
+                }
+                if (idle) {
+                    InfinoNative.releaseLatest();
+                } else if (forgot) {
+                    InfinoNative.forgetLatest();
+                }
+            }, REALTIME_LATEST_LINGER, ThreadPool.Names.GENERIC);
+        } catch (Exception e) {
+            // The pool is shutting down: let go now.
+            synchronized (REALTIME_HOLD_LOCK) {
+                realtimeHolds = false;
+                REALTIME_TABLES.clear();
+            }
+            InfinoNative.releaseLatest();
+        }
+    }
+
+    /**
+     * Whether this node's own connection has read every commit to
+     * {@code table}, so a realtime read may go through it. That connection
+     * reads under the engine's staleness bound: for up to its window after
+     * another node commits, it may answer from the commit before. Only the
+     * shard's primary, once it has committed since it began writing here,
+     * knows the last commit is its own, and only until it hands the shard
+     * off: the new primary commits from then on, while this copy still
+     * answers reads until it closes. Every other node (a replica, a node
+     * holding no copy, a primary that has just taken over or has handed off)
+     * may be behind, so its realtime reads read the table's latest commit.
+     * Searches are not realtime and keep the bound.
+     */
+    static boolean readsEveryCommit(String table) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        InfinoWriter writer = InfinoServices.writer();
+        return engine != null
+            && writer != null
+            && readsEveryCommit(
+                COPIES.get(engine.shardId),
+                handedOff(engine.config().getGlobalCheckpointSupplier()),
+                allocation -> writer.caughtUp(table, allocation)
+            );
+    }
+
+    /**
+     * {@link #readsEveryCommit(String)} for this node's {@code copy} of the
+     * shard (null for none), {@code handedOff} when that copy has handed the
+     * shard off to another node ({@link #handedOff(LongSupplier)}), where
+     * {@code caughtUp} says whether this node has committed to the table
+     * since it began writing it as a copy ({@link InfinoWriter#caughtUp}).
+     */
+    static boolean readsEveryCommit(Copy copy, boolean handedOff, Predicate<String> caughtUp) {
+        return copy != null && copy.primary() && handedOff == false && caughtUp.test(copy.allocationId());
+    }
+
+    /**
+     * Whether the copy whose shard's checkpoints {@code checkpoints} reads
+     * has handed the shard off to another node (a relocation), after which
+     * the new primary writes the table. A copy whose checkpoints cannot be
+     * read is taken as not handed off.
+     */
+    static boolean handedOff(LongSupplier checkpoints) {
+        return checkpoints instanceof ReplicationTracker tracker && tracker.isRelocated();
     }
 
     /**
@@ -796,21 +1127,25 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /**
-     * The routing value {@code id} was last written with, as a read sees it
-     * now: a pending write's, else the table's; null when it was written with
-     * none.
+     * The paths of the fields the mapper ignored in {@code id}'s document, as
+     * a read sees it now: a pending write's, else the table's.
      */
-    static String currentRouting(String table, String id) {
+    static List<String> currentIgnored(String table, String id) {
         Version v = latestPending(table, id);
         if (v != null && v.source() != null) {
-            return v.routing();
+            return v.ignored();
         }
-        return InfinoNative.routingOf(table, id);
+        return InfinoNative.ignoredOf(table, id);
     }
 
     @Override
     public void close() throws IOException {
         leaseRefreshStopped = true;
+        holdLatestWhileLookingUp(false);
+        InfinoWriter writer = InfinoServices.writer();
+        if (writer != null) {
+            writer.stopReadingLatest(table);
+        }
         Scheduler.ScheduledCancellable next = leaseRefresh;
         if (next != null) {
             next.cancel();
@@ -878,6 +1213,8 @@ public class InfinoEngine extends InternalEngine {
         String source = !toTable || index.source() == null
             ? null
             : InfinoBulkActionFilter.sourceAsJson(index.source(), index.parsedDoc() == null ? null : index.parsedDoc().getMediaType());
+        // The fields the mapper ignored for a malformed value: the row leaves them out, as the shard's document does.
+        List<String> ignored = source == null ? List.of() : InfinoIgnored.of(index.parsedDoc());
         // The table's columns refuse here, before the write is applied and
         // acknowledged, a document the commit would refuse: one the mapper takes
         // but a column cannot hold (an unsigned_long past the largest signed
@@ -888,12 +1225,27 @@ public class InfinoEngine extends InternalEngine {
         // or by a put-mapping) has its column, so the check reads the document
         // as the commit will. A failure to declare or check is no verdict on the
         // document: this write alone fails, and the bridge's failures answer 503,
-        // so it may be tried again.
+        // so it may be tried again. A document the columns refuse is checked
+        // again with the values the mapper read from its date and integer
+        // fields (a date in a format of the field's own, a fraction an integer
+        // field coerces), which its row then holds.
+        String mapped = null;
         if (source != null && !index.origin().isRecovery()) {
             String why;
             try {
                 InfinoPlugin.tables().ensure(config().getIndexSettings().getIndexMetadata(), config().getShardId().id());
-                why = InfinoNative.checkDoc(table, source);
+                why = InfinoNative.checkDoc(table, source, ignored);
+                if (why != null) {
+                    try {
+                        mapped = InfinoMappedValues.of(index.parsedDoc(), config().getMapperService());
+                    } catch (RuntimeException e) {
+                        // Values the mapper's document does not yield are no values: the bridge's refusal stands.
+                        mapped = null;
+                    }
+                    if (mapped != null) {
+                        why = InfinoNative.checkDoc(table, InfinoMappedValues.framed(source, mapped), ignored);
+                    }
+                }
             } catch (InfinoNative.InfinoException e) {
                 return new IndexResult(
                     e.status() == RestStatus.INTERNAL_SERVER_ERROR ? new InfinoNative.InfinoException(e.getMessage(), RestStatus.SERVICE_UNAVAILABLE) : e,
@@ -952,7 +1304,7 @@ public class InfinoEngine extends InternalEngine {
                     Base base = recovery || (!skeletonKnowsIds() && result.isCreated())
                         ? Base.UNKNOWN
                         : result.isCreated() ? Base.ABSENT : Base.PRESENT;
-                    batch.add(id, base, new Version(result.getSeqNo(), !recovery, source, index.routing(), stamp));
+                    batch.add(id, base, new Version(result.getSeqNo(), !recovery, source, index.routing(), stamp, ignored, mapped));
                     full = batchFull();
                 }
             }
@@ -1002,7 +1354,7 @@ public class InfinoEngine extends InternalEngine {
                 if (result.isFound()) {
                     synchronized (batchLock) {
                         unrefreshed.remove(id);
-                        batch.add(id, recovery ? Base.UNKNOWN : Base.PRESENT, new Version(result.getSeqNo(), !recovery, null, null, UNSTAMPED));
+                        batch.add(id, recovery ? Base.UNKNOWN : Base.PRESENT, new Version(result.getSeqNo(), !recovery, null, null, UNSTAMPED, List.of()));
                     }
                     return result;
                 }
@@ -1050,11 +1402,12 @@ public class InfinoEngine extends InternalEngine {
      * have before the rebuild.
      */
     private boolean deleteTableOnly(String id, long seq) {
-        if (InfinoNative.existingOsids(table, List.of(id)).isEmpty()) {
+        holdLatestWhileLookingUp(false);
+        if (InfinoNative.existingOsidsLatest(table, List.of(id)).isEmpty()) {
             return false;
         }
         synchronized (batchLock) {
-            batch.add(id, Base.PRESENT, new Version(seq, true, null, null, UNSTAMPED));
+            batch.add(id, Base.PRESENT, new Version(seq, true, null, null, UNSTAMPED, List.of()));
         }
         return true;
     }
@@ -1109,7 +1462,7 @@ public class InfinoEngine extends InternalEngine {
             }
             return getPersistedLocalCheckpoint();
         }
-        if (tracker.isRelocated()) {
+        if (handedOff(tracker)) {
             return NOTHING;
         }
         Copy copy = COPIES.get(shardId);
@@ -1135,6 +1488,9 @@ public class InfinoEngine extends InternalEngine {
      */
     private boolean commitBatch() {
         synchronized (commitLock) {
+            if (movedHere && !filled && !fillingAfterHandOff && takesPrimaryWrites()) {
+                fillAfterHandOff();
+            }
             synchronized (batchLock) {
                 if (batch.isEmpty()) {
                     return true;
@@ -1357,6 +1713,7 @@ public class InfinoEngine extends InternalEngine {
         List<Version> written = new ArrayList<>();
         List<String> sources = new ArrayList<>();
         List<String> routings = new ArrayList<>();
+        List<List<String>> ignored = new ArrayList<>();
         List<Long> stamps = new ArrayList<>();
         List<Long> ops = new ArrayList<>();
         Set<String> replaced = new HashSet<>();
@@ -1374,8 +1731,9 @@ public class InfinoEngine extends InternalEngine {
             }
             ids.add(id);
             written.add(last);
-            sources.add(last.source());
+            sources.add(last.forTable());
             routings.add(last.routing());
+            ignored.add(last.ignored());
             stamps.add(last.stamp());
             ops.add(last.seq());
             if (e.base == Base.PRESENT) {
@@ -1384,8 +1742,13 @@ public class InfinoEngine extends InternalEngine {
                 lookedUp.add(id);
             }
         }
+        // An id this node has no record of may be a row another node wrote:
+        // a replayed operation, after a takeover, of a write that node
+        // committed. The table's latest commit says, so the write replaces
+        // the row rather than appending it again.
+        holdLatestWhileLookingUp(!lookedUp.isEmpty());
         if (!lookedUp.isEmpty()) {
-            replaced.addAll(InfinoNative.existingOsids(table, lookedUp));
+            replaced.addAll(InfinoNative.existingOsidsLatest(table, lookedUp));
         }
         Batch retry = new Batch();
         // Deletes go first: until a commit's rows are in, the highest operation the
@@ -1416,7 +1779,7 @@ public class InfinoEngine extends InternalEngine {
             // is mapped before its document is applied): declared first, a new text
             // field gets its text index, where the append would add a plain column.
             InfinoPlugin.tables().ensure(config().getIndexSettings().getIndexMetadata(), config().getShardId().id());
-            Pointer prepared = InfinoNative.prepare(table, ids, sources, routings, seqs, opSeqs, generation);
+            Pointer prepared = InfinoNative.prepare(table, ids, sources, routings, seqs, opSeqs, generation, ignored);
             if (prepared == null) {
                 throw new IllegalStateException("[infino] the bridge could not prepare a batch for " + table);
             }
@@ -1427,6 +1790,11 @@ public class InfinoEngine extends InternalEngine {
         Set<String> touched = new HashSet<>(ids);
         touched.addAll(deleted);
         InfinoNative.forgetSources(table, touched);
+        if (!touched.isEmpty() && readsLatest) {
+            // This node's connection has read the table at its own commit, the latest.
+            readsLatest = false;
+            holdLatestWhileLookingUp(false);
+        }
         log.debug("[infino] engine committed {} writes and {} deletes to {} in {} ms", ids.size(), deleted.size(), table, (System.nanoTime() - start) / 1_000_000L);
         return retry;
     }
@@ -1455,10 +1823,28 @@ public class InfinoEngine extends InternalEngine {
             String refused = f.permanent() ? f.reason() : null;
             if (refused == null && checkable) {
                 try {
-                    refused = InfinoNative.checkDoc(table, v.source());
+                    refused = InfinoNative.checkDoc(table, v.forTable(), v.ignored());
                 } catch (InfinoNative.InfinoException e) {
                     // No verdict on this document or the ones after it: each is tried again.
                     checkable = false;
+                }
+            }
+            if (refused != null && checkable && v.mapped() == null) {
+                // A write that reached the commit unchecked (a replay of the shard's history) may
+                // need the values the mapper reads: with them, the next commit takes it.
+                try {
+                    Version withValues = withMapped(id, v);
+                    if (withValues != null && InfinoNative.checkDoc(table, withValues.forTable(), withValues.ignored()) == null) {
+                        log.debug("[infino] table {} takes document {} (operation {}) at the next commit, with the values the mapper read", table, id, v.seq());
+                        retry.add(id, Base.UNKNOWN, withValues);
+                        continue;
+                    }
+                } catch (InfinoNative.InfinoException e) {
+                    log.warn("[infino] table {} did not take document {} (operation {}); the next commit tries again: {}", table, id, v.seq(), e.getMessage());
+                    retry.add(id, Base.UNKNOWN, v);
+                    continue;
+                } catch (RuntimeException e) {
+                    log.debug("[infino] the mapper refuses document {} of {} on replay: {}", id, shardId, e.getMessage());
                 }
             }
             if (refused != null) {
@@ -1475,6 +1861,19 @@ public class InfinoEngine extends InternalEngine {
             retry.add(id, Base.UNKNOWN, v);
         }
         return retry;
+    }
+
+    /**
+     * {@code v} with the values the index's mapper reads from its source
+     * ({@link InfinoMappedValues}); null when it has none. Throws what the
+     * mapper throws for a source it refuses.
+     */
+    private Version withMapped(String id, Version v) {
+        if (v.source() == null) {
+            return null;
+        }
+        String mapped = InfinoMappedValues.parse(config().getMapperService(), shardId.getIndexName(), id, v.source(), v.routing());
+        return mapped == null ? null : new Version(v.seq(), v.gated(), v.source(), v.routing(), v.stamp(), v.ignored(), mapped);
     }
 
     /**
@@ -1610,14 +2009,71 @@ public class InfinoEngine extends InternalEngine {
      */
     @Override
     public int fillSeqNoGaps(long primaryTerm) throws IOException {
-        int filled = super.fillSeqNoGaps(primaryTerm);
+        int gaps = super.fillSeqNoGaps(primaryTerm);
         if (commitLock != null) {
             Copy copy = COPIES.get(shardId);
-            COPIES.put(shardId, new Copy(true, copy == null ? null : copy.allocationId()));
-            fillTable();
+            COPIES.put(shardId, new Copy(true, copy == null ? null : copy.allocationId(), false));
+            readsLatest = true;
+            fillTable(getSeqNoStats(SequenceNumbers.UNASSIGNED_SEQ_NO).getMaxSeqNo());
+            filled = true;
             TOOK_OVER.add(shardId);
         }
-        return filled;
+        return gaps;
+    }
+
+    /**
+     * Whether this copy takes the shard's writes as its primary: it is in
+     * primary mode and has not handed the shard off.
+     */
+    private boolean takesPrimaryWrites() {
+        return config().getGlobalCheckpointSupplier() instanceof ReplicationTracker tracker && tracker.isPrimaryMode() && !tracker.isRelocated();
+    }
+
+    /**
+     * On a copy that moved here ({@link #movedHere}) and now takes the
+     * shard's writes, write into the table the operations of its history
+     * the table may not hold ({@link #fillTable}), as a promotion does: the
+     * primary it took over from commits its writes as it hands the shard
+     * off, but a commit that fails then leaves them out of the table. It
+     * runs under {@link #commitLock} before this copy's first commit, so no
+     * write of the old primary's reaches the table after a newer one of
+     * this copy's. Writes arrive meanwhile, so it reads the history through
+     * what this copy has processed; those after it are its own, in the
+     * batch. A history that cannot be written fails the engine, as it fails
+     * a promotion.
+     */
+    private void fillAfterHandOff() {
+        assert Thread.holdsLock(commitLock);
+        if (filled || fillingAfterHandOff) {
+            return;
+        }
+        fillingAfterHandOff = true;
+        try {
+            readsLatest = true;
+            fillTable(getProcessedLocalCheckpoint());
+            filled = true;
+            log.info("[infino] {} holds the history of {} after its move here; updates merge here", table, shardId);
+        } catch (IOException | RuntimeException e) {
+            failEngine("writing the history of " + shardId + " into " + table + " after its move failed", e);
+            throw new IllegalStateException("[infino] writing the history of " + shardId + " into " + table + " after its move failed", e);
+        } finally {
+            fillingAfterHandOff = false;
+        }
+    }
+
+    /**
+     * The paths the mapper ignores in a source of the shard's history
+     * ({@link InfinoIgnored#parse}); none when {@code mappers} is null. The
+     * shard took the document once, so a mapper that refuses it on replay (its
+     * mapping moved since) leaves the row to the table's own check.
+     */
+    private List<String> fillIgnored(MapperService mappers, String id, String source, String routing) {
+        try {
+            return InfinoIgnored.parse(mappers, shardId.getIndexName(), id, source, routing);
+        } catch (RuntimeException e) {
+            log.warn("[infino] {} could not parse document {} from its history again for its ignored fields: {}", shardId, id, e.getMessage());
+            return List.of();
+        }
     }
 
     /**
@@ -1629,11 +2085,11 @@ public class InfinoEngine extends InternalEngine {
      * promotion fails rather than serving without them. A shard with no
      * lease (its table has not committed under this engine since it was
      * given one) starts past the highest operation a row records, as far as
-     * its history reaches.
+     * its history reaches. It writes through operation {@code to}, skipping
+     * an operation whose id the batch holds a write of at least as new.
      */
-    private void fillTable() throws IOException {
+    private void fillTable(long to) throws IOException {
         long retained = getMinRetainedSeqNo();
-        long to = getSeqNoStats(SequenceNumbers.UNASSIGNED_SEQ_NO).getMaxSeqNo();
         RetentionLease lease = tableLease();
         long from;
         if (lease != null) {
@@ -1663,6 +2119,8 @@ public class InfinoEngine extends InternalEngine {
         }
         long start = System.nanoTime();
         int written = 0;
+        // The history keeps sources, not parsed documents: an index that may ignore a malformed value parses each again.
+        MapperService ignoring = InfinoIgnored.mayIgnore(config().getMapperService()) ? config().getMapperService() : null;
         try (Translog.Snapshot history = newChangesSnapshot(FILL_SOURCE, from, to, lease != null, false)) {
             Translog.Operation op;
             while ((op = history.next()) != null) {
@@ -1676,20 +2134,27 @@ public class InfinoEngine extends InternalEngine {
                             index.source(),
                             index.source() == null ? null : MediaTypeRegistry.xContentType(index.source())
                         );
-                        v = new Version(op.seqNo(), false, source, index.routing(), UNSTAMPED);
+                        v = new Version(op.seqNo(), false, source, index.routing(), UNSTAMPED, fillIgnored(ignoring, id, source, index.routing()));
                     }
                     case DELETE -> {
                         id = ((Translog.Delete) op).id();
-                        v = new Version(op.seqNo(), false, null, null, UNSTAMPED);
+                        v = new Version(op.seqNo(), false, null, null, UNSTAMPED, List.of());
                     }
                     default -> {
                         continue;
                     }
                 }
                 boolean full;
-                synchronized (batchLock) {
-                    batch.add(id, Base.UNKNOWN, v);
-                    full = batchFull();
+                synchronized (idLock(id)) {
+                    synchronized (batchLock) {
+                        // A newer write of the id waits in the batch already: this copy took it.
+                        Version newer = batch.latest(id);
+                        if (newer != null && newer.seq() >= op.seqNo()) {
+                            continue;
+                        }
+                        batch.add(id, Base.UNKNOWN, v);
+                        full = batchFull();
+                    }
                 }
                 written++;
                 if (full) {

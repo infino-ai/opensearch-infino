@@ -1,0 +1,450 @@
+---
+setup:
+  # Every row is written by its own refreshing bulk, so each table holds one
+  # file per row. The queries below give every match the same constant score
+  # and ask for no sort, so the order of the tied hits is the order the rows
+  # are read in. ut_luc is the Lucene twin: it breaks the ties by doc id,
+  # which is write order, and the Infino tables must page the same way. The
+  # rows are written p3 e1 x9 b4 q2 t8; the case-insensitive queries match
+  # all but x9, so they page p3 e1 b4 q2 t8, where an _id order would start
+  # b4 e1. A long optimize interval keeps a scheduled optimize from
+  # rewriting the files mid-test.
+  - do:
+      indices.create:
+        index: ut_inf
+        body:
+          settings: { index.infino.enabled: true, index.infino.optimize_interval: 1h, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              w: { type: wildcard }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: ut_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, index.infino.optimize_interval: 1h, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              w: { type: wildcard }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: ut_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              w: { type: wildcard }
+              k: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ut_inf, _id: "p3" }
+          - { w: "AbCd", k: "AbCd" }
+          - index: { _index: ut_prx, _id: "p3" }
+          - { w: "AbCd", k: "AbCd" }
+          - index: { _index: ut_luc, _id: "p3" }
+          - { w: "AbCd", k: "AbCd" }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ut_inf, _id: "e1" }
+          - { w: "ABCD", k: "ABCD" }
+          - index: { _index: ut_prx, _id: "e1" }
+          - { w: "ABCD", k: "ABCD" }
+          - index: { _index: ut_luc, _id: "e1" }
+          - { w: "ABCD", k: "ABCD" }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ut_inf, _id: "x9" }
+          - { w: "zzzz", k: "zzzz" }
+          - index: { _index: ut_prx, _id: "x9" }
+          - { w: "zzzz", k: "zzzz" }
+          - index: { _index: ut_luc, _id: "x9" }
+          - { w: "zzzz", k: "zzzz" }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ut_inf, _id: "b4" }
+          - { w: "abcd", k: "abcd" }
+          - index: { _index: ut_prx, _id: "b4" }
+          - { w: "abcd", k: "abcd" }
+          - index: { _index: ut_luc, _id: "b4" }
+          - { w: "abcd", k: "abcd" }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ut_inf, _id: "q2" }
+          - { w: "aBcD", k: "aBcD" }
+          - index: { _index: ut_prx, _id: "q2" }
+          - { w: "aBcD", k: "aBcD" }
+          - index: { _index: ut_luc, _id: "q2" }
+          - { w: "aBcD", k: "aBcD" }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: ut_inf, _id: "t8" }
+          - { w: "abCD", k: "abCD" }
+          - index: { _index: ut_prx, _id: "t8" }
+          - { w: "abCD", k: "abCD" }
+          - index: { _index: ut_luc, _id: "t8" }
+          - { w: "abCD", k: "abCD" }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: ut_inf,ut_prx,ut_luc
+        ignore_unavailable: true
+
+---
+"A case-insensitive wildcard query with no sort pages through tied hits from several files in write order, as the Lucene twin does":
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 0, size: 2, query: { wildcard: { w: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 2, size: 2, query: { wildcard: { w: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b4" }
+  - match: { hits.hits.1._id: "q2" }
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 4, size: 2, query: { wildcard: { w: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "t8" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 0, size: 2, query: { wildcard: { w: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 2, size: 2, query: { wildcard: { w: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b4" }
+  - match: { hits.hits.1._id: "q2" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 4, size: 2, query: { wildcard: { w: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "t8" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 0, size: 2, query: { wildcard: { w: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 2, size: 2, query: { wildcard: { w: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b4" }
+  - match: { hits.hits.1._id: "q2" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 4, size: 2, query: { wildcard: { w: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "t8" }
+
+---
+"A case-insensitive regexp query with no sort pages through tied hits from several files in write order, as the Lucene twin does":
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 0, size: 2, query: { regexp: { w: { value: "ab.d", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 2, size: 2, query: { regexp: { w: { value: "ab.d", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b4" }
+  - match: { hits.hits.1._id: "q2" }
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 4, size: 2, query: { regexp: { w: { value: "ab.d", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "t8" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 0, size: 2, query: { regexp: { w: { value: "ab.d", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 2, size: 2, query: { regexp: { w: { value: "ab.d", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b4" }
+  - match: { hits.hits.1._id: "q2" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 4, size: 2, query: { regexp: { w: { value: "ab.d", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "t8" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 0, size: 2, query: { regexp: { w: { value: "ab.d", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 2, size: 2, query: { regexp: { w: { value: "ab.d", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b4" }
+  - match: { hits.hits.1._id: "q2" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 4, size: 2, query: { regexp: { w: { value: "ab.d", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "t8" }
+
+---
+"A case-insensitive prefix query on a keyword with no sort pages through tied hits from several files in write order, as the Lucene twin does":
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 0, size: 2, query: { prefix: { k: { value: "ABC", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 2, size: 2, query: { prefix: { k: { value: "ABC", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b4" }
+  - match: { hits.hits.1._id: "q2" }
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 4, size: 2, query: { prefix: { k: { value: "ABC", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "t8" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 0, size: 2, query: { prefix: { k: { value: "ABC", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 2, size: 2, query: { prefix: { k: { value: "ABC", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b4" }
+  - match: { hits.hits.1._id: "q2" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 4, size: 2, query: { prefix: { k: { value: "ABC", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "t8" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 0, size: 2, query: { prefix: { k: { value: "ABC", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 2, size: 2, query: { prefix: { k: { value: "ABC", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b4" }
+  - match: { hits.hits.1._id: "q2" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 4, size: 2, query: { prefix: { k: { value: "ABC", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "t8" }
+
+---
+"A case-insensitive term query on a keyword with no sort pages through tied hits from several files in write order, as the Lucene twin does":
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 0, size: 2, query: { term: { k: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 2, size: 2, query: { term: { k: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b4" }
+  - match: { hits.hits.1._id: "q2" }
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 4, size: 2, query: { term: { k: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "t8" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 0, size: 2, query: { term: { k: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 2, size: 2, query: { term: { k: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b4" }
+  - match: { hits.hits.1._id: "q2" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 4, size: 2, query: { term: { k: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "t8" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 0, size: 2, query: { term: { k: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 2, size: 2, query: { term: { k: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b4" }
+  - match: { hits.hits.1._id: "q2" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 4, size: 2, query: { term: { k: { value: "abcd", case_insensitive: true } } } }
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "t8" }
+
+---
+"A match_all query with no sort pages through tied hits from several files in write order, as the Lucene twin does":
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 0, size: 4, query: { match_all: {} } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - match: { hits.hits.2._id: "x9" }
+  - match: { hits.hits.3._id: "b4" }
+  - do:
+      search:
+        index: ut_inf
+        body: { from: 4, size: 4, query: { match_all: {} } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "q2" }
+  - match: { hits.hits.1._id: "t8" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 0, size: 4, query: { match_all: {} } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - match: { hits.hits.2._id: "x9" }
+  - match: { hits.hits.3._id: "b4" }
+  - do:
+      search:
+        index: ut_prx
+        body: { from: 4, size: 4, query: { match_all: {} } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "q2" }
+  - match: { hits.hits.1._id: "t8" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 0, size: 4, query: { match_all: {} } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "p3" }
+  - match: { hits.hits.1._id: "e1" }
+  - match: { hits.hits.2._id: "x9" }
+  - match: { hits.hits.3._id: "b4" }
+  - do:
+      search:
+        index: ut_luc
+        body: { from: 4, size: 4, query: { match_all: {} } }
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "q2" }
+  - match: { hits.hits.1._id: "t8" }

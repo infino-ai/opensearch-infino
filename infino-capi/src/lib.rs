@@ -38,11 +38,16 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr, CString};
+use std::fs;
+use std::io::{self, ErrorKind};
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::process;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::common::tree_node::TreeNode;
@@ -58,8 +63,8 @@ use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
 use infino::{
     connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions,
-    Connection, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaError,
-    SchemaPatch, Supertable,
+    Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions,
+    SchemaError, SchemaPatch, Supertable,
 };
 use rayon::prelude::*;
 
@@ -87,10 +92,18 @@ const OP: &str = "osop";
 /// compare only between rows of one writer's history, so a cut leaves
 /// another's alone.
 const GEN: &str = "osgen";
+/// The fields OpenSearch's mapper left out of a row's document for a value
+/// it could not parse (under `ignore_malformed`), by path: what a search
+/// reads as the document's `_ignored` field. A list of strings, null for a
+/// document with none; the column appears with the first such write.
+const IGNORED: &str = "osignored";
+/// What separates the paths of a document's ignored fields where the caller
+/// hands them over: no field name holds it.
+const IGNORED_SEPARATOR: char = '\n';
 /// The columns every table keeps for itself. A document's field of the same
 /// name is kept in a column of its own, named [`OWN_COLUMN_PREFIX`] and the
 /// field's name: no mapping can name a field so.
-const RESERVED: [&str; 3] = [OSID, SOURCE, SEQ];
+const RESERVED: [&str; 4] = [OSID, SOURCE, SEQ, IGNORED];
 const OWN_COLUMN_PREFIX: &str = ".";
 /// Where a table's mapping declares, as `properties` declares fields, the
 /// columns the plugin's engine writes beside a document's fields in default
@@ -101,6 +114,9 @@ const ENGINE_COLUMNS: &str = "_engine_columns";
 /// column: the values are joined so a text index sees every token. The
 /// original array is still in `source`.
 const MULTI_VALUE_SEPARATOR: &str = " ";
+/// The longest UTF-8 encoding a `keyword` value may have, as Lucene bounds
+/// one term.
+const MAX_TERM_BYTES: usize = 32766;
 /// What the column holding a field's values is named after the field's own,
 /// for a document that gives the field more than one: `<path>[]`, a list of
 /// the field's own type, declared the first time a document needs it. The
@@ -118,6 +134,26 @@ const TRIAL_PATH: &str = "/v1/trial";
 /// How long the trial call waits: a person is waiting on it, and a service
 /// that cannot provision an account in this time is a failure to report.
 const TRIAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The name the startup storage check gives the file it writes and deletes
+/// in a local storage root ([`check_local_root`]); the process id and a
+/// clock reading follow, so nodes sharing a directory never collide.
+const STORAGE_PROBE_NAME: &str = ".infino-storage-check";
+/// Where an `s3://` node's store client asks for the instance role's
+/// credentials: the engine reads no keys from anywhere else, so an instance
+/// metadata service that does not answer means the node has no credentials.
+const INSTANCE_METADATA: &str = "http://169.254.169.254";
+/// The instance metadata service's token route, the first request the store
+/// client makes for credentials.
+const INSTANCE_METADATA_TOKEN: &str = "/latest/api/token";
+/// The header that asks the token route for a token, and the token's life
+/// in seconds; the storage check asks for one only to see that it answers.
+const INSTANCE_METADATA_TTL_HEADER: &str = "X-aws-ec2-metadata-token-ttl-seconds";
+const INSTANCE_METADATA_TTL_SECS: &str = "60";
+/// How long the storage check waits for the instance metadata service. It
+/// answers within milliseconds when it answers at all: in Docker on EC2 at a
+/// hop limit of 1 its answer never reaches the container, and the store
+/// client retries for minutes before it reports that.
+const INSTANCE_METADATA_WAIT: Duration = Duration::from_secs(2);
 /// What the engine's hosted client puts before the HTTP status in the message
 /// of a refused call; the status is read back off it (see `status_in`).
 const STATUS_MARKER: &str = "server returned ";
@@ -130,6 +166,8 @@ const STATUS_BAD_REQUEST: u16 = 400;
 const STATUS_NOT_FOUND: u16 = 404;
 /// HTTP status of a caller's statement past the connection's memory budget.
 const STATUS_TOO_MANY_REQUESTS: u16 = 429;
+/// HTTP status of a request the hosted service refuses for its size.
+const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 /// The mapping type a column of the engine's row ids is declared with: no
 /// OpenSearch field type is the engine's `_id` type, so the plugin names it
 /// so for the id columns of an edge index.
@@ -157,6 +195,14 @@ thread_local! {
 
 /// Arrow type of a mapped `date`: epoch milliseconds in UTC, which is what
 /// OpenSearch stores and what its date queries compare against.
+/// `index` with token positions recorded or not; any other kind of index as it is.
+fn with_positions(mut index: ColumnIndex, on: bool) -> ColumnIndex {
+    if let ColumnIndex::Fts { positions, .. } = &mut index {
+        *positions = on;
+    }
+    index
+}
+
 fn date_type() -> DataType {
     DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
 }
@@ -180,12 +226,15 @@ const MAX_OFFSET_HOURS: i64 = 18;
 /// Days in each month of a common year.
 const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
+/// OpenSearch's date format for a date field whose mapping names none.
+const DEFAULT_DATE_FORMAT: &str = "strict_date_optional_time||epoch_millis";
+
 /// Epoch milliseconds of `s` as OpenSearch's default date format reads it,
 /// `strict_date_optional_time||epoch_millis`: a date `yyyy[-MM[-dd]]`, then
 /// optionally `T` and `HH[:mm[:ss[.fraction]]]`, any of it (`2026-11-23T`
 /// is a day), then optionally a zone (`Z`, `±HH`, `±HHmm`, `±HH:mm`), UTC
 /// when there is none; failing that, a whole number of milliseconds. `None`
-/// for any other string, which the engine's own parser then reads.
+/// for any other string.
 fn default_format_millis(s: &str) -> Option<i64> {
     optional_time_millis(s, true).or_else(|| {
         let digits = s.strip_prefix('-').unwrap_or(s);
@@ -332,9 +381,10 @@ fn epoch_millis(s: &str, unit_millis: i64) -> Option<i64> {
 /// it gives its epoch milliseconds, as OpenSearch tries a field's formats in
 /// order (a number by its digits, so an `epoch_second` field's `893966296`
 /// is a day of 1998, not of 1970). A form this bridge does not read (a
-/// custom pattern) does not stop the others: only when none of them reads
-/// the value is it left to [`conform`], as a field of the default format.
-/// A value no form reads fails its document, as OpenSearch fails it.
+/// custom pattern) does not stop the others. A value none of them reads
+/// fails its document here: one in a custom pattern is read by OpenSearch's
+/// mapper, whose values the caller sends with the document
+/// ([`mapped_values`]).
 fn conform_date(value: Value, formats: &[DateFormat]) -> Result<Value, String> {
     let text = match &value {
         Value::Null => return Ok(value),
@@ -342,23 +392,16 @@ fn conform_date(value: Value, formats: &[DateFormat]) -> Result<Value, String> {
         Value::Number(n) => n.to_string(),
         _ => return Err("not a date".into()),
     };
-    let mut custom = false;
     for format in formats {
         let millis = match format {
             DateFormat::OptionalTime { strict } => optional_time_millis(&text, *strict),
             DateFormat::EpochMillis => epoch_millis(&text, 1),
             DateFormat::EpochSecond => epoch_millis(&text, MILLIS_PER_SECOND),
-            DateFormat::Other(_) => {
-                custom = true;
-                None
-            }
+            DateFormat::Other(_) => None,
         };
         if let Some(millis) = millis {
             return Ok(json!(millis));
         }
-    }
-    if custom {
-        return conform(value, &date_type());
     }
     let names: Vec<&str> = formats.iter().map(DateFormat::name).collect();
     Err(format!(
@@ -430,6 +473,18 @@ unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
     unsafe { CStr::from_ptr(p) }.to_str().ok()
 }
 
+/// The strings of a C array of `count` of them; one that is null or not
+/// UTF-8 is left out, and a null array is none.
+unsafe fn cstrs<'a>(p: *const *const c_char, count: c_int) -> Vec<&'a str> {
+    if p.is_null() || count <= 0 {
+        return Vec::new();
+    }
+    unsafe { std::slice::from_raw_parts(p, count as usize) }
+        .iter()
+        .filter_map(|s| unsafe { cstr(*s) })
+        .collect()
+}
+
 fn out_string(s: String) -> *mut c_char {
     CString::new(s)
         .map(|c| c.into_raw())
@@ -475,6 +530,23 @@ pub struct Bridge {
     /// Each table's [`Gate`], by name: the order in which this node's
     /// writes take the table's writer.
     gates: Mutex<HashMap<String, Arc<Gate>>>,
+    /// How [`Bridge::latest`] connects: the storage, key and cache
+    /// directory `conn` was opened with. None where `conn` already reads
+    /// every commit there is to read: a hosted service, which answers from
+    /// its own copy, and `memory://`, which no other process writes.
+    latest_from: Option<LatestFrom>,
+    /// The connection [`Bridge::latest`] opened, while a reader holds it.
+    latest: Mutex<Option<Connection>>,
+    /// The readers holding [`Bridge::latest`]'s connection open
+    /// ([`Bridge::hold_latest`]); it is closed when the last lets it go.
+    latest_holds: AtomicUsize,
+}
+
+/// What [`Bridge::latest`] opens its connection from.
+struct LatestFrom {
+    uri: String,
+    api_key: Option<String>,
+    cache_dir: Option<String>,
 }
 
 impl Bridge {
@@ -634,16 +706,62 @@ impl Bridge {
     /// table's columns have changed since, it runs once more over the
     /// columns the table holds now.
     fn query_viewed(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
+        self.query_viewed_on(&self.conn, sql)
+    }
+
+    /// [`Bridge::query_viewed`] on `conn`, which may be [`Bridge::latest`].
+    fn query_viewed_on(
+        &self,
+        conn: &Connection,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
         let Some(viewed) = self.attached_sql(sql) else {
-            return self.conn.query_sql(sql);
+            return conn.query_sql(sql);
         };
-        match self.conn.query_sql(&viewed) {
+        match conn.query_sql(&viewed) {
             Err(_) if self.refresh_attached() => {
                 let viewed = self.attached_sql(sql);
-                self.conn.query_sql(viewed.as_deref().unwrap_or(sql))
+                conn.query_sql(viewed.as_deref().unwrap_or(sql))
             }
             other => other,
         }
+    }
+
+    /// A connection that reads a table's latest commit on every statement,
+    /// for reads that decide what a write does: whether a replayed
+    /// operation's id is already a row (and so is replaced, not appended
+    /// again), and where a replay starts. `conn` reads under the engine's
+    /// default staleness bound, so for up to its window after another node
+    /// commits it can answer from the commit before; a shard taking over
+    /// from another node replays that node's operations within that window
+    /// and would append each again. The engine's own update and delete read
+    /// the latest commit to find their rows; it offers a caller no way to
+    /// do so on a connection opened under the bound, so these reads go
+    /// through a connection opened for it. It shares `conn`'s cache
+    /// directory, which the engine supports for two connections, so it reads
+    /// the blocks the node already holds. Opened on the first such read and
+    /// closed when no reader holds it ([`Bridge::hold_latest`]): it holds a
+    /// handle to each table it has read, as `conn` does, and each handle
+    /// keeps that table's manifest in memory, which a node needs twice only
+    /// while a shard catches up with the copy before it.
+    fn latest(&self) -> Result<Connection, InfinoError> {
+        let Some(from) = &self.latest_from else {
+            return Ok(self.conn.clone());
+        };
+        let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = latest.as_ref() {
+            return Ok(conn.clone());
+        }
+        let mut options = ConnectOptions::new().with_read_consistency(Consistency::Strong);
+        if let Some(key) = &from.api_key {
+            options = options.with_api_key(key);
+        }
+        if let Some(dir) = &from.cache_dir {
+            options = options.with_cache_dir(dir);
+        }
+        let conn = connect_with(&from.uri, options)?;
+        *latest = Some(conn.clone());
+        Ok(conn)
     }
 
     fn table(&self, name: &str) -> Result<Supertable, InfinoError> {
@@ -664,10 +782,95 @@ impl Bridge {
         }
     }
 
+    /// Keep [`Bridge::latest`]'s connection open until the hold is let go
+    /// ([`Bridge::release_latest`]), for a reader that reads the latest
+    /// commit several times: a shard catching up with the copy before it
+    /// reads it for each batch it writes until its own first commit. Each
+    /// latest read holds it while it runs, so a read no one holds for closes
+    /// it when done.
+    fn hold_latest(&self) {
+        self.latest_holds.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Let go of a hold [`Bridge::hold_latest`] took, closing
+    /// [`Bridge::latest`]'s connection when it was the last. The count is
+    /// read again under the connection's lock, so a reader that took a hold
+    /// meanwhile keeps the connection it may already be reading through.
+    fn release_latest(&self) {
+        let held = self
+            .latest_holds
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if held.is_err() {
+            return;
+        }
+        let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.latest_holds.load(Ordering::SeqCst) == 0 {
+            *latest = None;
+        }
+    }
+
+    /// `read` on [`Bridge::latest`]'s connection, held while it runs. A read
+    /// that fails is read once more on a connection opened afresh: the one
+    /// before may hold a handle to a table another node has dropped and made
+    /// again under its name, which answers "not found" until the engine
+    /// notices the drop, and a search reports that as a failed query.
+    fn on_latest<T>(
+        &self,
+        read: impl Fn(&Connection) -> Result<T, InfinoError>,
+    ) -> Result<T, InfinoError> {
+        self.hold_latest();
+        let _held = LatestHold(self);
+        self.latest()
+            .and_then(|conn| read(&conn))
+            .or_else(|e| match e {
+                // Where `conn` is the connection there is no other to open.
+                _ if self.latest_from.is_some() => {
+                    self.forget_latest();
+                    self.latest().and_then(|conn| read(&conn))
+                }
+                e => Err(e),
+            })
+    }
+
+    /// [`Bridge::query_viewed`] on [`Bridge::latest`] ([`Bridge::on_latest`]).
+    fn query_latest(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
+        self.on_latest(|conn| self.query_viewed_on(conn, sql))
+    }
+
+    /// Close [`Bridge::latest`]'s connection, so the next latest read opens
+    /// one afresh. It holds a handle to each table it has read, and a handle
+    /// to a table dropped here would answer the next read of a table made
+    /// again under its name with "not found" ([`Bridge::forget`] does the same
+    /// for `conn`'s handles, which this bridge holds itself).
+    fn forget_latest(&self) {
+        *self.latest.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// How many bytes of ids one mutation may name ([`HOSTED_ID_LIST_BYTES`]
+    /// on the hosted service; no limit over storage of the bridge's own,
+    /// where a predicate never travels in a URL).
+    fn id_list_bytes(&self) -> usize {
+        if self.hosted {
+            HOSTED_ID_LIST_BYTES
+        } else {
+            usize::MAX
+        }
+    }
+
     /// The [`Gate`] of `name`'s writes on this node.
     fn gate(&self, name: &str) -> Arc<Gate> {
         let mut gates = self.gates.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(gates.entry(name.to_string()).or_default())
+    }
+}
+
+/// A hold on [`Bridge::latest`]'s connection for one read
+/// ([`Bridge::on_latest`]), let go however the read ends.
+struct LatestHold<'a>(&'a Bridge);
+
+impl Drop for LatestHold<'_> {
+    fn drop(&mut self) {
+        self.0.release_latest();
     }
 }
 
@@ -707,6 +910,16 @@ fn err_json(e: &str) -> *mut c_char {
     out_json(error_value(e))
 }
 
+/// The error object of a failed read by id: the message names the call and
+/// what it read (the id, or the table for a read of many ids), but the
+/// status is read off the engine's message alone, so an id that spells
+/// `server returned 200` cannot set it.
+fn read_err_json(call: &str, what: &str, e: &str) -> *mut c_char {
+    let mut v = error_value(e);
+    v["error"] = json!(format!("{call} {what}: {e}"));
+    out_json(v)
+}
+
 // ---------------------------------------------------------------------------
 // Connection lifecycle
 // ---------------------------------------------------------------------------
@@ -737,7 +950,18 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
     if let Some(dir) = cache_dir.filter(|_| !hosted) {
         options = options.with_cache_dir(dir);
     }
+    let staleness = READ_STALENESS_MS.load(Ordering::SeqCst);
+    if staleness > 0 && !hosted {
+        options = options.with_read_consistency(Consistency::BoundedStaleness(
+            Duration::from_millis(staleness),
+        ));
+    }
     let conn = connect_with(uri, options)?;
+    let latest_from = (!hosted && !uri.starts_with(MEMORY_SCHEME)).then(|| LatestFrom {
+        uri: uri.to_string(),
+        api_key: api_key.map(str::to_string),
+        cache_dir: cache_dir.map(str::to_string),
+    });
     if hosted {
         match conn.list_tables() {
             Ok(_) => {}
@@ -754,7 +978,29 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
         engine: RwLock::new(HashMap::new()),
         attached: RwLock::new(HashMap::new()),
         gates: Mutex::new(HashMap::new()),
+        latest_from,
+        latest: Mutex::new(None),
+        latest_holds: AtomicUsize::new(0),
     })
+}
+
+/// The scheme of a catalog held in this process's memory.
+const MEMORY_SCHEME: &str = "memory://";
+
+/// The staleness window the connections opened from here on read under, in
+/// milliseconds ([`infino_set_read_staleness_ms`]); 0 for the engine's
+/// default.
+static READ_STALENESS_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Open the connections from here on to read under a staleness window of
+/// `ms` milliseconds rather than the engine's default (0 restores it). For
+/// tests only: a wide window makes a read that should have gone to the
+/// table's latest commit, and went to a node's own connection instead,
+/// answer from the commit before every time rather than now and then. The
+/// connection that reads every commit ([`Bridge::latest`]) is unchanged.
+#[no_mangle]
+pub extern "C" fn infino_set_read_staleness_ms(ms: u64) {
+    READ_STALENESS_MS.store(ms, Ordering::SeqCst);
 }
 
 #[no_mangle]
@@ -772,7 +1018,7 @@ pub unsafe extern "C" fn infino_open_with(
     cache_dir: *const c_char,
 ) -> *mut Bridge {
     catch_unwind(AssertUnwindSafe(|| {
-        let uri = unsafe { cstr(uri) }.unwrap_or("memory://");
+        let uri = unsafe { cstr(uri) }.unwrap_or(MEMORY_SCHEME);
         let api_key = unsafe { cstr(api_key) }.filter(|k| !k.is_empty());
         let cache_dir = unsafe { cstr(cache_dir) }.filter(|d| !d.is_empty());
         match open(uri, api_key, cache_dir) {
@@ -800,6 +1046,138 @@ pub unsafe extern "C" fn infino_open_error() -> *mut c_char {
         Some(json) => out_string(json),
         None => ptr::null_mut(),
     }
+}
+
+/// Check once that the node can use the connection's own storage, as the
+/// node starts. Opening it reads nothing, so a store the node cannot use (no
+/// credentials, a directory it may not write) would otherwise fail each
+/// table operation on its own, the first of them while the node starts.
+///
+/// For local storage it writes a small file in the root and deletes it,
+/// which finds a root the node may not write. For `s3://` it first asks the
+/// instance metadata service for a token, which finds a node with no
+/// credentials in seconds rather than after the store client's minutes of
+/// retries. Then it lists the tables, as the node does before it serves any. Answers "" when both work, else
+/// `{"error", "permanent"}`: `permanent` is true only for a failure that
+/// will not pass on its own (the storage refused the node's credentials or
+/// its user), and false for one that may (a timeout, a 5xx, a dropped
+/// connection). The caller bounds how long it waits.
+#[no_mangle]
+pub unsafe extern "C" fn infino_check_storage(h: *mut Bridge) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(bridge) = bridge_ref(h) else {
+            return err_json("null argument");
+        };
+        let uri = bridge.latest_from.as_ref().map(|from| from.uri.as_str());
+        let root = uri.and_then(local_root);
+        let metadata = uri
+            .filter(|u| u.starts_with("s3://"))
+            .map(|_| INSTANCE_METADATA);
+        match check_storage(&bridge.conn, root.as_deref(), metadata) {
+            Ok(()) => out_string(String::new()),
+            Err(failure) => {
+                out_json(json!({ "error": failure.reason, "permanent": failure.permanent }))
+            }
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Why [`infino_check_storage`] failed, and whether the failure lasts.
+#[derive(Debug)]
+struct StorageFailure {
+    reason: String,
+    permanent: bool,
+}
+
+/// [`infino_check_storage`]'s checks: the write probe of a local `root`, or
+/// for an `s3://` node that its instance `metadata` service answers; then
+/// the listing. A catalog with no tables yet counts as an answer.
+fn check_storage(
+    conn: &Connection,
+    root: Option<&Path>,
+    metadata: Option<&str>,
+) -> Result<(), StorageFailure> {
+    if let Some(root) = root {
+        check_local_root(root)?;
+    }
+    if let Some(metadata) = metadata {
+        check_instance_metadata(metadata, INSTANCE_METADATA_WAIT)?;
+    }
+    match conn.list_tables() {
+        Ok(_) | Err(InfinoError::NotFound(_)) => Ok(()),
+        Err(e) => Err(StorageFailure {
+            permanent: matches!(e, InfinoError::PermissionDenied(_)),
+            reason: e.to_string(),
+        }),
+    }
+}
+
+/// Write a small file in a local storage `root` and delete it: the engine
+/// creates the root and writes there on the first table, so a root the
+/// node's user may not write fails here instead. Creating the root is what
+/// that first write would do anyway.
+fn check_local_root(root: &Path) -> Result<(), StorageFailure> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let probe = root.join(format!("{STORAGE_PROBE_NAME}-{}-{stamp}", process::id()));
+    let failed = |e: io::Error| StorageFailure {
+        reason: format!("{}: {e}", root.display()),
+        permanent: lasts(e.kind()),
+    };
+    fs::create_dir_all(root).map_err(failed)?;
+    fs::write(&probe, b"").map_err(failed)?;
+    fs::remove_file(&probe).map_err(failed)
+}
+
+/// Ask the instance metadata service at `base` for a token, as the store
+/// client does first when it fetches the instance role's credentials, and
+/// wait at most `wait`. Any HTTP answer means the service is reachable and
+/// the listing decides; no answer means the node has no credentials. That is
+/// reported at once and named, where the store client would report it only
+/// after minutes of retries, as an error about a token. Not permanent: the
+/// service can come back.
+fn check_instance_metadata(base: &str, wait: Duration) -> Result<(), StorageFailure> {
+    let agent = ureq::AgentBuilder::new().timeout(wait).build();
+    let asked = agent
+        .put(&format!("{base}{INSTANCE_METADATA_TOKEN}"))
+        .set(INSTANCE_METADATA_TTL_HEADER, INSTANCE_METADATA_TTL_SECS)
+        .call();
+    match asked {
+        Ok(_) | Err(ureq::Error::Status(..)) => Ok(()),
+        Err(ureq::Error::Transport(t)) => Err(StorageFailure {
+            reason: format!(
+                "no AWS credentials: the instance metadata service at {base} did not answer within {wait:?} ({t})"
+            ),
+            permanent: false,
+        }),
+    }
+}
+
+/// Whether a local file error is one that will not pass on its own: the
+/// node's user may not write there, the file system is read-only, or the
+/// root is not a directory.
+fn lasts(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::PermissionDenied
+            | ErrorKind::ReadOnlyFilesystem
+            | ErrorKind::NotADirectory
+            | ErrorKind::AlreadyExists
+    )
+}
+
+/// The directory of a local storage URI, read as the engine reads it:
+/// `file://<path>`, or a bare path (`/data/infino`, `./data`). None for
+/// any other storage, and for the in-memory catalog.
+fn local_root(uri: &str) -> Option<PathBuf> {
+    if let Some(path) = uri.strip_prefix("file://") {
+        return Some(PathBuf::from(path));
+    }
+    let memory = matches!(uri, "memory://" | "memory:" | "memory");
+    (!memory && !uri.contains("://")).then(|| PathBuf::from(uri))
 }
 
 /// Whether the connection forwards to the hosted service (1) or runs the
@@ -914,6 +1292,12 @@ struct MappedField {
     /// The formats a date field's mapping declares, in order; `None` for the
     /// default format, which [`default_format_millis`] reads.
     date_formats: Option<Vec<DateFormat>>,
+    /// For a `keyword` field, its `ignore_above`, if it sets one, and
+    /// whether it builds terms (it is indexed or has doc values).
+    keyword: Option<(Option<usize>, bool)>,
+    /// What OpenSearch accepts of an `ip` or narrow integer field beyond what
+    /// its column takes.
+    valid: Option<Valid>,
 }
 
 impl MappedField {
@@ -922,6 +1306,8 @@ impl MappedField {
         self.precision
             .map(Kept::Precision)
             .or_else(|| self.date_formats.clone().map(Kept::Date))
+            .or_else(|| self.keyword.map(|(ignore_above, terms)| Kept::Keyword { ignore_above, terms }))
+            .or_else(|| self.valid.map(Kept::Valid))
     }
 }
 
@@ -933,13 +1319,49 @@ enum Kept {
     Precision(Precision),
     /// A date read by the formats its mapping declares, in order.
     Date(Vec<DateFormat>),
+    /// A `keyword` value, indexed only up to `ignore_above` characters
+    /// (UTF-16 units, as OpenSearch counts them) and, when the field builds
+    /// terms (`terms`), refused past [`MAX_TERM_BYTES`].
+    Keyword { ignore_above: Option<usize>, terms: bool },
+    /// An `ip` or narrow integer value, which its column takes beyond what
+    /// OpenSearch accepts.
+    Valid(Valid),
+}
+
+/// What OpenSearch accepts of a field whose column is wider: an address of an
+/// `ip` field (a string column), an integer in a `byte`, `short` or `integer`
+/// field's range (a 64-bit column).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Valid {
+    Ip,
+    Integer(i64, i64),
+}
+
+impl Valid {
+    fn of(ty: &str) -> Option<Self> {
+        match ty {
+            "ip" => Some(Self::Ip),
+            "byte" => Some(Self::Integer(i8::MIN.into(), i8::MAX.into())),
+            "short" => Some(Self::Integer(i16::MIN.into(), i16::MAX.into())),
+            "integer" => Some(Self::Integer(i32::MIN.into(), i32::MAX.into())),
+            _ => None,
+        }
+    }
+
+    /// Whether OpenSearch accepts a value its column took.
+    fn accepts(self, v: &Value) -> bool {
+        match self {
+            Self::Ip => v.as_str().is_some_and(|s| s.parse::<std::net::IpAddr>().is_ok()),
+            Self::Integer(min, max) => v.as_i64().is_some_and(|n| (min..=max).contains(&n)),
+        }
+    }
 }
 
 impl Kept {
     fn precision(&self) -> Option<Precision> {
         match self {
             Self::Precision(p) => Some(*p),
-            Self::Date(_) => None,
+            _ => None,
         }
     }
 }
@@ -1300,6 +1722,12 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             range: ranged && indexed,
             precision: ty.and_then(|ty| Precision::of(ty, def)),
             date_formats,
+            keyword: (ty == Some("keyword")).then(|| {
+                let ignore_above = def.get("ignore_above").and_then(Value::as_u64).map(|n| n as usize);
+                let doc_values = def.get("doc_values").and_then(Value::as_bool).unwrap_or(true);
+                (ignore_above, indexed || doc_values)
+            }),
+            valid: ty.and_then(Valid::of),
         });
     }
 }
@@ -1377,38 +1805,13 @@ fn declare_table(
                 .iter()
                 .find(|c| c.name == OSID)
                 .and_then(|c| match &c.index {
-                    Some(ColumnIndex::Fts {
-                        stopwords,
-                        stemmer,
-                        stored,
-                        bm25,
-                        ..
-                    }) => Some(ColumnIndex::Fts {
-                        stopwords: *stopwords,
-                        stemmer: *stemmer,
-                        positions: true,
-                        stored: *stored,
-                        bm25: *bm25,
-                    }),
+                    Some(index @ ColumnIndex::Fts { .. }) => {
+                        Some(with_positions(index.clone(), true))
+                    }
                     _ => None,
                 });
             // The index a keyword field added now gets: the same, without positions.
-            let exact_index = text_index.clone().map(|index| match index {
-                ColumnIndex::Fts {
-                    stopwords,
-                    stemmer,
-                    stored,
-                    bm25,
-                    ..
-                } => ColumnIndex::Fts {
-                    stopwords,
-                    stemmer,
-                    positions: false,
-                    stored,
-                    bm25,
-                },
-                other => other,
-            });
+            let exact_index = text_index.clone().map(|index| with_positions(index, false));
             let mut conflicts: Vec<String> = Vec::new();
             for f in &mapped {
                 let present = schema.field_with_name(&f.path).is_ok();
@@ -1877,9 +2280,14 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
         },
         DataType::Timestamp(..) => match &value {
             // A string in OpenSearch's default date format is read as it
-            // reads it; any other is left to the engine's parser. An
-            // epoch-millisecond integer is taken as is.
-            Value::String(s) => Ok(default_format_millis(s).map_or(value.clone(), |ms| json!(ms))),
+            // reads it. Any other fails the document here rather than in
+            // the engine, which would read it otherwise or not at all: a
+            // date in a custom pattern is read by OpenSearch's mapper
+            // ([`mapped_values`]). An epoch-millisecond integer is taken
+            // as is.
+            Value::String(s) => default_format_millis(s).map(|ms| json!(ms)).ok_or_else(|| {
+                format!("failed to parse date field [{s}] with format [{DEFAULT_DATE_FORMAT}]")
+            }),
             Value::Number(n) if n.is_i64() || n.is_u64() => Ok(value),
             _ => Err("not a date".into()),
         },
@@ -2074,11 +2482,15 @@ fn unify_new_paths(rows: &mut [Map<String, Value>], schema: &Schema) {
 /// caller can refuse it synchronously (an OpenSearch bulk item error) rather
 /// than learn after the batch commits. A failure to check at all (the table
 /// cannot be opened) is an error object, not a verdict on the document.
+/// `ignored` (null for none) names the fields OpenSearch's mapper left out
+/// of the document, one path per line ([`IGNORED_SEPARATOR`]): they are
+/// not checked, as the row leaves them out.
 #[no_mangle]
 pub unsafe extern "C" fn infino_check_doc(
     h: *mut Bridge,
     name: *const c_char,
     source: *const c_char,
+    ignored: *const c_char,
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name), Some(source)) =
@@ -2087,6 +2499,14 @@ pub unsafe extern "C" fn infino_check_doc(
             })
         else {
             return err_json("null argument");
+        };
+        let ignored = if ignored.is_null() {
+            Vec::new()
+        } else {
+            match unsafe { cstr(ignored) } {
+                Some(paths) => ignored_paths(paths),
+                None => return err_json("ignored paths are not UTF-8"),
+            }
         };
         let table = match conn.table(name) {
             Ok(t) => t,
@@ -2101,6 +2521,7 @@ pub unsafe extern "C" fn infino_check_doc(
                 &conn.kept(name),
                 &conn.engine_columns(name),
                 stamp.as_deref(),
+                &ignored,
             ) {
                 Ok(_) => String::new(),
                 Err(why) => why,
@@ -2108,6 +2529,107 @@ pub unsafe extern "C" fn infino_check_doc(
         )
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// What separates a document's source from the values OpenSearch's mappers
+/// read from it, when the caller sends them ([`mapped_values`]): JSON text
+/// never holds it unescaped.
+const MAPPED_VALUES: char = '\u{1e}';
+
+/// A document's source and, when the caller sent them after
+/// [`MAPPED_VALUES`], the values OpenSearch's mappers read from its date and
+/// integer fields: an object of each field's values (epoch milliseconds, or
+/// whole numbers), which the field's column holds in place of what the
+/// source spells there. A date in a format of the field's mapping this
+/// bridge does not read, and a fractional number an integer field coerces,
+/// are held as OpenSearch reads them. Text after the separator that is no
+/// such object leaves the whole text the source.
+fn mapped_values(text: &str) -> (&str, Option<Map<String, Value>>) {
+    let Some(at) = text.rfind(MAPPED_VALUES) else {
+        return (text, None);
+    };
+    match serde_json::from_str::<Value>(&text[at + MAPPED_VALUES.len_utf8()..]) {
+        Ok(Value::Object(values)) => (&text[..at], Some(values)),
+        _ => (text, None),
+    }
+}
+
+/// How many values a source gives at one field: its non-null values, an
+/// array's at any depth, as OpenSearch's mapper reads an array of arrays.
+fn given_values(value: &Value) -> usize {
+    match value {
+        Value::Null => 0,
+        Value::Array(items) => items.iter().map(given_values).sum(),
+        _ => 1,
+    }
+}
+
+/// The paths of a document's ignored fields, as the caller hands them over
+/// ([`IGNORED_SEPARATOR`] between them), each once, in order.
+fn ignored_paths(paths: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for path in paths.split(IGNORED_SEPARATOR) {
+        if !path.is_empty() && !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// The values of the `keyword` fields `kept` names as OpenSearch indexes
+/// them: a value longer than its field's `ignore_above` is left out (the
+/// source keeps it), and one whose UTF-8 encoding is longer than a term may
+/// be refuses the document, as Lucene refuses it.
+fn keyword_values(flat: &mut Map<String, Value>, kept: &HashMap<String, Kept>) -> Result<(), String> {
+    for (path, value) in flat.iter_mut() {
+        let Some(Kept::Keyword { ignore_above, terms }) = kept.get(path) else {
+            continue;
+        };
+        let indexed = |v: &Value| -> Result<bool, String> {
+            // A number or boolean is indexed as its text.
+            let s = match v {
+                Value::String(s) => s.as_str(),
+                Value::Number(_) | Value::Bool(_) => {
+                    return Ok(!ignore_above.is_some_and(|n| v.to_string().len() > n));
+                }
+                _ => return Ok(true),
+            };
+            if ignore_above.is_some_and(|n| s.encode_utf16().count() > n) {
+                return Ok(false);
+            }
+            if *terms && s.len() > MAX_TERM_BYTES {
+                return Err(format!(
+                    "Document contains at least one immense term in field=\"{path}\" (whose UTF8 encoding is longer than the max length {MAX_TERM_BYTES}), all of which were skipped. bytes can be at most {MAX_TERM_BYTES} in length; got {}",
+                    s.len()
+                ));
+            }
+            Ok(true)
+        };
+        match value {
+            Value::Array(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                array_values(std::mem::take(items), &mut values);
+                for v in values {
+                    if indexed(&v)? {
+                        items.push(v);
+                    }
+                }
+            }
+            other => {
+                if !indexed(other)? {
+                    *other = Value::Null;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the flattened `path` is the field `field` or a path under it (a
+/// geo_point given as an object flattens to the paths under its field).
+fn is_at_or_under(path: &str, field: &str) -> bool {
+    path.strip_prefix(field)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 /// Parse, flatten and conform one document to the declared columns. The
@@ -2121,20 +2643,71 @@ pub unsafe extern "C" fn infino_check_doc(
 /// of arrays at a field without a scalar or string column the mapping
 /// declares is refused, as the engine would refuse it. A field named like
 /// one of the table's own columns ([`RESERVED`], or `engine`, those its
-/// engine writes) goes to a column of its own.
+/// engine writes) goes to a column of its own. A field `ignored` names, and
+/// every path under it, is left out of the row, as OpenSearch's mapper left
+/// it out of the document (its value stays in the source). A field the
+/// mapper's values cover ([`mapped_values`]) holds them, conformed to its
+/// column as they are, where the document gives it a value.
 fn conform_doc(
     source: &str,
     schema: &Schema,
     kept: &HashMap<String, Kept>,
     engine: &[String],
     stamp: Option<&str>,
+    ignored: &[&str],
 ) -> Result<Map<String, Value>, String> {
+    let (source, mapped) = mapped_values(source);
     let doc: Value = serde_json::from_str(source).map_err(|e| format!("malformed JSON: {e}"))?;
     let obj = doc
         .as_object()
         .ok_or_else(|| "the document is not an object".to_string())?;
     let mut flat = Map::new();
     flatten(obj, "", &mut flat);
+    // A declared field the mapper ignored keeps, of several values, those its
+    // column takes (OpenSearch drops only the malformed ones); any other path
+    // at or under an ignored field has no value OpenSearch indexed.
+    let mut partial: HashSet<String> = HashSet::new();
+    if !ignored.is_empty() {
+        flat.retain(|path, value| {
+            if !ignored.iter().any(|field| is_at_or_under(path, field)) {
+                return true;
+            }
+            let keeps_some = value.is_array()
+                && ignored.contains(&path.as_str())
+                && schema.field_with_name(path).is_ok();
+            if keeps_some {
+                partial.insert(path.clone());
+            }
+            keeps_some
+        });
+    }
+    // The mapper's values stand in for the source's at each field the
+    // source gives as many values as the mapper read there, so a field the
+    // document leaves out or null stays so whatever the mapper read (a
+    // `null_value`), and values the mapper read from elsewhere too (a
+    // `copy_to`) leave the source's as they are. At an ignored field that
+    // keeps some of its values, the mapper read only those it indexed, so
+    // fewer than the source gives stand in for them.
+    let mut by_mapper: HashSet<String> = HashSet::new();
+    for (path, values) in mapped.into_iter().flatten() {
+        let Some(value) = flat.get_mut(&path) else {
+            continue;
+        };
+        let given = given_values(value);
+        let read = match &values {
+            Value::Array(items) => items.len(),
+            _ => 1,
+        };
+        let fewer = partial.contains(&path) && read < given;
+        if given == 0 || (given != read && !fewer) {
+            continue;
+        }
+        *value = match values {
+            Value::Array(mut items) if items.len() == 1 => items.pop().unwrap_or(Value::Null),
+            other => other,
+        };
+        by_mapper.insert(path);
+    }
     // A field named like a reserved column goes to its own column once the
     // mapping declares it, and never to the reserved one.
     for reserved in RESERVED
@@ -2144,10 +2717,14 @@ fn conform_doc(
         if let Some(value) = flat.remove(reserved) {
             let own = format!("{OWN_COLUMN_PREFIX}{reserved}");
             if schema.field_with_name(&own).is_ok() {
+                if by_mapper.remove(reserved) {
+                    by_mapper.insert(own.clone());
+                }
                 flat.insert(own, value);
             }
         }
     }
+    keyword_values(&mut flat, kept)?;
     if let Some(field) = stamp {
         let values = match flat.get(field) {
             None | Some(Value::Null) => 0,
@@ -2186,23 +2763,39 @@ fn conform_doc(
         };
         let dt = field.data_type();
         let rule = kept.get(path);
+        let read = by_mapper.contains(path.as_str());
         let fit = |v: Value| match rule {
+            // The mapper read the value already, as an instant or a whole number.
+            _ if read => conform(v, dt),
             Some(Kept::Date(formats)) if matches!(dt, DataType::Timestamp(..)) => {
                 conform_date(v, formats)
             }
             _ => conform(v, dt).and_then(|v| keep(v, rule.and_then(Kept::precision))),
         };
+        // Of an ignored field's values, those OpenSearch indexed: the mapper
+        // dropped any it could not parse, which the column may still take.
+        let indexed = |v: Value| {
+            fit(v).ok().filter(|v| match rule {
+                Some(Kept::Valid(valid)) => valid.accepts(v),
+                _ => true,
+            })
+        };
         let why = |why: String| format!("field [{path}]: {why}");
+        let partial = partial.contains(path.as_str());
         *value = match value.take() {
             Value::Array(items) if list_type(dt).is_some() => {
                 let mut values = Vec::with_capacity(items.len());
                 array_values(items, &mut values);
-                if values.len() > 1 {
-                    let conformed = values
+                let mut conformed = if partial {
+                    values.into_iter().filter_map(indexed).collect()
+                } else {
+                    values
                         .into_iter()
                         .map(fit)
                         .collect::<Result<Vec<Value>, String>>()
-                        .map_err(why)?;
+                        .map_err(why)?
+                };
+                if conformed.len() > 1 {
                     // A string field keeps its values joined, for its text index.
                     let own = if matches!(
                         dt,
@@ -2221,9 +2814,10 @@ fn conform_doc(
                     lists.push((format!("{path}{LIST_SUFFIX}"), Value::Array(conformed)));
                     own
                 } else {
-                    values.pop().map_or(Ok(Value::Null), fit).map_err(why)?
+                    conformed.pop().unwrap_or(Value::Null)
                 }
             }
+            other if partial => indexed(other).unwrap_or(Value::Null),
             other => fit(other).map_err(why)?,
         };
     }
@@ -2406,17 +3000,80 @@ impl Drop for Pass<'_> {
 /// than its column's, an array of arrays, a path beneath a live column),
 /// except a schema that changed under the write, a column still converting,
 /// or a field cap that raising the table's limit lifts, which a later try
-/// can pass.
+/// can pass. The local engine returns the refusal typed; the hosted service
+/// answers it as a 400 whose body carries the same text
+/// ([`hosted_schema_refusal`]).
 fn refuses_content(e: &InfinoError) -> bool {
-    matches!(
-        e,
-        InfinoError::Schema(s) if !matches!(
+    match e {
+        InfinoError::Schema(s) => !matches!(
             s,
             SchemaError::SchemaConflict { .. }
                 | SchemaError::ConversionInProgress { .. }
                 | SchemaError::FieldCapExceeded { .. }
-        )
-    )
+        ),
+        _ => hosted_schema_refusal(e).is_some_and(|reason| {
+            !HOSTED_RETRYABLE_SCHEMA
+                .iter()
+                .any(|&shape| says(reason, shape))
+        }),
+    }
+}
+
+/// Whether the engine refused a write for taking the table over its cap of
+/// fields, typed by the local engine or in the text of the hosted service's
+/// 400.
+fn over_field_cap(e: &InfinoError) -> bool {
+    matches!(e, InfinoError::Schema(SchemaError::FieldCapExceeded { .. }))
+        || hosted_schema_refusal(e).is_some_and(|reason| says(reason, HOSTED_FIELD_CAP))
+}
+
+/// The shape of an engine message, as the text it starts with and the text
+/// it ends with: the parts between carry names and values from the
+/// documents, so a message is matched by its two ends, never by what it
+/// contains.
+type Shape = (&'static str, &'static str);
+
+/// The hosted service's schema errors that a later try can pass, in the
+/// engine's wording: the schema changed under the write, a column is still
+/// converting, or the write would take the table over its field cap.
+const HOSTED_RETRYABLE_SCHEMA: [Shape; 3] = [
+    ("the schema is at version ", "; re-read it and resubmit"),
+    (
+        "column `",
+        "` is still converting; run optimize before changing its type again",
+    ),
+    HOSTED_FIELD_CAP,
+];
+
+/// A field-cap refusal, in the engine's wording.
+const HOSTED_FIELD_CAP: Shape = (
+    "adding [",
+    "; raise `max_fields` in the schema or fix the producer",
+);
+
+/// Whether `reason` has the shape `(starts, ends)`.
+fn says(reason: &str, (starts, ends): Shape) -> bool {
+    let reason = reason.trim_end();
+    reason.len() >= starts.len() + ends.len()
+        && reason.starts_with(starts)
+        && reason.ends_with(ends)
+}
+
+/// The reason of a schema refusal the hosted service answered: it passes an
+/// engine error on as a 400 whose body is `<op> error: schema: <reason>`,
+/// which reaches the bridge as an untyped backend error
+/// (`<op>: server returned 400: <body>`). None for any other error.
+fn hosted_schema_refusal(e: &InfinoError) -> Option<&str> {
+    let InfinoError::Backend(message) = e else {
+        return None;
+    };
+    if status_in(message) != Some(STATUS_BAD_REQUEST) {
+        return None;
+    }
+    let (_, rest) = message.split_once(STATUS_MARKER)?;
+    let body = rest.get(STATUS_DIGITS..)?.strip_prefix(": ")?;
+    let (_, error) = body.split_once(" error: ")?;
+    error.strip_prefix("schema: ")
 }
 
 /// Write rows with `write`, isolating the ones the engine refuses: a refused
@@ -2438,7 +3095,7 @@ fn write_checked(
         Err(e) if rows.len() == 1 => {
             failed.push(json!({
                 "i": rows[0].0,
-                "reason": e.to_string(),
+                "reason": short_reason(&e),
                 "permanent": refuses_content(&e),
             }));
         }
@@ -2479,14 +3136,21 @@ fn append_checked(
 /// table. Any other refusal (a count that fails among them) is reported for
 /// every document its update carried, for a later try. A refused document
 /// keeps whatever row the table holds.
+///
+/// A failure that is not about the rows a call carried ([`stops_the_rest`]:
+/// the service unreachable, timed out or failing) stops the write there:
+/// its documents and every document not yet tried are reported for a later
+/// try, with no further call, and the stop is returned ([`Stopped`]) so a
+/// caller with more to write stops as well.
 fn replace_rows_checked(
     table: &Supertable,
     gate: &Gate,
     rows: &[(usize, Value)],
     failed: &mut Vec<Value>,
-) {
+    id_bytes: usize,
+) -> Result<(), Stopped> {
     if rows.is_empty() {
-        return;
+        return Ok(());
     }
     let values: Vec<Value> = rows.iter().map(|(_, v)| v.clone()).collect();
     let mut ids: Vec<&str> = values
@@ -2495,46 +3159,258 @@ fn replace_rows_checked(
         .collect();
     ids.sort_unstable();
     ids.dedup();
+    let replace_each = |runs: &[&[(usize, Value)]], failed: &mut Vec<Value>| {
+        each_run(runs, failed, |run, failed| {
+            replace_rows_checked(table, gate, run, failed, id_bytes)
+        })
+    };
+    // More ids than one call may name: each run of them replaces on its own.
+    if let Some(runs) = rows_by_id_run(rows, &ids, id_bytes) {
+        let runs: Vec<&[(usize, Value)]> = runs.iter().map(Vec::as_slice).collect();
+        return replace_each(&runs, failed);
+    }
     let pred = col(OSID).in_list(ids.iter().map(|s| lit(s.to_string())).collect(), false);
     let replace = {
         let _pass = gate.whole();
         waiting(|| table.update_rows(pred.clone(), &values))
     };
     let Err(e) = replace else {
-        return;
+        return Ok(());
     };
-    let over_cap = matches!(e, InfinoError::Schema(SchemaError::FieldCapExceeded { .. }));
+    let reason = short_reason(format_args!("replace: {e}"));
+    if stops_the_rest(&e) {
+        not_taken(rows, &reason, failed);
+        return Err(Stopped(reason));
+    }
+    let over_cap = over_field_cap(&e);
+    if rows.len() > 1 && refused_for_size(&e) {
+        let (a, b) = rows.split_at(rows.len() / 2);
+        return replace_each(&[a, b], failed);
+    }
     if counts_may_explain(&e) {
-        if let Ok(counts) = rows_under(table, &ids) {
-            let single: HashSet<&str> = ids
-                .iter()
-                .zip(&counts)
-                .filter(|(_, &n)| n == 1)
-                .map(|(id, _)| *id)
-                .collect();
-            let (once, miscounted): (Vec<_>, Vec<_>) = rows.iter().cloned().partition(|(_, v)| {
-                v.get(OSID)
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| single.contains(id))
-            });
-            if !miscounted.is_empty() {
-                rewrite_rows(table, gate, &miscounted, failed);
-                replace_rows_checked(table, gate, &once, failed);
-                return;
+        match rows_under(table, &ids) {
+            Ok(counts) => {
+                let single: HashSet<&str> = ids
+                    .iter()
+                    .zip(&counts)
+                    .filter(|(_, &n)| n == 1)
+                    .map(|(id, _)| *id)
+                    .collect();
+                let (once, miscounted): (Vec<_>, Vec<_>) =
+                    rows.iter().cloned().partition(|(_, v)| {
+                        v.get(OSID)
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| single.contains(id))
+                    });
+                if !miscounted.is_empty() {
+                    if let Err(stop) = rewrite_rows(table, gate, &miscounted, failed, id_bytes) {
+                        not_taken(&once, &stop.0, failed);
+                        return Err(stop);
+                    }
+                    return replace_rows_checked(table, gate, &once, failed, id_bytes);
+                }
             }
+            Err(count) if stops_the_rest(&count) => {
+                not_taken(rows, &reason, failed);
+                return Err(Stopped(short_reason(format_args!("replace: {count}"))));
+            }
+            Err(_) => {}
         }
     }
     if rows.len() > 1 && (over_cap || refuses_content(&e)) {
         let (a, b) = rows.split_at(rows.len() / 2);
-        replace_rows_checked(table, gate, a, failed);
-        replace_rows_checked(table, gate, b, failed);
-        return;
+        return replace_each(&[a, b], failed);
     }
     let permanent = rows.len() == 1 && refuses_content(&e);
-    let reason = format!("replace: {e}");
     for (i, _) in rows {
         failed.push(json!({"i": i, "reason": reason, "permanent": permanent}));
     }
+    Ok(())
+}
+
+/// A write cut short by a failure that every later call would meet as well
+/// ([`stops_the_rest`]), with the reason its untried documents are reported
+/// with.
+struct Stopped(String);
+
+/// Whether a failed call stops the calls of the same write after it: any
+/// failure but a refusal of the rows the call carried. The engine refuses
+/// rows for their content, the field cap, a schema that changed under the
+/// write, a count of rows its ids do not match, or a request too large, all
+/// of which another run of rows can pass; the local engine types each, and
+/// the hosted service answers each as a 400 or a 413. Anything else (a
+/// transport error, which a timeout is too, a 5xx, a key refused, a limit
+/// of the account) is about the service or the account, so a later run
+/// would only fail the same way, each call up to the client's timeout.
+fn stops_the_rest(e: &InfinoError) -> bool {
+    match e {
+        InfinoError::Schema(_) | InfinoError::Cardinality(_) => false,
+        InfinoError::Backend(m) => !matches!(
+            status_in(m),
+            Some(STATUS_BAD_REQUEST | STATUS_PAYLOAD_TOO_LARGE)
+        ),
+        _ => true,
+    }
+}
+
+/// Report each of `rows` as not taken, for a later try, with `reason`.
+fn not_taken(rows: &[(usize, Value)], reason: &str, failed: &mut Vec<Value>) {
+    for (i, _) in rows {
+        failed.push(json!({"i": i, "reason": reason, "permanent": false}));
+    }
+}
+
+/// Write each of `runs` with `write`, in order, until one stops the write
+/// ([`Stopped`]): the documents of every run after it are reported with its
+/// reason ([`not_taken`]), untried, and the stop is returned.
+fn each_run(
+    runs: &[&[(usize, Value)]],
+    failed: &mut Vec<Value>,
+    mut write: impl FnMut(&[(usize, Value)], &mut Vec<Value>) -> Result<(), Stopped>,
+) -> Result<(), Stopped> {
+    for (k, run) in runs.iter().enumerate() {
+        if let Err(stop) = write(run, failed) {
+            for rest in &runs[k + 1..] {
+                not_taken(rest, &stop.0, failed);
+            }
+            return Err(stop);
+        }
+    }
+    Ok(())
+}
+
+/// How many bytes of ids one mutation over the hosted service may name. The
+/// hosted transport sends an update's or a delete's predicate in the
+/// request's URL, and its front end refuses a long one (413 near 80 KB,
+/// a broken pipe a little past it), so a list of more ids is cut into runs
+/// of at most this many, each its own call. Measured as [`id_cost`] counts.
+const HOSTED_ID_LIST_BYTES: usize = 32 * 1024;
+
+/// Bytes of a URL a byte takes at most once percent-encoded (`%XX`).
+const ENCODED_BYTE: usize = 3;
+
+/// Bytes of a URL the frame around one id in an `IN` list takes once
+/// encoded: its two quotes (`%27` each), the comma after it (`%2C`) and the
+/// space (`+`).
+const ID_FRAME_BYTES: usize = 10;
+
+/// What one id adds to a predicate's URL, at most: each byte
+/// percent-encoded, a quote inside it twice (the SQL writes `'` as `''`),
+/// and its frame ([`ID_FRAME_BYTES`]).
+fn id_cost(id: &str) -> usize {
+    let quotes = id.bytes().filter(|&b| b == b'\'').count();
+    (id.len() + quotes) * ENCODED_BYTE + ID_FRAME_BYTES
+}
+
+/// `ids`, in order, cut into runs whose [`id_cost`] sums to at most
+/// `budget`; a run holds one id at least.
+fn id_runs<S: AsRef<str>>(ids: &[S], budget: usize) -> Vec<&[S]> {
+    let mut runs = Vec::new();
+    let (mut start, mut cost) = (0, 0usize);
+    for (i, id) in ids.iter().enumerate() {
+        let c = id_cost(id.as_ref());
+        if i > start && cost.saturating_add(c) > budget {
+            runs.push(&ids[start..i]);
+            start = i;
+            cost = 0;
+        }
+        cost = cost.saturating_add(c);
+    }
+    if start < ids.len() {
+        runs.push(&ids[start..]);
+    }
+    runs
+}
+
+/// `rows` grouped by the run of `ids` (sorted, without repeats) their id
+/// falls in ([`id_runs`]), in run order; `None` when every id fits one run.
+fn rows_by_id_run(
+    rows: &[(usize, Value)],
+    ids: &[&str],
+    budget: usize,
+) -> Option<Vec<Vec<(usize, Value)>>> {
+    let runs = id_runs(ids, budget);
+    if runs.len() < 2 {
+        return None;
+    }
+    let mut run_of: HashMap<&str, usize> = HashMap::new();
+    for (r, run) in runs.iter().enumerate() {
+        for id in *run {
+            run_of.insert(id, r);
+        }
+    }
+    let mut grouped = vec![Vec::new(); runs.len()];
+    for row in rows {
+        let r = row
+            .1
+            .get(OSID)
+            .and_then(Value::as_str)
+            .and_then(|id| run_of.get(id))
+            .copied()
+            .unwrap_or(0);
+        grouped[r].push(row.clone());
+    }
+    Some(grouped)
+}
+
+/// Whether the hosted service refused a request for its size (413): the
+/// same request in halves can pass. A transport error is not taken for one,
+/// though an oversized URL can break the connection too: a whole outage
+/// breaks it as well, and splitting a batch through an outage would only
+/// multiply the calls that fail. [`HOSTED_ID_LIST_BYTES`] keeps predicates
+/// short of either.
+fn refused_for_size(e: &InfinoError) -> bool {
+    matches!(e, InfinoError::Backend(m) if status_in(m) == Some(STATUS_PAYLOAD_TOO_LARGE))
+}
+
+/// The longest reason a refused document is reported with.
+const REASON_MAX_BYTES: usize = 1024;
+
+/// `e` as a refused document's reason: every URL in it without its query,
+/// which on the hosted service holds the request's predicate (every id it
+/// names, so as long as the batch), and the whole cut to
+/// [`REASON_MAX_BYTES`]. The reason is repeated for each document of a
+/// failed write, so its length must not grow with the write's.
+fn short_reason(e: impl std::fmt::Display) -> String {
+    let full = e.to_string();
+    let mut out = String::with_capacity(full.len().min(REASON_MAX_BYTES + 64));
+    let mut rest = full.as_str();
+    while let Some(at) = rest.find("http") {
+        let (head, from) = rest.split_at(at);
+        out.push_str(head);
+        if from.starts_with("http://") || from.starts_with("https://") {
+            let end = from.find(char::is_whitespace).unwrap_or(from.len());
+            let url = &from[..end];
+            // A transport error writes `url: kind`, so a trailing colon is the text's.
+            let (url, colon) = url.strip_suffix(':').map_or((url, ""), |u| (u, ":"));
+            match url.find('?') {
+                Some(q) => {
+                    out.push_str(&url[..q]);
+                    out.push_str("?<query left out>");
+                }
+                None => out.push_str(url),
+            }
+            out.push_str(colon);
+            rest = &from[end..];
+        } else {
+            out.push_str("http");
+            rest = &from[4..];
+        }
+        if out.len() > REASON_MAX_BYTES {
+            break;
+        }
+    }
+    out.push_str(rest);
+    if out.len() > REASON_MAX_BYTES {
+        let mut cut = REASON_MAX_BYTES;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let dropped = full.len().saturating_sub(cut);
+        out.truncate(cut);
+        out.push_str(&format!("... ({dropped} bytes left out)"));
+    }
+    out
 }
 
 /// Whether a refused update may have been refused for its count of rows:
@@ -2542,7 +3418,7 @@ fn replace_rows_checked(
 /// engine names a miscount ([`InfinoError::Cardinality`]); the hosted
 /// service answers it as a status the engine passes on untyped.
 fn counts_may_explain(e: &InfinoError) -> bool {
-    !refuses_content(e) && !matches!(e, InfinoError::Schema(SchemaError::FieldCapExceeded { .. }))
+    !refuses_content(e) && !over_field_cap(e)
 }
 
 /// Ids whose rows one call to [`rows_under`] counts.
@@ -2574,8 +3450,16 @@ fn rows_under(table: &Supertable, ids: &[&str]) -> Result<Vec<u64>, InfinoError>
 /// each id ends with the one row its document brings. Two mutations: until
 /// the append lands a read finds no row under the ids, and a document whose
 /// append fails is reported for a later try, which finds no row and
-/// appends it. A delete that fails reports every document for a later try.
-fn rewrite_rows(table: &Supertable, gate: &Gate, rows: &[(usize, Value)], failed: &mut Vec<Value>) {
+/// appends it. A delete that fails reports its documents for a later try,
+/// and one that fails for a reason a later delete would meet as well
+/// ([`stops_the_rest`]) stops the write there ([`Stopped`]).
+fn rewrite_rows(
+    table: &Supertable,
+    gate: &Gate,
+    rows: &[(usize, Value)],
+    failed: &mut Vec<Value>,
+    id_bytes: usize,
+) -> Result<(), Stopped> {
     let mut ids: Vec<String> = rows
         .iter()
         .filter_map(|(_, v)| v.get(OSID).and_then(Value::as_str))
@@ -2587,19 +3471,36 @@ fn rewrite_rows(table: &Supertable, gate: &Gate, rows: &[(usize, Value)], failed
         "[capi] replace: {} ids held no row or several; their rows are deleted and the documents appended",
         ids.len()
     );
-    let pred = col(OSID).in_list(ids.into_iter().map(lit).collect(), false);
-    let deleted = {
-        let _pass = gate.whole();
-        waiting(|| table.delete(pred.clone()))
-    };
-    if let Err(e) = deleted {
-        let reason = format!("replace: {e}");
-        for (i, _) in rows {
-            failed.push(json!({"i": i, "reason": reason, "permanent": false}));
+    // Each run of ids ([`id_runs`]) is deleted, then its documents appended,
+    // on its own: a run whose delete fails reports its documents alone.
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let groups = rows_by_id_run(rows, &id_refs, id_bytes).unwrap_or_else(|| vec![rows.to_vec()]);
+    let groups: Vec<&[(usize, Value)]> = groups.iter().map(Vec::as_slice).collect();
+    each_run(&groups, failed, |group, failed| {
+        let mut run: Vec<String> = group
+            .iter()
+            .filter_map(|(_, v)| v.get(OSID).and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        run.sort_unstable();
+        run.dedup();
+        let pred = col(OSID).in_list(run.into_iter().map(lit).collect(), false);
+        let deleted = {
+            let _pass = gate.whole();
+            waiting(|| table.delete(pred.clone()))
+        };
+        if let Err(e) = deleted {
+            let reason = short_reason(format_args!("replace: {e}"));
+            not_taken(group, &reason, failed);
+            return if stops_the_rest(&e) {
+                Err(Stopped(reason))
+            } else {
+                Ok(())
+            };
         }
-        return;
-    }
-    append_checked(table, gate, rows, failed);
+        append_checked(table, gate, group, failed);
+        Ok(())
+    })
 }
 
 /// Index many documents in one append. `osids` and `sources` are parallel
@@ -2642,7 +3543,8 @@ pub unsafe extern "C" fn infino_index_batch(
         for i in 0..n {
             let osid = unsafe { cstr(os_p[i]) }.unwrap_or("");
             let source = unsafe { cstr(sr_p[i]) }.unwrap_or("{}");
-            let mut flat = match conform_doc(source, &schema, &kept, &engine, stamp.as_deref()) {
+            let mut flat = match conform_doc(source, &schema, &kept, &engine, stamp.as_deref(), &[])
+            {
                 Ok(flat) => flat,
                 Err(why) => {
                     failed.push(json!({ "i": i, "reason": why, "permanent": true }));
@@ -2650,7 +3552,7 @@ pub unsafe extern "C" fn infino_index_batch(
                 }
             };
             flat.insert(OSID.into(), Value::String(osid.to_string()));
-            flat.insert(SOURCE.into(), Value::String(source.to_string()));
+            flat.insert(SOURCE.into(), Value::String(mapped_values(source).0.to_string()));
             rows.push((i, flat));
         }
 
@@ -2713,6 +3615,7 @@ pub unsafe extern "C" fn infino_index_batch_buf(
                 id_ends,
                 src_ends,
                 None,
+                ptr::null(),
                 count as usize,
             )
         } {
@@ -2724,7 +3627,14 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             Err(e) => return err_json(&e.to_string()),
         };
         let n = prepared.n;
-        let failed = append_prepared(&table, &conn.gate(name), vec![prepared], &[], &[]);
+        let failed = append_prepared(
+            &table,
+            &conn.gate(name),
+            vec![prepared],
+            &[],
+            &[],
+            conn.id_list_bytes(),
+        );
         let failed: Vec<Value> = failed
             .into_iter()
             .map(|(_, i, reason, permanent)| {
@@ -2749,6 +3659,18 @@ pub struct Prepared {
     failed: Vec<(usize, String)>,
 }
 
+/// One row of a buffer handed to [`prepare`]: its id, source, routing value
+/// (empty for none) and ignored fields, borrowed from the buffer, with its
+/// stamp and operation (negative for none).
+struct RowIn<'a> {
+    id: &'a str,
+    src: &'a str,
+    routing: &'a str,
+    ignored: Vec<&'a str>,
+    seq: i64,
+    op: i64,
+}
+
 /// Each row's routing value and sequence numbers, beside the buffer of ids
 /// and sources: `rt_ends[i]` is where row i's routing value ends (it follows
 /// the row's source in the buffer; an empty one is none), `seqs[i]` its
@@ -2765,7 +3687,10 @@ struct RowMeta {
 /// Parse the buffer's documents in parallel and convert them to one Arrow
 /// batch. With `meta`, each row also keeps its routing value in
 /// [`ROUTING`], its stamp in [`SEQ`] and its operation in [`OP`] (see
-/// [`RowMeta`]).
+/// [`RowMeta`]). With `ig_ends`, each row's segment ends with the paths of
+/// the fields OpenSearch's mapper left out of its document
+/// ([`IGNORED_SEPARATOR`] between them; an empty one is none), up to
+/// `ig_ends[i]`: the row leaves them out and keeps them in [`IGNORED`].
 #[allow(clippy::too_many_arguments)]
 unsafe fn prepare(
     conn: &Bridge,
@@ -2775,11 +3700,13 @@ unsafe fn prepare(
     id_ends: *const u32,
     src_ends: *const u32,
     meta: Option<RowMeta>,
+    ig_ends: *const u32,
     n: usize,
 ) -> Result<Prepared, String> {
     let bytes = unsafe { std::slice::from_raw_parts(buf, buf_len) };
     let id_ends = unsafe { std::slice::from_raw_parts(id_ends, n) };
     let src_ends = unsafe { std::slice::from_raw_parts(src_ends, n) };
+    let ig_ends = (!ig_ends.is_null()).then(|| unsafe { std::slice::from_raw_parts(ig_ends, n) });
     let rt_ends = meta.map(|m| unsafe { std::slice::from_raw_parts(m.rt_ends, n) });
     let seqs = meta.map(|m| unsafe { std::slice::from_raw_parts(m.seqs, n) });
     let ops = meta.map(|m| unsafe { std::slice::from_raw_parts(m.ops, n) });
@@ -2793,36 +3720,60 @@ unsafe fn prepare(
     let kept = conn.kept(name);
     let engine = conn.engine_columns(name);
     let stamp = conn.stamp(name);
+    // A table whose ignored column holds something else (a document's own
+    // field of that name, written before the column was reserved) keeps no
+    // ignored fields, rather than refusing every row that has some.
+    let keeps_ignored = schema
+        .field_with_name(IGNORED)
+        .map_or(true, |f| {
+            matches!(f.data_type(), DataType::List(item)
+                if matches!(item.data_type(), DataType::Utf8 | DataType::LargeUtf8))
+        });
 
-    // Each row's id, source and routing value as borrowed slices of the
-    // buffer, with its stamp and operation.
-    let mut rows_in: Vec<(&str, &str, &str, i64, i64)> = Vec::with_capacity(n);
+    // Each row's id, source, routing value and ignored fields as borrowed
+    // slices of the buffer, with its stamp and operation.
+    let mut rows_in: Vec<RowIn> = Vec::with_capacity(n);
     let mut start = 0usize;
     for i in 0..n {
         let (id_end, src_end) = (id_ends[i] as usize, src_ends[i] as usize);
         let rt_end = rt_ends.map_or(src_end, |ends| ends[i] as usize);
-        if id_end < start || src_end < id_end || rt_end < src_end || rt_end > buf_len {
+        let ig_end = ig_ends.map_or(rt_end, |ends| ends[i] as usize);
+        if id_end < start
+            || src_end < id_end
+            || rt_end < src_end
+            || ig_end < rt_end
+            || ig_end > buf_len
+        {
             return Err("offsets out of range".into());
         }
-        let id = std::str::from_utf8(&bytes[start..id_end]).unwrap_or("");
-        let src = std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}");
-        let routing = std::str::from_utf8(&bytes[src_end..rt_end]).unwrap_or("");
-        rows_in.push((
-            id,
-            src,
-            routing,
-            seqs.map_or(-1, |s| s[i]),
-            ops.map_or(-1, |o| o[i]),
-        ));
-        start = rt_end;
+        rows_in.push(RowIn {
+            id: std::str::from_utf8(&bytes[start..id_end]).unwrap_or(""),
+            src: std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}"),
+            routing: std::str::from_utf8(&bytes[src_end..rt_end]).unwrap_or(""),
+            ignored: ignored_paths(std::str::from_utf8(&bytes[rt_end..ig_end]).unwrap_or("")),
+            seq: seqs.map_or(-1, |s| s[i]),
+            op: ops.map_or(-1, |o| o[i]),
+        });
+        start = ig_end;
     }
 
     let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
         .par_iter()
-        .map(|(id, src, routing, seq, op)| {
-            conform_doc(src, &schema, &kept, &engine, stamp.as_deref()).map(|mut flat| {
+        .map(|row| {
+            let RowIn {
+                id,
+                src,
+                routing,
+                ignored,
+                seq,
+                op,
+            } = row;
+            conform_doc(src, &schema, &kept, &engine, stamp.as_deref(), ignored).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
-                flat.insert(SOURCE.into(), Value::String((*src).to_string()));
+                flat.insert(SOURCE.into(), Value::String(mapped_values(src).0.to_string()));
+                if keeps_ignored && !ignored.is_empty() {
+                    flat.insert(IGNORED.into(), json!(ignored));
+                }
                 if !routing.is_empty() {
                     flat.insert(ROUTING.into(), Value::String((*routing).to_string()));
                 }
@@ -3017,6 +3968,7 @@ fn append_prepared(
     mut prepared: Vec<Prepared>,
     replaced: &[String],
     seqs: &[Vec<i64>],
+    id_bytes: usize,
 ) -> Vec<NotTaken> {
     let mut failed: Vec<NotTaken> = Vec::new();
     for (b, p) in prepared.iter_mut().enumerate() {
@@ -3067,9 +4019,13 @@ fn append_prepared(
                     // than it brings, which the engine refuses whole.
                     replaced_landed = replacing.num_rows() == 0 || {
                         let ids = osids_of(&replacing);
-                        let pred = col(OSID).in_list(ids.into_iter().map(lit).collect(), false);
-                        let _pass = gate.whole();
-                        waiting(|| table.update(pred.clone(), &replacing)).is_ok()
+                        // Ids past one call's list go a run at a time,
+                        // below ([`replace_rows_checked`]).
+                        id_runs(&ids, id_bytes).len() < 2 && {
+                            let pred = col(OSID).in_list(ids.into_iter().map(lit).collect(), false);
+                            let _pass = gate.whole();
+                            waiting(|| table.update(pred.clone(), &replacing)).is_ok()
+                        }
                     };
                     fresh_landed = fresh.num_rows() == 0 || {
                         let _pass = gate.append();
@@ -3097,7 +4053,10 @@ fn append_prepared(
     // batch that could not be converted, and the rows of the joined batch
     // whose append or replace the engine refused. A document that replaces a
     // row goes through the engine's replace ([`replace_rows_checked`]), never
-    // an append that would put a second row beside the one it replaces.
+    // an append that would put a second row beside the one it replaces. Once
+    // a replace stops ([`Stopped`]), every document left is reported with its
+    // reason, untried.
+    let mut stopped: Option<String> = None;
     for (b, p) in prepared.into_iter().enumerate() {
         let converted = p.batch.is_some();
         if converted && !joined_batches {
@@ -3121,8 +4080,17 @@ fn append_prepared(
             }
         }
         let mut refused: Vec<Value> = Vec::new();
-        replace_rows_checked(table, gate, &replacing, &mut refused);
-        append_checked(table, gate, &indexed, &mut refused);
+        if let Some(reason) = &stopped {
+            not_taken(&replacing, reason, &mut refused);
+            not_taken(&indexed, reason, &mut refused);
+        } else if let Err(Stopped(reason)) =
+            replace_rows_checked(table, gate, &replacing, &mut refused, id_bytes)
+        {
+            not_taken(&indexed, &reason, &mut refused);
+            stopped = Some(reason);
+        } else {
+            append_checked(table, gate, &indexed, &mut refused);
+        }
         for r in refused {
             let i = r["i"].as_u64().unwrap_or(0) as usize;
             failed.push((
@@ -3137,11 +4105,14 @@ fn append_prepared(
 }
 
 /// Parse and convert a batch ahead of its append; see [`Prepared`]. The
-/// buffer layout is that of [`infino_index_batch_buf`]. Returns null when
+/// buffer layout is that of [`infino_index_batch_buf`], each row's segment
+/// followed by the paths of its ignored fields up to `ig_ends[i]` when
+/// `ig_ends` is not null (see [`prepare`]). Returns null when
 /// the table is unknown or the offsets do not fit the buffer; otherwise a
 /// handle that [`infino_append_prepared`] consumes or
 /// [`infino_free_prepared`] releases.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn infino_prepare_batch(
     h: *mut Bridge,
     name: *const c_char,
@@ -3149,6 +4120,7 @@ pub unsafe extern "C" fn infino_prepare_batch(
     buf_len: usize,
     id_ends: *const u32,
     src_ends: *const u32,
+    ig_ends: *const u32,
     count: c_int,
 ) -> *mut Prepared {
     catch_unwind(AssertUnwindSafe(|| {
@@ -3167,6 +4139,7 @@ pub unsafe extern "C" fn infino_prepare_batch(
                 id_ends,
                 src_ends,
                 None,
+                ig_ends,
                 count as usize,
             )
         } {
@@ -3185,7 +4158,9 @@ pub unsafe extern "C" fn infino_prepare_batch(
 /// `rt_ends[i]` is where row i's routing value ends (an empty one is none),
 /// `seqs[i]` is its stamp and `ops[i]` the operation that wrote it (each
 /// negative for none), by writer `gen`. A row keeps them in the
-/// `osrouting`, `osseq`, `osop` and `osgen` columns.
+/// `osrouting`, `osseq`, `osop` and `osgen` columns. With `ig_ends`, each
+/// routing value is followed by the paths of the row's ignored fields, as in
+/// [`infino_prepare_batch`].
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn infino_prepare_batch_meta(
@@ -3199,6 +4174,7 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
     seqs: *const i64,
     ops: *const i64,
     gen: i64,
+    ig_ends: *const u32,
     count: c_int,
 ) -> *mut Prepared {
     catch_unwind(AssertUnwindSafe(|| {
@@ -3229,6 +4205,7 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
                     ops,
                     gen,
                 }),
+                ig_ends,
                 count as usize,
             )
         } {
@@ -3309,7 +4286,14 @@ pub unsafe extern "C" fn infino_append_prepared(
                 })
                 .collect()
         };
-        let failed = append_prepared(&table, &conn.gate(name), owned, &replaced, &per_batch);
+        let failed = append_prepared(
+            &table,
+            &conn.gate(name),
+            owned,
+            &replaced,
+            &per_batch,
+            conn.id_list_bytes(),
+        );
         let ok = n.saturating_sub(failed.len());
         let failed: Vec<Value> = failed
             .into_iter()
@@ -3328,6 +4312,26 @@ pub unsafe extern "C" fn infino_free_prepared(p: *mut Prepared) {
     if !p.is_null() {
         drop(unsafe { Box::from_raw(p) });
     }
+}
+
+/// The rows of a prepared batch that do not conform to the table's columns,
+/// as `[{"i": row, "reason": why}]`, so the caller can answer or send them
+/// again before the batch is appended; the handle stays the caller's. Null
+/// for a null handle.
+#[no_mangle]
+pub unsafe extern "C" fn infino_prepared_failed(p: *const Prepared) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(p) = (unsafe { p.as_ref() }) else {
+            return ptr::null_mut();
+        };
+        let failed: Vec<Value> = p
+            .failed
+            .iter()
+            .map(|(i, why)| json!({ "i": i, "reason": why }))
+            .collect();
+        out_json(Value::Array(failed))
+    }))
+    .unwrap_or(ptr::null_mut())
 }
 
 /// Tombstone every row whose `osid` is in the list, in one mutation. Backs the
@@ -3353,29 +4357,27 @@ pub unsafe extern "C" fn infino_delete_osids(
         }
         let n = count as usize;
         let os_p = unsafe { std::slice::from_raw_parts(osids, n) };
-        let ids: Vec<_> = os_p
-            .iter()
-            .filter_map(|p| unsafe { cstr(*p) })
-            .map(|s| lit(s.to_string()))
-            .collect();
+        let ids: Vec<&str> = os_p.iter().filter_map(|p| unsafe { cstr(*p) }).collect();
         // No table yet means nothing to delete.
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(_) => return 0,
         };
-        let pred = col(OSID).in_list(ids, false);
-        let deleted = {
-            let gate = conn.gate(name);
-            let _pass = gate.whole();
-            waiting(|| table.delete(pred.clone()))
-        };
-        match deleted {
-            Ok(_) => 0,
-            Err(e) => {
-                eprintln!("[capi] delete_osids: {e}");
-                -2
+        // A run of ids at a time ([`id_runs`]); a failed run fails the call,
+        // which the caller tries again whole (a delete is idempotent).
+        let gate = conn.gate(name);
+        for run in id_runs(&ids, conn.id_list_bytes()) {
+            let pred = col(OSID).in_list(run.iter().map(|s| lit(s.to_string())).collect(), false);
+            let deleted = {
+                let _pass = gate.whole();
+                waiting(|| table.delete(pred.clone()))
+            };
+            if let Err(e) = deleted {
+                eprintln!("[capi] delete_osids: {}", short_reason(&e));
+                return -2;
             }
         }
+        0
     }))
     .unwrap_or(-99)
 }
@@ -3395,11 +4397,31 @@ fn ranked_columns(conn: &Bridge, name: &str) -> Vec<String> {
     }
 }
 
+/// One row as a get reads it: its source, the sequence number it was
+/// written under (0 for a row written without one), and the routing value
+/// it was written with ([`ROUTING`]; None for none).
+struct Row {
+    source: String,
+    seq: i64,
+    routing: Option<String>,
+}
+
+impl Row {
+    /// The row as `{"source", "seq"}`, with `"routing"` when it has one.
+    fn doc_json(self) -> Value {
+        let mut doc = json!({ "source": self.source, "seq": self.seq });
+        if let Some(routing) = self.routing {
+            doc["routing"] = Value::String(routing);
+        }
+        doc
+    }
+}
+
 /// The row of an attached table read under `osid`, its row id's digits, as
 /// [`get_row`] gives a row: its columns as the source, and no sequence
-/// number. None when `osid` is no row id or the table holds no such row; an
-/// error when the read fails.
-fn attached_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String, i64)>, String> {
+/// number or routing. None when `osid` is no row id or the table holds no
+/// such row; an error when the read fails.
+fn attached_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<Row>, String> {
     if !attached::is_row_id(osid) {
         return Ok(None);
     }
@@ -3409,10 +4431,11 @@ fn attached_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String,
         attached::ROW_ID
     );
     let batches = conn.conn.query_sql(&sql).map_err(|e| e.to_string())?;
-    Ok(batches
-        .iter()
-        .find(|b| b.num_rows() > 0)
-        .map(|b| (attached::source_json(b, 0), 0)))
+    Ok(batches.iter().find(|b| b.num_rows() > 0).map(|b| Row {
+        source: attached::source_json(b, 0),
+        seq: 0,
+        routing: None,
+    }))
 }
 
 /// Most rows of an attached table one statement of [`attached_rows`] asks
@@ -3455,24 +4478,132 @@ fn attached_rows(
     Ok(found)
 }
 
-/// The source of the row under `osid` and the sequence number it was
-/// written under (0 for a row written without one), None when the table
-/// holds no such row, or an error when the read fails.
-fn get_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String, i64)>, String> {
+/// The row under `osid` ([`Row`]), None when the table holds no such row,
+/// or an error when the read fails.
+fn get_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<Row>, String> {
     if conn.is_attached(name) {
         return attached_row(conn, name, osid);
     }
     let table = conn.table(name).map_err(|e| e.to_string())?;
+    row_in(&table, &conn.conn, name, osid).map_err(|e| e.to_string())
+}
+
+/// [`get_row`] as of the table's latest commit, read through
+/// [`Bridge::on_latest`]: for a write that merges into the document it
+/// finds. A lookup that fails is an error rather than no row, so the write
+/// fails instead of finding nothing to merge into.
+fn get_row_latest(conn: &Bridge, name: &str, osid: &str) -> Result<Option<Row>, InfinoError> {
+    if conn.is_attached(name) {
+        return attached_row(conn, name, osid).map_err(InfinoError::Query);
+    }
+    if conn.latest_from.is_none() {
+        // `conn` reads every commit already; its cached handle saves a
+        // hosted service the describe each open asks of it.
+        return row_in(&conn.table(name)?, &conn.conn, name, osid);
+    }
+    conn.on_latest(|latest| row_in(&latest.open_table(name)?, latest, name, osid))
+}
+
+/// The rows under `osids`, each id to its [`Row`] (an id the table does
+/// not hold is absent), for a realtime get or multi-get: as of the table's
+/// latest commit when `latest`, for a node that may not have read the last
+/// commit another node made, else through `conn` itself. One open of the
+/// table serves every id, whose lookups run side by side
+/// ([`side_by_side`]). A lookup that fails is an error for the whole call,
+/// so a failed read is never taken for a missing document.
+fn rows_of(
+    conn: &Bridge,
+    name: &str,
+    osids: &[&str],
+    latest: bool,
+) -> Result<Vec<(String, Row)>, InfinoError> {
+    if conn.is_attached(name) {
+        // An attached table is read in one statement over its ids, as a page is.
+        return Ok(attached_rows(conn, name, osids)
+            .map_err(InfinoError::Query)?
+            .into_iter()
+            .filter_map(|(id, source)| match source {
+                Value::String(source) => Some((
+                    id,
+                    Row {
+                        source,
+                        seq: 0,
+                        routing: None,
+                    },
+                )),
+                _ => None,
+            })
+            .collect());
+    }
+    let found = |table: &Supertable, sql: &Connection| {
+        side_by_side(osids, |id| row_in(table, sql, name, id), InfinoError::Query)
+    };
+    let rows = if !latest || conn.latest_from.is_none() {
+        // As in [`get_row_latest`]: where `conn` reads every commit already,
+        // its cached handle serves.
+        found(&conn.table(name)?, &conn.conn)?
+    } else {
+        conn.on_latest(|latest| found(&latest.open_table(name)?, latest))?
+    };
+    Ok(osids
+        .iter()
+        .zip(rows)
+        .filter_map(|(id, row)| row.map(|row| ((*id).to_owned(), row)))
+        .collect())
+}
+
+/// `lookup` of each of `ids`, in their order, run at most
+/// [`GET_MANY_THREADS`] at once: a page of lookups costs about what its
+/// slowest one does. The first that fails fails the whole call.
+fn side_by_side<T: Send, E: Send>(
+    ids: &[&str],
+    lookup: impl Fn(&str) -> Result<T, E> + Sync,
+    panicked: fn(String) -> E,
+) -> Result<Vec<T>, E> {
+    let mut out = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(GET_MANY_THREADS) {
+        let results: Vec<Result<T, E>> = std::thread::scope(|scope| {
+            let lookup = &lookup;
+            let running: Vec<_> = chunk
+                .iter()
+                .map(|id| scope.spawn(move || lookup(id)))
+                .collect();
+            running
+                .into_iter()
+                .map(|r| {
+                    r.join()
+                        .unwrap_or_else(|_| Err(panicked("a lookup panicked".to_string())))
+                })
+                .collect()
+        });
+        for result in results {
+            out.push(result?);
+        }
+    }
+    Ok(out)
+}
+
+/// The row under `osid` in `table` ([`Row`]), which `sql` (the connection
+/// it was opened on) holds; None when it holds no such row.
+fn row_in(
+    table: &Supertable,
+    sql: &Connection,
+    name: &str,
+    osid: &str,
+) -> Result<Option<Row>, InfinoError> {
     // A term lookup through the id column's FTS index, projected to the
-    // source and the sequence number. A table declared before the id column
-    // carried that index refuses the lookup; it falls back to an equality on
-    // the column.
-    let batches = match table.exact_match(OSID, osid, Some(&[SOURCE, SEQ])) {
+    // source, the sequence number and, where the table has taken a routed
+    // write, the routing. A table declared before the id column carried that
+    // index refuses the lookup; it falls back to an equality on the column.
+    let routed = table.schema().field_with_name(ROUTING).is_ok();
+    let columns: &[&str] = if routed {
+        &[SOURCE, SEQ, ROUTING]
+    } else {
+        &[SOURCE, SEQ]
+    };
+    let batches = match table.exact_match(OSID, osid, Some(columns)) {
         Ok(batches) => batches,
-        Err(_) => conn
-            .conn
-            .query_sql(&row_by_osid_sql(name, osid))
-            .map_err(|e| e.to_string())?,
+        Err(_) => sql.query_sql(&row_by_osid_sql(name, osid, columns))?,
     };
     for b in &batches {
         if b.num_rows() == 0 {
@@ -3492,32 +4623,48 @@ fn get_row(conn: &Bridge, name: &str, osid: &str) -> Result<Option<(String, i64)
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
             .filter(|a| !a.is_null(0))
             .map_or(0, |a| a.value(0));
-        return Ok(Some((source.value(0).to_string(), seq)));
+        let routing = b
+            .column_by_name(ROUTING)
+            .filter(|c| !c.is_null(0))
+            .and_then(|c| match c.data_type() {
+                DataType::LargeUtf8 => c
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .map(|a| a.value(0).to_string()),
+                DataType::Utf8 => c
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .map(|a| a.value(0).to_string()),
+                _ => None,
+            });
+        return Ok(Some(Row {
+            source: source.value(0).to_string(),
+            seq,
+            routing,
+        }));
     }
     Ok(None)
 }
 
-/// The statement [`get_row`] falls back to: the source and sequence number
-/// of the row under `osid`, by an equality on the id column. The table name
-/// is quoted as every other statement over a table quotes it, so an index
-/// whose name holds a `-` reads as one name.
-fn row_by_osid_sql(name: &str, osid: &str) -> String {
+/// The statement [`row_in`] falls back to: `columns` of the row under
+/// `osid`, by an equality on the id column. The table name is quoted as
+/// every other statement over a table quotes it, so an index whose name
+/// holds a `-` reads as one name.
+fn row_by_osid_sql(name: &str, osid: &str, columns: &[&str]) -> String {
     format!(
-        "SELECT {SOURCE}, {SEQ} FROM \"{}\" WHERE {OSID} = '{}' LIMIT 1",
+        "SELECT {} FROM \"{}\" WHERE {OSID} = '{}' LIMIT 1",
+        columns.join(", "),
         name.replace('"', "\"\""),
         osid.replace('\'', "''")
     )
 }
 
-/// [`get_row`], a failed read logged and answered as absent.
-fn found_row(conn: &Bridge, name: &str, osid: &str) -> Option<(String, i64)> {
-    get_row(conn, name, osid).unwrap_or_else(|e| {
-        eprintln!("[capi] get: {e}");
-        None
-    })
-}
-
-/// The raw `_source` JSON for one osid, or "" if absent.
+/// The raw `_source` JSON of one osid, as `{"source": ..}`, null when the
+/// table holds no such id, or `{"error":..}` when the lookup fails. A failed
+/// read is never answered as absent: a write would take the document as
+/// missing and create or overwrite it. The source sits one level down so
+/// that no document, one whose first field is `error` included, can make
+/// the answer read as an error.
 #[no_mangle]
 pub unsafe extern "C" fn infino_get(
     h: *mut Bridge,
@@ -3530,7 +4677,39 @@ pub unsafe extern "C" fn infino_get(
         else {
             return ptr::null_mut();
         };
-        out_string(found_row(conn, name, osid).map_or_else(String::new, |(source, _)| source))
+        match get_row(conn, name, osid) {
+            Ok(row) => out_json(json!({ "source": row.map(|row| row.source) })),
+            Err(e) => read_err_json("get", osid, &e),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// One osid's raw `_source` JSON as of the table's latest commit
+/// ([`get_row_latest`]), "" when the table holds no such id: for a write
+/// that merges into the document it finds, when the last node to write the
+/// table may be another. A lookup that fails answers null rather than "":
+/// a source is any JSON object, so no error object can stand for the
+/// failure.
+#[no_mangle]
+pub unsafe extern "C" fn infino_get_latest(
+    h: *mut Bridge,
+    name: *const c_char,
+    osid: *const c_char,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(osid)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe { cstr(osid) })
+        else {
+            return ptr::null_mut();
+        };
+        match get_row_latest(conn, name, osid) {
+            Ok(row) => out_string(row.map_or_else(String::new, |row| row.source)),
+            Err(e) => {
+                eprintln!("[capi] get_latest: {e}");
+                ptr::null_mut()
+            }
+        }
     }))
     .unwrap_or(ptr::null_mut())
 }
@@ -3560,49 +4739,41 @@ pub unsafe extern "C" fn infino_get_many(
         let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
             return ptr::null_mut();
         };
-        let ids: Vec<&str> = if osids.is_null() || count <= 0 {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(osids, count as usize) }
-                .iter()
-                .filter_map(|p| unsafe { cstr(*p) })
-                .collect()
-        };
+        let ids = unsafe { cstrs(osids, count) };
         if conn.is_attached(name) {
             return match attached_rows(conn, name, &ids) {
                 Ok(found) => out_json(json!({ "sources": found })),
                 Err(e) => err_json(&format!("get_many: {e}")),
             };
         }
-        let mut found = serde_json::Map::new();
-        for chunk in ids.chunks(GET_MANY_THREADS) {
-            let sources: Vec<Result<Option<(String, i64)>, String>> = std::thread::scope(|scope| {
-                let lookups: Vec<_> = chunk
-                    .iter()
-                    .map(|id| scope.spawn(move || get_row(conn, name, id)))
-                    .collect();
-                lookups
-                    .into_iter()
-                    .map(|lookup| lookup.join().unwrap_or_else(|_| Err("a lookup panicked".into())))
-                    .collect()
-            });
-            for (id, source) in chunk.iter().zip(sources) {
-                match source {
-                    Ok(Some((source, _))) if !source.is_empty() => {
-                        found.insert((*id).to_owned(), Value::String(source));
+        // A failure keeps the id apart from the engine's message, so the id
+        // names itself in the error but cannot set its status.
+        let rows = side_by_side(
+            &ids,
+            |id| get_row(conn, name, id).map_err(|e| (id.to_owned(), e)),
+            |e| (String::new(), e),
+        );
+        match rows {
+            Ok(rows) => {
+                let mut found = serde_json::Map::new();
+                for (id, row) in ids.iter().zip(rows) {
+                    if let Some(row) = row.filter(|row| !row.source.is_empty()) {
+                        found.insert((*id).to_owned(), Value::String(row.source));
                     }
-                    Ok(_) => {}
-                    Err(e) => return err_json(&format!("get_many {id}: {e}")),
                 }
+                out_json(json!({ "sources": found }))
             }
+            Err((id, e)) => read_err_json("get_many", &id, &e),
         }
-        out_json(json!({ "sources": found }))
     }))
     .unwrap_or(ptr::null_mut())
 }
 
-/// One osid's document as `{"source": .., "seq": n}`, its sequence number
-/// what a conditional write on it is checked against; "" if absent.
+/// One osid's document as `{"doc": {"source": .., "seq": n, "routing": ..}}`,
+/// its sequence number what a conditional write on it is checked against and
+/// `routing` (left out for none) what a get reports as `_routing`;
+/// `{"doc": null}` when the table holds no such id, and `{"error":..}` when
+/// the lookup fails, as [`infino_get`] answers.
 #[no_mangle]
 pub unsafe extern "C" fn infino_get_doc(
     h: *mut Bridge,
@@ -3615,9 +4786,74 @@ pub unsafe extern "C" fn infino_get_doc(
         else {
             return ptr::null_mut();
         };
-        match found_row(conn, name, osid) {
-            Some((source, seq)) => out_json(json!({ "source": source, "seq": seq })),
-            None => out_string(String::new()),
+        match get_row(conn, name, osid) {
+            Ok(row) => out_json(json!({ "doc": row.map(Row::doc_json) })),
+            Err(e) => read_err_json("get_doc", osid, &e),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// The documents of several osids ([`rows_of`]), as `{"docs": {id: doc}}`,
+/// each doc `{"source", "seq", "routing"}` as [`infino_get_doc`] gives it;
+/// an id the table does not hold is absent. For a realtime multi-get on the
+/// node whose own connection has read every commit: one open of the table
+/// for all the ids. A lookup that fails answers `{"error":..}` for the whole
+/// call, as [`infino_get`] answers, never an answer missing ids, so a failed
+/// read is never taken for a missing document. The ids sit one level down,
+/// so no id, `error` included, can make the answer read as an error.
+#[no_mangle]
+pub unsafe extern "C" fn infino_get_docs(
+    h: *mut Bridge,
+    name: *const c_char,
+    osids: *const *const c_char,
+    count: c_int,
+) -> *mut c_char {
+    unsafe { get_docs(h, name, osids, count, false) }
+}
+
+/// [`infino_get_docs`] as of the table's latest commit: for a realtime get
+/// or multi-get on a node that may not have read the last commit another
+/// node made, one read of the latest commit for all the ids.
+#[no_mangle]
+pub unsafe extern "C" fn infino_get_docs_latest(
+    h: *mut Bridge,
+    name: *const c_char,
+    osids: *const *const c_char,
+    count: c_int,
+) -> *mut c_char {
+    unsafe { get_docs(h, name, osids, count, true) }
+}
+
+/// [`infino_get_docs`], as of the table's latest commit when `latest`.
+unsafe fn get_docs(
+    h: *mut Bridge,
+    name: *const c_char,
+    osids: *const *const c_char,
+    count: c_int,
+    latest: bool,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name)) = (bridge_ref(h), unsafe { cstr(name) }) else {
+            return ptr::null_mut();
+        };
+        let ids = unsafe { cstrs(osids, count) };
+        match rows_of(conn, name, &ids, latest) {
+            Ok(rows) => {
+                let docs: serde_json::Map<String, Value> = rows
+                    .into_iter()
+                    .map(|(id, row)| (id, row.doc_json()))
+                    .collect();
+                out_json(json!({ "docs": docs }))
+            }
+            Err(e) => {
+                let call = if latest {
+                    "get_docs_latest"
+                } else {
+                    "get_docs"
+                };
+                read_err_json(call, name, &e.to_string())
+            }
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -3635,14 +4871,16 @@ pub unsafe extern "C" fn infino_drop(h: *mut Bridge, name: *const c_char) -> c_i
             return -2;
         }
         conn.forget(name);
-        match conn.conn.drop_table(name, true) {
+        let dropped = match conn.conn.drop_table(name, true) {
             Ok(_) => 0,
             Err(InfinoError::NotFound(_)) => 0,
             Err(e) => {
                 eprintln!("[capi] drop_table: {e}");
                 -2
             }
-        }
+        };
+        conn.forget_latest();
+        dropped
     }))
     .unwrap_or(-99)
 }
@@ -3706,6 +4944,54 @@ pub unsafe extern "C" fn infino_sql(h: *mut Bridge, sql: *const c_char) -> *mut 
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// Run `sql` as [`infino_sql`] does, reading each table's latest commit
+/// ([`Bridge::latest`]): for a read whose answer decides what a write does.
+#[no_mangle]
+pub unsafe extern "C" fn infino_sql_latest(h: *mut Bridge, sql: *const c_char) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(bridge), Some(sql)) = (bridge_ref(h), unsafe { cstr(sql) }) else {
+            return ptr::null_mut();
+        };
+        match bridge.query_latest(sql) {
+            Ok(b) => out_string(batches_to_json(&b)),
+            Err(e) => err_json(&e.to_string()),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Keep the connection [`infino_sql_latest`] and [`infino_get_latest`] read
+/// through open across calls until [`infino_release_latest`]
+/// ([`Bridge::hold_latest`]): for a shard that reads the latest commit for
+/// each batch it writes until its own first commit. Without a hold, the
+/// connection closes after each such read.
+#[no_mangle]
+pub unsafe extern "C" fn infino_hold_latest(h: *mut Bridge) {
+    if let Some(bridge) = bridge_ref(h) {
+        bridge.hold_latest();
+    }
+}
+
+/// Let go of a hold [`infino_hold_latest`] took ([`Bridge::release_latest`]).
+#[no_mangle]
+pub unsafe extern "C" fn infino_release_latest(h: *mut Bridge) {
+    if let Some(bridge) = bridge_ref(h) {
+        bridge.release_latest();
+    }
+}
+
+/// Close the connection the latest reads go through, holds or not
+/// ([`Bridge::forget_latest`]), so the next latest read opens it afresh
+/// with no table handle: for a holder that keeps the connection open while
+/// reads keep coming, to let go of the handles of tables no longer read.
+/// A read running on it keeps what it holds until it ends.
+#[no_mangle]
+pub unsafe extern "C" fn infino_forget_latest(h: *mut Bridge) {
+    if let Some(bridge) = bridge_ref(h) {
+        bridge.forget_latest();
+    }
 }
 
 /// The indices a caller's read-only statement reads, as
@@ -4461,6 +5747,25 @@ fn cell_json(col: &dyn Array, r: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
+    use std::thread;
+
+    use datafusion::arrow::ipc::writer::StreamWriter;
+
+    /// A directory its owner may read and enter but not write.
+    const READ_ONLY_DIR: u32 = 0o555;
+    /// A directory its owner may read, enter and write.
+    const WRITABLE_DIR: u32 = 0o755;
+    /// How long a test waits for a service that may never answer.
+    const SHORT_WAIT: Duration = Duration::from_millis(300);
+
+    /// How many catalogs [`open_logs`] has made in this process: part of
+    /// each one's directory name, since tests running at once can read the
+    /// same clock time.
+    static OPENED_LOGS: AtomicUsize = AtomicUsize::new(0);
 
     const MAPPING: &str = r#"{"properties":{
         "@timestamp":{"type":"date"},
@@ -4487,8 +5792,9 @@ mod tests {
     /// storage, and delete / update need one.
     fn open_logs() -> *mut Bridge {
         let dir = std::env::temp_dir().join(format!(
-            "infino-capi-test-{}-{}",
+            "infino-capi-test-{}-{}-{}",
             std::process::id(),
+            OPENED_LOGS.fetch_add(1, Ordering::SeqCst),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -4569,11 +5875,32 @@ mod tests {
                 h,
                 c("no_such_table").as_ptr(),
                 c(r#"{"level":"info"}"#).as_ptr(),
+                ptr::null(),
             )
         });
         let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
         assert!(v["error"].is_string(), "{out}");
         close(h);
+    }
+
+    /// [`infino_get_docs_latest`] of `ids` in table `logs`.
+    fn docs_latest(h: *mut Bridge, ids: &[&str]) -> String {
+        docs_from(h, "logs", ids, true)
+    }
+
+    /// [`infino_get_docs`] of `ids` in `table`, or [`infino_get_docs_latest`]
+    /// when `latest`.
+    fn docs_from(h: *mut Bridge, table: &str, ids: &[&str], latest: bool) -> String {
+        let ids: Vec<CString> = ids.iter().map(|id| c(id)).collect();
+        let ptrs: Vec<*const c_char> = ids.iter().map(|id| id.as_ptr()).collect();
+        let (table, count) = (c(table), ptrs.len() as c_int);
+        take(unsafe {
+            if latest {
+                infino_get_docs_latest(h, table.as_ptr(), ptrs.as_ptr(), count)
+            } else {
+                infino_get_docs(h, table.as_ptr(), ptrs.as_ptr(), count)
+            }
+        })
     }
 
     fn close(h: *mut Bridge) {
@@ -4611,7 +5938,7 @@ mod tests {
     }
 
     fn check(h: *mut Bridge, doc: &str) -> String {
-        take(unsafe { infino_check_doc(h, c("logs").as_ptr(), c(doc).as_ptr()) })
+        take(unsafe { infino_check_doc(h, c("logs").as_ptr(), c(doc).as_ptr(), ptr::null()) })
     }
 
     fn bm25(h: *mut Bridge, column: &str, query: &str) -> String {
@@ -4640,7 +5967,16 @@ mod tests {
     }
 
     fn get(h: *mut Bridge, osid: &str) -> String {
-        take(unsafe { infino_get(h, c("logs").as_ptr(), c(osid).as_ptr()) })
+        get_from(h, "logs", osid)
+    }
+
+    /// One id's source from `table` as `infino_get` answers it, "" when the
+    /// table holds no such id; a lookup that fails panics.
+    fn get_from(h: *mut Bridge, table: &str, osid: &str) -> String {
+        let out = take(unsafe { infino_get(h, c(table).as_ptr(), c(osid).as_ptr()) });
+        let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert!(v.get("source").is_some(), "{out}");
+        v["source"].as_str().unwrap_or_default().to_string()
     }
 
     fn get_many(h: *mut Bridge, osids: &[&str]) -> Value {
@@ -5030,27 +6366,18 @@ mod tests {
 
         // Its source by id, the row's columns as one document: a null left
         // out, a time as an instant, a quote escaped.
-        let newest: Value = serde_json::from_str(&take(unsafe {
-            infino_get(h, c("plain").as_ptr(), c(&ids[0]).as_ptr())
-        }))
-        .unwrap();
+        let newest: Value = serde_json::from_str(&get_from(h, "plain", &ids[0])).unwrap();
         assert_eq!(
             newest,
             json!({"time": "2025-05-08T20:00:00.000Z", "title": "India", "hits": 3, "page_id": 2})
         );
-        let second: Value = serde_json::from_str(&take(unsafe {
-            infino_get(h, c("plain").as_ptr(), c(&ids[1]).as_ptr())
-        }))
-        .unwrap();
+        let second: Value = serde_json::from_str(&get_from(h, "plain", &ids[1])).unwrap();
         assert_eq!(
             second,
             json!({"time": "2025-05-08T19:00:00.000Z", "title": "India national team", "hits": 5})
         );
         // An id that is no row id names no row.
-        assert_eq!(
-            take(unsafe { infino_get(h, c("plain").as_ptr(), c("a' OR '1'='1").as_ptr()) }),
-            ""
-        );
+        assert_eq!(get_from(h, "plain", "a' OR '1'='1"), "");
 
         // The source read in a statement is the same document, as text.
         let rows = sql(
@@ -5190,6 +6517,7 @@ mod tests {
                 doc.len(),
                 [1u32].as_ptr(),
                 [doc.len() as u32].as_ptr(),
+                ptr::null(),
                 1,
             )
         };
@@ -5554,12 +6882,10 @@ mod tests {
         assert_eq!(many["b"].as_str(), Some(get(h, "b").as_str()), "{many}");
         assert_eq!(many.as_object().map(|o| o.len()), Some(2), "{many}");
         assert_eq!(get_many(h, &[]), json!({}));
-        // A read that fails is an error, never an absent id; one get still
-        // answers it as absent.
+        // A read that fails is an error, never an absent id.
         let id = c("a");
         let failed = take(unsafe { infino_get_many(h, c("no_such_table").as_ptr(), &id.as_ptr(), 1) });
         assert!(failed.starts_with("{\"error\""), "{failed}");
-        assert_eq!(take(unsafe { infino_get(h, c("no_such_table").as_ptr(), id.as_ptr()) }), "");
         close(h);
     }
 
@@ -5600,16 +6926,125 @@ mod tests {
         close(h);
     }
 
+    /// A lookup by id that fails answers an error from `infino_get` and
+    /// `infino_get_doc`, never the empty answer of an id the table does not
+    /// hold: a write merging into that answer would create or overwrite the
+    /// document.
+    #[test]
+    fn a_failed_read_by_id_is_an_error_never_a_missing_document() {
+        let h = open_logs();
+        index(h, &[("a", r#"{"level":"info"}"#)]);
+        for out in [
+            take(unsafe { infino_get(h, c("no_such_table").as_ptr(), c("a").as_ptr()) }),
+            take(unsafe { infino_get_doc(h, c("no_such_table").as_ptr(), c("a").as_ptr()) }),
+            docs_from(h, "no_such_table", &["a"], false),
+            docs_from(h, "no_such_table", &["a"], true),
+        ] {
+            let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+            assert!(v["error"].is_string(), "{out}");
+            assert!(
+                v.get("source").is_none() && v.get("doc").is_none() && v.get("docs").is_none(),
+                "{out}"
+            );
+        }
+        // An id the table does not hold is absent, not an error.
+        let absent = take(unsafe { infino_get(h, c("logs").as_ptr(), c("zz").as_ptr()) });
+        assert_eq!(absent, r#"{"source":null}"#);
+        let absent = take(unsafe { infino_get_doc(h, c("logs").as_ptr(), c("zz").as_ptr()) });
+        assert_eq!(absent, r#"{"doc":null}"#);
+        for latest in [false, true] {
+            assert_eq!(docs_from(h, "logs", &["zz"], latest), r#"{"docs":{}}"#);
+        }
+        close(h);
+    }
+
+    /// A failed read by id takes its status from the engine's error alone:
+    /// an id that spells a status names itself in the message but does not
+    /// set the status the plugin answers with.
+    #[test]
+    fn an_id_does_not_set_the_status_of_a_failed_read() {
+        let h = open_logs();
+        let id = c("x server returned 200");
+        let many = [id.as_ptr()];
+        for out in [
+            take(unsafe { infino_get(h, c("no_such_table").as_ptr(), id.as_ptr()) }),
+            take(unsafe { infino_get_doc(h, c("no_such_table").as_ptr(), id.as_ptr()) }),
+            take(unsafe { infino_get_many(h, c("no_such_table").as_ptr(), many.as_ptr(), 1) }),
+        ] {
+            let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+            assert!(
+                v["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("x server returned 200")),
+                "{out}"
+            );
+            assert!(v.get("status").is_none(), "{out}");
+        }
+        // Nor does an id of a read of many: the error names the table.
+        for latest in [false, true] {
+            let out = docs_from(h, "no_such_table", &["x server returned 200"], latest);
+            let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+            assert!(v["error"].is_string(), "{out}");
+            assert!(v.get("status").is_none(), "{out}");
+        }
+        close(h);
+    }
+
+    /// A document whose id is `error`, or whose source starts with an
+    /// `error` field, is read as a document by `infino_get` and
+    /// `infino_get_doc`: each answer keeps the document one level down.
+    #[test]
+    fn a_document_that_spells_error_is_read_by_id_as_a_document() {
+        let h = open_logs();
+        let out = index(
+            h,
+            &[
+                ("error", r#"{"level":"info","message":"named error"}"#),
+                ("e2", r#"{"error":"boom","level":"warn"}"#),
+            ],
+        );
+        assert_eq!(out["ok"], 2, "{out}");
+        for (id, needle) in [("error", "named error"), ("e2", "boom")] {
+            let raw = take(unsafe { infino_get(h, c("logs").as_ptr(), c(id).as_ptr()) });
+            assert!(raw.starts_with("{\"source\""), "{raw}");
+            assert!(get(h, id).contains(needle), "{raw}");
+            let raw = take(unsafe { infino_get_doc(h, c("logs").as_ptr(), c(id).as_ptr()) });
+            assert!(raw.starts_with("{\"doc\""), "{raw}");
+            let doc = get_doc(h, id);
+            assert_eq!(doc["source"].as_str(), Some(get(h, id).as_str()), "{doc}");
+        }
+        // A read of many ids keeps them one level down too: the id `error`
+        // is a document, through the node's own connection and the latest
+        // commit alike.
+        for latest in [false, true] {
+            let raw = docs_from(h, "logs", &["error", "e2", "zz"], latest);
+            assert!(raw.starts_with("{\"docs\""), "{raw}");
+            let docs: Value = serde_json::from_str(&raw).unwrap_or_else(|_| panic!("{raw}"));
+            assert_eq!(
+                docs["docs"]["error"]["source"].as_str(),
+                Some(get(h, "error").as_str()),
+                "{raw}"
+            );
+            assert_eq!(
+                docs["docs"]["e2"]["source"].as_str(),
+                Some(get(h, "e2").as_str()),
+                "{raw}"
+            );
+            assert_eq!(docs["docs"].as_object().map(|o| o.len()), Some(2), "{raw}");
+        }
+        close(h);
+    }
+
     /// The equality [`get_row`] falls back to quotes the table name, so an
     /// index whose name holds a `-` (or a `"`) reads as one name rather than
     /// failing to parse.
     #[test]
     fn the_fallback_lookup_quotes_the_table_name() {
         assert_eq!(
-            row_by_osid_sql("my-logs", "it's"),
+            row_by_osid_sql("my-logs", "it's", &[SOURCE, SEQ]),
             format!("SELECT {SOURCE}, {SEQ} FROM \"my-logs\" WHERE {OSID} = 'it''s' LIMIT 1")
         );
-        assert!(row_by_osid_sql("a\"b", "x").contains("FROM \"a\"\"b\" WHERE"));
+        assert!(row_by_osid_sql("a\"b", "x", &[SOURCE]).contains("FROM \"a\"\"b\" WHERE"));
         let h = open_logs();
         let made =
             take(unsafe { infino_ensure_table(h, c("my-logs").as_ptr(), c(MAPPING).as_ptr()) });
@@ -5629,7 +7064,7 @@ mod tests {
         let bridge = bridge_ref(h).unwrap();
         let batches = bridge
             .conn
-            .query_sql(&row_by_osid_sql("my-logs", "a"))
+            .query_sql(&row_by_osid_sql("my-logs", "a", &[SOURCE, SEQ]))
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         close(h);
@@ -5814,6 +7249,7 @@ mod tests {
                 [4i64, 5].as_ptr(),
                 [-1i64, 5].as_ptr(),
                 3,
+                ptr::null(),
                 2,
             )
         };
@@ -5843,11 +7279,283 @@ mod tests {
         assert_eq!(rows[1]["osrouting"], "r", "{rows}");
         assert_eq!(rows[1]["osop"], 5, "{rows}");
         assert_eq!(rows[1][".osgen"], 8, "{rows}");
+        // A get reads the routing with the document, so a found get is one read.
+        let get_doc = |id: &str| -> Value {
+            serde_json::from_str(&take(unsafe {
+                infino_get_doc(h, c("logs").as_ptr(), c(id).as_ptr())
+            }))
+            .unwrap()
+        };
+        assert_eq!(get_doc("s2")["doc"]["routing"], "r");
+        assert!(
+            get_doc("s1")["doc"].get("routing").is_none(),
+            "no routing, none read"
+        );
+        let docs: Value = serde_json::from_str(&docs_latest(h, &["s1", "s2", "s3"])).unwrap();
+        assert_eq!(docs["docs"]["s2"]["routing"], "r", "{docs}");
+        assert_eq!(docs["docs"]["s2"]["seq"], 5, "{docs}");
+        assert!(docs["docs"]["s1"].get("routing").is_none(), "{docs}");
+        assert!(docs["docs"].get("s3").is_none(), "{docs}");
         // How far the table holds the writer's history is its own operations'.
         let highest = sql(h, "SELECT max(osop) AS highest FROM logs WHERE osgen = 3");
         assert_eq!(highest[0]["highest"], 5, "{highest}");
         assert_eq!(count(h, ".osop", "hello"), "1");
         close(h);
+    }
+
+    /// Of an ignored field's several values, those its column takes stay in
+    /// the row, as OpenSearch keeps the well-formed values of an array; a
+    /// single ignored value, an ignored field the mapping does not declare,
+    /// and the paths under an ignored field are left out whole.
+    #[test]
+    fn an_ignored_array_keeps_the_values_its_column_takes() {
+        let schema = Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new("m", DataType::Int64, true),
+        ]);
+        let row = |doc: &str, ignored: &[&str]| {
+            conform_doc(doc, &schema, &HashMap::new(), &[], None, ignored)
+        };
+        let flat = row(r#"{"n":[1,"x",3],"m":"y"}"#, &["n", "m"]).unwrap();
+        assert_eq!(flat.get("n[]"), Some(&json!([1, 3])), "{flat:?}");
+        assert!(!flat.contains_key("m"), "{flat:?}");
+        let flat = row(r#"{"n":["x",2]}"#, &["n"]).unwrap();
+        assert_eq!(flat.get("n"), Some(&json!(2)), "{flat:?}");
+        assert!(!flat.contains_key("n[]"), "{flat:?}");
+        let flat = row(r#"{"n":["x","y"]}"#, &["n"]).unwrap();
+        assert_eq!(flat.get("n"), Some(&Value::Null), "{flat:?}");
+        let flat = row(
+            r#"{"u":[1,"x"],"g":{"lat":"north","lon":[1,2]}}"#,
+            &["u", "g"],
+        )
+        .unwrap();
+        assert!(flat.is_empty(), "{flat:?}");
+        // Not ignored, the same array is refused.
+        assert!(row(r#"{"n":[1,"x",3]}"#, &[]).is_err());
+    }
+
+    #[test]
+    fn an_ignored_array_keeps_only_the_values_opensearch_accepts() {
+        let schema = Schema::new(vec![
+            Field::new("ip", DataType::LargeUtf8, true),
+            Field::new("b", DataType::Int64, true),
+            Field::new("ip[]", DataType::List(Arc::new(Field::new(LIST_ITEM, DataType::LargeUtf8, true))), true),
+        ]);
+        let kept: HashMap<String, Kept> = [
+            ("ip".to_string(), Kept::Valid(Valid::Ip)),
+            ("b".to_string(), Kept::Valid(Valid::Integer(-128, 127))),
+        ]
+        .into_iter()
+        .collect();
+        let row = |doc: &str, ignored: &[&str]| conform_doc(doc, &schema, &kept, &[], None, ignored);
+        let flat = row(r#"{"ip":["10.0.0.1","garbage","::1"]}"#, &["ip"]).unwrap();
+        assert_eq!(flat.get("ip[]"), Some(&json!(["10.0.0.1", "::1"])), "{flat:?}");
+        let flat = row(r#"{"b":[1,300,-128]}"#, &["b"]).unwrap();
+        assert_eq!(flat.get("b[]"), Some(&json!([1, -128])), "{flat:?}");
+        let flat = row(r#"{"b":[300,-129]}"#, &["b"]).unwrap();
+        assert_eq!(flat.get("b"), Some(&Value::Null), "{flat:?}");
+        // Not ignored, a value is kept as the mapper accepted it.
+        let flat = row(r#"{"b":5}"#, &[]).unwrap();
+        assert_eq!(flat.get("b"), Some(&json!(5)), "{flat:?}");
+    }
+
+    /// A `keyword` value longer than its field's `ignore_above` (counted in
+    /// UTF-16 units) is left out of the row, of several values only it; one
+    /// whose UTF-8 encoding is past a term's length refuses the document.
+    #[test]
+    fn keyword_values_follow_ignore_above_and_the_term_length() {
+        let schema = Schema::new(vec![
+            Field::new("short", DataType::LargeUtf8, true),
+            Field::new("long", DataType::LargeUtf8, true),
+            Field::new("stored", DataType::LargeUtf8, true),
+            Field::new("short[]", DataType::List(Arc::new(Field::new(LIST_ITEM, DataType::LargeUtf8, true))), true),
+        ]);
+        let kept: HashMap<String, Kept> = [
+            ("short".to_string(), Kept::Keyword { ignore_above: Some(5), terms: true }),
+            ("long".to_string(), Kept::Keyword { ignore_above: None, terms: true }),
+            ("stored".to_string(), Kept::Keyword { ignore_above: None, terms: false }),
+        ]
+        .into_iter()
+        .collect();
+        let row = |doc: String| conform_doc(&doc, &schema, &kept, &[], None, &[]);
+        let flat = row(r#"{"short":"abcdefgh"}"#.to_string()).unwrap();
+        assert_eq!(flat.get("short"), Some(&Value::Null), "{flat:?}");
+        let flat = row(r#"{"short":"abc"}"#.to_string()).unwrap();
+        assert_eq!(flat.get("short"), Some(&json!("abc")), "{flat:?}");
+        // Five characters of two UTF-8 bytes each are five UTF-16 units.
+        let flat = row(r#"{"short":"ééééé"}"#.to_string()).unwrap();
+        assert_eq!(flat.get("short"), Some(&json!("ééééé")), "{flat:?}");
+        let flat = row(r#"{"short":["abc","abcdefgh","de"]}"#.to_string()).unwrap();
+        assert_eq!(flat.get("short[]"), Some(&json!(["abc", "de"])), "{flat:?}");
+        let flat = row(r#"{"short":["abc","abcdefgh"]}"#.to_string()).unwrap();
+        assert_eq!(flat.get("short"), Some(&json!("abc")), "{flat:?}");
+        let at = "x".repeat(MAX_TERM_BYTES);
+        assert!(row(format!(r#"{{"long":"{at}"}}"#)).is_ok());
+        let past = format!("{at}x");
+        let why = row(format!(r#"{{"long":"{past}"}}"#)).unwrap_err();
+        assert!(why.contains("bytes can be at most 32766 in length; got 32767"), "{why}");
+        // A keyword that is neither indexed nor has doc values builds no term, so any length is kept.
+        let flat = row(format!(r#"{{"stored":"{past}"}}"#)).unwrap();
+        assert_eq!(flat.get("stored"), Some(&json!(past)), "{flat:?}");
+        // A number is indexed as its text, and left out past ignore_above.
+        let flat = row(r#"{"short":123456}"#.to_string()).unwrap();
+        assert_eq!(flat.get("short"), Some(&Value::Null), "{flat:?}");
+        let flat = row(r#"{"short":12345}"#.to_string()).unwrap();
+        assert_ne!(flat.get("short"), Some(&Value::Null), "{flat:?}");
+        // Past its ignore_above, a value of any length is left out, as OpenSearch leaves it.
+        let flat = row(format!(r#"{{"short":"{past}"}}"#)).unwrap();
+        assert_eq!(flat.get("short"), Some(&Value::Null), "{flat:?}");
+    }
+
+    /// Whether a `keyword` field builds terms follows its mapping: one that
+    /// is neither indexed nor has doc values stores a value past a term's
+    /// length in its row and its source; an indexed one, or one with only
+    /// doc values, refuses the document as an immense term, at the check
+    /// and at the write.
+    #[test]
+    fn a_keyword_builds_terms_unless_its_mapping_turns_off_index_and_doc_values() {
+        let h = open_logs();
+        let mapping = r#"{"properties":{
+            "@timestamp":{"type":"date"},
+            "level":{"type":"keyword"},
+            "message":{"type":"text"},
+            "status":{"type":"long"},
+            "took":{"type":"float"},
+            "http":{"properties":{"method":{"type":"keyword"}}},
+            "geo":{"type":"geo_point"},
+            "stored":{"type":"keyword","index":false,"doc_values":false},
+            "indexed":{"type":"keyword"},
+            "doc_values_only":{"type":"keyword","index":false}
+        }}"#;
+        let out = ensure(h, mapping);
+        assert!(!out.contains("error"), "{out}");
+        let past = "x".repeat(MAX_TERM_BYTES + 1);
+        let stored = format!(r#"{{"level":"info","stored":"{past}"}}"#);
+        let indexed = format!(r#"{{"level":"info","indexed":"{past}"}}"#);
+        let doc_values_only = format!(r#"{{"level":"info","doc_values_only":"{past}"}}"#);
+
+        assert_eq!(check(h, &stored), "");
+        for (doc, field) in [(&indexed, "indexed"), (&doc_values_only, "doc_values_only")] {
+            let why = check(h, doc);
+            assert!(
+                why.contains(&format!("immense term in field=\"{field}\"")),
+                "{field}: {why}"
+            );
+            assert!(
+                why.contains("bytes can be at most 32766 in length; got 32767"),
+                "{field}: {why}"
+            );
+        }
+
+        let out = index(
+            h,
+            &[("s", &stored), ("i", &indexed), ("d", &doc_values_only)],
+        );
+        assert_eq!(out["ok"], 1, "{out}");
+        let failed = out["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 2, "{out}");
+        for (f, (i, field)) in failed.iter().zip([(1, "indexed"), (2, "doc_values_only")]) {
+            assert_eq!(f["i"], i, "{out}");
+            let why = f["reason"].as_str().unwrap();
+            let term = format!("immense term in field=\"{field}\"");
+            assert!(why.contains(&term), "{out}");
+        }
+
+        // The stored value is whole in the row and in the source.
+        let q = "SELECT osid, length(stored) AS n FROM logs WHERE stored IS NOT NULL";
+        let rows = sql(h, q);
+        let expected = json!([{"osid": "s", "n": MAX_TERM_BYTES + 1}]);
+        assert_eq!(rows, expected, "{rows}");
+        assert_eq!(get(h, "s"), stored);
+        assert_eq!(get(h, "i"), "");
+        assert_eq!(get(h, "d"), "");
+        close(h);
+    }
+
+    /// The fields OpenSearch's mapper ignored for a malformed value are left
+    /// out of the check and of the row, a field's paths under it with it
+    /// (a geo_point given as an object), and kept by path in the ignored
+    /// column; the source keeps them whole. A row with none leaves the
+    /// column null, and a document's own field of that name stays out of it.
+    #[test]
+    fn ignored_fields_stay_out_of_the_row_and_are_kept_by_path() {
+        let h = open_logs();
+        let bad = r#"{"status":"not a number","geo":{"lat":"north","lon":1},"level":"info"}"#;
+        assert!(
+            check(h, bad).contains("status"),
+            "the column refuses the value"
+        );
+        let ignoring = |doc: &str, paths: &str| {
+            take(unsafe {
+                infino_check_doc(h, c("logs").as_ptr(), c(doc).as_ptr(), c(paths).as_ptr())
+            })
+        };
+        assert_eq!(ignoring(bad, "status\ngeo"), "");
+        assert_eq!(ignoring(r#"{"status":"x","statuses":"y"}"#, "status"), "");
+
+        let docs = [
+            ("a", bad, "status\ngeo\nstatus"),
+            ("b", r#"{"status":5,"osignored":"mine"}"#, ""),
+        ];
+        let mut buf: Vec<u8> = Vec::new();
+        let (mut id_ends, mut src_ends, mut ig_ends) = (Vec::new(), Vec::new(), Vec::new());
+        for (id, src, ignored) in docs {
+            buf.extend_from_slice(id.as_bytes());
+            id_ends.push(buf.len() as u32);
+            buf.extend_from_slice(src.as_bytes());
+            src_ends.push(buf.len() as u32);
+            buf.extend_from_slice(ignored.as_bytes());
+            ig_ends.push(buf.len() as u32);
+        }
+        let p = unsafe {
+            infino_prepare_batch(
+                h,
+                c("logs").as_ptr(),
+                buf.as_ptr(),
+                buf.len(),
+                id_ends.as_ptr(),
+                src_ends.as_ptr(),
+                ig_ends.as_ptr(),
+                docs.len() as c_int,
+            )
+        };
+        assert!(!p.is_null());
+        let out = append_with_seqs(h, &[p], &[], &[]);
+        assert_eq!(out["ok"], 2, "{out}");
+        let rows = sql(
+            h,
+            r#"SELECT osid, status, level, source, array_to_string(osignored, ',') AS ignored
+                FROM logs ORDER BY osid"#,
+        );
+        assert!(rows[0]["status"].is_null(), "{rows}");
+        assert_eq!(rows[0]["level"], "info", "{rows}");
+        assert_eq!(rows[0]["source"], bad, "{rows}");
+        assert_eq!(rows[0]["ignored"], "status,geo", "{rows}");
+        assert_eq!(rows[1]["status"], 5, "{rows}");
+        assert!(rows[1]["ignored"].is_null(), "{rows}");
+        let found = sql(h, "SELECT osid FROM logs WHERE array_has(osignored, 'geo')");
+        assert_eq!(found, json!([{"osid": "a"}]), "{found}");
+        // Read as the plugin reads it: the paths one per line.
+        let listed = sql(
+            h,
+            "SELECT osid, array_to_string(osignored, chr(10)) AS osignored FROM logs WHERE osignored IS NOT NULL",
+        );
+        assert_eq!(
+            listed,
+            json!([{"osid": "a", "osignored": "status\ngeo"}]),
+            "{listed}"
+        );
+        close(h);
+    }
+
+    #[test]
+    fn an_ignored_field_covers_its_own_path_and_those_under_it() {
+        assert!(is_at_or_under("geo", "geo"));
+        assert!(is_at_or_under("geo.lat", "geo"));
+        assert!(!is_at_or_under("geography", "geo"));
+        assert!(!is_at_or_under("a.geo", "geo"));
+        assert_eq!(ignored_paths("a\n\nb\na"), vec!["a", "b"]);
+        assert!(ignored_paths("").is_empty());
     }
 
     /// A field named like a reserved column the mapping does not declare is
@@ -6130,7 +7838,7 @@ mod tests {
                     .iter()
                     .map(|(id, src)| {
                         let mut flat =
-                            conform_doc(src, &schema, &conn.kept("bench"), &[], None).unwrap();
+                            conform_doc(src, &schema, &conn.kept("bench"), &[], None, &[]).unwrap();
                         flat.insert(OSID.into(), Value::String(id.clone()));
                         flat.insert(SOURCE.into(), Value::String(src.clone()));
                         flat
@@ -6181,6 +7889,7 @@ mod tests {
                 buf.len(),
                 id_ends.as_ptr(),
                 src_ends.as_ptr(),
+                ptr::null(),
                 docs.len() as c_int,
             )
         };
@@ -6190,6 +7899,83 @@ mod tests {
 
     fn append_replacing(h: *mut Bridge, p: *mut Prepared, replaced: &[&str]) -> Value {
         append_with_seqs(h, &[p], replaced, &[])
+    }
+
+    /// A prepared batch names the rows that do not conform, and the same
+    /// rows sent again with the mapper's values conform: the columns hold
+    /// those values, the id lookup answers the source as it was sent, and
+    /// the check of one document reaches the same verdicts.
+    #[test]
+    fn a_refused_row_conforms_with_the_mapper_s_values() {
+        let h = open_logs();
+        let out = ensure(
+            h,
+            r#"{"properties":{"t":{"type":"date","format":"dd/MMM/yyyy:HH:mm:ss Z"}}}"#,
+        );
+        assert!(!out.contains("error"), "{out}");
+        let plain = r#"{"level":"info","status":1}"#;
+        let odd = r#"{"status":200.7,"t":"25/Nov/2026:09:30:00 +0100"}"#;
+        let values = r#"{"status":[200],"t":[1795595400000]}"#;
+        let framed = format!("{odd}{MAPPED_VALUES}{values}");
+
+        assert!(!check(h, odd).is_empty());
+        assert_eq!(check(h, &framed), "");
+
+        let p = prepared(h, &[("a", plain), ("b", odd)]);
+        let failed: Value =
+            serde_json::from_str(&take(unsafe { infino_prepared_failed(p) })).unwrap();
+        let failed = failed.as_array().unwrap();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0]["i"], 1);
+        assert!(
+            failed[0]["reason"].as_str().unwrap().starts_with("field ["),
+            "{failed:?}"
+        );
+        unsafe { infino_free_prepared(p) };
+        assert!(unsafe { infino_prepared_failed(ptr::null()) }.is_null());
+
+        let p = prepared(h, &[("a", plain), ("b", &framed)]);
+        assert_eq!(take(unsafe { infino_prepared_failed(p) }), "[]");
+        let out = append_replacing(h, p, &[]);
+        assert_eq!(out["ok"], 2, "{out}");
+        assert_eq!(get(h, "b"), odd);
+        let at = sql(
+            h,
+            r#"SELECT count(*) AS c FROM "logs" WHERE status = 200 AND t = to_timestamp_millis(1795595400000)"#,
+        );
+        assert_eq!(at[0]["c"], 1, "{at}");
+
+        // The batch path of one call stores the source as it was sent too.
+        assert_eq!(index(h, &[("c", &framed)])["ok"], 1);
+        assert_eq!(get(h, "c"), odd);
+        close(h);
+    }
+
+    /// The mapper's values stand in for the source's only where the source
+    /// gives as many: values it read from elsewhere too (a `copy_to`), or
+    /// in place of a null (a `null_value`), leave the source's as they are.
+    #[test]
+    fn the_mapper_s_values_stand_in_only_where_the_source_gives_as_many() {
+        let h = open_logs();
+        let out = ensure(h, r#"{"properties":{"n":{"type":"long"}}}"#);
+        assert!(!out.contains("error"), "{out}");
+        // One value read where the source gives one: the mapper's is held.
+        let one = format!(r#"{{"n":2.5}}{MAPPED_VALUES}{{"n":[2]}}"#);
+        assert_eq!(check(h, &one), "");
+        // Two read where the source gives one: the source's stands, and is refused as it is.
+        let more = format!(r#"{{"n":2.5}}{MAPPED_VALUES}{{"n":[2,7]}}"#);
+        assert!(!check(h, &more).is_empty());
+        // As many as the source gives, an array of arrays counted at any depth.
+        let nested = format!(r#"{{"n":[[1.5,null],[2.5]]}}{MAPPED_VALUES}{{"n":[1,2]}}"#);
+        assert_eq!(check(h, &nested), "");
+        // The mapper read a value where the source gives none: nothing to stand in for.
+        let none = format!(r#"{{"n":null,"level":"x"}}{MAPPED_VALUES}{{"n":[0]}}"#);
+        assert_eq!(check(h, &none), "");
+        let given = |v: Value| given_values(&v);
+        assert_eq!(given(json!(null)), 0);
+        assert_eq!(given(json!([null, 1, [2, null, [3]]])), 3);
+        assert_eq!(given(json!("x")), 1);
+        close(h);
     }
 
     #[test]
@@ -6479,10 +8265,9 @@ mod tests {
     /// One id's document as `infino_get_doc` returns it; Null when it is absent.
     fn get_doc(h: *mut Bridge, id: &str) -> Value {
         let out = take(unsafe { infino_get_doc(h, c("logs").as_ptr(), c(id).as_ptr()) });
-        if out.is_empty() {
-            return Value::Null;
-        }
-        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+        let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert!(v.get("doc").is_some(), "{out}");
+        v["doc"].clone()
     }
 
     /// A field a document gives several values keeps them in its list column,
@@ -6552,6 +8337,145 @@ mod tests {
         let hits = sql(h, r#"SELECT osid FROM logs WHERE array_has("n[]", 2)"#);
         assert_eq!(hits, json!([{ "osid": "m1" }]), "{hits}");
         close(h);
+    }
+
+    /// The hosted service in front of a typed schema refusal: a 400 whose
+    /// body is the engine's error under the operation's name.
+    fn hosted(typed: SchemaError) -> InfinoError {
+        InfinoError::Backend(format!(
+            "append: server returned 400: append error: {}",
+            InfinoError::Schema(typed)
+        ))
+    }
+
+    /// The hosted service answers a schema refusal untyped; it is read as
+    /// the local engine's typed refusal is: a value the column cannot hold
+    /// is a refusal of the row's content, while a schema that changed under
+    /// the write, a column still converting and the field cap are for a
+    /// later try, and the field cap is told apart.
+    #[test]
+    fn a_hosted_schema_refusal_is_read_as_the_local_one() {
+        let cases = [
+            SchemaError::TypeMismatch {
+                column: "tags".into(),
+                frozen: DataType::LargeUtf8,
+                offered: DataType::List(std::sync::Arc::new(Field::new(
+                    "item",
+                    DataType::LargeUtf8,
+                    true,
+                ))),
+            },
+            SchemaError::NestedArray { path: "a.b".into() },
+            SchemaError::PathShadowsColumn {
+                path: "rec.n".into(),
+                column: "rec".into(),
+            },
+            SchemaError::SchemaConflict {
+                expected: 3,
+                current: 4,
+            },
+            SchemaError::ConversionInProgress { column: "n".into() },
+            SchemaError::FieldCapExceeded {
+                cap: 10,
+                current: 10,
+                fields: vec!["x".into()],
+            },
+        ];
+        for typed in cases {
+            let local = InfinoError::Schema(typed.clone());
+            let remote = hosted(typed);
+            assert_eq!(
+                refuses_content(&remote),
+                refuses_content(&local),
+                "{remote}"
+            );
+            assert_eq!(over_field_cap(&remote), over_field_cap(&local), "{remote}");
+            assert_eq!(
+                counts_may_explain(&remote),
+                counts_may_explain(&local),
+                "{remote}"
+            );
+        }
+        // What the service answered for an array into a string column.
+        let seen = InfinoError::Backend(
+            "append: server returned 400: append error: schema: column `tags` is `LargeUtf8` \
+             but the batch carries `List(LargeUtf8)`; apply the schema with the column's type \
+             changed to store it"
+                .into(),
+        );
+        assert!(refuses_content(&seen));
+        // A name from the document that repeats a retryable message's words
+        // leaves the refusal what its shape says it is.
+        for named in [
+            "a; re-read it and resubmit",
+            "x` is still converting; run optimize before changing its type again",
+            "y would take the table over its cap of 1 fields",
+        ] {
+            let remote = hosted(SchemaError::TypeMismatch {
+                column: named.into(),
+                frozen: DataType::LargeUtf8,
+                offered: DataType::Int64,
+            });
+            assert!(refuses_content(&remote), "{remote}");
+            assert!(!over_field_cap(&remote), "{remote}");
+        }
+        let capped = hosted(SchemaError::FieldCapExceeded {
+            cap: 1,
+            current: 1,
+            fields: vec!["a; re-read it and resubmit`".into()],
+        });
+        assert!(!refuses_content(&capped), "{capped}");
+        assert!(over_field_cap(&capped), "{capped}");
+        // Not a schema refusal, or not a 400: a later try may pass.
+        for other in [
+            "update: server returned 400: mutation error: cardinality: update: cardinality \
+             mismatch: predicate matched 72 rows; new_rows has 64",
+            "append: server returned 500: append error: schema: column `tags` is `LargeUtf8`",
+            "append: server returned 503: upstream unavailable",
+            "update: server returned 400: mutation error: query: no row under osid 'k error: \
+             schema: column `x` is `Int64` but the batch carries `LargeUtf8`; apply the schema \
+             with the column's type changed to store it'",
+        ] {
+            let e = InfinoError::Backend(other.into());
+            assert!(!refuses_content(&e), "{e}");
+            assert!(!over_field_cap(&e), "{e}");
+        }
+    }
+
+    /// One document the hosted service refuses for its content stands
+    /// alone, reported permanent, and the rest of its append is written.
+    #[test]
+    fn a_document_the_hosted_service_refuses_is_isolated_and_permanent() {
+        let rows: Vec<(usize, Value)> = vec![
+            (0, json!({"osid": "1", "tags": "x"})),
+            (1, json!({"osid": "2", "tags": ["x", "y"]})),
+            (2, json!({"osid": "3", "tags": "z"})),
+            (3, json!({"osid": "4", "tags": "w"})),
+        ];
+        let written = std::cell::RefCell::new(Vec::new());
+        let mut failed = Vec::new();
+        write_checked(&rows, &mut failed, &|values| {
+            if values.iter().any(|v| v["tags"].is_array()) {
+                return Err(InfinoError::Backend(
+                    "append: server returned 400: append error: schema: column `tags` is \
+                     `LargeUtf8` but the batch carries `List(LargeUtf8)`; apply the schema with \
+                     the column's type changed to store it"
+                        .into(),
+                ));
+            }
+            written.borrow_mut().extend(
+                values
+                    .iter()
+                    .map(|v| v["osid"].as_str().unwrap().to_string()),
+            );
+            Ok(())
+        });
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0]["i"], 1);
+        assert_eq!(failed[0]["permanent"], true);
+        let mut written = written.into_inner();
+        written.sort();
+        assert_eq!(written, ["1", "3", "4"]);
     }
 
     /// An `unsigned_long` past the largest signed 64-bit integer, and a
@@ -6833,6 +8757,474 @@ mod tests {
         close(h);
     }
 
+    /// Ids are cut into runs whose cost fits the budget, in order and with
+    /// none left out; an id past the budget alone is a run of its own.
+    #[test]
+    fn ids_are_cut_into_runs_that_fit_the_budget() {
+        let ids: Vec<String> = (0..10).map(|i| format!("id-{i}")).collect();
+        let per = id_cost("id-0");
+        let runs = id_runs(&ids, 3 * per);
+        assert_eq!(
+            runs.iter().map(|r| r.len()).collect::<Vec<_>>(),
+            vec![3, 3, 3, 1]
+        );
+        assert_eq!(runs.concat(), ids);
+        assert_eq!(id_runs(&ids, usize::MAX).len(), 1);
+        let long = vec!["x".repeat(1000), "y".to_string()];
+        assert_eq!(id_runs(&long, 10).len(), 2);
+        assert!(id_runs::<String>(&[], 10).is_empty());
+    }
+
+    /// A transport error names the whole request URL, whose query holds
+    /// every id of the write. The reason a document is reported with leaves
+    /// the query out and stays short, however many ids the write named; a
+    /// short reason is kept as it is.
+    #[test]
+    fn a_refused_write_s_reason_leaves_out_the_url_query_and_stays_short() {
+        let ids: Vec<String> = (0..5_000).map(|i| format!("%27doc-{i:06}%27")).collect();
+        let url = format!(
+            "https://api.example.test/v1/update/db?table=os_t&predicate=osid+IN+%28{}%29",
+            ids.join("%2C+")
+        );
+        let e = InfinoError::Backend(format!(
+            "update: transport error: {url}: Connection Failed: Broken pipe (os error 32)"
+        ));
+        let reason = short_reason(format_args!("replace: {e}"));
+        assert!(
+            reason.len() <= REASON_MAX_BYTES + 64,
+            "{} bytes",
+            reason.len()
+        );
+        assert!(!reason.contains("predicate="), "{reason}");
+        assert!(
+            reason.contains("https://api.example.test/v1/update/db?<query left out>:"),
+            "{reason}"
+        );
+        assert!(reason.contains("Broken pipe"), "{reason}");
+        let plain = "replace: backend: update: server returned 413: ";
+        assert_eq!(short_reason(plain), plain);
+        // A long reason with no URL is cut on a character boundary.
+        let wide = "é".repeat(2 * REASON_MAX_BYTES);
+        let cut = short_reason(&wide);
+        assert!(
+            cut.len() <= REASON_MAX_BYTES + 64 && cut.ends_with("bytes left out)"),
+            "{cut}"
+        );
+    }
+
+    /// Only a 413 is a refusal for size: a transport error, which an outage
+    /// gives too, is not split on.
+    #[test]
+    fn only_a_413_is_a_refusal_for_size() {
+        assert!(refused_for_size(&InfinoError::Backend(
+            "update: server returned 413: ".into()
+        )));
+        assert!(!refused_for_size(&InfinoError::Backend(
+            "update: transport error: https://h/v1/update/db?x: Connection Failed".into()
+        )));
+        assert!(!refused_for_size(&InfinoError::Backend(
+            "update: server returned 400: x".into()
+        )));
+    }
+
+    /// A replace of more ids than one call may name goes a run at a time,
+    /// and every document lands; so do documents whose ids hold several rows,
+    /// which are deleted and appended a run at a time.
+    #[test]
+    fn a_replace_of_more_ids_than_one_call_names_lands_a_run_at_a_time() {
+        let h = open_logs();
+        let docs: Vec<(String, String)> = (0..40)
+            .map(|i| {
+                (
+                    format!("d{i:02}"),
+                    format!(r#"{{"level":"info","message":"old {i}"}}"#),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let out = index(h, &refs);
+        assert_eq!(out["ok"], 40, "{out}");
+        let conn = bridge_ref(h).expect("bridge");
+        let table = conn.table("logs").expect("table");
+        let gate = Gate::default();
+        // Four ids per call: ten runs.
+        let budget = 4 * id_cost("d00");
+        let ids: Vec<String> = (0..40).map(|i| format!("d{i:02}")).collect();
+        assert_eq!(id_runs(&ids, budget).len(), 10);
+        let rows: Vec<(usize, Value)> = (0..40)
+            .map(|i| (i, json!({ OSID: format!("d{i:02}"), "level": "warn", "message": format!("new {i}") })))
+            .collect();
+        let mut failed = Vec::new();
+        assert!(replace_rows_checked(&table, &gate, &rows, &mut failed, budget).is_ok());
+        assert!(failed.is_empty(), "{failed:?}");
+        let rows_now = sql(h, "SELECT COUNT(*) AS c FROM logs");
+        assert_eq!(rows_now[0]["c"], 40, "{rows_now}");
+        let replaced = sql(h, "SELECT COUNT(*) AS c FROM logs WHERE level = 'warn'");
+        assert_eq!(replaced[0]["c"], 40, "{replaced}");
+
+        // Ids holding two rows each: the replace miscounts, and the rows are
+        // rewritten (deleted, then appended) a run at a time.
+        let twice: Vec<Value> = (0..12)
+            .flat_map(|i| {
+                let id = format!("t{i:02}");
+                [
+                    json!({ OSID: id.clone(), "level": "a" }),
+                    json!({ OSID: id, "level": "b" }),
+                ]
+            })
+            .collect();
+        table.append_rows(&twice).expect("append twice");
+        let ids: Vec<String> = (0..12).map(|i| format!("t{i:02}")).collect();
+        assert_eq!(id_runs(&ids, budget).len(), 3);
+        let rows: Vec<(usize, Value)> = (0..12)
+            .map(|i| (i, json!({ OSID: format!("t{i:02}"), "level": "one" })))
+            .collect();
+        let mut failed = Vec::new();
+        assert!(replace_rows_checked(&table, &gate, &rows, &mut failed, budget).is_ok());
+        assert!(failed.is_empty(), "{failed:?}");
+        let ones = sql(h, "SELECT COUNT(*) AS c FROM logs WHERE osid LIKE 't%'");
+        assert_eq!(ones[0]["c"], 12, "{ones}");
+        let ones = sql(h, "SELECT COUNT(*) AS c FROM logs WHERE level = 'one'");
+        assert_eq!(ones[0]["c"], 12, "{ones}");
+        close(h);
+    }
+
+    /// A replace through prepared batches whose replaced ids are more than
+    /// one call may name skips the one Arrow update and replaces a run at a
+    /// time: every document lands over storage of the bridge's own, and the
+    /// hosted service takes one update per run, never one naming every id.
+    #[test]
+    fn a_prepared_replace_of_more_ids_than_one_call_names_goes_a_run_at_a_time() {
+        let h = open_logs();
+        let old: Vec<(String, String)> = (0..FAKE_ROWS)
+            .map(|i| (fake_id(i), r#"{"level":"info"}"#.to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = old.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        assert_eq!(
+            index(h, &refs)["ok"],
+            FAKE_ROWS,
+            "every document lands first"
+        );
+        let new: Vec<(String, String)> = (0..FAKE_ROWS)
+            .map(|i| {
+                (
+                    fake_id(i),
+                    format!(r#"{{"level":"warn","message":"new {i}"}}"#),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = new.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let ids: Vec<String> = (0..FAKE_ROWS).map(fake_id).collect();
+        let budget = FAKE_IDS_PER_RUN * id_cost(&fake_id(0));
+        let runs = id_runs(&ids, budget).len();
+        assert!(runs > 1, "{runs} runs");
+        let take_prepared = || *unsafe { Box::from_raw(prepared(h, &refs)) };
+
+        let conn = bridge_ref(h).expect("bridge");
+        let table = conn.table("logs").expect("table");
+        let failed = append_prepared(
+            &table,
+            &Gate::default(),
+            vec![take_prepared()],
+            &ids,
+            &[],
+            budget,
+        );
+        assert!(failed.is_empty(), "{failed:?}");
+        let count = sql(h, "SELECT COUNT(*) AS c FROM logs");
+        assert_eq!(count[0]["c"], FAKE_ROWS, "{count}");
+        let warn = sql(h, "SELECT COUNT(*) AS c FROM logs WHERE level = 'warn'");
+        assert_eq!(warn[0]["c"], FAKE_ROWS, "{warn}");
+
+        let (hosted, calls) = fake_hosted(Answer::Lands, usize::MAX);
+        let failed = append_prepared(
+            &hosted,
+            &Gate::default(),
+            vec![take_prepared()],
+            &ids,
+            &[],
+            budget,
+        );
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(ops(&calls), vec!["update"; runs]);
+        close(h);
+    }
+
+    /// Only a refusal of the rows a call carried lets the calls after it
+    /// go on: of content, a miscount, a size, as the local engine types them
+    /// or the hosted service answers them. A transport error, a 5xx, a key
+    /// refused or any other failure stops them.
+    #[test]
+    fn only_a_refusal_of_a_call_s_own_rows_lets_the_calls_after_it_go_on() {
+        let goes_on = [
+            InfinoError::Cardinality("2 rows for 1 match".into()),
+            InfinoError::Backend("update: server returned 400: update error: x".into()),
+            InfinoError::Backend("update: server returned 413: ".into()),
+        ];
+        for e in &goes_on {
+            assert!(!stops_the_rest(e), "{e}");
+        }
+        let stops = [
+            InfinoError::Backend(
+                "update: transport error: http://h/v1/update/db?x: Connection Failed: timed out"
+                    .into(),
+            ),
+            InfinoError::Backend("update: server returned 503: unavailable".into()),
+            InfinoError::Backend("update: server returned 500: server returned 400".into()),
+            InfinoError::Backend("delete: server returned 403: the key was refused".into()),
+            InfinoError::Io("store unreachable".into()),
+        ];
+        for e in &stops {
+            assert!(stops_the_rest(e), "{e}");
+        }
+    }
+
+    /// A replace whose run the hosted service fails for a reason not about
+    /// its rows (a 5xx, or a connection that closes unanswered, as one does
+    /// past a timeout) stops there: one call in all, no count of rows, and
+    /// every document reported for a later try, where going on would cost
+    /// two calls a run.
+    #[test]
+    fn a_replace_stops_at_the_first_run_the_service_fails() {
+        let rows = fake_rows();
+        let budget = FAKE_IDS_PER_RUN * id_cost(&fake_id(0));
+        for answer in [Answer::Status(STATUS_UNAVAILABLE), Answer::Hangup] {
+            let (table, calls) = fake_hosted(answer, usize::MAX);
+            let mut failed = Vec::new();
+            let stopped =
+                replace_rows_checked(&table, &Gate::default(), &rows, &mut failed, budget);
+            assert!(stopped.is_err(), "{failed:?}");
+            assert_eq!(ops(&calls), vec!["update"]);
+            assert_all_not_taken(&failed);
+        }
+    }
+
+    /// The same for a rewrite: after the hosted service fails one run's
+    /// delete, no later run is deleted or appended.
+    #[test]
+    fn a_rewrite_stops_at_the_first_delete_the_service_fails() {
+        let rows = fake_rows();
+        let budget = FAKE_IDS_PER_RUN * id_cost(&fake_id(0));
+        let (table, calls) = fake_hosted(Answer::Status(STATUS_UNAVAILABLE), usize::MAX);
+        let mut failed = Vec::new();
+        assert!(rewrite_rows(&table, &Gate::default(), &rows, &mut failed, budget).is_err());
+        assert_eq!(ops(&calls), vec!["delete"]);
+        assert_all_not_taken(&failed);
+    }
+
+    /// Over the hosted service, a replace of more ids than
+    /// [`HOSTED_ID_LIST_BYTES`] names one run of them per call, each URL
+    /// within that budget (so [`id_cost`] is an upper bound, quotes inside
+    /// an id included), and the service refuses none for its size. A replace
+    /// it does refuse with 413 is split in halves, which land.
+    #[test]
+    fn a_hosted_replace_names_one_run_of_ids_per_call_and_splits_on_a_413() {
+        let ids: Vec<String> = (0..LONG_ROWS)
+            .map(|i| {
+                let quote = if i % 2 == 0 { "'" } else { " " };
+                format!("{i:04}{quote}{}", "x".repeat(LONG_ID_BYTES))
+            })
+            .collect();
+        let rows: Vec<(usize, Value)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (i, json!({ OSID: id, "level": "warn" })))
+            .collect();
+        let runs = id_runs(&ids, HOSTED_ID_LIST_BYTES).len();
+        assert!(runs > 1, "{runs} runs");
+        let limit = HOSTED_ID_LIST_BYTES + URL_HEAD_BYTES;
+        let (table, calls) = fake_hosted(Answer::Lands, limit);
+        let mut failed = Vec::new();
+        assert!(replace_rows_checked(
+            &table,
+            &Gate::default(),
+            &rows,
+            &mut failed,
+            HOSTED_ID_LIST_BYTES
+        )
+        .is_ok());
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(ops(&calls), vec!["update"; runs]);
+        let longest = calls.lock().unwrap().iter().map(|(_, len)| *len).max();
+        assert!(longest.is_some_and(|len| len <= limit), "{longest:?}");
+
+        // One call naming a run's ids, then the same call to a service that
+        // refuses anything that long: it goes in halves.
+        let run = &rows[..rows.len() / runs];
+        let (table, calls) = fake_hosted(Answer::Lands, usize::MAX);
+        let mut failed = Vec::new();
+        assert!(
+            replace_rows_checked(&table, &Gate::default(), run, &mut failed, usize::MAX).is_ok()
+        );
+        let whole = calls.lock().unwrap()[0].1;
+        let (table, calls) = fake_hosted(Answer::Lands, whole - 1);
+        assert!(
+            replace_rows_checked(&table, &Gate::default(), run, &mut failed, usize::MAX).is_ok()
+        );
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(ops(&calls), vec!["update"; 3]);
+    }
+
+    /// Rows a fake hosted service's tests replace.
+    const FAKE_ROWS: usize = 12;
+    /// Ids of [`fake_id`]'s length one call names in those tests.
+    const FAKE_IDS_PER_RUN: usize = 4;
+    /// Rows of ids long enough that a replace of them is past one call's list.
+    const LONG_ROWS: usize = 400;
+    /// The filler that makes each of those ids long.
+    const LONG_ID_BYTES: usize = 40;
+    /// What a hosted request's target holds besides the predicate's ids: its
+    /// path, the table, the predicate's column and parentheses.
+    const URL_HEAD_BYTES: usize = 256;
+    /// HTTP status of a service that cannot serve the call now.
+    const STATUS_UNAVAILABLE: u16 = 503;
+    /// The table a fake hosted service serves.
+    const FAKE_TABLE: &str = "t";
+    /// The key a test connects to a fake hosted service with.
+    const FAKE_KEY: &str = "ik_test";
+    /// The bytes that end an HTTP request's head.
+    const HEAD_END: &[u8] = b"\r\n\r\n";
+    /// How many bytes a fake hosted service reads at a time.
+    const READ_CHUNK: usize = 8 * 1024;
+
+    /// The `i`th id of a fake hosted service's tests, all of one length.
+    fn fake_id(i: usize) -> String {
+        format!("doc-{i:03}")
+    }
+
+    /// [`FAKE_ROWS`] documents replacing the rows of [`fake_id`]s.
+    fn fake_rows() -> Vec<(usize, Value)> {
+        (0..FAKE_ROWS)
+            .map(|i| (i, json!({ OSID: fake_id(i), "level": "warn" })))
+            .collect()
+    }
+
+    /// Every one of [`FAKE_ROWS`] documents is reported once, for a later try.
+    fn assert_all_not_taken(failed: &[Value]) {
+        let mut seen: Vec<u64> = failed.iter().filter_map(|f| f["i"].as_u64()).collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..FAKE_ROWS as u64).collect::<Vec<_>>(),
+            "{failed:?}"
+        );
+        assert!(failed.iter().all(|f| f["permanent"] == false), "{failed:?}");
+    }
+
+    /// What a fake hosted service answers an update or a delete with.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// The mutation lands.
+        Lands,
+        /// The service fails it with this status.
+        Status(u16),
+        /// The connection closes with no answer, as a service that went away.
+        Hangup,
+    }
+
+    /// The calls a fake hosted service took, as each one's operation and the
+    /// length of its request target (its path and query).
+    type Calls = Arc<Mutex<Vec<(String, usize)>>>;
+
+    /// The operation of each call in `calls`, in order.
+    fn ops(calls: &Calls) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(op, _)| op.clone())
+            .collect()
+    }
+
+    /// A fake hosted service on a local port serving one table: it answers
+    /// `list_tables` and `schema`, every `update` and `delete` with `answer`,
+    /// or with 413 when its request target is longer than `max_target`, and
+    /// anything else with 404. Returns the table, opened through the
+    /// engine's hosted client, and the calls taken after it opened.
+    fn fake_hosted(answer: Answer, max_target: usize) -> (Supertable, Calls) {
+        let schema = Schema::new(vec![
+            Field::new(OSID, DataType::Utf8, true),
+            Field::new("level", DataType::Utf8, true),
+            Field::new("message", DataType::Utf8, true),
+        ]);
+        let mut ipc = Vec::new();
+        StreamWriter::try_new(&mut ipc, &schema)
+            .and_then(|mut w| w.finish())
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/db", listener.local_addr().unwrap());
+        let calls: Calls = Arc::default();
+        let log = Arc::clone(&calls);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let Some(target) = read_request(&mut stream) else {
+                    continue;
+                };
+                let op = target
+                    .trim_start_matches("/v1/")
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                log.lock().unwrap().push((op.clone(), target.len()));
+                let lands = json!({ "matched": 0, "n_tombstoned": 0, "n_not_found": 0 });
+                let (status, body) = match op.as_str() {
+                    "list_tables" => (200, json!([FAKE_TABLE]).to_string().into_bytes()),
+                    "schema" => (200, ipc.clone()),
+                    "update" | "delete" if target.len() > max_target => {
+                        (STATUS_PAYLOAD_TOO_LARGE, b"too large".to_vec())
+                    }
+                    "update" | "delete" => match answer {
+                        Answer::Lands => (200, lands.to_string().into_bytes()),
+                        Answer::Status(code) => (code, b"failing".to_vec()),
+                        Answer::Hangup => continue,
+                    },
+                    _ => (STATUS_NOT_FOUND, Vec::new()),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream
+                    .write_all(head.as_bytes())
+                    .and_then(|()| stream.write_all(&body));
+            }
+        });
+        let conn = connect_with(&uri, ConnectOptions::new().with_api_key(FAKE_KEY)).unwrap();
+        let table = conn.open_table(FAKE_TABLE).unwrap();
+        calls.lock().unwrap().clear();
+        (table, calls)
+    }
+
+    /// Read one HTTP request off `stream`, its body included, and return its
+    /// target; None when the stream ends first.
+    fn read_request(stream: &mut TcpStream) -> Option<String> {
+        let mut got = Vec::new();
+        let mut buf = [0u8; READ_CHUNK];
+        let head_end = loop {
+            if let Some(at) = got.windows(HEAD_END.len()).position(|w| w == HEAD_END) {
+                break at + HEAD_END.len();
+            }
+            let n = stream.read(&mut buf).ok().filter(|&n| n > 0)?;
+            got.extend_from_slice(&buf[..n]);
+        };
+        let head = String::from_utf8_lossy(&got[..head_end]).to_string();
+        let length: usize = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse().ok())
+            .unwrap_or(0);
+        let mut body = got.len() - head_end;
+        while body < length {
+            body += stream.read(&mut buf).ok().filter(|&n| n > 0)?;
+        }
+        head.split_whitespace().nth(1).map(str::to_string)
+    }
+
     /// A whole write (a replace, a delete, a schema change) waits for the
     /// appends passing the gate, and an append that arrives while it waits
     /// or passes waits for it in turn.
@@ -6968,6 +9360,240 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// A node taking a shard over reads the rows the node before it
+    /// committed through `infino_sql_latest` and `infino_get_latest` at
+    /// once, where `infino_sql` and `infino_get` may still answer from the
+    /// commit they last read: the probe that keeps a replayed operation from
+    /// appending its row again, and the document an update merges into. The
+    /// reading node shares its cache directory with that connection.
+    #[test]
+    fn a_latest_read_sees_another_nodes_commit_at_once() {
+        let root = std::env::temp_dir().join(format!(
+            "infino-capi-latest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let uri = c(&format!("file://{}", data.display()));
+        let cache_dir = c(&root.join("cache").display().to_string());
+
+        let writer = unsafe { infino_open(uri.as_ptr()) };
+        assert!(!writer.is_null());
+        assert!(ensure(writer, MAPPING).contains("\"created\":true"));
+        index(writer, &[("a", r#"{"level":"info"}"#)]);
+
+        let reader = unsafe { infino_open_with(uri.as_ptr(), ptr::null(), cache_dir.as_ptr()) };
+        assert!(!reader.is_null());
+        let count = "SELECT count(*) AS n FROM logs";
+        let probe = "SELECT osid FROM token_match('logs', 'osid', 'b', 'or')";
+        let latest = |q: &str| -> Value {
+            let out = take(unsafe { infino_sql_latest(reader, c(q).as_ptr()) });
+            serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+        };
+        // Taken before the read, so the window it measures starts no later
+        // than the one the reader's connection opens when it reads.
+        let read_at = Instant::now();
+        assert_eq!(sql(reader, count)[0]["n"], 1);
+
+        index(writer, &[("b", r#"{"level":"warn"}"#)]);
+        let stale = sql(reader, count)[0]["n"].clone();
+        let get = |id: &str| get_from(reader, "logs", id);
+        let get_latest = |id: &str| {
+            take(unsafe { infino_get_latest(reader, c("logs").as_ptr(), c(id).as_ptr()) })
+        };
+        let stale_get = get("b");
+        // Within the engine's default window of the reader's last read, the
+        // reader's own connection still answers from the first commit: what
+        // makes the latest reads below more than reads like any other.
+        if read_at.elapsed() < Duration::from_millis(900) {
+            assert_eq!(
+                stale, 1,
+                "the default read answers from the commit it last read"
+            );
+            assert_eq!(
+                stale_get, "",
+                "the default get answers from the commit it last read"
+            );
+        }
+        let cached = bytes_under(&root.join("cache"));
+        assert_eq!(latest(count)[0]["n"], 2);
+        assert_eq!(latest(probe), json!([{ "osid": "b" }]));
+        let found: Value = serde_json::from_str(&get_latest("b")).unwrap();
+        assert_eq!(
+            found,
+            json!({ "level": "warn" }),
+            "the latest get finds the new id"
+        );
+        assert_eq!(get_latest("c"), "", "an id the table does not hold is \"\"");
+        let docs: Value = serde_json::from_str(&docs_latest(reader, &["a", "b", "c"])).unwrap();
+        let source: Value =
+            serde_json::from_str(docs["docs"]["b"]["source"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            source,
+            json!({ "level": "warn" }),
+            "the latest realtime get finds the new id with its source"
+        );
+        assert!(
+            docs["docs"]["b"]["seq"].is_i64(),
+            "and the sequence number it was written under: {docs}"
+        );
+        assert!(
+            docs["docs"]["a"].is_object(),
+            "and the id of the first commit: {docs}"
+        );
+        assert!(
+            docs["docs"].get("c").is_none(),
+            "an id the table does not hold is absent: {docs}"
+        );
+        // Only the latest connection has read the second commit, when the
+        // reader's own read was stale; the blocks it read land in the cache.
+        if stale == 1 {
+            assert!(
+                bytes_under(&root.join("cache")) > cached,
+                "the latest read went through the node's cache directory"
+            );
+        }
+
+        close(reader);
+        close(writer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A latest read of a table dropped and made again under its name reads
+    /// the table made again, whether the drop was this node's or another's:
+    /// the first write to a recreated index probes it before it holds a row.
+    #[test]
+    fn a_latest_read_finds_a_table_made_again_after_a_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "infino-capi-latest-drop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let uri = c(&format!("file://{}", data.display()));
+        let cache_dir = c(&root.join("cache").display().to_string());
+        let open = || unsafe { infino_open_with(uri.as_ptr(), ptr::null(), cache_dir.as_ptr()) };
+        let sql = |h: *mut Bridge, q: &str| -> Value {
+            let out = take(unsafe { infino_sql_latest(h, c(q).as_ptr()) });
+            serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+        };
+        let latest = |h: *mut Bridge| sql(h, "SELECT count(*) AS n FROM logs");
+        // The probe for ids a write may replace reads through a search.
+        let probe = |h: *mut Bridge| {
+            sql(
+                h,
+                "SELECT osid FROM token_match('logs', 'osid', 'a b', 'or')",
+            )
+        };
+        let node = open();
+        let other = open();
+        // Held, as a shard catching up holds them, so each keeps the handle
+        // it read the first table through.
+        unsafe {
+            infino_hold_latest(node);
+            infino_hold_latest(other);
+        }
+        assert!(ensure(node, MAPPING).contains("\"created\":true"));
+        index(node, &[("a", r#"{"level":"info"}"#)]);
+        assert_eq!(latest(node)[0]["n"], 1);
+        assert_eq!(latest(other)[0]["n"], 1);
+        assert_eq!(probe(other).as_array().map(Vec::len), Some(1));
+        assert!(latest_open(other), "a held connection stays open");
+
+        assert_eq!(unsafe { infino_drop(node, c("logs").as_ptr()) }, 0);
+        assert!(ensure(node, MAPPING).contains("\"created\":true"));
+        assert_eq!(latest(node)[0]["n"], 0, "this node's drop");
+        assert_eq!(latest(other)[0]["n"], 0, "another node's drop");
+        index(node, &[("b", r#"{"level":"info"}"#)]);
+        assert_eq!(latest(other)[0]["n"], 1);
+        // Dropped again: the other node's latest connection holds a handle
+        // to the table from before, which a search must not answer from.
+        assert_eq!(unsafe { infino_drop(node, c("logs").as_ptr()) }, 0);
+        assert!(ensure(node, MAPPING).contains("\"created\":true"));
+        index(node, &[("b", r#"{"level":"info"}"#)]);
+        assert_eq!(
+            probe(other)[0]["osid"],
+            "b",
+            "a search after another node's drop"
+        );
+
+        unsafe {
+            infino_release_latest(other);
+            infino_release_latest(node);
+        }
+        close(other);
+        close(node);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whether `h`'s latest connection is open.
+    fn latest_open(h: *mut Bridge) -> bool {
+        unsafe { &*h }
+            .latest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// The latest connection stays open while a reader holds it and closes
+    /// when the last hold goes, so a node keeps its second handle to a table
+    /// only while a shard catches up; a read no one holds for closes it.
+    #[test]
+    fn the_latest_connection_closes_when_no_reader_holds_it() {
+        let root = std::env::temp_dir().join(format!(
+            "infino-capi-latest-hold-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let uri = c(&format!("file://{}", data.display()));
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        assert!(ensure(h, MAPPING).contains("\"created\":true"));
+        index(h, &[("a", r#"{"level":"info"}"#)]);
+        let read = || {
+            let out =
+                take(unsafe { infino_sql_latest(h, c("SELECT count(*) AS n FROM logs").as_ptr()) });
+            let rows: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+            assert_eq!(rows[0]["n"], 1);
+        };
+        let get = || take(unsafe { infino_get_latest(h, c("logs").as_ptr(), c("a").as_ptr()) });
+
+        read();
+        assert!(!latest_open(h), "a read no one holds for closes it");
+        unsafe { infino_hold_latest(h) };
+        read();
+        assert!(latest_open(h));
+        unsafe { infino_hold_latest(h) };
+        unsafe { infino_release_latest(h) };
+        assert_eq!(get(), r#"{"level":"info"}"#);
+        assert!(latest_open(h), "open while one hold is left");
+        unsafe { infino_release_latest(h) };
+        assert!(!latest_open(h), "closed with the last hold");
+        // A release with no hold to let go counts nothing, so the next hold
+        // still keeps the connection open.
+        unsafe { infino_release_latest(h) };
+        unsafe { infino_hold_latest(h) };
+        read();
+        assert!(latest_open(h));
+        unsafe { infino_release_latest(h) };
+        assert!(!latest_open(h));
+
+        close(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A catalog reopened with a cache directory, as a node is after a
     /// restart, reads what its queries need through the cache: the bytes land
     /// there, and the answers are the ones the writing connection gave.
@@ -7047,6 +9673,145 @@ mod tests {
         assert!(unsafe { infino_open_error() }.is_null(), "read once");
     }
 
+    /// The startup check of a node's own storage answers "" for a directory
+    /// the node may write, and leaves nothing behind in it.
+    #[test]
+    fn the_storage_check_passes_a_writable_directory_and_leaves_it_as_it_was() {
+        let root = scratch_dir("infino-capi-check-ok");
+        let uri = c(&format!("file://{}", root.display()));
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        assert!(!h.is_null());
+        assert_eq!(
+            take(unsafe { infino_check_storage(h) }),
+            "",
+            "a usable directory"
+        );
+        let left: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "the probe file is deleted: {left:?}");
+        assert!(ensure(h, MAPPING).contains("\"created\":true"));
+        close(h);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A directory the node may read but not write passes a listing, so only
+    /// the write probe finds it; the failure is permanent, since it will not
+    /// pass on its own.
+    #[test]
+    fn the_storage_check_fails_a_read_only_directory_for_good() {
+        let root = scratch_dir("infino-capi-check-ro");
+        fs::set_permissions(&root, fs::Permissions::from_mode(READ_ONLY_DIR)).unwrap();
+        let uri = c(&format!("file://{}", root.display()));
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        assert!(!h.is_null());
+        let why = take(unsafe { infino_check_storage(h) });
+        close(h);
+        fs::set_permissions(&root, fs::Permissions::from_mode(WRITABLE_DIR)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let why: Value = serde_json::from_str(&why).unwrap_or_else(|_| panic!("{why:?}"));
+        let message = why["error"].as_str().unwrap_or_else(|| panic!("{why}"));
+        assert!(
+            message.to_lowercase().contains("permission denied"),
+            "names the cause: {message}"
+        );
+        assert!(
+            message.contains(&root.display().to_string()),
+            "names the directory: {message}"
+        );
+        assert_eq!(why["permanent"], true, "{why}");
+    }
+
+    /// A local root is read from a URI as the engine reads it: `file://`
+    /// and bare paths are local, the in-memory catalog and object stores
+    /// are not.
+    #[test]
+    fn a_local_root_is_read_from_the_uri_as_the_engine_reads_it() {
+        assert_eq!(
+            local_root("file:///data/infino"),
+            Some(PathBuf::from("/data/infino"))
+        );
+        assert_eq!(
+            local_root("/data/infino"),
+            Some(PathBuf::from("/data/infino"))
+        );
+        assert_eq!(local_root("./data"), Some(PathBuf::from("./data")));
+        for not_local in [
+            "memory://",
+            "memory:",
+            "memory",
+            "s3://b/p",
+            "gs://b",
+            "az://c/p",
+        ] {
+            assert_eq!(local_root(not_local), None, "{not_local}");
+        }
+    }
+
+    /// An `s3://` node whose instance metadata service accepts the
+    /// connection but never answers, as in Docker on EC2 at a hop limit of 1,
+    /// has no credentials: the check says so within its short wait, where
+    /// the store client would retry for minutes. One that answers at all,
+    /// even with an error status, lets the listing decide.
+    #[test]
+    fn an_instance_metadata_service_that_does_not_answer_means_no_credentials() {
+        let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", silent.local_addr().unwrap());
+        let started = Instant::now();
+        let failure = check_instance_metadata(&base, SHORT_WAIT).unwrap_err();
+        assert!(failure.reason.contains("no AWS credentials"), "{failure:?}");
+        assert!(!failure.permanent, "the service can come back: {failure:?}");
+        assert!(started.elapsed() < SHORT_WAIT * 3, "{:?}", started.elapsed());
+
+        let answering = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", answering.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = answering.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
+        });
+        assert!(check_instance_metadata(&base, SHORT_WAIT).is_ok());
+        server.join().unwrap();
+    }
+
+    /// Only a failure that will not pass on its own is permanent.
+    #[test]
+    fn only_a_refusal_of_the_local_root_is_permanent() {
+        assert!(lasts(ErrorKind::PermissionDenied));
+        assert!(lasts(ErrorKind::ReadOnlyFilesystem));
+        assert!(!lasts(ErrorKind::TimedOut));
+        assert!(!lasts(ErrorKind::Interrupted));
+    }
+
+    /// A new, empty directory under the system's temp directory.
+    fn scratch_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("{prefix}-{}-{stamp}", process::id()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// A URI that names no store the engine knows fails to open, with the
+    /// reason.
+    #[test]
+    fn a_uri_no_store_serves_fails_to_open_with_the_reason() {
+        let uri = c("nosuchscheme://bucket/prefix");
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        assert!(h.is_null());
+        let why: Value = serde_json::from_str(&take(unsafe { infino_open_error() })).unwrap();
+        assert!(
+            why["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{why}"
+        );
+    }
+
     /// A result's JSON is built up to the bound and no further, and within
     /// it is the same text as unbounded.
     #[test]
@@ -7110,8 +9875,8 @@ mod tests {
 
     /// Every form OpenSearch's default date format takes is read as the
     /// instant OpenSearch indexes it at, `2026-11-23T` (a day with an empty
-    /// time, as the sample flights write it) included; what it refuses is
-    /// left to the engine's parser.
+    /// time, as the sample flights write it) included; what it refuses fails
+    /// the document, rather than being left to the engine to read otherwise.
     #[test]
     fn a_date_is_read_as_opensearch_s_default_format_reads_it() {
         let cases = [
@@ -7152,10 +9917,10 @@ mod tests {
             conform(json!("2026-11-23T"), &date_type()).unwrap(),
             json!(1_795_392_000_000i64)
         );
-        // A form only the engine reads is left to it, as before.
+        // Any other form fails the document with OpenSearch's message.
         assert_eq!(
-            conform(json!("2026-11-23 10:30:15"), &date_type()).unwrap(),
-            json!("2026-11-23 10:30:15")
+            conform(json!("2026-11-23 10:30:15"), &date_type()),
+            Err("failed to parse date field [2026-11-23 10:30:15] with format [strict_date_optional_time||epoch_millis]".into())
         );
     }
 
@@ -7197,11 +9962,16 @@ mod tests {
             conform_date(json!(893966296000i64), &millis),
             Ok(json!(893_966_296_000i64))
         );
-        // A custom pattern's value is read as the default format's, as before.
+        // A value only a custom pattern reads fails here: the mapper reads
+        // it, and its value comes with the document.
         let custom = DateFormat::parse_all("yyyy-MM-dd HH:mm:ss||strict_date_optional_time");
         assert_eq!(
             conform_date(json!("2026-11-23 10:30:15"), &custom),
-            Ok(json!("2026-11-23 10:30:15"))
+            Err("failed to parse date field [2026-11-23 10:30:15] with format [yyyy-MM-dd HH:mm:ss||strict_date_optional_time]".into())
+        );
+        assert_eq!(
+            conform_date(json!("2026-11-23T10:30:15Z"), &custom),
+            Ok(json!(1_795_429_815_000i64))
         );
         // A custom pattern does not stop the forms after it: an
         // `epoch_second` listed after one still reads a number as seconds,
@@ -7306,7 +10076,7 @@ mod tests {
 
         let schema = Schema::new(vec![Field::new("message", DataType::LargeUtf8, true)]);
         let kept = HashMap::new();
-        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], Some("@timestamp"));
+        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], Some("@timestamp"), &[]);
         assert!(check(r#"{"@timestamp": "2023-01-01T00:00:01Z"}"#).is_ok());
         assert!(check(r#"{"@timestamp": ["2023-01-01T00:00:01Z", null]}"#).is_ok());
         for doc in [
@@ -7316,6 +10086,103 @@ mod tests {
         ] {
             assert_eq!(check(doc), Err(no_timestamp("@timestamp")), "{doc}");
         }
-        assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, &[], None).is_ok());
+        assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, &[], None, &[]).is_ok());
+    }
+
+    /// The mapper's values follow a document's source after the separator;
+    /// text after it that is no object of values leaves the text the source.
+    #[test]
+    fn mapped_values_follow_the_source() {
+        assert_eq!(mapped_values(r#"{"a":1}"#), (r#"{"a":1}"#, None));
+        let framed = format!("{}{MAPPED_VALUES}{}", r#"{"a":1.5}"#, r#"{"a":[1]}"#);
+        let (source, values) = mapped_values(&framed);
+        assert_eq!(source, r#"{"a":1.5}"#);
+        assert_eq!(values, json!({"a": [1]}).as_object().cloned());
+        let stray = format!("{}{MAPPED_VALUES}x", r#"{"a":1}"#);
+        assert_eq!(mapped_values(&stray), (stray.as_str(), None));
+    }
+
+    /// A date in a custom pattern and a fractional number in an integer
+    /// field fail a document by themselves, and conform when the mapper's
+    /// values come with it: each column holds the mapper's value as it is
+    /// (an `epoch_second` field's instant is not read as seconds again), a
+    /// field the source leaves out or null takes none of them, and a field
+    /// given several values keeps the mapper's in its list column.
+    #[test]
+    fn the_mapper_s_values_stand_in_for_the_source_s() {
+        let schema = Schema::new(vec![
+            Field::new("status", DataType::Int64, true),
+            Field::new("t", date_type(), true),
+            Field::new("t3", date_type(), true),
+            Field::new("gone", DataType::Int64, true),
+        ]);
+        let kept = HashMap::from([
+            (
+                "t".to_string(),
+                Kept::Date(DateFormat::parse_all("dd/MMM/yyyy:HH:mm:ss Z")),
+            ),
+            (
+                "t3".to_string(),
+                Kept::Date(DateFormat::parse_all("epoch_second")),
+            ),
+        ]);
+        let source = r#"{"status": 200.7, "t": "25/Nov/2026:09:30:00 +0100", "t3": "1795595400", "gone": null}"#;
+        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], None, &[]);
+        let refused = check(source).unwrap_err();
+        assert!(
+            refused.contains("fractional") || refused.contains("failed to parse date"),
+            "{refused}"
+        );
+        let values = r#"{"status": [200], "t": [1795595400000], "t3": [1795595400000], "gone": [7], "absent": [1]}"#;
+        let row = check(&format!("{source}{MAPPED_VALUES}{values}")).expect("conformed");
+        assert_eq!(row.get("status"), Some(&json!(200)));
+        assert_eq!(row.get("t"), Some(&json!(1_795_595_400_000i64)));
+        assert_eq!(row.get("t3"), Some(&json!(1_795_595_400_000i64)));
+        assert_eq!(row.get("gone"), Some(&Value::Null));
+        assert_eq!(row.get("absent"), None);
+
+        let many = format!(
+            "{}{MAPPED_VALUES}{}",
+            r#"{"status": [1.5, 2.7]}"#, r#"{"status": [1, 2]}"#
+        );
+        let row = check(&many).expect("conformed");
+        assert_eq!(
+            row.get(&format!("status{LIST_SUFFIX}")),
+            Some(&json!([1, 2]))
+        );
+    }
+
+    /// At an ignored field that keeps some of its values, the mapper's
+    /// values are those it indexed, fewer than the source gives: they stand
+    /// in for the source's, so a value only the mapper reads (a fraction an
+    /// integer field coerces, a date in a custom pattern) is kept beside the
+    /// others, and the malformed ones are left out.
+    #[test]
+    fn an_ignored_array_keeps_the_values_the_mapper_read() {
+        let list = |dt: DataType| DataType::List(Arc::new(Field::new(LIST_ITEM, dt, true)));
+        let schema = Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new(format!("n{LIST_SUFFIX}"), list(DataType::Int64), true),
+            Field::new("t", date_type(), true),
+            Field::new(format!("t{LIST_SUFFIX}"), list(date_type()), true),
+        ]);
+        let kept = HashMap::from([(
+            "t".to_string(),
+            Kept::Date(DateFormat::parse_all("dd/MMM/yyyy:HH:mm:ss Z")),
+        )]);
+        let row = |doc: String, ignored: &[&str]| conform_doc(&doc, &schema, &kept, &[], None, ignored);
+
+        let source = r#"{"n": [1, 2.5, "x"], "t": ["25/Nov/2026:09:30:00 +0100", "never"]}"#;
+        let values = r#"{"n": [1, 2], "t": [1795595400000]}"#;
+        let flat = row(format!("{source}{MAPPED_VALUES}{values}"), &["n", "t"]).unwrap();
+        assert_eq!(flat.get(&format!("n{LIST_SUFFIX}")), Some(&json!([1, 2])), "{flat:?}");
+        assert_eq!(flat.get("t"), Some(&json!(1_795_595_400_000i64)), "{flat:?}");
+        // Without the mapper's values, only what the column reads by itself is kept.
+        let flat = row(source.to_string(), &["n", "t"]).unwrap();
+        assert_eq!(flat.get("n"), Some(&json!(1)), "{flat:?}");
+        assert_eq!(flat.get("t"), Some(&Value::Null), "{flat:?}");
+        // At a field not ignored, fewer values than the source gives stand in for none.
+        let fewer = format!(r#"{{"n": [1, 2.5]}}{MAPPED_VALUES}{{"n": [1]}}"#);
+        assert!(row(fewer, &[]).is_err());
     }
 }

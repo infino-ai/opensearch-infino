@@ -1,0 +1,457 @@
+# The first write to a data stream that does not exist yet creates it, as
+# stock does when a data-stream template matches the name: a single index
+# without an id, a create with an id, and a bulk create each create their
+# data stream and write the document into its backing index, in default and
+# proxy mode as in a Lucene twin. A bulk item whose index cannot be created
+# fails on its own, and the bulk's other items are written; an index item in
+# the same bulk to a plain new name creates an ordinary index. An index op
+# (not a create) to a missing data stream creates the data stream and fails
+# its item with 400, as stock does. A delete creates no data stream.
+
+---
+"Default mode: the first write to a missing data stream creates it":
+  - do:
+      indices.put_index_template:
+        name: dsa-def-template
+        body:
+          index_patterns: [ "dsa-def-*" ]
+          data_stream: {}
+          priority: 200
+          template:
+            settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+            mappings: { properties: { msg: { type: text }, n: { type: long } } }
+  - do:
+      indices.put_index_template:
+        name: plain-dsa-def-template
+        body:
+          index_patterns: [ "plain-dsa-def*" ]
+          priority: 200
+          template:
+            settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+            mappings: { properties: { msg: { type: text }, n: { type: long } } }
+
+  # A single index without an id.
+  - do:
+      index:
+        index: dsa-def-post
+        refresh: true
+        body: { "@timestamp": "2026-11-24T00:00:01Z", msg: hello, n: 1 }
+  - match: { result: created }
+  - match: { _index: "/^\\.ds-dsa-def-post-000001$/" }
+  - set: { _index: backing }
+  - do:
+      indices.get_settings:
+        index: $backing
+  - match: { \.ds-dsa-def-post-000001.settings.index.infino.enabled: "true" }
+  - do:
+      indices.get_data_stream:
+        name: dsa-def-post
+  - match: { data_streams.0.name: dsa-def-post }
+  - match: { data_streams.0.template: dsa-def-template }
+  - match: { data_streams.0.indices.0.index_name: $backing }
+
+  # A create with an id.
+  - do:
+      create:
+        index: dsa-def-put
+        id: c1
+        refresh: true
+        body: { "@timestamp": "2026-11-24T00:00:02Z", msg: hello there, n: 2 }
+  - match: { result: created }
+  - match: { _id: c1 }
+  - match: { _index: "/^\\.ds-dsa-def-put-000001$/" }
+
+  # A bulk create, beside an item whose index cannot be created: that item
+  # fails on its own and the others are written. An index item to a plain new
+  # name in the same bulk creates an ordinary index, not a data stream.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: dsa-def-bulk }
+          - { "@timestamp": "2026-11-24T00:00:04Z", msg: a b, n: 4 }
+          - create: { _index: dsa-def-BAD }
+          - { "@timestamp": "2026-11-24T00:00:05Z", msg: a, n: 5 }
+          - create: { _index: dsa-def-bulk }
+          - { "@timestamp": "2026-11-24T00:00:03Z", msg: b, n: 3 }
+          - index: { _index: plain-dsa-def, _id: p1 }
+          - { msg: plain, n: 6 }
+  - match: { errors: true }
+  - match: { items.0.create.status: 201 }
+  - match: { items.0.create._index: "/^\\.ds-dsa-def-bulk-000001$/" }
+  - match: { items.1.create.status: 400 }
+  - match: { items.1.create.error.type: illegal_argument_exception }
+  - match: { items.1.create.error.reason: "data_stream [dsa-def-BAD] must be lowercase" }
+  - match: { items.2.create.status: 201 }
+  - match: { items.3.index.status: 201 }
+  - match: { items.3.index.result: created }
+  - match: { items.3.index._index: plain-dsa-def }
+  - do:
+      indices.get:
+        index: plain-dsa-def
+  - is_false: plain-dsa-def.data_stream
+  - match: { plain-dsa-def.settings.index.infino.enabled: "true" }
+  - do:
+      search:
+        index: plain-dsa-def
+        body: { query: { match: { msg: plain } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: p1 }
+
+  # An index op, not a create, to a missing data stream creates the data stream
+  # and fails its item: a data stream takes only creates.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: dsa-def-idx }
+          - { "@timestamp": "2026-11-24T00:00:06Z", msg: c, n: 7 }
+  - match: { errors: true }
+  - match: { items.0.index.status: 400 }
+  - match: { items.0.index.error.type: illegal_argument_exception }
+  - match: { items.0.index.error.reason: "only write ops with an op_type of create are allowed in data streams" }
+  - do:
+      indices.get_data_stream:
+        name: dsa-def-idx
+  - match: { data_streams.0.name: dsa-def-idx }
+  - match: { data_streams.0.template: dsa-def-template }
+  - match: { data_streams.0.indices.0.index_name: "/^\\.ds-dsa-def-idx-000001$/" }
+
+  # A delete creates nothing: it finds no document in a missing index.
+  - do:
+      bulk:
+        body:
+          - delete: { _index: dsa-def-gone, _id: "1" }
+          - delete: { _index: dsa-def-gone, _id: "2" }
+  - match: { errors: true }
+  - match: { items.0.delete.status: 404 }
+  - match: { items.1.delete.status: 404 }
+  - do:
+      indices.exists:
+        index: dsa-def-gone
+  - is_false: ''
+
+  # Each document is searchable, sortable and aggregatable in its data stream.
+  - do:
+      search:
+        index: dsa-def-*
+        body:
+          sort: [ { "@timestamp": asc } ]
+          aggs: { total: { sum: { field: n } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._source.n: 1 }
+  - match: { hits.hits.1._source.n: 2 }
+  - match: { hits.hits.2._source.n: 3 }
+  - match: { hits.hits.3._source.n: 4 }
+  - match: { aggregations.total.value: 10.0 }
+  - do:
+      search:
+        index: dsa-def-put
+        body: { query: { match: { msg: there } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: c1 }
+  - do:
+      search:
+        index: dsa-def-bulk
+        body: { query: { range: { "@timestamp": { gte: "2026-11-24T00:00:04Z" } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._source.n: 4 }
+
+---
+"Proxy mode: the first write to a missing data stream creates it":
+  - do:
+      indices.put_index_template:
+        name: dsa-px-template
+        body:
+          index_patterns: [ "dsa-px-*" ]
+          data_stream: {}
+          priority: 200
+          template:
+            settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+            mappings: { properties: { msg: { type: text }, n: { type: long } } }
+  - do:
+      indices.put_index_template:
+        name: plain-dsa-px-template
+        body:
+          index_patterns: [ "plain-dsa-px*" ]
+          priority: 200
+          template:
+            settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+            mappings: { properties: { msg: { type: text }, n: { type: long } } }
+
+  # A single index without an id.
+  - do:
+      index:
+        index: dsa-px-post
+        refresh: true
+        body: { "@timestamp": "2026-11-24T00:00:01Z", msg: hello, n: 1 }
+  - match: { result: created }
+  - match: { _index: "/^\\.ds-dsa-px-post-000001$/" }
+  - set: { _index: backing }
+  - do:
+      indices.get_settings:
+        index: $backing
+  - match: { \.ds-dsa-px-post-000001.settings.index.infino.enabled: "true" }
+  - match: { \.ds-dsa-px-post-000001.settings.index.infino.mode: proxy }
+  - do:
+      indices.get_data_stream:
+        name: dsa-px-post
+  - match: { data_streams.0.name: dsa-px-post }
+  - match: { data_streams.0.template: dsa-px-template }
+  - match: { data_streams.0.indices.0.index_name: $backing }
+
+  # A create with an id.
+  - do:
+      create:
+        index: dsa-px-put
+        id: c1
+        refresh: true
+        body: { "@timestamp": "2026-11-24T00:00:02Z", msg: hello there, n: 2 }
+  - match: { result: created }
+  - match: { _id: c1 }
+  - match: { _index: "/^\\.ds-dsa-px-put-000001$/" }
+
+  # A bulk create, beside an item whose index cannot be created: that item
+  # fails on its own and the others are written. An index item to a plain new
+  # name in the same bulk creates an ordinary index, not a data stream.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: dsa-px-bulk }
+          - { "@timestamp": "2026-11-24T00:00:04Z", msg: a b, n: 4 }
+          - create: { _index: dsa-px-BAD }
+          - { "@timestamp": "2026-11-24T00:00:05Z", msg: a, n: 5 }
+          - create: { _index: dsa-px-bulk }
+          - { "@timestamp": "2026-11-24T00:00:03Z", msg: b, n: 3 }
+          - index: { _index: plain-dsa-px, _id: p1 }
+          - { msg: plain, n: 6 }
+  - match: { errors: true }
+  - match: { items.0.create.status: 201 }
+  - match: { items.0.create._index: "/^\\.ds-dsa-px-bulk-000001$/" }
+  - match: { items.1.create.status: 400 }
+  - match: { items.1.create.error.type: illegal_argument_exception }
+  - match: { items.1.create.error.reason: "data_stream [dsa-px-BAD] must be lowercase" }
+  - match: { items.2.create.status: 201 }
+  - match: { items.3.index.status: 201 }
+  - match: { items.3.index.result: created }
+  - match: { items.3.index._index: plain-dsa-px }
+  - do:
+      indices.get:
+        index: plain-dsa-px
+  - is_false: plain-dsa-px.data_stream
+  - match: { plain-dsa-px.settings.index.infino.enabled: "true" }
+  - do:
+      search:
+        index: plain-dsa-px
+        body: { query: { match: { msg: plain } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: p1 }
+
+  # An index op, not a create, to a missing data stream creates the data stream
+  # and fails its item: a data stream takes only creates.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: dsa-px-idx }
+          - { "@timestamp": "2026-11-24T00:00:06Z", msg: c, n: 7 }
+  - match: { errors: true }
+  - match: { items.0.index.status: 400 }
+  - match: { items.0.index.error.type: illegal_argument_exception }
+  - match: { items.0.index.error.reason: "only write ops with an op_type of create are allowed in data streams" }
+  - do:
+      indices.get_data_stream:
+        name: dsa-px-idx
+  - match: { data_streams.0.name: dsa-px-idx }
+  - match: { data_streams.0.template: dsa-px-template }
+  - match: { data_streams.0.indices.0.index_name: "/^\\.ds-dsa-px-idx-000001$/" }
+
+  # A delete creates nothing: it finds no document in a missing index.
+  - do:
+      bulk:
+        body:
+          - delete: { _index: dsa-px-gone, _id: "1" }
+          - delete: { _index: dsa-px-gone, _id: "2" }
+  - match: { errors: true }
+  - match: { items.0.delete.status: 404 }
+  - match: { items.1.delete.status: 404 }
+  - do:
+      indices.exists:
+        index: dsa-px-gone
+  - is_false: ''
+
+  # Each document is searchable, sortable and aggregatable in its data stream.
+  - do:
+      search:
+        index: dsa-px-*
+        body:
+          sort: [ { "@timestamp": asc } ]
+          aggs: { total: { sum: { field: n } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._source.n: 1 }
+  - match: { hits.hits.1._source.n: 2 }
+  - match: { hits.hits.2._source.n: 3 }
+  - match: { hits.hits.3._source.n: 4 }
+  - match: { aggregations.total.value: 10.0 }
+  - do:
+      search:
+        index: dsa-px-put
+        body: { query: { match: { msg: there } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: c1 }
+  - do:
+      search:
+        index: dsa-px-bulk
+        body: { query: { range: { "@timestamp": { gte: "2026-11-24T00:00:04Z" } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._source.n: 4 }
+
+---
+"A Lucene twin: the first write to a missing data stream creates it":
+  - do:
+      indices.put_index_template:
+        name: dsa-luc-template
+        body:
+          index_patterns: [ "dsa-luc-*" ]
+          data_stream: {}
+          priority: 200
+          template:
+            settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+            mappings: { properties: { msg: { type: text }, n: { type: long } } }
+  - do:
+      indices.put_index_template:
+        name: plain-dsa-luc-template
+        body:
+          index_patterns: [ "plain-dsa-luc*" ]
+          priority: 200
+          template:
+            settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+            mappings: { properties: { msg: { type: text }, n: { type: long } } }
+
+  # A single index without an id.
+  - do:
+      index:
+        index: dsa-luc-post
+        refresh: true
+        body: { "@timestamp": "2026-11-24T00:00:01Z", msg: hello, n: 1 }
+  - match: { result: created }
+  - match: { _index: "/^\\.ds-dsa-luc-post-000001$/" }
+  - set: { _index: backing }
+  - do:
+      indices.get_settings:
+        index: $backing
+  - match: { \.ds-dsa-luc-post-000001.settings.index.infino.enabled: "false" }
+  - do:
+      indices.get_data_stream:
+        name: dsa-luc-post
+  - match: { data_streams.0.name: dsa-luc-post }
+  - match: { data_streams.0.template: dsa-luc-template }
+  - match: { data_streams.0.indices.0.index_name: $backing }
+
+  # A create with an id.
+  - do:
+      create:
+        index: dsa-luc-put
+        id: c1
+        refresh: true
+        body: { "@timestamp": "2026-11-24T00:00:02Z", msg: hello there, n: 2 }
+  - match: { result: created }
+  - match: { _id: c1 }
+  - match: { _index: "/^\\.ds-dsa-luc-put-000001$/" }
+
+  # A bulk create, beside an item whose index cannot be created: that item
+  # fails on its own and the others are written. An index item to a plain new
+  # name in the same bulk creates an ordinary index, not a data stream.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: dsa-luc-bulk }
+          - { "@timestamp": "2026-11-24T00:00:04Z", msg: a b, n: 4 }
+          - create: { _index: dsa-luc-BAD }
+          - { "@timestamp": "2026-11-24T00:00:05Z", msg: a, n: 5 }
+          - create: { _index: dsa-luc-bulk }
+          - { "@timestamp": "2026-11-24T00:00:03Z", msg: b, n: 3 }
+          - index: { _index: plain-dsa-luc, _id: p1 }
+          - { msg: plain, n: 6 }
+  - match: { errors: true }
+  - match: { items.0.create.status: 201 }
+  - match: { items.0.create._index: "/^\\.ds-dsa-luc-bulk-000001$/" }
+  - match: { items.1.create.status: 400 }
+  - match: { items.1.create.error.type: illegal_argument_exception }
+  - match: { items.1.create.error.reason: "data_stream [dsa-luc-BAD] must be lowercase" }
+  - match: { items.2.create.status: 201 }
+  - match: { items.3.index.status: 201 }
+  - match: { items.3.index.result: created }
+  - match: { items.3.index._index: plain-dsa-luc }
+  - do:
+      indices.get:
+        index: plain-dsa-luc
+  - is_false: plain-dsa-luc.data_stream
+  - match: { plain-dsa-luc.settings.index.infino.enabled: "false" }
+  - do:
+      search:
+        index: plain-dsa-luc
+        body: { query: { match: { msg: plain } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: p1 }
+
+  # An index op, not a create, to a missing data stream creates the data stream
+  # and fails its item: a data stream takes only creates.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: dsa-luc-idx }
+          - { "@timestamp": "2026-11-24T00:00:06Z", msg: c, n: 7 }
+  - match: { errors: true }
+  - match: { items.0.index.status: 400 }
+  - match: { items.0.index.error.type: illegal_argument_exception }
+  - match: { items.0.index.error.reason: "only write ops with an op_type of create are allowed in data streams" }
+  - do:
+      indices.get_data_stream:
+        name: dsa-luc-idx
+  - match: { data_streams.0.name: dsa-luc-idx }
+  - match: { data_streams.0.template: dsa-luc-template }
+  - match: { data_streams.0.indices.0.index_name: "/^\\.ds-dsa-luc-idx-000001$/" }
+
+  # A delete creates nothing: it finds no document in a missing index.
+  - do:
+      bulk:
+        body:
+          - delete: { _index: dsa-luc-gone, _id: "1" }
+          - delete: { _index: dsa-luc-gone, _id: "2" }
+  - match: { errors: true }
+  - match: { items.0.delete.status: 404 }
+  - match: { items.1.delete.status: 404 }
+  - do:
+      indices.exists:
+        index: dsa-luc-gone
+  - is_false: ''
+
+  # Each document is searchable, sortable and aggregatable in its data stream.
+  - do:
+      search:
+        index: dsa-luc-*
+        body:
+          sort: [ { "@timestamp": asc } ]
+          aggs: { total: { sum: { field: n } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._source.n: 1 }
+  - match: { hits.hits.1._source.n: 2 }
+  - match: { hits.hits.2._source.n: 3 }
+  - match: { hits.hits.3._source.n: 4 }
+  - match: { aggregations.total.value: 10.0 }
+  - do:
+      search:
+        index: dsa-luc-put
+        body: { query: { match: { msg: there } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: c1 }
+  - do:
+      search:
+        index: dsa-luc-bulk
+        body: { query: { range: { "@timestamp": { gte: "2026-11-24T00:00:04Z" } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._source.n: 4 }
