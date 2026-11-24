@@ -1789,6 +1789,53 @@ public final class InfinoNative {
         return null;
     }
 
+    /** The paths of the fields the mapper ignored in {@code id}'s document, as the table holds them ({@link InfinoIgnored}); none when it ignored none. */
+    public static List<String> ignoredOf(String name, String id) {
+        return ignoredOf(name, List.of(id)).getOrDefault(id, List.of());
+    }
+
+    /**
+     * {@link #ignoredOf(String, String)} for each of these ids that has any,
+     * by id: through the id column's term index as {@link #existingOsids}
+     * finds ids, and only over rows that hold the column; none when the
+     * table holds no such column.
+     */
+    public static Map<String, List<String>> ignoredOf(String name, Collection<String> ids) {
+        if (ids.isEmpty() || InfinoQueryTranslator.ignoredColumn(columns(name)) == null) {
+            return Map.of();
+        }
+        Set<String> wanted = new HashSet<>(ids);
+        String columns = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.ignoredPaths();
+        String held = InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.IGNORED) + " IS NOT NULL";
+        List<String> termed = new ArrayList<>(wanted.size());
+        List<String> bare = new ArrayList<>();
+        for (String id : wanted) {
+            (hasTerm(id) ? termed : bare).add(id);
+        }
+        List<String> statements = new ArrayList<>(2);
+        for (int from = 0; from < termed.size(); from += PROBE_IDS_PER_STATEMENT) {
+            List<String> batch = termed.subList(from, Math.min(termed.size(), from + PROBE_IDS_PER_STATEMENT));
+            statements.add(
+                "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
+                    + InfinoQueryTranslator.literal(idTerms(batch)) + ", 'or') WHERE " + held
+            );
+        }
+        if (!bare.isEmpty()) {
+            statements.add(byIds(name, columns, bare, held));
+        }
+        Map<String, List<String>> out = new HashMap<>();
+        for (String sql : statements) {
+            for (Map<String, Object> row : sqlRows(sql)) {
+                Object id = row.get(InfinoQueryTranslator.OSID);
+                List<String> paths = InfinoIgnored.split(row.get(InfinoQueryTranslator.IGNORED));
+                if (id != null && wanted.contains(id.toString()) && !paths.isEmpty()) {
+                    out.put(id.toString(), paths);
+                }
+            }
+        }
+        return out;
+    }
+
     /** Keep the sources of rows a hit statement returned (id and source columns), for the fetch phase. */
     public static void keepSources(String name, List<Map<String, Object>> rows) {
         for (Map<String, Object> row : rows) {

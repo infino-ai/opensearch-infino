@@ -3219,19 +3219,33 @@ final class InfinoQueryTranslator {
         return anyValue(c, v -> v + in);
     }
 
-    /** The rows whose ignored fields include a path {@code test} (an SQL comparison of it) holds for. */
+    /**
+     * The rows whose ignored fields include a path {@code test} (an SQL
+     * comparison of it) holds for; null, as for any list column, where the
+     * clause may only compare column values ({@link #columnValuesOnly}).
+     */
     private String ignoredHas(String test) {
-        return ignoredColumn(cols) == null ? NONE : anyValue(table, null, quoteIdent(IGNORED), v -> v + test);
+        if (ignoredColumn(cols) == null) {
+            return NONE;
+        }
+        return columnValuesOnly ? null : anyValue(table, null, quoteIdent(IGNORED), v -> v + test);
     }
 
     /**
      * The table's {@link #IGNORED} column, or null when no document has had a
      * field ignored: the column is added with the first. A document field of
-     * that name is not it ({@link #OWN_COLUMN_PREFIX}).
+     * that name is not it ({@link #OWN_COLUMN_PREFIX}), nor is a column that
+     * holds no list.
      */
     static Column ignoredColumn(Map<String, Column> cols) {
         Column c = cols.get(IGNORED);
-        return c != null && c.name().equals(IGNORED) ? c : null;
+        return c != null && c.name().equals(IGNORED) && c.isList() ? c : null;
+    }
+
+    /** The select item reading the {@link #IGNORED} column as one string, a path per line ({@link InfinoIgnored#SEPARATOR}). */
+    static String ignoredPaths() {
+        String column = quoteIdent(IGNORED);
+        return "array_to_string(" + column + ", chr(10)) AS " + column;
     }
 
     private String range(RangeQueryBuilder r) {

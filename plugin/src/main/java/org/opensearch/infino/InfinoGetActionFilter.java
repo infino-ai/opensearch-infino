@@ -24,12 +24,15 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.get.GetResult;
+import org.opensearch.index.mapper.IgnoredFieldMapper;
 import org.opensearch.index.mapper.RoutingFieldMapper;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
@@ -117,7 +120,8 @@ public class InfinoGetActionFilter implements ActionFilter {
                         access,
                         InfinoMappingSource.of(index.mapping()),
                         get.fetchSourceContext(),
-                        routingOf(index, table, get.id(), doc, get.realtime())
+                        routingOf(index, table, get.id(), doc, get.realtime()),
+                        ignoredOf(index, table, get.id(), doc, get.realtime())
                     )
                 );
                 listener.onResponse(response);
@@ -189,11 +193,24 @@ public class InfinoGetActionFilter implements ActionFilter {
     }
 
     /**
+     * The paths of the fields the mapper ignored in a found document, which a
+     * stock get reports as {@code _ignored}: a realtime default-mode read sees
+     * a pending write's; none when it was not found or ignored none.
+     */
+    static List<String> ignoredOf(IndexMetadata index, String table, String id, InfinoNative.Doc doc, boolean realtime) {
+        if (doc == null) {
+            return List.of();
+        }
+        return realtime && InfinoPlugin.inDefaultMode(index.getSettings()) ? InfinoEngine.currentIgnored(table, id) : InfinoNative.ignoredOf(table, id);
+    }
+
+    /**
      * A get result from the table's document (null when it is missing): its
      * source as the user may see it (the read reported to the audit log when
      * it watches the index), with the request's source filter applied, the
-     * sequence number it was written under, and {@code routing} (null for
-     * none) as its {@code _routing}.
+     * sequence number it was written under, {@code routing} (null for
+     * none) as its {@code _routing}, and {@code ignored} (empty for none) as
+     * its {@code _ignored}.
      */
     static GetResult result(
         String index,
@@ -202,13 +219,21 @@ public class InfinoGetActionFilter implements ActionFilter {
         InfinoAccess access,
         InfinoMappingSource stored,
         FetchSourceContext fetch,
-        String routing
+        String routing,
+        List<String> ignored
     ) {
         String source = doc == null ? null : access.read(id, doc.source());
         boolean exists = source != null && !source.isEmpty();
         BytesReference bytes = null;
         if (exists && (fetch == null || fetch.fetchSource())) {
             bytes = stored.shown(source, fetch);
+        }
+        Map<String, DocumentField> meta = new HashMap<>();
+        if (exists && routing != null) {
+            meta.put(RoutingFieldMapper.NAME, new DocumentField(RoutingFieldMapper.NAME, List.of(routing)));
+        }
+        if (exists && !ignored.isEmpty()) {
+            meta.put(IgnoredFieldMapper.NAME, new DocumentField(IgnoredFieldMapper.NAME, new ArrayList<>(ignored)));
         }
         // A found document carries its sequence number, and the version and primary term the table reports (see InfinoDocumentVersion).
         return new GetResult(
@@ -220,7 +245,7 @@ public class InfinoGetActionFilter implements ActionFilter {
             exists,
             bytes,
             Map.of(),
-            exists && routing != null ? Map.of(RoutingFieldMapper.NAME, new DocumentField(RoutingFieldMapper.NAME, List.of(routing))) : Map.of()
+            meta
         );
     }
 }

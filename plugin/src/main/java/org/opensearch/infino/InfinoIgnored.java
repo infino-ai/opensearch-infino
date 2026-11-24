@@ -5,6 +5,7 @@
 package org.opensearch.infino;
 
 import org.apache.lucene.index.IndexableField;
+import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
@@ -18,7 +19,9 @@ import org.opensearch.indices.IndicesService;
 
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.WeakHashMap;
 
 /**
  * The fields of a document that OpenSearch's mapper ignored because their
@@ -27,8 +30,8 @@ import java.util.Set;
  * by it, and what it lists under {@code _ignored} is left out of the row,
  * kept by path in the {@link InfinoQueryTranslator#IGNORED} column and
  * served as {@code _ignored}, while the source keeps the value whole.
- * Parsing costs a second pass over the document, so only an index whose
- * settings or mapping name {@code ignore_malformed} pays it.
+ * Parsing costs a second pass over the document, so only an index that
+ * can ignore a field ({@link #mayIgnore}) pays it.
  */
 final class InfinoIgnored {
 
@@ -37,12 +40,23 @@ final class InfinoIgnored {
     /** The index setting that makes every field that supports it ignore a malformed value. */
     static final String SETTING = "index.mapping.ignore_malformed";
     private static final String OPTION = "ignore_malformed";
+    /** {@link #mayIgnore} by mapping; a mapping update makes a new mapper. */
+    private static final Map<DocumentMapper, Boolean> BY_MAPPING = new WeakHashMap<>();
 
     private InfinoIgnored() {}
 
     /** The paths as the bridge takes them. */
     static String join(List<String> paths) {
         return String.join(SEPARATOR, paths);
+    }
+
+    /**
+     * The paths a row's {@link InfinoQueryTranslator#ignoredPaths()} item
+     * holds, joined as {@link #join} joins them: a row reads a list column
+     * back as a string.
+     */
+    static List<String> split(Object joined) {
+        return joined instanceof String s && !s.isEmpty() ? List.of(s.split(SEPARATOR)) : List.of();
     }
 
     /** The paths the mapper ignored in {@code doc}, each once, in the order it listed them. */
@@ -66,8 +80,9 @@ final class InfinoIgnored {
 
     /**
      * Whether a document of the index {@code mappers} maps may have a field
-     * the mapper ignores: its settings or its mapping name
-     * {@code ignore_malformed}, at the index or on a field or template.
+     * the mapper ignores: its settings turn {@code ignore_malformed} on, or
+     * its mapping does on a field or template. The answer is kept per
+     * mapping, which a mapping update replaces.
      */
     static boolean mayIgnore(MapperService mappers) {
         if (mappers == null) {
@@ -77,7 +92,40 @@ final class InfinoIgnored {
             return true;
         }
         DocumentMapper mapper = mappers.documentMapper();
-        return mapper != null && mapper.mappingSource().string().contains(OPTION);
+        if (mapper == null) {
+            return false;
+        }
+        synchronized (BY_MAPPING) {
+            return BY_MAPPING.computeIfAbsent(
+                mapper,
+                m -> namesIgnoring(XContentHelper.convertToMap(m.mappingSource().uncompressed(), false, MediaTypeRegistry.JSON).v2())
+            );
+        }
+    }
+
+    /**
+     * Whether a mapping, or a part of one, turns {@code ignore_malformed}
+     * on anywhere, on a field, a multi-field or a dynamic template.
+     */
+    static boolean namesIgnoring(Object node) {
+        if (node instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> e : map.entrySet()) {
+                Object key = e.getKey();
+                if (OPTION.equals(key) && Boolean.parseBoolean(String.valueOf(e.getValue()))) {
+                    return true;
+                }
+                if (namesIgnoring(e.getValue())) {
+                    return true;
+                }
+            }
+        } else if (node instanceof List<?> list) {
+            for (Object item : list) {
+                if (namesIgnoring(item)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**

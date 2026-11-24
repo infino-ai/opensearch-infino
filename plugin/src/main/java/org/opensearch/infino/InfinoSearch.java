@@ -2307,40 +2307,19 @@ public final class InfinoSearch {
         return md == null ? null : md.mapping();
     }
 
-    /**
-     * The paths of the ignored fields ({@link InfinoIgnored}) of each of the
-     * first {@code end} rows that has any, by id: read by id from the
-     * {@link InfinoQueryTranslator#IGNORED} column, which a table holds once
-     * a document has had a field ignored; none when it holds no such column.
-     */
+    /** The paths of the ignored fields ({@link InfinoIgnored}) of each of the first {@code end} rows that has any, by id. */
     private static Map<String, List<String>> ignored(String table, Map<String, Column> cols, List<Map<String, Object>> rows, int end) {
         if (InfinoQueryTranslator.ignoredColumn(cols) == null) {
             return Map.of();
         }
-        List<String> literals = new ArrayList<>();
+        List<String> ids = new ArrayList<>();
         for (int i = 0; i < end; i++) {
             Object id = rows.get(i).get(InfinoQueryTranslator.OSID);
             if (id != null) {
-                literals.add(InfinoQueryTranslator.literal(id.toString()));
+                ids.add(id.toString());
             }
         }
-        if (literals.isEmpty()) {
-            return Map.of();
-        }
-        String column = InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.IGNORED);
-        Map<String, List<String>> out = new HashMap<>();
-        // Joined one per line (InfinoIgnored.SEPARATOR, which no path holds): a row reads a list column back as a string.
-        for (Map<String, Object> row : InfinoNative.sqlRows(
-            "SELECT " + InfinoQueryTranslator.OSID + ", array_to_string(" + column + ", chr(10)) AS " + column + " FROM "
-                + InfinoQueryTranslator.quoteIdent(table) + " WHERE " + InfinoQueryTranslator.OSID + " IN (" + String.join(", ", literals)
-                + ") AND " + column + " IS NOT NULL"
-        )) {
-            Object id = row.get(InfinoQueryTranslator.OSID);
-            if (id != null && row.get(InfinoQueryTranslator.IGNORED) instanceof String paths && !paths.isEmpty()) {
-                out.put(id.toString(), List.of(paths.split(InfinoIgnored.SEPARATOR)));
-            }
-        }
-        return out;
+        return InfinoNative.ignoredOf(table, ids);
     }
 
     /** A hit's metadata fields: {@code _ignored} when the mapper ignored any of its fields, as stock's hit carries it. */
@@ -2391,7 +2370,8 @@ public final class InfinoSearch {
             if (id == null) {
                 continue;
             }
-            SearchHit h = new SearchHit(hits.size(), id.toString(), Map.of(), Map.of());
+            List<String> ignoredFields = InfinoIgnored.split(row.get(InfinoQueryTranslator.IGNORED));
+            SearchHit h = new SearchHit(hits.size(), id.toString(), Map.of(), ignoredField(ignoredFields));
             if (target != null) {
                 h.shard(target);
             }
@@ -2407,7 +2387,7 @@ public final class InfinoSearch {
                             h.sourceRef(shown);
                         }
                     }
-                    fillRequested(h, src, stored, docValueFields, fetchFields, cols, List.of());
+                    fillRequested(h, src, stored, docValueFields, fetchFields, cols, ignoredFields);
                 }
             }
             if (!sorts.isEmpty()) {

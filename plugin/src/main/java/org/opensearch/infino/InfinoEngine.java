@@ -974,6 +974,18 @@ public class InfinoEngine extends InternalEngine {
         return InfinoNative.routingOf(table, id);
     }
 
+    /**
+     * The paths of the fields the mapper ignored in {@code id}'s document, as
+     * a read sees it now: a pending write's, else the table's.
+     */
+    static List<String> currentIgnored(String table, String id) {
+        Version v = latestPending(table, id);
+        if (v != null && v.source() != null) {
+            return v.ignored();
+        }
+        return InfinoNative.ignoredOf(table, id);
+    }
+
     @Override
     public void close() throws IOException {
         leaseRefreshStopped = true;
