@@ -222,8 +222,9 @@ record InfinoAccess(
     }
 
     /**
-     * The columns a plan may name: a hidden column is gone (the id and the
-     * sequence number stay, as metadata), a masked one carries its hash. A
+     * The columns a plan may name: a hidden column is gone (the id, the
+     * sequence number and the ignored fields stay, as metadata), a masked one
+     * carries its hash. A
      * query, sort, aggregation or script naming a hidden field then finds no
      * column, as it would for an unmapped field. A field alias goes with
      * the field it names: hidden, masked or visible as that field is, and so
@@ -244,7 +245,9 @@ record InfinoAccess(
             if (name.equals(InfinoQueryTranslator.SOURCE)) {
                 continue;
             }
-            boolean reserved = name.equals(InfinoQueryTranslator.OSID) || name.equals(InfinoQueryTranslator.SEQ);
+            boolean reserved = name.equals(InfinoQueryTranslator.OSID)
+                || name.equals(InfinoQueryTranslator.SEQ)
+                || name.equals(InfinoQueryTranslator.IGNORED);
             String field = InfinoQueryTranslator.fieldOf(name);
             if (!reserved && restrictsFields() && !fieldVisible.test(field)) {
                 continue;

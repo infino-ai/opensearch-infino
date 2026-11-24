@@ -175,6 +175,15 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                     docsOf.put(e.getKey(), InfinoEngine.currentDocs(e.getKey(), e.getValue()));
                 }
             }
+            // The ignored fields of each table's ids, read once per table,
+            // except where a realtime default-mode read sees pending writes.
+            Map<String, Map<String, List<String>>> ignoredOf = new HashMap<>();
+            for (Map.Entry<String, List<String>> e : idsByTable.entrySet()) {
+                IndexMetadata md = indices.get(indexOfTable.get(e.getKey()));
+                if (!(mget.realtime() && InfinoPlugin.inDefaultMode(md.getSettings()))) {
+                    ignoredOf.put(e.getKey(), InfinoNative.ignoredOf(e.getKey(), e.getValue()));
+                }
+            }
             // What each index's mapping keeps of a document's _source, read once per index.
             Map<String, InfinoMappingSource> storedOf = new HashMap<>();
             MultiGetItemResponse[] responses = new MultiGetItemResponse[mget.getItems().size()];
@@ -196,7 +205,10 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                         accessOf.get(item.index()),
                         storedOf.computeIfAbsent(item.index(), k -> InfinoMappingSource.of(md.mapping())),
                         item.fetchSourceContext(),
-                        routing
+                        routing,
+                        doc == null ? List.of()
+                            : ignoredOf.containsKey(tableOfItem[i]) ? ignoredOf.get(tableOfItem[i]).getOrDefault(item.id(), List.of())
+                            : InfinoGetActionFilter.ignoredOf(md, tableOfItem[i], item.id(), doc, true)
                     )
                 );
                 responses[i] = new MultiGetItemResponse(get, null);
