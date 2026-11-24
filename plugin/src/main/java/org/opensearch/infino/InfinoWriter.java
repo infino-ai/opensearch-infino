@@ -26,6 +26,7 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.engine.DocumentMissingException;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.mapper.MapperParsingException;
+import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -40,6 +41,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
@@ -120,16 +122,38 @@ public final class InfinoWriter {
      * One write a bulk item asks for: the source to append (null for a
      * delete or an update), whether the id may already exist (looked up at
      * flush), whether it must not ({@code op_type: create}, answered with a
-     * conflict when it does), and for an update the request whose document
-     * is merged when its batch is written.
+     * conflict when it does), for an update the request whose document is
+     * merged when its batch is written, the paths of the source's fields the
+     * mapper ignored ({@link InfinoIgnored}), left out of its row, and the
+     * values OpenSearch's mapper read from the source's date and integer
+     * fields (null when the bridge reads the source alone; see
+     * {@link InfinoMappedValues}).
      */
-    record Write(String id, String source, boolean lookup, boolean create, UpdateRequest update) {
+    record Write(String id, String source, boolean lookup, boolean create, UpdateRequest update, List<String> ignored, String values) {
+        Write(String id, String source, boolean lookup, boolean create, UpdateRequest update, List<String> ignored) {
+            this(id, source, lookup, create, update, ignored, null);
+        }
+
+        Write(String id, String source, boolean lookup, boolean create, List<String> ignored) {
+            this(id, source, lookup, create, null, ignored);
+        }
+
         Write(String id, String source, boolean lookup, boolean create) {
-            this(id, source, lookup, create, null);
+            this(id, source, lookup, create, null, List.of());
         }
 
         Write(String id, String source, boolean lookup) {
-            this(id, source, lookup, false, null);
+            this(id, source, lookup, false, null, List.of());
+        }
+
+        /** This write with the values the mapper read from its source. */
+        Write withValues(String values) {
+            return new Write(id, source, lookup, create, update, ignored, values);
+        }
+
+        /** The source as it crosses to the bridge: with the mapper's values when it has them. */
+        String forTable() {
+            return InfinoMappedValues.framed(source, values);
         }
 
         /**
@@ -139,7 +163,7 @@ public final class InfinoWriter {
          * earlier in its batch, or in an append that has committed since.
          */
         static Write update(UpdateRequest update) {
-            return new Write(update.id(), null, true, false, update);
+            return new Write(update.id(), null, true, false, update, List.of());
         }
 
         /** Whether this write removes its id's document. */
@@ -202,7 +226,7 @@ public final class InfinoWriter {
         String runningIndex;
         /** The ids the running appends name, with how many of them name each. */
         final Map<String, Integer> busy = new HashMap<>();
-        /** Guards {@link #nextSeq} and {@link #seqAllocation}: appends running at once take numbers in turn. */
+        /** Guards {@link #nextSeq} and changes to {@link #reads}: appends running at once take numbers in turn. */
         final Object seqLock = new Object();
         /**
          * The sequence number the next write is given; {@link InfinoWriter#UNREAD}
@@ -210,25 +234,51 @@ public final class InfinoWriter {
          * under {@link #seqLock}.
          */
         long nextSeq = UNREAD;
-        /** The copy that wrote the table when {@link #nextSeq} was read; another copy since means it is read again. */
-        String seqAllocation;
         /**
-         * Whether this node's reads of what the table holds, for the writes it
-         * stages, read the table's latest commit ({@link InfinoNative#latestRows}):
-         * set when {@link #nextSeq} is read, as a shard starts writing here or
-         * takes over from another copy, and cleared once an append started
-         * since commits. Until then this node's connection may answer from a
-         * commit before the last one the copy before it made, for up to the
-         * engine's staleness window; its own commit brings it to the latest.
-         * While set, the batch holds the connection those reads go through
-         * open ({@link InfinoNative#holdLatest}). Read and set under
-         * {@link #seqLock}.
+         * The copy that wrote the table when {@link #nextSeq} was read, and
+         * whether this node's reads of the table still read its latest commit
+         * ({@link Reads}). Changed under {@link #seqLock}, each change a new
+         * snapshot, so {@link InfinoWriter#caughtUp} reads it without the lock,
+         * which an append holds through its base reads.
          */
-        boolean readLatest;
-        /** How often {@link #readLatest} was set, so an append clears only the setting it read under. Under {@link #seqLock}. */
+        volatile Reads reads = Reads.NONE;
+        /** How often {@link Reads#latest} was set, so an append clears only the setting it read under. Under {@link #seqLock}. */
         long readLatestSet;
+
+        /**
+         * Set this node's reads of the table to read its latest commit, as an
+         * append does before it reads the table's highest sequence number, and
+         * hold the connection they go through open. Under {@link #seqLock}.
+         */
+        void readLatest() {
+            if (!reads.latest()) {
+                InfinoNative.holdLatest();
+            }
+            reads = new Reads(reads.allocation(), true);
+            readLatestSet++;
+        }
         /** The UUID of the index whose writes {@link #nextSeq} was read for. */
         String seqIndex;
+    }
+
+    /**
+     * How a node reads a table it writes, as one snapshot ({@link Batch#reads}).
+     *
+     * @param allocation the copy that wrote the table when the batch's next
+     *     sequence number was read; another copy since means it is read again.
+     *     Null before the first write and after the copy closes.
+     * @param latest whether this node's reads of what the table holds, for the
+     *     writes it stages, read the table's latest commit
+     *     ({@link InfinoNative#latestRows}): set when the next sequence number is
+     *     read, as a shard starts writing here or takes over from another copy,
+     *     and cleared once an append started since commits. Until then this
+     *     node's connection may answer from a commit before the last one the
+     *     copy before it made, for up to the engine's staleness window; its own
+     *     commit brings it to the latest. While set, the batch holds the
+     *     connection those reads go through open ({@link InfinoNative#holdLatest}).
+     */
+    record Reads(String allocation, boolean latest) {
+        static final Reads NONE = new Reads(null, false);
     }
 
     /**
@@ -276,6 +326,72 @@ public final class InfinoWriter {
         this.maxAppends = Math.max(1, maxAppends);
     }
 
+    /** The rows of one bulk's writes, prepared in its order; null when it carries none, or the table is unknown. */
+    private static Pointer prepareRows(String table, Waiter waiter) {
+        List<String> ids = new ArrayList<>();
+        List<String> sources = new ArrayList<>();
+        List<List<String>> ignored = new ArrayList<>();
+        for (Outcome o : waiter.outcomes()) {
+            if (carriesRow(o)) {
+                ids.add(o.write().id());
+                sources.add(o.write().forTable());
+                ignored.add(o.write().ignored());
+            }
+        }
+        return ids.isEmpty() ? null : InfinoNative.prepare(table, ids, sources, ignored);
+    }
+
+    /**
+     * Give each write whose row the bridge refuses the values OpenSearch's
+     * mapper reads from its source, as the shard would read them: a date in
+     * a format of the field's own mapping, or a fractional number an integer
+     * field coerces. A write the mapper refuses too is answered with what the
+     * mapper throws, as stock answers it (a fractional number in an integer
+     * field with {@code coerce: false}). Only refused rows pay for the parse.
+     * Whether any write changed, so the bulk must be prepared again.
+     */
+    private static boolean withMapperValues(Waiter waiter, Pointer prepared) {
+        List<InfinoNative.Failure> failed = InfinoNative.preparedFailed(prepared);
+        if (failed.isEmpty()) {
+            return false;
+        }
+        MapperService mappers = InfinoMappedValues.mappers(waiter.shardId().getIndex());
+        if (mappers == null) {
+            return false;
+        }
+        List<Outcome> outcomes = waiter.outcomes();
+        // Where each prepared row's write sits among the bulk's outcomes.
+        List<Integer> rows = new ArrayList<>();
+        for (int at = 0; at < outcomes.size(); at++) {
+            if (carriesRow(outcomes.get(at))) {
+                rows.add(at);
+            }
+        }
+        boolean changed = false;
+        for (InfinoNative.Failure f : failed) {
+            int at = rows.get(f.index());
+            Outcome o = outcomes.get(at);
+            Write w = o.write();
+            if (w.values() != null) {
+                continue;
+            }
+            String values;
+            try {
+                values = InfinoMappedValues.parse(mappers, waiter.indexName(), w.id(), w.source(), o.item().routing());
+            } catch (RuntimeException e) {
+                BulkItemResponse.Failure refused = new BulkItemResponse.Failure(waiter.indexName(), o.item().id(), e);
+                outcomes.set(at, new Outcome(o.slot(), o.item(), null, new BulkItemResponse(o.slot(), o.item().opType(), refused)));
+                changed = true;
+                continue;
+            }
+            if (values != null) {
+                outcomes.set(at, new Outcome(o.slot(), o.item(), w.withValues(values), null));
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
     /**
      * Stage one bulk's writes to a table: its documents are prepared here,
      * on the caller's thread, then join the batch. Items answered up front
@@ -283,8 +399,21 @@ public final class InfinoWriter {
      * commits, and the listener gets the whole bulk's response then.
      */
     void submit(String table, Waiter waiter) {
+        Pointer prepared = prepareRows(table, waiter);
+        if (prepared != null) {
+            boolean changed;
+            try {
+                changed = withMapperValues(waiter, prepared);
+            } catch (RuntimeException e) {
+                InfinoNative.freePrepared(prepared);
+                throw e;
+            }
+            if (changed) {
+                InfinoNative.freePrepared(prepared);
+                prepared = prepareRows(table, waiter);
+            }
+        }
         List<String> ids = new ArrayList<>();
-        List<String> sources = new ArrayList<>();
         long bytes = 0;
         // An update's document is made when its batch is written; it counts toward the bound as a document.
         int updates = 0;
@@ -295,13 +424,11 @@ public final class InfinoWriter {
             }
             if (carriesRow(o)) {
                 ids.add(o.write().id());
-                sources.add(o.write().source());
                 bytes += o.write().source().length();
             } else if (o.write() != null && o.write().update() != null) {
                 updates++;
             }
         }
-        Pointer prepared = ids.isEmpty() ? null : InfinoNative.prepare(table, ids, sources);
         if (!ids.isEmpty() && prepared == null) {
             waiter.listener().onFailure(new IllegalStateException("[infino] the bridge could not prepare the batch for " + table));
             return;
@@ -551,21 +678,18 @@ public final class InfinoWriter {
             String index = staged.isEmpty() ? null : staged.get(0).waiter().shardId().getIndex().getUUID();
             synchronized (batch.seqLock) {
                 boolean newIndex = index != null && !index.equals(batch.seqIndex);
-                if (batch.nextSeq == UNREAD || newIndex || !Objects.equals(allocation, batch.seqAllocation)) {
+                if (batch.nextSeq == UNREAD || newIndex || !Objects.equals(allocation, batch.reads.allocation())) {
                     // Held from here, so the read below and the batch's lookups go
-                    // through one connection.
-                    if (!batch.readLatest) {
-                        InfinoNative.holdLatest();
-                    }
-                    batch.readLatest = true;
-                    batch.readLatestSet++;
+                    // through one connection; and no realtime read takes this node
+                    // as caught up while the allocation changes.
+                    batch.readLatest();
                     batch.nextSeq = nextSeq(batch.nextSeq, InfinoNative.maxSeq(table) + 1, !newIndex);
-                    batch.seqAllocation = allocation;
+                    batch.reads = new Reads(allocation, true);
                     if (index != null) {
                         batch.seqIndex = index;
                     }
                 }
-                latest = batch.readLatest;
+                latest = batch.reads.latest();
                 latestSet = batch.readLatestSet;
             }
             // A conditioned write is checked against the sequence numbers the table
@@ -596,8 +720,13 @@ public final class InfinoWriter {
         Map<String, Long> standing = new HashMap<>();
         // The document each id stands at after the writes so far, for an update to merge into; null once deleted.
         Map<String, String> documents = new HashMap<>();
-        // The document each update became.
+        // The document each update became, and the values the mapper read from it when the bridge refuses it alone.
         Map<Outcome, String> merged = new IdentityHashMap<>();
+        Map<Outcome, String> mapped = new IdentityHashMap<>();
+        // The paths of the fields the mapper ignored in each update's document.
+        Map<Outcome, List<String>> mergedIgnored = new IdentityHashMap<>();
+        // The mapper of the index when its documents may have a field it ignores; parsed against once, at the first update.
+        Map<ShardId, Optional<MapperService>> ignoring = new HashMap<>();
         // The last write of each id that goes to the table.
         Map<String, Outcome> last = new LinkedHashMap<>();
         boolean folded = false;
@@ -629,15 +758,48 @@ public final class InfinoWriter {
                                 if (document == null) {
                                     rejection = new DocumentMissingException(shardId, w.id());
                                 } else {
-                                    String why = InfinoNative.checkDoc(table, document);
+                                    MapperService mappers = ignoring.computeIfAbsent(
+                                        shardId,
+                                        id -> Optional.ofNullable(InfinoIgnored.ignoring(id.getIndex()))
+                                    ).orElse(null);
+                                    List<String> ignored = null;
+                                    try {
+                                        ignored = InfinoIgnored.parse(mappers, shardId.getIndexName(), w.id(), document, w.update().routing());
+                                    } catch (RuntimeException e) {
+                                        // The mapper refuses the merged document, as a shard's would: this update alone fails.
+                                        rejection = e;
+                                    }
+                                    String why = ignored == null ? null : InfinoNative.checkDoc(table, document, ignored);
+                                    String values = null;
                                     if (why != null) {
+                                        try {
+                                            MapperService reading = InfinoMappedValues.mappers(shardId.getIndex());
+                                            values = InfinoMappedValues.parse(reading, s.waiter().indexName(), w.id(), document, w.update().routing());
+                                            if (values != null) {
+                                                why = InfinoNative.checkDoc(table, InfinoMappedValues.framed(document, values), ignored);
+                                            }
+                                        } catch (InfinoNative.InfinoException e) {
+                                            throw e;
+                                        } catch (RuntimeException e) {
+                                            // The mapper refuses the merged document: the update fails as stock fails it.
+                                            rejection = e;
+                                        }
+                                    }
+                                    if (rejection == null && why != null) {
                                         rejection = refused(why);
-                                    } else {
+                                    } else if (rejection == null) {
                                         merged.put(o, document);
+                                        mergedIgnored.put(o, ignored);
+                                        if (values != null) {
+                                            mapped.put(o, values);
+                                        }
                                     }
                                 }
                             } catch (InfinoNative.InfinoException e) {
                                 // Not read or not checked: this update alone fails, with a status that says it may be tried again.
+                                rejection = e;
+                            } catch (MapperParsingException e) {
+                                // An upsert document that is no JSON document: this update alone fails, as stock fails it.
                                 rejection = e;
                             }
                         }
@@ -682,7 +844,7 @@ public final class InfinoWriter {
         try {
             // Both paths release every handle: the engine does on the prepared
             // path, the folded path up front. Nothing after this may release one.
-            appended = folded ? appendFolded(table, staged, last.values(), merged, written, replaced) : appendPrepared(table, staged, written, replaced);
+            appended = folded ? appendFolded(table, staged, last.values(), merged, mergedIgnored, mapped, written, replaced) : appendPrepared(table, staged, written, replaced);
         } finally {
             // A read after the write must see the table, not a prefetched copy.
             InfinoNative.forgetSources(table, last.keySet());
@@ -710,7 +872,7 @@ public final class InfinoWriter {
     }
 
     /**
-     * Stop {@code table}'s batch reading the latest commit ({@link Batch#readLatest})
+     * Stop {@code table}'s batch reading the latest commit ({@link Reads#latest})
      * and let go of the connection it holds for it: this node's copy of the
      * shard is closing. A write here after it reads the table's latest
      * commit again, as a copy that starts writing does.
@@ -721,28 +883,65 @@ public final class InfinoWriter {
             return;
         }
         synchronized (batch.seqLock) {
-            batch.seqAllocation = null;
-            if (!batch.readLatest) {
+            boolean held = batch.reads.latest();
+            batch.reads = Reads.NONE;
+            if (!held) {
                 return;
             }
-            batch.readLatest = false;
             batch.readLatestSet++;
         }
         InfinoNative.releaseLatest();
     }
 
     /**
+     * Whether this node's own connection has read {@code table}'s latest
+     * commit: it started writing the table as the copy {@code allocation}
+     * and an append it started since has committed ({@link Reads#latest}
+     * cleared), so the last commit is its own. Until then, another copy may
+     * have committed last. Takes no lock: a realtime read asks this, and an
+     * append holds the batch's lock through its base reads.
+     */
+    boolean caughtUp(String table, String allocation) {
+        Batch batch = batches.get(table);
+        if (batch == null || allocation == null) {
+            return false;
+        }
+        Reads reads = batch.reads;
+        return !reads.latest() && allocation.equals(reads.allocation());
+    }
+
+    /**
+     * For tests: {@code table}'s reads as an append that starts writing it as
+     * the copy {@code allocation} leaves them, without reading the table's
+     * highest sequence number; the setting it returns is what
+     * {@link #committedUnder} takes.
+     */
+    long readingLatestAs(String table, String allocation) {
+        Batch batch = batches.computeIfAbsent(table, t -> new Batch());
+        synchronized (batch.seqLock) {
+            batch.readLatest();
+            batch.reads = new Reads(allocation, true);
+            return batch.readLatestSet;
+        }
+    }
+
+    /** For tests: an append begun under the reads' setting {@code set} ({@link #readingLatestAs}) has committed to {@code table}. */
+    void committedUnder(String table, long set) {
+        readsCaughtUp(batches.get(table), set);
+    }
+
+    /**
      * This node has committed to the batch's table since its reads were set
-     * to read the latest commit ({@link Batch#readLatest}), as the setting
+     * to read the latest commit ({@link Reads#latest}), as the setting
      * {@code set} counts: its connection now reads from that commit on, so
      * the reads go back to it. A setting made since is left as it is.
      */
     private static void readsCaughtUp(Batch batch, long set) {
         synchronized (batch.seqLock) {
-            if (!batch.readLatest || batch.readLatestSet != set) {
+            if (!batch.reads.latest() || batch.readLatestSet != set) {
                 return;
             }
-            batch.readLatest = false;
+            batch.reads = new Reads(batch.reads.allocation(), false);
         }
         // Outside the lock: the release waits for a latest read opening the
         // connection, which this table's appends need not wait for.
@@ -830,7 +1029,9 @@ public final class InfinoWriter {
     /**
      * The batch's last write of each id, prepared afresh and written as one
      * mutation under the sequence number it was given (a delete writes no
-     * row; an update writes the document {@code merged} holds for it): the
+     * row; an update writes the document {@code merged} holds for it,
+     * without the fields {@code mergedIgnored} lists and with the values
+     * {@code mapped} holds for it): the
      * path for a batch in which one id appears twice, a write meets a
      * conflict and is left out, or an update was merged.
      */
@@ -839,6 +1040,8 @@ public final class InfinoWriter {
         List<Staged> staged,
         Collection<Outcome> last,
         Map<Outcome, String> merged,
+        Map<Outcome, List<String>> mergedIgnored,
+        Map<Outcome, String> mapped,
         Map<Outcome, Written> written,
         List<String> replaced
     ) {
@@ -847,12 +1050,14 @@ public final class InfinoWriter {
         }
         List<String> ids = new ArrayList<>();
         List<String> sources = new ArrayList<>();
+        List<List<String>> ignored = new ArrayList<>();
         List<Long> seqs = new ArrayList<>();
         for (Outcome o : last) {
-            String document = merged.containsKey(o) ? merged.get(o) : o.write().source();
+            String document = merged.containsKey(o) ? InfinoMappedValues.framed(merged.get(o), mapped.get(o)) : o.write().forTable();
             if (document != null) {
                 ids.add(o.write().id());
                 sources.add(document);
+                ignored.add(merged.containsKey(o) ? mergedIgnored.get(o) : o.write().ignored());
                 seqs.add(written.get(o).seq());
             }
         }
@@ -860,7 +1065,7 @@ public final class InfinoWriter {
         if (ids.isEmpty()) {
             return new Appended(refused, false);
         }
-        Pointer prepared = InfinoNative.prepare(table, ids, sources);
+        Pointer prepared = InfinoNative.prepare(table, ids, sources, ignored);
         if (prepared == null) {
             throw new IllegalStateException("[infino] the bridge could not prepare the folded batch for " + table);
         }

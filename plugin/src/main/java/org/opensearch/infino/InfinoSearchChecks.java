@@ -25,19 +25,29 @@ import org.opensearch.index.query.WildcardQueryBuilder;
 import org.opensearch.index.query.functionscore.FunctionScoreQueryBuilder;
 import org.opensearch.index.query.functionscore.ScriptScoreQueryBuilder;
 import org.opensearch.search.SearchService;
+import org.opensearch.search.aggregations.AggregationBuilder;
+import org.opensearch.search.aggregations.bucket.filter.FilterAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.filter.FiltersAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator;
+import org.opensearch.search.aggregations.bucket.terms.SignificantTermsAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.fetch.subphase.highlight.HighlightBuilder;
+import org.opensearch.search.rescore.QueryRescorerBuilder;
 import org.opensearch.search.rescore.RescorerBuilder;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
  * The checks a shard makes of a search as written, made for the indices the
  * plugin serves, whose shards never see it as written: the index's limits on
  * the rescore window, docvalue and script fields and a terms query's terms,
- * and the queries {@code search.allow_expensive_queries: false} refuses.
+ * and the queries {@code search.allow_expensive_queries: false} refuses,
+ * wherever in the search a query sits.
  * Each is refused with stock's message, as a bad request.
  */
 final class InfinoSearchChecks {
@@ -59,9 +69,73 @@ final class InfinoSearchChecks {
             }
             checkRescores(source, settings);
             checkFields(source, settings);
+            if (source.storedFields() != null) {
+                String stored = storedField(properties, source.storedFields().fieldNames());
+                if (stored != null) {
+                    throw storedFieldRefused(stored, index.getIndex().getName());
+                }
+            }
             int maxTerms = IndexSettings.MAX_TERMS_COUNT_SETTING.get(settings);
-            checkQuery(source.query(), maxTerms, allowExpensive, properties);
-            checkQuery(source.postFilter(), maxTerms, allowExpensive, properties);
+            for (QueryBuilder query : queries(source)) {
+                checkQuery(query, maxTerms, allowExpensive, properties);
+            }
+            for (QueryBuilder query : highlightQueries(source)) {
+                checkQuery(query, maxTerms, allowExpensive, properties);
+            }
+        }
+    }
+
+    /**
+     * Every query the search holds, each of which a shard builds and checks:
+     * its query, its post filter, the query of a filter or filters
+     * aggregation and a significant terms aggregation's background filter at
+     * any depth, and a rescore's query.
+     */
+    static List<QueryBuilder> queries(SearchSourceBuilder source) {
+        List<QueryBuilder> all = new ArrayList<>();
+        all.add(source.query());
+        all.add(source.postFilter());
+        if (source.aggregations() != null) {
+            aggregationQueries(source.aggregations().getAggregatorFactories(), all);
+        }
+        if (source.rescores() != null) {
+            for (RescorerBuilder<?> rescore : source.rescores()) {
+                if (rescore instanceof QueryRescorerBuilder query) {
+                    all.add(query.getRescoreQuery());
+                }
+            }
+        }
+        all.removeIf(Objects::isNull);
+        return all;
+    }
+
+    /** The queries a highlight asks to be built, which a shard checks as it checks the search's own. */
+    private static List<QueryBuilder> highlightQueries(SearchSourceBuilder source) {
+        HighlightBuilder highlight = source.highlighter();
+        if (highlight == null) {
+            return List.of();
+        }
+        List<QueryBuilder> all = new ArrayList<>();
+        all.add(highlight.highlightQuery());
+        for (HighlightBuilder.Field field : highlight.fields()) {
+            all.add(field.highlightQuery());
+        }
+        all.removeIf(Objects::isNull);
+        return all;
+    }
+
+    private static void aggregationQueries(Collection<AggregationBuilder> aggregations, List<QueryBuilder> all) {
+        for (AggregationBuilder agg : aggregations) {
+            if (agg instanceof FilterAggregationBuilder filter) {
+                all.add(filter.getFilter());
+            } else if (agg instanceof FiltersAggregationBuilder filters) {
+                for (FiltersAggregator.KeyedFilter keyed : filters.filters()) {
+                    all.add(keyed.filter());
+                }
+            } else if (agg instanceof SignificantTermsAggregationBuilder significant) {
+                all.add(significant.backgroundFilter());
+            }
+            aggregationQueries(agg.getSubAggregations(), all);
         }
     }
 
@@ -108,7 +182,8 @@ final class InfinoSearchChecks {
         if (qb == null) {
             return;
         }
-        if (qb instanceof TermsQueryBuilder terms && terms.values() != null && terms.values().size() > maxTerms) {
+        // A shard answers a terms query on a field its index does not map with nothing, before it counts the terms.
+        if (qb instanceof TermsQueryBuilder terms && terms.values() != null && terms.values().size() > maxTerms && mapped(properties, terms.fieldName())) {
             throw new IllegalArgumentException(
                 "The number of terms [" + terms.values().size() + "] used in the Terms Query request has exceeded the allowed maximum of [" + maxTerms + "]. "
                     + "This maximum can be set by changing the [" + IndexSettings.MAX_TERMS_COUNT_SETTING.getKey() + "] index level setting."
@@ -124,6 +199,11 @@ final class InfinoSearchChecks {
         for (QueryBuilder inner : inner(qb)) {
             checkQuery(inner, maxTerms, allowExpensive, properties);
         }
+    }
+
+    /** Whether the index maps the field: in its mapping, or one of the metadata fields every index has. */
+    private static boolean mapped(Map<String, Object> properties, String name) {
+        return name != null && (name.startsWith("_") || field(properties, name) != null);
     }
 
     /** What stock names a query {@code search.allow_expensive_queries: false} refuses, or null when it does not refuse it. */
@@ -194,6 +274,30 @@ final class InfinoSearchChecks {
     static Map<String, Object> properties(MappingMetadata mapping) {
         Object properties = mapping == null ? null : mapping.sourceAsMap().get("properties");
         return properties instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
+    }
+
+    /**
+     * The first of {@code names} that {@code properties} maps with {@code store: true},
+     * or null when none is. A pattern is not matched: a request for every stored
+     * field, as a dashboard's search sends, reads the source as it always has.
+     */
+    static String storedField(Map<String, Object> properties, List<String> names) {
+        if (names == null) {
+            return null;
+        }
+        for (String name : names) {
+            Map<String, Object> field = Regex.isSimpleMatchPattern(name) ? null : field(properties, name);
+            if (field != null && Boolean.parseBoolean(String.valueOf(field.get("store")))) {
+                return name;
+            }
+        }
+        return null;
+    }
+
+    /** The refusal of a request for the values of {@code field}, which {@code index} stores apart from the source. */
+    static IllegalArgumentException storedFieldRefused(String field, String index) {
+        // The table keeps the source, not the values a stored field holds apart from it.
+        return new IllegalArgumentException("[infino] the stored field [" + field + "] of [" + index + "] is not served by the table; read it from _source");
     }
 
     /** A field's mapping by its full name, through objects and multi-fields, an alias followed; null when it is not mapped. */

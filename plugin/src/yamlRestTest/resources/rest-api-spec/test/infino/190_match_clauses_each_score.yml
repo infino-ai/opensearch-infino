@@ -1,0 +1,471 @@
+---
+"Every match clause of a bool adds its BM25 to the score, as a Lucene twin scores it":
+  # Stock sums the scores of a bool's must and should clauses, so each
+  # match clause adds its own BM25 where it matches, on one field or on
+  # several, and a clause given twice adds twice. Proxy and default mode
+  # rank the same way. Every document is under 16 tokens, so the engine
+  # keeps the same lengths as Lucene and the scores agree.
+  - do:
+      indices.create:
+        index: mc_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { message: { type: text }, title: { type: text } } }
+  - do:
+      indices.create:
+        index: mc_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { message: { type: text }, title: { type: text } } }
+  - do:
+      indices.create:
+        index: mc_default
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { message: { type: text }, title: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        index: mc_luc
+        body:
+          - index: { _id: "d01" }
+          - {"message": "disk error", "title": "disk"}
+          - index: { _id: "d02" }
+          - {"message": "error error error", "title": "error"}
+          - index: { _id: "d03" }
+          - {"message": "disk full now", "title": "error"}
+          - index: { _id: "d04" }
+          - {"message": "error", "title": "disk"}
+          - index: { _id: "d05" }
+          - {"message": "disk disk error log", "title": "log"}
+          - index: { _id: "d06" }
+          - {"message": "log rotated", "title": "disk error"}
+          - index: { _id: "d07" }
+          - {"message": "error on the disk sector seven", "title": "sector"}
+          - index: { _id: "d08" }
+          - {"message": "cpu error", "title": "cpu"}
+          - index: { _id: "d09" }
+          - {"message": "disk", "title": "error report"}
+          - index: { _id: "d10" }
+          - {"message": "fan noise", "title": "fan"}
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: mc_proxy
+        body:
+          - index: { _id: "d01" }
+          - {"message": "disk error", "title": "disk"}
+          - index: { _id: "d02" }
+          - {"message": "error error error", "title": "error"}
+          - index: { _id: "d03" }
+          - {"message": "disk full now", "title": "error"}
+          - index: { _id: "d04" }
+          - {"message": "error", "title": "disk"}
+          - index: { _id: "d05" }
+          - {"message": "disk disk error log", "title": "log"}
+          - index: { _id: "d06" }
+          - {"message": "log rotated", "title": "disk error"}
+          - index: { _id: "d07" }
+          - {"message": "error on the disk sector seven", "title": "sector"}
+          - index: { _id: "d08" }
+          - {"message": "cpu error", "title": "cpu"}
+          - index: { _id: "d09" }
+          - {"message": "disk", "title": "error report"}
+          - index: { _id: "d10" }
+          - {"message": "fan noise", "title": "fan"}
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: mc_default
+        body:
+          - index: { _id: "d01" }
+          - {"message": "disk error", "title": "disk"}
+          - index: { _id: "d02" }
+          - {"message": "error error error", "title": "error"}
+          - index: { _id: "d03" }
+          - {"message": "disk full now", "title": "error"}
+          - index: { _id: "d04" }
+          - {"message": "error", "title": "disk"}
+          - index: { _id: "d05" }
+          - {"message": "disk disk error log", "title": "log"}
+          - index: { _id: "d06" }
+          - {"message": "log rotated", "title": "disk error"}
+          - index: { _id: "d07" }
+          - {"message": "error on the disk sector seven", "title": "sector"}
+          - index: { _id: "d08" }
+          - {"message": "cpu error", "title": "cpu"}
+          - index: { _id: "d09" }
+          - {"message": "disk", "title": "error report"}
+          - index: { _id: "d10" }
+          - {"message": "fan noise", "title": "fan"}
+  - match: { errors: false }
+  # Two matches on one field: d05, with more disks, would lead on the first clause alone.
+  - do:
+      search:
+        index: mc_luc
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"message": "error"}}]}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "d01" }
+  - gt: { hits.hits.0._score: 0.6110 }
+  - lt: { hits.hits.0._score: 0.6130 }
+  - match: { hits.hits.1._id: "d05" }
+  - gt: { hits.hits.1._score: 0.5712 }
+  - lt: { hits.hits.1._score: 0.5732 }
+  - match: { hits.hits.2._id: "d07" }
+  - gt: { hits.hits.2._score: 0.3601 }
+  - lt: { hits.hits.2._score: 0.3621 }
+  - do:
+      search:
+        index: mc_proxy
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"message": "error"}}]}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "d01" }
+  - gt: { hits.hits.0._score: 0.6110 }
+  - lt: { hits.hits.0._score: 0.6130 }
+  - match: { hits.hits.1._id: "d05" }
+  - gt: { hits.hits.1._score: 0.5712 }
+  - lt: { hits.hits.1._score: 0.5732 }
+  - match: { hits.hits.2._id: "d07" }
+  - gt: { hits.hits.2._score: 0.3601 }
+  - lt: { hits.hits.2._score: 0.3621 }
+  - do:
+      search:
+        index: mc_default
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"message": "error"}}]}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "d01" }
+  - gt: { hits.hits.0._score: 0.6110 }
+  - lt: { hits.hits.0._score: 0.6130 }
+  - match: { hits.hits.1._id: "d05" }
+  - gt: { hits.hits.1._score: 0.5712 }
+  - lt: { hits.hits.1._score: 0.5732 }
+  - match: { hits.hits.2._id: "d07" }
+  - gt: { hits.hits.2._score: 0.3601 }
+  - lt: { hits.hits.2._score: 0.3621 }
+  # Matches on different fields each score their own column.
+  - do:
+      search:
+        index: mc_luc
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"title": "error"}}]}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "d09" }
+  - gt: { hits.hits.0._score: 0.7393 }
+  - lt: { hits.hits.0._score: 0.7413 }
+  - match: { hits.hits.1._id: "d03" }
+  - gt: { hits.hits.1._score: 0.7314 }
+  - lt: { hits.hits.1._score: 0.7334 }
+  - do:
+      search:
+        index: mc_proxy
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"title": "error"}}]}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "d09" }
+  - gt: { hits.hits.0._score: 0.7393 }
+  - lt: { hits.hits.0._score: 0.7413 }
+  - match: { hits.hits.1._id: "d03" }
+  - gt: { hits.hits.1._score: 0.7314 }
+  - lt: { hits.hits.1._score: 0.7334 }
+  - do:
+      search:
+        index: mc_default
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"title": "error"}}]}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "d09" }
+  - gt: { hits.hits.0._score: 0.7393 }
+  - lt: { hits.hits.0._score: 0.7413 }
+  - match: { hits.hits.1._id: "d03" }
+  - gt: { hits.hits.1._score: 0.7314 }
+  - lt: { hits.hits.1._score: 0.7334 }
+  # A should match scores where it matches: d01, with both words, outranks d02, with only the must clause's word three times.
+  - do:
+      search:
+        index: mc_luc
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "error"}}], "should": [{"match": {"message": "disk"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: "d01" }
+  - gt: { hits.hits.0._score: 0.6110 }
+  - lt: { hits.hits.0._score: 0.6130 }
+  - match: { hits.hits.1._id: "d05" }
+  - gt: { hits.hits.1._score: 0.5712 }
+  - lt: { hits.hits.1._score: 0.5732 }
+  - match: { hits.hits.2._id: "d02" }
+  - gt: { hits.hits.2._score: 0.3628 }
+  - lt: { hits.hits.2._score: 0.3648 }
+  - match: { hits.hits.3._id: "d07" }
+  - gt: { hits.hits.3._score: 0.3601 }
+  - lt: { hits.hits.3._score: 0.3621 }
+  - match: { hits.hits.4._id: "d04" }
+  - gt: { hits.hits.4._score: 0.3186 }
+  - lt: { hits.hits.4._score: 0.3206 }
+  - match: { hits.hits.5._id: "d08" }
+  - gt: { hits.hits.5._score: 0.2631 }
+  - lt: { hits.hits.5._score: 0.2651 }
+  - do:
+      search:
+        index: mc_proxy
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "error"}}], "should": [{"match": {"message": "disk"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: "d01" }
+  - gt: { hits.hits.0._score: 0.6110 }
+  - lt: { hits.hits.0._score: 0.6130 }
+  - match: { hits.hits.1._id: "d05" }
+  - gt: { hits.hits.1._score: 0.5712 }
+  - lt: { hits.hits.1._score: 0.5732 }
+  - match: { hits.hits.2._id: "d02" }
+  - gt: { hits.hits.2._score: 0.3628 }
+  - lt: { hits.hits.2._score: 0.3648 }
+  - match: { hits.hits.3._id: "d07" }
+  - gt: { hits.hits.3._score: 0.3601 }
+  - lt: { hits.hits.3._score: 0.3621 }
+  - match: { hits.hits.4._id: "d04" }
+  - gt: { hits.hits.4._score: 0.3186 }
+  - lt: { hits.hits.4._score: 0.3206 }
+  - match: { hits.hits.5._id: "d08" }
+  - gt: { hits.hits.5._score: 0.2631 }
+  - lt: { hits.hits.5._score: 0.2651 }
+  - do:
+      search:
+        index: mc_default
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "error"}}], "should": [{"match": {"message": "disk"}}]}}}
+  - match: { hits.total.value: 6 }
+  - length: { hits.hits: 6 }
+  - match: { hits.hits.0._id: "d01" }
+  - gt: { hits.hits.0._score: 0.6110 }
+  - lt: { hits.hits.0._score: 0.6130 }
+  - match: { hits.hits.1._id: "d05" }
+  - gt: { hits.hits.1._score: 0.5712 }
+  - lt: { hits.hits.1._score: 0.5732 }
+  - match: { hits.hits.2._id: "d02" }
+  - gt: { hits.hits.2._score: 0.3628 }
+  - lt: { hits.hits.2._score: 0.3648 }
+  - match: { hits.hits.3._id: "d07" }
+  - gt: { hits.hits.3._score: 0.3601 }
+  - lt: { hits.hits.3._score: 0.3621 }
+  - match: { hits.hits.4._id: "d04" }
+  - gt: { hits.hits.4._score: 0.3186 }
+  - lt: { hits.hits.4._score: 0.3206 }
+  - match: { hits.hits.5._id: "d08" }
+  - gt: { hits.hits.5._score: 0.2631 }
+  - lt: { hits.hits.5._score: 0.2651 }
+  # A clause given twice scores twice.
+  - do:
+      search:
+        index: mc_luc
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"message": "disk"}}]}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d09" }
+  - gt: { hits.hits.0._score: 0.8411 }
+  - lt: { hits.hits.0._score: 0.8431 }
+  - match: { hits.hits.1._id: "d05" }
+  - gt: { hits.hits.1._score: 0.7515 }
+  - lt: { hits.hits.1._score: 0.7535 }
+  - match: { hits.hits.2._id: "d01" }
+  - gt: { hits.hits.2._score: 0.6948 }
+  - lt: { hits.hits.2._score: 0.6968 }
+  - match: { hits.hits.3._id: "d03" }
+  - gt: { hits.hits.3._score: 0.5918 }
+  - lt: { hits.hits.3._score: 0.5938 }
+  - match: { hits.hits.4._id: "d07" }
+  - gt: { hits.hits.4._score: 0.4095 }
+  - lt: { hits.hits.4._score: 0.4115 }
+  - do:
+      search:
+        index: mc_proxy
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"message": "disk"}}]}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d09" }
+  - gt: { hits.hits.0._score: 0.8411 }
+  - lt: { hits.hits.0._score: 0.8431 }
+  - match: { hits.hits.1._id: "d05" }
+  - gt: { hits.hits.1._score: 0.7515 }
+  - lt: { hits.hits.1._score: 0.7535 }
+  - match: { hits.hits.2._id: "d01" }
+  - gt: { hits.hits.2._score: 0.6948 }
+  - lt: { hits.hits.2._score: 0.6968 }
+  - match: { hits.hits.3._id: "d03" }
+  - gt: { hits.hits.3._score: 0.5918 }
+  - lt: { hits.hits.3._score: 0.5938 }
+  - match: { hits.hits.4._id: "d07" }
+  - gt: { hits.hits.4._score: 0.4095 }
+  - lt: { hits.hits.4._score: 0.4115 }
+  - do:
+      search:
+        index: mc_default
+        body: {"size": 10, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"message": "disk"}}]}}}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "d09" }
+  - gt: { hits.hits.0._score: 0.8411 }
+  - lt: { hits.hits.0._score: 0.8431 }
+  - match: { hits.hits.1._id: "d05" }
+  - gt: { hits.hits.1._score: 0.7515 }
+  - lt: { hits.hits.1._score: 0.7535 }
+  - match: { hits.hits.2._id: "d01" }
+  - gt: { hits.hits.2._score: 0.6948 }
+  - lt: { hits.hits.2._score: 0.6968 }
+  - match: { hits.hits.3._id: "d03" }
+  - gt: { hits.hits.3._score: 0.5918 }
+  - lt: { hits.hits.3._score: 0.5938 }
+  - match: { hits.hits.4._id: "d07" }
+  - gt: { hits.hits.4._score: 0.4095 }
+  - lt: { hits.hits.4._score: 0.4115 }
+
+---
+"Only the rows every must match keeps are ranked, however high the rows one clause matches score":
+  # Twelve short documents hold one of the two words and each scores more
+  # on its own clause than s00, the only document holding both, scores in
+  # sum; a page of one is still s00.
+  - do:
+      indices.create:
+        index: mx_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { message: { type: text } } }
+  - do:
+      indices.create:
+        index: mx_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { message: { type: text } } }
+  - do:
+      indices.create:
+        index: mx_default
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { message: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        index: mx_luc
+        body:
+          - index: { _id: "s00" }
+          - {"message": "alpha beta gamma delta epsilon zeta eta theta iota disk error"}
+          - index: { _id: "s01" }
+          - {"message": "error"}
+          - index: { _id: "s02" }
+          - {"message": "disk"}
+          - index: { _id: "s03" }
+          - {"message": "error"}
+          - index: { _id: "s04" }
+          - {"message": "disk"}
+          - index: { _id: "s05" }
+          - {"message": "error"}
+          - index: { _id: "s06" }
+          - {"message": "disk"}
+          - index: { _id: "s07" }
+          - {"message": "error fan"}
+          - index: { _id: "s08" }
+          - {"message": "disk fan"}
+          - index: { _id: "s09" }
+          - {"message": "error fan"}
+          - index: { _id: "s10" }
+          - {"message": "disk fan"}
+          - index: { _id: "s11" }
+          - {"message": "error fan"}
+          - index: { _id: "s12" }
+          - {"message": "disk fan"}
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: mx_proxy
+        body:
+          - index: { _id: "s00" }
+          - {"message": "alpha beta gamma delta epsilon zeta eta theta iota disk error"}
+          - index: { _id: "s01" }
+          - {"message": "error"}
+          - index: { _id: "s02" }
+          - {"message": "disk"}
+          - index: { _id: "s03" }
+          - {"message": "error"}
+          - index: { _id: "s04" }
+          - {"message": "disk"}
+          - index: { _id: "s05" }
+          - {"message": "error"}
+          - index: { _id: "s06" }
+          - {"message": "disk"}
+          - index: { _id: "s07" }
+          - {"message": "error fan"}
+          - index: { _id: "s08" }
+          - {"message": "disk fan"}
+          - index: { _id: "s09" }
+          - {"message": "error fan"}
+          - index: { _id: "s10" }
+          - {"message": "disk fan"}
+          - index: { _id: "s11" }
+          - {"message": "error fan"}
+          - index: { _id: "s12" }
+          - {"message": "disk fan"}
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        index: mx_default
+        body:
+          - index: { _id: "s00" }
+          - {"message": "alpha beta gamma delta epsilon zeta eta theta iota disk error"}
+          - index: { _id: "s01" }
+          - {"message": "error"}
+          - index: { _id: "s02" }
+          - {"message": "disk"}
+          - index: { _id: "s03" }
+          - {"message": "error"}
+          - index: { _id: "s04" }
+          - {"message": "disk"}
+          - index: { _id: "s05" }
+          - {"message": "error"}
+          - index: { _id: "s06" }
+          - {"message": "disk"}
+          - index: { _id: "s07" }
+          - {"message": "error fan"}
+          - index: { _id: "s08" }
+          - {"message": "disk fan"}
+          - index: { _id: "s09" }
+          - {"message": "error fan"}
+          - index: { _id: "s10" }
+          - {"message": "disk fan"}
+          - index: { _id: "s11" }
+          - {"message": "error fan"}
+          - index: { _id: "s12" }
+          - {"message": "disk fan"}
+  - match: { errors: false }
+  # The one document matching both clauses, in a page of one.
+  - do:
+      search:
+        index: mx_luc
+        body: {"size": 1, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"message": "error"}}]}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "s00" }
+  - gt: { hits.hits.0._score: 0.2166 }
+  - lt: { hits.hits.0._score: 0.2186 }
+  - do:
+      search:
+        index: mx_proxy
+        body: {"size": 1, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"message": "error"}}]}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "s00" }
+  - gt: { hits.hits.0._score: 0.2166 }
+  - lt: { hits.hits.0._score: 0.2186 }
+  - do:
+      search:
+        index: mx_default
+        body: {"size": 1, "query": {"bool": {"must": [{"match": {"message": "disk"}}, {"match": {"message": "error"}}]}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "s00" }
+  - gt: { hits.hits.0._score: 0.2166 }
+  - lt: { hits.hits.0._score: 0.2186 }

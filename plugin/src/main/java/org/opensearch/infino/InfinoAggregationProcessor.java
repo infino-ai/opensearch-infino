@@ -398,6 +398,19 @@ public class InfinoAggregationProcessor {
         return p;
     }
 
+    /**
+     * Refuses an aggregation on a field whose column does not hold the values
+     * it aggregates: a keyword whose normalizer changes the indexed terms, which
+     * the table keeps as written, so buckets would group the written values; or
+     * a multi-field the table keeps no column of.
+     */
+    static void refuseUnserved(String what, String table, String field) {
+        String why = InfinoNative.unservedField(table, field);
+        if (why != null) {
+            throw new Unsupported(what + " on [" + field + "], " + why + ", is not served");
+        }
+    }
+
     /** An aggregation the table cannot serve; the request fails with this reason. */
     static final class Unsupported extends IllegalArgumentException {
         Unsupported(String message) {
@@ -829,6 +842,7 @@ public class InfinoAggregationProcessor {
         static Source sourceOf(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols, String table, long now) {
             Column c = null;
             if (b.field() != null) {
+                refuseUnserved("aggregation [" + b.getName() + "]", table, b.field());
                 c = InfinoSearch.columnFor(cols, b.field());
                 if (c == null) {
                     if (!InfinoNative.maps(table, b.field())) {
@@ -1510,7 +1524,7 @@ public class InfinoAggregationProcessor {
             );
         }
 
-        /** The columns a hit row carries beyond the id and the source. */
+        /** The columns a hit row carries beyond the id and the source: its sort values and its ignored fields. */
         List<String> rowColumns() {
             List<String> out = new ArrayList<>();
             for (SortSpec s : sorts) {
@@ -1518,6 +1532,9 @@ public class InfinoAggregationProcessor {
                     continue; // the id is selected already
                 }
                 out.add(s.expr() + " AS " + quoteIdent(s.name()));
+            }
+            if (InfinoQueryTranslator.ignoredColumn(cols) != null) {
+                out.add(InfinoQueryTranslator.ignoredPaths());
             }
             return out;
         }
@@ -2653,6 +2670,7 @@ public class InfinoAggregationProcessor {
             Column column = null;
             Source unmapped = null;
             if (s.field() != null) {
+                refuseUnserved("aggregation [" + agg + "] source [" + s.name() + "]", table, s.field());
                 column = InfinoSearch.columnFor(cols, s.field());
                 if (column == null && !InfinoNative.maps(table, s.field())) {
                     // As for any aggregation: a field the index does not map has no value here.

@@ -133,14 +133,16 @@ final class InfinoSql {
     /**
      * The columns a default-mode index's engine stamps its rows with for its
      * own bookkeeping (the routing a row was written with, the write that
-     * created it, a commit's newest operation, the index generation): no
-     * field of a document, never read.
+     * created it, a commit's newest operation, the index generation), and
+     * the fields of a document the mapper ignored: no field of a document,
+     * never read.
      */
     private static final Set<String> STAMPS = Set.of(
         InfinoQueryTranslator.ROUTING,
         InfinoQueryTranslator.SEQ,
         InfinoQueryTranslator.OP,
-        InfinoQueryTranslator.GEN
+        InfinoQueryTranslator.GEN,
+        InfinoQueryTranslator.IGNORED
     );
     /** What separates the parts of a masked-field expression, as the security plugin splits it. */
     private static final String MASK_SEPARATOR = "::";
