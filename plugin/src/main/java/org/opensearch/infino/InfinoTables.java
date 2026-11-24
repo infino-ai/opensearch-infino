@@ -258,6 +258,20 @@ public final class InfinoTables {
         namingOf(metadata);
     }
 
+    /**
+     * The name of the index {@code table} backs (see {@link #owner}), as the
+     * metadata the node last applied names it; null when no live index is
+     * served from it, or before the node has applied any.
+     */
+    String indexOf(String table) {
+        Naming known = naming;
+        if (known == null) {
+            return null;
+        }
+        Index owner = owner(known.byTable().getOrDefault(table, List.of()));
+        return owner == null ? null : owner.getName();
+    }
+
     /** Whether every table of {@code md} is its own, as {@code metadata} names them (see {@link #claim}). */
     boolean owns(IndexMetadata md, Metadata metadata) {
         if (!free(md)) {

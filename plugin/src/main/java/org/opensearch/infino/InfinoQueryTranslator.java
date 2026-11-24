@@ -1169,6 +1169,12 @@ final class InfinoQueryTranslator {
      * rule or an alias filter, which the user did not write, compares them.
      */
     Column column(String field) {
+        if (InfinoIndexField.NAME.equals(field)) {
+            // The field has no column: read as one, it would be unmapped and match nothing.
+            throw new IllegalArgumentException(
+                "[infino] this query on [" + field + "] is not served; term, terms, prefix, wildcard, match, match_phrase and exists are"
+            );
+        }
         refuseColumnless(field);
         Column c = resolve(field);
         if (c != null && c.masked() && !trusted) {
@@ -1323,6 +1329,59 @@ final class InfinoQueryTranslator {
     }
 
     /**
+     * The rows a clause on the {@code _index} metadata field matches, as
+     * stock's: the field has one value over the table, its index's name
+     * ({@link InfinoIndexField}), so a term, terms, prefix or wildcard
+     * matches every row or none. A match or match_phrase reads the field
+     * as a keyword reads it, as one term. Null for a clause on another
+     * field; any other clause on the field is refused by {@link #column}.
+     */
+    private String indexField(QueryBuilder qb) {
+        if (qb instanceof TermQueryBuilder t && InfinoIndexField.NAME.equals(t.fieldName())) {
+            return indexMatches(t.value(), t.caseInsensitive());
+        }
+        if (qb instanceof TermsQueryBuilder ts && InfinoIndexField.NAME.equals(ts.fieldName())) {
+            for (Object value : termsOf(ts)) {
+                if (InfinoIndexField.matches(table, String.valueOf(value), false)) {
+                    return ALL;
+                }
+            }
+            return NONE;
+        }
+        if (qb instanceof PrefixQueryBuilder p && InfinoIndexField.NAME.equals(p.fieldName())) {
+            return indexMatches(p.value() + "*", p.caseInsensitive());
+        }
+        if (qb instanceof WildcardQueryBuilder w && InfinoIndexField.NAME.equals(w.fieldName())) {
+            return indexMatches(w.value(), w.caseInsensitive());
+        }
+        if (qb instanceof MatchQueryBuilder m && InfinoIndexField.NAME.equals(m.fieldName())) {
+            unfuzzy("match", m.fieldName(), m.fuzziness());
+            return indexMatches(m.value(), false);
+        }
+        if (qb instanceof MatchPhraseQueryBuilder mp && InfinoIndexField.NAME.equals(mp.fieldName())) {
+            return indexMatches(mp.value(), false);
+        }
+        return null;
+    }
+
+    /** Every row when {@code value} on {@code _index} matches the table's index ({@link InfinoIndexField#matches}), else none. */
+    private String indexMatches(Object value, boolean caseInsensitive) {
+        return InfinoIndexField.matches(table, String.valueOf(value), caseInsensitive) ? ALL : NONE;
+    }
+
+    /** The values a terms query names: its own, or a terms lookup's, which only a trusted query (a security rule) reads. */
+    private List<Object> termsOf(TermsQueryBuilder ts) {
+        refuseBitmap(ts);
+        if (ts.termsLookup() == null) {
+            return ts.values();
+        }
+        if (!trusted) {
+            throw new IllegalArgumentException("[infino] a terms lookup into [" + ts.termsLookup().index() + "] is not served by the table");
+        }
+        return InfinoTermsLookup.values(ts.termsLookup());
+    }
+
+    /**
      * Refuses a query on a field the index maps but the table keeps no
      * column of (a multi-field of another type or with a normalizer), or
      * whose values the mapping normalizes: answered over the raw values or
@@ -1382,6 +1441,10 @@ final class InfinoQueryTranslator {
         if (qb instanceof MatchNoneQueryBuilder) {
             return NONE;
         }
+        String onIndex = indexField(qb);
+        if (onIndex != null) {
+            return onIndex;
+        }
         if (qb instanceof TermQueryBuilder t) {
             // A term on a text column is one indexed term, as in Lucene; on an exact column the value.
             Column c = column(t.fieldName());
@@ -1396,14 +1459,7 @@ final class InfinoQueryTranslator {
             return equality(t.fieldName(), t.value());
         }
         if (qb instanceof TermsQueryBuilder ts) {
-            refuseBitmap(ts);
-            if (ts.termsLookup() != null) {
-                if (!trusted) {
-                    throw new IllegalArgumentException("[infino] a terms lookup into [" + ts.termsLookup().index() + "] is not served by the table");
-                }
-                return inList(ts.fieldName(), InfinoTermsLookup.values(ts.termsLookup()));
-            }
-            return inList(ts.fieldName(), ts.values());
+            return inList(ts.fieldName(), termsOf(ts));
         }
         if (qb instanceof RangeQueryBuilder r) {
             return range(r);
@@ -3118,6 +3174,9 @@ final class InfinoQueryTranslator {
             if (w.field() == null) {
                 return anyOf(targets, c -> termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*")));
             }
+            if (InfinoIndexField.NAME.equals(w.field())) {
+                return indexMatches(w.pattern(), false);
+            }
             Column c = column(w.field());
             if (c == null) {
                 return NONE;
@@ -3268,6 +3327,10 @@ final class InfinoQueryTranslator {
         }
         if ("_id".equals(a.field())) {
             return OSID + " = " + literal(a.text());
+        }
+        if (InfinoIndexField.NAME.equals(a.field())) {
+            // As stock: a term or phrase is one value, a wildcard one a pattern, either matched against the index.
+            return indexMatches(a.text(), false);
         }
         Column c = column(a.field());
         if (c == null) {

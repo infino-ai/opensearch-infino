@@ -1,0 +1,807 @@
+# The _index metadata field holds the name of the index a document is in,
+# one value for every document of an index. Queries and aggregations on it
+# answer as on a Lucene twin, in default and proxy mode: a term, terms,
+# prefix, wildcard, match_phrase or query_string matches every document of
+# the index or none; value_count counts every document (what the SQL
+# plugin's COUNT(*) sends); a terms aggregation keys one bucket per index; a
+# cardinality counts the indices with hits; a filters bucket on it is per
+# index. Across a data stream's backing indices each index answers with its
+# own name, and a term naming the data stream matches all of them. A query
+# or aggregation on the field that cannot be answered so is refused.
+---
+"_index in one index, Lucene twin":
+  - do:
+      indices.create:
+        index: ixf_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { service: { type: keyword }, latency_ms: { type: long }, msg: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixf_luc
+        body:
+          - index: { _id: "1" }
+          - { service: payments, latency_ms: 120, msg: slow call }
+          - index: { _id: "2" }
+          - { service: payments, latency_ms: 80, msg: fast call }
+          - index: { _id: "3" }
+          - { service: payments, latency_ms: 300, msg: slow call }
+          - index: { _id: "4" }
+          - { service: search, latency_ms: 150, msg: slow query }
+          - index: { _id: "5" }
+          - { service: search, latency_ms: 20, msg: fast query }
+  - match: { errors: false }
+
+  # What the SQL plugin sends for SELECT COUNT(*) FROM ixf_luc WHERE service='payments' AND latency_ms>100.
+  - do:
+      search:
+        index: ixf_luc
+        body:
+          size: 0
+          query: { bool: { filter: [ { term: { service: payments } }, { range: { latency_ms: { gt: 100 } } } ] } }
+          aggregations: { "COUNT(*)": { value_count: { field: _index } } }
+  - match: { aggregations.COUNT(*).value: 2 }
+
+  # ... and for SELECT service, COUNT(*) FROM ixf_luc GROUP BY service.
+  - do:
+      search:
+        index: ixf_luc
+        body:
+          size: 0
+          aggregations:
+            composite_buckets:
+              composite:
+                size: 1000
+                sources: [ { service: { terms: { field: service, missing_bucket: true, missing_order: first, order: asc } } } ]
+              aggregations: { "COUNT(*)": { value_count: { field: _index } } }
+  - length: { aggregations.composite_buckets.buckets: 2 }
+  - match: { aggregations.composite_buckets.buckets.0.key.service: payments }
+  - match: { aggregations.composite_buckets.buckets.0.COUNT(*).value: 3 }
+  - match: { aggregations.composite_buckets.buckets.1.key.service: search }
+  - match: { aggregations.composite_buckets.buckets.1.COUNT(*).value: 2 }
+
+  # A terms bucket for the index, a cardinality of 1, and filters on it.
+  - do:
+      search:
+        index: ixf_luc
+        body:
+          size: 0
+          aggregations:
+            by_index: { terms: { field: _index }, aggregations: { slow: { filter: { range: { latency_ms: { gt: 100 } } } } } }
+            indices: { cardinality: { field: _index } }
+            each:
+              filters:
+                filters:
+                  own: { term: { _index: ixf_luc } }
+                  other: { term: { _index: ixf_none } }
+  - length: { aggregations.by_index.buckets: 1 }
+  - match: { aggregations.by_index.buckets.0.key: ixf_luc }
+  - match: { aggregations.by_index.buckets.0.doc_count: 5 }
+  - match: { aggregations.by_index.buckets.0.slow.doc_count: 3 }
+  - match: { aggregations.indices.value: 1 }
+  - match: { aggregations.each.buckets.own.doc_count: 5 }
+  - match: { aggregations.each.buckets.other.doc_count: 0 }
+
+  # A composite source on it keys the index.
+  - do:
+      search:
+        index: ixf_luc
+        body:
+          size: 0
+          aggregations:
+            c: { composite: { sources: [ { idx: { terms: { field: _index } } }, { s: { terms: { field: service } } } ] } }
+  - length: { aggregations.c.buckets: 2 }
+  - match: { aggregations.c.buckets.0.key.idx: ixf_luc }
+  - match: { aggregations.c.buckets.0.key.s: payments }
+  - match: { aggregations.c.buckets.0.doc_count: 3 }
+
+  # Queries: every document of the index or none.
+  - do:
+      count: { index: ixf_luc, body: { query: { term: { _index: ixf_luc } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_luc, body: { query: { term: { _index: ixf_none } } } }
+  - match: { count: 0 }
+  - do:
+      count: { index: ixf_luc, body: { query: { term: { _index: { value: IXF_LUC, case_insensitive: true } } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_luc, body: { query: { terms: { _index: [ ixf_none, ixf_luc ] } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_luc, body: { query: { prefix: { _index: ixf_ } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_luc, body: { query: { wildcard: { _index: "*_luc" } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_luc, body: { query: { wildcard: { _index: "*_none" } } } }
+  - match: { count: 0 }
+  - do:
+      count: { index: ixf_luc, body: { query: { bool: { filter: [ { match_phrase: { _index: ixf_luc } }, { term: { service: search } } ] } } } }
+  - match: { count: 2 }
+  - do:
+      count: { index: ixf_luc, body: { query: { bool: { must_not: [ { term: { _index: ixf_luc } } ] } } } }
+  - match: { count: 0 }
+  - do:
+      count: { index: ixf_luc, body: { query: { query_string: { query: "_index:ixf_luc AND service:payments" } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixf_luc, body: { query: { query_string: { query: "_index:ixf_* AND msg:slow" } } } }
+  - match: { count: 3 }
+
+  # A range on it is an error, as on the twin.
+  - do:
+      catch: bad_request
+      search: { index: ixf_luc, body: { query: { range: { _index: { gte: a } } } } }
+---
+"_index in one index, default mode":
+  - do:
+      indices.create:
+        index: ixf_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { service: { type: keyword }, latency_ms: { type: long }, msg: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixf_def
+        body:
+          - index: { _id: "1" }
+          - { service: payments, latency_ms: 120, msg: slow call }
+          - index: { _id: "2" }
+          - { service: payments, latency_ms: 80, msg: fast call }
+          - index: { _id: "3" }
+          - { service: payments, latency_ms: 300, msg: slow call }
+          - index: { _id: "4" }
+          - { service: search, latency_ms: 150, msg: slow query }
+          - index: { _id: "5" }
+          - { service: search, latency_ms: 20, msg: fast query }
+  - match: { errors: false }
+
+  # What the SQL plugin sends for SELECT COUNT(*) FROM ixf_def WHERE service='payments' AND latency_ms>100.
+  - do:
+      search:
+        index: ixf_def
+        body:
+          size: 0
+          query: { bool: { filter: [ { term: { service: payments } }, { range: { latency_ms: { gt: 100 } } } ] } }
+          aggregations: { "COUNT(*)": { value_count: { field: _index } } }
+  - match: { aggregations.COUNT(*).value: 2 }
+
+  # ... and for SELECT service, COUNT(*) FROM ixf_def GROUP BY service.
+  - do:
+      search:
+        index: ixf_def
+        body:
+          size: 0
+          aggregations:
+            composite_buckets:
+              composite:
+                size: 1000
+                sources: [ { service: { terms: { field: service, missing_bucket: true, missing_order: first, order: asc } } } ]
+              aggregations: { "COUNT(*)": { value_count: { field: _index } } }
+  - length: { aggregations.composite_buckets.buckets: 2 }
+  - match: { aggregations.composite_buckets.buckets.0.key.service: payments }
+  - match: { aggregations.composite_buckets.buckets.0.COUNT(*).value: 3 }
+  - match: { aggregations.composite_buckets.buckets.1.key.service: search }
+  - match: { aggregations.composite_buckets.buckets.1.COUNT(*).value: 2 }
+
+  # A terms bucket for the index, a cardinality of 1, and filters on it.
+  - do:
+      search:
+        index: ixf_def
+        body:
+          size: 0
+          aggregations:
+            by_index: { terms: { field: _index }, aggregations: { slow: { filter: { range: { latency_ms: { gt: 100 } } } } } }
+            indices: { cardinality: { field: _index } }
+            each:
+              filters:
+                filters:
+                  own: { term: { _index: ixf_def } }
+                  other: { term: { _index: ixf_none } }
+  - length: { aggregations.by_index.buckets: 1 }
+  - match: { aggregations.by_index.buckets.0.key: ixf_def }
+  - match: { aggregations.by_index.buckets.0.doc_count: 5 }
+  - match: { aggregations.by_index.buckets.0.slow.doc_count: 3 }
+  - match: { aggregations.indices.value: 1 }
+  - match: { aggregations.each.buckets.own.doc_count: 5 }
+  - match: { aggregations.each.buckets.other.doc_count: 0 }
+
+  # A composite source on it keys the index.
+  - do:
+      search:
+        index: ixf_def
+        body:
+          size: 0
+          aggregations:
+            c: { composite: { sources: [ { idx: { terms: { field: _index } } }, { s: { terms: { field: service } } } ] } }
+  - length: { aggregations.c.buckets: 2 }
+  - match: { aggregations.c.buckets.0.key.idx: ixf_def }
+  - match: { aggregations.c.buckets.0.key.s: payments }
+  - match: { aggregations.c.buckets.0.doc_count: 3 }
+
+  # Queries: every document of the index or none.
+  - do:
+      count: { index: ixf_def, body: { query: { term: { _index: ixf_def } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_def, body: { query: { term: { _index: ixf_none } } } }
+  - match: { count: 0 }
+  - do:
+      count: { index: ixf_def, body: { query: { term: { _index: { value: IXF_DEF, case_insensitive: true } } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_def, body: { query: { terms: { _index: [ ixf_none, ixf_def ] } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_def, body: { query: { prefix: { _index: ixf_ } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_def, body: { query: { wildcard: { _index: "*_def" } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_def, body: { query: { wildcard: { _index: "*_none" } } } }
+  - match: { count: 0 }
+  - do:
+      count: { index: ixf_def, body: { query: { bool: { filter: [ { match_phrase: { _index: ixf_def } }, { term: { service: search } } ] } } } }
+  - match: { count: 2 }
+  - do:
+      count: { index: ixf_def, body: { query: { bool: { must_not: [ { term: { _index: ixf_def } } ] } } } }
+  - match: { count: 0 }
+  - do:
+      count: { index: ixf_def, body: { query: { query_string: { query: "_index:ixf_def AND service:payments" } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixf_def, body: { query: { query_string: { query: "_index:ixf_* AND msg:slow" } } } }
+  - match: { count: 3 }
+
+  # A range on it is an error, as on the twin.
+  - do:
+      catch: bad_request
+      search: { index: ixf_def, body: { query: { range: { _index: { gte: a } } } } }
+---
+"_index in one index, proxy mode":
+  - do:
+      indices.create:
+        index: ixf_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { service: { type: keyword }, latency_ms: { type: long }, msg: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixf_prx
+        body:
+          - index: { _id: "1" }
+          - { service: payments, latency_ms: 120, msg: slow call }
+          - index: { _id: "2" }
+          - { service: payments, latency_ms: 80, msg: fast call }
+          - index: { _id: "3" }
+          - { service: payments, latency_ms: 300, msg: slow call }
+          - index: { _id: "4" }
+          - { service: search, latency_ms: 150, msg: slow query }
+          - index: { _id: "5" }
+          - { service: search, latency_ms: 20, msg: fast query }
+  - match: { errors: false }
+
+  # What the SQL plugin sends for SELECT COUNT(*) FROM ixf_prx WHERE service='payments' AND latency_ms>100.
+  - do:
+      search:
+        index: ixf_prx
+        body:
+          size: 0
+          query: { bool: { filter: [ { term: { service: payments } }, { range: { latency_ms: { gt: 100 } } } ] } }
+          aggregations: { "COUNT(*)": { value_count: { field: _index } } }
+  - match: { aggregations.COUNT(*).value: 2 }
+
+  # ... and for SELECT service, COUNT(*) FROM ixf_prx GROUP BY service.
+  - do:
+      search:
+        index: ixf_prx
+        body:
+          size: 0
+          aggregations:
+            composite_buckets:
+              composite:
+                size: 1000
+                sources: [ { service: { terms: { field: service, missing_bucket: true, missing_order: first, order: asc } } } ]
+              aggregations: { "COUNT(*)": { value_count: { field: _index } } }
+  - length: { aggregations.composite_buckets.buckets: 2 }
+  - match: { aggregations.composite_buckets.buckets.0.key.service: payments }
+  - match: { aggregations.composite_buckets.buckets.0.COUNT(*).value: 3 }
+  - match: { aggregations.composite_buckets.buckets.1.key.service: search }
+  - match: { aggregations.composite_buckets.buckets.1.COUNT(*).value: 2 }
+
+  # A terms bucket for the index, a cardinality of 1, and filters on it.
+  - do:
+      search:
+        index: ixf_prx
+        body:
+          size: 0
+          aggregations:
+            by_index: { terms: { field: _index }, aggregations: { slow: { filter: { range: { latency_ms: { gt: 100 } } } } } }
+            indices: { cardinality: { field: _index } }
+            each:
+              filters:
+                filters:
+                  own: { term: { _index: ixf_prx } }
+                  other: { term: { _index: ixf_none } }
+  - length: { aggregations.by_index.buckets: 1 }
+  - match: { aggregations.by_index.buckets.0.key: ixf_prx }
+  - match: { aggregations.by_index.buckets.0.doc_count: 5 }
+  - match: { aggregations.by_index.buckets.0.slow.doc_count: 3 }
+  - match: { aggregations.indices.value: 1 }
+  - match: { aggregations.each.buckets.own.doc_count: 5 }
+  - match: { aggregations.each.buckets.other.doc_count: 0 }
+
+  # A composite source on it keys the index.
+  - do:
+      search:
+        index: ixf_prx
+        body:
+          size: 0
+          aggregations:
+            c: { composite: { sources: [ { idx: { terms: { field: _index } } }, { s: { terms: { field: service } } } ] } }
+  - length: { aggregations.c.buckets: 2 }
+  - match: { aggregations.c.buckets.0.key.idx: ixf_prx }
+  - match: { aggregations.c.buckets.0.key.s: payments }
+  - match: { aggregations.c.buckets.0.doc_count: 3 }
+
+  # Queries: every document of the index or none.
+  - do:
+      count: { index: ixf_prx, body: { query: { term: { _index: ixf_prx } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_prx, body: { query: { term: { _index: ixf_none } } } }
+  - match: { count: 0 }
+  - do:
+      count: { index: ixf_prx, body: { query: { term: { _index: { value: IXF_PRX, case_insensitive: true } } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_prx, body: { query: { terms: { _index: [ ixf_none, ixf_prx ] } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_prx, body: { query: { prefix: { _index: ixf_ } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_prx, body: { query: { wildcard: { _index: "*_prx" } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixf_prx, body: { query: { wildcard: { _index: "*_none" } } } }
+  - match: { count: 0 }
+  - do:
+      count: { index: ixf_prx, body: { query: { bool: { filter: [ { match_phrase: { _index: ixf_prx } }, { term: { service: search } } ] } } } }
+  - match: { count: 2 }
+  - do:
+      count: { index: ixf_prx, body: { query: { bool: { must_not: [ { term: { _index: ixf_prx } } ] } } } }
+  - match: { count: 0 }
+  - do:
+      count: { index: ixf_prx, body: { query: { query_string: { query: "_index:ixf_prx AND service:payments" } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixf_prx, body: { query: { query_string: { query: "_index:ixf_* AND msg:slow" } } } }
+  - match: { count: 3 }
+
+  # A range on it is an error, as on the twin.
+  - do:
+      catch: bad_request
+      search: { index: ixf_prx, body: { query: { range: { _index: { gte: a } } } } }
+---
+"_index across a data stream's backing indices, Lucene twin":
+  - do:
+      indices.put_index_template:
+        name: ixfds-luc-template
+        body:
+          index_patterns: [ "ixfds-luc*" ]
+          data_stream: {}
+          priority: 200
+          template:
+            settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+            mappings: { properties: { service: { type: keyword }, user: { type: keyword }, latency_ms: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: ixfds-luc }
+          - { "@timestamp": "2026-11-24T00:00:01Z", service: payments, user: u1, latency_ms: 120 }
+          - create: { _index: ixfds-luc }
+          - { "@timestamp": "2026-11-24T00:00:02Z", service: search, user: u2, latency_ms: 80 }
+  - match: { errors: false }
+  - do:
+      indices.rollover:
+        alias: ixfds-luc
+  - match: { new_index: ".ds-ixfds-luc-000002" }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: ixfds-luc }
+          - { "@timestamp": "2026-11-24T00:00:03Z", service: payments, user: u1, latency_ms: 300 }
+          - create: { _index: ixfds-luc }
+          - { "@timestamp": "2026-11-24T00:00:04Z", service: payments, user: u3, latency_ms: 150 }
+          - create: { _index: ixfds-luc }
+          - { "@timestamp": "2026-11-24T00:00:05Z", service: search, user: u3, latency_ms: 20 }
+  - match: { errors: false }
+
+  # Each backing index answers with its own name, and the counts add up.
+  - do:
+      search:
+        index: ixfds-luc
+        body:
+          size: 0
+          aggregations:
+            "COUNT(*)": { value_count: { field: _index } }
+            by_index: { terms: { field: _index, order: { _key: asc } } }
+            indices: { cardinality: { field: _index } }
+            each:
+              filters:
+                filters:
+                  first: { term: { _index: ".ds-ixfds-luc-000001" } }
+                  stream: { term: { _index: ixfds-luc } }
+                  pattern: { wildcard: { _index: ".ds-ixfds-luc-*2" } }
+                  hidden: { wildcard: { _index: "*-000002" } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.COUNT(*).value: 5 }
+  - length: { aggregations.by_index.buckets: 2 }
+  - match: { aggregations.by_index.buckets.0.key: ".ds-ixfds-luc-000001" }
+  - match: { aggregations.by_index.buckets.0.doc_count: 2 }
+  - match: { aggregations.by_index.buckets.1.key: ".ds-ixfds-luc-000002" }
+  - match: { aggregations.by_index.buckets.1.doc_count: 3 }
+  - match: { aggregations.indices.value: 2 }
+  - match: { aggregations.each.buckets.first.doc_count: 2 }
+  - match: { aggregations.each.buckets.stream.doc_count: 5 }
+  - match: { aggregations.each.buckets.pattern.doc_count: 3 }
+  # A pattern expands to visible indices only, unless it starts with a dot: the backing indices are hidden.
+  - match: { aggregations.each.buckets.hidden.doc_count: 0 }
+
+  # A cardinality counts the indices with hits only, and one under an _index
+  # bucket counts that index's values alone.
+  - do:
+      search:
+        index: ixfds-luc
+        body:
+          size: 0
+          query: { range: { latency_ms: { gte: 150 } } }
+          aggregations:
+            indices: { cardinality: { field: _index } }
+            by_index: { terms: { field: _index, order: { _key: asc } }, aggregations: { users: { cardinality: { field: user } } } }
+  - match: { hits.total.value: 2 }
+  - match: { aggregations.indices.value: 1 }
+  - length: { aggregations.by_index.buckets: 1 }
+  - match: { aggregations.by_index.buckets.0.key: ".ds-ixfds-luc-000002" }
+  - match: { aggregations.by_index.buckets.0.users.value: 2 }
+  - do:
+      search:
+        index: ixfds-luc
+        body:
+          size: 0
+          aggregations:
+            by_index: { terms: { field: _index, order: { _key: asc } }, aggregations: { users: { cardinality: { field: user } } } }
+            users: { cardinality: { field: user } }
+  - match: { aggregations.by_index.buckets.0.users.value: 2 }
+  - match: { aggregations.by_index.buckets.1.users.value: 2 }
+  - match: { aggregations.users.value: 3 }
+
+  # The SQL plugin's GROUP BY over the stream.
+  - do:
+      search:
+        index: ixfds-luc
+        body:
+          size: 0
+          aggregations:
+            composite_buckets:
+              composite:
+                size: 1000
+                sources: [ { service: { terms: { field: service, missing_bucket: true, missing_order: first, order: asc } } } ]
+              aggregations: { "COUNT(*)": { value_count: { field: _index } } }
+  - match: { aggregations.composite_buckets.buckets.0.key.service: payments }
+  - match: { aggregations.composite_buckets.buckets.0.COUNT(*).value: 3 }
+  - match: { aggregations.composite_buckets.buckets.1.key.service: search }
+  - match: { aggregations.composite_buckets.buckets.1.COUNT(*).value: 2 }
+
+  # Queries naming a backing index, the data stream, or a pattern.
+  - do:
+      count: { index: ixfds-luc, body: { query: { term: { _index: ".ds-ixfds-luc-000002" } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfds-luc, body: { query: { term: { _index: ixfds-luc } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixfds-luc, body: { query: { bool: { must_not: [ { terms: { _index: [ ".ds-ixfds-luc-000001" ] } } ], filter: [ { term: { service: payments } } ] } } } }
+  - match: { count: 2 }
+---
+"_index across a data stream's backing indices, default mode":
+  - do:
+      indices.put_index_template:
+        name: ixfds-def-template
+        body:
+          index_patterns: [ "ixfds-def*" ]
+          data_stream: {}
+          priority: 200
+          template:
+            settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+            mappings: { properties: { service: { type: keyword }, user: { type: keyword }, latency_ms: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: ixfds-def }
+          - { "@timestamp": "2026-11-24T00:00:01Z", service: payments, user: u1, latency_ms: 120 }
+          - create: { _index: ixfds-def }
+          - { "@timestamp": "2026-11-24T00:00:02Z", service: search, user: u2, latency_ms: 80 }
+  - match: { errors: false }
+  - do:
+      indices.rollover:
+        alias: ixfds-def
+  - match: { new_index: ".ds-ixfds-def-000002" }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: ixfds-def }
+          - { "@timestamp": "2026-11-24T00:00:03Z", service: payments, user: u1, latency_ms: 300 }
+          - create: { _index: ixfds-def }
+          - { "@timestamp": "2026-11-24T00:00:04Z", service: payments, user: u3, latency_ms: 150 }
+          - create: { _index: ixfds-def }
+          - { "@timestamp": "2026-11-24T00:00:05Z", service: search, user: u3, latency_ms: 20 }
+  - match: { errors: false }
+
+  # Each backing index answers with its own name, and the counts add up.
+  - do:
+      search:
+        index: ixfds-def
+        body:
+          size: 0
+          aggregations:
+            "COUNT(*)": { value_count: { field: _index } }
+            by_index: { terms: { field: _index, order: { _key: asc } } }
+            indices: { cardinality: { field: _index } }
+            each:
+              filters:
+                filters:
+                  first: { term: { _index: ".ds-ixfds-def-000001" } }
+                  stream: { term: { _index: ixfds-def } }
+                  pattern: { wildcard: { _index: ".ds-ixfds-def-*2" } }
+                  hidden: { wildcard: { _index: "*-000002" } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.COUNT(*).value: 5 }
+  - length: { aggregations.by_index.buckets: 2 }
+  - match: { aggregations.by_index.buckets.0.key: ".ds-ixfds-def-000001" }
+  - match: { aggregations.by_index.buckets.0.doc_count: 2 }
+  - match: { aggregations.by_index.buckets.1.key: ".ds-ixfds-def-000002" }
+  - match: { aggregations.by_index.buckets.1.doc_count: 3 }
+  - match: { aggregations.indices.value: 2 }
+  - match: { aggregations.each.buckets.first.doc_count: 2 }
+  - match: { aggregations.each.buckets.stream.doc_count: 5 }
+  - match: { aggregations.each.buckets.pattern.doc_count: 3 }
+  # A pattern expands to visible indices only, unless it starts with a dot: the backing indices are hidden.
+  - match: { aggregations.each.buckets.hidden.doc_count: 0 }
+
+  # A cardinality counts the indices with hits only, and one under an _index
+  # bucket counts that index's values alone.
+  - do:
+      search:
+        index: ixfds-def
+        body:
+          size: 0
+          query: { range: { latency_ms: { gte: 150 } } }
+          aggregations:
+            indices: { cardinality: { field: _index } }
+            by_index: { terms: { field: _index, order: { _key: asc } }, aggregations: { users: { cardinality: { field: user } } } }
+  - match: { hits.total.value: 2 }
+  - match: { aggregations.indices.value: 1 }
+  - length: { aggregations.by_index.buckets: 1 }
+  - match: { aggregations.by_index.buckets.0.key: ".ds-ixfds-def-000002" }
+  - match: { aggregations.by_index.buckets.0.users.value: 2 }
+  - do:
+      search:
+        index: ixfds-def
+        body:
+          size: 0
+          aggregations:
+            by_index: { terms: { field: _index, order: { _key: asc } }, aggregations: { users: { cardinality: { field: user } } } }
+            users: { cardinality: { field: user } }
+  - match: { aggregations.by_index.buckets.0.users.value: 2 }
+  - match: { aggregations.by_index.buckets.1.users.value: 2 }
+  - match: { aggregations.users.value: 3 }
+
+  # The SQL plugin's GROUP BY over the stream.
+  - do:
+      search:
+        index: ixfds-def
+        body:
+          size: 0
+          aggregations:
+            composite_buckets:
+              composite:
+                size: 1000
+                sources: [ { service: { terms: { field: service, missing_bucket: true, missing_order: first, order: asc } } } ]
+              aggregations: { "COUNT(*)": { value_count: { field: _index } } }
+  - match: { aggregations.composite_buckets.buckets.0.key.service: payments }
+  - match: { aggregations.composite_buckets.buckets.0.COUNT(*).value: 3 }
+  - match: { aggregations.composite_buckets.buckets.1.key.service: search }
+  - match: { aggregations.composite_buckets.buckets.1.COUNT(*).value: 2 }
+
+  # Queries naming a backing index, the data stream, or a pattern.
+  - do:
+      count: { index: ixfds-def, body: { query: { term: { _index: ".ds-ixfds-def-000002" } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfds-def, body: { query: { term: { _index: ixfds-def } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixfds-def, body: { query: { bool: { must_not: [ { terms: { _index: [ ".ds-ixfds-def-000001" ] } } ], filter: [ { term: { service: payments } } ] } } } }
+  - match: { count: 2 }
+---
+"_index across a data stream's backing indices, proxy mode":
+  - do:
+      indices.put_index_template:
+        name: ixfds-prx-template
+        body:
+          index_patterns: [ "ixfds-prx*" ]
+          data_stream: {}
+          priority: 200
+          template:
+            settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+            mappings: { properties: { service: { type: keyword }, user: { type: keyword }, latency_ms: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: ixfds-prx }
+          - { "@timestamp": "2026-11-24T00:00:01Z", service: payments, user: u1, latency_ms: 120 }
+          - create: { _index: ixfds-prx }
+          - { "@timestamp": "2026-11-24T00:00:02Z", service: search, user: u2, latency_ms: 80 }
+  - match: { errors: false }
+  - do:
+      indices.rollover:
+        alias: ixfds-prx
+  - match: { new_index: ".ds-ixfds-prx-000002" }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - create: { _index: ixfds-prx }
+          - { "@timestamp": "2026-11-24T00:00:03Z", service: payments, user: u1, latency_ms: 300 }
+          - create: { _index: ixfds-prx }
+          - { "@timestamp": "2026-11-24T00:00:04Z", service: payments, user: u3, latency_ms: 150 }
+          - create: { _index: ixfds-prx }
+          - { "@timestamp": "2026-11-24T00:00:05Z", service: search, user: u3, latency_ms: 20 }
+  - match: { errors: false }
+
+  # Each backing index answers with its own name, and the counts add up.
+  - do:
+      search:
+        index: ixfds-prx
+        body:
+          size: 0
+          aggregations:
+            "COUNT(*)": { value_count: { field: _index } }
+            by_index: { terms: { field: _index, order: { _key: asc } } }
+            indices: { cardinality: { field: _index } }
+            each:
+              filters:
+                filters:
+                  first: { term: { _index: ".ds-ixfds-prx-000001" } }
+                  stream: { term: { _index: ixfds-prx } }
+                  pattern: { wildcard: { _index: ".ds-ixfds-prx-*2" } }
+                  hidden: { wildcard: { _index: "*-000002" } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.COUNT(*).value: 5 }
+  - length: { aggregations.by_index.buckets: 2 }
+  - match: { aggregations.by_index.buckets.0.key: ".ds-ixfds-prx-000001" }
+  - match: { aggregations.by_index.buckets.0.doc_count: 2 }
+  - match: { aggregations.by_index.buckets.1.key: ".ds-ixfds-prx-000002" }
+  - match: { aggregations.by_index.buckets.1.doc_count: 3 }
+  - match: { aggregations.indices.value: 2 }
+  - match: { aggregations.each.buckets.first.doc_count: 2 }
+  - match: { aggregations.each.buckets.stream.doc_count: 5 }
+  - match: { aggregations.each.buckets.pattern.doc_count: 3 }
+  # A pattern expands to visible indices only, unless it starts with a dot: the backing indices are hidden.
+  - match: { aggregations.each.buckets.hidden.doc_count: 0 }
+
+  # A cardinality counts the indices with hits only, and one under an _index
+  # bucket counts that index's values alone.
+  - do:
+      search:
+        index: ixfds-prx
+        body:
+          size: 0
+          query: { range: { latency_ms: { gte: 150 } } }
+          aggregations:
+            indices: { cardinality: { field: _index } }
+            by_index: { terms: { field: _index, order: { _key: asc } }, aggregations: { users: { cardinality: { field: user } } } }
+  - match: { hits.total.value: 2 }
+  - match: { aggregations.indices.value: 1 }
+  - length: { aggregations.by_index.buckets: 1 }
+  - match: { aggregations.by_index.buckets.0.key: ".ds-ixfds-prx-000002" }
+  - match: { aggregations.by_index.buckets.0.users.value: 2 }
+  - do:
+      search:
+        index: ixfds-prx
+        body:
+          size: 0
+          aggregations:
+            by_index: { terms: { field: _index, order: { _key: asc } }, aggregations: { users: { cardinality: { field: user } } } }
+            users: { cardinality: { field: user } }
+  - match: { aggregations.by_index.buckets.0.users.value: 2 }
+  - match: { aggregations.by_index.buckets.1.users.value: 2 }
+  - match: { aggregations.users.value: 3 }
+
+  # The SQL plugin's GROUP BY over the stream.
+  - do:
+      search:
+        index: ixfds-prx
+        body:
+          size: 0
+          aggregations:
+            composite_buckets:
+              composite:
+                size: 1000
+                sources: [ { service: { terms: { field: service, missing_bucket: true, missing_order: first, order: asc } } } ]
+              aggregations: { "COUNT(*)": { value_count: { field: _index } } }
+  - match: { aggregations.composite_buckets.buckets.0.key.service: payments }
+  - match: { aggregations.composite_buckets.buckets.0.COUNT(*).value: 3 }
+  - match: { aggregations.composite_buckets.buckets.1.key.service: search }
+  - match: { aggregations.composite_buckets.buckets.1.COUNT(*).value: 2 }
+
+  # Queries naming a backing index, the data stream, or a pattern.
+  - do:
+      count: { index: ixfds-prx, body: { query: { term: { _index: ".ds-ixfds-prx-000002" } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfds-prx, body: { query: { term: { _index: ixfds-prx } } } }
+  - match: { count: 5 }
+  - do:
+      count: { index: ixfds-prx, body: { query: { bool: { must_not: [ { terms: { _index: [ ".ds-ixfds-prx-000001" ] } } ], filter: [ { term: { service: payments } } ] } } } }
+  - match: { count: 2 }
+---
+"A query or aggregation on _index that cannot be answered as a Lucene twin is refused":
+  - do:
+      indices.create:
+        index: ixf_refused_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { service: { type: keyword } } }
+  - do:
+      indices.create:
+        index: ixf_refused_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { service: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixf_refused_prx
+        body:
+          - index: { _id: "1" }
+          - { service: payments }
+  - do:
+      bulk:
+        refresh: true
+        index: ixf_refused_def
+        body:
+          - index: { _id: "1" }
+          - { service: payments }
+  - do:
+      catch: /\[infino\] this query on \[_index\] is not served/
+      search: { index: ixf_refused_prx, body: { query: { regexp: { _index: "ixf.*" } } } }
+  # In default mode the shard's own parse refuses it first, as stock's does.
+  - do:
+      catch: bad_request
+      search: { index: ixf_refused_def, body: { query: { regexp: { _index: "ixf.*" } } } }
+  - do:
+      catch: /\[infino\] this query on \[_index\] is not served/
+      search: { index: ixf_refused_prx, body: { query: { query_string: { query: "_index:/ixf.*/" } } } }
+  - do:
+      catch: /\[infino\] aggregation \[h\] of type \[histogram\] on \[_index\] is not served/
+      search: { index: ixf_refused_prx, body: { size: 0, aggregations: { h: { histogram: { field: _index, interval: 1 } } } } }
+  - do:
+      catch: /\[infino\] aggregation \[t\] has a script beside \[_index\]/
+      search: { index: ixf_refused_prx, body: { size: 0, aggregations: { t: { terms: { field: _index, script: { source: "_value" } } } } } }
+  - do:
+      catch: /\[infino\] aggregation \[t\] has a script beside \[_index\]/
+      search: { index: ixf_refused_def, body: { size: 0, aggregations: { t: { terms: { field: _index, script: { source: "_value" } } } } } }

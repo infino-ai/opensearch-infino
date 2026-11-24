@@ -205,6 +205,8 @@ public class InfinoAggregationProcessor {
     private static final String NULL_KEY = "\u0000";
     /** The column of {@link #unionOf} naming which shard's table a row came from. */
     private static final String SHARD_COLUMN = "_infino_shard";
+    /** The column of {@link #unionOf} holding the name of the index a row's table backs: its {@code _index}. */
+    private static final String INDEX_COLUMN = "_infino_index";
     /** The alias of {@link #unionOf}'s relation. */
     private static final String UNION_ALIAS = "_infino_shards";
     /** The alias of a significant_terms level's background rows. */
@@ -430,7 +432,19 @@ public class InfinoAggregationProcessor {
      */
     Counted evaluate(Collection<AggregationBuilder> builders, Plan plan, Long total) {
         Translation q = plan.query();
-        return evaluate(builders, plan, List.of(plan.table()), q.from(), q.where(), predicates(plan), () -> InfinoSearch.count(plan.table(), q), q, shardOfMany, total);
+        return evaluate(
+            builders,
+            plan,
+            plan.cols(),
+            List.of(plan.table()),
+            q.from(),
+            q.where(),
+            predicates(plan),
+            () -> InfinoSearch.count(plan.table(), q),
+            q,
+            shardOfMany,
+            total
+        );
     }
 
     /**
@@ -441,29 +455,37 @@ public class InfinoAggregationProcessor {
      * values, which cannot be merged from the shards' parts; the
      * coordinating node answers such an aggregation once this way (see
      * {@link InfinoExactAggregation}). {@code plan} is the first shard's,
-     * which the aggregations are planned against.
+     * which the aggregations are planned against. {@code shardIndices} names
+     * the index of each plan's table, which an aggregation on
+     * {@code _index} reads per row.
      */
-    Counted evaluateOver(Collection<AggregationBuilder> builders, Plan plan, List<Plan> shardPlans) {
-        String from = unionOf(shardPlans);
+    Counted evaluateOver(Collection<AggregationBuilder> builders, Plan plan, List<Plan> shardPlans, List<String> shardIndices) {
+        String from = unionOf(shardPlans, shardIndices);
         List<String> shardTables = new ArrayList<>();
         for (Plan p : shardPlans) {
             shardTables.add(p.table());
         }
         Function<QueryBuilder, String> predicates = qb -> perShard(qb, shardPlans);
         Supplier<Long> counter = () -> asLong(oneRow("SELECT COUNT(*) AS c FROM " + from).get("c"));
+        // The aggregations are planned against the first plan's columns, and
+        // read _index from the union's own column rather than as that plan's name.
+        Map<String, Column> cols = new LinkedHashMap<>(plan.cols());
+        cols.put(INDEX_COLUMN, new Column(INDEX_COLUMN, "str", false, false));
         // One answer for the whole index: each terms level at its final size.
-        return evaluate(builders, plan, shardTables, from, InfinoQueryTranslator.ALL, predicates, counter, null, false, null);
+        return evaluate(builders, plan, cols, shardTables, from, InfinoQueryTranslator.ALL, predicates, counter, null, false, null);
     }
 
     /**
      * The aggregations over {@code from WHERE where}. When the count is
      * needed it comes from a top terms level's own groups if the relation is
      * the plan's own query ({@code own}, null when it is not; see
-     * {@link #totalFromTopTerms}), else from {@code counter}.
+     * {@link #totalFromTopTerms}), else from {@code counter}. The
+     * aggregations are planned against {@code cols}.
      */
     private Counted evaluate(
         Collection<AggregationBuilder> builders,
         Plan plan,
+        Map<String, Column> cols,
         List<String> tables,
         String from,
         String where,
@@ -479,7 +501,7 @@ public class InfinoAggregationProcessor {
         List<Spec> specs = new ArrayList<>();
         int position = 0;
         for (AggregationBuilder b : builders) {
-            specs.add(Spec.of(b, plan.cols(), plan.table(), predicates, plan.access(), position++, shardSized, plan.nowMillis()));
+            specs.add(Spec.of(b, cols, plan.table(), predicates, plan.access(), position++, shardSized, plan.nowMillis()));
         }
         // A metric over a field some document gives several values reads each
         // document's figures over them, joined in once for the whole request.
@@ -556,10 +578,11 @@ public class InfinoAggregationProcessor {
     /**
      * The rows of each plan's relation, every column any of the tables has
      * but vectors (which no aggregation reads), as one relation: a column a
-     * table lacks is null in its rows, and {@link #SHARD_COLUMN} says which
-     * plan a row came from.
+     * table lacks is null in its rows, {@link #SHARD_COLUMN} says which plan
+     * a row came from, and {@link #INDEX_COLUMN} holds its index's name, of
+     * {@code indices} (one per plan).
      */
-    static String unionOf(List<Plan> plans) {
+    static String unionOf(List<Plan> plans, List<String> indices) {
         Map<String, Column> all = new LinkedHashMap<>();
         List<Map<String, Column>> each = new ArrayList<>();
         for (Plan p : plans) {
@@ -575,6 +598,7 @@ public class InfinoAggregationProcessor {
         for (int i = 0; i < plans.size(); i++) {
             List<String> select = new ArrayList<>();
             select.add(i + " AS " + quoteIdent(SHARD_COLUMN));
+            select.add(literal(indices.get(i)) + " AS " + quoteIdent(INDEX_COLUMN));
             for (String name : all.keySet()) {
                 select.add(each.get(i).containsKey(name) ? quoteIdent(name) : "NULL AS " + quoteIdent(name));
             }
@@ -840,6 +864,16 @@ public class InfinoAggregationProcessor {
          * cannot be read.
          */
         static Source sourceOf(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols, String table, long now) {
+            if (InfinoIndexField.NAME.equals(b.field())) {
+                if (b.script() != null) {
+                    throw new Unsupported("aggregation [" + b.getName() + "] has a script beside [" + b.field() + "], which is not served");
+                }
+                if (!(b instanceof TermsAggregationBuilder || b instanceof ValueCountAggregationBuilder || b instanceof CardinalityAggregationBuilder)) {
+                    throw new Unsupported("aggregation [" + b.getName() + "] of type [" + b.getType() + "] on [" + b.field() + "] is not served");
+                }
+                // Every document has one, so a missing value never stands in.
+                return indexSource(cols, table);
+            }
             Column c = null;
             if (b.field() != null) {
                 refuseUnserved("aggregation [" + b.getName() + "]", table, b.field());
@@ -861,6 +895,24 @@ public class InfinoAggregationProcessor {
                 throw new Unsupported("aggregation [" + b.getName() + "] needs a field or a script");
             }
             return withMissing(b, Source.of(c, cols, table), now);
+        }
+
+        /**
+         * What an aggregation on the {@code _index} metadata field reads, as
+         * stock reads it: the name of the index each row belongs to. Over one
+         * table that is one value ({@link InfinoIndexField}), so a terms level
+         * keys one bucket holding every row, a value_count counts every row
+         * and a cardinality is 1 where any row is. Over several shards' tables
+         * read as one ({@link #unionOf}) each row's own index's, from the
+         * column the relation carries it in.
+         */
+        static Source indexSource(Map<String, Column> cols, String table) {
+            String label = "[" + InfinoIndexField.NAME + "]";
+            Column perRow = cols.get(INDEX_COLUMN);
+            if (perRow != null) {
+                return new Source(quoteIdent(perRow.name()), SqlType.STRING, label, null);
+            }
+            return new Source(literal(InfinoIndexField.indexOf(table)), SqlType.STRING, label, null);
         }
 
         /**
@@ -2708,7 +2760,13 @@ public class InfinoAggregationProcessor {
         private static CompositeSource source(String agg, CompositeValuesSourceBuilder<?> s, Map<String, Column> cols, String table, long now) {
             Column column = null;
             Source unmapped = null;
-            if (s.field() != null) {
+            Source onIndex = null;
+            if (InfinoIndexField.NAME.equals(s.field())) {
+                if (s.script() != null || !(s instanceof TermsValuesSourceBuilder)) {
+                    throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] on [" + s.field() + "] is not served; a terms source without a script is");
+                }
+                onIndex = Spec.indexSource(cols, table);
+            } else if (s.field() != null) {
                 refuseUnserved("aggregation [" + agg + "] source [" + s.name() + "]", table, s.field());
                 column = InfinoSearch.columnFor(cols, s.field());
                 if (column == null && !InfinoNative.maps(table, s.field())) {
@@ -2721,7 +2779,9 @@ public class InfinoAggregationProcessor {
                 }
             }
             Source c;
-            if (unmapped != null) {
+            if (onIndex != null) {
+                c = onIndex;
+            } else if (unmapped != null) {
                 c = unmapped;
             } else if (s.script() != null) {
                 // A script reads values themselves, so it sees no masked column, the value script's included.

@@ -165,30 +165,49 @@ final class InfinoExactAggregation extends InternalAggregation {
         // One order whatever order the shards answered in, so the statement is the same.
         all.sort(Comparator.comparing(Part::index).thenComparing(Part::table));
         boolean severalIndices = all.stream().map(Part::index).distinct().count() > 1;
-        if (severalIndices && holdsTopHits(builder)) {
-            throw new InfinoAggregationProcessor.Unsupported("top_hits under [" + getName() + "] over several indices is not served");
+        if (severalIndices) {
+            refuseTopHitsOverSeveral(builder);
         }
         List<InfinoSearch.Plan> plans = new ArrayList<>(all.size());
+        List<String> indices = new ArrayList<>(all.size());
         for (Part p : all) {
             // Fail closed: a part of an index the routing node did not record the user's access to is not read.
             InfinoAccess access = routed.access().get(p.index());
             if (access == null) {
                 throw InfinoAccess.refused("the access to [" + p.index() + "] was not recorded for the search");
             }
-            // The aggregation is planned under one index's access (its masked keys, a
-            // significant_terms background's rule), which would read the others' rows
-            // under the wrong rules.
-            if (severalIndices && !access.unrestricted()) {
-                throw InfinoAccess.refused(
-                    "[" + getName() + "] over several indices, one of them [" + p.index() + "] under a document, field or masking rule, is not served"
-                );
+            if (severalIndices) {
+                refuseRestrictedOverSeveral(builder, p.index(), access);
             }
             InfinoSearch.Plan plan = InfinoSearch.plan(p.table(), routed.source(), routed.nowMillis(), access);
             plans.add(InfinoQueryPhaseSearcher.visibleTo(plan, p.cut(), p.generation()));
+            indices.add(p.index());
         }
         Part first = all.get(0);
         InfinoAggregationProcessor processor = new InfinoAggregationProcessor(new Index(first.index(), first.indexUuid()), false);
-        return processor.evaluateOver(List.of(builder), plans.get(0), plans).aggregations().get(getName());
+        return processor.evaluateOver(List.of(builder), plans.get(0), plans, indices).aggregations().get(getName());
+    }
+
+    /** Refuses an aggregation over several indices' rows read as one when a top_hits is under it: its hits name one index. */
+    static void refuseTopHitsOverSeveral(AggregationBuilder builder) {
+        if (holdsTopHits(builder)) {
+            throw new InfinoAggregationProcessor.Unsupported("top_hits under [" + builder.getName() + "] over several indices is not served");
+        }
+    }
+
+    /**
+     * Refuses an aggregation over several indices' rows read as one when
+     * {@code index} is read under a document, field or masking rule: the
+     * aggregation is planned under one index's access (its masked keys, a
+     * significant_terms background's rule), which would read the others'
+     * rows under the wrong rules.
+     */
+    static void refuseRestrictedOverSeveral(AggregationBuilder builder, String index, InfinoAccess access) {
+        if (!access.unrestricted()) {
+            throw InfinoAccess.refused(
+                "[" + builder.getName() + "] over several indices, one of them [" + index + "] under a document, field or masking rule, is not served"
+            );
+        }
     }
 
     /** Whether {@code builder} or one under it is a top_hits, whose hits name one index. */
