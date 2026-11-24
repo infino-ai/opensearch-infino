@@ -60,7 +60,7 @@ use infino::serde_json::{self, json, Map, Value};
 use infino::{
     connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions,
     Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions,
-    SchemaError, SchemaPatch, Supertable,
+    SchemaError, SchemaPatch, Supertable, TableSchema,
 };
 use rayon::prelude::*;
 
@@ -448,6 +448,12 @@ fn out_json(v: Value) -> *mut c_char {
 pub struct Bridge {
     conn: Connection,
     tables: RwLock<HashMap<String, Supertable>>,
+    /// The schema document of each table [`Bridge::tables`] holds a handle
+    /// to, on a hosted connection, where reading it is a request to the
+    /// service ([`Bridge::table_schema`]). Kept and dropped with the handle,
+    /// whose own Arrow schema is fixed when it is opened, so the two always
+    /// describe the same version of the table.
+    schemas: RwLock<HashMap<String, TableSchema>>,
     /// Whether the connection forwards to the hosted service (an `http(s)://`
     /// URI) rather than running the engine over storage of its own.
     hosted: bool,
@@ -722,9 +728,33 @@ impl Bridge {
         Ok(t)
     }
 
+    /// The schema document of `name`. On a hosted connection, reading it is
+    /// a request to the service, so it is kept until the table's handle is
+    /// dropped ([`Bridge::forget`], which every change to the table's schema
+    /// here makes): preparing a batch then waits on the service only right
+    /// after such a change, not for each batch. A connection over storage
+    /// answers from the handle it holds open, and is asked each time.
+    fn table_schema(&self, name: &str) -> Result<TableSchema, InfinoError> {
+        if !self.hosted {
+            return self.conn.schema(name);
+        }
+        if let Some(s) = self.schemas.read().map_err(poisoned)?.get(name) {
+            return Ok(s.clone());
+        }
+        let s = self.conn.schema(name)?;
+        self.schemas
+            .write()
+            .map_err(poisoned)?
+            .insert(name.to_string(), s.clone());
+        Ok(s)
+    }
+
     fn forget(&self, name: &str) {
         if let Ok(mut tables) = self.tables.write() {
             tables.remove(name);
+        }
+        if let Ok(mut schemas) = self.schemas.write() {
+            schemas.remove(name);
         }
     }
 
@@ -900,6 +930,7 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
     Ok(Bridge {
         conn,
         tables: RwLock::new(HashMap::new()),
+        schemas: RwLock::new(HashMap::new()),
         hosted,
         kept: RwLock::new(HashMap::new()),
         stamps: RwLock::new(HashMap::new()),
@@ -1693,7 +1724,11 @@ fn declare_table(
                 let patch = SchemaPatch::new(patches);
                 let gate = bridge.gate(name);
                 let _pass = gate.whole();
-                waiting(|| table.apply_schema(&patch, None)).map_err(|e| e.to_string())?;
+                let applied = waiting(|| table.apply_schema(&patch, None));
+                // A batch prepared while this ran may have cached the handle (and
+                // schema) from before the change; drop it either way.
+                bridge.forget(name);
+                applied.map_err(|e| e.to_string())?;
             }
             Ok(json!({ "created": false, "added": added }))
         }
@@ -2942,7 +2977,7 @@ unsafe fn prepare(
     // it is refused as the append it prepares is.
     conn.refuse_write(name)?;
     let table = conn.table(name).map_err(|e| e.to_string())?;
-    let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
+    let table_schema = conn.table_schema(name).map_err(|e| e.to_string())?;
     let schema = table.schema();
     let kept = conn.kept(name);
     let engine = conn.engine_columns(name);
@@ -3009,7 +3044,7 @@ unsafe fn prepare(
     // the rows are then converted against the schema that holds it.
     let (table_schema, schema) = if ensure_list_columns(conn, name, &schema, &rows)? {
         (
-            conn.conn.schema(name).map_err(|e| e.to_string())?,
+            conn.table_schema(name).map_err(|e| e.to_string())?,
             conn.table(name).map_err(|e| e.to_string())?.schema(),
         )
     } else {
@@ -4761,6 +4796,34 @@ mod tests {
         let out = ensure(h, MAPPING);
         assert!(out.contains("\"created\":true"), "{out}");
         h
+    }
+
+    /// On a hosted connection the schema document a batch is prepared
+    /// against is kept with the table's handle, so preparing batch after
+    /// batch asks the service nothing; a declaration that changes the table
+    /// drops it, and the next batch reads the new one.
+    #[test]
+    fn a_hosted_tables_schema_is_kept_until_a_declaration_changes_it() {
+        let h = open_logs();
+        let names = |s: &TableSchema| s.fields().iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+        // Storage answers the same document a hosted service would; the flag
+        // is what makes the bridge keep it.
+        unsafe { (*h).hosted = true };
+        let bridge = unsafe { &*h };
+        let before = names(&bridge.table_schema("logs").unwrap());
+        // A column added behind the bridge is not seen: the document is kept.
+        let behind = SchemaPatch::new(vec![FieldPatch::named("behind".to_string())
+            .with_type(DataType::Int64)
+            .with_nullable(true)]);
+        let table = bridge.conn.open_table("logs").unwrap();
+        table.apply_schema(&behind, None).unwrap();
+        assert_eq!(names(&bridge.table_schema("logs").unwrap()), before);
+        // A declaration that adds a column drops it.
+        let out = ensure(h, r#"{"properties":{"added":{"type":"long"}}}"#);
+        assert!(!out.contains("error"), "{out}");
+        let after = names(&bridge.table_schema("logs").unwrap());
+        assert!(after.contains(&"added".to_string()), "{after:?}");
+        assert!(after.contains(&"behind".to_string()), "{after:?}");
     }
 
     /// An array of arrays at a path without a column (a geo_point given

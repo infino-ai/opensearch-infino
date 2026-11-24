@@ -681,7 +681,13 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         return List.of(appendPool(settings));
     }
 
-    /** {@link #APPEND_POOL}: as many threads as the node's {@code write} pool has, and their size settings under {@code thread_pool.infino_append}. */
+    /**
+     * {@link #APPEND_POOL}: one thread per allocated processor, the {@code write}
+     * pool's default size, sized with its own settings under
+     * {@code thread_pool.infino_append}. A node that sets
+     * {@code thread_pool.write.size} does not carry that over: set
+     * {@code thread_pool.infino_append.size} as well.
+     */
     static ExecutorBuilder<?> appendPool(Settings settings) {
         return new FixedExecutorBuilder(
             settings,

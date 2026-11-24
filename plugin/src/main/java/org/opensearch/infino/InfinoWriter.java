@@ -269,7 +269,13 @@ public final class InfinoWriter {
      * {@code maxAppends} appends to one table run at once. They run on the
      * append pool, apart from the write pool the bulks that feed them are
      * prepared on, and are kept under its size, half of it by default, so
-     * one table's appends leave threads for another's.
+     * one table's stalled appends leave threads for another's. That holds
+     * for one stalled table only: two stalled tables fill the pool, and a
+     * healthy table's appends then queue behind theirs (on a node with two
+     * processors, one append per table fills it). A hosted service that
+     * stalls usually stalls every table of the account, so expect that
+     * case: what the pool keeps free is the {@code write} pool, not the
+     * other tables' appends.
      */
     InfinoWriter(Supplier<Executor> flushes, int maxBatchDocs, long maxBatchBytes, int maxAppends) {
         this.flushes = flushes;

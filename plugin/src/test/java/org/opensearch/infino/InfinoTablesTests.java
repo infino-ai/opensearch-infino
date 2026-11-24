@@ -34,6 +34,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Which index a table backs when two live indices name it, and the tables no index is served from. */
 public class InfinoTablesTests extends OpenSearchTestCase {
@@ -388,6 +389,45 @@ public class InfinoTablesTests extends OpenSearchTestCase {
         } finally {
             release.countDown();
             threads.shutdownNow();
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /**
+     * A declaration during which another connection opens (the account
+     * changed while the service was being asked) was made over the old
+     * connection, which the new one does not share: it is not noted, so the
+     * table's next use declares it again over the new one.
+     */
+    public void testADeclarationOverAConnectionReplacedMidCallIsNotNoted() {
+        InfinoNative.Target other = new InfinoNative.Target("memory://other", null, false, "memory://other");
+        AtomicInteger declarations = new AtomicInteger();
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> {
+            switch (method.getName()) {
+                case "infino_open_with":
+                    return new Memory(1);
+                case "infino_ensure_table":
+                    if (declarations.getAndIncrement() == 0) {
+                        // Another connection opens while the first declaration runs.
+                        InfinoNative.configure(other);
+                    }
+                    return nativeString("{}");
+                default:
+                    return null;
+            }
+        }));
+        try {
+            InfinoTables tables = new InfinoTables();
+            IndexMetadata logs = index("logs", "u1", 1);
+            assertEquals("os_logs", tables.ensure(logs));
+            assertEquals(1, declarations.get());
+            assertFalse(tables.declaredAt("os_logs", logs.getMappingVersion()));
+            // The next use declares it again, over the new connection, and that one is noted.
+            assertEquals("os_logs", tables.ensure(logs));
+            assertEquals(2, declarations.get());
+            assertTrue(tables.declaredAt("os_logs", logs.getMappingVersion()));
+        } finally {
+            InfinoNative.configure(InfinoNative.Target.node());
             InfinoNative.useLib(null);
         }
     }
