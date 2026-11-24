@@ -289,4 +289,32 @@ public class InfinoEngineTests extends OpenSearchTestCase {
         m.setByte(bytes.length, (byte) 0);
         return m;
     }
+
+    /**
+     * While commits take nothing, a full batch waits before it commits
+     * again: a second, doubling, and never more than thirty seconds.
+     */
+    public void testAFullBatchWaitsLongerAfterEachStalledCommit() {
+        long second = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
+        assertEquals(second, InfinoEngine.stallBackoffNanos(1));
+        assertEquals(2 * second, InfinoEngine.stallBackoffNanos(2));
+        assertEquals(16 * second, InfinoEngine.stallBackoffNanos(5));
+        assertEquals(30 * second, InfinoEngine.stallBackoffNanos(6));
+        assertEquals(30 * second, InfinoEngine.stallBackoffNanos(1_000));
+        assertEquals(second, InfinoEngine.stallBackoffNanos(0));
+    }
+
+    /**
+     * A replay stops only once its commits have stalled twice in a row and
+     * it holds more writes than a client's write is refused past: a replay
+     * whose commit failed once, or that holds little, goes on.
+     */
+    public void testAReplayStopsOnlyWhenItsCommitsStallAndItsWritesPileUp() {
+        long many = 4L * Integer.getInteger("infino.engine.batch.docs", 50_000);
+        assertFalse(InfinoEngine.replayStops(1, many, 0));
+        assertFalse(InfinoEngine.replayStops(2, many - 1, 0));
+        assertTrue(InfinoEngine.replayStops(2, many, 0));
+        assertTrue(InfinoEngine.replayStops(2, 1, 4L * (64L << 20)));
+        assertFalse(InfinoEngine.replayStops(0, Long.MAX_VALUE, Long.MAX_VALUE));
+    }
 }
