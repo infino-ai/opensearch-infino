@@ -208,6 +208,10 @@ final class InfinoQueryTranslator {
      * and a hit scores the sum over the clauses it matches (a bool's should
      * clauses). {@code match} is the predicate the query string translated
      * to, every row any clause matches; the ranked clauses read the same rows.
+     * {@code match} is null for a bool's match clauses beside a ranked
+     * principal, each on one column ({@link #summedClauses}): the
+     * translation's predicate and the principal's own keep the rows they
+     * match, and the clauses only score them.
      */
     record Across(List<List<TextClause>> clauses, String match) {
         /** The columns of a clause share its query, and every clause matches any of its words ({@code or}). */
@@ -260,8 +264,9 @@ final class InfinoQueryTranslator {
      * query scores at all (a bool of filter and must_not clauses alone,
      * {@link #scoresNothing}): every hit scores 0, as in stock.
      * {@code across} when a required query string over several text columns
-     * is the one scoring clause: its hits rank by its BM25 across the
-     * columns ({@link Across}), beside {@code offset}.
+     * is the one scoring clause, or when a ranked principal shares the score
+     * with other match clauses: its hits rank by the sum of the clauses'
+     * BM25 ({@link Across}), beside {@code offset}.
      */
     record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable, boolean zero, Across across) {
         static final Scoring NONE = new Scoring(null, 0, List.of());
@@ -555,12 +560,19 @@ final class InfinoQueryTranslator {
         double[] offset = { 0 };
         List<Bonus> bonuses = new ArrayList<>();
         List<TextClause> texts = new ArrayList<>();
+        List<TextClause> summed = new ArrayList<>();
         boolean[] unscored = { false };
+        boolean[] stray = { false };
         if (scoresNothing(root)) {
             return Scoring.ZERO;
         }
-        required(root, offset, bonuses, texts, unscored);
+        required(root, offset, bonuses, texts, summed, unscored, stray);
         TextClause ranked = principalRanks ? principal : null;
+        Across clauses = ranked == null || across != null || stray[0] || !bonuses.isEmpty() ? null : summedClauses(summed);
+        if (clauses != null) {
+            // The principal's BM25 and every other match clause's, summed where each matches.
+            return new Scoring(null, offset[0], List.of(), false, false, false, clauses);
+        }
         if (across != null) {
             if (principal == null && !unscored[0] && texts.isEmpty() && bonuses.isEmpty()) {
                 // The query string's BM25 across its columns is the only score beside the offset.
@@ -582,17 +594,47 @@ final class InfinoQueryTranslator {
         return offset[0] == 0 && bonuses.isEmpty() && text == null ? Scoring.NONE : new Scoring(text, offset[0], List.copyOf(bonuses));
     }
 
-    /** A clause every hit matches: the root, or a must clause of a bool every hit matches. */
-    private void required(QueryBuilder qb, double[] offset, List<Bonus> bonuses, List<TextClause> texts, boolean[] unscored) {
+    /**
+     * A clause every hit matches: the root, or a must clause of a bool every
+     * hit matches. {@code summed} gathers the text clauses whose BM25 the
+     * hits may sum ({@link #summedClauses}), required and optional, null for
+     * one that scores otherwise than plain BM25 ({@link #summable});
+     * {@code stray} is set by a clause that scores and is no text clause,
+     * which no sum of them holds.
+     */
+    private void required(
+        QueryBuilder qb,
+        double[] offset,
+        List<Bonus> bonuses,
+        List<TextClause> texts,
+        List<TextClause> summed,
+        boolean[] unscored,
+        boolean[] stray
+    ) {
         // A bool with no clause is a match_all: it scores its boost (constantScore).
         if (qb instanceof BoolQueryBuilder b && b.hasClauses()) {
+            if (b.boost() != 1f) {
+                // A boosted bool weighs its clauses' sum, which no sum of them keeps.
+                summed.add(null);
+            }
             // A filter or must_not clause scores nothing.
             for (QueryBuilder c : b.must()) {
-                required(c, offset, bonuses, texts, unscored);
+                required(c, offset, bonuses, texts, summed, unscored, stray);
             }
             for (QueryBuilder c : b.should()) {
+                int known = texts.size();
                 if (!optional(c, bonuses, texts)) {
                     unscored[0] = true;
+                    stray[0] = true;
+                } else if (texts.size() == known + 1) {
+                    // An optional clause scores where it matches: all its words
+                    // under operator and, which a sum over any of them would not keep.
+                    TextClause t = texts.get(known);
+                    summed.add(summable(c) && "or".equals(t.mode()) ? t : null);
+                } else if (texts.size() > known) {
+                    // A clause that reads as several text clauses scores as their
+                    // combination, which no plain sum of them keeps.
+                    summed.add(null);
                 }
             }
             return;
@@ -610,6 +652,11 @@ final class InfinoQueryTranslator {
             // other (a text clause on a second column, a query string over
             // several, a script) scores nothing here, where stock scores it.
             TextClause t = textOnly(qb);
+            if (t != null) {
+                summed.add(summable(qb) ? t : null);
+            } else {
+                stray[0] = true;
+            }
             if (t == null || !principalRanks || !t.equals(principal)) {
                 // A query string over several columns ranks across them when it is the one text clause.
                 Across a = principal == null && across == null && qb instanceof QueryStringQueryBuilder qs ? across(qs) : null;
@@ -620,6 +667,47 @@ final class InfinoQueryTranslator {
                 }
             }
         }
+    }
+
+    /**
+     * How the hits rank when a bool's match clauses each score, as Lucene
+     * sums a bool's scoring clauses: the ranked principal and the other
+     * text clauses in {@code summed} (required ones, which the predicate
+     * keeps, and optional ones, which score where they match), each on its
+     * one column ({@link Across}). Null when the principal's BM25 alone is
+     * the score: no other text clause, one that scores otherwise
+     * ({@link #summable}), one past plain words or the principal's own
+     * predicate ({@link #plainQuery}), or past {@link #MAX_ACROSS_SEARCHES}.
+     * A clause scores in {@code or}: within the rows a required clause's
+     * predicate keeps, all of its words, the sum is the same.
+     */
+    private Across summedClauses(List<TextClause> summed) {
+        List<TextClause> others = new ArrayList<>(summed);
+        if (others.contains(null) || !others.remove(principal) || others.isEmpty() || summed.size() > MAX_ACROSS_SEARCHES) {
+            return null;
+        }
+        others.add(0, principal);
+        List<List<TextClause>> clauses = new ArrayList<>();
+        for (TextClause t : others) {
+            if (!plainQuery(t.query())) {
+                return null;
+            }
+            clauses.add(List.of(new TextClause(t.column(), t.query(), "or")));
+        }
+        return new Across(List.copyOf(clauses), null);
+    }
+
+    /**
+     * Whether {@code qb} scores as the plain BM25 of its words: a match with
+     * boost 1 and no option that changes which words it reads or how they
+     * score (minimum_should_match, fuzziness, an analyzer).
+     */
+    private static boolean summable(QueryBuilder qb) {
+        return qb instanceof MatchQueryBuilder m
+            && m.boost() == 1f
+            && m.minimumShouldMatch() == null
+            && m.fuzziness() == null
+            && m.analyzer() == null;
     }
 
     /** How a query string's JSON names its default type, best_fields: the builder has no getter for it. */
@@ -1237,17 +1325,19 @@ final class InfinoQueryTranslator {
      * on such a column: one the engine applies above a ranked search, so the
      * rows it removes go after the ranking. A string literal that happens to
      * hold the same text only costs that search a wider candidate window.
+     * The summed search of several text clauses ({@link Across}) takes a
+     * text_match into the rows it ranks; only {@link #joinsById} falls after it.
      */
     static boolean joinsAfterRanking(String predicate) {
-        return predicate.contains(ID_SUBQUERY) || predicate.contains(TEXT_PREDICATE);
+        return joinsById(predicate) || predicate.contains(TEXT_PREDICATE);
     }
 
     /**
      * Whether a predicate holds a subquery by id (a text clause the token
      * index answers, or a field's list values), which the engine plans as a
-     * join that reads the whole table before it returns a row. A string
-     * literal that happens to hold the same text only costs a page an order
-     * by row id.
+     * join that reads the whole table before it returns a row, and joins to
+     * the rows above any search it ranks. A string literal that happens to
+     * hold the same text only costs a page an order by row id.
      */
     static boolean joinsById(String predicate) {
         return predicate.contains(ID_SUBQUERY);
