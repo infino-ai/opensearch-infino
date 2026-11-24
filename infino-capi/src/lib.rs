@@ -181,12 +181,15 @@ const MAX_OFFSET_HOURS: i64 = 18;
 /// Days in each month of a common year.
 const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
+/// OpenSearch's date format for a date field whose mapping names none.
+const DEFAULT_DATE_FORMAT: &str = "strict_date_optional_time||epoch_millis";
+
 /// Epoch milliseconds of `s` as OpenSearch's default date format reads it,
 /// `strict_date_optional_time||epoch_millis`: a date `yyyy[-MM[-dd]]`, then
 /// optionally `T` and `HH[:mm[:ss[.fraction]]]`, any of it (`2026-11-23T`
 /// is a day), then optionally a zone (`Z`, `±HH`, `±HHmm`, `±HH:mm`), UTC
 /// when there is none; failing that, a whole number of milliseconds. `None`
-/// for any other string, which the engine's own parser then reads.
+/// for any other string.
 fn default_format_millis(s: &str) -> Option<i64> {
     optional_time_millis(s, true).or_else(|| {
         let digits = s.strip_prefix('-').unwrap_or(s);
@@ -333,9 +336,10 @@ fn epoch_millis(s: &str, unit_millis: i64) -> Option<i64> {
 /// it gives its epoch milliseconds, as OpenSearch tries a field's formats in
 /// order (a number by its digits, so an `epoch_second` field's `893966296`
 /// is a day of 1998, not of 1970). A form this bridge does not read (a
-/// custom pattern) does not stop the others: only when none of them reads
-/// the value is it left to [`conform`], as a field of the default format.
-/// A value no form reads fails its document, as OpenSearch fails it.
+/// custom pattern) does not stop the others. A value none of them reads
+/// fails its document here: one in a custom pattern is read by OpenSearch's
+/// mapper, whose values the caller sends with the document
+/// ([`mapped_values`]).
 fn conform_date(value: Value, formats: &[DateFormat]) -> Result<Value, String> {
     let text = match &value {
         Value::Null => return Ok(value),
@@ -343,23 +347,16 @@ fn conform_date(value: Value, formats: &[DateFormat]) -> Result<Value, String> {
         Value::Number(n) => n.to_string(),
         _ => return Err("not a date".into()),
     };
-    let mut custom = false;
     for format in formats {
         let millis = match format {
             DateFormat::OptionalTime { strict } => optional_time_millis(&text, *strict),
             DateFormat::EpochMillis => epoch_millis(&text, 1),
             DateFormat::EpochSecond => epoch_millis(&text, MILLIS_PER_SECOND),
-            DateFormat::Other(_) => {
-                custom = true;
-                None
-            }
+            DateFormat::Other(_) => None,
         };
         if let Some(millis) = millis {
             return Ok(json!(millis));
         }
-    }
-    if custom {
-        return conform(value, &date_type());
     }
     let names: Vec<&str> = formats.iter().map(DateFormat::name).collect();
     Err(format!(
@@ -2031,9 +2028,14 @@ fn conform(value: Value, dt: &DataType) -> Result<Value, String> {
         },
         DataType::Timestamp(..) => match &value {
             // A string in OpenSearch's default date format is read as it
-            // reads it; any other is left to the engine's parser. An
-            // epoch-millisecond integer is taken as is.
-            Value::String(s) => Ok(default_format_millis(s).map_or(value.clone(), |ms| json!(ms))),
+            // reads it. Any other fails the document here rather than in
+            // the engine, which would read it otherwise or not at all: a
+            // date in a custom pattern is read by OpenSearch's mapper
+            // ([`mapped_values`]). An epoch-millisecond integer is taken
+            // as is.
+            Value::String(s) => default_format_millis(s).map(|ms| json!(ms)).ok_or_else(|| {
+                format!("failed to parse date field [{s}] with format [{DEFAULT_DATE_FORMAT}]")
+            }),
             Value::Number(n) if n.is_i64() || n.is_u64() => Ok(value),
             _ => Err("not a date".into()),
         },
@@ -2264,6 +2266,39 @@ pub unsafe extern "C" fn infino_check_doc(
     .unwrap_or(ptr::null_mut())
 }
 
+/// What separates a document's source from the values OpenSearch's mappers
+/// read from it, when the caller sends them ([`mapped_values`]): JSON text
+/// never holds it unescaped.
+const MAPPED_VALUES: char = '\u{1e}';
+
+/// A document's source and, when the caller sent them after
+/// [`MAPPED_VALUES`], the values OpenSearch's mappers read from its date and
+/// integer fields: an object of each field's values (epoch milliseconds, or
+/// whole numbers), which the field's column holds in place of what the
+/// source spells there. A date in a format of the field's mapping this
+/// bridge does not read, and a fractional number an integer field coerces,
+/// are held as OpenSearch reads them. Text after the separator that is no
+/// such object leaves the whole text the source.
+fn mapped_values(text: &str) -> (&str, Option<Map<String, Value>>) {
+    let Some(at) = text.rfind(MAPPED_VALUES) else {
+        return (text, None);
+    };
+    match serde_json::from_str::<Value>(&text[at + MAPPED_VALUES.len_utf8()..]) {
+        Ok(Value::Object(values)) => (&text[..at], Some(values)),
+        _ => (text, None),
+    }
+}
+
+/// How many values a source gives at one field: its non-null values, an
+/// array's at any depth, as OpenSearch's mapper reads an array of arrays.
+fn given_values(value: &Value) -> usize {
+    match value {
+        Value::Null => 0,
+        Value::Array(items) => items.iter().map(given_values).sum(),
+        _ => 1,
+    }
+}
+
 /// Parse, flatten and conform one document to the declared columns. The
 /// row it returns is what the engine is given. A declared field the document
 /// gives several values goes to its list column ([`LIST_SUFFIX`]), each
@@ -2275,7 +2310,9 @@ pub unsafe extern "C" fn infino_check_doc(
 /// of arrays at a field without a scalar or string column the mapping
 /// declares is refused, as the engine would refuse it. A field named like
 /// one of the table's own columns ([`RESERVED`], or `engine`, those its
-/// engine writes) goes to a column of its own.
+/// engine writes) goes to a column of its own. A field the mapper's values
+/// cover ([`mapped_values`]) holds them, conformed to its column as they
+/// are, where the document gives it a value.
 fn conform_doc(
     source: &str,
     schema: &Schema,
@@ -2283,12 +2320,37 @@ fn conform_doc(
     engine: &[String],
     stamp: Option<&str>,
 ) -> Result<Map<String, Value>, String> {
+    let (source, mapped) = mapped_values(source);
     let doc: Value = serde_json::from_str(source).map_err(|e| format!("malformed JSON: {e}"))?;
     let obj = doc
         .as_object()
         .ok_or_else(|| "the document is not an object".to_string())?;
     let mut flat = Map::new();
     flatten(obj, "", &mut flat);
+    // The mapper's values stand in for the source's at each field the
+    // source gives as many values as the mapper read there, so a field the
+    // document leaves out or null stays so whatever the mapper read (a
+    // `null_value`), and values the mapper read from elsewhere too (a
+    // `copy_to`) leave the source's as they are.
+    let mut by_mapper: HashSet<String> = HashSet::new();
+    for (path, values) in mapped.into_iter().flatten() {
+        let Some(value) = flat.get_mut(&path) else {
+            continue;
+        };
+        let given = given_values(value);
+        let read = match &values {
+            Value::Array(items) => items.len(),
+            _ => 1,
+        };
+        if given == 0 || given != read {
+            continue;
+        }
+        *value = match values {
+            Value::Array(mut items) if items.len() == 1 => items.pop().unwrap_or(Value::Null),
+            other => other,
+        };
+        by_mapper.insert(path);
+    }
     // A field named like a reserved column goes to its own column once the
     // mapping declares it, and never to the reserved one.
     for reserved in RESERVED
@@ -2298,6 +2360,9 @@ fn conform_doc(
         if let Some(value) = flat.remove(reserved) {
             let own = format!("{OWN_COLUMN_PREFIX}{reserved}");
             if schema.field_with_name(&own).is_ok() {
+                if by_mapper.remove(reserved) {
+                    by_mapper.insert(own.clone());
+                }
                 flat.insert(own, value);
             }
         }
@@ -2340,7 +2405,10 @@ fn conform_doc(
         };
         let dt = field.data_type();
         let rule = kept.get(path);
+        let read = by_mapper.contains(path.as_str());
         let fit = |v: Value| match rule {
+            // The mapper read the value already, as an instant or a whole number.
+            _ if read => conform(v, dt),
             Some(Kept::Date(formats)) if matches!(dt, DataType::Timestamp(..)) => {
                 conform_date(v, formats)
             }
@@ -2804,7 +2872,7 @@ pub unsafe extern "C" fn infino_index_batch(
                 }
             };
             flat.insert(OSID.into(), Value::String(osid.to_string()));
-            flat.insert(SOURCE.into(), Value::String(source.to_string()));
+            flat.insert(SOURCE.into(), Value::String(mapped_values(source).0.to_string()));
             rows.push((i, flat));
         }
 
@@ -2976,7 +3044,7 @@ unsafe fn prepare(
         .map(|(id, src, routing, seq, op)| {
             conform_doc(src, &schema, &kept, &engine, stamp.as_deref()).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
-                flat.insert(SOURCE.into(), Value::String((*src).to_string()));
+                flat.insert(SOURCE.into(), Value::String(mapped_values(src).0.to_string()));
                 if !routing.is_empty() {
                     flat.insert(ROUTING.into(), Value::String((*routing).to_string()));
                 }
@@ -3482,6 +3550,26 @@ pub unsafe extern "C" fn infino_free_prepared(p: *mut Prepared) {
     if !p.is_null() {
         drop(unsafe { Box::from_raw(p) });
     }
+}
+
+/// The rows of a prepared batch that do not conform to the table's columns,
+/// as `[{"i": row, "reason": why}]`, so the caller can answer or send them
+/// again before the batch is appended; the handle stays the caller's. Null
+/// for a null handle.
+#[no_mangle]
+pub unsafe extern "C" fn infino_prepared_failed(p: *const Prepared) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(p) = (unsafe { p.as_ref() }) else {
+            return ptr::null_mut();
+        };
+        let failed: Vec<Value> = p
+            .failed
+            .iter()
+            .map(|(i, why)| json!({ "i": i, "reason": why }))
+            .collect();
+        out_json(Value::Array(failed))
+    }))
+    .unwrap_or(ptr::null_mut())
 }
 
 /// Tombstone every row whose `osid` is in the list, in one mutation. Backs the
@@ -6495,6 +6583,83 @@ mod tests {
         append_with_seqs(h, &[p], replaced, &[])
     }
 
+    /// A prepared batch names the rows that do not conform, and the same
+    /// rows sent again with the mapper's values conform: the columns hold
+    /// those values, the id lookup answers the source as it was sent, and
+    /// the check of one document reaches the same verdicts.
+    #[test]
+    fn a_refused_row_conforms_with_the_mapper_s_values() {
+        let h = open_logs();
+        let out = ensure(
+            h,
+            r#"{"properties":{"t":{"type":"date","format":"dd/MMM/yyyy:HH:mm:ss Z"}}}"#,
+        );
+        assert!(!out.contains("error"), "{out}");
+        let plain = r#"{"level":"info","status":1}"#;
+        let odd = r#"{"status":200.7,"t":"25/Nov/2026:09:30:00 +0100"}"#;
+        let values = r#"{"status":[200],"t":[1795595400000]}"#;
+        let framed = format!("{odd}{MAPPED_VALUES}{values}");
+
+        assert!(!check(h, odd).is_empty());
+        assert_eq!(check(h, &framed), "");
+
+        let p = prepared(h, &[("a", plain), ("b", odd)]);
+        let failed: Value =
+            serde_json::from_str(&take(unsafe { infino_prepared_failed(p) })).unwrap();
+        let failed = failed.as_array().unwrap();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0]["i"], 1);
+        assert!(
+            failed[0]["reason"].as_str().unwrap().starts_with("field ["),
+            "{failed:?}"
+        );
+        unsafe { infino_free_prepared(p) };
+        assert!(unsafe { infino_prepared_failed(ptr::null()) }.is_null());
+
+        let p = prepared(h, &[("a", plain), ("b", &framed)]);
+        assert_eq!(take(unsafe { infino_prepared_failed(p) }), "[]");
+        let out = append_replacing(h, p, &[]);
+        assert_eq!(out["ok"], 2, "{out}");
+        assert_eq!(get(h, "b"), odd);
+        let at = sql(
+            h,
+            r#"SELECT count(*) AS c FROM "logs" WHERE status = 200 AND t = to_timestamp_millis(1795595400000)"#,
+        );
+        assert_eq!(at[0]["c"], 1, "{at}");
+
+        // The batch path of one call stores the source as it was sent too.
+        assert_eq!(index(h, &[("c", &framed)])["ok"], 1);
+        assert_eq!(get(h, "c"), odd);
+        close(h);
+    }
+
+    /// The mapper's values stand in for the source's only where the source
+    /// gives as many: values it read from elsewhere too (a `copy_to`), or
+    /// in place of a null (a `null_value`), leave the source's as they are.
+    #[test]
+    fn the_mapper_s_values_stand_in_only_where_the_source_gives_as_many() {
+        let h = open_logs();
+        let out = ensure(h, r#"{"properties":{"n":{"type":"long"}}}"#);
+        assert!(!out.contains("error"), "{out}");
+        // One value read where the source gives one: the mapper's is held.
+        let one = format!(r#"{{"n":2.5}}{MAPPED_VALUES}{{"n":[2]}}"#);
+        assert_eq!(check(h, &one), "");
+        // Two read where the source gives one: the source's stands, and is refused as it is.
+        let more = format!(r#"{{"n":2.5}}{MAPPED_VALUES}{{"n":[2,7]}}"#);
+        assert!(!check(h, &more).is_empty());
+        // As many as the source gives, an array of arrays counted at any depth.
+        let nested = format!(r#"{{"n":[[1.5,null],[2.5]]}}{MAPPED_VALUES}{{"n":[1,2]}}"#);
+        assert_eq!(check(h, &nested), "");
+        // The mapper read a value where the source gives none: nothing to stand in for.
+        let none = format!(r#"{{"n":null,"level":"x"}}{MAPPED_VALUES}{{"n":[0]}}"#);
+        assert_eq!(check(h, &none), "");
+        let given = |v: Value| given_values(&v);
+        assert_eq!(given(json!(null)), 0);
+        assert_eq!(given(json!([null, 1, [2, null, [3]]])), 3);
+        assert_eq!(given(json!("x")), 1);
+        close(h);
+    }
+
     #[test]
     fn a_replacing_append_replaces_in_one_mutation_and_the_id_lookup_follows() {
         let h = open_logs();
@@ -7626,8 +7791,8 @@ mod tests {
 
     /// Every form OpenSearch's default date format takes is read as the
     /// instant OpenSearch indexes it at, `2026-11-23T` (a day with an empty
-    /// time, as the sample flights write it) included; what it refuses is
-    /// left to the engine's parser.
+    /// time, as the sample flights write it) included; what it refuses fails
+    /// the document, rather than being left to the engine to read otherwise.
     #[test]
     fn a_date_is_read_as_opensearch_s_default_format_reads_it() {
         let cases = [
@@ -7668,10 +7833,10 @@ mod tests {
             conform(json!("2026-11-23T"), &date_type()).unwrap(),
             json!(1_795_392_000_000i64)
         );
-        // A form only the engine reads is left to it, as before.
+        // Any other form fails the document with OpenSearch's message.
         assert_eq!(
-            conform(json!("2026-11-23 10:30:15"), &date_type()).unwrap(),
-            json!("2026-11-23 10:30:15")
+            conform(json!("2026-11-23 10:30:15"), &date_type()),
+            Err("failed to parse date field [2026-11-23 10:30:15] with format [strict_date_optional_time||epoch_millis]".into())
         );
     }
 
@@ -7713,11 +7878,16 @@ mod tests {
             conform_date(json!(893966296000i64), &millis),
             Ok(json!(893_966_296_000i64))
         );
-        // A custom pattern's value is read as the default format's, as before.
+        // A value only a custom pattern reads fails here: the mapper reads
+        // it, and its value comes with the document.
         let custom = DateFormat::parse_all("yyyy-MM-dd HH:mm:ss||strict_date_optional_time");
         assert_eq!(
             conform_date(json!("2026-11-23 10:30:15"), &custom),
-            Ok(json!("2026-11-23 10:30:15"))
+            Err("failed to parse date field [2026-11-23 10:30:15] with format [yyyy-MM-dd HH:mm:ss||strict_date_optional_time]".into())
+        );
+        assert_eq!(
+            conform_date(json!("2026-11-23T10:30:15Z"), &custom),
+            Ok(json!(1_795_429_815_000i64))
         );
         // A custom pattern does not stop the forms after it: an
         // `epoch_second` listed after one still reads a number as seconds,
@@ -7833,5 +8003,68 @@ mod tests {
             assert_eq!(check(doc), Err(no_timestamp("@timestamp")), "{doc}");
         }
         assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, &[], None).is_ok());
+    }
+
+    /// The mapper's values follow a document's source after the separator;
+    /// text after it that is no object of values leaves the text the source.
+    #[test]
+    fn mapped_values_follow_the_source() {
+        assert_eq!(mapped_values(r#"{"a":1}"#), (r#"{"a":1}"#, None));
+        let framed = format!("{}{MAPPED_VALUES}{}", r#"{"a":1.5}"#, r#"{"a":[1]}"#);
+        let (source, values) = mapped_values(&framed);
+        assert_eq!(source, r#"{"a":1.5}"#);
+        assert_eq!(values, json!({"a": [1]}).as_object().cloned());
+        let stray = format!("{}{MAPPED_VALUES}x", r#"{"a":1}"#);
+        assert_eq!(mapped_values(&stray), (stray.as_str(), None));
+    }
+
+    /// A date in a custom pattern and a fractional number in an integer
+    /// field fail a document by themselves, and conform when the mapper's
+    /// values come with it: each column holds the mapper's value as it is
+    /// (an `epoch_second` field's instant is not read as seconds again), a
+    /// field the source leaves out or null takes none of them, and a field
+    /// given several values keeps the mapper's in its list column.
+    #[test]
+    fn the_mapper_s_values_stand_in_for_the_source_s() {
+        let schema = Schema::new(vec![
+            Field::new("status", DataType::Int64, true),
+            Field::new("t", date_type(), true),
+            Field::new("t3", date_type(), true),
+            Field::new("gone", DataType::Int64, true),
+        ]);
+        let kept = HashMap::from([
+            (
+                "t".to_string(),
+                Kept::Date(DateFormat::parse_all("dd/MMM/yyyy:HH:mm:ss Z")),
+            ),
+            (
+                "t3".to_string(),
+                Kept::Date(DateFormat::parse_all("epoch_second")),
+            ),
+        ]);
+        let source = r#"{"status": 200.7, "t": "25/Nov/2026:09:30:00 +0100", "t3": "1795595400", "gone": null}"#;
+        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], None);
+        let refused = check(source).unwrap_err();
+        assert!(
+            refused.contains("fractional") || refused.contains("failed to parse date"),
+            "{refused}"
+        );
+        let values = r#"{"status": [200], "t": [1795595400000], "t3": [1795595400000], "gone": [7], "absent": [1]}"#;
+        let row = check(&format!("{source}{MAPPED_VALUES}{values}")).expect("conformed");
+        assert_eq!(row.get("status"), Some(&json!(200)));
+        assert_eq!(row.get("t"), Some(&json!(1_795_595_400_000i64)));
+        assert_eq!(row.get("t3"), Some(&json!(1_795_595_400_000i64)));
+        assert_eq!(row.get("gone"), Some(&Value::Null));
+        assert_eq!(row.get("absent"), None);
+
+        let many = format!(
+            "{}{MAPPED_VALUES}{}",
+            r#"{"status": [1.5, 2.7]}"#, r#"{"status": [1, 2]}"#
+        );
+        let row = check(&many).expect("conformed");
+        assert_eq!(
+            row.get(&format!("status{LIST_SUFFIX}")),
+            Some(&json!([1, 2]))
+        );
     }
 }

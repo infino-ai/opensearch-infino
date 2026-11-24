@@ -58,6 +58,7 @@ import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.engine.DocumentMissingException;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.get.GetResult;
+import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.infino.InfinoWriter.Outcome;
@@ -1653,6 +1654,11 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                 // appended, and a refused one comes back as its own item then; checking it
                 // here too would parse every document twice.
                 String source = sourceAsJson(index.source(), index.getContentType());
+                String unreadable = unreadable(source);
+                if (unreadable != null) {
+                    outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, new MapperParsingException(unreadable), RestStatus.BAD_REQUEST)));
+                    continue;
+                }
                 // A generated id is new by definition; an explicit id is looked up at flush,
                 // to replace its row, or to refuse a create that would duplicate it.
                 boolean create = index.opType() == DocWriteRequest.OpType.CREATE;
@@ -1689,6 +1695,19 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
         return new BulkItemResponse(slot, item.opType(), new BulkItemResponse.Failure(index, item.id(), cause));
     }
 
+    /**
+     * Why a client's JSON source is no document, when it holds the character
+     * that parts a source from the mapper's values on the way to the bridge
+     * ({@link InfinoMappedValues#SEPARATOR}); null otherwise. JSON holds it
+     * only escaped, so OpenSearch refuses such a source as it parses it; the
+     * bridge would read what follows it as values the mapper read.
+     */
+    static String unreadable(String source) {
+        return source != null && source.indexOf(InfinoMappedValues.SEPARATOR) >= 0
+            ? "failed to parse: the document holds an unescaped control character (code 30)"
+            : null;
+    }
+
     /** The source in whatever content type the client sent, as JSON for the bridge. */
     static String sourceAsJson(BytesReference source, MediaType type) {
         if (source == null) {
@@ -1714,13 +1733,14 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
         boolean exists = current != null && !current.isEmpty();
         IndexRequest doc = update.doc();
         if (!exists) {
-            if (update.docAsUpsert() && doc != null) {
-                return sourceAsJson(doc.source(), doc.getContentType());
+            String upsert = update.docAsUpsert() && doc != null ? sourceAsJson(doc.source(), doc.getContentType())
+                : update.upsertRequest() != null ? sourceAsJson(update.upsertRequest().source(), update.upsertRequest().getContentType())
+                : null;
+            String unreadable = unreadable(upsert);
+            if (unreadable != null) {
+                throw new MapperParsingException(unreadable);
             }
-            if (update.upsertRequest() != null) {
-                return sourceAsJson(update.upsertRequest().source(), update.upsertRequest().getContentType());
-            }
-            return null;
+            return upsert;
         }
         if (doc == null) {
             return current;

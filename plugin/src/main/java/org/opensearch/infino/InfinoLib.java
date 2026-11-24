@@ -84,6 +84,12 @@ public interface InfinoLib extends Library {
 
     void infino_free_prepared(Pointer prepared);
 
+    /**
+     * The rows of a prepared batch the table refuses, as {@code [{"i": .., "reason": ..}]};
+     * null for a null handle. The handle stays the caller's.
+     */
+    Pointer infino_prepared_failed(Pointer prepared);
+
     int infino_delete_osids(Pointer h, String name, String[] osids, int count);
 
     /** One id's source as {@code {"source": ..}}, null when the table holds no such id; {@code {"error": ..}} when the lookup fails. */
