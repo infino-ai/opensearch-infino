@@ -94,15 +94,16 @@ public interface InfinoLib extends Library {
 
     int infino_delete_osids(Pointer h, String name, String[] osids, int count);
 
+    /** One id's source as {@code {"source": ..}}, null when the table holds no such id; {@code {"error": ..}} when the lookup fails. */
     Pointer infino_get(Pointer h, String name, String osid);
 
-    /** {@link #infino_get} as of the table's latest commit; null when the lookup fails. */
+    /** One id's raw source as of the table's latest commit; "" when the table holds no such id, null when the lookup fails. */
     Pointer infino_get_latest(Pointer h, String name, String osid);
 
     /** The sources of several osids at once, as a JSON object from each id the table holds to its source. */
     Pointer infino_get_many(Pointer h, String name, String[] osids, int count);
 
-    /** One id's document as {@code {"source", "seq"}}; "" when the table holds no such id. */
+    /** One id's document as {@code {"doc": {"source", "seq"}}}, null when the table holds no such id; {@code {"error": ..}} when the lookup fails. */
     Pointer infino_get_doc(Pointer h, String name, String osid);
 
     int infino_drop(Pointer h, String name);
