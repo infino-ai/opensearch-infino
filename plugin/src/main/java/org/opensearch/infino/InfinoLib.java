@@ -27,6 +27,14 @@ public interface InfinoLib extends Library {
     int infino_hosted(Pointer h);
 
     /**
+     * Check once that the node can use the connection's own storage: for
+     * local storage, write a small file in the root and delete it; then list
+     * the tables. "" when both work, else {@code {"error", "permanent"}},
+     * where {@code permanent} says the failure will not pass on its own.
+     */
+    Pointer infino_check_storage(Pointer h);
+
+    /**
      * Ask the hosted service for a trial account, made without a key: the
      * service's response ({@code api_key}, {@code database}, {@code credit_cents},
      * {@code console_url}) or {@code {"error", "status"}}.

@@ -38,10 +38,15 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BooleanSupplier;
 import java.util.function.UnaryOperator;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -68,6 +73,23 @@ public final class InfinoNative {
     // URI, -Dinfino.uri=file:///abs/path or s3://bucket/prefix for tables that
     // survive restart. The default is in-process and non-persistent.
     private static final String NODE_URI = System.getProperty("infino.uri", "memory://");
+    /** The URIs of a catalog held in the node's memory, as the engine reads them: there is no storage to check. */
+    private static final Set<String> MEMORY_URIS = Set.of("memory://", "memory:", "memory");
+    /** The scheme of local storage; a URI with no scheme at all is a local path too. */
+    private static final String FILE_SCHEME = "file://";
+    /** What separates a URI's scheme from the rest. */
+    private static final String SCHEME_END = "://";
+    /**
+     * How long the node's start waits for its storage check ({@link #checkStorage}),
+     * the hosted open included: a storage that has not answered by then is reported
+     * and the node keeps starting, rather than waiting out the client's own retries
+     * and timeouts, which can run for minutes.
+     */
+    static final TimeValue STORAGE_CHECK_TIMEOUT = TimeValue.timeValueSeconds(30);
+    /** What a user and password in a URI, or the key, are shown as in a message. */
+    private static final String HIDDEN = "***";
+    /** A user, and a password, between a URI's scheme and its host. */
+    private static final Pattern URI_USER = Pattern.compile("://[^/@\\s]*@");
     /**
      * For tests only: the read staleness window the node's connections read
      * under, in milliseconds, in place of the engine's default (0 for that).
@@ -434,6 +456,181 @@ public final class InfinoNative {
     /** The target the node is configured for. */
     static Target target() {
         return wanted;
+    }
+
+    /** Why the node's storage check failed, and whether the failure will not pass on its own. */
+    record StorageFailure(String reason, boolean permanent) {}
+
+    /**
+     * Open the storage the node is configured for and check once that the
+     * node can use it, as the node starts. Opening the node's own storage
+     * reads nothing, so a store it cannot use would otherwise fail each table
+     * operation on its own, the security plugin's index first, and the node
+     * would never become ready with nothing in its log naming the cause.
+     *
+     * <p>Waits at most {@link #STORAGE_CHECK_TIMEOUT}. On a failure it logs one
+     * ERROR naming the storage, the reason and what to check. It stops the node
+     * (throws) only for a failure that will not pass on its own: the key was
+     * refused, the storage refused the node's credentials or its user. On any
+     * other failure (a timeout, a 5xx, a dropped connection) the node keeps
+     * starting and each index tries the storage again when it is used. While
+     * a hosted open that outlived the wait is still running, it holds the lock
+     * {@link #init} opens under, so an index's {@code init()} waits for that
+     * open to return (up to the client's read timeout) rather than trying
+     * again at once. A node in memory has nothing to check.
+     *
+     * <p>The bridge library is loaded here, on the starting thread, before the
+     * check: a library that cannot be loaded (a wrong {@code -Dinfino.lib})
+     * stops the node with the loader's own error, as an {@link Error} raised
+     * on the check's thread does.
+     *
+     * @return the ERROR it logged and the node did not stop for; null when the storage is usable
+     */
+    static String checkStorage() {
+        return checkStorage(STORAGE_CHECK_TIMEOUT);
+    }
+
+    static String checkStorage(TimeValue timeout) {
+        lib();
+        Target target = wanted;
+        if (MEMORY_URIS.contains(target.uri())) {
+            return null;
+        }
+        StorageFailure failure = within(timeout, () -> probeStorage(target));
+        if (failure == null) {
+            log.info("[infino] the storage at {} is usable", scrubbed(target, target.name()));
+            return null;
+        }
+        String message = unusableStorage(target, failure);
+        log.error(message);
+        if (failure.permanent()) {
+            throw new IllegalStateException(message);
+        }
+        return message;
+    }
+
+    /**
+     * Run {@code check} on a thread of its own and wait at most {@code timeout}
+     * for it: the hosted open and a store's own retries can take minutes, and
+     * the node's start should not. A check still running is left to finish.
+     * An {@link Error} the check raised (a library that does not link, say) is
+     * thrown again here: no retry fixes it, so it stops the node.
+     */
+    private static StorageFailure within(TimeValue timeout, Callable<StorageFailure> check) {
+        FutureTask<StorageFailure> task = new FutureTask<>(check);
+        Thread thread = new Thread(task, "infino-storage-check");
+        thread.setDaemon(true);
+        thread.start();
+        try {
+            return task.get(timeout.millis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            return new StorageFailure("it did not answer within " + timeout, false);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new StorageFailure("the check was interrupted", false);
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof Error error) {
+                throw error;
+            }
+            return new StorageFailure(String.valueOf(e.getCause()), false);
+        }
+    }
+
+    /**
+     * Open {@code target} and, for the node's own storage, run the bridge's
+     * check of it. For a hosted account the open is the check: it lists the
+     * database's tables before it hands the connection back.
+     */
+    private static StorageFailure probeStorage(Target target) {
+        try {
+            init();
+        } catch (InfinoException e) {
+            String opening = "cannot open " + target.name() + ": ";
+            String why = e.getMessage().startsWith(opening) ? e.getMessage().substring(opening.length()) : e.getMessage();
+            return new StorageFailure(why, refused(e.status()));
+        }
+        if (target.hosted()) {
+            return null;
+        }
+        InfinoLib loaded = lib();
+        return storageFailure(take(loaded, loaded.infino_check_storage(conn)));
+    }
+
+    /**
+     * The failure in the bridge's answer to {@code infino_check_storage}: none
+     * for "", the reason for {@code {"error", "permanent"}}. No answer at all
+     * (the bridge failed) is a failure too, though not one that stops the node.
+     */
+    static StorageFailure storageFailure(String answer) {
+        if (answer == null) {
+            return new StorageFailure("the bridge returned no answer", false);
+        }
+        if (answer.isEmpty()) {
+            return null;
+        }
+        Map<String, Object> error = object(answer);
+        Object reason = error.get("error");
+        return new StorageFailure(reason == null ? answer : reason.toString(), Boolean.TRUE.equals(error.get("permanent")));
+    }
+
+    /** Whether the service refused the key: it will not take it however often it is sent. */
+    private static boolean refused(RestStatus status) {
+        return status == RestStatus.UNAUTHORIZED || status == RestStatus.FORBIDDEN;
+    }
+
+    /**
+     * The message the node logs when it cannot use its storage: the storage,
+     * the reason, what to check for its kind, and whether the node stops.
+     * Never shows a user or password in a URI, or the key.
+     */
+    static String unusableStorage(Target target, StorageFailure failure) {
+        String then = failure.permanent()
+            ? " The node stops: every Infino-backed index it serves, the security plugin's included, lives there."
+            : " The node keeps starting, and each index tries the storage again when it is used,"
+                + " after any open still in progress returns.";
+        return scrubbed(
+            target,
+            "[infino] this node cannot use its storage at "
+                + target.name()
+                + ": "
+                + failure.reason()
+                + ". "
+                + storageHint(target, failure)
+                + then
+        );
+    }
+
+    /** What to check for a storage of {@code target}'s kind that failed with {@code failure}. */
+    static String storageHint(Target target, StorageFailure failure) {
+        String uri = target.uri();
+        if (target.hosted()) {
+            if (failure.permanent()) {
+                return "The service refused the key. A key belongs to one platform URL: check that "
+                    + InfinoPlugin.PLATFORM_URL.getKey()
+                    + " is the one the key was made on.";
+            }
+            return "Check that the node can reach the service.";
+        }
+        if (uri.startsWith("s3://")) {
+            return "Check the node's AWS credentials and that they may list the bucket. On Docker on EC2 with an instance role, "
+                + "set the instance metadata hop limit to 2: at 1 the container gets no credentials.";
+        }
+        if (local(uri)) {
+            return "Check that the directory exists and that the user the node runs as may read and write it.";
+        }
+        return "Check the node's credentials for this storage and that they may list it.";
+    }
+
+    /** Whether {@code uri} names local storage: {@code file://}, or a path with no scheme. */
+    private static boolean local(String uri) {
+        return uri.startsWith(FILE_SCHEME) || (!uri.contains(SCHEME_END) && !MEMORY_URIS.contains(uri));
+    }
+
+    /** {@code text} without any user or password a URI in it carries, or {@code target}'s key. */
+    static String scrubbed(Target target, String text) {
+        String out = URI_USER.matcher(text).replaceAll(Matcher.quoteReplacement("://" + HIDDEN + "@"));
+        String key = target.apiKey();
+        return key == null || key.isEmpty() ? out : out.replace(key, HIDDEN);
     }
 
     /** Whether the tables are served from the hosted service rather than the node's own storage. */

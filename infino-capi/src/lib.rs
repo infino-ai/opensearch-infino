@@ -38,12 +38,16 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr, CString};
+use std::fs;
+use std::io::{self, ErrorKind};
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::process;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::common::tree_node::TreeNode;
@@ -130,6 +134,26 @@ const TRIAL_PATH: &str = "/v1/trial";
 /// How long the trial call waits: a person is waiting on it, and a service
 /// that cannot provision an account in this time is a failure to report.
 const TRIAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The name the startup storage check gives the file it writes and deletes
+/// in a local storage root ([`check_local_root`]); the process id and a
+/// clock reading follow, so nodes sharing a directory never collide.
+const STORAGE_PROBE_NAME: &str = ".infino-storage-check";
+/// Where an `s3://` node's store client asks for the instance role's
+/// credentials: the engine reads no keys from anywhere else, so an instance
+/// metadata service that does not answer means the node has no credentials.
+const INSTANCE_METADATA: &str = "http://169.254.169.254";
+/// The instance metadata service's token route, the first request the store
+/// client makes for credentials.
+const INSTANCE_METADATA_TOKEN: &str = "/latest/api/token";
+/// The header that asks the token route for a token, and the token's life
+/// in seconds; the storage check asks for one only to see that it answers.
+const INSTANCE_METADATA_TTL_HEADER: &str = "X-aws-ec2-metadata-token-ttl-seconds";
+const INSTANCE_METADATA_TTL_SECS: &str = "60";
+/// How long the storage check waits for the instance metadata service. It
+/// answers within milliseconds when it answers at all: in Docker on EC2 at a
+/// hop limit of 1 its answer never reaches the container, and the store
+/// client retries for minutes before it reports that.
+const INSTANCE_METADATA_WAIT: Duration = Duration::from_secs(2);
 /// What the engine's hosted client puts before the HTTP status in the message
 /// of a refused call; the status is read back off it (see `status_in`).
 const STATUS_MARKER: &str = "server returned ";
@@ -1004,6 +1028,138 @@ pub unsafe extern "C" fn infino_open_error() -> *mut c_char {
         Some(json) => out_string(json),
         None => ptr::null_mut(),
     }
+}
+
+/// Check once that the node can use the connection's own storage, as the
+/// node starts. Opening it reads nothing, so a store the node cannot use (no
+/// credentials, a directory it may not write) would otherwise fail each
+/// table operation on its own, the first of them while the node starts.
+///
+/// For local storage it writes a small file in the root and deletes it,
+/// which finds a root the node may not write. For `s3://` it first asks the
+/// instance metadata service for a token, which finds a node with no
+/// credentials in seconds rather than after the store client's minutes of
+/// retries. Then it lists the tables, as the node does before it serves any. Answers "" when both work, else
+/// `{"error", "permanent"}`: `permanent` is true only for a failure that
+/// will not pass on its own (the storage refused the node's credentials or
+/// its user), and false for one that may (a timeout, a 5xx, a dropped
+/// connection). The caller bounds how long it waits.
+#[no_mangle]
+pub unsafe extern "C" fn infino_check_storage(h: *mut Bridge) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(bridge) = bridge_ref(h) else {
+            return err_json("null argument");
+        };
+        let uri = bridge.latest_from.as_ref().map(|from| from.uri.as_str());
+        let root = uri.and_then(local_root);
+        let metadata = uri
+            .filter(|u| u.starts_with("s3://"))
+            .map(|_| INSTANCE_METADATA);
+        match check_storage(&bridge.conn, root.as_deref(), metadata) {
+            Ok(()) => out_string(String::new()),
+            Err(failure) => {
+                out_json(json!({ "error": failure.reason, "permanent": failure.permanent }))
+            }
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Why [`infino_check_storage`] failed, and whether the failure lasts.
+#[derive(Debug)]
+struct StorageFailure {
+    reason: String,
+    permanent: bool,
+}
+
+/// [`infino_check_storage`]'s checks: the write probe of a local `root`, or
+/// for an `s3://` node that its instance `metadata` service answers; then
+/// the listing. A catalog with no tables yet counts as an answer.
+fn check_storage(
+    conn: &Connection,
+    root: Option<&Path>,
+    metadata: Option<&str>,
+) -> Result<(), StorageFailure> {
+    if let Some(root) = root {
+        check_local_root(root)?;
+    }
+    if let Some(metadata) = metadata {
+        check_instance_metadata(metadata, INSTANCE_METADATA_WAIT)?;
+    }
+    match conn.list_tables() {
+        Ok(_) | Err(InfinoError::NotFound(_)) => Ok(()),
+        Err(e) => Err(StorageFailure {
+            permanent: matches!(e, InfinoError::PermissionDenied(_)),
+            reason: e.to_string(),
+        }),
+    }
+}
+
+/// Write a small file in a local storage `root` and delete it: the engine
+/// creates the root and writes there on the first table, so a root the
+/// node's user may not write fails here instead. Creating the root is what
+/// that first write would do anyway.
+fn check_local_root(root: &Path) -> Result<(), StorageFailure> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let probe = root.join(format!("{STORAGE_PROBE_NAME}-{}-{stamp}", process::id()));
+    let failed = |e: io::Error| StorageFailure {
+        reason: format!("{}: {e}", root.display()),
+        permanent: lasts(e.kind()),
+    };
+    fs::create_dir_all(root).map_err(failed)?;
+    fs::write(&probe, b"").map_err(failed)?;
+    fs::remove_file(&probe).map_err(failed)
+}
+
+/// Ask the instance metadata service at `base` for a token, as the store
+/// client does first when it fetches the instance role's credentials, and
+/// wait at most `wait`. Any HTTP answer means the service is reachable and
+/// the listing decides; no answer means the node has no credentials. That is
+/// reported at once and named, where the store client would report it only
+/// after minutes of retries, as an error about a token. Not permanent: the
+/// service can come back.
+fn check_instance_metadata(base: &str, wait: Duration) -> Result<(), StorageFailure> {
+    let agent = ureq::AgentBuilder::new().timeout(wait).build();
+    let asked = agent
+        .put(&format!("{base}{INSTANCE_METADATA_TOKEN}"))
+        .set(INSTANCE_METADATA_TTL_HEADER, INSTANCE_METADATA_TTL_SECS)
+        .call();
+    match asked {
+        Ok(_) | Err(ureq::Error::Status(..)) => Ok(()),
+        Err(ureq::Error::Transport(t)) => Err(StorageFailure {
+            reason: format!(
+                "no AWS credentials: the instance metadata service at {base} did not answer within {wait:?} ({t})"
+            ),
+            permanent: false,
+        }),
+    }
+}
+
+/// Whether a local file error is one that will not pass on its own: the
+/// node's user may not write there, the file system is read-only, or the
+/// root is not a directory.
+fn lasts(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::PermissionDenied
+            | ErrorKind::ReadOnlyFilesystem
+            | ErrorKind::NotADirectory
+            | ErrorKind::AlreadyExists
+    )
+}
+
+/// The directory of a local storage URI, read as the engine reads it:
+/// `file://<path>`, or a bare path (`/data/infino`, `./data`). None for
+/// any other storage, and for the in-memory catalog.
+fn local_root(uri: &str) -> Option<PathBuf> {
+    if let Some(path) = uri.strip_prefix("file://") {
+        return Some(PathBuf::from(path));
+    }
+    let memory = matches!(uri, "memory://" | "memory:" | "memory");
+    (!memory && !uri.contains("://")).then(|| PathBuf::from(uri))
 }
 
 /// Whether the connection forwards to the hosted service (1) or runs the
@@ -5164,6 +5320,18 @@ fn cell_json(col: &dyn Array, r: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+    use std::thread;
+
+    /// A directory its owner may read and enter but not write.
+    const READ_ONLY_DIR: u32 = 0o555;
+    /// A directory its owner may read, enter and write.
+    const WRITABLE_DIR: u32 = 0o755;
+    /// How long a test waits for a service that may never answer.
+    const SHORT_WAIT: Duration = Duration::from_millis(300);
 
     /// How many catalogs [`open_logs`] has made in this process: part of
     /// each one's directory name, since tests running at once can read the
@@ -8360,6 +8528,145 @@ mod tests {
             "{why}"
         );
         assert!(unsafe { infino_open_error() }.is_null(), "read once");
+    }
+
+    /// The startup check of a node's own storage answers "" for a directory
+    /// the node may write, and leaves nothing behind in it.
+    #[test]
+    fn the_storage_check_passes_a_writable_directory_and_leaves_it_as_it_was() {
+        let root = scratch_dir("infino-capi-check-ok");
+        let uri = c(&format!("file://{}", root.display()));
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        assert!(!h.is_null());
+        assert_eq!(
+            take(unsafe { infino_check_storage(h) }),
+            "",
+            "a usable directory"
+        );
+        let left: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "the probe file is deleted: {left:?}");
+        assert!(ensure(h, MAPPING).contains("\"created\":true"));
+        close(h);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A directory the node may read but not write passes a listing, so only
+    /// the write probe finds it; the failure is permanent, since it will not
+    /// pass on its own.
+    #[test]
+    fn the_storage_check_fails_a_read_only_directory_for_good() {
+        let root = scratch_dir("infino-capi-check-ro");
+        fs::set_permissions(&root, fs::Permissions::from_mode(READ_ONLY_DIR)).unwrap();
+        let uri = c(&format!("file://{}", root.display()));
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        assert!(!h.is_null());
+        let why = take(unsafe { infino_check_storage(h) });
+        close(h);
+        fs::set_permissions(&root, fs::Permissions::from_mode(WRITABLE_DIR)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let why: Value = serde_json::from_str(&why).unwrap_or_else(|_| panic!("{why:?}"));
+        let message = why["error"].as_str().unwrap_or_else(|| panic!("{why}"));
+        assert!(
+            message.to_lowercase().contains("permission denied"),
+            "names the cause: {message}"
+        );
+        assert!(
+            message.contains(&root.display().to_string()),
+            "names the directory: {message}"
+        );
+        assert_eq!(why["permanent"], true, "{why}");
+    }
+
+    /// A local root is read from a URI as the engine reads it: `file://`
+    /// and bare paths are local, the in-memory catalog and object stores
+    /// are not.
+    #[test]
+    fn a_local_root_is_read_from_the_uri_as_the_engine_reads_it() {
+        assert_eq!(
+            local_root("file:///data/infino"),
+            Some(PathBuf::from("/data/infino"))
+        );
+        assert_eq!(
+            local_root("/data/infino"),
+            Some(PathBuf::from("/data/infino"))
+        );
+        assert_eq!(local_root("./data"), Some(PathBuf::from("./data")));
+        for not_local in [
+            "memory://",
+            "memory:",
+            "memory",
+            "s3://b/p",
+            "gs://b",
+            "az://c/p",
+        ] {
+            assert_eq!(local_root(not_local), None, "{not_local}");
+        }
+    }
+
+    /// An `s3://` node whose instance metadata service accepts the
+    /// connection but never answers, as in Docker on EC2 at a hop limit of 1,
+    /// has no credentials: the check says so within its short wait, where
+    /// the store client would retry for minutes. One that answers at all,
+    /// even with an error status, lets the listing decide.
+    #[test]
+    fn an_instance_metadata_service_that_does_not_answer_means_no_credentials() {
+        let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", silent.local_addr().unwrap());
+        let started = Instant::now();
+        let failure = check_instance_metadata(&base, SHORT_WAIT).unwrap_err();
+        assert!(failure.reason.contains("no AWS credentials"), "{failure:?}");
+        assert!(!failure.permanent, "the service can come back: {failure:?}");
+        assert!(started.elapsed() < SHORT_WAIT * 3, "{:?}", started.elapsed());
+
+        let answering = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", answering.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = answering.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
+        });
+        assert!(check_instance_metadata(&base, SHORT_WAIT).is_ok());
+        server.join().unwrap();
+    }
+
+    /// Only a failure that will not pass on its own is permanent.
+    #[test]
+    fn only_a_refusal_of_the_local_root_is_permanent() {
+        assert!(lasts(ErrorKind::PermissionDenied));
+        assert!(lasts(ErrorKind::ReadOnlyFilesystem));
+        assert!(!lasts(ErrorKind::TimedOut));
+        assert!(!lasts(ErrorKind::Interrupted));
+    }
+
+    /// A new, empty directory under the system's temp directory.
+    fn scratch_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = env::temp_dir().join(format!("{prefix}-{}-{stamp}", process::id()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// A URI that names no store the engine knows fails to open, with the
+    /// reason.
+    #[test]
+    fn a_uri_no_store_serves_fails_to_open_with_the_reason() {
+        let uri = c("nosuchscheme://bucket/prefix");
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        assert!(h.is_null());
+        let why: Value = serde_json::from_str(&take(unsafe { infino_open_error() })).unwrap();
+        assert!(
+            why["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{why}"
+        );
     }
 
     /// A result's JSON is built up to the bound and no further, and within
