@@ -41,6 +41,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
@@ -122,26 +123,32 @@ public final class InfinoWriter {
      * delete or an update), whether the id may already exist (looked up at
      * flush), whether it must not ({@code op_type: create}, answered with a
      * conflict when it does), for an update the request whose document is
-     * merged when its batch is written, and the values OpenSearch's mapper
-     * read from the source's date and integer fields (null when the bridge
-     * reads the source alone; see {@link InfinoMappedValues}).
+     * merged when its batch is written, the paths of the source's fields the
+     * mapper ignored ({@link InfinoIgnored}), left out of its row, and the
+     * values OpenSearch's mapper read from the source's date and integer
+     * fields (null when the bridge reads the source alone; see
+     * {@link InfinoMappedValues}).
      */
-    record Write(String id, String source, boolean lookup, boolean create, UpdateRequest update, String values) {
-        Write(String id, String source, boolean lookup, boolean create, UpdateRequest update) {
-            this(id, source, lookup, create, update, null);
+    record Write(String id, String source, boolean lookup, boolean create, UpdateRequest update, List<String> ignored, String values) {
+        Write(String id, String source, boolean lookup, boolean create, UpdateRequest update, List<String> ignored) {
+            this(id, source, lookup, create, update, ignored, null);
+        }
+
+        Write(String id, String source, boolean lookup, boolean create, List<String> ignored) {
+            this(id, source, lookup, create, null, ignored);
         }
 
         Write(String id, String source, boolean lookup, boolean create) {
-            this(id, source, lookup, create, null);
+            this(id, source, lookup, create, null, List.of());
         }
 
         Write(String id, String source, boolean lookup) {
-            this(id, source, lookup, false, null);
+            this(id, source, lookup, false, null, List.of());
         }
 
         /** This write with the values the mapper read from its source. */
         Write withValues(String values) {
-            return new Write(id, source, lookup, create, update, values);
+            return new Write(id, source, lookup, create, update, ignored, values);
         }
 
         /** The source as it crosses to the bridge: with the mapper's values when it has them. */
@@ -156,7 +163,7 @@ public final class InfinoWriter {
          * earlier in its batch, or in an append that has committed since.
          */
         static Write update(UpdateRequest update) {
-            return new Write(update.id(), null, true, false, update);
+            return new Write(update.id(), null, true, false, update, List.of());
         }
 
         /** Whether this write removes its id's document. */
@@ -323,13 +330,15 @@ public final class InfinoWriter {
     private static Pointer prepareRows(String table, Waiter waiter) {
         List<String> ids = new ArrayList<>();
         List<String> sources = new ArrayList<>();
+        List<List<String>> ignored = new ArrayList<>();
         for (Outcome o : waiter.outcomes()) {
             if (carriesRow(o)) {
                 ids.add(o.write().id());
                 sources.add(o.write().forTable());
+                ignored.add(o.write().ignored());
             }
         }
-        return ids.isEmpty() ? null : InfinoNative.prepare(table, ids, sources);
+        return ids.isEmpty() ? null : InfinoNative.prepare(table, ids, sources, ignored);
     }
 
     /**
@@ -714,6 +723,10 @@ public final class InfinoWriter {
         // The document each update became, and the values the mapper read from it when the bridge refuses it alone.
         Map<Outcome, String> merged = new IdentityHashMap<>();
         Map<Outcome, String> mapped = new IdentityHashMap<>();
+        // The paths of the fields the mapper ignored in each update's document.
+        Map<Outcome, List<String>> mergedIgnored = new IdentityHashMap<>();
+        // The mapper of the index when its documents may have a field it ignores; parsed against once, at the first update.
+        Map<ShardId, Optional<MapperService>> ignoring = new HashMap<>();
         // The last write of each id that goes to the table.
         Map<String, Outcome> last = new LinkedHashMap<>();
         boolean folded = false;
@@ -745,14 +758,25 @@ public final class InfinoWriter {
                                 if (document == null) {
                                     rejection = new DocumentMissingException(shardId, w.id());
                                 } else {
-                                    String why = InfinoNative.checkDoc(table, document);
+                                    MapperService mappers = ignoring.computeIfAbsent(
+                                        shardId,
+                                        id -> Optional.ofNullable(InfinoIgnored.ignoring(id.getIndex()))
+                                    ).orElse(null);
+                                    List<String> ignored = null;
+                                    try {
+                                        ignored = InfinoIgnored.parse(mappers, shardId.getIndexName(), w.id(), document, w.update().routing());
+                                    } catch (RuntimeException e) {
+                                        // The mapper refuses the merged document, as a shard's would: this update alone fails.
+                                        rejection = e;
+                                    }
+                                    String why = ignored == null ? null : InfinoNative.checkDoc(table, document, ignored);
                                     String values = null;
                                     if (why != null) {
                                         try {
-                                            MapperService mappers = InfinoMappedValues.mappers(shardId.getIndex());
-                                            values = InfinoMappedValues.parse(mappers, s.waiter().indexName(), w.id(), document, w.update().routing());
+                                            MapperService reading = InfinoMappedValues.mappers(shardId.getIndex());
+                                            values = InfinoMappedValues.parse(reading, s.waiter().indexName(), w.id(), document, w.update().routing());
                                             if (values != null) {
-                                                why = InfinoNative.checkDoc(table, InfinoMappedValues.framed(document, values));
+                                                why = InfinoNative.checkDoc(table, InfinoMappedValues.framed(document, values), ignored);
                                             }
                                         } catch (InfinoNative.InfinoException e) {
                                             throw e;
@@ -765,6 +789,7 @@ public final class InfinoWriter {
                                         rejection = refused(why);
                                     } else if (rejection == null) {
                                         merged.put(o, document);
+                                        mergedIgnored.put(o, ignored);
                                         if (values != null) {
                                             mapped.put(o, values);
                                         }
@@ -819,7 +844,7 @@ public final class InfinoWriter {
         try {
             // Both paths release every handle: the engine does on the prepared
             // path, the folded path up front. Nothing after this may release one.
-            appended = folded ? appendFolded(table, staged, last.values(), merged, mapped, written, replaced) : appendPrepared(table, staged, written, replaced);
+            appended = folded ? appendFolded(table, staged, last.values(), merged, mergedIgnored, mapped, written, replaced) : appendPrepared(table, staged, written, replaced);
         } finally {
             // A read after the write must see the table, not a prefetched copy.
             InfinoNative.forgetSources(table, last.keySet());
@@ -1004,8 +1029,9 @@ public final class InfinoWriter {
     /**
      * The batch's last write of each id, prepared afresh and written as one
      * mutation under the sequence number it was given (a delete writes no
-     * row; an update writes the document {@code merged} holds for it, with
-     * the values {@code mapped} holds for it): the
+     * row; an update writes the document {@code merged} holds for it,
+     * without the fields {@code mergedIgnored} lists and with the values
+     * {@code mapped} holds for it): the
      * path for a batch in which one id appears twice, a write meets a
      * conflict and is left out, or an update was merged.
      */
@@ -1014,6 +1040,7 @@ public final class InfinoWriter {
         List<Staged> staged,
         Collection<Outcome> last,
         Map<Outcome, String> merged,
+        Map<Outcome, List<String>> mergedIgnored,
         Map<Outcome, String> mapped,
         Map<Outcome, Written> written,
         List<String> replaced
@@ -1023,12 +1050,14 @@ public final class InfinoWriter {
         }
         List<String> ids = new ArrayList<>();
         List<String> sources = new ArrayList<>();
+        List<List<String>> ignored = new ArrayList<>();
         List<Long> seqs = new ArrayList<>();
         for (Outcome o : last) {
             String document = merged.containsKey(o) ? InfinoMappedValues.framed(merged.get(o), mapped.get(o)) : o.write().forTable();
             if (document != null) {
                 ids.add(o.write().id());
                 sources.add(document);
+                ignored.add(merged.containsKey(o) ? mergedIgnored.get(o) : o.write().ignored());
                 seqs.add(written.get(o).seq());
             }
         }
@@ -1036,7 +1065,7 @@ public final class InfinoWriter {
         if (ids.isEmpty()) {
             return new Appended(refused, false);
         }
-        Pointer prepared = InfinoNative.prepare(table, ids, sources);
+        Pointer prepared = InfinoNative.prepare(table, ids, sources, ignored);
         if (prepared == null) {
             throw new IllegalStateException("[infino] the bridge could not prepare the folded batch for " + table);
         }

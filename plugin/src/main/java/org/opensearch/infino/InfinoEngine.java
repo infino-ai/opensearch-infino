@@ -29,6 +29,7 @@ import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.FlushFailedEngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.mapper.MapperParsingException;
+import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.ParseContext.Document;
 import org.opensearch.index.mapper.SourceFieldMapper;
 import org.opensearch.index.seqno.ReplicationTracker;
@@ -216,16 +217,17 @@ public class InfinoEngine extends InternalEngine {
 
     /**
      * One write of an id waiting for its commit: its source (null for a
-     * delete), routing value and stamp, and the operation that made it.
-     * A write the copies need not hold first (a replay of the shard's own
-     * history) is not gated. {@code mapped} holds the values OpenSearch's
-     * mapper read from the source's date and integer fields, for a document
-     * the table's columns refuse without them ({@link InfinoMappedValues});
-     * null for any other.
+     * delete), routing value and stamp, the operation that made it, and the
+     * paths of the source's fields the mapper ignored ({@link InfinoIgnored}),
+     * left out of its row. A write the copies need not hold first (a replay
+     * of the shard's own history) is not gated. {@code mapped} holds the
+     * values OpenSearch's mapper read from the source's date and integer
+     * fields, for a document the table's columns refuse without them
+     * ({@link InfinoMappedValues}); null for any other.
      */
-    private record Version(long seq, boolean gated, String source, String routing, long stamp, String mapped) {
-        Version(long seq, boolean gated, String source, String routing, long stamp) {
-            this(seq, gated, source, routing, stamp, null);
+    private record Version(long seq, boolean gated, String source, String routing, long stamp, List<String> ignored, String mapped) {
+        Version(long seq, boolean gated, String source, String routing, long stamp, List<String> ignored) {
+            this(seq, gated, source, routing, stamp, ignored, null);
         }
 
         /** The source as the bridge takes it, with the mapper's values when it has them. */
@@ -1124,6 +1126,18 @@ public class InfinoEngine extends InternalEngine {
         }
     }
 
+    /**
+     * The paths of the fields the mapper ignored in {@code id}'s document, as
+     * a read sees it now: a pending write's, else the table's.
+     */
+    static List<String> currentIgnored(String table, String id) {
+        Version v = latestPending(table, id);
+        if (v != null && v.source() != null) {
+            return v.ignored();
+        }
+        return InfinoNative.ignoredOf(table, id);
+    }
+
     @Override
     public void close() throws IOException {
         leaseRefreshStopped = true;
@@ -1199,6 +1213,8 @@ public class InfinoEngine extends InternalEngine {
         String source = !toTable || index.source() == null
             ? null
             : InfinoBulkActionFilter.sourceAsJson(index.source(), index.parsedDoc() == null ? null : index.parsedDoc().getMediaType());
+        // The fields the mapper ignored for a malformed value: the row leaves them out, as the shard's document does.
+        List<String> ignored = source == null ? List.of() : InfinoIgnored.of(index.parsedDoc());
         // The table's columns refuse here, before the write is applied and
         // acknowledged, a document the commit would refuse: one the mapper takes
         // but a column cannot hold (an unsigned_long past the largest signed
@@ -1218,7 +1234,7 @@ public class InfinoEngine extends InternalEngine {
             String why;
             try {
                 InfinoPlugin.tables().ensure(config().getIndexSettings().getIndexMetadata(), config().getShardId().id());
-                why = InfinoNative.checkDoc(table, source);
+                why = InfinoNative.checkDoc(table, source, ignored);
                 if (why != null) {
                     try {
                         mapped = InfinoMappedValues.of(index.parsedDoc(), config().getMapperService());
@@ -1227,7 +1243,7 @@ public class InfinoEngine extends InternalEngine {
                         mapped = null;
                     }
                     if (mapped != null) {
-                        why = InfinoNative.checkDoc(table, InfinoMappedValues.framed(source, mapped));
+                        why = InfinoNative.checkDoc(table, InfinoMappedValues.framed(source, mapped), ignored);
                     }
                 }
             } catch (InfinoNative.InfinoException e) {
@@ -1288,7 +1304,7 @@ public class InfinoEngine extends InternalEngine {
                     Base base = recovery || (!skeletonKnowsIds() && result.isCreated())
                         ? Base.UNKNOWN
                         : result.isCreated() ? Base.ABSENT : Base.PRESENT;
-                    batch.add(id, base, new Version(result.getSeqNo(), !recovery, source, index.routing(), stamp, mapped));
+                    batch.add(id, base, new Version(result.getSeqNo(), !recovery, source, index.routing(), stamp, ignored, mapped));
                     full = batchFull();
                 }
             }
@@ -1338,7 +1354,7 @@ public class InfinoEngine extends InternalEngine {
                 if (result.isFound()) {
                     synchronized (batchLock) {
                         unrefreshed.remove(id);
-                        batch.add(id, recovery ? Base.UNKNOWN : Base.PRESENT, new Version(result.getSeqNo(), !recovery, null, null, UNSTAMPED));
+                        batch.add(id, recovery ? Base.UNKNOWN : Base.PRESENT, new Version(result.getSeqNo(), !recovery, null, null, UNSTAMPED, List.of()));
                     }
                     return result;
                 }
@@ -1391,7 +1407,7 @@ public class InfinoEngine extends InternalEngine {
             return false;
         }
         synchronized (batchLock) {
-            batch.add(id, Base.PRESENT, new Version(seq, true, null, null, UNSTAMPED));
+            batch.add(id, Base.PRESENT, new Version(seq, true, null, null, UNSTAMPED, List.of()));
         }
         return true;
     }
@@ -1697,6 +1713,7 @@ public class InfinoEngine extends InternalEngine {
         List<Version> written = new ArrayList<>();
         List<String> sources = new ArrayList<>();
         List<String> routings = new ArrayList<>();
+        List<List<String>> ignored = new ArrayList<>();
         List<Long> stamps = new ArrayList<>();
         List<Long> ops = new ArrayList<>();
         Set<String> replaced = new HashSet<>();
@@ -1716,6 +1733,7 @@ public class InfinoEngine extends InternalEngine {
             written.add(last);
             sources.add(last.forTable());
             routings.add(last.routing());
+            ignored.add(last.ignored());
             stamps.add(last.stamp());
             ops.add(last.seq());
             if (e.base == Base.PRESENT) {
@@ -1761,7 +1779,7 @@ public class InfinoEngine extends InternalEngine {
             // is mapped before its document is applied): declared first, a new text
             // field gets its text index, where the append would add a plain column.
             InfinoPlugin.tables().ensure(config().getIndexSettings().getIndexMetadata(), config().getShardId().id());
-            Pointer prepared = InfinoNative.prepare(table, ids, sources, routings, seqs, opSeqs, generation);
+            Pointer prepared = InfinoNative.prepare(table, ids, sources, routings, seqs, opSeqs, generation, ignored);
             if (prepared == null) {
                 throw new IllegalStateException("[infino] the bridge could not prepare a batch for " + table);
             }
@@ -1805,7 +1823,7 @@ public class InfinoEngine extends InternalEngine {
             String refused = f.permanent() ? f.reason() : null;
             if (refused == null && checkable) {
                 try {
-                    refused = InfinoNative.checkDoc(table, v.forTable());
+                    refused = InfinoNative.checkDoc(table, v.forTable(), v.ignored());
                 } catch (InfinoNative.InfinoException e) {
                     // No verdict on this document or the ones after it: each is tried again.
                     checkable = false;
@@ -1816,7 +1834,7 @@ public class InfinoEngine extends InternalEngine {
                 // need the values the mapper reads: with them, the next commit takes it.
                 try {
                     Version withValues = withMapped(id, v);
-                    if (withValues != null && InfinoNative.checkDoc(table, withValues.forTable()) == null) {
+                    if (withValues != null && InfinoNative.checkDoc(table, withValues.forTable(), withValues.ignored()) == null) {
                         log.debug("[infino] table {} takes document {} (operation {}) at the next commit, with the values the mapper read", table, id, v.seq());
                         retry.add(id, Base.UNKNOWN, withValues);
                         continue;
@@ -1855,7 +1873,7 @@ public class InfinoEngine extends InternalEngine {
             return null;
         }
         String mapped = InfinoMappedValues.parse(config().getMapperService(), shardId.getIndexName(), id, v.source(), v.routing());
-        return mapped == null ? null : new Version(v.seq(), v.gated(), v.source(), v.routing(), v.stamp(), mapped);
+        return mapped == null ? null : new Version(v.seq(), v.gated(), v.source(), v.routing(), v.stamp(), v.ignored(), mapped);
     }
 
     /**
@@ -2044,6 +2062,21 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /**
+     * The paths the mapper ignores in a source of the shard's history
+     * ({@link InfinoIgnored#parse}); none when {@code mappers} is null. The
+     * shard took the document once, so a mapper that refuses it on replay (its
+     * mapping moved since) leaves the row to the table's own check.
+     */
+    private List<String> fillIgnored(MapperService mappers, String id, String source, String routing) {
+        try {
+            return InfinoIgnored.parse(mappers, shardId.getIndexName(), id, source, routing);
+        } catch (RuntimeException e) {
+            log.warn("[infino] {} could not parse document {} from its history again for its ignored fields: {}", shardId, id, e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
      * Write into the table the operations of this copy's history it may not
      * hold: from where the table's lease holds the history
      * ({@link #holdHistoryThrough}), which the copy kept for exactly this.
@@ -2086,6 +2119,8 @@ public class InfinoEngine extends InternalEngine {
         }
         long start = System.nanoTime();
         int written = 0;
+        // The history keeps sources, not parsed documents: an index that may ignore a malformed value parses each again.
+        MapperService ignoring = InfinoIgnored.mayIgnore(config().getMapperService()) ? config().getMapperService() : null;
         try (Translog.Snapshot history = newChangesSnapshot(FILL_SOURCE, from, to, lease != null, false)) {
             Translog.Operation op;
             while ((op = history.next()) != null) {
@@ -2099,11 +2134,11 @@ public class InfinoEngine extends InternalEngine {
                             index.source(),
                             index.source() == null ? null : MediaTypeRegistry.xContentType(index.source())
                         );
-                        v = new Version(op.seqNo(), false, source, index.routing(), UNSTAMPED);
+                        v = new Version(op.seqNo(), false, source, index.routing(), UNSTAMPED, fillIgnored(ignoring, id, source, index.routing()));
                     }
                     case DELETE -> {
                         id = ((Translog.Delete) op).id();
-                        v = new Version(op.seqNo(), false, null, null, UNSTAMPED);
+                        v = new Version(op.seqNo(), false, null, null, UNSTAMPED, List.of());
                     }
                     default -> {
                         continue;

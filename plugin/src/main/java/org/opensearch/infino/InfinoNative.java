@@ -1029,8 +1029,17 @@ public final class InfinoNative {
      * for the next commit rather than dropped.
      */
     public static String checkDoc(String name, String source) {
+        return checkDoc(name, source, List.of());
+    }
+
+    /**
+     * {@link #checkDoc(String, String)} with the fields at {@code ignored}
+     * left out of the document, as OpenSearch's mapper leaves out a field
+     * with a malformed value it ignores.
+     */
+    public static String checkDoc(String name, String source, List<String> ignored) {
         init();
-        Pointer p = lib.infino_check_doc(conn, name, source);
+        Pointer p = lib.infino_check_doc(conn, name, source, ignored.isEmpty() ? null : InfinoIgnored.join(ignored));
         if (p == null) {
             throw new InfinoException("the bridge failed while checking the document", RestStatus.SERVICE_UNAVAILABLE);
         }
@@ -1041,27 +1050,35 @@ public final class InfinoNative {
     /**
      * The ids and sources of a batch as one UTF-8 buffer with the end offset
      * of each id and each source; with routing values, each row's follows its
-     * source (empty for none) and {@code rtEnds} holds where it ends.
+     * source (empty for none) and {@code rtEnds} holds where it ends. With
+     * ignored fields, the paths of each row's follow ({@link InfinoIgnored#join},
+     * empty for none) and {@code igEnds} holds where they end; null when no
+     * row has any.
      */
-    private record Packed(byte[] buf, int[] idEnds, int[] srcEnds, int[] rtEnds) {
-        static Packed of(List<String> osids, List<String> sources) {
-            return of(osids, sources, null);
+    private record Packed(byte[] buf, int[] idEnds, int[] srcEnds, int[] rtEnds, int[] igEnds) {
+        static Packed of(List<String> osids, List<String> sources, List<List<String>> ignored) {
+            return of(osids, sources, null, ignored);
         }
 
-        static Packed of(List<String> osids, List<String> sources, List<String> routings) {
+        static Packed of(List<String> osids, List<String> sources, List<String> routings, List<List<String>> ignored) {
             int n = osids.size();
             int[] idEnds = new int[n];
             int[] srcEnds = new int[n];
             int[] rtEnds = routings == null ? null : new int[n];
+            boolean anyIgnored = ignored != null && ignored.stream().anyMatch(paths -> paths != null && paths.isEmpty() == false);
+            int[] igEnds = anyIgnored ? new int[n] : null;
             byte[][] idBytes = new byte[n][];
             byte[][] srcBytes = new byte[n][];
             byte[][] rtBytes = new byte[n][];
+            byte[][] igBytes = new byte[n][];
             int total = 0;
             for (int i = 0; i < n; i++) {
                 idBytes[i] = osids.get(i).getBytes(StandardCharsets.UTF_8);
                 srcBytes[i] = sources.get(i).getBytes(StandardCharsets.UTF_8);
                 String routing = routings == null ? null : routings.get(i);
                 rtBytes[i] = routing == null ? new byte[0] : routing.getBytes(StandardCharsets.UTF_8);
+                List<String> paths = anyIgnored ? ignored.get(i) : null;
+                igBytes[i] = paths == null || paths.isEmpty() ? new byte[0] : InfinoIgnored.join(paths).getBytes(StandardCharsets.UTF_8);
                 total += idBytes[i].length;
                 idEnds[i] = total;
                 total += srcBytes[i].length;
@@ -1069,6 +1086,10 @@ public final class InfinoNative {
                 if (rtEnds != null) {
                     total += rtBytes[i].length;
                     rtEnds[i] = total;
+                }
+                if (igEnds != null) {
+                    total += igBytes[i].length;
+                    igEnds[i] = total;
                 }
             }
             byte[] buf = new byte[total];
@@ -1082,8 +1103,12 @@ public final class InfinoNative {
                     System.arraycopy(rtBytes[i], 0, buf, at, rtBytes[i].length);
                     at += rtBytes[i].length;
                 }
+                if (igEnds != null) {
+                    System.arraycopy(igBytes[i], 0, buf, at, igBytes[i].length);
+                    at += igBytes[i].length;
+                }
             }
-            return new Packed(buf, idEnds, srcEnds, rtEnds);
+            return new Packed(buf, idEnds, srcEnds, rtEnds, igEnds);
         }
     }
 
@@ -1104,9 +1129,19 @@ public final class InfinoNative {
      * or {@link #freePrepared}. Null when the table is unknown.
      */
     public static Pointer prepare(String name, List<String> osids, List<String> sources) {
+        return prepare(name, osids, sources, (List<List<String>>) null);
+    }
+
+    /**
+     * {@link #prepare(String, List, List)} with the paths of each row's
+     * fields that OpenSearch's mapper ignored (null, or an empty list, for
+     * none): the row leaves them out and keeps them in the
+     * {@link InfinoQueryTranslator#IGNORED} column.
+     */
+    public static Pointer prepare(String name, List<String> osids, List<String> sources, List<List<String>> ignored) {
         init();
-        Packed p = Packed.of(osids, sources);
-        return lib.infino_prepare_batch(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), osids.size());
+        Packed p = Packed.of(osids, sources, ignored);
+        return lib.infino_prepare_batch(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), p.igEnds(), osids.size());
     }
 
     /**
@@ -1114,7 +1149,8 @@ public final class InfinoNative {
      * and the operation that wrote it (each negative for none), by writer
      * {@code gen}, kept in the {@link InfinoQueryTranslator#ROUTING},
      * {@link InfinoQueryTranslator#SEQ}, {@link InfinoQueryTranslator#OP} and
-     * {@link InfinoQueryTranslator#GEN} columns.
+     * {@link InfinoQueryTranslator#GEN} columns, and the paths of its
+     * ignored fields as {@link #prepare(String, List, List, List)} keeps them.
      */
     public static Pointer prepare(
         String name,
@@ -1123,10 +1159,11 @@ public final class InfinoNative {
         List<String> routings,
         long[] seqs,
         long[] ops,
-        long gen
+        long gen,
+        List<List<String>> ignored
     ) {
         init();
-        Packed p = Packed.of(osids, sources, routings);
+        Packed p = Packed.of(osids, sources, routings, ignored);
         return lib.infino_prepare_batch_meta(
             conn,
             name,
@@ -1138,6 +1175,7 @@ public final class InfinoNative {
             seqs,
             ops,
             gen,
+            p.igEnds(),
             osids.size()
         );
     }
@@ -1234,7 +1272,7 @@ public final class InfinoNative {
     public static BatchResult indexBatch(String name, String[] osids, String[] sources, int n) {
         init();
         COLUMNS.remove(name); // the batch may have added paths to the schema
-        Packed p = Packed.of(List.of(osids).subList(0, n), List.of(sources).subList(0, n));
+        Packed p = Packed.of(List.of(osids).subList(0, n), List.of(sources).subList(0, n), null);
         InfinoRequestCache.changed(name);
         Map<String, Object> out;
         try {
@@ -1813,6 +1851,53 @@ public final class InfinoNative {
     /** Whether an id holds a letter or a digit, and so indexes as at least one term of the id column's term index. */
     static boolean hasTerm(String id) {
         return id.codePoints().anyMatch(Character::isLetterOrDigit);
+    }
+
+    /** The paths of the fields the mapper ignored in {@code id}'s document, as the table holds them ({@link InfinoIgnored}); none when it ignored none. */
+    public static List<String> ignoredOf(String name, String id) {
+        return ignoredOf(name, List.of(id)).getOrDefault(id, List.of());
+    }
+
+    /**
+     * {@link #ignoredOf(String, String)} for each of these ids that has any,
+     * by id: through the id column's term index as {@link #existingOsids}
+     * finds ids, and only over rows that hold the column; none when the
+     * table holds no such column.
+     */
+    public static Map<String, List<String>> ignoredOf(String name, Collection<String> ids) {
+        if (ids.isEmpty() || InfinoQueryTranslator.ignoredColumn(columns(name)) == null) {
+            return Map.of();
+        }
+        Set<String> wanted = new HashSet<>(ids);
+        String columns = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.ignoredPaths();
+        String held = InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.IGNORED) + " IS NOT NULL";
+        List<String> termed = new ArrayList<>(wanted.size());
+        List<String> bare = new ArrayList<>();
+        for (String id : wanted) {
+            (hasTerm(id) ? termed : bare).add(id);
+        }
+        List<String> statements = new ArrayList<>(2);
+        for (int from = 0; from < termed.size(); from += PROBE_IDS_PER_STATEMENT) {
+            List<String> batch = termed.subList(from, Math.min(termed.size(), from + PROBE_IDS_PER_STATEMENT));
+            statements.add(
+                "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
+                    + InfinoQueryTranslator.literal(idTerms(batch)) + ", 'or') WHERE " + held
+            );
+        }
+        if (!bare.isEmpty()) {
+            statements.add(byIds(name, columns, bare, held));
+        }
+        Map<String, List<String>> out = new HashMap<>();
+        for (String sql : statements) {
+            for (Map<String, Object> row : sqlRows(sql)) {
+                Object id = row.get(InfinoQueryTranslator.OSID);
+                List<String> paths = InfinoIgnored.split(row.get(InfinoQueryTranslator.IGNORED));
+                if (id != null && wanted.contains(id.toString()) && !paths.isEmpty()) {
+                    out.put(id.toString(), paths);
+                }
+            }
+        }
+        return out;
     }
 
     /** Keep the sources of rows a hit statement returned (id and source columns), for the fetch phase. */

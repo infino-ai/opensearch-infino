@@ -909,7 +909,7 @@
         index: rc_default
 
 ---
-"Default mode: a malformed date its field ignores and an array of arrays in a flat_object are each refused when written, and the writes after them land":
+"Default mode: a malformed value its field ignores is left out of the row, a document the table cannot hold is refused as its own item, and the writes after both land":
   - do:
       indices.create:
         index: ep
@@ -927,11 +927,9 @@
               labels: { type: flat_object }
 
   # The mapper takes both bad documents (a malformed date it ignores, an
-  # array of arrays in a flat_object). Neither has a value its column holds,
-  # so each is refused as its own bulk item when it is written, never
-  # acknowledged and then lost. The malformed date's 400 is interim: stock
-  # answers it 201 with the field dropped and listed in `_ignored`, which
-  # this expects once ignore_malformed is honoured on write.
+  # array of arrays in a flat_object). The array of arrays is refused as its
+  # own bulk item when it is written. The malformed date is indexed without
+  # the field, as stock indexes it, and listed under _ignored.
   - do:
       bulk:
         body:
@@ -945,7 +943,7 @@
           - { when: "2026-10-24T10:03:00Z", status: 4 }
   - match: { errors: true }
   - match: { items.0.index.status: 201 }
-  - match: { items.1.index.status: 400 }
+  - match: { items.1.index.status: 201 }
   - match: { items.2.index.status: 400 }
   - match: { items.3.index.status: 201 }
 
@@ -966,10 +964,20 @@
         body:
           track_total_hits: true
           sort: [ { status: asc } ]
-  - match: { hits.total.value: 3 }
+  - match: { hits.total.value: 4 }
   - match: { hits.hits.0._id: a }
-  - match: { hits.hits.1._id: b }
-  - match: { hits.hits.2._id: c }
+  - match: { hits.hits.1._id: bad_date }
+  - match: { hits.hits.1._ignored: [ when ] }
+  - match: { hits.hits.1._source.when: bar }
+  - match: { hits.hits.2._id: b }
+  - match: { hits.hits.3._id: c }
+
+  - do:
+      count:
+        index: ep
+        body:
+          query: { exists: { field: when } }
+  - match: { count: 3 }
 
   - do:
       indices.delete:

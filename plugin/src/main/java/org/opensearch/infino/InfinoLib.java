@@ -44,20 +44,29 @@ public interface InfinoLib extends Library {
 
     Pointer infino_columns(Pointer h, String name);
 
-    Pointer infino_check_doc(Pointer h, String name, String source);
+    /**
+     * The reason one document would be refused by the declared columns, or an empty string; {@code ignored} holds
+     * the paths of the fields left out of it, separated by newlines (null for none).
+     */
+    Pointer infino_check_doc(Pointer h, String name, String source, String ignored);
 
     Pointer infino_index_batch(Pointer h, String name, String[] osids, String[] sources, int count);
 
     /** One buffer of ids and sources with their end offsets: three native arrays instead of one allocation per string. */
     Pointer infino_index_batch_buf(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
 
-    /** Parse and convert a batch ahead of its append; null when the table is unknown. */
-    Pointer infino_prepare_batch(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
+    /**
+     * Parse and convert a batch ahead of its append; null when the table is unknown. With {@code igEnds}, each
+     * row's source is followed by the paths of its fields left out of the row, separated by newlines and ending
+     * at {@code igEnds} (null for none).
+     */
+    Pointer infino_prepare_batch(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int[] igEnds, int count);
 
     /**
      * {@link #infino_prepare_batch} with each row's routing value after its source (empty for none), ending
      * at {@code rtEnds}, its stamp in {@code seqs} and the operation that wrote it in {@code ops} (each
-     * negative for none), by writer {@code gen}.
+     * negative for none), by writer {@code gen}; with {@code igEnds}, the paths of a row's fields left out of
+     * it follow its routing value.
      */
     Pointer infino_prepare_batch_meta(
         Pointer h,
@@ -70,6 +79,7 @@ public interface InfinoLib extends Library {
         long[] seqs,
         long[] ops,
         long gen,
+        int[] igEnds,
         int count
     );
 
