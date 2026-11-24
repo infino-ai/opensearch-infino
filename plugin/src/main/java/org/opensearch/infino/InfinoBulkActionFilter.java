@@ -55,6 +55,7 @@ import org.opensearch.core.xcontent.MediaType;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexNotFoundException;
+import org.opensearch.index.VersionType;
 import org.opensearch.index.engine.DocumentMissingException;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.get.GetResult;
@@ -787,21 +788,27 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
         ActionListener<BulkResponse> listener,
         Runnable instead
     ) {
-        createMissing(missingIndices(clusters, bulk, answered), ActionListener.wrap(created -> {
-            Map<String, IndexMetadata> infino;
+        Runnable serve = () -> {
             List<String> concrete = concreteIndices(clusters.state(), bulk);
-            try {
-                infino = infinoIndices(clusters, concrete);
-            } catch (Exception e) {
-                listener.onFailure(e);
-                return;
-            }
+            Map<String, IndexMetadata> infino = infinoIndices(clusters, concrete);
             if (infino.isEmpty()) {
                 instead.run();
-                return;
+            } else {
+                dispatch(bulk, concrete, infino, answered, writes, tables, clusters, listener);
             }
-            dispatch(bulk, concrete, infino, answered, writes, tables, clusters, listener);
-        }, listener::onFailure));
+        };
+        List<String> missing = missingIndices(clusters, bulk, answered);
+        if (missing.isEmpty()) {
+            try {
+                serve.run();
+            } catch (Exception e) {
+                listener.onFailure(e);
+            }
+            return;
+        }
+        // The creations answer on a cluster-state or transport thread: the bulk goes on on the write
+        // pool, as the stock bulk does once its indices are created, and a failure of its own answers it.
+        createMissing(missing, bulk, answered, () -> InfinoServices.fork(ThreadPool.Names.WRITE, listener::onFailure, serve));
     }
 
     /**
@@ -1333,7 +1340,8 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
      * cluster's rule forbids creating one, nothing is listed: the stock path
      * reports the missing index. Neither is one an item requires be an alias
      * ({@link #aliasRequired}): the cluster creates no index for it, and the
-     * item fails.
+     * item fails. Nor is one only a delete names, unless with an external
+     * version: a delete of a document in a missing index finds none.
      */
     static List<String> missingIndices(ClusterService clusters, BulkRequest bulk) {
         return missingIndices(clusters, bulk, null);
@@ -1357,8 +1365,13 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
             if (answered != null && answered[slot] != null) {
                 continue;
             }
-            String name = bulk.requests().get(slot).index();
+            DocWriteRequest<?> item = bulk.requests().get(slot);
+            String name = item.index();
+            // As the stock bulk: a delete creates no index, unless it carries an external version.
             if (name == null
+                || (item.opType() == DocWriteRequest.OpType.DELETE
+                    && item.versionType() != VersionType.EXTERNAL
+                    && item.versionType() != VersionType.EXTERNAL_GTE)
                 || state.metadata().getIndicesLookup().containsKey(name)
                 || missing.contains(name)
                 || aliasRequired.contains(name)) {
@@ -1446,15 +1459,68 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
         return metadata.getIndicesLookup().containsKey(index) ? null : new IndexNotFoundException(index);
     }
 
-    /** Create the indices named, one after another, then tell {@code then}. */
-    static void createMissing(List<String> names, ActionListener<Void> then) {
+    /**
+     * Create the indices named, all at once, as the stock bulk creates them
+     * ({@link InfinoClient#autoCreate}: a data stream where a data-stream
+     * template matches), then run {@code then} once every creation is
+     * answered. A name that cannot be created fails the bulk's items that
+     * write to it, each in its own slot of {@code answered}, and the others go
+     * on, as the stock bulk answers them.
+     */
+    static void createMissing(List<String> names, BulkRequest bulk, BulkItemResponse[] answered, Runnable then) {
+        createMissing(names, bulk, answered, then, InfinoClient::autoCreate);
+    }
+
+    /** How {@link #createMissing} creates one index: {@link InfinoClient#autoCreate} but in a unit test. */
+    interface Creator {
+        void create(String index, TimeValue timeout, ActionListener<Void> listener);
+    }
+
+    /** {@link #createMissing(List, BulkRequest, BulkItemResponse[], Runnable)} through {@code creator}. */
+    static void createMissing(List<String> names, BulkRequest bulk, BulkItemResponse[] answered, Runnable then, Creator creator) {
         if (names.isEmpty()) {
-            then.onResponse(null);
+            then.run();
             return;
         }
-        String first = names.get(0);
-        List<String> rest = names.subList(1, names.size());
-        InfinoClient.createIndex(first, ActionListener.wrap(created -> createMissing(rest, then), then::onFailure));
+        // Each name fails only its own slots, and the last creation answered (whichever thread
+        // delivers it) sees every slot the others failed before it counted down.
+        AtomicInteger left = new AtomicInteger(names.size());
+        for (String name : names) {
+            AtomicBoolean done = new AtomicBoolean();
+            creator.create(name, bulk.timeout(), new ActionListener<>() {
+                @Override
+                public void onResponse(Void created) {
+                    answer(null);
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    answer(e);
+                }
+
+                private void answer(Exception failure) {
+                    if (!done.compareAndSet(false, true)) {
+                        return;
+                    }
+                    if (failure != null) {
+                        failItemsOf(name, failure, bulk, answered);
+                    }
+                    if (left.decrementAndGet() == 0) {
+                        then.run();
+                    }
+                }
+            });
+        }
+    }
+
+    /** Answer each item of {@code bulk} not yet answered that writes to {@code index} with {@code cause}. */
+    static void failItemsOf(String index, Exception cause, BulkRequest bulk, BulkItemResponse[] answered) {
+        for (int slot = 0; slot < bulk.requests().size(); slot++) {
+            DocWriteRequest<?> item = bulk.requests().get(slot);
+            if (answered[slot] == null && index.equals(item.index())) {
+                answered[slot] = failure(slot, item, index, cause);
+            }
+        }
     }
 
     /**

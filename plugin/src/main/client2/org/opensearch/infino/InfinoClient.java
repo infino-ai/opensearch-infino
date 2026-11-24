@@ -7,11 +7,13 @@ package org.opensearch.infino;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.admin.cluster.reroute.ClusterRerouteRequest;
+import org.opensearch.action.admin.indices.create.AutoCreateAction;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.client.Client;
 import org.opensearch.common.inject.Injector;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 
 /**
@@ -29,9 +31,28 @@ final class InfinoClient {
         client = injector.getInstance(Client.class);
     }
 
-    /** Create {@code index} with the cluster's defaults; one that appeared meanwhile counts as created. */
-    static void createIndex(String index, ActionListener<Void> listener) {
-        createIndex(new CreateIndexRequest(index), listener);
+    /**
+     * Create {@code index} for a write that names it, as the stock bulk
+     * creates it: through the cluster's auto-create action, which makes a data
+     * stream when a data-stream template matches the name and an index with
+     * the cluster's defaults otherwise. One that appeared meanwhile counts as
+     * created.
+     */
+    static void autoCreate(String index, TimeValue timeout, ActionListener<Void> listener) {
+        Client c = client;
+        if (c == null) {
+            listener.onFailure(new IllegalStateException("[infino] the node client is not available yet"));
+            return;
+        }
+        CreateIndexRequest request = new CreateIndexRequest(index).cause("auto(bulk api)");
+        request.clusterManagerNodeTimeout(timeout);
+        c.execute(AutoCreateAction.INSTANCE, request, ActionListener.wrap(response -> listener.onResponse(null), e -> {
+            if (ExceptionsHelper.unwrapCause(e) instanceof ResourceAlreadyExistsException) {
+                listener.onResponse(null);
+            } else {
+                listener.onFailure(e);
+            }
+        }));
     }
 
     /**
