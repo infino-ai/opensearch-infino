@@ -51,39 +51,39 @@ delete/50_refresh/Refresh  # [bug:default] a delete sent without refresh hides t
 search/260_sort_mixed/*  # [bug] a sort across long, double and unsigned_long indices stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
 
 # --- Write responses
-update/12_result/Update result field  # [bug] an update reports the wrong result or _version
-update/16_noop/Noop  # [bug] an update that changes nothing is not a noop: it takes a new _seq_no
-update/40_routing/Routing  # [bug] an update with routing returns no get._source (default) or no _routing (proxy)
-update/80_source_filtering/Source filtering  # [bug] an update with _source filtering returns no get._source
-bulk/40_source/Source filtering  # [bug] an update with _source filtering returns no get._source
+update/12_result/Update result field  # [bug] an update that changes nothing answers updated, not noop, and takes a new _version (https://github.com/infino-ai/opensearch-infino/issues/229, https://github.com/infino-ai/opensearch-infino/issues/57)
+update/16_noop/Noop  # [bug] an update that changes nothing is not a noop: it writes and takes a new _seq_no (https://github.com/infino-ai/opensearch-infino/issues/229, https://github.com/infino-ai/opensearch-infino/issues/57)
+update/40_routing/Routing  # [bug] an update with routing returns no get._source (default) or no _routing (proxy) (https://github.com/infino-ai/opensearch-infino/issues/57, https://github.com/infino-ai/opensearch-infino/issues/203)
+update/80_source_filtering/Source filtering  # [bug] an update with _source filtering returns no get._source (https://github.com/infino-ai/opensearch-infino/issues/203)
+bulk/40_source/Source filtering  # [bug] an update with _source filtering returns no get._source (https://github.com/infino-ai/opensearch-infino/issues/203)
 
 # --- Search and get response fields
-search/100_stored_fields/Stored fields  # [bug] stored_fields: _none_ still returns _id
-search/330_fetch_fields/Test disable _source loading  # [bug] fields returns nothing when _source is not loaded
-search/330_fetch_fields/Test token count  # [bug] fields returns the wrong token_count
-search/190_index_prefix_search/search with index prefixes  # [bug] max_score differs from stock scoring
-search/210_rescore_explain/Score should match explanation in rescore  # [bug] max_score differs from stock scoring
-search/50_multi_match/Cross fields do not return negative scores  # [bug] multi_match over several text fields is answered unranked: field boosts, tie_breaker and the cross_fields type are ignored, so hits come back in write order, not by score
+search/100_stored_fields/Stored fields  # [bug] stored_fields: _none_ still returns _id (https://github.com/infino-ai/opensearch-infino/issues/204)
+search/330_fetch_fields/Test disable _source loading  # [bug] fields returns nothing when _source is not loaded (https://github.com/infino-ai/opensearch-infino/issues/204)
+search/330_fetch_fields/Test token count  # [bug] fields returns the wrong token_count (https://github.com/infino-ai/opensearch-infino/issues/204)
+search/190_index_prefix_search/search with index prefixes  # [bug] max_score differs from stock scoring (https://github.com/infino-ai/opensearch-infino/issues/212)
+search/210_rescore_explain/Score should match explanation in rescore  # [bug] max_score differs from stock scoring (https://github.com/infino-ai/opensearch-infino/issues/212)
+search/50_multi_match/Cross fields do not return negative scores  # [bug] multi_match over several text fields is answered unranked: field boosts, tie_breaker and the cross_fields type are ignored, so hits come back in write order, not by score (https://github.com/infino-ai/opensearch-infino/issues/230)
 
 # --- Aggregation results
-search.aggregation/10_histogram/Deprecated _time order  # [bug] date_histogram ignores order: a descending key order comes back ascending
-search.aggregation/10_histogram/Format test  # [bug] histogram buckets have no key_as_string
-search.aggregation/20_terms/Unmapped booleans  # [bug] terms on an unmapped field with value_type and missing returns a string key
-search.aggregation/20_terms/Unmapped dates  # [bug] terms on an unmapped field with value_type and missing returns a string key
-search.aggregation/20_terms/Unmapped doubles  # [bug] terms on an unmapped field with value_type and missing returns a string key
-search.aggregation/20_terms/Unmapped longs  # [bug] terms on an unmapped field with value_type and missing returns a string key
-search.aggregation/20_terms/Unmapped unsigned longs  # [bug] terms on an unmapped field with value_type and missing returns a string key
-search.aggregation/20_terms/Date test  # [bug] terms on a date field returns no key_as_string. The test then uses terms include/exclude, which is not served
-search.aggregation/200_top_hits_metric/top_hits aggregation with sequence numbers  # [bug] top_hits returns the wrong hit
-search.aggregation/230_composite/date_histogram with time_zone  # [bug] composite date_histogram with time_zone splits one day into two buckets
-search.aggregation/30_sig_terms/Default index  # [bug] significant_terms on a text field returns no buckets
-search.aggregation/30_sig_terms_field_match_only_text/Default index  # [bug] significant_terms on a text field returns no buckets
-search.aggregation/40_range/Date Range Missing  # [bug] date_range with missing returns 500
+search.aggregation/10_histogram/Deprecated _time order  # [bug] date_histogram ignores order: a descending key order comes back ascending (https://github.com/infino-ai/opensearch-infino/issues/205)
+search.aggregation/10_histogram/Format test  # [bug] histogram buckets have no key_as_string (https://github.com/infino-ai/opensearch-infino/issues/205)
+search.aggregation/20_terms/Unmapped booleans  # [bug] terms on an unmapped field with value_type and missing returns a string key (https://github.com/infino-ai/opensearch-infino/issues/206)
+search.aggregation/20_terms/Unmapped dates  # [bug] terms on an unmapped field with value_type and missing returns a string key (https://github.com/infino-ai/opensearch-infino/issues/206)
+search.aggregation/20_terms/Unmapped doubles  # [bug] terms on an unmapped field with value_type and missing returns a string key (https://github.com/infino-ai/opensearch-infino/issues/206)
+search.aggregation/20_terms/Unmapped longs  # [bug] terms on an unmapped field with value_type and missing returns a string key (https://github.com/infino-ai/opensearch-infino/issues/206)
+search.aggregation/20_terms/Unmapped unsigned longs  # [bug] terms on an unmapped field with value_type and missing returns a string key (https://github.com/infino-ai/opensearch-infino/issues/206)
+search.aggregation/20_terms/Date test  # [bug] terms on a date field returns no key_as_string. The test then uses terms include/exclude, which is not served (https://github.com/infino-ai/opensearch-infino/issues/205)
+search.aggregation/200_top_hits_metric/top_hits aggregation with sequence numbers  # [bug] top_hits returns the wrong hit (https://github.com/infino-ai/opensearch-infino/issues/207)
+search.aggregation/230_composite/date_histogram with time_zone  # [bug] composite date_histogram with time_zone splits one day into two buckets (https://github.com/infino-ai/opensearch-infino/issues/208)
+search.aggregation/30_sig_terms/Default index  # [bug] significant_terms on a text field returns no buckets (https://github.com/infino-ai/opensearch-infino/issues/209)
+search.aggregation/30_sig_terms_field_match_only_text/Default index  # [bug] significant_terms on a text field returns no buckets (https://github.com/infino-ai/opensearch-infino/issues/209)
+search.aggregation/40_range/Date Range Missing  # [bug] date_range with missing returns 500 (https://github.com/infino-ai/opensearch-infino/issues/210)
 
 # --- Errors that differ from stock
-search.aggregation/230_composite/Composite aggregation and array size  # [bug] the error message differs from stock
-search/110_field_collapsing/field collapsing with search_after - _score and _doc sorts  # [bug:default] the error message differs from stock
-search/30_limits/Regexp length limit  # [bug] the error message differs from stock
+search.aggregation/230_composite/Composite aggregation and array size  # [bug] the error message differs from stock (https://github.com/infino-ai/opensearch-infino/issues/211)
+search/110_field_collapsing/field collapsing with search_after - _score and _doc sorts  # [bug:default] the error message differs from stock (https://github.com/infino-ai/opensearch-infino/issues/211)
+search/30_limits/Regexp length limit  # [bug] the error message differs from stock (https://github.com/infino-ai/opensearch-infino/issues/211)
 
 # --- An index named "index" never starts
 search/260_sort_geopoint/*  # [bug] an index named index is refused at create: its table would be the registry's (https://github.com/infino-ai/opensearch-infino/issues/171)
@@ -320,10 +320,10 @@ search.aggregation/180_percentiles_tdigest_metric/Non-keyed test  # [gap] the ta
 search.aggregation/180_percentiles_tdigest_metric/Only aggs test  # [gap] the table computes percentiles another way, so they differ from the stock t-digest
 
 # --- Values the table does not hold; the write is refused
-index/90_flat_object/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/91_flat_object_null_value/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/100_partial_flat_object/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/105_partial_flat_object_nested/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/90_flat_object/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/231)
+index/91_flat_object_null_value/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/231)
+index/100_partial_flat_object/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/231)
+index/105_partial_flat_object_nested/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/231)
 index/90_unsigned_long/*  # [gap] the setup indexes unsigned_long values above the signed 64-bit maximum, which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/54)
 search/90_search_after/unsigned long  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/54)
 search/340_doc_values_field/*  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/54)
