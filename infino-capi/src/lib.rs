@@ -837,6 +837,17 @@ impl Bridge {
     }
 
     /// The [`Gate`] of `name`'s writes on this node.
+    /// How many bytes of ids one mutation may name ([`HOSTED_ID_LIST_BYTES`]
+    /// on the hosted service; no limit over storage of the bridge's own,
+    /// where a predicate never travels in a URL).
+    fn id_list_bytes(&self) -> usize {
+        if self.hosted {
+            HOSTED_ID_LIST_BYTES
+        } else {
+            usize::MAX
+        }
+    }
+
     fn gate(&self, name: &str) -> Arc<Gate> {
         let mut gates = self.gates.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(gates.entry(name.to_string()).or_default())
@@ -3095,7 +3106,7 @@ fn write_checked(
         Err(e) if rows.len() == 1 => {
             failed.push(json!({
                 "i": rows[0].0,
-                "reason": e.to_string(),
+                "reason": short_reason(&e),
                 "permanent": refuses_content(&e),
             }));
         }
@@ -3141,6 +3152,7 @@ fn replace_rows_checked(
     gate: &Gate,
     rows: &[(usize, Value)],
     failed: &mut Vec<Value>,
+    id_bytes: usize,
 ) {
     if rows.is_empty() {
         return;
@@ -3152,6 +3164,13 @@ fn replace_rows_checked(
         .collect();
     ids.sort_unstable();
     ids.dedup();
+    // More ids than one call may name: each run of them replaces on its own.
+    if let Some(runs) = rows_by_id_run(rows, &ids, id_bytes) {
+        for run in runs {
+            replace_rows_checked(table, gate, &run, failed, id_bytes);
+        }
+        return;
+    }
     let pred = col(OSID).in_list(ids.iter().map(|s| lit(s.to_string())).collect(), false);
     let replace = {
         let _pass = gate.whole();
@@ -3161,6 +3180,12 @@ fn replace_rows_checked(
         return;
     };
     let over_cap = over_field_cap(&e);
+    if rows.len() > 1 && refused_for_size(&e) {
+        let (a, b) = rows.split_at(rows.len() / 2);
+        replace_rows_checked(table, gate, a, failed, id_bytes);
+        replace_rows_checked(table, gate, b, failed, id_bytes);
+        return;
+    }
     if counts_may_explain(&e) {
         if let Ok(counts) = rows_under(table, &ids) {
             let single: HashSet<&str> = ids
@@ -3175,23 +3200,147 @@ fn replace_rows_checked(
                     .is_some_and(|id| single.contains(id))
             });
             if !miscounted.is_empty() {
-                rewrite_rows(table, gate, &miscounted, failed);
-                replace_rows_checked(table, gate, &once, failed);
+                rewrite_rows(table, gate, &miscounted, failed, id_bytes);
+                replace_rows_checked(table, gate, &once, failed, id_bytes);
                 return;
             }
         }
     }
     if rows.len() > 1 && (over_cap || refuses_content(&e)) {
         let (a, b) = rows.split_at(rows.len() / 2);
-        replace_rows_checked(table, gate, a, failed);
-        replace_rows_checked(table, gate, b, failed);
+        replace_rows_checked(table, gate, a, failed, id_bytes);
+        replace_rows_checked(table, gate, b, failed, id_bytes);
         return;
     }
     let permanent = rows.len() == 1 && refuses_content(&e);
-    let reason = format!("replace: {e}");
+    let reason = short_reason(format_args!("replace: {e}"));
     for (i, _) in rows {
         failed.push(json!({"i": i, "reason": reason, "permanent": permanent}));
     }
+}
+
+/// How many bytes of ids one mutation over the hosted service may name. The
+/// hosted transport sends an update's or a delete's predicate in the
+/// request's URL, and its front end refuses a long one (413 near 80 KB,
+/// a broken pipe a little past it), so a list of more ids is cut into runs
+/// of at most this many, each its own call. Measured as [`id_cost`] counts.
+const HOSTED_ID_LIST_BYTES: usize = 32 * 1024;
+
+/// What one id adds to a predicate's URL, at most: each byte
+/// percent-encoded, and its quotes and separator.
+fn id_cost(id: &str) -> usize {
+    id.len() * 3 + 8
+}
+
+/// `ids`, in order, cut into runs whose [`id_cost`] sums to at most
+/// `budget`; a run holds one id at least.
+fn id_runs<'a, S: AsRef<str>>(ids: &'a [S], budget: usize) -> Vec<&'a [S]> {
+    let mut runs = Vec::new();
+    let (mut start, mut cost) = (0, 0usize);
+    for (i, id) in ids.iter().enumerate() {
+        let c = id_cost(id.as_ref());
+        if i > start && cost.saturating_add(c) > budget {
+            runs.push(&ids[start..i]);
+            start = i;
+            cost = 0;
+        }
+        cost = cost.saturating_add(c);
+    }
+    if start < ids.len() {
+        runs.push(&ids[start..]);
+    }
+    runs
+}
+
+/// `rows` grouped by the run of `ids` (sorted, without repeats) their id
+/// falls in ([`id_runs`]), in run order; `None` when every id fits one run.
+fn rows_by_id_run(
+    rows: &[(usize, Value)],
+    ids: &[&str],
+    budget: usize,
+) -> Option<Vec<Vec<(usize, Value)>>> {
+    let runs = id_runs(ids, budget);
+    if runs.len() < 2 {
+        return None;
+    }
+    let mut run_of: HashMap<&str, usize> = HashMap::new();
+    for (r, run) in runs.iter().enumerate() {
+        for id in *run {
+            run_of.insert(id, r);
+        }
+    }
+    let mut grouped = vec![Vec::new(); runs.len()];
+    for row in rows {
+        let r = row
+            .1
+            .get(OSID)
+            .and_then(Value::as_str)
+            .and_then(|id| run_of.get(id))
+            .copied()
+            .unwrap_or(0);
+        grouped[r].push(row.clone());
+    }
+    Some(grouped)
+}
+
+/// Whether the hosted service refused a request for its size (413): the
+/// same request in halves can pass. A transport error is not taken for one,
+/// though an oversized URL can break the connection too: a whole outage
+/// breaks it as well, and splitting a batch through an outage would only
+/// multiply the calls that fail. [`HOSTED_ID_LIST_BYTES`] keeps predicates
+/// short of either.
+fn refused_for_size(e: &InfinoError) -> bool {
+    matches!(e, InfinoError::Backend(m) if m.contains("server returned 413"))
+}
+
+/// The longest reason a refused document is reported with.
+const REASON_MAX_BYTES: usize = 1024;
+
+/// `e` as a refused document's reason: every URL in it without its query,
+/// which on the hosted service holds the request's predicate (every id it
+/// names, so as long as the batch), and the whole cut to
+/// [`REASON_MAX_BYTES`]. The reason is repeated for each document of a
+/// failed write, so its length must not grow with the write's.
+fn short_reason(e: impl std::fmt::Display) -> String {
+    let full = e.to_string();
+    let mut out = String::with_capacity(full.len().min(REASON_MAX_BYTES + 64));
+    let mut rest = full.as_str();
+    while let Some(at) = rest.find("http") {
+        let (head, from) = rest.split_at(at);
+        out.push_str(head);
+        if from.starts_with("http://") || from.starts_with("https://") {
+            let end = from.find(char::is_whitespace).unwrap_or(from.len());
+            let url = &from[..end];
+            // A transport error writes `url: kind`, so a trailing colon is the text's.
+            let (url, colon) = url.strip_suffix(':').map_or((url, ""), |u| (u, ":"));
+            match url.find('?') {
+                Some(q) => {
+                    out.push_str(&url[..q]);
+                    out.push_str("?<query left out>");
+                }
+                None => out.push_str(url),
+            }
+            out.push_str(colon);
+            rest = &from[end..];
+        } else {
+            out.push_str("http");
+            rest = &from[4..];
+        }
+        if out.len() > REASON_MAX_BYTES {
+            break;
+        }
+    }
+    out.push_str(rest);
+    if out.len() > REASON_MAX_BYTES {
+        let mut cut = REASON_MAX_BYTES;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let dropped = full.len().saturating_sub(cut);
+        out.truncate(cut);
+        out.push_str(&format!("... ({dropped} bytes left out)"));
+    }
+    out
 }
 
 /// Whether a refused update may have been refused for its count of rows:
@@ -3232,7 +3381,13 @@ fn rows_under(table: &Supertable, ids: &[&str]) -> Result<Vec<u64>, InfinoError>
 /// the append lands a read finds no row under the ids, and a document whose
 /// append fails is reported for a later try, which finds no row and
 /// appends it. A delete that fails reports every document for a later try.
-fn rewrite_rows(table: &Supertable, gate: &Gate, rows: &[(usize, Value)], failed: &mut Vec<Value>) {
+fn rewrite_rows(
+    table: &Supertable,
+    gate: &Gate,
+    rows: &[(usize, Value)],
+    failed: &mut Vec<Value>,
+    id_bytes: usize,
+) {
     let mut ids: Vec<String> = rows
         .iter()
         .filter_map(|(_, v)| v.get(OSID).and_then(Value::as_str))
@@ -3244,19 +3399,32 @@ fn rewrite_rows(table: &Supertable, gate: &Gate, rows: &[(usize, Value)], failed
         "[capi] replace: {} ids held no row or several; their rows are deleted and the documents appended",
         ids.len()
     );
-    let pred = col(OSID).in_list(ids.into_iter().map(lit).collect(), false);
-    let deleted = {
-        let _pass = gate.whole();
-        waiting(|| table.delete(pred.clone()))
-    };
-    if let Err(e) = deleted {
-        let reason = format!("replace: {e}");
-        for (i, _) in rows {
-            failed.push(json!({"i": i, "reason": reason, "permanent": false}));
+    // Each run of ids ([`id_runs`]) is deleted, then its documents appended,
+    // on its own: a run whose delete fails reports its documents alone.
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let groups = rows_by_id_run(rows, &id_refs, id_bytes).unwrap_or_else(|| vec![rows.to_vec()]);
+    for group in groups {
+        let mut run: Vec<String> = group
+            .iter()
+            .filter_map(|(_, v)| v.get(OSID).and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        run.sort_unstable();
+        run.dedup();
+        let pred = col(OSID).in_list(run.into_iter().map(lit).collect(), false);
+        let deleted = {
+            let _pass = gate.whole();
+            waiting(|| table.delete(pred.clone()))
+        };
+        if let Err(e) = deleted {
+            let reason = short_reason(format_args!("replace: {e}"));
+            for (i, _) in &group {
+                failed.push(json!({"i": i, "reason": reason, "permanent": false}));
+            }
+            continue;
         }
-        return;
+        append_checked(table, gate, &group, failed);
     }
-    append_checked(table, gate, rows, failed);
 }
 
 /// Index many documents in one append. `osids` and `sources` are parallel
@@ -3383,7 +3551,14 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             Err(e) => return err_json(&e.to_string()),
         };
         let n = prepared.n;
-        let failed = append_prepared(&table, &conn.gate(name), vec![prepared], &[], &[]);
+        let failed = append_prepared(
+            &table,
+            &conn.gate(name),
+            vec![prepared],
+            &[],
+            &[],
+            conn.id_list_bytes(),
+        );
         let failed: Vec<Value> = failed
             .into_iter()
             .map(|(_, i, reason, permanent)| {
@@ -3717,6 +3892,7 @@ fn append_prepared(
     mut prepared: Vec<Prepared>,
     replaced: &[String],
     seqs: &[Vec<i64>],
+    id_bytes: usize,
 ) -> Vec<NotTaken> {
     let mut failed: Vec<NotTaken> = Vec::new();
     for (b, p) in prepared.iter_mut().enumerate() {
@@ -3767,9 +3943,13 @@ fn append_prepared(
                     // than it brings, which the engine refuses whole.
                     replaced_landed = replacing.num_rows() == 0 || {
                         let ids = osids_of(&replacing);
-                        let pred = col(OSID).in_list(ids.into_iter().map(lit).collect(), false);
-                        let _pass = gate.whole();
-                        waiting(|| table.update(pred.clone(), &replacing)).is_ok()
+                        // Ids past one call's list go a run at a time,
+                        // below ([`replace_rows_checked`]).
+                        id_runs(&ids, id_bytes).len() < 2 && {
+                            let pred = col(OSID).in_list(ids.into_iter().map(lit).collect(), false);
+                            let _pass = gate.whole();
+                            waiting(|| table.update(pred.clone(), &replacing)).is_ok()
+                        }
                     };
                     fresh_landed = fresh.num_rows() == 0 || {
                         let _pass = gate.append();
@@ -3821,7 +4001,7 @@ fn append_prepared(
             }
         }
         let mut refused: Vec<Value> = Vec::new();
-        replace_rows_checked(table, gate, &replacing, &mut refused);
+        replace_rows_checked(table, gate, &replacing, &mut refused, id_bytes);
         append_checked(table, gate, &indexed, &mut refused);
         for r in refused {
             let i = r["i"].as_u64().unwrap_or(0) as usize;
@@ -4018,7 +4198,14 @@ pub unsafe extern "C" fn infino_append_prepared(
                 })
                 .collect()
         };
-        let failed = append_prepared(&table, &conn.gate(name), owned, &replaced, &per_batch);
+        let failed = append_prepared(
+            &table,
+            &conn.gate(name),
+            owned,
+            &replaced,
+            &per_batch,
+            conn.id_list_bytes(),
+        );
         let ok = n.saturating_sub(failed.len());
         let failed: Vec<Value> = failed
             .into_iter()
@@ -4082,29 +4269,27 @@ pub unsafe extern "C" fn infino_delete_osids(
         }
         let n = count as usize;
         let os_p = unsafe { std::slice::from_raw_parts(osids, n) };
-        let ids: Vec<_> = os_p
-            .iter()
-            .filter_map(|p| unsafe { cstr(*p) })
-            .map(|s| lit(s.to_string()))
-            .collect();
+        let ids: Vec<&str> = os_p.iter().filter_map(|p| unsafe { cstr(*p) }).collect();
         // No table yet means nothing to delete.
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(_) => return 0,
         };
-        let pred = col(OSID).in_list(ids, false);
-        let deleted = {
-            let gate = conn.gate(name);
-            let _pass = gate.whole();
-            waiting(|| table.delete(pred.clone()))
-        };
-        match deleted {
-            Ok(_) => 0,
-            Err(e) => {
-                eprintln!("[capi] delete_osids: {e}");
-                -2
+        // A run of ids at a time ([`id_runs`]); a failed run fails the call,
+        // which the caller tries again whole (a delete is idempotent).
+        let gate = conn.gate(name);
+        for run in id_runs(&ids, conn.id_list_bytes()) {
+            let pred = col(OSID).in_list(run.iter().map(|s| lit(s.to_string())).collect(), false);
+            let deleted = {
+                let _pass = gate.whole();
+                waiting(|| table.delete(pred.clone()))
+            };
+            if let Err(e) = deleted {
+                eprintln!("[capi] delete_osids: {}", short_reason(&e));
+                return -2;
             }
         }
+        0
     }))
     .unwrap_or(-99)
 }
@@ -8449,6 +8634,134 @@ mod tests {
         let rows = sql(h, "SELECT COUNT(*) AS c FROM logs");
         assert_eq!(rows[0]["c"], 0, "{rows}");
         assert_eq!(optimize(h), 0);
+        close(h);
+    }
+
+    /// Ids are cut into runs whose cost fits the budget, in order and with
+    /// none left out; an id past the budget alone is a run of its own.
+    #[test]
+    fn ids_are_cut_into_runs_that_fit_the_budget() {
+        let ids: Vec<String> = (0..10).map(|i| format!("id-{i}")).collect();
+        let per = id_cost("id-0");
+        let runs = id_runs(&ids, 3 * per);
+        assert_eq!(
+            runs.iter().map(|r| r.len()).collect::<Vec<_>>(),
+            vec![3, 3, 3, 1]
+        );
+        assert_eq!(runs.concat(), ids);
+        assert_eq!(id_runs(&ids, usize::MAX).len(), 1);
+        let long = vec!["x".repeat(1000), "y".to_string()];
+        assert_eq!(id_runs(&long, 10).len(), 2);
+        assert!(id_runs::<String>(&[], 10).is_empty());
+    }
+
+    /// A transport error names the whole request URL, whose query holds
+    /// every id of the write. The reason a document is reported with leaves
+    /// the query out and stays short, however many ids the write named; a
+    /// short reason is kept as it is.
+    #[test]
+    fn a_refused_write_s_reason_leaves_out_the_url_query_and_stays_short() {
+        let ids: Vec<String> = (0..5_000).map(|i| format!("%27doc-{i:06}%27")).collect();
+        let url = format!(
+            "https://api.example.test/v1/update/db?table=os_t&predicate=osid+IN+%28{}%29",
+            ids.join("%2C+")
+        );
+        let e = InfinoError::Backend(format!(
+            "update: transport error: {url}: Connection Failed: Broken pipe (os error 32)"
+        ));
+        let reason = short_reason(format_args!("replace: {e}"));
+        assert!(
+            reason.len() <= REASON_MAX_BYTES + 64,
+            "{} bytes",
+            reason.len()
+        );
+        assert!(!reason.contains("predicate="), "{reason}");
+        assert!(
+            reason.contains("https://api.example.test/v1/update/db?<query left out>:"),
+            "{reason}"
+        );
+        assert!(reason.contains("Broken pipe"), "{reason}");
+        let plain = "replace: backend: update: server returned 413: ";
+        assert_eq!(short_reason(plain), plain);
+        // A long reason with no URL is cut on a character boundary.
+        let wide = "é".repeat(2 * REASON_MAX_BYTES);
+        let cut = short_reason(&wide);
+        assert!(
+            cut.len() <= REASON_MAX_BYTES + 64 && cut.ends_with("bytes left out)"),
+            "{cut}"
+        );
+    }
+
+    /// Only a 413 is a refusal for size: a transport error, which an outage
+    /// gives too, is not split on.
+    #[test]
+    fn only_a_413_is_a_refusal_for_size() {
+        assert!(refused_for_size(&InfinoError::Backend(
+            "update: server returned 413: ".into()
+        )));
+        assert!(!refused_for_size(&InfinoError::Backend(
+            "update: transport error: https://h/v1/update/db?x: Connection Failed".into()
+        )));
+        assert!(!refused_for_size(&InfinoError::Backend(
+            "update: server returned 400: x".into()
+        )));
+    }
+
+    /// A replace of more ids than one call may name goes a run at a time,
+    /// and every document lands; so do documents whose ids hold several rows,
+    /// which are deleted and appended a run at a time.
+    #[test]
+    fn a_replace_of_more_ids_than_one_call_names_lands_a_run_at_a_time() {
+        let h = open_logs();
+        let docs: Vec<(String, String)> = (0..40)
+            .map(|i| {
+                (
+                    format!("d{i:02}"),
+                    format!(r#"{{"level":"info","message":"old {i}"}}"#),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let out = index(h, &refs);
+        assert_eq!(out["ok"], 40, "{out}");
+        let conn = bridge_ref(h).expect("bridge");
+        let table = conn.table("logs").expect("table");
+        let gate = Gate::default();
+        // About four ids per call: ten runs.
+        let budget = 4 * id_cost("d00");
+        let rows: Vec<(usize, Value)> = (0..40)
+            .map(|i| (i, json!({ OSID: format!("d{i:02}"), "level": "warn", "message": format!("new {i}") })))
+            .collect();
+        let mut failed = Vec::new();
+        replace_rows_checked(&table, &gate, &rows, &mut failed, budget);
+        assert!(failed.is_empty(), "{failed:?}");
+        let rows_now = sql(h, "SELECT COUNT(*) AS c FROM logs");
+        assert_eq!(rows_now[0]["c"], 40, "{rows_now}");
+        let replaced = sql(h, "SELECT COUNT(*) AS c FROM logs WHERE level = 'warn'");
+        assert_eq!(replaced[0]["c"], 40, "{replaced}");
+
+        // Ids holding two rows each: the replace miscounts, and the rows are
+        // rewritten (deleted, then appended) a run at a time.
+        let twice: Vec<Value> = (0..12)
+            .flat_map(|i| {
+                let id = format!("t{i:02}");
+                [
+                    json!({ OSID: id.clone(), "level": "a" }),
+                    json!({ OSID: id, "level": "b" }),
+                ]
+            })
+            .collect();
+        table.append_rows(&twice).expect("append twice");
+        let rows: Vec<(usize, Value)> = (0..12)
+            .map(|i| (i, json!({ OSID: format!("t{i:02}"), "level": "one" })))
+            .collect();
+        let mut failed = Vec::new();
+        replace_rows_checked(&table, &gate, &rows, &mut failed, budget);
+        assert!(failed.is_empty(), "{failed:?}");
+        let ones = sql(h, "SELECT COUNT(*) AS c FROM logs WHERE osid LIKE 't%'");
+        assert_eq!(ones[0]["c"], 12, "{ones}");
+        let ones = sql(h, "SELECT COUNT(*) AS c FROM logs WHERE level = 'one'");
+        assert_eq!(ones[0]["c"], 12, "{ones}");
         close(h);
     }
 
