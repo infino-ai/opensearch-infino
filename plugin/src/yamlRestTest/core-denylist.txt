@@ -63,9 +63,7 @@ search/330_fetch_fields/Test disable _source loading  # [bug] fields returns not
 search/330_fetch_fields/Test token count  # [bug] fields returns the wrong token_count (https://github.com/infino-ai/opensearch-infino/issues/204)
 search/190_index_prefix_search/search with index prefixes  # [bug] max_score differs from stock scoring (https://github.com/infino-ai/opensearch-infino/issues/212)
 search/210_rescore_explain/Score should match explanation in rescore  # [bug] max_score differs from stock scoring (https://github.com/infino-ai/opensearch-infino/issues/212)
-search/50_multi_match/Cross fields do not return negative scores  # [bug] multi_match cross_fields orders hits differently from stock on some runs (https://github.com/infino-ai/opensearch-infino/issues/162)
-search/270_wildcard_fieldtype_queries/case insensitive query on wildcard field  # [bug] hits with equal scores come back in a different order from stock, so the first _id differs on some runs (https://github.com/infino-ai/opensearch-infino/issues/162)
-search/270_wildcard_fieldtype_queries/case insensitive regexp query on wildcard field  # [bug] hits with equal scores come back in a different order from stock, so the first _id differs on some runs (https://github.com/infino-ai/opensearch-infino/issues/162)
+search/50_multi_match/Cross fields do not return negative scores  # [bug] multi_match over several text fields is answered unranked: field boosts, tie_breaker and the cross_fields type are ignored, so hits come back in write order, not by score (https://github.com/infino-ai/opensearch-infino/issues/230)
 
 # --- Aggregation results
 search.aggregation/10_histogram/Deprecated _time order  # [bug] date_histogram ignores order: a descending key order comes back ascending (https://github.com/infino-ai/opensearch-infino/issues/205)
@@ -327,10 +325,10 @@ search.aggregation/180_percentiles_tdigest_metric/Non-keyed test  # [gap] the ta
 search.aggregation/180_percentiles_tdigest_metric/Only aggs test  # [gap] the table computes percentiles another way, so they differ from the stock t-digest
 
 # --- Values the table does not hold; the write is refused
-index/90_flat_object/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/91_flat_object_null_value/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/100_partial_flat_object/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/53)
-index/105_partial_flat_object_nested/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/53)
+index/90_flat_object/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/231)
+index/91_flat_object_null_value/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/231)
+index/100_partial_flat_object/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/231)
+index/105_partial_flat_object_nested/*  # [gap] the setup indexes a flat_object the table does not hold (an array of arrays, or a value and an object at one path), which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/231)
 index/90_unsigned_long/*  # [gap] the setup indexes unsigned_long values above the signed 64-bit maximum, which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/54)
 search/90_search_after/unsigned long  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/54)
 search/340_doc_values_field/*  # [gap] the setup indexes an unsigned_long above the signed 64-bit maximum, which the table refuses with a 400 (https://github.com/infino-ai/opensearch-infino/issues/54)
