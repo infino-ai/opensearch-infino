@@ -1,6 +1,6 @@
 # Configuration
 
-**None of this has to change for a default run.** Every setting below has a default that works as it is. The [quick start](../README.md#quick-start) and the [getting-started guide](getting-started.md) don't ask you to set any of them: every index the cluster creates is Infino-backed, with its table compacted every 60 seconds, and the guide's free-account step fills in the account settings for you. Where the tables live is the one choice a node makes, and `INFINO_STORAGE` in Docker Compose (or `run.sh`) makes it (see [where the tables live](../README.md#install-on-a-cluster)).
+**None of this has to change for a default run.** Every setting below has a default that works as it is. The [quick start](../README.md#quick-start) and the [getting-started guide](getting-started.md) don't ask you to set any of them: every index the cluster creates is Infino-backed, with its table compacted every 60 seconds, and the guide's account step fills in the account settings for you. Where the tables live is the one choice a node makes, and `INFINO_STORAGE` in Docker Compose (or `run.sh`) makes it (see [where the tables live](../README.md#install-on-a-cluster)).
 
 Come here when you want to:
 

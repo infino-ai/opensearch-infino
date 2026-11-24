@@ -62,7 +62,7 @@ OpenSearch 3.3 and later need Gradle 9.4.1 or later: an older Gradle stops with 
 
 ### Try it
 
-[Getting started](docs/getting-started.md) walks through the rest: create an index, load 100,000 sample log events (or your own data), and search them with full-text queries, aggregations, vector and hybrid search, and SQL. It keeps the tables on a free hosted Infino account; to keep them on the node's own storage instead, skip its step 2. Every index the cluster creates is backed by Infino, so an index needs no setting of its own.
+[Getting started](docs/getting-started.md) walks through the rest: create an index, load 100,000 sample log events (or your own data), and search them with full-text queries, aggregations, vector and hybrid search, and SQL. It keeps the tables on a hosted Infino account; to keep them on the node's own storage instead, skip its step 2. Every index the cluster creates is backed by Infino, so an index needs no setting of its own.
 
 ## How it works
 
@@ -155,7 +155,7 @@ PUT _ingest/pipeline/embed
 
 With an Infino account, the tables live on the hosted service. It runs the engine, compacts the tables, and serves Infino's own SQL and search APIs over the same data. The account stores the tables in an Infino bucket or in your own bucket, with customer-managed encryption keys (CMEK) supported. The node holds no table data.
 
-[Getting started](docs/getting-started.md) walks through it end to end on the Docker node: a free account, data loaded and searched, and a new node with an empty data volume bringing every index back. This section is the reference.
+[Getting started](docs/getting-started.md) walks through it end to end on the Docker node: an account, data loaded and searched, and a new node with an empty data volume bringing every index back. This section is the reference.
 
 The account is node configuration, read at startup:
 
@@ -169,18 +169,18 @@ infino.platform.database: logs        # optional: the cluster's name when unset
 bin/opensearch-keystore add infino.platform.api_key    # or INFINO_API_KEY in the node's environment
 ```
 
-**Getting an account.** Start the node without these settings and ask for a free account. Sending `"accept": true` accepts Infino's [Terms of Service](https://www.infino.ai/terms), and from then on every document the cluster writes is sent to the hosted service:
+**Getting an account.** Start the node without these settings and ask for a trial account. Sending `"accept": true` accepts Infino's [Terms of Service](https://www.infino.ai/terms), and from then on every document the cluster writes is sent to the hosted service:
 
 ```bash
 curl -XPOST localhost:9200/_plugins/_infino/account/trial -H 'Content-Type: application/json' -d '{"accept": true}'
 ```
 
-An account is created only when the request says `"accept": true`. The trial creates a free account with credit, with no email, password or card. It registers one database, named after the cluster (or `database` in the body), and answers with the key, exactly once, along with the configuration lines above. The node uses the account from then on, and those lines keep it after a restart. If the service gives out no free accounts, it answers 501; if the cluster's address has already had one, it answers 409. Either way the response names the next step ([errors](docs/getting-started.md#7-limits-and-errors)). `infino.platform.default_url` names the service a trial is asked from.
+An account is created only when the request says `"accept": true`. The trial creates an account with starting credit, with no email, password or card. It registers one database, named after the cluster (or `database` in the body), and answers with the key, exactly once, along with the configuration lines above. The node uses the account from then on, and those lines keep it after a restart. If the service gives out no trial accounts, it answers 501; if the cluster's address has already had one, it answers 409. Either way the response names the next step ([errors](docs/getting-started.md#7-limits-and-errors)). `infino.platform.default_url` names the service a trial is asked from.
 
 | Request | |
 |---|---|
 | `GET /_plugins/_infino/account` | What the tables are served from |
-| `POST /_plugins/_infino/account/trial` | Create a free account (`{"accept": true}`) |
+| `POST /_plugins/_infino/account/trial` | Create a trial account (`{"accept": true}`) |
 | `PUT /_plugins/_infino/account` | Use an account you have: `{"api_key": "..."}`, with optional `platform` (`infino.platform.default_url` when unset) and `database` (the cluster's name when unset). The key is tried once first, so a wrong key fails here. |
 | `DELETE /_plugins/_infino/account` | Stop using the account on this node; the tables stay on the service |
 | `GET /_plugins/_infino/account/indices` | What would come back on a fresh cluster (`?name=<index>` for one) |
