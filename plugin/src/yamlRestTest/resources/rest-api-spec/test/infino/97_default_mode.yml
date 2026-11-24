@@ -1301,3 +1301,149 @@
   - do:
       indices.delete:
         index: gs
+
+---
+"Default mode: an update writes on the document's sequence number, as stock does":
+  - do:
+      indices.create:
+        index: eu
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+            refresh_interval: -1
+
+  - do:
+      index:
+        index: eu
+        id: x
+        body: { a: 0 }
+  - set: { _seq_no: seq0, _primary_term: term0 }
+
+  # An update the client conditions on the number the document stands at is
+  # applied; one on the number before is refused.
+  - do:
+      update:
+        index: eu
+        id: x
+        if_seq_no: $seq0
+        if_primary_term: $term0
+        body: { doc: { a: 1 } }
+  - match: { result: updated }
+  - set: { _seq_no: seq1 }
+  - do:
+      catch: conflict
+      update:
+        index: eu
+        id: x
+        if_seq_no: $seq0
+        if_primary_term: $term0
+        body: { doc: { a: 2 } }
+
+  # The same once a refresh: the shard checks the number its skeleton keeps.
+  - do:
+      indices.refresh:
+        index: eu
+  - do:
+      catch: conflict
+      index:
+        index: eu
+        id: x
+        if_seq_no: $seq0
+        if_primary_term: $term0
+        body: { a: 3 }
+  - do:
+      catch: conflict
+      update:
+        index: eu
+        id: x
+        if_seq_no: $seq0
+        if_primary_term: $term0
+        body: { doc: { a: 3 } }
+  - do:
+      update:
+        index: eu
+        id: x
+        if_seq_no: $seq1
+        if_primary_term: $term0
+        retry_on_conflict: 0
+        body: { doc: { b: 1 } }
+  - match: { result: updated }
+
+  # An update conditioned on a document that is missing is answered missing.
+  - do:
+      catch: missing
+      update:
+        index: eu
+        id: none
+        if_seq_no: $seq0
+        if_primary_term: $term0
+        body: { doc: { a: 1 } }
+
+  # An upsert creates the document and the next merges into it; a doc as
+  # upsert creates its own.
+  - do:
+      update:
+        index: eu
+        id: y
+        body: { doc: { a: 1 }, upsert: { a: 0, made: true } }
+  - match: { result: created }
+  - do:
+      update:
+        index: eu
+        id: y
+        retry_on_conflict: 3
+        body: { doc: { a: 1 }, upsert: { a: 0, made: true } }
+  - match: { result: updated }
+  - do:
+      update:
+        index: eu
+        id: z
+        body: { doc: { c: 1 }, doc_as_upsert: true }
+  - match: { result: created }
+
+  # Two updates of one document in one bulk, and a write followed by an
+  # update of its document: each merges into the write before it.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - update: { _index: eu, _id: x }
+          - { doc: { c: 1 } }
+          - update: { _index: eu, _id: x, retry_on_conflict: 2 }
+          - { doc: { d: 1 } }
+          - index: { _index: eu, _id: n }
+          - { e: 1 }
+          - update: { _index: eu, _id: n }
+          - { doc: { f: 1 } }
+  - match: { errors: false }
+  - match: { items.0.update.result: updated }
+  - match: { items.1.update.result: updated }
+  - match: { items.2.index.result: created }
+  - match: { items.3.update.result: updated }
+  - do:
+      get:
+        index: eu
+        id: x
+  - match: { _source: { a: 1, b: 1, c: 1, d: 1 } }
+  - do:
+      get:
+        index: eu
+        id: y
+  - match: { _source: { a: 1, made: true } }
+  - do:
+      get:
+        index: eu
+        id: z
+  - match: { _source: { c: 1 } }
+  - do:
+      get:
+        index: eu
+        id: n
+  - match: { _source: { e: 1, f: 1 } }
+
+  - do:
+      indices.delete:
+        index: eu
