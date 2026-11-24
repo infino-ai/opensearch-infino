@@ -296,18 +296,43 @@ public final class InfinoNative {
      * The bridge answered with an error object. Carries the HTTP status a
      * hosted refusal came with (a key refused, an account at a limit), so the
      * caller is answered with the same one and the service's own message;
-     * anything else is an internal error.
+     * anything else is an internal error. Says too whether the bridge marked
+     * the error as the hosted service not answering ({@link #unavailable}).
      */
     public static final class InfinoException extends OpenSearchException {
         private final RestStatus status;
+        private final boolean unavailable;
 
         InfinoException(String message) {
             this(message, RestStatus.INTERNAL_SERVER_ERROR);
         }
 
         InfinoException(String message, RestStatus status) {
+            this(message, status, false);
+        }
+
+        InfinoException(String message, RestStatus status, boolean unavailable) {
             super(message);
             this.status = status;
+            this.unavailable = unavailable;
+        }
+
+        /**
+         * {@code message} with the status of the bridge's error object
+         * {@code error}, else {@code fallback}, and its {@code unavailable}
+         * mark.
+         */
+        static InfinoException of(String message, Map<String, Object> error, RestStatus fallback) {
+            return new InfinoException(message, statusOf(error, fallback), Boolean.TRUE.equals(error.get("unavailable")));
+        }
+
+        /**
+         * Whether the hosted service could not be reached or did not answer:
+         * a transport failure, or a 502, 503 or 504 from it, whatever status
+         * the error carries. A write that met it may have landed or not.
+         */
+        public boolean unavailable() {
+            return unavailable;
         }
 
         @Override
@@ -613,7 +638,7 @@ public final class InfinoNative {
         if (s.startsWith("{\"error\"")) {
             Map<String, Object> error = object(s);
             Object message = error.get("error");
-            throw new InfinoException(message == null ? s : message.toString(), statusOf(error, fallback));
+            throw InfinoException.of(message == null ? s : message.toString(), error, fallback);
         }
         return s;
     }
@@ -1131,7 +1156,7 @@ public final class InfinoNative {
             return new InfinoException("[infino] the bridge could not prepare the batch for " + name);
         }
         Map<String, Object> error = object(why);
-        return new InfinoException("[infino] the batch for " + name + " could not be prepared: " + error.get("error"), statusOf(error));
+        return InfinoException.of("[infino] the batch for " + name + " could not be prepared: " + error.get("error"), error, RestStatus.INTERNAL_SERVER_ERROR);
     }
 
     /**

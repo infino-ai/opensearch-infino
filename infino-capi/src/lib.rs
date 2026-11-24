@@ -864,9 +864,12 @@ fn err_json(e: &str) -> *mut c_char {
 }
 
 /// [`error_value`] of an engine error. When the hosted service could not be
-/// reached or did not answer in time, the message says so and the status is
-/// 503 (unless the service answered with a status of its own), so the
-/// caller is told to try again later rather than that the request failed.
+/// reached or did not answer in time ([`InfinoError::Unavailable`]: a
+/// transport failure, or a 502, 503 or 504 from the service), the message
+/// says so, `"unavailable": true` marks it, and the status is 503 unless
+/// the service answered with a status of its own. The caller is told to try
+/// again later rather than that the request failed, and can tell this case
+/// apart whatever the status.
 fn engine_error_value(e: &InfinoError) -> Value {
     if !matches!(e, InfinoError::Unavailable(_)) {
         return error_value(&e.to_string());
@@ -874,6 +877,7 @@ fn engine_error_value(e: &InfinoError) -> Value {
     let mut v = error_value(&format!(
         "the hosted service could not be reached or did not answer in time; try again later: {e}"
     ));
+    v["unavailable"] = json!(true);
     if v.get("status").is_none() {
         v["status"] = json!(SERVICE_UNAVAILABLE);
     }
@@ -8465,6 +8469,7 @@ mod tests {
         });
         let out: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(out["status"], 503, "{out}");
+        assert_eq!(out["unavailable"], true, "{out}");
         assert!(
             out["error"]
                 .as_str()
@@ -8553,4 +8558,23 @@ mod tests {
         unsafe { infino_close(h) };
     }
 
+    /// An engine error that says the hosted service could not serve the call
+    /// is marked `unavailable`, whatever status it carries: a 504 from a
+    /// gateway keeps its 504, a transport failure is a 503. Any other error
+    /// carries no mark.
+    #[test]
+    fn an_unavailable_service_is_marked_whatever_its_status() {
+        for (e, status) in [
+            (InfinoError::Unavailable("append: server returned 504: gateway timeout".into()), 504),
+            (InfinoError::Unavailable("append: server returned 502: bad gateway".into()), 502),
+            (InfinoError::Unavailable("append: transport error: timeout".into()), 503),
+        ] {
+            let v = engine_error_value(&e);
+            assert_eq!(v["unavailable"], true, "{v}");
+            assert_eq!(v["status"], status, "{v}");
+        }
+        let v = engine_error_value(&InfinoError::Backend("append: server returned 500: boom".into()));
+        assert!(v.get("unavailable").is_none(), "{v}");
+        assert_eq!(v["status"], 500, "{v}");
+    }
 }

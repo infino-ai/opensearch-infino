@@ -97,7 +97,9 @@ import java.util.function.Predicate;
  * reached or did not answer fails neither: the batch is kept for the next
  * commit, as a write the table did not take is, so the write is
  * acknowledged and the table's hold on the shard's history stays below it
- * (see {@link #commitBeforeSync} and {@link #holdHistoryThrough}).
+ * (see {@link #commitBeforeSync} and {@link #holdHistoryThrough}). A batch
+ * of deletes alone still fails the sync then, since the bridge answers a
+ * delete with a code and not the reason; a delete retried does no harm.
  * Writes wait rather than pile up past a bound while commits fail.
  *
  * <p>A search sees what the skeleton's reader sees, as on a stock index: a
@@ -1702,8 +1704,10 @@ public class InfinoEngine extends InternalEngine {
      * whether any is; {@code declare} runs before the rows are prepared, so
      * a field mapped since the table was declared gets its index.
      *
-     * <p>When the hosted service could not be reached or did not answer (a
-     * 503 from the lookup, the prepare or the append), the whole batch is
+     * <p>When the hosted service could not be reached or did not answer the
+     * lookup, the prepare or the append (the bridge marks the error
+     * {@link InfinoNative.InfinoException#unavailable}, whether its status is
+     * 502, 503 or 504), the whole batch is
      * returned to retry rather than the failure thrown: the write's sync is
      * acknowledged and the next commit writes the batch, looking each row up
      * first since the service may have committed the append and only its
@@ -1786,10 +1790,11 @@ public class InfinoEngine extends InternalEngine {
                 retry = notTaken(table, result.failed(), ids, written);
             }
         } catch (InfinoNative.InfinoException e) {
-            if (e.status() != RestStatus.SERVICE_UNAVAILABLE) {
+            if (!e.unavailable()) {
                 throw e;
             }
-            // The hosted service could not be reached or did not answer. The whole
+            // The hosted service could not be reached or did not answer (a 502, 503
+            // or 504, or no answer at all: the bridge marks each alike). The whole
             // batch is kept for the next commit, which looks each row up, since the
             // service may have committed the append and only its answer was lost.
             // The write's sync is not failed for it (see commitBeforeSync): a

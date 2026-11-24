@@ -216,9 +216,17 @@ public class InfinoEngineTests extends OpenSearchTestCase {
      * the next commit takes anyway, storing an auto-id write twice). Here the
      * service committed the first append and only its answer was lost: the
      * next commit looks the ids up, finds them, and replaces their rows
-     * rather than adding them again.
+     * rather than adding them again. A gateway's 502 or 504 is the same case
+     * as a 503: the bridge marks each {@code unavailable}.
      */
     public void testADefaultModeCommitTheServiceDidNotAnswerIsRetriedAndLandsOnceWithTheNext() {
+        for (int status : new int[] { 502, 503, 504 }) {
+            retriedAndLandsOnceWithTheNext(status);
+        }
+    }
+
+    /** {@link #testADefaultModeCommitTheServiceDidNotAnswerIsRetriedAndLandsOnceWithTheNext} for an unanswered append marked with {@code status}. */
+    private void retriedAndLandsOnceWithTheNext(int status) {
         List<String> ids = List.of("a", "b");
         Set<String> inTable = new TreeSet<>();
         List<Set<String>> replacedByAppend = new ArrayList<>();
@@ -232,7 +240,11 @@ public class InfinoEngineTests extends OpenSearchTestCase {
                 replacedByAppend.add(new TreeSet<>(Arrays.asList((String[]) args[4])));
                 if (appends.incrementAndGet() == 1) {
                     inTable.addAll(ids); // committed, but the answer never came back
-                    yield string("{\"error\":\"the hosted service could not be reached or did not answer in time; try again later\",\"status\":503}");
+                    yield string(
+                        "{\"error\":\"the hosted service could not be reached or did not answer in time; try again later\",\"unavailable\":true,\"status\":"
+                            + status
+                            + "}"
+                    );
                 }
                 yield string("{\"ok\":" + ids.size() + ",\"failed\":[]}");
             }
@@ -248,7 +260,7 @@ public class InfinoEngineTests extends OpenSearchTestCase {
             InfinoEngine.Written first = InfinoEngine.write("t", 1, batch, held -> {}, () -> {});
 
             assertEquals(1, appends.get());
-            assertEquals("every write comes back to retry", Set.copyOf(ids), first.retry().entries.keySet());
+            assertEquals("every write comes back to retry after a " + status, Set.copyOf(ids), first.retry().entries.keySet());
 
             InfinoEngine.Batch open = new InfinoEngine.Batch();
             open.putBack(first.retry()); // as the commit puts back what it did not take
@@ -340,11 +352,22 @@ public class InfinoEngineTests extends OpenSearchTestCase {
         }
     }
 
-    /** A commit that fails for any other reason than an unanswered hosted service still fails. */
+    /**
+     * A commit that fails for any other reason than an unanswered hosted
+     * service still fails, a 503 the bridge did not mark {@code unavailable}
+     * included.
+     */
     public void testADefaultModeCommitThatFailsOtherwiseIsThrown() {
+        for (String error : new String[] { "{\"error\":\"append: storage failed\"}", "{\"error\":\"append: storage failed\",\"status\":503}" }) {
+            thrown(error);
+        }
+    }
+
+    /** {@link #testADefaultModeCommitThatFailsOtherwiseIsThrown} for an append answered {@code error}. */
+    private void thrown(String error) {
         InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
             case "infino_open_with", "infino_prepare_batch_meta" -> new Memory(1);
-            case "infino_append_prepared" -> string("{\"error\":\"append: storage failed\"}");
+            case "infino_append_prepared" -> string(error);
             default -> null;
         }));
         try {
