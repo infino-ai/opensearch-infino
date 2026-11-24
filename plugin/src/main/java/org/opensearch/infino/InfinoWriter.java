@@ -26,6 +26,7 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.engine.DocumentMissingException;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.mapper.MapperParsingException;
+import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -40,6 +41,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
@@ -120,16 +122,21 @@ public final class InfinoWriter {
      * One write a bulk item asks for: the source to append (null for a
      * delete or an update), whether the id may already exist (looked up at
      * flush), whether it must not ({@code op_type: create}, answered with a
-     * conflict when it does), and for an update the request whose document
-     * is merged when its batch is written.
+     * conflict when it does), for an update the request whose document
+     * is merged when its batch is written, and the paths of the source's
+     * fields the mapper ignored ({@link InfinoIgnored}), left out of its row.
      */
-    record Write(String id, String source, boolean lookup, boolean create, UpdateRequest update) {
+    record Write(String id, String source, boolean lookup, boolean create, UpdateRequest update, List<String> ignored) {
+        Write(String id, String source, boolean lookup, boolean create, List<String> ignored) {
+            this(id, source, lookup, create, null, ignored);
+        }
+
         Write(String id, String source, boolean lookup, boolean create) {
-            this(id, source, lookup, create, null);
+            this(id, source, lookup, create, null, List.of());
         }
 
         Write(String id, String source, boolean lookup) {
-            this(id, source, lookup, false, null);
+            this(id, source, lookup, false, null, List.of());
         }
 
         /**
@@ -139,7 +146,7 @@ public final class InfinoWriter {
          * earlier in its batch, or in an append that has committed since.
          */
         static Write update(UpdateRequest update) {
-            return new Write(update.id(), null, true, false, update);
+            return new Write(update.id(), null, true, false, update, List.of());
         }
 
         /** Whether this write removes its id's document. */
@@ -311,6 +318,7 @@ public final class InfinoWriter {
     void submit(String table, Waiter waiter) {
         List<String> ids = new ArrayList<>();
         List<String> sources = new ArrayList<>();
+        List<List<String>> ignored = new ArrayList<>();
         long bytes = 0;
         // An update's document is made when its batch is written; it counts toward the bound as a document.
         int updates = 0;
@@ -322,6 +330,7 @@ public final class InfinoWriter {
             if (carriesRow(o)) {
                 ids.add(o.write().id());
                 sources.add(o.write().source());
+                ignored.add(o.write().ignored());
                 bytes += o.write().source().length();
             } else if (o.write() != null && o.write().update() != null) {
                 updates++;
@@ -329,7 +338,7 @@ public final class InfinoWriter {
         }
         Pointer prepared;
         try {
-            prepared = ids.isEmpty() ? null : InfinoNative.prepare(table, ids, sources);
+            prepared = ids.isEmpty() ? null : InfinoNative.prepare(table, ids, sources, ignored);
         } catch (InfinoNative.InfinoException e) {
             // With its status: a 503 when the hosted service could not be reached or did not answer in time.
             waiter.listener().onFailure(e);
@@ -624,6 +633,10 @@ public final class InfinoWriter {
         Map<String, String> documents = new HashMap<>();
         // The document each update became.
         Map<Outcome, String> merged = new IdentityHashMap<>();
+        // The paths of the fields the mapper ignored in each update's document.
+        Map<Outcome, List<String>> mergedIgnored = new IdentityHashMap<>();
+        // The mapper of the index when its documents may have a field it ignores; parsed against once, at the first update.
+        Map<ShardId, Optional<MapperService>> ignoring = new HashMap<>();
         // The last write of each id that goes to the table.
         Map<String, Outcome> last = new LinkedHashMap<>();
         boolean folded = false;
@@ -655,11 +668,23 @@ public final class InfinoWriter {
                                 if (document == null) {
                                     rejection = new DocumentMissingException(shardId, w.id());
                                 } else {
-                                    String why = InfinoNative.checkDoc(table, document);
+                                    MapperService mappers = ignoring.computeIfAbsent(
+                                        shardId,
+                                        id -> Optional.ofNullable(InfinoIgnored.ignoring(id.getIndex()))
+                                    ).orElse(null);
+                                    List<String> ignored = null;
+                                    try {
+                                        ignored = InfinoIgnored.parse(mappers, shardId.getIndexName(), w.id(), document, w.update().routing());
+                                    } catch (RuntimeException e) {
+                                        // The mapper refuses the merged document, as a shard's would: this update alone fails.
+                                        rejection = e;
+                                    }
+                                    String why = ignored == null ? null : InfinoNative.checkDoc(table, document, ignored);
                                     if (why != null) {
                                         rejection = refused(why);
-                                    } else {
+                                    } else if (ignored != null) {
                                         merged.put(o, document);
+                                        mergedIgnored.put(o, ignored);
                                     }
                                 }
                             } catch (InfinoNative.InfinoException e) {
@@ -708,7 +733,7 @@ public final class InfinoWriter {
         try {
             // Both paths release every handle: the engine does on the prepared
             // path, the folded path up front. Nothing after this may release one.
-            appended = folded ? appendFolded(table, staged, last.values(), merged, written, replaced) : appendPrepared(table, staged, written, replaced);
+            appended = folded ? appendFolded(table, staged, last.values(), merged, mergedIgnored, written, replaced) : appendPrepared(table, staged, written, replaced);
         } finally {
             // A read after the write must see the table, not a prefetched copy.
             InfinoNative.forgetSources(table, last.keySet());
@@ -893,7 +918,8 @@ public final class InfinoWriter {
     /**
      * The batch's last write of each id, prepared afresh and written as one
      * mutation under the sequence number it was given (a delete writes no
-     * row; an update writes the document {@code merged} holds for it): the
+     * row; an update writes the document {@code merged} holds for it, without
+     * the fields {@code mergedIgnored} lists): the
      * path for a batch in which one id appears twice, a write meets a
      * conflict and is left out, or an update was merged.
      */
@@ -902,6 +928,7 @@ public final class InfinoWriter {
         List<Staged> staged,
         Collection<Outcome> last,
         Map<Outcome, String> merged,
+        Map<Outcome, List<String>> mergedIgnored,
         Map<Outcome, Written> written,
         List<String> replaced
     ) {
@@ -910,12 +937,14 @@ public final class InfinoWriter {
         }
         List<String> ids = new ArrayList<>();
         List<String> sources = new ArrayList<>();
+        List<List<String>> ignored = new ArrayList<>();
         List<Long> seqs = new ArrayList<>();
         for (Outcome o : last) {
             String document = merged.containsKey(o) ? merged.get(o) : o.write().source();
             if (document != null) {
                 ids.add(o.write().id());
                 sources.add(document);
+                ignored.add(merged.containsKey(o) ? mergedIgnored.get(o) : o.write().ignored());
                 seqs.add(written.get(o).seq());
             }
         }
@@ -923,7 +952,7 @@ public final class InfinoWriter {
         if (ids.isEmpty()) {
             return new Appended(refused, false);
         }
-        Pointer prepared = InfinoNative.prepare(table, ids, sources);
+        Pointer prepared = InfinoNative.prepare(table, ids, sources, ignored);
         long[] numbers = seqs.stream().mapToLong(Long::longValue).toArray();
         InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced, numbers);
         for (InfinoNative.PreparedFailure f : result.failed()) {

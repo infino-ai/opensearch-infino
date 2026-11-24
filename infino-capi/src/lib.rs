@@ -88,10 +88,18 @@ const OP: &str = "osop";
 /// compare only between rows of one writer's history, so a cut leaves
 /// another's alone.
 const GEN: &str = "osgen";
+/// The fields OpenSearch's mapper left out of a row's document for a value
+/// it could not parse (under `ignore_malformed`), by path: what a search
+/// reads as the document's `_ignored` field. A list of strings, null for a
+/// document with none; the column appears with the first such write.
+const IGNORED: &str = "osignored";
+/// What separates the paths of a document's ignored fields where the caller
+/// hands them over: no field name holds it.
+const IGNORED_SEPARATOR: char = '\n';
 /// The columns every table keeps for itself. A document's field of the same
 /// name is kept in a column of its own, named [`OWN_COLUMN_PREFIX`] and the
 /// field's name: no mapping can name a field so.
-const RESERVED: [&str; 3] = [OSID, SOURCE, SEQ];
+const RESERVED: [&str; 4] = [OSID, SOURCE, SEQ, IGNORED];
 const OWN_COLUMN_PREFIX: &str = ".";
 /// Where a table's mapping declares, as `properties` declares fields, the
 /// columns the plugin's engine writes beside a document's fields in default
@@ -102,6 +110,9 @@ const ENGINE_COLUMNS: &str = "_engine_columns";
 /// column: the values are joined so a text index sees every token. The
 /// original array is still in `source`.
 const MULTI_VALUE_SEPARATOR: &str = " ";
+/// The longest UTF-8 encoding a `keyword` value may have, as Lucene bounds
+/// one term.
+const MAX_TERM_BYTES: usize = 32766;
 /// What the column holding a field's values is named after the field's own,
 /// for a document that gives the field more than one: `<path>[]`, a list of
 /// the field's own type, declared the first time a document needs it. The
@@ -1140,6 +1151,12 @@ struct MappedField {
     /// The formats a date field's mapping declares, in order; `None` for the
     /// default format, which [`default_format_millis`] reads.
     date_formats: Option<Vec<DateFormat>>,
+    /// For a `keyword` field, its `ignore_above`, if it sets one, and
+    /// whether it builds terms (it is indexed or has doc values).
+    keyword: Option<(Option<usize>, bool)>,
+    /// What OpenSearch accepts of an `ip` or narrow integer field beyond what
+    /// its column takes.
+    valid: Option<Valid>,
 }
 
 impl MappedField {
@@ -1148,6 +1165,8 @@ impl MappedField {
         self.precision
             .map(Kept::Precision)
             .or_else(|| self.date_formats.clone().map(Kept::Date))
+            .or_else(|| self.keyword.map(|(ignore_above, terms)| Kept::Keyword { ignore_above, terms }))
+            .or_else(|| self.valid.map(Kept::Valid))
     }
 }
 
@@ -1159,13 +1178,49 @@ enum Kept {
     Precision(Precision),
     /// A date read by the formats its mapping declares, in order.
     Date(Vec<DateFormat>),
+    /// A `keyword` value, indexed only up to `ignore_above` characters
+    /// (UTF-16 units, as OpenSearch counts them) and, when the field builds
+    /// terms (`terms`), refused past [`MAX_TERM_BYTES`].
+    Keyword { ignore_above: Option<usize>, terms: bool },
+    /// An `ip` or narrow integer value, which its column takes beyond what
+    /// OpenSearch accepts.
+    Valid(Valid),
+}
+
+/// What OpenSearch accepts of a field whose column is wider: an address of an
+/// `ip` field (a string column), an integer in a `byte`, `short` or `integer`
+/// field's range (a 64-bit column).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Valid {
+    Ip,
+    Integer(i64, i64),
+}
+
+impl Valid {
+    fn of(ty: &str) -> Option<Self> {
+        match ty {
+            "ip" => Some(Self::Ip),
+            "byte" => Some(Self::Integer(i8::MIN.into(), i8::MAX.into())),
+            "short" => Some(Self::Integer(i16::MIN.into(), i16::MAX.into())),
+            "integer" => Some(Self::Integer(i32::MIN.into(), i32::MAX.into())),
+            _ => None,
+        }
+    }
+
+    /// Whether OpenSearch accepts a value its column took.
+    fn accepts(self, v: &Value) -> bool {
+        match self {
+            Self::Ip => v.as_str().is_some_and(|s| s.parse::<std::net::IpAddr>().is_ok()),
+            Self::Integer(min, max) => v.as_i64().is_some_and(|n| (min..=max).contains(&n)),
+        }
+    }
 }
 
 impl Kept {
     fn precision(&self) -> Option<Precision> {
         match self {
             Self::Precision(p) => Some(*p),
-            Self::Date(_) => None,
+            _ => None,
         }
     }
 }
@@ -1526,6 +1581,12 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             range: ranged && indexed,
             precision: ty.and_then(|ty| Precision::of(ty, def)),
             date_formats,
+            keyword: (ty == Some("keyword")).then(|| {
+                let ignore_above = def.get("ignore_above").and_then(Value::as_u64).map(|n| n as usize);
+                let doc_values = def.get("doc_values").and_then(Value::as_bool).unwrap_or(true);
+                (ignore_above, indexed || doc_values)
+            }),
+            valid: ty.and_then(Valid::of),
         });
     }
 }
@@ -2296,11 +2357,15 @@ fn unify_new_paths(rows: &mut [Map<String, Value>], schema: &Schema) {
 /// caller can refuse it synchronously (an OpenSearch bulk item error) rather
 /// than learn after the batch commits. A failure to check at all (the table
 /// cannot be opened) is an error object, not a verdict on the document.
+/// `ignored` (null for none) names the fields OpenSearch's mapper left out
+/// of the document, one path per line ([`IGNORED_SEPARATOR`]): they are
+/// not checked, as the row leaves them out.
 #[no_mangle]
 pub unsafe extern "C" fn infino_check_doc(
     h: *mut Bridge,
     name: *const c_char,
     source: *const c_char,
+    ignored: *const c_char,
 ) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
         let (Some(conn), Some(name), Some(source)) =
@@ -2309,6 +2374,14 @@ pub unsafe extern "C" fn infino_check_doc(
             })
         else {
             return err_json("null argument");
+        };
+        let ignored = if ignored.is_null() {
+            Vec::new()
+        } else {
+            match unsafe { cstr(ignored) } {
+                Some(paths) => ignored_paths(paths),
+                None => return err_json("ignored paths are not UTF-8"),
+            }
         };
         let table = match conn.table(name) {
             Ok(t) => t,
@@ -2323,6 +2396,7 @@ pub unsafe extern "C" fn infino_check_doc(
                 &conn.kept(name),
                 &conn.engine_columns(name),
                 stamp.as_deref(),
+                &ignored,
             ) {
                 Ok(_) => String::new(),
                 Err(why) => why,
@@ -2330,6 +2404,74 @@ pub unsafe extern "C" fn infino_check_doc(
         )
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// The paths of a document's ignored fields, as the caller hands them over
+/// ([`IGNORED_SEPARATOR`] between them), each once, in order.
+fn ignored_paths(paths: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for path in paths.split(IGNORED_SEPARATOR) {
+        if !path.is_empty() && !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// The values of the `keyword` fields `kept` names as OpenSearch indexes
+/// them: a value longer than its field's `ignore_above` is left out (the
+/// source keeps it), and one whose UTF-8 encoding is longer than a term may
+/// be refuses the document, as Lucene refuses it.
+fn keyword_values(flat: &mut Map<String, Value>, kept: &HashMap<String, Kept>) -> Result<(), String> {
+    for (path, value) in flat.iter_mut() {
+        let Some(Kept::Keyword { ignore_above, terms }) = kept.get(path) else {
+            continue;
+        };
+        let indexed = |v: &Value| -> Result<bool, String> {
+            // A number or boolean is indexed as its text.
+            let s = match v {
+                Value::String(s) => s.as_str(),
+                Value::Number(_) | Value::Bool(_) => {
+                    return Ok(!ignore_above.is_some_and(|n| v.to_string().len() > n));
+                }
+                _ => return Ok(true),
+            };
+            if ignore_above.is_some_and(|n| s.encode_utf16().count() > n) {
+                return Ok(false);
+            }
+            if *terms && s.len() > MAX_TERM_BYTES {
+                return Err(format!(
+                    "Document contains at least one immense term in field=\"{path}\" (whose UTF8 encoding is longer than the max length {MAX_TERM_BYTES}), all of which were skipped. bytes can be at most {MAX_TERM_BYTES} in length; got {}",
+                    s.len()
+                ));
+            }
+            Ok(true)
+        };
+        match value {
+            Value::Array(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                array_values(std::mem::take(items), &mut values);
+                for v in values {
+                    if indexed(&v)? {
+                        items.push(v);
+                    }
+                }
+            }
+            other => {
+                if !indexed(other)? {
+                    *other = Value::Null;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the flattened `path` is the field `field` or a path under it (a
+/// geo_point given as an object flattens to the paths under its field).
+fn is_at_or_under(path: &str, field: &str) -> bool {
+    path.strip_prefix(field)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 /// Parse, flatten and conform one document to the declared columns. The
@@ -2343,13 +2485,16 @@ pub unsafe extern "C" fn infino_check_doc(
 /// of arrays at a field without a scalar or string column the mapping
 /// declares is refused, as the engine would refuse it. A field named like
 /// one of the table's own columns ([`RESERVED`], or `engine`, those its
-/// engine writes) goes to a column of its own.
+/// engine writes) goes to a column of its own. A field `ignored` names, and
+/// every path under it, is left out of the row, as OpenSearch's mapper left
+/// it out of the document (its value stays in the source).
 fn conform_doc(
     source: &str,
     schema: &Schema,
     kept: &HashMap<String, Kept>,
     engine: &[String],
     stamp: Option<&str>,
+    ignored: &[&str],
 ) -> Result<Map<String, Value>, String> {
     let doc: Value = serde_json::from_str(source).map_err(|e| format!("malformed JSON: {e}"))?;
     let obj = doc
@@ -2357,6 +2502,24 @@ fn conform_doc(
         .ok_or_else(|| "the document is not an object".to_string())?;
     let mut flat = Map::new();
     flatten(obj, "", &mut flat);
+    // A declared field the mapper ignored keeps, of several values, those its
+    // column takes (OpenSearch drops only the malformed ones); any other path
+    // at or under an ignored field has no value OpenSearch indexed.
+    let mut partial: HashSet<String> = HashSet::new();
+    if !ignored.is_empty() {
+        flat.retain(|path, value| {
+            if !ignored.iter().any(|field| is_at_or_under(path, field)) {
+                return true;
+            }
+            let keeps_some = value.is_array()
+                && ignored.contains(&path.as_str())
+                && schema.field_with_name(path).is_ok();
+            if keeps_some {
+                partial.insert(path.clone());
+            }
+            keeps_some
+        });
+    }
     // A field named like a reserved column goes to its own column once the
     // mapping declares it, and never to the reserved one.
     for reserved in RESERVED
@@ -2370,6 +2533,7 @@ fn conform_doc(
             }
         }
     }
+    keyword_values(&mut flat, kept)?;
     if let Some(field) = stamp {
         let values = match flat.get(field) {
             None | Some(Value::Null) => 0,
@@ -2414,17 +2578,30 @@ fn conform_doc(
             }
             _ => conform(v, dt).and_then(|v| keep(v, rule.and_then(Kept::precision))),
         };
+        // Of an ignored field's values, those OpenSearch indexed: the mapper
+        // dropped any it could not parse, which the column may still take.
+        let indexed = |v: Value| {
+            fit(v).ok().filter(|v| match rule {
+                Some(Kept::Valid(valid)) => valid.accepts(v),
+                _ => true,
+            })
+        };
         let why = |why: String| format!("field [{path}]: {why}");
+        let partial = partial.contains(path.as_str());
         *value = match value.take() {
             Value::Array(items) if list_type(dt).is_some() => {
                 let mut values = Vec::with_capacity(items.len());
                 array_values(items, &mut values);
-                if values.len() > 1 {
-                    let conformed = values
+                let mut conformed = if partial {
+                    values.into_iter().filter_map(indexed).collect()
+                } else {
+                    values
                         .into_iter()
                         .map(fit)
                         .collect::<Result<Vec<Value>, String>>()
-                        .map_err(why)?;
+                        .map_err(why)?
+                };
+                if conformed.len() > 1 {
                     // A string field keeps its values joined, for its text index.
                     let own = if matches!(
                         dt,
@@ -2443,9 +2620,10 @@ fn conform_doc(
                     lists.push((format!("{path}{LIST_SUFFIX}"), Value::Array(conformed)));
                     own
                 } else {
-                    values.pop().map_or(Ok(Value::Null), fit).map_err(why)?
+                    conformed.pop().unwrap_or(Value::Null)
                 }
             }
+            other if partial => indexed(other).unwrap_or(Value::Null),
             other => fit(other).map_err(why)?,
         };
     }
@@ -2878,7 +3056,8 @@ pub unsafe extern "C" fn infino_index_batch(
         for i in 0..n {
             let osid = unsafe { cstr(os_p[i]) }.unwrap_or("");
             let source = unsafe { cstr(sr_p[i]) }.unwrap_or("{}");
-            let mut flat = match conform_doc(source, &schema, &kept, &engine, stamp.as_deref()) {
+            let mut flat = match conform_doc(source, &schema, &kept, &engine, stamp.as_deref(), &[])
+            {
                 Ok(flat) => flat,
                 Err(why) => {
                     failed.push(json!({ "i": i, "reason": why, "permanent": true }));
@@ -2951,6 +3130,7 @@ pub unsafe extern "C" fn infino_index_batch_buf(
                 id_ends,
                 src_ends,
                 None,
+                ptr::null(),
                 count as usize,
             )
         } {
@@ -2990,6 +3170,18 @@ pub struct Prepared {
     failed: Vec<(usize, String)>,
 }
 
+/// One row of a buffer handed to [`prepare`]: its id, source, routing value
+/// (empty for none) and ignored fields, borrowed from the buffer, with its
+/// stamp and operation (negative for none).
+struct RowIn<'a> {
+    id: &'a str,
+    src: &'a str,
+    routing: &'a str,
+    ignored: Vec<&'a str>,
+    seq: i64,
+    op: i64,
+}
+
 /// Each row's routing value and sequence numbers, beside the buffer of ids
 /// and sources: `rt_ends[i]` is where row i's routing value ends (it follows
 /// the row's source in the buffer; an empty one is none), `seqs[i]` its
@@ -3006,7 +3198,10 @@ struct RowMeta {
 /// Parse the buffer's documents in parallel and convert them to one Arrow
 /// batch. With `meta`, each row also keeps its routing value in
 /// [`ROUTING`], its stamp in [`SEQ`] and its operation in [`OP`] (see
-/// [`RowMeta`]).
+/// [`RowMeta`]). With `ig_ends`, each row's segment ends with the paths of
+/// the fields OpenSearch's mapper left out of its document
+/// ([`IGNORED_SEPARATOR`] between them; an empty one is none), up to
+/// `ig_ends[i]`: the row leaves them out and keeps them in [`IGNORED`].
 #[allow(clippy::too_many_arguments)]
 unsafe fn prepare(
     conn: &Bridge,
@@ -3016,11 +3211,13 @@ unsafe fn prepare(
     id_ends: *const u32,
     src_ends: *const u32,
     meta: Option<RowMeta>,
+    ig_ends: *const u32,
     n: usize,
 ) -> Result<Prepared, Value> {
     let bytes = unsafe { std::slice::from_raw_parts(buf, buf_len) };
     let id_ends = unsafe { std::slice::from_raw_parts(id_ends, n) };
     let src_ends = unsafe { std::slice::from_raw_parts(src_ends, n) };
+    let ig_ends = (!ig_ends.is_null()).then(|| unsafe { std::slice::from_raw_parts(ig_ends, n) });
     let rt_ends = meta.map(|m| unsafe { std::slice::from_raw_parts(m.rt_ends, n) });
     let seqs = meta.map(|m| unsafe { std::slice::from_raw_parts(m.seqs, n) });
     let ops = meta.map(|m| unsafe { std::slice::from_raw_parts(m.ops, n) });
@@ -3034,36 +3231,60 @@ unsafe fn prepare(
     let kept = conn.kept(name);
     let engine = conn.engine_columns(name);
     let stamp = conn.stamp(name);
+    // A table whose ignored column holds something else (a document's own
+    // field of that name, written before the column was reserved) keeps no
+    // ignored fields, rather than refusing every row that has some.
+    let keeps_ignored = schema
+        .field_with_name(IGNORED)
+        .map_or(true, |f| {
+            matches!(f.data_type(), DataType::List(item)
+                if matches!(item.data_type(), DataType::Utf8 | DataType::LargeUtf8))
+        });
 
-    // Each row's id, source and routing value as borrowed slices of the
-    // buffer, with its stamp and operation.
-    let mut rows_in: Vec<(&str, &str, &str, i64, i64)> = Vec::with_capacity(n);
+    // Each row's id, source, routing value and ignored fields as borrowed
+    // slices of the buffer, with its stamp and operation.
+    let mut rows_in: Vec<RowIn> = Vec::with_capacity(n);
     let mut start = 0usize;
     for i in 0..n {
         let (id_end, src_end) = (id_ends[i] as usize, src_ends[i] as usize);
         let rt_end = rt_ends.map_or(src_end, |ends| ends[i] as usize);
-        if id_end < start || src_end < id_end || rt_end < src_end || rt_end > buf_len {
+        let ig_end = ig_ends.map_or(rt_end, |ends| ends[i] as usize);
+        if id_end < start
+            || src_end < id_end
+            || rt_end < src_end
+            || ig_end < rt_end
+            || ig_end > buf_len
+        {
             return Err(error_value("offsets out of range"));
         }
-        let id = std::str::from_utf8(&bytes[start..id_end]).unwrap_or("");
-        let src = std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}");
-        let routing = std::str::from_utf8(&bytes[src_end..rt_end]).unwrap_or("");
-        rows_in.push((
-            id,
-            src,
-            routing,
-            seqs.map_or(-1, |s| s[i]),
-            ops.map_or(-1, |o| o[i]),
-        ));
-        start = rt_end;
+        rows_in.push(RowIn {
+            id: std::str::from_utf8(&bytes[start..id_end]).unwrap_or(""),
+            src: std::str::from_utf8(&bytes[id_end..src_end]).unwrap_or("{}"),
+            routing: std::str::from_utf8(&bytes[src_end..rt_end]).unwrap_or(""),
+            ignored: ignored_paths(std::str::from_utf8(&bytes[rt_end..ig_end]).unwrap_or("")),
+            seq: seqs.map_or(-1, |s| s[i]),
+            op: ops.map_or(-1, |o| o[i]),
+        });
+        start = ig_end;
     }
 
     let parsed: Vec<Result<Map<String, Value>, String>> = rows_in
         .par_iter()
-        .map(|(id, src, routing, seq, op)| {
-            conform_doc(src, &schema, &kept, &engine, stamp.as_deref()).map(|mut flat| {
+        .map(|row| {
+            let RowIn {
+                id,
+                src,
+                routing,
+                ignored,
+                seq,
+                op,
+            } = row;
+            conform_doc(src, &schema, &kept, &engine, stamp.as_deref(), ignored).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 flat.insert(SOURCE.into(), Value::String((*src).to_string()));
+                if keeps_ignored && !ignored.is_empty() {
+                    flat.insert(IGNORED.into(), json!(ignored));
+                }
                 if !routing.is_empty() {
                     flat.insert(ROUTING.into(), Value::String((*routing).to_string()));
                 }
@@ -3405,11 +3626,14 @@ fn append_prepared(
 }
 
 /// Parse and convert a batch ahead of its append; see [`Prepared`]. The
-/// buffer layout is that of [`infino_index_batch_buf`]. Returns null when
+/// buffer layout is that of [`infino_index_batch_buf`], each row's segment
+/// followed by the paths of its ignored fields up to `ig_ends[i]` when
+/// `ig_ends` is not null (see [`prepare`]). Returns null when
 /// the table is unknown or the offsets do not fit the buffer; otherwise a
 /// handle that [`infino_append_prepared`] consumes or
 /// [`infino_free_prepared`] releases.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn infino_prepare_batch(
     h: *mut Bridge,
     name: *const c_char,
@@ -3417,6 +3641,7 @@ pub unsafe extern "C" fn infino_prepare_batch(
     buf_len: usize,
     id_ends: *const u32,
     src_ends: *const u32,
+    ig_ends: *const u32,
     count: c_int,
 ) -> *mut Prepared {
     // Cleared first, so a null this call returns before it records a reason
@@ -3438,6 +3663,7 @@ pub unsafe extern "C" fn infino_prepare_batch(
                 id_ends,
                 src_ends,
                 None,
+                ig_ends,
                 count as usize,
             )
         } {
@@ -3457,7 +3683,9 @@ pub unsafe extern "C" fn infino_prepare_batch(
 /// `rt_ends[i]` is where row i's routing value ends (an empty one is none),
 /// `seqs[i]` is its stamp and `ops[i]` the operation that wrote it (each
 /// negative for none), by writer `gen`. A row keeps them in the
-/// `osrouting`, `osseq`, `osop` and `osgen` columns.
+/// `osrouting`, `osseq`, `osop` and `osgen` columns. With `ig_ends`, each
+/// routing value is followed by the paths of the row's ignored fields, as in
+/// [`infino_prepare_batch`].
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn infino_prepare_batch_meta(
@@ -3471,6 +3699,7 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
     seqs: *const i64,
     ops: *const i64,
     gen: i64,
+    ig_ends: *const u32,
     count: c_int,
 ) -> *mut Prepared {
     // Cleared first, so a null this call returns before it records a reason
@@ -3504,6 +3733,7 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
                     ops,
                     gen,
                 }),
+                ig_ends,
                 count as usize,
             )
         } {
@@ -5145,6 +5375,7 @@ mod tests {
                 h,
                 c("no_such_table").as_ptr(),
                 c(r#"{"level":"info"}"#).as_ptr(),
+                ptr::null(),
             )
         });
         let v: Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
@@ -5207,7 +5438,7 @@ mod tests {
     }
 
     fn check(h: *mut Bridge, doc: &str) -> String {
-        take(unsafe { infino_check_doc(h, c("logs").as_ptr(), c(doc).as_ptr()) })
+        take(unsafe { infino_check_doc(h, c("logs").as_ptr(), c(doc).as_ptr(), ptr::null()) })
     }
 
     fn bm25(h: *mut Bridge, column: &str, query: &str) -> String {
@@ -5786,6 +6017,7 @@ mod tests {
                 doc.len(),
                 [1u32].as_ptr(),
                 [doc.len() as u32].as_ptr(),
+                ptr::null(),
                 1,
             )
         };
@@ -6490,6 +6722,7 @@ mod tests {
                 [4i64, 5].as_ptr(),
                 [-1i64, 5].as_ptr(),
                 3,
+                ptr::null(),
                 2,
             )
         };
@@ -6541,6 +6774,261 @@ mod tests {
         assert_eq!(highest[0]["highest"], 5, "{highest}");
         assert_eq!(count(h, ".osop", "hello"), "1");
         close(h);
+    }
+
+    /// Of an ignored field's several values, those its column takes stay in
+    /// the row, as OpenSearch keeps the well-formed values of an array; a
+    /// single ignored value, an ignored field the mapping does not declare,
+    /// and the paths under an ignored field are left out whole.
+    #[test]
+    fn an_ignored_array_keeps_the_values_its_column_takes() {
+        let schema = Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new("m", DataType::Int64, true),
+        ]);
+        let row = |doc: &str, ignored: &[&str]| {
+            conform_doc(doc, &schema, &HashMap::new(), &[], None, ignored)
+        };
+        let flat = row(r#"{"n":[1,"x",3],"m":"y"}"#, &["n", "m"]).unwrap();
+        assert_eq!(flat.get("n[]"), Some(&json!([1, 3])), "{flat:?}");
+        assert!(!flat.contains_key("m"), "{flat:?}");
+        let flat = row(r#"{"n":["x",2]}"#, &["n"]).unwrap();
+        assert_eq!(flat.get("n"), Some(&json!(2)), "{flat:?}");
+        assert!(!flat.contains_key("n[]"), "{flat:?}");
+        let flat = row(r#"{"n":["x","y"]}"#, &["n"]).unwrap();
+        assert_eq!(flat.get("n"), Some(&Value::Null), "{flat:?}");
+        let flat = row(
+            r#"{"u":[1,"x"],"g":{"lat":"north","lon":[1,2]}}"#,
+            &["u", "g"],
+        )
+        .unwrap();
+        assert!(flat.is_empty(), "{flat:?}");
+        // Not ignored, the same array is refused.
+        assert!(row(r#"{"n":[1,"x",3]}"#, &[]).is_err());
+    }
+
+    #[test]
+    fn an_ignored_array_keeps_only_the_values_opensearch_accepts() {
+        let schema = Schema::new(vec![
+            Field::new("ip", DataType::LargeUtf8, true),
+            Field::new("b", DataType::Int64, true),
+            Field::new("ip[]", DataType::List(Arc::new(Field::new(LIST_ITEM, DataType::LargeUtf8, true))), true),
+        ]);
+        let kept: HashMap<String, Kept> = [
+            ("ip".to_string(), Kept::Valid(Valid::Ip)),
+            ("b".to_string(), Kept::Valid(Valid::Integer(-128, 127))),
+        ]
+        .into_iter()
+        .collect();
+        let row = |doc: &str, ignored: &[&str]| conform_doc(doc, &schema, &kept, &[], None, ignored);
+        let flat = row(r#"{"ip":["10.0.0.1","garbage","::1"]}"#, &["ip"]).unwrap();
+        assert_eq!(flat.get("ip[]"), Some(&json!(["10.0.0.1", "::1"])), "{flat:?}");
+        let flat = row(r#"{"b":[1,300,-128]}"#, &["b"]).unwrap();
+        assert_eq!(flat.get("b[]"), Some(&json!([1, -128])), "{flat:?}");
+        let flat = row(r#"{"b":[300,-129]}"#, &["b"]).unwrap();
+        assert_eq!(flat.get("b"), Some(&Value::Null), "{flat:?}");
+        // Not ignored, a value is kept as the mapper accepted it.
+        let flat = row(r#"{"b":5}"#, &[]).unwrap();
+        assert_eq!(flat.get("b"), Some(&json!(5)), "{flat:?}");
+    }
+
+    /// A `keyword` value longer than its field's `ignore_above` (counted in
+    /// UTF-16 units) is left out of the row, of several values only it; one
+    /// whose UTF-8 encoding is past a term's length refuses the document.
+    #[test]
+    fn keyword_values_follow_ignore_above_and_the_term_length() {
+        let schema = Schema::new(vec![
+            Field::new("short", DataType::LargeUtf8, true),
+            Field::new("long", DataType::LargeUtf8, true),
+            Field::new("stored", DataType::LargeUtf8, true),
+            Field::new("short[]", DataType::List(Arc::new(Field::new(LIST_ITEM, DataType::LargeUtf8, true))), true),
+        ]);
+        let kept: HashMap<String, Kept> = [
+            ("short".to_string(), Kept::Keyword { ignore_above: Some(5), terms: true }),
+            ("long".to_string(), Kept::Keyword { ignore_above: None, terms: true }),
+            ("stored".to_string(), Kept::Keyword { ignore_above: None, terms: false }),
+        ]
+        .into_iter()
+        .collect();
+        let row = |doc: String| conform_doc(&doc, &schema, &kept, &[], None, &[]);
+        let flat = row(r#"{"short":"abcdefgh"}"#.to_string()).unwrap();
+        assert_eq!(flat.get("short"), Some(&Value::Null), "{flat:?}");
+        let flat = row(r#"{"short":"abc"}"#.to_string()).unwrap();
+        assert_eq!(flat.get("short"), Some(&json!("abc")), "{flat:?}");
+        // Five characters of two UTF-8 bytes each are five UTF-16 units.
+        let flat = row(r#"{"short":"ééééé"}"#.to_string()).unwrap();
+        assert_eq!(flat.get("short"), Some(&json!("ééééé")), "{flat:?}");
+        let flat = row(r#"{"short":["abc","abcdefgh","de"]}"#.to_string()).unwrap();
+        assert_eq!(flat.get("short[]"), Some(&json!(["abc", "de"])), "{flat:?}");
+        let flat = row(r#"{"short":["abc","abcdefgh"]}"#.to_string()).unwrap();
+        assert_eq!(flat.get("short"), Some(&json!("abc")), "{flat:?}");
+        let at = "x".repeat(MAX_TERM_BYTES);
+        assert!(row(format!(r#"{{"long":"{at}"}}"#)).is_ok());
+        let past = format!("{at}x");
+        let why = row(format!(r#"{{"long":"{past}"}}"#)).unwrap_err();
+        assert!(why.contains("bytes can be at most 32766 in length; got 32767"), "{why}");
+        // A keyword that is neither indexed nor has doc values builds no term, so any length is kept.
+        let flat = row(format!(r#"{{"stored":"{past}"}}"#)).unwrap();
+        assert_eq!(flat.get("stored"), Some(&json!(past)), "{flat:?}");
+        // A number is indexed as its text, and left out past ignore_above.
+        let flat = row(r#"{"short":123456}"#.to_string()).unwrap();
+        assert_eq!(flat.get("short"), Some(&Value::Null), "{flat:?}");
+        let flat = row(r#"{"short":12345}"#.to_string()).unwrap();
+        assert_ne!(flat.get("short"), Some(&Value::Null), "{flat:?}");
+        // Past its ignore_above, a value of any length is left out, as OpenSearch leaves it.
+        let flat = row(format!(r#"{{"short":"{past}"}}"#)).unwrap();
+        assert_eq!(flat.get("short"), Some(&Value::Null), "{flat:?}");
+    }
+
+    /// Whether a `keyword` field builds terms follows its mapping: one that
+    /// is neither indexed nor has doc values stores a value past a term's
+    /// length in its row and its source; an indexed one, or one with only
+    /// doc values, refuses the document as an immense term, at the check
+    /// and at the write.
+    #[test]
+    fn a_keyword_builds_terms_unless_its_mapping_turns_off_index_and_doc_values() {
+        let h = open_logs();
+        let mapping = r#"{"properties":{
+            "@timestamp":{"type":"date"},
+            "level":{"type":"keyword"},
+            "message":{"type":"text"},
+            "status":{"type":"long"},
+            "took":{"type":"float"},
+            "http":{"properties":{"method":{"type":"keyword"}}},
+            "geo":{"type":"geo_point"},
+            "stored":{"type":"keyword","index":false,"doc_values":false},
+            "indexed":{"type":"keyword"},
+            "doc_values_only":{"type":"keyword","index":false}
+        }}"#;
+        let out = ensure(h, mapping);
+        assert!(!out.contains("error"), "{out}");
+        let past = "x".repeat(MAX_TERM_BYTES + 1);
+        let stored = format!(r#"{{"level":"info","stored":"{past}"}}"#);
+        let indexed = format!(r#"{{"level":"info","indexed":"{past}"}}"#);
+        let doc_values_only = format!(r#"{{"level":"info","doc_values_only":"{past}"}}"#);
+
+        assert_eq!(check(h, &stored), "");
+        for (doc, field) in [(&indexed, "indexed"), (&doc_values_only, "doc_values_only")] {
+            let why = check(h, doc);
+            assert!(
+                why.contains(&format!("immense term in field=\"{field}\"")),
+                "{field}: {why}"
+            );
+            assert!(
+                why.contains("bytes can be at most 32766 in length; got 32767"),
+                "{field}: {why}"
+            );
+        }
+
+        let out = index(
+            h,
+            &[("s", &stored), ("i", &indexed), ("d", &doc_values_only)],
+        );
+        assert_eq!(out["ok"], 1, "{out}");
+        let failed = out["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 2, "{out}");
+        for (f, (i, field)) in failed.iter().zip([(1, "indexed"), (2, "doc_values_only")]) {
+            assert_eq!(f["i"], i, "{out}");
+            let why = f["reason"].as_str().unwrap();
+            let term = format!("immense term in field=\"{field}\"");
+            assert!(why.contains(&term), "{out}");
+        }
+
+        // The stored value is whole in the row and in the source.
+        let q = "SELECT osid, length(stored) AS n FROM logs WHERE stored IS NOT NULL";
+        let rows = sql(h, q);
+        let expected = json!([{"osid": "s", "n": MAX_TERM_BYTES + 1}]);
+        assert_eq!(rows, expected, "{rows}");
+        assert_eq!(get(h, "s"), stored);
+        assert_eq!(get(h, "i"), "");
+        assert_eq!(get(h, "d"), "");
+        close(h);
+    }
+
+    /// The fields OpenSearch's mapper ignored for a malformed value are left
+    /// out of the check and of the row, a field's paths under it with it
+    /// (a geo_point given as an object), and kept by path in the ignored
+    /// column; the source keeps them whole. A row with none leaves the
+    /// column null, and a document's own field of that name stays out of it.
+    #[test]
+    fn ignored_fields_stay_out_of_the_row_and_are_kept_by_path() {
+        let h = open_logs();
+        let bad = r#"{"status":"not a number","geo":{"lat":"north","lon":1},"level":"info"}"#;
+        assert!(
+            check(h, bad).contains("status"),
+            "the column refuses the value"
+        );
+        let ignoring = |doc: &str, paths: &str| {
+            take(unsafe {
+                infino_check_doc(h, c("logs").as_ptr(), c(doc).as_ptr(), c(paths).as_ptr())
+            })
+        };
+        assert_eq!(ignoring(bad, "status\ngeo"), "");
+        assert_eq!(ignoring(r#"{"status":"x","statuses":"y"}"#, "status"), "");
+
+        let docs = [
+            ("a", bad, "status\ngeo\nstatus"),
+            ("b", r#"{"status":5,"osignored":"mine"}"#, ""),
+        ];
+        let mut buf: Vec<u8> = Vec::new();
+        let (mut id_ends, mut src_ends, mut ig_ends) = (Vec::new(), Vec::new(), Vec::new());
+        for (id, src, ignored) in docs {
+            buf.extend_from_slice(id.as_bytes());
+            id_ends.push(buf.len() as u32);
+            buf.extend_from_slice(src.as_bytes());
+            src_ends.push(buf.len() as u32);
+            buf.extend_from_slice(ignored.as_bytes());
+            ig_ends.push(buf.len() as u32);
+        }
+        let p = unsafe {
+            infino_prepare_batch(
+                h,
+                c("logs").as_ptr(),
+                buf.as_ptr(),
+                buf.len(),
+                id_ends.as_ptr(),
+                src_ends.as_ptr(),
+                ig_ends.as_ptr(),
+                docs.len() as c_int,
+            )
+        };
+        assert!(!p.is_null());
+        let out = append_with_seqs(h, &[p], &[], &[]);
+        assert_eq!(out["ok"], 2, "{out}");
+        let rows = sql(
+            h,
+            r#"SELECT osid, status, level, source, array_to_string(osignored, ',') AS ignored
+                FROM logs ORDER BY osid"#,
+        );
+        assert!(rows[0]["status"].is_null(), "{rows}");
+        assert_eq!(rows[0]["level"], "info", "{rows}");
+        assert_eq!(rows[0]["source"], bad, "{rows}");
+        assert_eq!(rows[0]["ignored"], "status,geo", "{rows}");
+        assert_eq!(rows[1]["status"], 5, "{rows}");
+        assert!(rows[1]["ignored"].is_null(), "{rows}");
+        let found = sql(h, "SELECT osid FROM logs WHERE array_has(osignored, 'geo')");
+        assert_eq!(found, json!([{"osid": "a"}]), "{found}");
+        // Read as the plugin reads it: the paths one per line.
+        let listed = sql(
+            h,
+            "SELECT osid, array_to_string(osignored, chr(10)) AS osignored FROM logs WHERE osignored IS NOT NULL",
+        );
+        assert_eq!(
+            listed,
+            json!([{"osid": "a", "osignored": "status\ngeo"}]),
+            "{listed}"
+        );
+        close(h);
+    }
+
+    #[test]
+    fn an_ignored_field_covers_its_own_path_and_those_under_it() {
+        assert!(is_at_or_under("geo", "geo"));
+        assert!(is_at_or_under("geo.lat", "geo"));
+        assert!(!is_at_or_under("geography", "geo"));
+        assert!(!is_at_or_under("a.geo", "geo"));
+        assert_eq!(ignored_paths("a\n\nb\na"), vec!["a", "b"]);
+        assert!(ignored_paths("").is_empty());
     }
 
     /// A field named like a reserved column the mapping does not declare is
@@ -6823,7 +7311,7 @@ mod tests {
                     .iter()
                     .map(|(id, src)| {
                         let mut flat =
-                            conform_doc(src, &schema, &conn.kept("bench"), &[], None).unwrap();
+                            conform_doc(src, &schema, &conn.kept("bench"), &[], None, &[]).unwrap();
                         flat.insert(OSID.into(), Value::String(id.clone()));
                         flat.insert(SOURCE.into(), Value::String(src.clone()));
                         flat
@@ -6874,6 +7362,7 @@ mod tests {
                 buf.len(),
                 id_ends.as_ptr(),
                 src_ends.as_ptr(),
+                ptr::null(),
                 docs.len() as c_int,
             )
         };
@@ -8232,7 +8721,7 @@ mod tests {
 
         let schema = Schema::new(vec![Field::new("message", DataType::LargeUtf8, true)]);
         let kept = HashMap::new();
-        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], Some("@timestamp"));
+        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], Some("@timestamp"), &[]);
         assert!(check(r#"{"@timestamp": "2023-01-01T00:00:01Z"}"#).is_ok());
         assert!(check(r#"{"@timestamp": ["2023-01-01T00:00:01Z", null]}"#).is_ok());
         for doc in [
@@ -8242,7 +8731,7 @@ mod tests {
         ] {
             assert_eq!(check(doc), Err(no_timestamp("@timestamp")), "{doc}");
         }
-        assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, &[], None).is_ok());
+        assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, &[], None, &[]).is_ok());
     }
 
     /// A write the hosted service could not take is not split into halves:
@@ -8319,6 +8808,7 @@ mod tests {
                 buf.len(),
                 id_ends.as_ptr(),
                 src_ends.as_ptr(),
+                ptr::null(),
                 1,
             )
         };
@@ -8445,6 +8935,7 @@ mod tests {
                 buf.len(),
                 id_ends.as_ptr(),
                 src_ends.as_ptr(),
+                ptr::null(),
                 ids.len() as c_int,
             )
         };

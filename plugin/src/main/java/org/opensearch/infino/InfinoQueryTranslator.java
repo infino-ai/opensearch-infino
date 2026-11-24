@@ -126,6 +126,13 @@ final class InfinoQueryTranslator {
      */
     static final String GEN = "osgen";
     /**
+     * The reserved list column holding the paths of a document's fields that OpenSearch's mapper ignored for a
+     * malformed value ({@link InfinoIgnored}), served as {@code _ignored}; null for a document with none.
+     */
+    static final String IGNORED = "osignored";
+    /** The metadata field listing a document's ignored fields. */
+    static final String IGNORED_FIELD = "_ignored";
+    /**
      * What the bridge adds to a field's column name for the list column that
      * holds the field's values for a document that gives it several; the
      * field's own column is then null for that document (a string field's
@@ -133,8 +140,8 @@ final class InfinoQueryTranslator {
      */
     static final String LIST_SUFFIX = "[]";
     /**
-     * What the bridge puts before the name of a field named like {@link #OSID}, {@link #SOURCE} or {@link #SEQ}
-     * for the column holding it: no mapping names a field so.
+     * What the bridge puts before the name of a field named like {@link #OSID}, {@link #SOURCE}, {@link #SEQ} or
+     * {@link #IGNORED} for the column holding it: no mapping names a field so.
      */
     static final String OWN_COLUMN_PREFIX = ".";
     /**
@@ -1270,7 +1277,7 @@ final class InfinoQueryTranslator {
         List<String> present = new ArrayList<>();
         for (Column sub : cols.values()) {
             String name = sub.name();
-            if (name.equals(OSID) || name.equals(SOURCE) || name.equals(SEQ)) {
+            if (name.equals(OSID) || name.equals(SOURCE) || name.equals(SEQ) || name.equals(IGNORED)) {
                 continue;
             }
             String held = fieldOf(name);
@@ -1285,7 +1292,8 @@ final class InfinoQueryTranslator {
      * The rows an exists on a metadata field matches, as stock's: every
      * document has an {@code _id}, {@code _index}, {@code _seq_no} and
      * {@code _version}; {@code _routing} is the documents written with a
-     * routing value, which only a default-mode table keeps. {@code _source}
+     * routing value, which only a default-mode table keeps; {@code _ignored}
+     * is the documents with a field the mapper ignored. {@code _source}
      * cannot be searched, and stock says so. Null for any other field.
      */
     private String metadataExists(String field) {
@@ -1298,6 +1306,9 @@ final class InfinoQueryTranslator {
                     throw new IllegalArgumentException("[infino] exists on [_routing] is not served: the table keeps no routing values");
                 }
                 return quoteIdent(ROUTING) + " IS NOT NULL";
+            }
+            case IGNORED_FIELD -> {
+                return ignoredColumn(cols) == null ? NONE : quoteIdent(IGNORED) + " IS NOT NULL";
             }
             case "_source" -> throw new QueryShardException((Index) null, "The _source field is not searchable", (Throwable) null);
             default -> {
@@ -3160,6 +3171,9 @@ final class InfinoQueryTranslator {
         if ("_id".equals(field)) {
             return value == null ? NONE : OSID + " = " + literal(String.valueOf(value));
         }
+        if (IGNORED_FIELD.equals(field)) {
+            return value == null ? NONE : ignoredHas(" = " + literal(String.valueOf(value)));
+        }
         Column c = column(field);
         if (c == null || value == null) {
             return c == null ? NONE : null;
@@ -3175,6 +3189,16 @@ final class InfinoQueryTranslator {
                 ids.add(literal(String.valueOf(v)));
             }
             return OSID + " IN (" + String.join(", ", ids) + ")";
+        }
+        if (IGNORED_FIELD.equals(field)) {
+            if (values == null || values.isEmpty()) {
+                return NONE;
+            }
+            List<String> paths = new ArrayList<>();
+            for (Object v : values) {
+                paths.add(literal(String.valueOf(v)));
+            }
+            return ignoredHas(" IN (" + String.join(", ", paths) + ")");
         }
         Column c = column(field);
         if (c == null) {
@@ -3193,6 +3217,35 @@ final class InfinoQueryTranslator {
         }
         String in = " IN (" + String.join(", ", lits) + ")";
         return anyValue(c, v -> v + in);
+    }
+
+    /**
+     * The rows whose ignored fields include a path {@code test} (an SQL
+     * comparison of it) holds for; null, as for any list column, where the
+     * clause may only compare column values ({@link #columnValuesOnly}).
+     */
+    private String ignoredHas(String test) {
+        if (ignoredColumn(cols) == null) {
+            return NONE;
+        }
+        return columnValuesOnly ? null : anyValue(table, null, quoteIdent(IGNORED), v -> v + test);
+    }
+
+    /**
+     * The table's {@link #IGNORED} column, or null when no document has had a
+     * field ignored: the column is added with the first. A document field of
+     * that name is not it ({@link #OWN_COLUMN_PREFIX}), nor is a column that
+     * holds no list.
+     */
+    static Column ignoredColumn(Map<String, Column> cols) {
+        Column c = cols.get(IGNORED);
+        return c != null && c.name().equals(IGNORED) && c.isList() ? c : null;
+    }
+
+    /** The select item reading the {@link #IGNORED} column as one string, a path per line ({@link InfinoIgnored#SEPARATOR}). */
+    static String ignoredPaths() {
+        String column = quoteIdent(IGNORED);
+        return "array_to_string(" + column + ", chr(10)) AS " + column;
     }
 
     private String range(RangeQueryBuilder r) {

@@ -254,7 +254,7 @@ public class InfinoEngineTests extends OpenSearchTestCase {
         try {
             InfinoEngine.Batch batch = new InfinoEngine.Batch();
             for (int i = 0; i < ids.size(); i++) {
-                batch.add(ids.get(i), InfinoEngine.Base.ABSENT, new InfinoEngine.Version(i, true, "{\"n\":" + i + "}", null, -1));
+                batch.add(ids.get(i), InfinoEngine.Base.ABSENT, new InfinoEngine.Version(i, true, "{\"n\":" + i + "}", null, -1, null));
             }
 
             InfinoEngine.Written first = InfinoEngine.write("t", 1, batch, held -> {}, () -> {});
@@ -372,7 +372,7 @@ public class InfinoEngineTests extends OpenSearchTestCase {
         }));
         try {
             InfinoEngine.Batch batch = new InfinoEngine.Batch();
-            batch.add("a", InfinoEngine.Base.ABSENT, new InfinoEngine.Version(0, true, "{}", null, -1));
+            batch.add("a", InfinoEngine.Base.ABSENT, new InfinoEngine.Version(0, true, "{}", null, -1, null));
             InfinoNative.InfinoException e = expectThrows(
                 InfinoNative.InfinoException.class,
                 () -> InfinoEngine.write("t", 1, batch, held -> {}, () -> {})
