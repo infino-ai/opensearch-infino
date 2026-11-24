@@ -1837,6 +1837,20 @@ fn conform_doc(
     }
     let mut lists: Vec<(String, Value)> = Vec::new();
     let mut kept_as_written: Vec<(String, Value)> = Vec::new();
+    // The paths kept whole already, and with them every path inside one.
+    let whole: Vec<String> = flat
+        .keys()
+        .filter_map(|k| k.strip_suffix(OBJECTS_SUFFIX))
+        .map(str::to_owned)
+        .collect();
+    let inside_whole = |path: &str| {
+        whole.iter().any(|w| {
+            path == w
+                || path
+                    .strip_prefix(w.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
+    };
     for (path, value) in flat.iter_mut() {
         let field = schema.field_with_name(path).ok();
         // A field the mapping declares with a scalar or string column reads
@@ -1905,6 +1919,16 @@ fn conform_doc(
                     lists.push((format!("{path}{LIST_SUFFIX}"), Value::Array(conformed)));
                     own
                 } else {
+                    // One value or none goes to the field's own column, which
+                    // cannot say it was an array: the array is kept as
+                    // written, so `["x"]` does not come back as `"x"`.
+                    if !inside_whole(path) {
+                        let written = Value::Array(values.clone());
+                        kept_as_written.push((
+                            format!("{path}{OBJECTS_SUFFIX}"),
+                            Value::String(written.to_string()),
+                        ));
+                    }
                     values.pop().map_or(Ok(Value::Null), fit).map_err(why)?
                 }
             }
@@ -4823,6 +4847,30 @@ mod tests {
         let text = sent.to_string();
         index(h, &[("d1", text.as_str())]);
         let doc: Value = serde_json::from_str(&get(h, "d1")).unwrap();
+        assert_eq!(doc, sent, "{doc}");
+        close(h);
+    }
+
+    /// An array holding one value is stored in the field's own column, which
+    /// cannot say it was an array; it comes back as written, an array, at the
+    /// top level and inside an object. Plugins that keep their configuration
+    /// in an index (alerting, notifications) parse such a field as a list and
+    /// refuse a lone value.
+    #[test]
+    fn an_array_of_one_value_comes_back_an_array() {
+        let h = open_logs();
+        ensure(
+            h,
+            r#"{"properties":{"roles":{"type":"keyword"},"meta":{"properties":{"access":{"type":"keyword"},"n":{"type":"long"}}}}}"#,
+        );
+        let sent = json!({
+            "roles": ["admin"],
+            "meta": {"access": ["all"], "n": [3]},
+            "tags": ["x", "y"]
+        });
+        let text = sent.to_string();
+        index(h, &[("one", text.as_str())]);
+        let doc: Value = serde_json::from_str(&get(h, "one")).unwrap();
         assert_eq!(doc, sent, "{doc}");
         close(h);
     }
