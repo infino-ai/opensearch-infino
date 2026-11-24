@@ -7,6 +7,7 @@ package org.opensearch.infino;
 import org.opensearch.client.ResponseException;
 
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +45,17 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     private static final String HELD_DELETED = "h1";
     /** The cluster setting that holds skeleton rebuilds. */
     private static final String PAUSED = "infino.skeleton_rebuild.paused";
+    /** The table of the untouched-rows test's indices, and its rows. */
+    private static final String KEPT_TABLE = "emr5_rows";
+    private static final int KEPT_ROWS = 200;
+    /**
+     * How long a read waits before it compares the table's rows: a read of
+     * the table may trail its latest commit by up to a second, and a write
+     * the test looks for may have been committed just before.
+     */
+    private static final long SETTLE_MILLIS = 3_000;
+    /** The mark a rebuild's creates open their source with, which a client's write may not carry. */
+    private static final String MARK = "/*infino:skeleton*/";
 
     @SuppressWarnings("unchecked")
     public void testARebuiltIndexGetsItsRowsBackAndKeepsThemOnce() throws Exception {
@@ -158,6 +170,78 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         ResponseException gone = expectThrows(ResponseException.class, () -> call("GET", "/emr3/_doc/" + HELD_DELETED, null));
         assertEquals(404, gone.getResponse().getStatusLine().getStatusCode());
         call("DELETE", "/emr3", null);
+    }
+
+    /**
+     * A rebuild writes the skeleton alone: the table already holds every
+     * row, so each keeps the engine's id it had, rather than being written
+     * again as a new row. A primary that starts again from its own store,
+     * or as the index is opened again, writes the table the operations of
+     * its history the table may not hold: the rebuild's creates are among
+     * them, and the rows stay as they are. A client's write may not carry
+     * the mark that keeps a rebuild's creates out of the table.
+     */
+    @SuppressWarnings("unchecked")
+    public void testARebuildLeavesTheTableAsItIs() throws Exception {
+        createIndex("emr5_old", false, KEPT_TABLE, 1);
+        StringBuilder bulk = new StringBuilder();
+        for (int i = 0; i < KEPT_ROWS; i++) {
+            bulk.append("{\"index\":{\"_index\":\"emr5_old\",\"_id\":\"k").append(i).append("\"}}\n");
+            bulk.append("{\"n\":").append(i).append("}\n");
+        }
+        assertEquals(false, call("POST", "/_bulk?refresh=true", bulk.toString()).get("errors"));
+        Map<String, Object> before = rowIds("emr5_old");
+        assertEquals(KEPT_ROWS, before.size());
+        call("DELETE", "/emr5_old", null);
+
+        createIndex("emr5", true, KEPT_TABLE, 1);
+        // The shard's own document count, which a search of a skeleton being rebuilt does not wait for.
+        assertBusy(() -> {
+            Map<String, Object> index = (Map<String, Object>) callList("GET", "/_cat/indices/emr5?format=json&h=docs.count", null).get(0);
+            assertEquals(String.valueOf(KEPT_ROWS), index.get("docs.count"));
+        }, REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertEquals("every row keeps its engine id through the rebuild", before, rowIds("emr5"));
+
+        // Fail the primary and allocate it again from its own store: as it
+        // becomes primary it writes the table the operations of its history the
+        // table may not hold, the rebuild's creates among them, as a restarted
+        // node's primary does.
+        List<Object> shard = callList("GET", "/_cat/shards/emr5?format=json&h=node", null);
+        String node = ((Map<String, Object>) shard.get(0)).get("node").toString();
+        call(
+            "POST",
+            "/_cluster/reroute",
+            "{\"commands\":[{\"cancel\":{\"index\":\"emr5\",\"shard\":0,\"node\":\"" + node + "\",\"allow_primary\":true}}]}"
+        );
+        call("GET", "/_cluster/health/emr5?wait_for_status=green&timeout=60s", null);
+        assertEquals("and through the primary's start from its store", before, rowIds("emr5"));
+
+        call("POST", "/emr5/_close", null);
+        call("POST", "/emr5/_open?wait_for_active_shards=1", null);
+        call("GET", "/_cluster/health/emr5?wait_for_status=green&timeout=60s", null);
+        assertEquals("and through the index's reopening", before, rowIds("emr5"));
+        assertEquals(KEPT_ROWS, ((Number) call("GET", "/emr5/_count", null).get("count")).intValue());
+
+        ResponseException forged = expectThrows(
+            ResponseException.class,
+            () -> call("PUT", "/emr5/_doc/forged?refresh=true", "{" + MARK + "\"n\":1}")
+        );
+        assertEquals(400, forged.getResponse().getStatusLine().getStatusCode());
+        assertEquals(KEPT_ROWS, rowIds("emr5").size());
+        call("DELETE", "/emr5", null);
+    }
+
+    /** Each row of {@code index}'s table by its document id: the engine's id of the row, as the latest commit holds it. */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> rowIds(String index) throws IOException, InterruptedException {
+        Thread.sleep(SETTLE_MILLIS);
+        Map<String, Object> out = call("POST", "/_plugins/_infino/sql", "{\"query\":\"SELECT osid, _id FROM " + index + "\"}");
+        Map<String, Object> ids = new HashMap<>();
+        for (Object row : (List<?>) out.get("rows")) {
+            Map<String, Object> r = (Map<String, Object>) row;
+            assertNull("each document id once", ids.put(r.get("osid").toString(), r.get("_id")));
+        }
+        return ids;
     }
 
     /** The hits of a search of the held-rebuild test's index, room left for every row. */

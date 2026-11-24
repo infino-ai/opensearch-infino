@@ -21,6 +21,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.mapper.IdFieldMapper;
@@ -30,6 +31,7 @@ import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -48,9 +50,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * skeleton lacks is created through the cluster's own write path, from the
  * row's own source, so each of the shard's copies gets it as it gets any
  * write, routed by the routing value the row was written with when it was
- * written with one. The table already holds these rows, so the primary's
- * engine leaves the table alone for them (the request carries
- * {@link #SKELETON_ONLY}).
+ * written with one. The table already holds these rows, so no copy's
+ * engine writes them to the table: each create's source carries
+ * {@link #MARK} (see {@link #isMarked}), which the shard's translog and its
+ * history keep with the document, so a translog replay after a restart and
+ * a copy taking over as primary leave the table alone for them too.
  * Each is a create, so a client's write of the same id wins; a row a client
  * deleted while its create was in flight is deleted again through the
  * shard, so the skeleton and the translog end where the table is. Until a
@@ -65,8 +69,29 @@ final class InfinoSkeletonAdopter {
 
     private static final Logger log = LogManager.getLogger(InfinoSkeletonAdopter.class);
 
-    /** The header a skeleton-only write carries, so the primary's engine writes Lucene alone. */
-    static final String SKELETON_ONLY = "_infino_skeleton_only";
+    /**
+     * The comment a skeleton-only create's JSON source opens with, right
+     * after its first brace, so every engine that applies it writes Lucene
+     * alone. It is part of the operation itself, not of the request around
+     * it: a thread-context header does not survive the hop to the primary's
+     * shard (the security plugin's transport interceptor forwards its own
+     * headers only), and an operation replayed from the translog or read
+     * from the shard's history never carries one. The mapper reads JSON with
+     * comments allowed, so the document is parsed as if it were not there,
+     * and the content type is still detected from the leading brace.
+     */
+    static final String MARK = "/*infino:skeleton*/";
+    /** The bytes a marked source opens with. */
+    private static final byte[] MARKED_PREFIX = ("{" + MARK).getBytes(StandardCharsets.UTF_8);
+    /** The pipeline name that runs no ingest pipeline: the table's row was written through them already. */
+    private static final String NO_PIPELINE = "_none";
+    /**
+     * The skeleton-only creates this node's rebuilds have in flight, by
+     * shard, id and marked source: a primary takes a marked create as
+     * skeleton-only only when it is one of these (see {@link #claim}), so a
+     * client cannot send the mark to keep its write out of the table.
+     */
+    private static final Map<ShardId, Map<String, String>> IN_FLIGHT = new ConcurrentHashMap<>();
     /** Rows read from the table per page. */
     private static final int PAGE_ROWS = 10_000;
     /** The count's alias in the row-count statement. */
@@ -157,7 +182,7 @@ final class InfinoSkeletonAdopter {
                 }
             }
             if (!missing.isEmpty()) {
-                created += createMissing(md.getIndex().getName(), table, missing);
+                created += createMissing(shardId, table, missing);
             }
             if (page.size() < PAGE_ROWS) {
                 break;
@@ -231,21 +256,37 @@ final class InfinoSkeletonAdopter {
      * delete through the shard any whose row the table lost meanwhile.
      * Returns the documents created.
      */
-    private static long createMissing(String index, String table, Map<String, Row> missing) {
+    private static long createMissing(ShardId shardId, String table, Map<String, Row> missing) {
         BulkRequest creates = new BulkRequest();
+        Map<String, String> inFlight = new ConcurrentHashMap<>();
         for (Map.Entry<String, Row> row : missing.entrySet()) {
+            String source = marked(row.getValue().source());
+            if (source == null) {
+                log.warn("[infino] the row of {} in table {} holds no JSON object; it is left out of the skeleton of {}", row.getKey(), table, shardId);
+                continue;
+            }
+            inFlight.put(row.getKey(), source);
             creates.add(
-                new IndexRequest(index).id(row.getKey())
+                new IndexRequest(shardId.getIndexName()).id(row.getKey())
                     .routing(row.getValue().routing())
-                    .source(row.getValue().source(), XContentType.JSON)
+                    .source(source, XContentType.JSON)
                     .opType(DocWriteRequest.OpType.CREATE)
+                    .setPipeline(NO_PIPELINE)
             );
         }
+        if (inFlight.isEmpty()) {
+            return 0;
+        }
         List<String> created = new ArrayList<>();
-        for (BulkItemResponse item : run(creates, true).getItems()) {
-            if (!item.isFailed()) {
-                created.add(item.getId());
+        IN_FLIGHT.put(shardId, inFlight);
+        try {
+            for (BulkItemResponse item : run(creates).getItems()) {
+                if (!item.isFailed()) {
+                    created.add(item.getId());
+                }
             }
+        } finally {
+            IN_FLIGHT.remove(shardId, inFlight);
         }
         if (created.isEmpty()) {
             return 0;
@@ -257,22 +298,65 @@ final class InfinoSkeletonAdopter {
         BulkRequest deletes = new BulkRequest();
         for (String id : created) {
             if (!kept.contains(id)) {
-                deletes.add(new DeleteRequest(index, id).routing(missing.get(id).routing()));
+                deletes.add(new DeleteRequest(shardId.getIndexName(), id).routing(missing.get(id).routing()));
             }
         }
         if (deletes.numberOfActions() > 0) {
-            run(deletes, false);
+            run(deletes);
         }
         return created.size();
     }
 
-    /** Run {@code bulk} as the node, skeleton-only when asked, and wait for it. */
-    private static BulkResponse run(BulkRequest bulk, boolean skeletonOnly) {
+    /**
+     * {@code source} with {@link #MARK} after its opening brace, or null when
+     * it is no JSON object.
+     */
+    static String marked(String source) {
+        String s = source.strip();
+        if (!s.startsWith("{")) {
+            return null;
+        }
+        return "{" + MARK + s.substring(1);
+    }
+
+    /**
+     * Whether {@code source} is a skeleton-only create's (see {@link #MARK}).
+     * A replayed operation or one of a shard's history that is was taken by
+     * a primary as one of its rebuild's creates ({@link #claim}), whose row
+     * the table holds.
+     */
+    static boolean isMarked(BytesReference source) {
+        if (source == null || source.length() < MARKED_PREFIX.length) {
+            return false;
+        }
+        for (int i = 0; i < MARKED_PREFIX.length; i++) {
+            if (source.get(i) != MARKED_PREFIX[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether a marked create of {@code id} the primary of {@code shard}
+     * applies is one this node's rebuild of the shard sent, with this very
+     * source; it is claimed once. The rebuild runs on the node of the
+     * shard's primary, so its creates reach this node's engine. One that is
+     * not (a client's write that carries the mark) is refused by the engine.
+     */
+    static boolean claim(ShardId shard, String id, BytesReference source) {
+        Map<String, String> inFlight = IN_FLIGHT.get(shard);
+        if (inFlight == null || source == null) {
+            return false;
+        }
+        String expected = inFlight.get(id);
+        return expected != null && expected.equals(source.utf8ToString()) && inFlight.remove(id, expected);
+    }
+
+    /** Run {@code bulk} as the node and wait for it. */
+    private static BulkResponse run(BulkRequest bulk) {
         ThreadContext context = InfinoServices.threadPool().getThreadContext();
         try (ThreadContext.StoredContext ignored = context.stashContext()) {
-            if (skeletonOnly) {
-                context.putHeader(SKELETON_ONLY, Boolean.TRUE.toString());
-            }
             PlainActionFuture<BulkResponse> response = PlainActionFuture.newFuture();
             InfinoClient.bulk(bulk, response);
             return response.actionGet();

@@ -606,11 +606,6 @@ public class InfinoEngine extends InternalEngine {
         }
     }
 
-    /** Whether the write being applied is a skeleton-only one, whose row the table holds already. */
-    private boolean skeletonOnly() {
-        return config().getThreadPool().getThreadContext().getHeader(InfinoSkeletonAdopter.SKELETON_ONLY) != null;
-    }
-
     public InfinoEngine(EngineConfig config) {
         super(config);
         this.shardId = config.getShardId();
@@ -1206,7 +1201,23 @@ public class InfinoEngine extends InternalEngine {
 
     @Override
     public IndexResult index(Index index) throws IOException {
-        boolean toTable = writesTable(index.origin()) && !skeletonOnly();
+        // A skeleton rebuild's create, whose row the table holds already, carries
+        // a mark in its source that the translog and the shard's history keep,
+        // so no copy writes it to the table: not the primary taking it, not a
+        // replay after a restart, not a copy taking over (see fillTable). A
+        // primary takes the mark only on a create this node's rebuild of the
+        // shard sent, and refuses any other write that carries it, so a client
+        // cannot keep a write out of the table with it.
+        boolean skeletonOnly = InfinoSkeletonAdopter.isMarked(index.source());
+        if (skeletonOnly && index.origin() == Operation.Origin.PRIMARY && !InfinoSkeletonAdopter.claim(shardId, index.id(), index.source())) {
+            return new IndexResult(
+                new MapperParsingException(
+                    "[infino] a document may not open with " + InfinoSkeletonAdopter.MARK + ": it marks the documents a rebuild creates"
+                ),
+                index.version()
+            );
+        }
+        boolean toTable = writesTable(index.origin()) && !skeletonOnly;
         if (toTable) {
             refuseWhileBacklogged(index.origin());
         }
@@ -2129,6 +2140,9 @@ public class InfinoEngine extends InternalEngine {
                 switch (op.opType()) {
                     case INDEX, CREATE -> {
                         Translog.Index index = (Translog.Index) op;
+                        if (InfinoSkeletonAdopter.isMarked(index.source())) {
+                            continue; // a skeleton rebuild's create: the table holds its row
+                        }
                         id = index.id();
                         String source = InfinoBulkActionFilter.sourceAsJson(
                             index.source(),
