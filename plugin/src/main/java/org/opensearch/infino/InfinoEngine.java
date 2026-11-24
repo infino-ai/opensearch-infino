@@ -42,6 +42,7 @@ import org.opensearch.threadpool.ThreadPool;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -56,6 +57,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 
 /**
  * The engine of an index in default mode ({@code index.infino.mode: default}):
@@ -390,7 +392,7 @@ public class InfinoEngine extends InternalEngine {
      * allocation, and whether it is recovering as the target of the
      * primary's move to this node.
      */
-    private record Copy(boolean primary, String allocationId, boolean relocationTarget) {}
+    record Copy(boolean primary, String allocationId, boolean relocationTarget) {}
 
     private final String table;
     private final ShardId shardId;
@@ -922,16 +924,167 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /**
-     * {@code id}'s document as a read sees it now, with the sequence number
-     * it was written under: a pending write's, else the table's; null when it
-     * is deleted or missing.
+     * {@code id}'s document as a realtime read sees it now ({@link #currentDocs});
+     * null when it is deleted or missing.
      */
     static InfinoNative.Doc currentDoc(String table, String id) {
-        Version v = latestPending(table, id);
-        if (v != null) {
-            return v.source() == null ? null : new InfinoNative.Doc(v.source(), v.seq());
+        return currentDocs(table, List.of(id)).get(id);
+    }
+
+    /**
+     * The documents of {@code ids} as a realtime read sees them now, by id,
+     * each with the sequence number and routing it was written with: a
+     * pending write's, else the table's; an id deleted or missing is absent.
+     * The ids with no pending write are read from the table in one call,
+     * through this node's own connection when it has read every commit
+     * ({@link #readsEveryCommit(String)}), else from the table's latest commit.
+     */
+    static Map<String, InfinoNative.Doc> currentDocs(String table, Collection<String> ids) {
+        Map<String, InfinoNative.Doc> out = new HashMap<>();
+        List<String> committed = new ArrayList<>();
+        for (String id : ids) {
+            Version v = latestPending(table, id);
+            if (v == null) {
+                committed.add(id);
+            } else if (v.source() != null) {
+                out.put(id, new InfinoNative.Doc(v.source(), v.seq(), v.routing()));
+            }
         }
-        return InfinoNative.getDoc(table, id);
+        if (committed.isEmpty()) {
+            return out;
+        }
+        boolean latest = readsEveryCommit(table) == false;
+        if (latest) {
+            holdLatestForRealtime(table);
+        }
+        out.putAll(InfinoNative.docsOf(table, committed, latest));
+        return out;
+    }
+
+    /**
+     * How long the latest connection stays held after this node's last
+     * realtime read through it, and how long it keeps a table's handle that
+     * no realtime read has read. Unheld, each such read opens the connection
+     * and the table again (a catalog read and the manifest); held, it costs
+     * one pointer read.
+     */
+    private static final TimeValue REALTIME_LATEST_LINGER = TimeValue.timeValueSeconds(30);
+    private static final Object REALTIME_HOLD_LOCK = new Object();
+    /** Whether realtime reads hold the latest connection open; under {@link #REALTIME_HOLD_LOCK}. */
+    private static boolean realtimeHolds;
+    /**
+     * When a realtime read last read each table through the latest connection
+     * ({@link System#nanoTime}), while realtime reads hold it. The connection
+     * keeps a handle (and the manifest) of each table it has read; once a
+     * table goes {@link #REALTIME_LATEST_LINGER} unread, the connection is
+     * opened afresh, so it holds only the tables read within about twice
+     * that, not every table the node has served a realtime read for.
+     */
+    private static final Map<String, Long> REALTIME_TABLES = new ConcurrentHashMap<>();
+
+    /**
+     * Hold the latest connection open for realtime reads of {@code table}
+     * until {@link #REALTIME_LATEST_LINGER} passes with none. Without a
+     * thread pool to time the release (a unit test), each read opens it alone.
+     */
+    private static void holdLatestForRealtime(String table) {
+        ThreadPool pool = InfinoServices.threadPool();
+        if (pool == null) {
+            return;
+        }
+        REALTIME_TABLES.put(table, System.nanoTime());
+        synchronized (REALTIME_HOLD_LOCK) {
+            if (realtimeHolds) {
+                return;
+            }
+            InfinoNative.holdLatest();
+            realtimeHolds = true;
+        }
+        releaseWhenIdle(pool);
+    }
+
+    /**
+     * Each {@link #REALTIME_LATEST_LINGER}: forget the tables no realtime read
+     * has read for that long, opening the connection afresh so it lets go of
+     * their handles when realtime reads still hold it, and letting go of the
+     * hold when none is left.
+     */
+    private static void releaseWhenIdle(ThreadPool pool) {
+        try {
+            pool.schedule(() -> {
+                boolean idle;
+                boolean forgot;
+                synchronized (REALTIME_HOLD_LOCK) {
+                    long now = System.nanoTime();
+                    // Removed only when still that old: a read since keeps its table.
+                    forgot = REALTIME_TABLES.values().removeIf(read -> now - read >= REALTIME_LATEST_LINGER.nanos());
+                    idle = REALTIME_TABLES.isEmpty();
+                    if (idle) {
+                        realtimeHolds = false;
+                    } else {
+                        releaseWhenIdle(pool);
+                    }
+                }
+                if (idle) {
+                    InfinoNative.releaseLatest();
+                } else if (forgot) {
+                    InfinoNative.forgetLatest();
+                }
+            }, REALTIME_LATEST_LINGER, ThreadPool.Names.GENERIC);
+        } catch (Exception e) {
+            // The pool is shutting down: let go now.
+            synchronized (REALTIME_HOLD_LOCK) {
+                realtimeHolds = false;
+                REALTIME_TABLES.clear();
+            }
+            InfinoNative.releaseLatest();
+        }
+    }
+
+    /**
+     * Whether this node's own connection has read every commit to
+     * {@code table}, so a realtime read may go through it. That connection
+     * reads under the engine's staleness bound: for up to its window after
+     * another node commits, it may answer from the commit before. Only the
+     * shard's primary, once it has committed since it began writing here,
+     * knows the last commit is its own, and only until it hands the shard
+     * off: the new primary commits from then on, while this copy still
+     * answers reads until it closes. Every other node (a replica, a node
+     * holding no copy, a primary that has just taken over or has handed off)
+     * may be behind, so its realtime reads read the table's latest commit.
+     * Searches are not realtime and keep the bound.
+     */
+    static boolean readsEveryCommit(String table) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        InfinoWriter writer = InfinoServices.writer();
+        return engine != null
+            && writer != null
+            && readsEveryCommit(
+                COPIES.get(engine.shardId),
+                handedOff(engine.config().getGlobalCheckpointSupplier()),
+                allocation -> writer.caughtUp(table, allocation)
+            );
+    }
+
+    /**
+     * {@link #readsEveryCommit(String)} for this node's {@code copy} of the
+     * shard (null for none), {@code handedOff} when that copy has handed the
+     * shard off to another node ({@link #handedOff(LongSupplier)}), where
+     * {@code caughtUp} says whether this node has committed to the table
+     * since it began writing it as a copy ({@link InfinoWriter#caughtUp}).
+     */
+    static boolean readsEveryCommit(Copy copy, boolean handedOff, Predicate<String> caughtUp) {
+        return copy != null && copy.primary() && handedOff == false && caughtUp.test(copy.allocationId());
+    }
+
+    /**
+     * Whether the copy whose shard's checkpoints {@code checkpoints} reads
+     * has handed the shard off to another node (a relocation), after which
+     * the new primary writes the table. A copy whose checkpoints cannot be
+     * read is taken as not handed off.
+     */
+    static boolean handedOff(LongSupplier checkpoints) {
+        return checkpoints instanceof ReplicationTracker tracker && tracker.isRelocated();
     }
 
     /**
@@ -957,19 +1110,6 @@ public class InfinoEngine extends InternalEngine {
         if (engine != null) {
             engine.refresh(source);
         }
-    }
-
-    /**
-     * The routing value {@code id} was last written with, as a read sees it
-     * now: a pending write's, else the table's; null when it was written with
-     * none.
-     */
-    static String currentRouting(String table, String id) {
-        Version v = latestPending(table, id);
-        if (v != null && v.source() != null) {
-            return v.routing();
-        }
-        return InfinoNative.routingOf(table, id);
     }
 
     @Override
@@ -1279,7 +1419,7 @@ public class InfinoEngine extends InternalEngine {
             }
             return getPersistedLocalCheckpoint();
         }
-        if (tracker.isRelocated()) {
+        if (handedOff(tracker)) {
             return NOTHING;
         }
         Copy copy = COPIES.get(shardId);
