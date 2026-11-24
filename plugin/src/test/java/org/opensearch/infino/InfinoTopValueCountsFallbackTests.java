@@ -4,9 +4,6 @@
 
 package org.opensearch.infino;
 
-import com.sun.jna.Library;
-import com.sun.jna.Memory;
-import com.sun.jna.Native;
 import com.sun.jna.Pointer;
 
 import org.opensearch.core.index.Index;
@@ -18,13 +15,11 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Set;
 
 /**
@@ -52,15 +47,13 @@ public class InfinoTopValueCountsFallbackTests extends OpenSearchTestCase {
     @Override
     public void setUp() throws Exception {
         super.setUp();
-        InfinoLib real = Native.load(
-            System.getProperty("infino.lib", "libinfino_capi.so"),
-            InfinoLib.class,
-            Map.of(Library.OPTION_STRING_ENCODING, StandardCharsets.UTF_8.name())
-        );
+        // The library as the plugin loads it (the same -Dinfino.lib), wrapped below.
+        InfinoNative.useLib(null);
+        InfinoLib real = InfinoNative.lib();
         InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (p, m, a) -> {
             calls.add(m.getName());
             if (declineTop && m.getName().equals("infino_value_counts_top")) {
-                Pointer answer = nativeString("null");
+                Pointer answer = InfinoNativeTests.cString("null");
                 ours.add(answer);
                 return answer;
             }
@@ -138,7 +131,8 @@ public class InfinoTopValueCountsFallbackTests extends OpenSearchTestCase {
         // Declined, the level reads the value counts itself, as before the call existed.
         assertTrue(declinedCalls.toString(), declinedCalls.contains("infino_value_counts"));
         assertEquals(taken, declined);
-        assertEquals(size, declined.buckets().size());
+        // A shard keeps more buckets than the size (its shard size); the reduce cuts them.
+        assertTrue(declined.buckets().toString(), declined.buckets().size() >= size);
     }
 
     /** More values than the value counts carry: the declined level runs its window statement. */
@@ -149,13 +143,5 @@ public class InfinoTopValueCountsFallbackTests extends OpenSearchTestCase {
     /** Few values: the declined level picks its buckets from the value counts. */
     public void testFewValuesAnswerTheSameWhenTheTopCallDeclines() {
         assertTheDeclinedCallAnswersTheSame(40, 10);
-    }
-
-    private static Pointer nativeString(String s) {
-        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
-        Memory m = new Memory(bytes.length + 1);
-        m.write(0, bytes, 0, bytes.length);
-        m.setByte(bytes.length, (byte) 0);
-        return m;
     }
 }

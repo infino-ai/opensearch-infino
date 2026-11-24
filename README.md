@@ -73,7 +73,7 @@ The plugin has two parts: a Java plugin (`plugin/`) and a native bridge (`infino
 | `date` | a timestamp column, with a range index unless the mapping says `"index": false` |
 | numeric types | a numeric column, with a range index unless the mapping says `"index": false` |
 | `text` | a string column with its own BM25 index |
-| `keyword` | a string column compared by exact value, with a term index that keeps each value whole (the engine's `keyword` analyzer), which counts its values for a terms aggregation |
+| `keyword` | a string column compared by exact value, with a term index that keeps each value whole (the engine's `keyword` analyzer), which counts its values for a terms aggregation. On a hosted account the column takes the default analyzer instead, and a terms aggregation counts with a statement, until the hosted service accepts the keyword analyzer ([#274](https://github.com/infino-ai/opensearch-infino/issues/274)) |
 | `knn_vector` | a vector column, searched by the space type the mapping names |
 
 The document id is a column too, with a term index.
@@ -153,10 +153,12 @@ PUT _ingest/pipeline/embed
 
 ### Upgrading and downgrading
 
-Upgrading to this version is one way for any index that gains a `keyword` field under it. A table's schema then carries the engine's `keyword` analyzer, which only engines from the release that carries [infino-ai/infino#1454](https://github.com/infino-ai/infino/pull/1454) can read. That covers a new index and also a `keyword` field added to an existing one, which a dynamic mapping does whenever a document brings a new string field (its `.keyword` sub-field). In practice, most live indices gain one soon after the upgrade.
+On local or bucket storage, upgrading to this version is one way for any index that gains a `keyword` field under it. A table's schema then carries the engine's `keyword` analyzer, which only engines from the release that carries [infino-ai/infino#1454](https://github.com/infino-ai/infino/pull/1454) can read. That covers a new index and also a `keyword` field added to an existing one, which a dynamic mapping does whenever a document brings a new string field (its `.keyword` sub-field). In practice, most live indices gain one soon after the upgrade.
 
 - **No downgrade.** A plugin build whose engine predates that release cannot open these tables. Rolling back leaves them unreadable, not only slower.
 - **No mixed-version cluster while such indices are written.** During a rolling upgrade, a primary on an upgraded node can declare a column that a node still on the old build cannot read. Upgrade every node, or stop writes to Infino-backed indices until every node runs the new build.
+
+On a hosted account none of this applies: keyword fields don't take the analyzer there, so tables stay readable by older builds.
 
 Indices whose `keyword` fields were all declared before the upgrade keep their tables as they are, and terms aggregations on them run as before.
 

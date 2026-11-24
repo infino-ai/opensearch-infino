@@ -985,6 +985,8 @@ impl Bridge {
     /// refuses a table that declares it: there a keyword field keeps the
     /// default analyzer without positions, and a terms aggregation counts
     /// its values with a statement ([`infino_value_counts_top`] declines).
+    /// Drop this once the hosted service takes the analyzer (#274); hosted
+    /// tables made before then keep the default analyzer until reloaded.
     fn keyword_analyzer(&self) -> bool {
         !self.hosted
     }
