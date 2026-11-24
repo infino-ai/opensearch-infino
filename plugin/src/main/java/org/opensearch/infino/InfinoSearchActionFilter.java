@@ -129,6 +129,11 @@ public class InfinoSearchActionFilter extends InfinoActionFilter {
             listener.onFailure(new IllegalArgumentException("[infino] a search mixing default-mode indices with others is not served"));
             return;
         }
+        if (!infino.isEmpty() && infino.size() != concrete.length) {
+            // Refused before anything the search reads from other documents is read.
+            listener.onFailure(new IllegalArgumentException("[infino] a search mixing Infino-backed indices with others is not served"));
+            return;
+        }
         if (served.isEmpty() || search.source() == null) {
             serveFetched(task, action, request, search, listener, chain, clusters, names, state, concrete, infino, metadata, served, engine);
             return;
@@ -269,10 +274,6 @@ public class InfinoSearchActionFilter extends InfinoActionFilter {
         }
         if (infino.isEmpty()) {
             chain.proceed(task, action, request, listener);
-            return;
-        }
-        if (infino.size() != concrete.length) {
-            listener.onFailure(new IllegalArgumentException("[infino] a search mixing Infino-backed indices with others is not served"));
             return;
         }
         long start = System.nanoTime();
