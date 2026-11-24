@@ -34,8 +34,9 @@ import java.util.function.Supplier;
  * response handed back as the update's. An index the update names before
  * it exists is created first, and its upsert goes through its ingest
  * pipelines, as for a bulk. An update to an index in default mode goes to
- * the cluster as that one-item bulk, which the bulk filter merges and hands
- * to the shard as a write of the whole document.
+ * the cluster as that one-item bulk, which the bulk filter merges on the node
+ * holding its shard's primary and hands to the shard as a write of the whole
+ * document.
  */
 public class InfinoUpdateActionFilter extends InfinoActionFilter {
 
@@ -85,7 +86,10 @@ public class InfinoUpdateActionFilter extends InfinoActionFilter {
             );
             return;
         }
-        BulkRequest bulk = new BulkRequest().add(update).setRefreshPolicy(update.getRefreshPolicy());
+        BulkRequest bulk = new BulkRequest().add(update)
+            .setRefreshPolicy(update.getRefreshPolicy())
+            .timeout(update.timeout())
+            .waitForActiveShards(update.waitForActiveShards());
         ActionListener<BulkResponse> answer = ActionListener.wrap(response -> {
             BulkItemResponse item = response.getItems()[0];
             if (item.isFailed()) {
@@ -105,8 +109,10 @@ public class InfinoUpdateActionFilter extends InfinoActionFilter {
             if (md != null && InfinoPlugin.inDefaultMode(md.getSettings())) {
                 // The stock update reads the document's source from Lucene, which a
                 // default-mode index keeps no copy of: as a one-item bulk, the bulk
-                // path merges it here and writes it whole through the shard. The
-                // bulk carries the refresh policy, which a bulk's item may not.
+                // path sends it to the node holding its shard's primary, which
+                // merges it and writes it whole through the shard. The bulk carries
+                // the update's refresh policy (which a bulk's item may not), timeout
+                // and active-shard count.
                 update.setRefreshPolicy(WriteRequest.RefreshPolicy.NONE);
                 InfinoClient.bulk(bulk, answer);
                 return;
