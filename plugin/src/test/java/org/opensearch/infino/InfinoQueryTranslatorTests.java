@@ -2567,4 +2567,145 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(InfinoSearch.ranksAcross(sorted));
         assertNull(t.ascending().scoring().across());
     }
+
+    private static Map<String, Column> typedColumns() {
+        Map<String, Column> cols = columns();
+        cols.put("f", new Column("f", "f64", false, false).typed(new InfinoNative.FieldType("float", 0)));
+        cols.put("h", new Column("h", "f64", false, false).typed(new InfinoNative.FieldType("half_float", 0)));
+        cols.put("s", new Column("s", "f64", false, false).typed(new InfinoNative.FieldType("scaled_float", 100)));
+        cols.put("d", new Column("d", "f64", false, false));
+        cols.put("ip", new Column("ip", "str", false, false).typed(new InfinoNative.FieldType("ip", 0)));
+        return cols;
+    }
+
+    private static String typedWhere(org.opensearch.index.query.QueryBuilder qb) {
+        return InfinoQueryTranslator.translate(qb, typedColumns(), TABLE, NOW).where();
+    }
+
+    /** A half float's value, rounded to the nearest as the field keeps it. */
+    private static double half(float v) {
+        return (double) org.apache.lucene.sandbox.document.HalfFloatPoint.sortableShortToHalfFloat(
+            org.apache.lucene.sandbox.document.HalfFloatPoint.halfFloatToSortableShort(v)
+        );
+    }
+
+    /**
+     * A float field keeps 0.3 as the 32-bit float nearest it, so a term compares that float and
+     * a range's bounds are the first floats within it, as stock reads them; a double field's
+     * number is its own.
+     */
+    public void testFloatLiteralsAreReadAtTheFieldsPrecision() {
+        assertEquals("\"f\" = " + (double) 0.3f, typedWhere(QueryBuilders.termQuery("f", 0.3)));
+        assertEquals("\"f\" = " + (double) 0.3f, typedWhere(QueryBuilders.termQuery("f", "0.3")));
+        assertEquals("\"f\" IN (" + (double) 0.3f + ", 1.5)", typedWhere(QueryBuilders.termsQuery("f", List.of(0.3, 1.5))));
+        assertEquals("(\"f\" >= " + (double) Math.nextUp(0.3f) + ")", typedWhere(QueryBuilders.rangeQuery("f").gt(0.3)));
+        assertEquals("(\"f\" <= " + (double) 2.7f + ")", typedWhere(QueryBuilders.rangeQuery("f").lte(2.7)));
+        assertEquals(
+            "(\"f\" >= " + (double) 0.3f + " AND \"f\" <= " + (double) 0.3f + ")",
+            typedWhere(QueryBuilders.rangeQuery("f").gte(0.3).lte(0.3))
+        );
+        assertEquals("(\"f\" <= " + (double) Math.nextDown(0.3f) + ")", typedWhere(QueryBuilders.rangeQuery("f").lt(0.3)));
+        // Past the greatest float, nothing; below the least, every value.
+        assertEquals("1=0", typedWhere(QueryBuilders.rangeQuery("f").gt(Float.MAX_VALUE)));
+        assertEquals("(\"f\" >= 1)", typedWhere(QueryBuilders.rangeQuery("f").gte(1)));
+        // A value the field cannot hold has no translation, as text on a double field has none.
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("f", "1e39"), typedColumns(), TABLE, NOW));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("f", "abc"), typedColumns(), TABLE, NOW));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("d", "abc"), typedColumns(), TABLE, NOW));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.rangeQuery("f").gte("abc"), typedColumns(), TABLE, NOW));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.rangeQuery("s").lt("abc"), typedColumns(), TABLE, NOW));
+        // Text across a text and a float field reads the float field as it reads a double one.
+        assertEquals(
+            typedWhere(QueryBuilders.multiMatchQuery("disk", "message", "d")).replace("\"d\"", "\"f\""),
+            typedWhere(QueryBuilders.multiMatchQuery("disk", "message", "f"))
+        );
+        assertEquals("\"d\" = 0.3", typedWhere(QueryBuilders.termQuery("d", 0.3)));
+        assertEquals("(\"d\" > 0.3)", typedWhere(QueryBuilders.rangeQuery("d").gt(0.3)));
+    }
+
+    /** A half_float field keeps the nearest 16-bit float: a term compares it, a range's bounds are the first halves within it. */
+    public void testHalfFloatLiteralsAreReadAtTheFieldsPrecision() {
+        assertEquals("\"h\" = " + half(0.3f), typedWhere(QueryBuilders.termQuery("h", 0.3)));
+        // 0.3 is kept as its nearest half, which lies above 0.3: gte and gt 0.3 admit it, lte 0.3 does not.
+        assertEquals("(\"h\" >= " + half(0.3f) + ")", typedWhere(QueryBuilders.rangeQuery("h").gte(0.3)));
+        assertEquals("(\"h\" >= " + half(0.3f) + ")", typedWhere(QueryBuilders.rangeQuery("h").gt(0.3)));
+        assertEquals(
+            "(\"h\" <= " + (double) org.apache.lucene.sandbox.document.HalfFloatPoint.nextDown(0.3f) + ")",
+            typedWhere(QueryBuilders.rangeQuery("h").lte(0.3))
+        );
+        // 1.5 is a half: gt 1.5 starts at the next one, lte 1.5 ends at it.
+        assertEquals(
+            "(\"h\" >= " + (double) org.apache.lucene.sandbox.document.HalfFloatPoint.nextUp(1.5f) + ")",
+            typedWhere(QueryBuilders.rangeQuery("h").gt(1.5))
+        );
+        assertEquals("(\"h\" <= 1.5)", typedWhere(QueryBuilders.rangeQuery("h").lte(1.5)));
+    }
+
+    /** A scaled_float field keeps multiples of 1/scaling_factor: a term compares the rounded value, a range the first multiples within it. */
+    public void testScaledFloatLiteralsAreReadAtTheFieldsPrecision() {
+        assertEquals("\"s\" = 1.23", typedWhere(QueryBuilders.termQuery("s", 1.234)));
+        assertEquals("\"s\" = 1.24", typedWhere(QueryBuilders.termQuery("s", 1.235)));
+        assertEquals("(\"s\" >= 1.24)", typedWhere(QueryBuilders.rangeQuery("s").gt(1.234)));
+        assertEquals("(\"s\" >= 1.24)", typedWhere(QueryBuilders.rangeQuery("s").gt(1.23)));
+        assertEquals("(\"s\" >= 1.23)", typedWhere(QueryBuilders.rangeQuery("s").gte(1.23)));
+        assertEquals("(\"s\" <= 1.24)", typedWhere(QueryBuilders.rangeQuery("s").lt(1.25)));
+        // A bound is rounded to the nearest multiple first, so gte 1.234 admits the 1.23 that term 1.234 finds.
+        assertEquals("(\"s\" >= 1.23)", typedWhere(QueryBuilders.rangeQuery("s").gte(1.234)));
+        assertEquals("(\"s\" >= 1.24)", typedWhere(QueryBuilders.rangeQuery("s").gte(1.235)));
+        assertEquals("(\"s\" <= 1.23)", typedWhere(QueryBuilders.rangeQuery("s").lte(1.234)));
+        assertEquals("(\"s\" <= 1.26)", typedWhere(QueryBuilders.rangeQuery("s").lte(1.259)));
+    }
+
+    /** A CIDR block in a term on an ip field is the addresses it covers, a prefix of their text; an IPv6 block is refused. */
+    public void testCidrTermsOnAnIpField() {
+        assertEquals("\"ip\" LIKE '10.%'", typedWhere(QueryBuilders.termQuery("ip", "10.0.0.0/8")));
+        assertEquals("\"ip\" LIKE '10.%'", typedWhere(QueryBuilders.termQuery("ip", "10.9.8.7/8")));
+        assertEquals("\"ip\" LIKE '192.168.%'", typedWhere(QueryBuilders.termQuery("ip", "192.168.0.0/16")));
+        assertEquals("\"ip\" = '192.168.1.9'", typedWhere(QueryBuilders.termQuery("ip", "192.168.1.9/32")));
+        assertEquals("\"ip\" NOT LIKE '%:%'", typedWhere(QueryBuilders.termQuery("ip", "0.0.0.0/0")));
+        StringBuilder sixteen = new StringBuilder();
+        for (int i = 0; i < 16; i++) {
+            sixteen.append(i == 0 ? "" : "|").append(i);
+        }
+        assertEquals("regexp_like(\"ip\", '^10\\.(?:" + sixteen + ")\\.')", typedWhere(QueryBuilders.termQuery("ip", "10.1.2.3/12")));
+        assertEquals(
+            "regexp_like(\"ip\", '^192\\.168\\.1\\.(?:8|9|10|11)$')",
+            typedWhere(QueryBuilders.termQuery("ip", "192.168.1.9/30"))
+        );
+        assertEquals(
+            "(\"ip\" LIKE '10.%' OR \"ip\" = '192.168.1.9')",
+            typedWhere(QueryBuilders.termsQuery("ip", List.of("10.0.0.0/8", "192.168.1.9")))
+        );
+        assertEquals("\"ip\" = '10.0.0.1'", typedWhere(QueryBuilders.termQuery("ip", "10.0.0.1")));
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> typedWhere(QueryBuilders.termQuery("ip", "2001:db8::/32"))
+        );
+        assertEquals("[infino] a term with the IPv6 CIDR block [2001:db8::/32] on [ip] is not served", e.getMessage());
+        expectThrows(IllegalArgumentException.class, () -> typedWhere(QueryBuilders.termQuery("ip", "10.0.0.0/33")));
+        // On a keyword field the text is the value.
+        assertEquals("\"level\" = 'a/8'", typedWhere(QueryBuilders.termQuery("level", "a/8")));
+    }
+
+    /** A match asking for fuzziness is refused, naming it; a fuzziness of 0 asks for none and is served. */
+    public void testFuzzyMatchIsRefused() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.matchQuery("message", "dsk").fuzziness(org.opensearch.common.unit.Fuzziness.AUTO))
+        );
+        assertEquals("[infino] match on [message] asks for fuzziness [AUTO], which is not served", e.getMessage());
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("level", "eror").fuzziness(org.opensearch.common.unit.Fuzziness.ONE)))
+        );
+        e = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.multiMatchQuery("dsk", "message").fuzziness(org.opensearch.common.unit.Fuzziness.ONE))
+        );
+        assertEquals("[infino] multi_match on [message] asks for fuzziness [1], which is not served", e.getMessage());
+        assertEquals(
+            translate(QueryBuilders.matchQuery("message", "disk")).where(),
+            translate(QueryBuilders.matchQuery("message", "disk").fuzziness(org.opensearch.common.unit.Fuzziness.ZERO)).where()
+        );
+    }
 }

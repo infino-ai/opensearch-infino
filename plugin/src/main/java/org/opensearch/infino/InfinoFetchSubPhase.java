@@ -73,7 +73,8 @@ public class InfinoFetchSubPhase implements FetchSubPhase {
                 if (kept.getSourceRef() != null) {
                     hit.hit().sourceRef(kept.getSourceRef());
                 }
-                for (Map.Entry<String, DocumentField> field : kept.getFields().entrySet()) {
+                // The document fields alone: the metadata fields, _ignored among them, come from the shard's own document.
+                for (Map.Entry<String, DocumentField> field : kept.getDocumentFields().entrySet()) {
                     hit.hit().setDocumentField(field.getKey(), field.getValue());
                 }
             }

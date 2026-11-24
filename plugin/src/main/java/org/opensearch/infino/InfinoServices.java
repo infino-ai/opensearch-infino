@@ -55,6 +55,9 @@ public final class InfinoServices extends AbstractLifecycleComponent {
     private static volatile IndicesService indicesService;
     private static volatile MappingUpdatedAction mappingUpdatedAction;
 
+    /** For tests that start the services without a node: binds nothing. */
+    InfinoServices() {}
+
     @Inject
     public InfinoServices(
         ClusterService clusterService,
@@ -254,6 +257,10 @@ public final class InfinoServices extends AbstractLifecycleComponent {
 
     @Override
     protected void doStart() {
+        // A node that cannot use its storage says why here, rather than
+        // waiting forever on the first index it would serve from it, and
+        // stops when the failure will not pass on its own.
+        InfinoNative.checkStorage();
         InfinoScrolls.start(threadPool);
     }
 
