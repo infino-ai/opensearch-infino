@@ -46,8 +46,10 @@ import java.util.Set;
  * The checks a shard makes of a search as written, made for the indices the
  * plugin serves, whose shards never see it as written: the index's limits on
  * the rescore window, docvalue and script fields and a terms query's terms,
- * and the queries {@code search.allow_expensive_queries: false} refuses,
- * wherever in the search a query sits.
+ * the queries {@code search.allow_expensive_queries: false} refuses,
+ * wherever in the search a query sits, {@code stored_fields: _none_}
+ * alongside the source or {@code fields}, and a {@code token_count} field
+ * without doc values in {@code docvalue_fields}.
  * Each is refused with stock's message, as a bad request.
  */
 final class InfinoSearchChecks {
@@ -69,7 +71,9 @@ final class InfinoSearchChecks {
             }
             checkRescores(source, settings);
             checkFields(source, settings);
+            checkTokenCountDocValues(source, properties);
             if (source.storedFields() != null) {
+                checkNoStoredFields(source);
                 String stored = storedField(properties, source.storedFields().fieldNames());
                 if (stored != null) {
                     throw storedFieldRefused(stored, index.getIndex().getName());
@@ -175,6 +179,37 @@ final class InfinoSearchChecks {
                         + "]. This limit can be set by changing the [" + IndexSettings.MAX_SCRIPT_FIELDS_SETTING.getKey() + "] index level setting."
                 );
             }
+        }
+    }
+
+    /**
+     * A {@code docvalue_fields} entry, by name or pattern, naming a
+     * {@code token_count} field without doc values ({@link InfinoTokenCounts}):
+     * stock has no field data to read its counts from.
+     */
+    static void checkTokenCountDocValues(SearchSourceBuilder source, Map<String, Object> properties) {
+        if (source.docValueFields() == null || source.docValueFields().isEmpty()) {
+            return;
+        }
+        for (Map.Entry<String, Boolean> e : InfinoTokenCounts.fields(properties).entrySet()) {
+            if (!e.getValue() && source.docValueFields().stream().anyMatch(f -> Regex.simpleMatch(f.field, e.getKey()))) {
+                throw new IllegalArgumentException(
+                    "Can't load fielddata on [" + e.getKey() + "] because fielddata is unsupported on fields of type [" + InfinoTokenCounts.TYPE + "]. Use doc values instead."
+                );
+            }
+        }
+    }
+
+    /** {@code stored_fields: _none_} leaves a hit nothing to show, so it cannot ask for the source or for fields. */
+    static void checkNoStoredFields(SearchSourceBuilder source) {
+        if (source.storedFields() == null || source.storedFields().fetchFields()) {
+            return;
+        }
+        if (source.fetchSource() != null && source.fetchSource().fetchSource()) {
+            throw new IllegalArgumentException("[stored_fields] cannot be disabled if [_source] is requested");
+        }
+        if (source.fetchFields() != null) {
+            throw new IllegalArgumentException("[stored_fields] cannot be disabled when using the [fields] option");
         }
     }
 
