@@ -202,7 +202,7 @@ public final class InfinoWriter {
         String runningIndex;
         /** The ids the running appends name, with how many of them name each. */
         final Map<String, Integer> busy = new HashMap<>();
-        /** Guards {@link #nextSeq} and {@link #seqAllocation}: appends running at once take numbers in turn. */
+        /** Guards {@link #nextSeq} and changes to {@link #reads}: appends running at once take numbers in turn. */
         final Object seqLock = new Object();
         /**
          * The sequence number the next write is given; {@link InfinoWriter#UNREAD}
@@ -210,25 +210,51 @@ public final class InfinoWriter {
          * under {@link #seqLock}.
          */
         long nextSeq = UNREAD;
-        /** The copy that wrote the table when {@link #nextSeq} was read; another copy since means it is read again. */
-        String seqAllocation;
         /**
-         * Whether this node's reads of what the table holds, for the writes it
-         * stages, read the table's latest commit ({@link InfinoNative#latestRows}):
-         * set when {@link #nextSeq} is read, as a shard starts writing here or
-         * takes over from another copy, and cleared once an append started
-         * since commits. Until then this node's connection may answer from a
-         * commit before the last one the copy before it made, for up to the
-         * engine's staleness window; its own commit brings it to the latest.
-         * While set, the batch holds the connection those reads go through
-         * open ({@link InfinoNative#holdLatest}). Read and set under
-         * {@link #seqLock}.
+         * The copy that wrote the table when {@link #nextSeq} was read, and
+         * whether this node's reads of the table still read its latest commit
+         * ({@link Reads}). Changed under {@link #seqLock}, each change a new
+         * snapshot, so {@link InfinoWriter#caughtUp} reads it without the lock,
+         * which an append holds through its base reads.
          */
-        boolean readLatest;
-        /** How often {@link #readLatest} was set, so an append clears only the setting it read under. Under {@link #seqLock}. */
+        volatile Reads reads = Reads.NONE;
+        /** How often {@link Reads#latest} was set, so an append clears only the setting it read under. Under {@link #seqLock}. */
         long readLatestSet;
+
+        /**
+         * Set this node's reads of the table to read its latest commit, as an
+         * append does before it reads the table's highest sequence number, and
+         * hold the connection they go through open. Under {@link #seqLock}.
+         */
+        void readLatest() {
+            if (!reads.latest()) {
+                InfinoNative.holdLatest();
+            }
+            reads = new Reads(reads.allocation(), true);
+            readLatestSet++;
+        }
         /** The UUID of the index whose writes {@link #nextSeq} was read for. */
         String seqIndex;
+    }
+
+    /**
+     * How a node reads a table it writes, as one snapshot ({@link Batch#reads}).
+     *
+     * @param allocation the copy that wrote the table when the batch's next
+     *     sequence number was read; another copy since means it is read again.
+     *     Null before the first write and after the copy closes.
+     * @param latest whether this node's reads of what the table holds, for the
+     *     writes it stages, read the table's latest commit
+     *     ({@link InfinoNative#latestRows}): set when the next sequence number is
+     *     read, as a shard starts writing here or takes over from another copy,
+     *     and cleared once an append started since commits. Until then this
+     *     node's connection may answer from a commit before the last one the
+     *     copy before it made, for up to the engine's staleness window; its own
+     *     commit brings it to the latest. While set, the batch holds the
+     *     connection those reads go through open ({@link InfinoNative#holdLatest}).
+     */
+    record Reads(String allocation, boolean latest) {
+        static final Reads NONE = new Reads(null, false);
     }
 
     /**
@@ -551,21 +577,18 @@ public final class InfinoWriter {
             String index = staged.isEmpty() ? null : staged.get(0).waiter().shardId().getIndex().getUUID();
             synchronized (batch.seqLock) {
                 boolean newIndex = index != null && !index.equals(batch.seqIndex);
-                if (batch.nextSeq == UNREAD || newIndex || !Objects.equals(allocation, batch.seqAllocation)) {
+                if (batch.nextSeq == UNREAD || newIndex || !Objects.equals(allocation, batch.reads.allocation())) {
                     // Held from here, so the read below and the batch's lookups go
-                    // through one connection.
-                    if (!batch.readLatest) {
-                        InfinoNative.holdLatest();
-                    }
-                    batch.readLatest = true;
-                    batch.readLatestSet++;
+                    // through one connection; and no realtime read takes this node
+                    // as caught up while the allocation changes.
+                    batch.readLatest();
                     batch.nextSeq = nextSeq(batch.nextSeq, InfinoNative.maxSeq(table) + 1, !newIndex);
-                    batch.seqAllocation = allocation;
+                    batch.reads = new Reads(allocation, true);
                     if (index != null) {
                         batch.seqIndex = index;
                     }
                 }
-                latest = batch.readLatest;
+                latest = batch.reads.latest();
                 latestSet = batch.readLatestSet;
             }
             // A conditioned write is checked against the sequence numbers the table
@@ -710,7 +733,7 @@ public final class InfinoWriter {
     }
 
     /**
-     * Stop {@code table}'s batch reading the latest commit ({@link Batch#readLatest})
+     * Stop {@code table}'s batch reading the latest commit ({@link Reads#latest})
      * and let go of the connection it holds for it: this node's copy of the
      * shard is closing. A write here after it reads the table's latest
      * commit again, as a copy that starts writing does.
@@ -721,28 +744,65 @@ public final class InfinoWriter {
             return;
         }
         synchronized (batch.seqLock) {
-            batch.seqAllocation = null;
-            if (!batch.readLatest) {
+            boolean held = batch.reads.latest();
+            batch.reads = Reads.NONE;
+            if (!held) {
                 return;
             }
-            batch.readLatest = false;
             batch.readLatestSet++;
         }
         InfinoNative.releaseLatest();
     }
 
     /**
+     * Whether this node's own connection has read {@code table}'s latest
+     * commit: it started writing the table as the copy {@code allocation}
+     * and an append it started since has committed ({@link Reads#latest}
+     * cleared), so the last commit is its own. Until then, another copy may
+     * have committed last. Takes no lock: a realtime read asks this, and an
+     * append holds the batch's lock through its base reads.
+     */
+    boolean caughtUp(String table, String allocation) {
+        Batch batch = batches.get(table);
+        if (batch == null || allocation == null) {
+            return false;
+        }
+        Reads reads = batch.reads;
+        return !reads.latest() && allocation.equals(reads.allocation());
+    }
+
+    /**
+     * For tests: {@code table}'s reads as an append that starts writing it as
+     * the copy {@code allocation} leaves them, without reading the table's
+     * highest sequence number; the setting it returns is what
+     * {@link #committedUnder} takes.
+     */
+    long readingLatestAs(String table, String allocation) {
+        Batch batch = batches.computeIfAbsent(table, t -> new Batch());
+        synchronized (batch.seqLock) {
+            batch.readLatest();
+            batch.reads = new Reads(allocation, true);
+            return batch.readLatestSet;
+        }
+    }
+
+    /** For tests: an append begun under the reads' setting {@code set} ({@link #readingLatestAs}) has committed to {@code table}. */
+    void committedUnder(String table, long set) {
+        readsCaughtUp(batches.get(table), set);
+    }
+
+    /**
      * This node has committed to the batch's table since its reads were set
-     * to read the latest commit ({@link Batch#readLatest}), as the setting
+     * to read the latest commit ({@link Reads#latest}), as the setting
      * {@code set} counts: its connection now reads from that commit on, so
      * the reads go back to it. A setting made since is left as it is.
      */
     private static void readsCaughtUp(Batch batch, long set) {
         synchronized (batch.seqLock) {
-            if (!batch.readLatest || batch.readLatestSet != set) {
+            if (!batch.reads.latest() || batch.readLatestSet != set) {
                 return;
             }
-            batch.readLatest = false;
+            batch.reads = new Reads(batch.reads.allocation(), false);
         }
         // Outside the lock: the release waits for a latest read opening the
         // connection, which this table's appends need not wait for.

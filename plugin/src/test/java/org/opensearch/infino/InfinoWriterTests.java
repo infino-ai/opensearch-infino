@@ -218,6 +218,42 @@ public class InfinoWriterTests extends OpenSearchTestCase {
         assertEquals(0L, InfinoWriter.nextSeq(7L, 0L, false));
     }
 
+    /** A node that has not written a table, or whose copy closed, has not caught up with its latest commit. */
+    public void testANodeThatHasNotCommittedToATableIsNotCaughtUp() {
+        InfinoWriter writer = new InfinoWriter(() -> task -> {}, 10, Long.MAX_VALUE);
+        assertFalse(writer.caughtUp("t", "alloc-1"));
+        assertFalse(writer.caughtUp("t", null));
+        writer.stopReadingLatest("t");
+        assertFalse(writer.caughtUp("t", "alloc-1"));
+    }
+
+    /**
+     * A node catches up with a table once an append it began as a copy has
+     * committed, and only as that copy: a promotion, which starts writing the
+     * table as another, reads the latest commit again until its own first
+     * commit, and so does a copy that closed. An append begun before the
+     * setting changed does not clear it.
+     */
+    public void testANodeIsCaughtUpOnlyAfterItsOwnCommitAsTheSameCopy() {
+        InfinoWriter writer = new InfinoWriter(() -> task -> {}, 10, Long.MAX_VALUE);
+        long first = writer.readingLatestAs("t", "alloc-1");
+        assertFalse("before its first commit", writer.caughtUp("t", "alloc-1"));
+        writer.committedUnder("t", first);
+        assertTrue("after its first commit", writer.caughtUp("t", "alloc-1"));
+        assertFalse("as another copy", writer.caughtUp("t", "alloc-2"));
+
+        long promoted = writer.readingLatestAs("t", "alloc-2");
+        assertFalse("the old copy after a promotion", writer.caughtUp("t", "alloc-1"));
+        assertFalse("the new copy before its first commit", writer.caughtUp("t", "alloc-2"));
+        writer.committedUnder("t", first);
+        assertFalse("an append begun before the promotion commits", writer.caughtUp("t", "alloc-2"));
+        writer.committedUnder("t", promoted);
+        assertTrue("the new copy after its first commit", writer.caughtUp("t", "alloc-2"));
+
+        writer.stopReadingLatest("t");
+        assertFalse("once the copy closes", writer.caughtUp("t", "alloc-2"));
+    }
+
     private static final ShardId SHARD = new ShardId("i", "_na_", 0);
 
     private static InfinoWriter.Outcome update(String id, long ifSeqNo) {
