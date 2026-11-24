@@ -6780,6 +6780,71 @@ mod tests {
         assert_eq!(flat.get("short"), Some(&Value::Null), "{flat:?}");
     }
 
+    /// Whether a `keyword` field builds terms follows its mapping: one that
+    /// is neither indexed nor has doc values stores a value past a term's
+    /// length in its row and its source; an indexed one, or one with only
+    /// doc values, refuses the document as an immense term, at the check
+    /// and at the write.
+    #[test]
+    fn a_keyword_builds_terms_unless_its_mapping_turns_off_index_and_doc_values() {
+        let h = open_logs();
+        let mapping = r#"{"properties":{
+            "@timestamp":{"type":"date"},
+            "level":{"type":"keyword"},
+            "message":{"type":"text"},
+            "status":{"type":"long"},
+            "took":{"type":"float"},
+            "http":{"properties":{"method":{"type":"keyword"}}},
+            "geo":{"type":"geo_point"},
+            "stored":{"type":"keyword","index":false,"doc_values":false},
+            "indexed":{"type":"keyword"},
+            "doc_values_only":{"type":"keyword","index":false}
+        }}"#;
+        let out = ensure(h, mapping);
+        assert!(!out.contains("error"), "{out}");
+        let past = "x".repeat(MAX_TERM_BYTES + 1);
+        let stored = format!(r#"{{"level":"info","stored":"{past}"}}"#);
+        let indexed = format!(r#"{{"level":"info","indexed":"{past}"}}"#);
+        let doc_values_only = format!(r#"{{"level":"info","doc_values_only":"{past}"}}"#);
+
+        assert_eq!(check(h, &stored), "");
+        for (doc, field) in [(&indexed, "indexed"), (&doc_values_only, "doc_values_only")] {
+            let why = check(h, doc);
+            assert!(
+                why.contains(&format!("immense term in field=\"{field}\"")),
+                "{field}: {why}"
+            );
+            assert!(
+                why.contains("bytes can be at most 32766 in length; got 32767"),
+                "{field}: {why}"
+            );
+        }
+
+        let out = index(
+            h,
+            &[("s", &stored), ("i", &indexed), ("d", &doc_values_only)],
+        );
+        assert_eq!(out["ok"], 1, "{out}");
+        let failed = out["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 2, "{out}");
+        for (f, (i, field)) in failed.iter().zip([(1, "indexed"), (2, "doc_values_only")]) {
+            assert_eq!(f["i"], i, "{out}");
+            let why = f["reason"].as_str().unwrap();
+            let term = format!("immense term in field=\"{field}\"");
+            assert!(why.contains(&term), "{out}");
+        }
+
+        // The stored value is whole in the row and in the source.
+        let q = "SELECT osid, length(stored) AS n FROM logs WHERE stored IS NOT NULL";
+        let rows = sql(h, q);
+        let expected = json!([{"osid": "s", "n": MAX_TERM_BYTES + 1}]);
+        assert_eq!(rows, expected, "{rows}");
+        assert_eq!(get(h, "s"), stored);
+        assert_eq!(get(h, "i"), "");
+        assert_eq!(get(h, "d"), "");
+        close(h);
+    }
+
     /// The fields OpenSearch's mapper ignored for a malformed value are left
     /// out of the check and of the row, a field's paths under it with it
     /// (a geo_point given as an object), and kept by path in the ignored
