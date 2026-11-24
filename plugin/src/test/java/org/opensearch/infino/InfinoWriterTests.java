@@ -27,6 +27,8 @@ import com.sun.jna.Memory;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
@@ -356,5 +358,42 @@ public class InfinoWriterTests extends OpenSearchTestCase {
         Exception e = InfinoWriter.rejection(SHARD, index("1", -1, true), 0L);
         assertTrue(e.toString(), e instanceof VersionConflictEngineException);
         assertNull(InfinoWriter.rejection(SHARD, index("1", -1, true), null));
+    }
+
+    /**
+     * A batch's updates read the documents they merge into in one call: the
+     * updates of ids the table holds, and nothing else. An id the read no
+     * longer finds stands at no document, so its update meets no base.
+     */
+    public void testABatchReadsItsUpdatesBasesInOneCall() {
+        UpdateRequest update = new UpdateRequest("i", "u").doc("{\"a\":1}", MediaTypeRegistry.JSON);
+        List<InfinoWriter.Write> writes = List.of(
+            new InfinoWriter.Write("u1", null, true, false, update, List.of()),
+            new InfinoWriter.Write("u2", null, true, false, update, List.of()),
+            new InfinoWriter.Write("gone", null, true, false, update, List.of()),
+            new InfinoWriter.Write("new", null, true, false, update, List.of()),
+            new InfinoWriter.Write("replaced", "{}", true, false)
+        );
+        List<Set<String>> reads = new ArrayList<>();
+        Map<String, String> bases = InfinoWriter.updateBases(writes, Set.of("u1", "u2", "gone", "replaced"), ids -> {
+            reads.add(Set.copyOf(ids));
+            return Map.of("u1", new InfinoNative.Doc("{\"b\":1}", 1, null), "u2", new InfinoNative.Doc("{\"b\":2}", 2, null));
+        });
+        assertEquals(List.of(Set.of("u1", "u2", "gone")), reads);
+        assertEquals("{\"b\":1}", bases.get("u1"));
+        assertEquals("{\"b\":2}", bases.get("u2"));
+        assertTrue(bases.containsKey("gone"));
+        assertNull(bases.get("gone"));
+        assertFalse(bases.containsKey("new"));
+        assertFalse(bases.containsKey("replaced"));
+    }
+
+    /** A batch with no update of a document the table holds reads no base at all. */
+    public void testABatchWithoutUpdatesReadsNoBases() {
+        List<InfinoWriter.Write> writes = List.of(new InfinoWriter.Write("d", "{}", true, false));
+        Map<String, String> bases = InfinoWriter.updateBases(writes, Set.of("d"), ids -> {
+            throw new AssertionError("read " + ids);
+        });
+        assertTrue(bases.isEmpty());
     }
 }
