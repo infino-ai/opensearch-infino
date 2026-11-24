@@ -41,15 +41,6 @@ The node's data volume belongs to the storage it was first started with, so to c
 
 You need a Rust toolchain (the Docker build uses 1.95.0), a JDK 21, Gradle 9, and an [OpenSearch 3.9.0 distribution](https://opensearch.org/downloads/) to run it in. For another release, set `OPENSEARCH_VERSION` and use the Gradle that release wants (see [Build and test](#build-and-test)).
 
-```bash
-./scripts/build.sh                                      # the native bridge and the plugin zip
-DISTRO=/path/to/opensearch-3.9.0 ./scripts/run.sh       # install the plugin and start the node
-```
-
-OpenSearch 3.3 and later need Gradle 9.4.1 or later: an older Gradle stops with `Gradle 9.4.1+ is required`. [Build and test](#build-and-test) lists the Gradle for older releases.
-
-`run.sh` keeps the tables in `data/` at the repository's root. Set `INFINO_URI=s3://bucket/prefix` or `gs://bucket/prefix` to keep them in a bucket instead; see [where the tables live](#install-on-a-cluster) for the credentials it uses.
-
 **Using the full OpenSearch bundle.** The standard 3.9.0 download includes the security plugin. With an empty `opensearch.yml`, the security plugin stops the node at startup with `No SSL configuration found`. For a local node that answers plain HTTP, turn security off in `$DISTRO/config/opensearch.yml`:
 
 ```yaml
@@ -59,6 +50,15 @@ plugins.security.disabled: true
 To keep security on, run `$DISTRO/opensearch-tar-install.sh` once with `OPENSEARCH_INITIAL_ADMIN_PASSWORD` set. It installs demo certificates, and requests then need `-k -u admin:<password> https://localhost:9200/...`, as in the guide.
 
 The bundle also includes neural search, so the node creates its indices in proxy mode (see [Neural search](#neural-search)).
+
+```bash
+./scripts/build.sh                                      # the native bridge and the plugin zip
+DISTRO=/path/to/opensearch-3.9.0 ./scripts/run.sh       # install the plugin and start the node
+```
+
+OpenSearch 3.3 and later need Gradle 9.4.1 or later: an older Gradle stops with `Gradle 9.4.1+ is required`. [Build and test](#build-and-test) lists the Gradle for older releases.
+
+`run.sh` keeps the tables in `data/` at the repository's root. Set `INFINO_URI=s3://bucket/prefix` or `gs://bucket/prefix` to keep them in a bucket instead; see [where the tables live](#install-on-a-cluster) for the credentials it uses.
 
 ### Try it
 

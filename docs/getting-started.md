@@ -55,6 +55,8 @@ curl -sk -u "admin:$OPENSEARCH_ADMIN_PASSWORD" https://localhost:9200/_plugins/_
 
 ## 2. Get a free account
 
+Free accounts are not open yet, so this step answers 501 for now. Until they are, skip this step and go on to step 3, which keeps the tables on the node's own storage (see [Without an account](#before-you-start)).
+
 The trial creates an account with free credit. It asks for no email, password or card. Sending `"accept": true` accepts Infino's [Terms of Service](https://www.infino.ai/terms); from then on, every document the cluster writes is sent to the hosted service.
 
 ```bash
