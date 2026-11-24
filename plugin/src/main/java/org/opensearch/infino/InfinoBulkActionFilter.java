@@ -466,11 +466,12 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                 waiting.add(key);
                 later.add(slot);
             } catch (Exception e) {
-                if (retries(update, e, retriesLeft)) {
+                BulkItemResponse answer = unmerged(slot, update, index, e, retriesLeft);
+                if (answer == null) {
                     waiting.add(key);
                     later.add(slot);
                 } else {
-                    items[slot] = failure(slot, update, index, e);
+                    items[slot] = answer;
                 }
             }
         }
@@ -615,6 +616,18 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
             write.create(true);
         }
         return write;
+    }
+
+    /**
+     * The answer to an update whose merge failed with {@code e} before any
+     * write was made of it, or null when it runs again ({@link #retries}).
+     * A read of the document that failed is answered with its own status
+     * (503, which the client may retry), never taken for a missing
+     * document: nothing is written for it, neither the partial document
+     * as an upsert nor the upsert body.
+     */
+    static BulkItemResponse unmerged(int slot, UpdateRequest update, String index, Exception e, Map<UpdateRequest, Integer> retriesLeft) {
+        return retries(update, e, retriesLeft) ? null : failure(slot, update, index, e);
     }
 
     /**

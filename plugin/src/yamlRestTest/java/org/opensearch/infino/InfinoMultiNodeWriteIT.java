@@ -537,12 +537,28 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
         client().performRequest(new Request("POST", "/" + index + "/_refresh"));
         AtomicReference<Map<?, ?>> source = new AtomicReference<>();
         assertBusy(() -> {
-            Map<?, ?> first = (Map<?, ?>) on(0, new Request("GET", "/" + index + "/_doc/" + id)).get("_source");
-            Map<?, ?> second = (Map<?, ?>) on(1, new Request("GET", "/" + index + "/_doc/" + id)).get("_source");
+            Map<?, ?> first = sourceOn(0, index, id);
+            Map<?, ?> second = sourceOn(1, index, id);
             assertEquals("both nodes read the same document", first, second);
             source.set(first);
         }, STALENESS_WAIT_SECONDS, TimeUnit.SECONDS);
         return source.get();
+    }
+
+    /**
+     * {@code id}'s source as node {@code node} reads it. A node that does
+     * not find it yet fails the assertion rather than the test, so a wait
+     * for the nodes to agree ({@link #sourceAfterRefresh}) tries again.
+     */
+    private Map<?, ?> sourceOn(int node, String index, String id) throws IOException {
+        try {
+            return (Map<?, ?>) on(node, new Request("GET", "/" + index + "/_doc/" + id)).get("_source");
+        } catch (ResponseException e) {
+            if (e.getResponse().getStatusLine().getStatusCode() == 404) {
+                throw new AssertionError("node " + node + " does not find " + id + " yet", e);
+            }
+            throw e;
+        }
     }
 
     /** The node, by its number here, that holds {@code index}'s primary. */
