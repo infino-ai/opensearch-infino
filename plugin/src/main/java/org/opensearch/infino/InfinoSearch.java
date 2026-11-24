@@ -34,6 +34,7 @@ import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.mapper.SourceFieldMapper;
+import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Bonus;
@@ -150,6 +151,12 @@ public final class InfinoSearch {
     private static final String COLLAPSE_RANK = "collapse_rank";
     /** Why a scroll sorted by {@code _score} then fields over a scored query is refused: its pages resume from a score no keyset can compare against. */
     static final String SCORE_SORT_SCROLL = "[infino] a sort mixing _score with a field is not served with scroll on a scored query";
+    /**
+     * Why a scroll with {@code terminate_after} is refused: its rounds are
+     * read from a cursor over the table, with no shard collecting toward the
+     * limit as a stock scroll's rounds do.
+     */
+    static final String TERMINATE_AFTER_SCROLL = "[infino] terminate_after is not served with a scroll";
     /** The column a ranked or scored statement gives each hit's score under. */
     static final String SCORE = "score";
     /**
@@ -523,14 +530,11 @@ public final class InfinoSearch {
         }
         // Each changes which documents match or how they rank, so answering without it would be a
         // wrong answer: min_score drops documents scored under it from the hits, total and
-        // aggregations (a score is never negative, so one of 0 or less drops none),
-        // terminate_after stops each shard after that many documents, and rescore reranks the top
-        // documents by another query.
+        // aggregations (a score is never negative, so one of 0 or less drops none), and rescore
+        // reranks the top documents by another query. terminate_after is served once the total
+        // is known (see terminated).
         if (source.minScore() != null && source.minScore() > 0) {
             throw new IllegalArgumentException("[infino] min_score is not served by the table");
-        }
-        if (source.terminateAfter() > 0) {
-            throw new IllegalArgumentException("[infino] terminate_after is not served by the table");
         }
         if (source.rescores() != null && !source.rescores().isEmpty()) {
             if (source.collapse() != null) {
@@ -2316,6 +2320,13 @@ public final class InfinoSearch {
         return upTo == null || upTo != SearchContext.TRACK_TOTAL_HITS_DISABLED;
     }
 
+    /** The index's number of shards from the cluster state, or 0 when it cannot be read there. */
+    private static int shards(Index index) {
+        ClusterService clusters = InfinoServices.clusterService();
+        IndexMetadata md = clusters == null ? null : clusters.state().metadata().index(index);
+        return md == null ? 0 : md.getNumberOfShards();
+    }
+
     /** The index's mapping from the cluster state, or null when it cannot be read there. */
     private static MappingMetadata mapping(Index index) {
         ClusterService clusters = InfinoServices.clusterService();
@@ -2570,6 +2581,8 @@ public final class InfinoSearch {
      * {@link #reported} turns any count past the limit into the limit, as a
      * lower bound. A default-mode shard's total reaches its coordinator the
      * same way: one past the limit stays past it when shards' totals add up.
+     * One past {@code terminate_after} when that is larger, to tell whether
+     * more documents match than it names (see {@link #terminated}).
      * Unlimited when the request tracks every hit or none.
      */
     static long countCap(SearchSourceBuilder source) {
@@ -2578,7 +2591,96 @@ public final class InfinoSearch {
         if (limit == SearchContext.TRACK_TOTAL_HITS_DISABLED || limit == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
             return Long.MAX_VALUE;
         }
-        return (long) limit + 1;
+        return Math.max((long) limit, (long) source.terminateAfter()) + 1;
+    }
+
+    /** What a search with {@code terminate_after} reports: its total, and whether a shard stopped early. */
+    record Terminated(long total, boolean early) {}
+
+    /**
+     * What a search of {@code index}, held by {@code shards} stock shards,
+     * reports for its {@code terminate_after}, from the page's {@code total}
+     * (exact up to {@link #countCap} when the request tracks it); null when
+     * the request sets none.
+     *
+     * <p>A stock shard stops collecting once more documents than {@code
+     * terminate_after} match its query and post_filter, and says so. When no
+     * more match, the answer is the full one, reported as not stopped early.
+     * Past it, the hits and aggregations are whichever documents the shard
+     * collected first, which only its segment order decides, so the search is
+     * refused. A stock shard's total, past it, is its full count when Lucene
+     * counts the query from the index without collecting it (a query that
+     * matches every document, a term on a segment with no deletes, ...), and
+     * the documents it collected otherwise. Only the first does not hang on
+     * the shard's segments: a request that only counts every document
+     * ({@link #countsEveryDocument}) is served with its full count, stopped
+     * early when one of its shards holds more than {@code terminate_after}
+     * documents, which is certain once more than {@code shards} times that
+     * many match. Any other is refused.
+     */
+    static Terminated terminated(Index index, Plan plan, SearchSourceBuilder source, long total, int shards) {
+        int after = source.terminateAfter();
+        if (after <= 0) {
+            return null;
+        }
+        if (plan.vector() != null) {
+            throw new IllegalArgumentException("[infino] terminate_after is not served by the table with a vector query");
+        }
+        long matched = trackTotal(source) ? total : total(plan, (long) after + 1);
+        if (matched <= after) {
+            return new Terminated(total, false);
+        }
+        long beyondEveryShard = (long) after * Math.max(shards, 1) + 1;
+        if (shards >= 1
+            && countsEveryDocument(index, plan, source)
+            && (shards == 1 || total(plan, beyondEveryShard) >= beyondEveryShard)) {
+            return new Terminated(total, true);
+        }
+        throw new IllegalArgumentException(
+            "[infino] terminate_after is not served by the table when more than [" + after + "] documents match"
+        );
+    }
+
+    /**
+     * Whether a request only counts, and counts every document of the index:
+     * no hits, no aggregations, no query other than match_all, no
+     * post_filter or slice, and nothing that narrows the documents (a
+     * filtering alias, a document rule, or nested documents a stock shard
+     * leaves out). A stock shard counts such a request from its index.
+     */
+    private static boolean countsEveryDocument(Index index, Plan plan, SearchSourceBuilder source) {
+        if (source.size() != 0 || source.aggregations() != null && source.aggregations().count() > 0) {
+            return false;
+        }
+        if (source.query() != null && !(source.query() instanceof MatchAllQueryBuilder)) {
+            return false;
+        }
+        if (source.postFilter() != null || source.slice() != null) {
+            return false;
+        }
+        if (plan.access() != null && plan.access().restrictsDocuments()) {
+            return false;
+        }
+        MappingMetadata mapping = mapping(index);
+        return mapping != null && !hasNested(mapping.sourceAsMap());
+    }
+
+    /** Whether a mapping, or an object within it, declares a nested field. */
+    private static boolean hasNested(Map<String, Object> mapping) {
+        Object properties = mapping.get("properties");
+        if (!(properties instanceof Map<?, ?> fields)) {
+            return false;
+        }
+        for (Object field : fields.values()) {
+            if (field instanceof Map<?, ?> f) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> def = (Map<String, Object>) f;
+                if ("nested".equals(def.get("type")) || hasNested(def)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -2716,6 +2818,7 @@ public final class InfinoSearch {
         List<InternalAggregations> aggs = new ArrayList<>();
         Collection<AggregationBuilder> builders = builders(source);
         List<SortSpec> sorts = List.of();
+        boolean terminatedEarly = false;
         for (Index index : indices) {
             SearchSourceBuilder perIndex = after == null || after.get(index) == null ? source : withSearchAfter(source, after.get(index));
             Plan plan = plan(tableOf.apply(index), perIndex, now, accessOf.apply(index));
@@ -2745,6 +2848,12 @@ public final class InfinoSearch {
                 if (countWithAggs) {
                     page = new Page(page.hits(), counted.total(), page.exact(), page.maxScore(), page.unsourced(), page.chosen());
                 }
+            }
+            // The index's table holds every shard's rows.
+            Terminated terminated = terminated(index, plan, perIndex, page.total(), shards(index));
+            if (terminated != null) {
+                terminatedEarly |= terminated.early();
+                page = new Page(page.hits(), terminated.total(), page.exact(), page.maxScore(), page.unsourced(), page.chosen());
             }
             pages.add(page);
         }
@@ -2776,7 +2885,9 @@ public final class InfinoSearch {
             );
             reduced = InternalAggregations.topLevelReduce(aggs, ctx);
         }
-        SearchResponseSections sections = new SearchResponseSections(hits, reduced, null, false, null, null, 1);
+        // As stock, a search with terminate_after says whether a shard stopped early, and one without says nothing.
+        Boolean early = source.terminateAfter() > 0 ? terminatedEarly : null;
+        SearchResponseSections sections = new SearchResponseSections(hits, reduced, null, false, early, null, 1);
         long tookMillis = (System.nanoTime() - startNanos) / 1_000_000L;
         SearchResponse response = new SearchResponse(
             sections,

@@ -264,6 +264,9 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
             .filteredBy(aliases == null ? null : aliases.getQueryBuilder());
 
         ScrollContext scroll = context.scrollContext();
+        if (scroll != null && carried.source().terminateAfter() > 0) {
+            throw new IllegalArgumentException(InfinoSearch.TERMINATE_AFTER_SCROLL);
+        }
         boolean laterRound = scroll != null && scroll.totalHits != null;
         SearchSourceBuilder source = scroll == null ? carried.source() : scrollRound(carried.source(), scroll, laterRound, searcher);
         // The coordinating node's clock, so every shard reads `now` the same.
@@ -327,6 +330,12 @@ public class InfinoQueryPhaseSearcher implements QueryPhaseSearcher {
                 }
             }
             context.queryResult().aggregations(InternalAggregations.from(ordered));
+        }
+        // This shard's table holds this shard's rows alone.
+        InfinoSearch.Terminated terminated = InfinoSearch.terminated(index, plan, source, total, 1);
+        if (terminated != null) {
+            total = terminated.total();
+            context.queryResult().terminatedEarly(terminated.early());
         }
         TotalHits totalHits = laterRound
             ? scroll.totalHits
