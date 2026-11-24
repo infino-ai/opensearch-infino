@@ -1,12 +1,12 @@
-# Getting started with a free Infino account
+# Getting started with an Infino account
 
-This guide takes you from nothing to searching your own data, with the tables kept on a free hosted Infino account. You run one OpenSearch node in Docker, ask it for an account, load 100,000 sample log events (or your own), search them with OpenSearch queries and with SQL, and then throw the node away and watch a new one bring every index back from the account.
+This guide takes you from nothing to searching your own data, with the tables kept on a hosted Infino account. You run one OpenSearch node in Docker, ask it for an account, load 100,000 sample log events (or your own), search them with OpenSearch queries and with SQL, and then throw the node away and watch a new one bring every index back from the account.
 
 It takes about half an hour, most of it the first image build.
 
 **What the outputs are.** The commands in steps 1 and 3 to 6 were run, in this order, on a Docker Compose node of OpenSearch 3.9.0 built from this repository, with the tables on the node's own storage (step 6 as its last part describes), and the outputs shown are theirs, trimmed where marked `...`; where the node in the guide is using an account, a `serving` line shows what such a node answers instead. The responses in step 2, and the account's status after it, are shown in the shape the node returns them, with placeholders where your account's own values go. The plugin is in beta: see the [README](../README.md) for its status, and try it on data you can rebuild.
 
-**Contents:** [Before you start](#before-you-start) · [1. Start a node](#1-start-a-node) · [2. Get a free account](#2-get-a-free-account) · [3. Create an index](#3-create-an-index) · [4. Load data](#4-load-data) · [5. Search](#5-search) · [6. Your data lives on the account](#6-your-data-lives-on-the-account) · [7. Limits and errors](#7-limits-and-errors) · [Cleaning up](#cleaning-up)
+**Contents:** [Before you start](#before-you-start) · [1. Start a node](#1-start-a-node) · [2. Get an account](#2-get-an-account) · [3. Create an index](#3-create-an-index) · [4. Load data](#4-load-data) · [5. Search](#5-search) · [6. Your data lives on the account](#6-your-data-lives-on-the-account) · [7. Limits and errors](#7-limits-and-errors) · [Cleaning up](#cleaning-up)
 
 ## Before you start
 
@@ -53,11 +53,11 @@ curl -sk -u "admin:$OPENSEARCH_ADMIN_PASSWORD" https://localhost:9200/_plugins/_
 {"configured":false,"serving":"file:///usr/share/opensearch/infino/data","notice":["The hosted service holds every document of this cluster.", ...]}
 ```
 
-## 2. Get a free account
+## 2. Get an account
 
-Free accounts are not open yet, so this step answers 501 for now. Until they are, skip this step and go on to step 3, which keeps the tables on the node's own storage (see [Without an account](#before-you-start)).
+Trial accounts are not open yet, so this step answers 501 for now. Until they are, skip this step and go on to step 3, which keeps the tables on the node's own storage (see [Without an account](#before-you-start)).
 
-The trial creates an account with free credit. It asks for no email, password or card. Sending `"accept": true` accepts Infino's [Terms of Service](https://www.infino.ai/terms); from then on, every document the cluster writes is sent to the hosted service.
+The trial creates an account with starting credit. It asks for no email, password or card. Sending `"accept": true` accepts Infino's [Terms of Service](https://www.infino.ai/terms); from then on, every document the cluster writes is sent to the hosted service.
 
 ```bash
 curl -sk -u "admin:$OPENSEARCH_ADMIN_PASSWORD" -XPOST https://localhost:9200/_plugins/_infino/account/trial \
@@ -68,7 +68,7 @@ curl -sk -u "admin:$OPENSEARCH_ADMIN_PASSWORD" -XPOST https://localhost:9200/_pl
 {"created": true,
  "platform": "https://api.platform.infino.ws",
  "database": "opensearch-infino",
- "credit_cents": <the account's free credit>,
+ "credit_cents": <the account's starting credit>,
  "console_url": "<where the account's usage and billing are>",
  "accepted_by": "admin",
  "api_key": "<the account's key>",
@@ -374,7 +374,7 @@ docker compose up -d
 
 ## 7. Limits and errors
 
-**Trial limits.** The account comes with free credit (`credit_cents` in the trial's response). The service enforces the account's limits: at a ceiling or out of credit, it refuses a write with a message naming the console where billing is added, and the bulk request fails with that status and message. Searches of what is already stored keep working.
+**Trial limits.** The account comes with starting credit (`credit_cents` in the trial's response). The service enforces the account's limits: at a ceiling or out of credit, it refuses a write with a message naming the console where billing is added, and the bulk request fails with that status and message. Searches of what is already stored keep working.
 
 **Errors you may see:**
 
@@ -382,8 +382,8 @@ docker compose up -d
 |---|---|---|
 | 400 | A trial request without `"accept": true` | The response carries the notice; send it again with `{"accept": true}` |
 | 400 | A trial on a node that already uses an account | `DELETE /_plugins/_infino/account` first, or keep the account you have |
-| 501 | The service gives out no free accounts | With a key from the service's operator: `PUT /_plugins/_infino/account {"api_key": "..."}` |
-| 409 | This cluster's network address has already had a free account | Use that account's key: `PUT /_plugins/_infino/account {"api_key": "..."}`, or `INFINO_API_KEY` in `.env` |
+| 501 | The service gives out no trial accounts | With a key from the service's operator: `PUT /_plugins/_infino/account {"api_key": "..."}` |
+| 409 | This cluster's network address has already had a trial account | Use that account's key: `PUT /_plugins/_infino/account {"api_key": "..."}`, or `INFINO_API_KEY` in `.env` |
 | 429 | `cluster_block_exception` naming the flood-stage disk watermark: the disk Docker keeps volumes on is over 95% full | Free space for Docker (`docker system df` shows what can go), then retry |
 | 400 | A query clause the table does not serve (`[infino] query not served by the table: ...`), or a sliced search | See [What is supported](../README.md#what-is-supported) |
 
