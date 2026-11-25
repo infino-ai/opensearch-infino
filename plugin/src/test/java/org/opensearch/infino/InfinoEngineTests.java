@@ -21,14 +21,19 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.io.IOException;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -217,6 +222,71 @@ public class InfinoEngineTests extends OpenSearchTestCase {
     }
 
     /**
+     * In default mode a commit the hosted service did not answer is not a
+     * failure: the batch comes back to retry, so the write's sync is
+     * acknowledged as before (a 503 there would have a client retry a write
+     * the next commit takes anyway, storing an auto-id write twice). Here the
+     * service committed the first append and only its answer was lost: the
+     * next commit looks the ids up, finds them, and replaces their rows
+     * rather than adding them again. A gateway's 502 or 504 is the same case
+     * as a 503: the bridge marks each {@code unavailable}.
+     */
+    public void testADefaultModeCommitTheServiceDidNotAnswerIsRetriedAndLandsOnceWithTheNext() {
+        for (int status : new int[] { 502, 503, 504 }) {
+            retriedAndLandsOnceWithTheNext(status);
+        }
+    }
+
+    /** {@link #testADefaultModeCommitTheServiceDidNotAnswerIsRetriedAndLandsOnceWithTheNext} for an unanswered append marked with {@code status}. */
+    private void retriedAndLandsOnceWithTheNext(int status) {
+        List<String> ids = List.of("a", "b");
+        Set<String> inTable = new TreeSet<>();
+        List<Set<String>> replacedByAppend = new ArrayList<>();
+        AtomicInteger appends = new AtomicInteger();
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with", "infino_prepare_batch_meta" -> new Memory(1);
+            case "infino_sql_latest" -> string(
+                inTable.stream().map(id -> "{\"" + InfinoQueryTranslator.OSID + "\":\"" + id + "\"}").reduce((x, y) -> x + "," + y).map(r -> "[" + r + "]").orElse("[]")
+            );
+            case "infino_append_prepared" -> {
+                replacedByAppend.add(new TreeSet<>(Arrays.asList((String[]) args[4])));
+                if (appends.incrementAndGet() == 1) {
+                    inTable.addAll(ids); // committed, but the answer never came back
+                    yield string(
+                        "{\"error\":\"the hosted service could not be reached or did not answer in time; try again later\",\"unavailable\":true,\"status\":"
+                            + status
+                            + "}"
+                    );
+                }
+                yield string("{\"ok\":" + ids.size() + ",\"failed\":[]}");
+            }
+            case "infino_check_doc" -> throw new AssertionError("a document was checked against a service that did not answer");
+            default -> null; // the latest hold and its release, and the frees
+        }));
+        try {
+            InfinoEngine.Batch batch = new InfinoEngine.Batch();
+            for (int i = 0; i < ids.size(); i++) {
+                batch.add(ids.get(i), InfinoEngine.Base.ABSENT, new InfinoEngine.Version(i, true, "{\"n\":" + i + "}", null, -1, null));
+            }
+
+            InfinoEngine.Written first = InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null);
+
+            assertEquals(1, appends.get());
+            assertEquals("every write comes back to retry after a " + status, Set.copyOf(ids), first.retry().entries.keySet());
+
+            InfinoEngine.Batch open = new InfinoEngine.Batch();
+            open.putBack(first.retry()); // as the commit puts back what it did not take
+            InfinoEngine.Written second = InfinoEngine.write("t", 1, open, held -> {}, () -> {}, (id, v) -> null);
+
+            assertTrue("the next commit takes every write", second.retry().isEmpty());
+            assertEquals(2, appends.get());
+            assertEquals("the retried rows replace the ones the first append landed", Set.copyOf(ids), replacedByAppend.get(1));
+        } finally {
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /**
      * A realtime get reads through the node's own connection only on the
      * shard's primary, once it has committed since it began writing as that
      * copy and until it hands the shard off: then the table's last commit is
@@ -289,6 +359,37 @@ public class InfinoEngineTests extends OpenSearchTestCase {
             Map<String, InfinoNative.Doc> docs = InfinoEngine.currentDocs("not_held_here", List.of("d1", "d2"));
             assertEquals(Map.of("d1", new InfinoNative.Doc("{}", 3, "r")), docs);
             assertEquals("one call for both ids", List.of("infino_get_docs_latest [d1, d2]"), calls);
+        } finally {
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /**
+     * A commit that fails for any other reason than an unanswered hosted
+     * service still fails, a 503 the bridge did not mark {@code unavailable}
+     * included.
+     */
+    public void testADefaultModeCommitThatFailsOtherwiseIsThrown() {
+        for (String error : new String[] { "{\"error\":\"append: storage failed\"}", "{\"error\":\"append: storage failed\",\"status\":503}" }) {
+            thrown(error);
+        }
+    }
+
+    /** {@link #testADefaultModeCommitThatFailsOtherwiseIsThrown} for an append answered {@code error}. */
+    private void thrown(String error) {
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with", "infino_prepare_batch_meta" -> new Memory(1);
+            case "infino_append_prepared" -> string(error);
+            default -> null;
+        }));
+        try {
+            InfinoEngine.Batch batch = new InfinoEngine.Batch();
+            batch.add("a", InfinoEngine.Base.ABSENT, new InfinoEngine.Version(0, true, "{}", null, -1, null));
+            InfinoNative.InfinoException e = expectThrows(
+                InfinoNative.InfinoException.class,
+                () -> InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null)
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("storage failed"));
         } finally {
             InfinoNative.useLib(null);
         }

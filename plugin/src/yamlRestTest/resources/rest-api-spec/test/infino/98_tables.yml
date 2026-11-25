@@ -50,36 +50,13 @@
       indices.delete:
         index: own-b
 
-  # The registry's table backs no index, named explicitly or by the index's own name.
+  # The registry's table backs no index named onto it explicitly.
   - do:
       catch: /holds\sthe\sregistry/
       indices.create:
         index: reg1
         body:
           settings: { index.infino.enabled: true, index.infino.mode: proxy, index.infino.table: os_index, number_of_shards: 1, number_of_replicas: 0 }
-  # An index named "index" would be served from os_index: refused at create, in either mode.
-  - do:
-      catch: bad_request
-      indices.create:
-        index: index
-        body:
-          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
-  - match: { error.type: illegal_argument_exception }
-  - match:
-      error.reason: /index\s\[index\]\swould\sbe\sserved\sfrom\stable\s\[os_index\].*holds\sthe\sregistry/
-  - do:
-      catch: bad_request
-      indices.create:
-        index: index
-        body:
-          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
-  - match: { error.type: illegal_argument_exception }
-  - match:
-      error.reason: /index\s\[index\]\swould\sbe\sserved\sfrom\stable\s\[os_index\].*holds\sthe\sregistry/
-  - do:
-      indices.exists:
-        index: index
-  - is_false: ''
   # The registry still answers.
   - do:
       infino.account_indices:
@@ -93,6 +70,104 @@
       indices.delete:
         index: own.a
 
+---
+"An index named index is served from a table of its own, never the registry's, in either mode":
+  - do:
+      indices.create:
+        index: own.reg
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      index:
+        index: own.reg
+        id: "1"
+        refresh: true
+        body: { v: 1 }
+  # The index's name maps to the registry's table name: it takes os_-index, which no other index name maps to.
+  - do:
+      indices.create:
+        index: index
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: index, _id: "1" } }
+          - { v: 10, tag: a }
+          - { index: { _index: index, _id: "2" } }
+          - { v: 20, tag: b }
+  - do:
+      search:
+        index: index
+        body: { query: { term: { tag: b } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.0._source: { v: 20, tag: b } }
+  - do:
+      get:
+        index: index
+        id: "1"
+  - match: { _source: { v: 10, tag: a } }
+  - do:
+      infino.account_indices:
+        name: index
+  - match: { registered: true }
+  - match: { table: os_-index }
+  # Deleting it drops its own table and leaves the registry.
+  - do:
+      indices.delete:
+        index: index
+  - do:
+      infino.account_indices:
+        name: own.reg
+  - match: { registered: true }
+  - match: { table: os_own_reg }
+
+  # The same in default mode, where the shard's engine writes the table.
+  - do:
+      indices.create:
+        index: index
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: index, _id: "1" } }
+          - { v: 10, tag: a }
+          - { index: { _index: index, _id: "2" } }
+          - { v: 20, tag: b }
+  - do:
+      search:
+        index: index
+        body: { query: { term: { tag: a } }, sort: [ { v: desc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0._source: { v: 10, tag: a } }
+  - do:
+      count:
+        index: index
+  - match: { count: 2 }
+  - do:
+      infino.account_indices:
+        name: index
+  - match: { registered: true }
+  - match: { table: os_-index }
+  - do:
+      indices.delete:
+        index: index
+  - do:
+      infino.account_indices:
+        name: own.reg
+  - match: { registered: true }
+  - do:
+      count:
+        index: own.reg
+  - match: { count: 1 }
+  - do:
+      indices.delete:
+        index: own.reg
 ---
 "Deleting the index a table backs hands its rows to no index refused beside it":
   - do:

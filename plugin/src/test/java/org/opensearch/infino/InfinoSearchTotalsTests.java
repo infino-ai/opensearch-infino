@@ -51,6 +51,19 @@ public class InfinoSearchTotalsTests extends OpenSearchTestCase {
         assertNull(InfinoSearch.reported(aTrillion, true, new SearchSourceBuilder().trackTotalHits(false)));
     }
 
+    /**
+     * A total is counted one past the track_total_hits limit, or one past
+     * terminate_after when that is larger, so a search can tell whether more
+     * documents match than terminate_after names.
+     */
+    public void testATotalIsCountedOnePastTheLimitOrTerminateAfter() {
+        assertEquals(CAP + 1, InfinoSearch.countCap(new SearchSourceBuilder()));
+        assertEquals(CAP + 1, InfinoSearch.countCap(new SearchSourceBuilder().terminateAfter(5)));
+        assertEquals(100_001, InfinoSearch.countCap(new SearchSourceBuilder().terminateAfter(100_000)));
+        assertEquals(Long.MAX_VALUE, InfinoSearch.countCap(new SearchSourceBuilder().trackTotalHits(true).terminateAfter(100_000)));
+        assertEquals(Long.MAX_VALUE, InfinoSearch.countCap(new SearchSourceBuilder().trackTotalHits(false).terminateAfter(100_000)));
+    }
+
     /** A hit statement's one row. */
     private static final List<Map<String, Object>> ONE_ROW = List.of(Map.of(InfinoQueryTranslator.OSID, "d1"));
 

@@ -64,9 +64,9 @@ public interface InfinoLib extends Library {
     Pointer infino_index_batch_buf(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
 
     /**
-     * Parse and convert a batch ahead of its append; null when the table is unknown. With {@code igEnds}, each
-     * row's source is followed by the paths of its fields left out of the row, separated by newlines and ending
-     * at {@code igEnds} (null for none).
+     * Parse and convert a batch ahead of its append; null when it could not be, with the reason in
+     * {@link #infino_prepare_error()}. With {@code igEnds}, each row's source is followed by the paths of its
+     * fields left out of the row, separated by newlines and ending at {@code igEnds} (null for none).
      */
     Pointer infino_prepare_batch(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int[] igEnds, int count);
 
@@ -90,6 +90,9 @@ public interface InfinoLib extends Library {
         int[] igEnds,
         int count
     );
+
+    /** Why the last prepare on this thread returned null, as {@code {"error", "status"?}}; null when it did not fail. */
+    Pointer infino_prepare_error();
 
     /**
      * Append prepared batches in one commit and release them; the rows whose ids
@@ -171,6 +174,8 @@ public interface InfinoLib extends Library {
     Pointer infino_count_where(Pointer h, String name, String predicatesJson);
 
     Pointer infino_value_counts(Pointer h, String name, String column, int maxRows);
+
+    Pointer infino_value_counts_top(Pointer h, String name, String column, int top);
 
     Pointer infino_token_match(Pointer h, String name, String column, String query);
 

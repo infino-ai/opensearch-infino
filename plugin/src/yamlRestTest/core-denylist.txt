@@ -58,11 +58,7 @@ update/80_source_filtering/Source filtering  # [bug] an update with _source filt
 bulk/40_source/Source filtering  # [bug] an update with _source filtering returns no get._source (https://github.com/infino-ai/opensearch-infino/issues/203)
 
 # --- Search and get response fields
-search/100_stored_fields/Stored fields  # [bug] stored_fields: _none_ still returns _id (https://github.com/infino-ai/opensearch-infino/issues/204)
-search/330_fetch_fields/Test disable _source loading  # [bug] fields returns nothing when _source is not loaded (https://github.com/infino-ai/opensearch-infino/issues/204)
-search/330_fetch_fields/Test token count  # [bug] fields returns the wrong token_count (https://github.com/infino-ai/opensearch-infino/issues/204)
 search/190_index_prefix_search/search with index prefixes  # [bug] max_score differs from stock scoring (https://github.com/infino-ai/opensearch-infino/issues/212)
-search/210_rescore_explain/Score should match explanation in rescore  # [bug] max_score differs from stock scoring (https://github.com/infino-ai/opensearch-infino/issues/212)
 search/50_multi_match/Cross fields do not return negative scores  # [bug] multi_match over several text fields is answered unranked: field boosts, tie_breaker and the cross_fields type are ignored, so hits come back in write order, not by score (https://github.com/infino-ai/opensearch-infino/issues/230)
 
 # --- Aggregation results
@@ -75,27 +71,13 @@ search.aggregation/20_terms/Unmapped longs  # [bug] terms on an unmapped field w
 search.aggregation/20_terms/Unmapped unsigned longs  # [bug] terms on an unmapped field with value_type and missing returns a string key (https://github.com/infino-ai/opensearch-infino/issues/206)
 search.aggregation/20_terms/Date test  # [bug] terms on a date field returns no key_as_string. The test then uses terms include/exclude, which is not served (https://github.com/infino-ai/opensearch-infino/issues/205)
 search.aggregation/200_top_hits_metric/top_hits aggregation with sequence numbers  # [bug] top_hits returns the wrong hit (https://github.com/infino-ai/opensearch-infino/issues/207)
-search.aggregation/230_composite/date_histogram with time_zone  # [bug] composite date_histogram with time_zone splits one day into two buckets (https://github.com/infino-ai/opensearch-infino/issues/208)
 search.aggregation/30_sig_terms/Default index  # [bug] significant_terms on a text field returns no buckets (https://github.com/infino-ai/opensearch-infino/issues/209)
 search.aggregation/30_sig_terms_field_match_only_text/Default index  # [bug] significant_terms on a text field returns no buckets (https://github.com/infino-ai/opensearch-infino/issues/209)
-search.aggregation/40_range/Date Range Missing  # [bug] date_range with missing returns 500 (https://github.com/infino-ai/opensearch-infino/issues/210)
 
 # --- Errors that differ from stock
 search.aggregation/230_composite/Composite aggregation and array size  # [bug] the error message differs from stock (https://github.com/infino-ai/opensearch-infino/issues/211)
 search/110_field_collapsing/field collapsing with search_after - _score and _doc sorts  # [bug:default] the error message differs from stock (https://github.com/infino-ai/opensearch-infino/issues/211)
 search/30_limits/Regexp length limit  # [bug] the error message differs from stock (https://github.com/infino-ai/opensearch-infino/issues/211)
-
-# --- Terms lookup returns 500, not a refusal
-search/170_terms_query/*  # [bug] terms lookup returns 500 (a null pointer) instead of the clear refusal the filter aggregation gives (https://github.com/infino-ai/opensearch-infino/issues/198)
-search/171_terms_lookup_query/*  # [bug] terms lookup returns 500 (a null pointer) instead of the clear refusal the filter aggregation gives (https://github.com/infino-ai/opensearch-infino/issues/198)
-search/380_bitmap_filtering/Terms lookup on a binary field with bitmap  # [bug] terms lookup returns 500 (a null pointer) instead of the clear refusal the filter aggregation gives (https://github.com/infino-ai/opensearch-infino/issues/198)
-search/380_bitmap_filtering/Boolean must bitmap filtering  # [bug] terms lookup returns 500 (a null pointer) instead of the clear refusal the filter aggregation gives (https://github.com/infino-ai/opensearch-infino/issues/198)
-search/380_bitmap_filtering/Boolean should bitmap filtering  # [bug] terms lookup returns 500 (a null pointer) instead of the clear refusal the filter aggregation gives (https://github.com/infino-ai/opensearch-infino/issues/198)
-search/381_bitmap_filtering_long/Terms lookup on a binary field with bitmap (long)  # [bug] terms lookup returns 500 (a null pointer) instead of the clear refusal the filter aggregation gives (https://github.com/infino-ai/opensearch-infino/issues/198)
-search/150_rewrite_on_coordinator/*  # [bug] terms lookup returns 500 (a null pointer) instead of the clear refusal the filter aggregation gives (https://github.com/infino-ai/opensearch-infino/issues/198)
-
-# --- An index named "index" never starts
-search/260_sort_geopoint/*  # [bug] an index named index is refused at create: its table would be the registry's (https://github.com/infino-ai/opensearch-infino/issues/171)
 
 # --- Gaps: tests that need a feature Infino does not have yet. Remove the entry when the feature lands.
 # Derived from the stock tests' own requests, checked against what the query and aggregation translators serve;
@@ -199,7 +181,6 @@ search.aggregation/40_range/IP range  # [gap] not served: aggregation ip_range
 search.aggregation/40_range/IP Range Key Generation  # [gap] not served: aggregation ip_range
 search.aggregation/40_range/IP Range avg_bucket  # [gap] not served: aggregation ip_range
 search.aggregation/410_nested_aggs/*  # [gap] not served: aggregation nested
-search.aggregation/50_filter/Filter aggs with terms lookup and ensure it's cached  # [gap] not served: terms lookup (https://github.com/infino-ai/opensearch-infino/issues/198)
 search.aggregation/70_adjacency_matrix/*  # [gap] not served: aggregation adjacency_matrix
 search.aggregation/80_typed_keys/Test typed keys parameter for extended_stats aggregation  # [gap] not served: aggregation extended_stats
 search.aggregation/80_typed_keys/Test typed keys parameter for stats aggregation  # [gap] not served: aggregation stats
@@ -218,12 +199,15 @@ search/110_field_collapsing/field collapsing on a field alias  # [gap] not serve
 search/110_field_collapsing/field collapsing, inner_hits and seq_no  # [gap] not served: collapse with inner_hits
 search/115_multiple_field_collapsing/*  # [gap] not served: collapse with inner_hits
 search/140_pre_filter_search_shards/pre_filter_shard_size with shards that have no hit  # [gap] not served: aggregation global
+search/150_rewrite_on_coordinator/Ensure that we fetch the document only once  # [gap] the lookup is fetched once and the search answers as stock, but a get the table answers is not counted in the index's get stats
 search/190_index_prefix_search/search index prefixes with span_multi  # [gap] not served: query span_near
 search/190_index_prefix_search/search index prefixes with multiple values  # [gap] not served: query match_phrase_prefix
 search/190_index_prefix_search/search index prefixes with multiple values and custom position_increment_gap  # [gap] not served: query match_phrase_prefix
+search/210_rescore_explain/Score should match explanation in rescore  # [gap] not served: rescore
 search/230_interval_query/*  # [gap] not served: query intervals
 search/250_distance_feature/*  # [gap] not served: query distance_feature
 search/260_sort_double/*  # [gap] not served: sort mode median/avg/sum
+search/260_sort_geopoint/*  # [gap] not served: sort _geo_distance
 search/260_sort_long/*  # [gap] not served: sort mode median/avg/sum
 search/260_sort_unsigned_long/*  # [gap] not served: sort mode median/avg/sum
 search/270_wildcard_fieldtype_queries/term query matches lowercase-normalized value  # [gap] query on a normalized multi-field, which has no column
@@ -254,12 +238,15 @@ search/310_match_bool_prefix_field_match_only_text/multi_match multiple fields p
 search/310_match_bool_prefix_field_match_only_text/multi_match multiple fields with analyzer  # [gap] not served: multi_match type bool_prefix
 search/310_match_bool_prefix_field_match_only_text/multi_match multiple fields with minimum_should_match  # [gap] not served: multi_match type bool_prefix
 search/310_match_bool_prefix_field_match_only_text/multi_match multiple fields with fuzziness  # [gap] not served: multi_match type bool_prefix
+search/380_bitmap_filtering/Terms lookup on a binary field with bitmap  # [gap] not served: terms with a bitmap value, refused as a bad request
+search/380_bitmap_filtering/Boolean must bitmap filtering  # [gap] not served: terms with a bitmap value, refused as a bad request
+search/380_bitmap_filtering/Boolean should bitmap filtering  # [gap] not served: terms with a bitmap value, refused as a bad request
+search/381_bitmap_filtering_long/Terms lookup on a binary field with bitmap (long)  # [gap] not served: terms with a bitmap value, refused as a bad request
 search/390_search_as_you_type/*  # [gap] not served: multi_match type bool_prefix
 search/400_combined_fields/*  # [gap] not served: query combined_fields
 
 # --- Checks stock makes that the plugin skips: it answers or accepts what stock rejects
 search/330_fetch_fields/Test date formatting  # [gap] the plugin does not make stock's check: a fields request stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
-search/110_field_collapsing/field collapsing and rescore  # [gap:default] the plugin does not make stock's check: a collapse stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
 search/110_field_collapsing/field collapsing and scroll  # [gap:default] the plugin does not make stock's check: a collapse stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
 search/110_field_collapsing/field collapsing with search_after - basic functionality  # [gap:default] the plugin does not make stock's check: a collapse stock rejects with a 400 is answered (https://github.com/infino-ai/opensearch-infino/issues/57)
 search/40_indices_boost/Indices boost for nonexistent index/alias  # [gap] the plugin does not make stock's check: indices_boost on a missing index is not rejected (https://github.com/infino-ai/opensearch-infino/issues/57)
@@ -287,6 +274,8 @@ scroll/10_basic/Basic scroll with 1 shard  # [gap:proxy] a scroll is not a point
 get/20_stored_fields/Stored fields  # [gap] not served: stored_fields; the table keeps no stored fields
 mget/20_stored_fields/Stored fields  # [gap] not served: stored_fields; the table keeps no stored fields
 get/70_source_filtering/Source filtering  # [gap] not served: stored_fields; the table keeps no stored fields
+search/200_ignore_malformed/_ignored is still returned with explicit list of stored fields  # [gap] not served: stored_fields; the table keeps no stored fields
+search/330_fetch_fields/Test disable _source loading  # [gap] not served: stored_fields; the table keeps no stored fields
 search/330_fetch_fields/Test basic field retrieval  # [gap] fields on a range field, which has no column
 search/350_matched_queries/*  # [gap] not served: matched_queries
 search/40_indices_boost/Indices boost using object  # [gap] not served: indices_boost
@@ -342,8 +331,8 @@ count/20_query_string/count with query_string parameters  # [gap] not served: qu
 search/60_query_string/search with query_string parameters  # [gap] not served: query_string with default_field, analyzer or lenient
 search/200_index_phrase_search/search with indexed phrases  # [gap] not served: a phrase with slop in query_string
 search/200_phrase_search_field_match_only_text/search with indexed phrases  # [gap] not served: a phrase with slop in query_string
-search/380_bitmap_filtering/Terms query accepting bitmap as value  # [gap] not served: terms with a bitmap value
-search/381_bitmap_filtering_long/Terms query accepting bitmap as value (long)  # [gap] not served: terms with a bitmap value
+search/380_bitmap_filtering/Terms query accepting bitmap as value  # [gap] not served: terms with a bitmap value, refused as a bad request
+search/381_bitmap_filtering_long/Terms query accepting bitmap as value (long)  # [gap] not served: terms with a bitmap value, refused as a bad request
 search/95_search_after_shard_doc/accept _shard_doc with PIT + paginate with search_after (multi-shard)  # [gap] not served: sort on _shard_doc
 search.aggregation/400_inner_hits/Include inner hits in top hits  # [gap] not served: inner_hits on a nested query
 search.aggregation/10_histogram/histogram with hard bounds  # [gap] aggregation on a range field, which has no column
