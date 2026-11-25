@@ -374,7 +374,7 @@ public class InfinoWriterTests extends OpenSearchTestCase {
             + "unavailable: schema(t): schema: transport error: timeout: per read";
         InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
             case "infino_open_with" -> new Memory(1);
-            case "infino_prepare_error" -> nativeString("{\"error\":\"" + reason + "\",\"status\":503}");
+            case "infino_prepare_error" -> nativeString("{\"error\":\"" + reason + "\",\"unavailable\":true,\"status\":503}");
             default -> null; // the prepare itself returns null, and the frees
         }));
         try {
