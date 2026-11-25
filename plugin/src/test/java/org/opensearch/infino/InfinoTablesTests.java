@@ -18,12 +18,25 @@ import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.MetadataCreateIndexService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.indices.InvalidIndexNameException;
 import org.opensearch.test.OpenSearchTestCase;
 
+import com.sun.jna.Memory;
+import com.sun.jna.Pointer;
+
+import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Which index a table backs when two live indices name it, and the tables no index is served from. */
 public class InfinoTablesTests extends OpenSearchTestCase {
@@ -80,9 +93,7 @@ public class InfinoTablesTests extends OpenSearchTestCase {
     }
 
     public void testTheRegistrysTableBacksNoIndex() {
-        // An index named "index" maps to the registry's table by its name alone.
-        IndexMetadata named = index("index", "u1", 1);
-        assertEquals(InfinoRegistry.TABLE, InfinoTables.tablesOf(named).get(0));
+        IndexMetadata named = index("reg1", "u1", 1, Settings.builder().put(InfinoPlugin.INFINO_TABLE.getKey(), InfinoRegistry.TABLE).build());
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
             () -> InfinoTables.claim(InfinoRegistry.TABLE, named, InfinoTables.naming(List.of(named)))
@@ -90,15 +101,54 @@ public class InfinoTablesTests extends OpenSearchTestCase {
         assertTrue(e.getMessage(), e.getMessage().contains("holds the registry"));
     }
 
-    public void testAnIndexWhoseTableWouldBeTheRegistrysIsRefusedAtCreate() {
+    public void testAnIndexNamedIndexIsServedFromATableNoOtherIndexNameMapsTo() {
+        Settings oneShard = Settings.builder()
+            .put(InfinoPlugin.INFINO_ENABLED.getKey(), true)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .build();
         for (String mode : List.of(InfinoPlugin.MODE_PROXY, InfinoPlugin.MODE_DEFAULT)) {
-            Settings settings = Settings.builder().put(InfinoPlugin.INFINO_MODE.getKey(), mode).build();
+            Settings settings = Settings.builder().put(oneShard).put(InfinoPlugin.INFINO_MODE.getKey(), mode).build();
+            assertEquals(List.of("os_-index"), InfinoTables.tablesOf("index", settings));
+            InfinoTables.refuseRegistryTable("index", settings);
+            // Every other name keeps the table it maps to, the registry's neighbours included.
+            for (String name : List.of("logs", ".index", "index_", "index-1", "os_index", "index_shard0")) {
+                String table = InfinoTables.tablesOf(name, settings).get(0);
+                assertNotEquals(name, "os_-index", table);
+                assertNotEquals(name, InfinoRegistry.TABLE, table);
+                assertEquals(name, InfinoNative.tableFor(name), table);
+            }
+        }
+        // A default-mode index of several shards keeps the shard tables it always had: none is the registry's.
+        Settings sharded = Settings.builder()
+            .put(oneShard)
+            .put(InfinoPlugin.INFINO_MODE.getKey(), InfinoPlugin.MODE_DEFAULT)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 2)
+            .build();
+        assertEquals(List.of("os_index_shard0", "os_index_shard1"), InfinoTables.tablesOf("index", sharded));
+        // Beside an older index whose name differs only by a character a table name may not hold, the index is served from its own
+        // table, and no index is named for the registry's.
+        IndexMetadata index = index("index", "u2", 2);
+        IndexMetadata dotted = index(".index", "u1", 1);
+        Map<String, List<IndexMetadata>> naming = InfinoTables.naming(List.of(dotted, index));
+        assertEquals(index.getIndex(), InfinoTables.owner(naming.get("os_-index")));
+        InfinoTables.claim("os_-index", index, naming);
+        assertNull(naming.get(InfinoRegistry.TABLE));
+        // The one name that would map to the same table is one OpenSearch refuses.
+        expectThrows(InvalidIndexNameException.class, () -> MetadataCreateIndexService.validateIndexOrAliasName("-index", InvalidIndexNameException::new));
+    }
+
+    public void testAnIndexWhoseTableWouldBeTheRegistrysIsRefusedAtCreate() {
+        // Only a table named explicitly can be the registry's, as a template may name it.
+        for (String mode : List.of(InfinoPlugin.MODE_PROXY, InfinoPlugin.MODE_DEFAULT)) {
+            Settings settings = Settings.builder()
+                .put(InfinoPlugin.INFINO_MODE.getKey(), mode)
+                .put(InfinoPlugin.INFINO_TABLE.getKey(), InfinoRegistry.TABLE)
+                .build();
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> InfinoTables.refuseRegistryTable("index", settings)
+                () -> InfinoTables.refuseRegistryTable("logs", settings)
             );
-            assertTrue(e.getMessage(), e.getMessage().contains("index [index] would be served from table [os_index]"));
-            InfinoTables.refuseRegistryTable("logs", settings);
+            assertTrue(e.getMessage(), e.getMessage().contains("index [logs] would be served from table [os_index]"));
         }
         Settings named = Settings.builder().put(InfinoPlugin.INFINO_TABLE.getKey(), "os_other").build();
         InfinoTables.refuseRegistryTable("index", named);
@@ -340,5 +390,92 @@ public class InfinoTablesTests extends OpenSearchTestCase {
     public void testAnAttachedTableIsNeverCompacted() {
         // Answered before the bridge is loaded: the table is its owner's to compact.
         assertEquals(0, InfinoNative.optimize("pageviews", attaching("pageviews", Settings.EMPTY)));
+    }
+
+    /**
+     * A table whose declaration waits on the hosted service holds back no
+     * other table's: before, every declaration shared one lock, held across
+     * the call to the service, so one shard's start waiting there stopped
+     * every other shard's.
+     */
+    public void testADeclarationWaitingOnTheServiceHoldsBackNoOtherTable() throws Exception {
+        CountDownLatch stalled = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> {
+            switch (method.getName()) {
+                case "infino_open_with":
+                    return new Memory(1);
+                case "infino_ensure_table":
+                    if ("os_slow".equals(args[1])) {
+                        stalled.countDown();
+                        release.await();
+                    }
+                    return nativeString("{}");
+                default:
+                    return null;
+            }
+        }));
+        ExecutorService threads = Executors.newFixedThreadPool(2);
+        try {
+            InfinoTables tables = new InfinoTables();
+            Future<String> slow = threads.submit(() -> tables.ensure(index("slow", "u1", 1)));
+            assertTrue("the slow declaration reached the service", stalled.await(5, TimeUnit.SECONDS));
+            Future<String> other = threads.submit(() -> tables.ensure(index("other", "u2", 2)));
+            assertEquals("os_other", other.get(5, TimeUnit.SECONDS));
+            assertFalse(slow.isDone());
+            release.countDown();
+            assertEquals("os_slow", slow.get(5, TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+            threads.shutdownNow();
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /**
+     * A declaration during which another connection opens (the account
+     * changed while the service was being asked) was made over the old
+     * connection, which the new one does not share: it is not noted, so the
+     * table's next use declares it again over the new one.
+     */
+    public void testADeclarationOverAConnectionReplacedMidCallIsNotNoted() {
+        InfinoNative.Target other = new InfinoNative.Target("memory://other", null, false, "memory://other");
+        AtomicInteger declarations = new AtomicInteger();
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> {
+            switch (method.getName()) {
+                case "infino_open_with":
+                    return new Memory(1);
+                case "infino_ensure_table":
+                    if (declarations.getAndIncrement() == 0) {
+                        // Another connection opens while the first declaration runs.
+                        InfinoNative.configure(other);
+                    }
+                    return nativeString("{}");
+                default:
+                    return null;
+            }
+        }));
+        try {
+            InfinoTables tables = new InfinoTables();
+            IndexMetadata logs = index("logs", "u1", 1);
+            assertEquals("os_logs", tables.ensure(logs));
+            assertEquals(1, declarations.get());
+            assertFalse(tables.declaredAt("os_logs", logs.getMappingVersion()));
+            // The next use declares it again, over the new connection, and that one is noted.
+            assertEquals("os_logs", tables.ensure(logs));
+            assertEquals(2, declarations.get());
+            assertTrue(tables.declaredAt("os_logs", logs.getMappingVersion()));
+        } finally {
+            InfinoNative.configure(InfinoNative.Target.node());
+            InfinoNative.useLib(null);
+        }
+    }
+
+    private static Pointer nativeString(String s) {
+        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+        Memory m = new Memory(bytes.length + 1);
+        m.write(0, bytes, 0, bytes.length);
+        m.setByte(bytes.length, (byte) 0);
+        return m;
     }
 }
