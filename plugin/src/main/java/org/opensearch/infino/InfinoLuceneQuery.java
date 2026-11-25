@@ -79,7 +79,18 @@ final class InfinoLuceneQuery {
 
     /** As {@link #parse}, with {@link Parsed#requiredAlone()}. */
     static Parsed parseTop(String query, Operator op) {
-        Parser p = new Parser(query, op);
+        return parseTop(query, op, false);
+    }
+
+    /**
+     * As {@link #parseTop(String, Operator)}; with {@code runs}, each run
+     * ({@link #hasRun}) is one term of its words joined by a space, as
+     * Lucene's parser reads it, rather than a term per word. The two read
+     * alike on text fields, where the run's words are analyzed together;
+     * on a keyword field the run is one value.
+     */
+    static Parsed parseTop(String query, Operator op, boolean runs) {
+        Parser p = new Parser(query, op, runs);
         Node n = p.group();
         if (p.pos < p.tokens.size() - 1) {
             throw new Malformed("[" + query + "] has text after the end of the query: [" + p.tokens.get(p.pos).text() + "]");
@@ -105,30 +116,24 @@ final class InfinoLuceneQuery {
             if (before == Kind.PLUS || before == Kind.MINUS || before == Kind.NOT || before == Kind.COLON || before == Kind.AND || before == Kind.OR) {
                 continue;
             }
-            Kind after = tokens.get(i + 2).kind();
-            if (plainWord(tokens.get(i)) && plainWord(tokens.get(i + 1)) && after != Kind.COLON && after != Kind.AND && after != Kind.OR) {
+            if (plainWord(tokens.get(i)) && inRun(tokens, i + 1)) {
                 return true;
             }
         }
         return false;
     }
 
-    /** Whether {@code query} is one run ({@link #hasRun}) and nothing else: plain words only, with no escape. */
-    static boolean isOneRun(String query) {
-        if (query.indexOf('\\') >= 0) {
+    /**
+     * Whether the word at {@code i} joins the run before it: a plain word
+     * with no field prefix, {@code AND} or {@code OR} right after it, which
+     * would make it the start of a clause of its own.
+     */
+    private static boolean inRun(List<Token> tokens, int i) {
+        if (i + 1 >= tokens.size() || !plainWord(tokens.get(i))) {
             return false;
         }
-        List<Token> tokens = tokenize(query);
-        // At least two words, then the end.
-        if (tokens.size() < 3) {
-            return false;
-        }
-        for (int i = 0; i < tokens.size() - 1; i++) {
-            if (!plainWord(tokens.get(i))) {
-                return false;
-            }
-        }
-        return true;
+        Kind after = tokens.get(i + 1).kind();
+        return after != Kind.COLON && after != Kind.AND && after != Kind.OR;
     }
 
     /** Whether a token is a plain word, one a run may hold: no pattern, comparison, boost or fuzziness. */
@@ -333,6 +338,8 @@ final class InfinoLuceneQuery {
         final List<Token> tokens;
         final Operator op;
         final String query;
+        /** Whether a run is one term ({@link #parseTop(String, Operator, boolean)}). */
+        final boolean runs;
         int pos;
         /**
          * Whether the group last read is, as Lucene reads it, a list of one
@@ -343,10 +350,11 @@ final class InfinoLuceneQuery {
          */
         boolean requiredAlone;
 
-        Parser(String query, Operator op) {
+        Parser(String query, Operator op, boolean runs) {
             this.query = query;
             this.tokens = tokenize(query);
             this.op = op;
+            this.runs = runs;
         }
 
         private Token peek() {
@@ -386,7 +394,8 @@ final class InfinoLuceneQuery {
                     at += 2;
                 }
                 boolean paren = tokens.get(at).kind() == Kind.LPAREN;
-                Node value = clauseValue();
+                // A run starts at a plain word no operator or sigil comes before.
+                Node value = runs && conj == null && mod == null && plainWord(peek()) && inRun(tokens, pos + 1) ? run() : clauseValue();
                 // The operator before this clause settles the clause before it.
                 if (!clauses.isEmpty() && conj == Kind.AND) {
                     Clause last = clauses.get(clauses.size() - 1);
@@ -435,6 +444,15 @@ final class InfinoLuceneQuery {
                 }
             }
             return new Bool(must, should, mustNot);
+        }
+
+        /** A run's words, as one term on the default fields: Lucene joins them with a space and analyzes them together. */
+        private Node run() {
+            StringBuilder words = new StringBuilder(take().text());
+            while (inRun(tokens, pos)) {
+                words.append(' ').append(take().text());
+            }
+            return new Term(null, words.toString(), false, 0, 0);
         }
 
         /** A field prefix, then a group, range, phrase, regex or term. */

@@ -68,6 +68,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -462,6 +463,11 @@ final class InfinoQueryTranslator {
     /** How the translator reads rows of the table: a nested query's candidates, with their sources. */
     private final Function<String, List<Map<String, Object>>> rows;
     private TextClause principal;
+    /**
+     * The fields the query string last translated searched on its default
+     * fields, as {@link #liveTargets} left them; null before one.
+     */
+    private List<String> searched;
     /** Whether {@link #principal} came from a clause that scores, not one in filter context. */
     private boolean principalRanks;
     /** How many filter clauses enclose the clause being translated: within any, a clause scores nothing. */
@@ -517,7 +523,9 @@ final class InfinoQueryTranslator {
 
     /** {@link #translate(QueryBuilder, Map, String, long)}, reading the table's rows through {@code rows}. */
     static Translation translate(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis, Function<String, List<Map<String, Object>>> rows) {
-        InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, false, false, rows);
+        // The query is read more than once (what scores it, how it ranks): each read of the table is made once.
+        Map<String, List<Map<String, Object>>> read = new HashMap<>();
+        InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, false, false, sql -> read.computeIfAbsent(sql, rows));
         t.filterTextIsPredicate = t.scoresText(qb);
         String where = t.predicate(qb, true);
         if (where == null) {
@@ -802,7 +810,8 @@ final class InfinoQueryTranslator {
         }
         List<String> defaults = new ArrayList<>();
         try {
-            for (String f : searchedFields(namedFields(new ArrayList<>(qs.fields().keySet()), qs.defaultField()))) {
+            // The fields its translation searched: a keyword field no clause matches in any row is no part of the dis_max.
+            for (String f : alone.searched) {
                 Column c = column(f);
                 if (c == null && f.indexOf('*') < 0) {
                     continue; // stock's dis_max has no clause for a field the mapping does not have
@@ -2729,34 +2738,41 @@ final class InfinoQueryTranslator {
 
     /** {@link #queryString(String, String, List, Operator, String, boolean, Boolean, boolean)} over the fields {@code named}, its leniency set. */
     private String queryString(String q, List<String> named, Operator op, String minimumShouldMatch, boolean simple, boolean positive) {
-        List<String> targets = searchedFields(named);
-        InfinoLuceneQuery.Parsed top = InfinoLuceneQuery.parseTop(q, op);
-        Node parsed = top.node();
-        if (!simple && valueTargets(targets, q) && InfinoLuceneQuery.hasRun(q)) {
-            // Stock's parser splits on operators, not on white space: a run of
-            // words with no operator between them is one clause, its words read
-            // together, which on a keyword, number or date field is one value
-            // ("disk full" is the keyword "disk full", not "disk" or "full").
-            // The tree has a clause per word, so a run is served only when it is
-            // the whole query: then it is a multi_match of the text.
-            if (minimumShouldMatch == null && InfinoLuceneQuery.isOneRun(q)) {
-                return textOnFields(targets, q, op, positive, false, true);
-            }
-            if (minimumShouldMatch != null) {
-                // The cases it names are refused with its reasons.
-                refuseUncountedClauses(top, q, minimumShouldMatch, simple, oneField(named), targets);
-            }
+        List<String> fields = searchedFields(named);
+        // Stock's parser splits on operators, not on white space: a run of
+        // words with no operator between them is one clause, its words read
+        // together, which on a keyword, number or date field is one value
+        // ("disk full" is the keyword "disk full", not "disk" or "full"). On
+        // text fields alone that reads as a clause per word, the tree's
+        // usual shape; beside a field that reads a value whole, the tree
+        // keeps each run as one term (simple_query_string has no runs).
+        boolean runs = !simple && joinsRuns(q, op, fields);
+        if (runs && minimumShouldMatch != null) {
+            // The tree has a clause per word where stock counts the run as one:
+            // the cases it names are refused with its reasons.
+            refuseUncountedClauses(InfinoLuceneQuery.parseTop(q, op), q, minimumShouldMatch, simple, oneField(named), fields);
             throw new InfinoLuceneQuery.Malformed(
                 "["
                     + q
                     + "] searches keyword, number or date fields ("
                     + String.join(", ", named)
-                    + ") with words that have no operator between them"
-                    + (minimumShouldMatch == null ? " beside other clauses" : " and minimum_should_match [" + minimumShouldMatch + "]")
-                    + ": stock reads such a run of words as one value on those fields, which the plugin does not tell apart from a clause per word; "
+                    + ") with words that have no operator between them and minimum_should_match ["
+                    + minimumShouldMatch
+                    + "]: stock reads such a run of words as one value on those fields, which the plugin does not tell apart from a clause per word; "
                     + "put AND or OR between the words, or name only text fields"
             );
         }
+        // Only where the hits rank, and not under minimum_should_match: stock
+        // counts a run over several fields as one clause, matching fields or not.
+        List<String> targets = positive && filtering == 0 && minimumShouldMatch == null && valueTargets(fields, q)
+            ? liveTargets(InfinoLuceneQuery.parseTop(q, op, runs).node(), fields, q, op)
+            : fields;
+        if (targets.size() < fields.size()) {
+            runs = !simple && joinsRuns(q, op, targets);
+        }
+        searched = targets;
+        InfinoLuceneQuery.Parsed top = InfinoLuceneQuery.parseTop(q, op, runs);
+        Node parsed = top.node();
         if (minimumShouldMatch == null) {
             return node(parsed, targets, positive, q, op);
         }
@@ -2791,6 +2807,90 @@ final class InfinoQueryTranslator {
             return atLeastOptional(b, required, targets, positive, q, op);
         }
         return node(parsed, targets, positive, q, op);
+    }
+
+    /**
+     * {@code targets} without the columns that read a value whole (keyword,
+     * number, date, boolean) where none of the query's clauses on the
+     * default fields matches a row: as stock reads it, such a field adds
+     * no hit and no score (its term query matches nothing, so the clause's
+     * dis_max is its other fields'), and without it the query is read over
+     * the text columns, which rank it. A value such a field cannot read is
+     * refused here as it is where the query is read, unless the query is
+     * lenient. One read of the table asks for any row the clauses match
+     * there (a value, a pattern); the table as a search reads it.
+     */
+    private List<String> liveTargets(Node parsed, List<String> targets, String q, Operator op) {
+        List<String> values = new ArrayList<>();
+        List<String> text = new ArrayList<>();
+        for (String f : targets) {
+            Column c = column(f);
+            if (c != null && !c.fts()) {
+                values.add(f);
+            } else {
+                text.add(f);
+            }
+        }
+        List<String> or = new ArrayList<>();
+        for (Node leaf : defaultFieldLeaves(parsed, new ArrayList<>())) {
+            String p = node(leaf, values, false, q, op);
+            if (p == null) {
+                // A clause the table cannot take on those columns is refused as the query is read.
+                return targets;
+            }
+            if (!NONE.equals(p)) {
+                or.add(p);
+            }
+        }
+        if (!or.isEmpty() && !rows.apply("SELECT 1 AS infino_hit FROM " + quoteIdent(table) + " WHERE " + String.join(" OR ", or) + " LIMIT 1").isEmpty()) {
+            return targets;
+        }
+        return text;
+    }
+
+    /**
+     * Whether a query string's tree keeps each run as one term: where a run
+     * reaches a field that reads a value whole, a default field among
+     * {@code targets} or a field a group names ({@code level:(disk full)}).
+     */
+    private boolean joinsRuns(String q, Operator op, List<String> targets) {
+        if (!InfinoLuceneQuery.hasRun(q)) {
+            return false;
+        }
+        return valueTargets(targets, q) || runOnValueField(InfinoLuceneQuery.parseTop(q, op, true).node());
+    }
+
+    /** Whether {@code n} holds a run on a named field that reads a value whole. */
+    private boolean runOnValueField(Node n) {
+        if (n instanceof Bool b) {
+            for (List<Node> clauses : List.of(b.must(), b.should(), b.mustNot())) {
+                for (Node c : clauses) {
+                    if (runOnValueField(c)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        if (n instanceof Term t && t.field() != null && !t.quoted() && QUERY_WHITESPACE.matcher(t.text()).find()) {
+            Column c = column(t.field());
+            return c != null && !c.fts();
+        }
+        return false;
+    }
+
+    /** The clauses of {@code n} on the default fields (no field of their own), at any depth, into {@code out}. */
+    private static List<Node> defaultFieldLeaves(Node n, List<Node> out) {
+        if (n instanceof Bool b) {
+            for (List<Node> clauses : List.of(b.must(), b.should(), b.mustNot())) {
+                for (Node c : clauses) {
+                    defaultFieldLeaves(c, out);
+                }
+            }
+        } else if ((n instanceof Term t && t.field() == null) || (n instanceof Wildcard w && w.field() == null) || (n instanceof Regex r && r.field() == null)) {
+            out.add(n);
+        }
+        return out;
     }
 
     /**
@@ -3352,6 +3452,12 @@ final class InfinoQueryTranslator {
             }
             if (t.field() == null) {
                 return textOnFields(targets, t.text(), op, positive, t.quoted(), true);
+            }
+            if (!t.quoted() && QUERY_WHITESPACE.matcher(t.text()).find() && !"_exists_".equals(t.field()) && !"_id".equals(t.field())) {
+                // A run on a named field (field:(disk full)), read as stock reads
+                // it there: a text field's words under the default operator, any
+                // other field the whole run as its one value.
+                return textOnFields(List.of(t.field()), t.text(), op, false, false, true);
             }
             return fieldAtom(new Atom((char) 0, t.field(), t.text(), t.quoted()));
         }

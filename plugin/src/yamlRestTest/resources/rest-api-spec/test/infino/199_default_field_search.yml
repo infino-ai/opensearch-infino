@@ -804,20 +804,37 @@ teardown:
   - match: { hits.hits.1._id: "1" }
 
 ---
-"What the table cannot tell apart is refused, never answered differently":
+"A run of words is one value on a keyword field, beside other clauses too":
   # A run of words beside another clause: stock reads "disk full" as one value on
-  # the keyword fields, which the plugin's tree (a clause per word) does not keep.
+  # the keyword fields (message.keyword holds it), the words on the text field.
   - do:
-      search: { index: dfs_luc, body: { query: { query_string: { query: "level:error disk full" } } } }
+      search: { index: dfs_luc, body: { query: { query_string: { query: "level:error disk full" } }, sort: [ { "@timestamp": desc } ] } }
   - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "1" }
   - do:
-      catch: bad_request
-      search: { index: dfs_prx, body: { query: { query_string: { query: "level:error disk full" } } } }
-  - match: { error.root_cause.0.reason: "/.*with.words.that.have.no.operator.between.them.*/" }
+      search: { index: dfs_prx, body: { query: { query_string: { query: "level:error disk full" } }, sort: [ { "@timestamp": desc } ] } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "1" }
   - do:
-      catch: bad_request
-      search: { index: dfs_def, body: { query: { query_string: { query: "level:error disk full" } } } }
-  - match: { error.root_cause.0.reason: "/.*with.words.that.have.no.operator.between.them.*/" }
+      search: { index: dfs_def, body: { query: { query_string: { query: "level:error disk full" } }, sort: [ { "@timestamp": desc } ] } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "1" }
+  # On a keyword field a group's run is its one value: no host is "pay-1 pay-2".
+  - do:
+      search: { index: dfs_luc, body: { query: { query_string: { query: "host:(pay-1 pay-2)" } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: dfs_prx, body: { query: { query_string: { query: "host:(pay-1 pay-2)" } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: dfs_def, body: { query: { query_string: { query: "host:(pay-1 pay-2)" } } } }
+  - match: { hits.total.value: 0 }
+
+---
+"What the table cannot tell apart is refused, never answered differently":
   # A word on a number field the query names, not lenient: stock fails it too.
   - do:
       catch: bad_request

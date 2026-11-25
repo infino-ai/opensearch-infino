@@ -38,7 +38,12 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
     }
 
     private static Translation translate(org.opensearch.index.query.QueryBuilder qb) {
-        return InfinoQueryTranslator.translate(qb, columns(), TABLE, NOW);
+        return InfinoQueryTranslator.translate(qb, columns(), TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
+    }
+
+    /** Answers any read of the table with one row: whatever a query string's keyword clauses ask for, some row has it. */
+    private static List<Map<String, Object>> aRowMatches(String sql) {
+        return List.of(Map.of("infino_hit", 1));
     }
 
     public void testARangeOnADateColumnCarriesItsSpan() {
@@ -300,7 +305,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         // A numeric field mapped "index": false: the table keeps no range index on its column.
         Map<String, Column> cols = columns();
         cols.put("bytes", new Column("bytes", "i64", false, false));
-        Translation all = InfinoQueryTranslator.translate(QueryBuilders.matchAllQuery(), cols, TABLE, NOW);
+        Translation all = InfinoQueryTranslator.translate(QueryBuilders.matchAllQuery(), cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
         java.util.List<InfinoSearch.SortSpec> byBytes = java.util.List.of(InfinoSearch.SortSpec.of(cols.get("bytes"), true));
         InfinoSearch.Plan plan = sortedPlan(cols, all, byBytes, null);
         InfinoSearch.Keyset whole = InfinoSearch.Keyset.WHOLE;
@@ -663,7 +668,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         InfinoSearch.Plan plan = new InfinoSearch.Plan(
             TABLE,
             cols,
-            InfinoQueryTranslator.translate(qb, cols, TABLE, NOW),
+            InfinoQueryTranslator.translate(qb, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches),
             java.util.List.of(InfinoSearch.SortSpec.of(cols.get("status"), true), InfinoSearch.SortSpec.rowId()),
             null,
             null,
@@ -765,7 +770,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         BoolQueryBuilder joined = QueryBuilders.boolQuery()
             .must(QueryBuilders.matchQuery("message", "disk"))
             .filter(QueryBuilders.matchQuery("title", "outage"));
-        String joinedSql = hits(InfinoQueryTranslator.translate(joined, cols, TABLE, NOW), null, 10);
+        String joinedSql = hits(InfinoQueryTranslator.translate(joined, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches), null, 10);
         assertTrue(joinedSql, joinedSql.endsWith("ORDER BY " + tie + " LIMIT 10"));
         String collapsed = hits(translate(filtered), columns().get("level"), 10);
         assertTrue(collapsed, collapsed.contains("ORDER BY " + tie + ")"));
@@ -780,7 +785,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         BoolQueryBuilder b = QueryBuilders.boolQuery()
             .must(QueryBuilders.matchQuery("message", "disk"))
             .filter(QueryBuilders.matchQuery("title", "outage"));
-        Translation t = InfinoQueryTranslator.translate(b, cols, TABLE, NOW);
+        Translation t = InfinoQueryTranslator.translate(b, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
         assertTrue(InfinoQueryTranslator.joinsAfterRanking(t.where()));
         assertTrue(hits(t, null, 10).contains("bm25_search('os_logs_0', 'message', 'disk', 10000, 'or')"));
         // A collapse keeps one row per value after the ranking: a filtered one
@@ -804,7 +809,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             cols,
             TABLE,
             NOW
-        );
+        , InfinoQueryTranslatorTests::aRowMatches);
         assertNull(t.principal());
         InfinoQueryTranslator.Across across = t.scoring().across();
         assertNotNull(across);
@@ -826,7 +831,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
 
         // One run alone: one clause, scored by its best column.
-        Translation one = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").field("message").field("title"), cols, TABLE, NOW);
+        Translation one = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").field("message").field("title"), cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
         assertEquals(1, one.scoring().across().clauses().size());
         assertTrue(
             hits(one, null, 10).contains("bm25_search_fields('os_logs_0', '[{\"query\":\"jackal bear\",\"fields\":[\"message\",\"title\"]}]', 10, 'or')")
@@ -836,7 +841,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         BoolQueryBuilder b = QueryBuilders.boolQuery()
             .must(QueryBuilders.rangeQuery("status").gte(500))
             .must(QueryBuilders.queryStringQuery("jackal bear").field("message").field("title"));
-        Translation filtered = InfinoQueryTranslator.translate(b, cols, TABLE, NOW);
+        Translation filtered = InfinoQueryTranslator.translate(b, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
         assertNotNull(filtered.scoring().across());
         assertEquals(1.0, filtered.scoring().offset(), 0);
         String filteredSql = hits(filtered, null, 10);
@@ -855,14 +860,14 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             QueryBuilders.queryStringQuery("jackal bear").field("message").field("level"),
             QueryBuilders.queryStringQuery("jackal jackal").field("message").field("title")
         )) {
-            assertNull(qs.toString(), InfinoQueryTranslator.translate(qs, cols, TABLE, NOW).scoring().across());
+            assertNull(qs.toString(), InfinoQueryTranslator.translate(qs, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).scoring().across());
         }
         // Beside another scoring text clause, or on one column, it is not ranked across.
         BoolQueryBuilder two = QueryBuilders.boolQuery()
             .must(QueryBuilders.queryStringQuery("jackal bear").field("message").field("title"))
             .should(QueryBuilders.matchQuery("title", "owl"));
-        assertNull(InfinoQueryTranslator.translate(two, cols, TABLE, NOW).scoring().across());
-        assertNull(InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").defaultField("message"), cols, TABLE, NOW).scoring().across());
+        assertNull(InfinoQueryTranslator.translate(two, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).scoring().across());
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").defaultField("message"), cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).scoring().across());
         // An ascending score sort reads it unscored.
         assertNull(one.ascending().scoring().across());
     }
@@ -876,7 +881,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             cols,
             TABLE,
             NOW
-        ).scoring().across();
+        , InfinoQueryTranslatorTests::aRowMatches).scoring().across();
         assertNotNull(across);
         assertEquals(
             List.of(List.of("jackal"), List.of("bear"), List.of("owl cat")),
@@ -891,7 +896,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             cols,
             TABLE,
             NOW
-        ).scoring().across();
+        , InfinoQueryTranslatorTests::aRowMatches).scoring().across();
         assertNotNull(fielded);
         assertEquals(
             List.of(List.of("jackal"), List.of("bear"), List.of("owl cat")),
@@ -913,7 +918,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             cols,
             TABLE,
             NOW
-        ).scoring().across();
+        , InfinoQueryTranslatorTests::aRowMatches).scoring().across();
         assertNotNull(across);
         assertEquals(
             List.of(List.of(new InfinoQueryTranslator.TextClause("message", "jackal bear", "or"), new InfinoQueryTranslator.TextClause("title", "jackal bear", "or"))),
@@ -925,7 +930,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             cols,
             TABLE,
             NOW
-        ).scoring().across();
+        , InfinoQueryTranslatorTests::aRowMatches).scoring().across();
         assertNotNull(fielded);
         assertEquals(
             List.of(List.of("jackal"), List.of("owl")),
@@ -933,18 +938,18 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
         // A mapped column with no text index still leaves it unranked.
         QueryStringQueryBuilder keyword = QueryBuilders.queryStringQuery("jackal bear").field("message").field("title").field("level");
-        assertNull(InfinoQueryTranslator.translate(keyword, cols, TABLE, NOW).scoring().across());
+        assertNull(InfinoQueryTranslator.translate(keyword, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).scoring().across());
         // A field pattern is the fields it matches, as stock expands it over the mapping: here the two text columns.
         assertEquals(
-            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").field("title").field("message"), cols, TABLE, NOW).scoring().across(),
-            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").field("title").field("mess*"), cols, TABLE, NOW).scoring().across()
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").field("title").field("message"), cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).scoring().across(),
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("jackal bear").field("title").field("mess*"), cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).scoring().across()
         );
     }
 
     private static Translation translateWithTitle(org.opensearch.index.query.QueryBuilder qb) {
         Map<String, Column> cols = columns();
         cols.put("title", new Column("title", "str", true, false));
-        return InfinoQueryTranslator.translate(qb, cols, TABLE, NOW);
+        return InfinoQueryTranslator.translate(qb, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
     }
 
     private static final String RANGE_FILTER = "WHERE (\"@timestamp\" >= '2023-01-03T00:00:00Z') AND (\"@timestamp\" < '2023-01-03T10:00:00Z')";
@@ -1456,7 +1461,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         cols.put("source", new Column("source", "str", false, false));
         assertEquals(
             "(\"level\" = 'disk' OR \"host.name\" = 'disk' OR \"message\" = 'disk' OR text_match(\"message\", 'disk', 'or'))",
-            InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk"), cols, TABLE, NOW).where()
+            InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk"), cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).where()
         );
     }
 
@@ -1485,11 +1490,10 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
 
     /**
      * Stock's query string reads a run of words with no operator between them
-     * as one clause, one value on a keyword field. Over keyword fields the
-     * plugin serves such a run when it is the whole query (a multi_match of
-     * it) and refuses one beside other clauses, which its tree, a clause per
-     * word, cannot tell apart. A word right before OR ends a run, so
-     * {@code disk full OR x} is three clauses; simple_query_string has no runs.
+     * as one clause, one value on a keyword field: beside a keyword field the
+     * tree keeps the run as one term, alone or beside other clauses. A word
+     * right before OR ends a run, so {@code disk full OR x} is three clauses;
+     * simple_query_string has no runs.
      */
     public void testARunOfWordsOverKeywordFields() {
         assertEquals(
@@ -1500,9 +1504,16 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             translate(QueryBuilders.multiMatchQuery("disk full").operator(Operator.AND)).where(),
             translate(QueryBuilders.queryStringQuery("disk full").defaultOperator(Operator.AND)).where()
         );
-        IllegalArgumentException run = expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("disk full error OR x")));
-        assertTrue(run.getMessage(), run.getMessage().contains("no operator between them"));
-        expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("level:error disk full")));
+        // The run is one value beside the clauses around it: error before OR is a clause of its own.
+        String beside = translate(QueryBuilders.queryStringQuery("disk full error OR x")).where();
+        assertTrue(beside, beside.contains("\"level\" = 'disk full'") && beside.contains("\"level\" = 'error'") && beside.contains("\"level\" = 'x'"));
+        assertFalse(beside, beside.contains("\"level\" = 'disk'"));
+        String field = translate(QueryBuilders.queryStringQuery("level:error disk full")).where();
+        assertTrue(field, field.contains("\"level\" = 'error'") && field.contains("\"host.name\" = 'disk full'"));
+        assertTrue(field, field.contains("text_match(\"message\", 'disk full', 'or')"));
+        // On a named field a run is that field's one value, or a text field's words.
+        String named = translate(QueryBuilders.queryStringQuery("level:(disk full) OR message:(disk full)")).where();
+        assertTrue(named, named.contains("\"level\" = 'disk full'") && named.contains("text_match(\"message\", 'disk full', 'or')"));
         String each = translate(QueryBuilders.queryStringQuery("disk full OR x")).where();
         assertTrue(each, each.contains("\"level\" = 'disk'") && each.contains("\"level\" = 'full'") && each.contains("\"level\" = 'x'"));
         assertNotNull(translate(QueryBuilders.queryStringQuery("disk AND full")));
@@ -1515,14 +1526,119 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         dated.put("message", columns().get("message"));
         assertEquals(
             "token_match('os_logs_0', 'message', 'monkey jackal bear', 'or')",
-            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("message: monkey jackal bear"), dated, TABLE, NOW).from()
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("message: monkey jackal bear"), dated, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).from()
         );
-        expectThrows(
-            IllegalArgumentException.class,
-            () -> InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("message:monkey jackal 500"), dated, TABLE, NOW)
+        // Beside 500 the run is "jackal 500", which no number or date field reads: the text column alone, ranked.
+        assertEquals(
+            "token_match('os_logs_0', 'message', 'monkey jackal 500', 'or')",
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("message:monkey jackal 500"), dated, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).from()
         );
         // Over text fields alone a run is the words, as before.
         assertEquals("token_match('os_logs_0', 'message', 'disk full', 'or')", translate(QueryBuilders.queryStringQuery("disk full").defaultField("message")).from());
+    }
+
+    /**
+     * A keyword, number or date field that none of a query string's clauses
+     * on the default fields matches in any row adds no hit and no score in
+     * stock, so the query is read over the text columns, which rank it as
+     * stock does (big5's message: monkey jackal bear over every field). One
+     * read asks for such a row; where one exists the fields stay, unranked.
+     */
+    public void testKeywordFieldsNoRowMatchesLeaveTheTextToRank() {
+        List<String> reads = new java.util.ArrayList<>();
+        java.util.function.Function<String, List<Map<String, Object>>> none = sql -> {
+            reads.add(sql);
+            return List.of();
+        };
+        Translation big5 = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("message: monkey jackal bear"), columns(), TABLE, NOW, none);
+        assertEquals("token_match('os_logs_0', 'message', 'monkey jackal bear', 'or')", big5.from());
+        assertEquals(1, reads.size());
+        String read = reads.get(0);
+        assertTrue(read, read.startsWith("SELECT 1 AS infino_hit FROM \"os_logs_0\" WHERE "));
+        assertTrue(read, read.contains("\"level\" = 'jackal bear'") && read.contains("\"host.name\" = 'jackal bear'") && read.endsWith(" LIMIT 1"));
+        // Beside a range, as big5's filtered search sends it: the same, read once.
+        reads.clear();
+        Translation filtered = InfinoQueryTranslator.translate(
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-03T00:00:00").lt("2023-01-03T10:00:00"))
+                .must(QueryBuilders.queryStringQuery("message: monkey jackal bear")),
+            columns(),
+            TABLE,
+            NOW,
+            none
+        );
+        assertEquals("token_match('os_logs_0', 'message', 'monkey jackal bear', 'or')", filtered.from());
+        assertEquals(1, reads.size());
+        // A lone word: ranked by the text column.
+        assertEquals(
+            "token_match('os_logs_0', 'message', 'monkey', 'or')",
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("monkey"), columns(), TABLE, NOW, none).from()
+        );
+        // Where a row has the value, the keyword fields stay and the run is their one value.
+        String kept = translate(QueryBuilders.queryStringQuery("message: monkey jackal bear")).where();
+        assertTrue(kept, kept.contains("\"level\" = 'jackal bear'") && kept.contains("text_match(\"message\", 'monkey', 'and')"));
+        // In filter context nothing scores: the fields stay and nothing is read.
+        reads.clear();
+        String filter = InfinoQueryTranslator.translate(
+            QueryBuilders.boolQuery().filter(QueryBuilders.queryStringQuery("message: monkey jackal bear")),
+            columns(),
+            TABLE,
+            NOW,
+            none
+        ).where();
+        assertTrue(filter, filter.contains("\"level\" = 'jackal bear'"));
+        assertEquals(0, reads.size());
+        // Named fields: the same, and a value a field cannot read is still refused unless the query is lenient.
+        assertEquals(
+            "token_match('os_logs_0', 'message', 'monkey jackal bear', 'or')",
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("message: monkey jackal bear").field("message").field("level"), columns(), TABLE, NOW, none)
+                .from()
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("monkey").field("message").field("status"), columns(), TABLE, NOW, none)
+        );
+        // A run under minimum_should_match stays refused, the fields read or not: stock
+        // counts it as one clause over every field, which the tree does not count.
+        reads.clear();
+        IllegalArgumentException counted = expectThrows(
+            IllegalArgumentException.class,
+            () -> InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("message: monkey jackal bear").minimumShouldMatch("2"), columns(), TABLE, NOW, none)
+        );
+        assertTrue(counted.getMessage(), counted.getMessage().contains("minimum_should_match [2]"));
+        assertEquals(0, reads.size());
+    }
+
+    public void testARunIsOneTermWhenAsked() {
+        assertEquals(
+            new InfinoLuceneQuery.Bool(
+                List.of(),
+                List.of(new InfinoLuceneQuery.Term("message", "monkey", false, 0, 0), new InfinoLuceneQuery.Term(null, "jackal bear", false, 0, 0)),
+                List.of()
+            ),
+            InfinoLuceneQuery.parseTop("message: monkey jackal bear", Operator.OR, true).node()
+        );
+        // Under AND the run is a required clause; a word before AND or OR, or after one, is a clause of its own.
+        assertEquals(
+            new InfinoLuceneQuery.Bool(
+                List.of(new InfinoLuceneQuery.Term(null, "a b", false, 0, 0), new InfinoLuceneQuery.Term(null, "c", false, 0, 0), new InfinoLuceneQuery.Term(null, "d", false, 0, 0)),
+                List.of(),
+                List.of()
+            ),
+            InfinoLuceneQuery.parseTop("a b c AND d", Operator.AND, true).node()
+        );
+        assertEquals(
+            new InfinoLuceneQuery.Bool(
+                List.of(),
+                List.of(new InfinoLuceneQuery.Term(null, "a", false, 0, 0), new InfinoLuceneQuery.Term(null, "b", false, 0, 0), new InfinoLuceneQuery.Term(null, "c d", false, 0, 0)),
+                List.of()
+            ),
+            InfinoLuceneQuery.parseTop("a OR b c d", Operator.OR, true).node()
+        );
+        // In a field's group the run takes the field.
+        assertEquals(new InfinoLuceneQuery.Term("level", "disk full", false, 0, 0), InfinoLuceneQuery.parseTop("level:(disk full)", Operator.OR, true).node());
+        // Without asking, a term per word, as before.
+        assertEquals(3, ((InfinoLuceneQuery.Bool) InfinoLuceneQuery.parseTop("message: monkey jackal bear", Operator.OR).node()).should().size());
     }
 
     public void testRunsAreReadAsLucenesParserReadsThem() {
@@ -1538,10 +1654,6 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(InfinoLuceneQuery.hasRun("disk^2 full"));
         assertFalse(InfinoLuceneQuery.hasRun("disk ful*"));
         assertFalse(InfinoLuceneQuery.hasRun("\"disk full\""));
-        assertTrue(InfinoLuceneQuery.isOneRun("disk full error"));
-        assertFalse(InfinoLuceneQuery.isOneRun("disk"));
-        assertFalse(InfinoLuceneQuery.isOneRun("disk full OR x"));
-        assertFalse(InfinoLuceneQuery.isOneRun("disk\\-full x"));
     }
 
     /**
@@ -1566,16 +1678,16 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         InfinoPlugin.tables().observe(org.opensearch.cluster.metadata.Metadata.builder().put(md, false).build());
         try {
             String levelOrMessage = "(\"level\" = 'disk' OR text_match(\"message\", 'disk', 'or'))";
-            assertEquals(levelOrMessage, InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk"), columns(), table, NOW).where());
-            assertEquals(levelOrMessage, InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("disk"), columns(), table, NOW).where());
+            assertEquals(levelOrMessage, InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk"), columns(), table, NOW, InfinoQueryTranslatorTests::aRowMatches).where());
+            assertEquals(levelOrMessage, InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("disk"), columns(), table, NOW, InfinoQueryTranslatorTests::aRowMatches).where());
             // Not every field, so not lenient: a field the word is no value of fails, as stock's does.
             Map<String, Column> cols = columns();
             cols.put("level", cols.get("status"));
-            expectThrows(IllegalArgumentException.class, () -> InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk"), cols, table, NOW));
+            expectThrows(IllegalArgumentException.class, () -> InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk"), cols, table, NOW, InfinoQueryTranslatorTests::aRowMatches));
             // The query's own fields come first.
             assertEquals(
                 "\"host.name\" = 'disk'",
-                InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("disk").defaultField("host.name"), columns(), table, NOW).where()
+                InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("disk").defaultField("host.name"), columns(), table, NOW, InfinoQueryTranslatorTests::aRowMatches).where()
             );
         } finally {
             InfinoPlugin.tables().observe(org.opensearch.cluster.metadata.Metadata.EMPTY_METADATA);
@@ -1704,7 +1816,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         Map<String, Column> cols = columns();
         cols.put("level[]", Column.list("level[]", "str"));
         BoolQueryBuilder b = QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.termQuery("level", "error"));
-        Translation t = InfinoQueryTranslator.translate(b, cols, TABLE, NOW);
+        Translation t = InfinoQueryTranslator.translate(b, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
         InfinoQueryTranslator.Bonus bonus = t.scoring().bonuses().get(0);
         assertEquals("CASE WHEN infino_match0.infino_hit IS NOT NULL THEN 1.0 ELSE 0.0 END", bonus.expr());
         assertTrue(bonus.join(), bonus.join().startsWith(" LEFT JOIN (SELECT osid AS infino_hit FROM \"os_logs_0\" WHERE ((\"level[]\" IS NULL AND \"level\" = 'error') OR osid IN (SELECT "));
@@ -2496,7 +2608,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("[infino] exists on [_routing] is not served: the table keeps no routing values", e.getMessage());
         Map<String, Column> routed = new LinkedHashMap<>(columns());
         routed.put("osrouting", new Column("osrouting", "str", false, false));
-        assertEquals("\"osrouting\" IS NOT NULL", InfinoQueryTranslator.translate(QueryBuilders.existsQuery("_routing"), routed, TABLE, NOW).where());
+        assertEquals("\"osrouting\" IS NOT NULL", InfinoQueryTranslator.translate(QueryBuilders.existsQuery("_routing"), routed, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).where());
         // _source cannot be searched, as stock says.
         QueryShardException source = expectThrows(QueryShardException.class, () -> translate(QueryBuilders.existsQuery("_source")));
         assertEquals("The _source field is not searchable", source.getMessage());
@@ -2726,7 +2838,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         Map<String, Column> cols = columns();
         cols.put("title", new Column("title", "str", true, false));
         BoolQueryBuilder same = QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(QueryBuilders.matchQuery("message", "full"));
-        Translation t = InfinoQueryTranslator.translate(same, cols, TABLE, NOW);
+        Translation t = InfinoQueryTranslator.translate(same, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
         assertEquals(new InfinoQueryTranslator.TextClause("message", "disk", "or"), t.ranked());
         InfinoQueryTranslator.Across across = t.scoring().across();
         assertNotNull(across);
@@ -2747,7 +2859,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
 
         // On different fields each clause scores its own column.
         BoolQueryBuilder apart = QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(QueryBuilders.matchQuery("title", "full"));
-        Translation a = InfinoQueryTranslator.translate(apart, cols, TABLE, NOW);
+        Translation a = InfinoQueryTranslator.translate(apart, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
         assertEquals(List.of(clause("message", "disk"), clause("title", "full")), a.scoring().across().clauses());
         assertTrue(
             hits(a, null, 10),
@@ -2759,19 +2871,19 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
 
         // A clause repeated scores twice, as stock sums each.
         BoolQueryBuilder twice = QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(QueryBuilders.matchQuery("message", "disk"));
-        assertEquals(List.of(clause("message", "disk"), clause("message", "disk")), InfinoQueryTranslator.translate(twice, cols, TABLE, NOW).scoring().across().clauses());
+        assertEquals(List.of(clause("message", "disk"), clause("message", "disk")), InfinoQueryTranslator.translate(twice, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).scoring().across().clauses());
 
         // An all-words clause scores in or: its own predicate, still all-words, keeps only the rows with every word.
         BoolQueryBuilder all = QueryBuilders.boolQuery()
             .must(QueryBuilders.matchQuery("message", "disk"))
             .must(QueryBuilders.matchQuery("title", "full error").operator(Operator.AND));
-        Translation al = InfinoQueryTranslator.translate(all, cols, TABLE, NOW);
+        Translation al = InfinoQueryTranslator.translate(all, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
         assertEquals(List.of(clause("message", "disk"), clause("title", "full error")), al.scoring().across().clauses());
         assertTrue(hits(al, null, 10), hits(al, null, 10).contains("AND ((1=1 AND text_match(\"title\", 'full error', 'and')))"));
 
         // An optional match scores where it matches; only the principal keeps the rows.
         BoolQueryBuilder optional = QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.matchQuery("title", "full"));
-        Translation o = InfinoQueryTranslator.translate(optional, cols, TABLE, NOW);
+        Translation o = InfinoQueryTranslator.translate(optional, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
         assertEquals(List.of(clause("message", "disk"), clause("title", "full")), o.scoring().across().clauses());
         String optionalHits = hits(o, null, 10);
         assertTrue(optionalHits, optionalHits.contains("10, 'or') WHERE (text_match(\"message\", 'disk', 'or')) AND "));
@@ -2782,7 +2894,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             .must(QueryBuilders.matchQuery("message", "disk"))
             .must(QueryBuilders.matchQuery("message", "full"))
             .must(QueryBuilders.rangeQuery("status").gte(500));
-        Translation r = InfinoQueryTranslator.translate(ranged, cols, TABLE, NOW);
+        Translation r = InfinoQueryTranslator.translate(ranged, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
         assertEquals(1.0, r.scoring().offset(), 0);
         assertEquals(2, r.scoring().across().clauses().size());
         assertTrue(hits(r, null, 10), hits(r, null, 10).contains("(\"status\" >= 500)"));
@@ -2817,7 +2929,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             // A boosted bool, which weighs the whole sum.
             QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(QueryBuilders.matchQuery("title", "full")).boost(2f)
         )) {
-            Translation t = InfinoQueryTranslator.translate(b, cols, TABLE, NOW);
+            Translation t = InfinoQueryTranslator.translate(b, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
             assertNull(b.toString(), t.scoring().across());
             assertEquals(b.toString(), new InfinoQueryTranslator.TextClause("message", "disk", "or"), t.ranked());
             assertFalse(b.toString(), InfinoSearch.ranksAcross(unsortedPlan(t, cols)));
@@ -2826,15 +2938,15 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         BoolQueryBuilder joined = QueryBuilders.boolQuery()
             .must(QueryBuilders.matchQuery("message", "disk").operator(Operator.AND))
             .must(QueryBuilders.matchQuery("message", "full").operator(Operator.AND));
-        Translation j = InfinoQueryTranslator.translate(joined, cols, TABLE, NOW);
+        Translation j = InfinoQueryTranslator.translate(joined, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
         assertEquals(new InfinoQueryTranslator.TextClause("message", "disk full", "and"), j.ranked());
         assertNull(j.scoring().across());
         // A match in filter context scores nothing: the principal ranks alone.
         BoolQueryBuilder filtered = QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).filter(QueryBuilders.matchQuery("title", "full"));
-        assertNull(InfinoQueryTranslator.translate(filtered, cols, TABLE, NOW).scoring().across());
+        assertNull(InfinoQueryTranslator.translate(filtered, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).scoring().across());
         // A sorted page has no score to sum; an ascending score sort reads the hits unscored.
         BoolQueryBuilder same = QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(QueryBuilders.matchQuery("message", "full"));
-        Translation t = InfinoQueryTranslator.translate(same, cols, TABLE, NOW);
+        Translation t = InfinoQueryTranslator.translate(same, cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches);
         InfinoSearch.Plan sorted = new InfinoSearch.Plan(
             TABLE,
             cols,
@@ -2863,7 +2975,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
     }
 
     private static String typedWhere(org.opensearch.index.query.QueryBuilder qb) {
-        return InfinoQueryTranslator.translate(qb, typedColumns(), TABLE, NOW).where();
+        return InfinoQueryTranslator.translate(qb, typedColumns(), TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).where();
     }
 
     /** A half float's value, rounded to the nearest as the field keeps it. */
@@ -2893,11 +3005,11 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("1=0", typedWhere(QueryBuilders.rangeQuery("f").gt(Float.MAX_VALUE)));
         assertEquals("(\"f\" >= 1)", typedWhere(QueryBuilders.rangeQuery("f").gte(1)));
         // A value the field cannot hold has no translation, as text on a double field has none.
-        assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("f", "1e39"), typedColumns(), TABLE, NOW));
-        assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("f", "abc"), typedColumns(), TABLE, NOW));
-        assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("d", "abc"), typedColumns(), TABLE, NOW));
-        assertNull(InfinoQueryTranslator.translate(QueryBuilders.rangeQuery("f").gte("abc"), typedColumns(), TABLE, NOW));
-        assertNull(InfinoQueryTranslator.translate(QueryBuilders.rangeQuery("s").lt("abc"), typedColumns(), TABLE, NOW));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("f", "1e39"), typedColumns(), TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("f", "abc"), typedColumns(), TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("d", "abc"), typedColumns(), TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.rangeQuery("f").gte("abc"), typedColumns(), TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.rangeQuery("s").lt("abc"), typedColumns(), TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches));
         // Text across a text and a float field reads the float field as it reads a double one: a
         // lenient query skips it, another is refused, as stock fails it.
         assertEquals(

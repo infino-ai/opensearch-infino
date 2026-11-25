@@ -131,9 +131,7 @@
           - {"k": "d12", "n": 12, "message": "emu fox", "title": "fox jackal monkey bear"}
   - match: { errors: false }
 
-  # A run of words is one clause: each document's best field for the run. The
-  # text fields are named: with no fields stock searches every field, k and n
-  # too, which the table matches but does not rank beside the text.
+  # A run of words is one clause: each document's best field for the run.
   - do:
       search:
         index: qa_luc
@@ -171,28 +169,45 @@
   - match: { hits.hits.3._id: "d06" }
   - match: { hits.hits.4._id: "d05" }
 
-  # With no fields the run searches every field: the same documents.
+  # With no fields the run searches every field, k and n too. Stock's dis_max
+  # holds their term queries, which match no document here (no k is the run,
+  # and no number reads it), so they add nothing: the same ranking.
   - do:
       search:
         index: qa_luc
         body:
-          size: 0
+          size: 5
           query: { query_string: { query: "monkey jackal bear" } }
   - match: { hits.total.value: 12 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d12" }
+  - match: { hits.hits.3._id: "d06" }
+  - match: { hits.hits.4._id: "d05" }
   - do:
       search:
         index: qa_proxy
         body:
-          size: 0
+          size: 5
           query: { query_string: { query: "monkey jackal bear" } }
   - match: { hits.total.value: 12 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d12" }
+  - match: { hits.hits.3._id: "d06" }
+  - match: { hits.hits.4._id: "d05" }
   - do:
       search:
         index: qa_default
         body:
-          size: 0
+          size: 5
           query: { query_string: { query: "monkey jackal bear" } }
   - match: { hits.total.value: 12 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d12" }
+  - match: { hits.hits.3._id: "d06" }
+  - match: { hits.hits.4._id: "d05" }
 
   # A field's word is a clause of its own, summed with the run after it.
   - do:
@@ -225,6 +240,44 @@
         body:
           size: 5
           query: { query_string: { query: "message: monkey jackal bear", fields: [ message, title ] } }
+  - match: { hits.total.value: 11 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d01" }
+  - match: { hits.hits.3._id: "d05" }
+  - match: { hits.hits.4._id: "d09" }
+
+  # big5's query_string-on-message names no fields: the same ranking as over the text fields.
+  - do:
+      search:
+        index: qa_luc
+        body:
+          size: 5
+          query: { query_string: { query: "message: monkey jackal bear" } }
+  - match: { hits.total.value: 11 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d01" }
+  - match: { hits.hits.3._id: "d05" }
+  - match: { hits.hits.4._id: "d09" }
+  - do:
+      search:
+        index: qa_proxy
+        body:
+          size: 5
+          query: { query_string: { query: "message: monkey jackal bear" } }
+  - match: { hits.total.value: 11 }
+  - match: { hits.hits.0._id: "d04" }
+  - match: { hits.hits.1._id: "d02" }
+  - match: { hits.hits.2._id: "d01" }
+  - match: { hits.hits.3._id: "d05" }
+  - match: { hits.hits.4._id: "d09" }
+  - do:
+      search:
+        index: qa_default
+        body:
+          size: 5
+          query: { query_string: { query: "message: monkey jackal bear" } }
   - match: { hits.total.value: 11 }
   - match: { hits.hits.0._id: "d04" }
   - match: { hits.hits.1._id: "d02" }
