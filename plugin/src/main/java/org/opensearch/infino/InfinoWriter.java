@@ -60,8 +60,9 @@ import java.util.function.Supplier;
  * arrives while a slot is free starts an append at once; bulks that arrive
  * while every slot is taken accumulate and go to the table as the next
  * append the moment one finishes, bounded by a document and a byte
- * threshold. The appends run on the write pool, never on the thread that
- * took the request.
+ * threshold. The appends run on the plugin's append pool
+ * ({@link InfinoPlugin#APPEND_POOL}), never on the thread that took the
+ * request nor on the write pool the bulks are staged on.
  *
  * <p>Two appends running at once never write the same id. A bulk that names
  * an id (an index with a client id, a delete, an update) waits while a
@@ -113,7 +114,7 @@ public final class InfinoWriter {
     private static final long VERSION = InfinoDocumentVersion.VERSION;
     /** Primary term reported for every write; the table has no primary to fail over. */
     private static final long PRIMARY_TERM = InfinoDocumentVersion.PRIMARY_TERM;
-    /** Appends to one table that may run at once; 0 or less means half the write pool. */
+    /** Appends to one table that may run at once; 0 or less means half the append pool ({@link InfinoPlugin#APPEND_POOL}). */
     private static final int MAX_CONCURRENT_APPENDS = Integer.getInteger("infino.batch.concurrency", 0);
     /** A table's next sequence number before its first flush on this node has read the highest the table holds. */
     private static final long UNREAD = -1L;
@@ -294,7 +295,7 @@ public final class InfinoWriter {
         return current == UNREAD || !sameIndex ? read : Math.max(read, current);
     }
 
-    /** Where a table's appends run: the {@code write} pool. */
+    /** Where a table's appends run: the plugin's append pool ({@link InfinoPlugin#APPEND_POOL}), never the {@code write} pool. */
     private final Supplier<Executor> flushes;
     private final int maxBatchDocs;
     private final long maxBatchBytes;
@@ -303,10 +304,10 @@ public final class InfinoWriter {
 
     public InfinoWriter(ThreadPool threadPool) {
         this(
-            () -> threadPool.executor(ThreadPool.Names.WRITE),
+            () -> threadPool.executor(InfinoPlugin.APPEND_POOL),
             MAX_BATCH_DOCS,
             MAX_BATCH_BYTES,
-            MAX_CONCURRENT_APPENDS > 0 ? MAX_CONCURRENT_APPENDS : Math.max(1, threadPool.info(ThreadPool.Names.WRITE).getMax() / 2)
+            MAX_CONCURRENT_APPENDS > 0 ? MAX_CONCURRENT_APPENDS : Math.max(1, threadPool.info(InfinoPlugin.APPEND_POOL).getMax() / 2)
         );
     }
 
@@ -316,8 +317,15 @@ public final class InfinoWriter {
 
     /**
      * {@code maxAppends} appends to one table run at once. They run on the
-     * write pool, as the bulks that feed them are prepared there, so it is
-     * kept under the pool's size: half of it by default.
+     * append pool, apart from the write pool the bulks that feed them are
+     * prepared on, and are kept under its size, half of it by default, so
+     * one table's stalled appends leave threads for another's. That holds
+     * for one stalled table only: two stalled tables fill the pool, and a
+     * healthy table's appends then queue behind theirs (on a node with two
+     * processors, one append per table fills it). A hosted service that
+     * stalls usually stalls every table of the account, so expect that
+     * case: what the pool keeps free is the {@code write} pool, not the
+     * other tables' appends.
      */
     InfinoWriter(Supplier<Executor> flushes, int maxBatchDocs, long maxBatchBytes, int maxAppends) {
         this.flushes = flushes;
@@ -442,9 +450,9 @@ public final class InfinoWriter {
         batch.lock.lock();
         try {
             // A batch past its bound refuses more until a running append
-            // takes it. It never waits here: this is a write-pool thread, the
-            // pool the appends themselves run on, and threads waiting on a
-            // stalled append would leave none to run it.
+            // takes it. It never waits here: this is a write-pool thread, and
+            // an append can wait on the hosted service for minutes; threads
+            // waiting on it would hold the pool every write on the node needs.
             pending = batch.docs;
             admitted = !refuse(batch.running > 0, batch.docs, batch.bytes);
             if (admitted) {
@@ -483,7 +491,7 @@ public final class InfinoWriter {
     }
 
     /**
-     * Hand appends taken under the batch's lock to the write pool. An append
+     * Hand appends taken under the batch's lock to the append pool. An append
      * the pool refuses (its queue is full, or the node is closing) answers
      * its bulks with the refusal, a 429 for a full queue, and nothing of them
      * is written; it gives back its slot and the ids it named, and the bulks
@@ -498,7 +506,7 @@ public final class InfinoWriter {
                 flushes.get().execute(() -> flush(table, batch, next));
                 continue;
             } catch (RejectedExecutionException e) {
-                log.warn("[infino] the write pool refused an append of {} bulks to {}", next.size(), table, e);
+                log.warn("[infino] the append pool refused an append of {} bulks to {}", next.size(), table, e);
                 for (Staged s : next) {
                     if (s.prepared() != null) {
                         InfinoNative.freePrepared(s.prepared());

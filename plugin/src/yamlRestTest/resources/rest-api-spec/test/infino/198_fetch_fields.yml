@@ -1,0 +1,594 @@
+# What a hit carries for fields, docvalue_fields and stored_fields, in
+# default mode, proxy mode and on a Lucene twin, as stock answers them
+# (issue #204): the fields API reads the document whatever _source the
+# request asks for, on a page, a scroll, a search_after page and a
+# top_hits hit; stored_fields: _none_ leaves out the id along with the
+# source on a page, a scroll and a search_after page, and cannot be asked
+# with the source or fields; and a token_count field gives the number of
+# tokens its analyzer makes, from the doc values a field without them
+# lacks, which docvalue_fields refuses.
+
+---
+"Default mode: fields without _source, stored_fields _none_ and token_count":
+  - do:
+      indices.create:
+        index: ff_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              keyword: { type: keyword }
+              title: { type: text, fields: { raw: { type: keyword }, length: { type: token_count, analyzer: standard } } }
+              count: { type: token_count, analyzer: standard }
+              count_without_dv: { type: token_count, analyzer: standard, doc_values: false }
+              day: { type: date, format: yyyy-MM-dd }
+              rank: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        index: ff_def
+        body:
+          - { index: { _id: "1" } }
+          - { keyword: a, title: "quick brown fox", count: "some text", count_without_dv: "one two three", day: "2024-01-02", rank: 5 }
+          - { index: { _id: "2" } }
+          - { keyword: b, title: "the lazy dog jumps", count: [ "one two three", "four" ], day: "2024-03-04", rank: 7 }
+          - { index: { _id: "3" } }
+          - { keyword: c, title: "over", count: "", day: "2024-05-06", rank: 9 }
+  - match: { errors: false }
+
+  # fields read the document when the source is not returned, formatted as with it.
+  - do:
+      search:
+        index: ff_def
+        body:
+          _source: false
+          sort: [ { rank: asc } ]
+          fields: [ keyword, { field: day, format: dd/MM/yyyy }, "title*", rank ]
+  - match: { hits.total.value: 3 }
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.fields.keyword: [ a ] }
+  - match: { hits.hits.0.fields.day: [ "02/01/2024" ] }
+  - match: { hits.hits.0.fields.title: [ "quick brown fox" ] }
+  - match: { hits.hits.0.fields.title\.raw: [ "quick brown fox" ] }
+  - match: { hits.hits.0.fields.title\.length: [ 3 ] }
+  - match: { hits.hits.0.fields.rank: [ 5 ] }
+  - match: { hits.hits.2.fields.keyword: [ c ] }
+  - do:
+      search:
+        index: ff_def
+        body:
+          _source: false
+          query: { term: { keyword: b } }
+          fields: [ keyword ]
+          docvalue_fields: [ rank, { field: day, format: epoch_millis } ]
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.keyword: [ b ] }
+  - match: { hits.hits.0.fields.rank: [ 7 ] }
+  - match: { hits.hits.0.fields.day: [ "1709510400000" ] }
+
+  # A search_after page and a scroll read them the same way.
+  - do:
+      search:
+        index: ff_def
+        body:
+          _source: false
+          size: 1
+          sort: [ { rank: asc } ]
+          search_after: [ 5 ]
+          fields: [ keyword ]
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.keyword: [ b ] }
+  - do:
+      search:
+        index: ff_def
+        scroll: 1m
+        body:
+          _source: false
+          size: 2
+          sort: [ { rank: asc } ]
+          fields: [ keyword ]
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.keyword: [ a ] }
+  - match: { hits.hits.1.fields.keyword: [ b ] }
+  - set: { _scroll_id: scroll_id }
+  - do:
+      scroll:
+        scroll_id: $scroll_id
+        scroll: 1m
+  - length: { hits.hits: 1 }
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.keyword: [ c ] }
+  - do:
+      clear_scroll:
+        scroll_id: $scroll_id
+
+  # And so does a top_hits hit.
+  - do:
+      search:
+        index: ff_def
+        body:
+          size: 0
+          aggs: { top: { top_hits: { size: 1, sort: [ { rank: desc } ], _source: false, fields: [ keyword ] } } }
+  - is_false: aggregations.top.hits.hits.0._source
+  - match: { aggregations.top.hits.hits.0.fields.keyword: [ c ] }
+
+  # stored_fields _none_ leaves out the id and the source.
+  - do:
+      search:
+        index: ff_def
+        body: { sort: [ { rank: asc } ], stored_fields: _none_ }
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - is_false: hits.hits.0._id
+  - is_false: hits.hits.0._source
+  - do:
+      search:
+        index: ff_def
+        body: { sort: [ { rank: asc } ], stored_fields: _none_, docvalue_fields: [ rank ] }
+  - is_false: hits.hits.0._id
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.rank: [ 5 ] }
+  - match: { hits.hits.2.fields.rank: [ 9 ] }
+  - do:
+      search:
+        index: ff_def
+        body: { size: 1, sort: [ { rank: asc } ], search_after: [ 5 ], stored_fields: _none_, docvalue_fields: [ rank ] }
+  - is_false: hits.hits.0._id
+  - match: { hits.hits.0.fields.rank: [ 7 ] }
+  - do:
+      search:
+        index: ff_def
+        scroll: 1m
+        body: { size: 2, sort: [ { rank: asc } ], stored_fields: _none_, docvalue_fields: [ rank ] }
+  - is_false: hits.hits.1._id
+  - match: { hits.hits.1.fields.rank: [ 7 ] }
+  - set: { _scroll_id: scroll_id }
+  - do:
+      scroll:
+        scroll_id: $scroll_id
+        scroll: 1m
+  - length: { hits.hits: 1 }
+  - is_false: hits.hits.0._id
+  - match: { hits.hits.0.fields.rank: [ 9 ] }
+  - do:
+      clear_scroll:
+        scroll_id: $scroll_id
+  - do:
+      catch: /\[stored_fields\] cannot be disabled if \[_source\] is requested/
+      search:
+        index: ff_def
+        body: { stored_fields: _none_, _source: true }
+  - do:
+      catch: /\[stored_fields\] cannot be disabled when using the \[fields\] option/
+      search:
+        index: ff_def
+        body: { stored_fields: _none_, fields: [ keyword ] }
+
+  # A token_count field gives its analyzer's count of each value, sorted, from its doc values.
+  - do:
+      search:
+        index: ff_def
+        body: { sort: [ { rank: asc } ], fields: [ count, count_without_dv, title.length ] }
+  - match: { hits.hits.0.fields.count: [ 2 ] }
+  - is_false: hits.hits.0.fields.count_without_dv
+  - match: { hits.hits.0.fields.title\.length: [ 3 ] }
+  - match: { hits.hits.1.fields.count: [ 1, 3 ] }
+  - match: { hits.hits.1.fields.title\.length: [ 4 ] }
+  - match: { hits.hits.2.fields.count: [ 0 ] }
+  - do:
+      search:
+        index: ff_def
+        body: { sort: [ { rank: asc } ], _source: false, docvalue_fields: [ count, title.length ] }
+  - match: { hits.hits.0.fields.count: [ 2 ] }
+  - match: { hits.hits.0.fields.title\.length: [ 3 ] }
+  - match: { hits.hits.1.fields.count: [ 1, 3 ] }
+  - do:
+      search:
+        index: ff_def
+        body: { sort: [ { rank: asc } ], _source: false, docvalue_fields: [ { field: count, format: "#.0" } ], fields: [ { field: title.length, format: "#.00" } ] }
+  - match: { hits.hits.1.fields.count: [ "1.0", "3.0" ] }
+  - match: { hits.hits.1.fields.title\.length: [ "4.00" ] }
+  # A token_count field without doc values shows nothing, on hits with a value for it and without.
+  - do:
+      search:
+        index: ff_def
+        body: { sort: [ { rank: asc } ], fields: [ count_without_dv ] }
+  - length: { hits.hits: 3 }
+  - is_false: hits.hits.0.fields
+  - is_false: hits.hits.1.fields
+  - do:
+      catch: /Can't load fielddata on \[count_without_dv\]/
+      search:
+        index: ff_def
+        body: { docvalue_fields: [ count_without_dv ] }
+
+---
+"Proxy mode: fields without _source, stored_fields _none_ and token_count":
+  - do:
+      indices.create:
+        index: ff_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              keyword: { type: keyword }
+              title: { type: text, fields: { raw: { type: keyword }, length: { type: token_count, analyzer: standard } } }
+              count: { type: token_count, analyzer: standard }
+              count_without_dv: { type: token_count, analyzer: standard, doc_values: false }
+              day: { type: date, format: yyyy-MM-dd }
+              rank: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        index: ff_px
+        body:
+          - { index: { _id: "1" } }
+          - { keyword: a, title: "quick brown fox", count: "some text", count_without_dv: "one two three", day: "2024-01-02", rank: 5 }
+          - { index: { _id: "2" } }
+          - { keyword: b, title: "the lazy dog jumps", count: [ "one two three", "four" ], day: "2024-03-04", rank: 7 }
+          - { index: { _id: "3" } }
+          - { keyword: c, title: "over", count: "", day: "2024-05-06", rank: 9 }
+  - match: { errors: false }
+
+  # fields read the document when the source is not returned, formatted as with it.
+  - do:
+      search:
+        index: ff_px
+        body:
+          _source: false
+          sort: [ { rank: asc } ]
+          fields: [ keyword, { field: day, format: dd/MM/yyyy }, "title*", rank ]
+  - match: { hits.total.value: 3 }
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.fields.keyword: [ a ] }
+  - match: { hits.hits.0.fields.day: [ "02/01/2024" ] }
+  - match: { hits.hits.0.fields.title: [ "quick brown fox" ] }
+  - match: { hits.hits.0.fields.title\.raw: [ "quick brown fox" ] }
+  - match: { hits.hits.0.fields.title\.length: [ 3 ] }
+  - match: { hits.hits.0.fields.rank: [ 5 ] }
+  - match: { hits.hits.2.fields.keyword: [ c ] }
+  - do:
+      search:
+        index: ff_px
+        body:
+          _source: false
+          query: { term: { keyword: b } }
+          fields: [ keyword ]
+          docvalue_fields: [ rank, { field: day, format: epoch_millis } ]
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.keyword: [ b ] }
+  - match: { hits.hits.0.fields.rank: [ 7 ] }
+  - match: { hits.hits.0.fields.day: [ "1709510400000" ] }
+
+  # A search_after page and a scroll read them the same way.
+  - do:
+      search:
+        index: ff_px
+        body:
+          _source: false
+          size: 1
+          sort: [ { rank: asc } ]
+          search_after: [ 5 ]
+          fields: [ keyword ]
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.keyword: [ b ] }
+  - do:
+      search:
+        index: ff_px
+        scroll: 1m
+        body:
+          _source: false
+          size: 2
+          sort: [ { rank: asc } ]
+          fields: [ keyword ]
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.keyword: [ a ] }
+  - match: { hits.hits.1.fields.keyword: [ b ] }
+  - set: { _scroll_id: scroll_id }
+  - do:
+      scroll:
+        scroll_id: $scroll_id
+        scroll: 1m
+  - length: { hits.hits: 1 }
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.keyword: [ c ] }
+  - do:
+      clear_scroll:
+        scroll_id: $scroll_id
+
+  # And so does a top_hits hit.
+  - do:
+      search:
+        index: ff_px
+        body:
+          size: 0
+          aggs: { top: { top_hits: { size: 1, sort: [ { rank: desc } ], _source: false, fields: [ keyword ] } } }
+  - is_false: aggregations.top.hits.hits.0._source
+  - match: { aggregations.top.hits.hits.0.fields.keyword: [ c ] }
+
+  # stored_fields _none_ leaves out the id and the source.
+  - do:
+      search:
+        index: ff_px
+        body: { sort: [ { rank: asc } ], stored_fields: _none_ }
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - is_false: hits.hits.0._id
+  - is_false: hits.hits.0._source
+  - do:
+      search:
+        index: ff_px
+        body: { sort: [ { rank: asc } ], stored_fields: _none_, docvalue_fields: [ rank ] }
+  - is_false: hits.hits.0._id
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.rank: [ 5 ] }
+  - match: { hits.hits.2.fields.rank: [ 9 ] }
+  - do:
+      search:
+        index: ff_px
+        body: { size: 1, sort: [ { rank: asc } ], search_after: [ 5 ], stored_fields: _none_, docvalue_fields: [ rank ] }
+  - is_false: hits.hits.0._id
+  - match: { hits.hits.0.fields.rank: [ 7 ] }
+  - do:
+      search:
+        index: ff_px
+        scroll: 1m
+        body: { size: 2, sort: [ { rank: asc } ], stored_fields: _none_, docvalue_fields: [ rank ] }
+  - is_false: hits.hits.1._id
+  - match: { hits.hits.1.fields.rank: [ 7 ] }
+  - set: { _scroll_id: scroll_id }
+  - do:
+      scroll:
+        scroll_id: $scroll_id
+        scroll: 1m
+  - length: { hits.hits: 1 }
+  - is_false: hits.hits.0._id
+  - match: { hits.hits.0.fields.rank: [ 9 ] }
+  - do:
+      clear_scroll:
+        scroll_id: $scroll_id
+  - do:
+      catch: /\[stored_fields\] cannot be disabled if \[_source\] is requested/
+      search:
+        index: ff_px
+        body: { stored_fields: _none_, _source: true }
+  - do:
+      catch: /\[stored_fields\] cannot be disabled when using the \[fields\] option/
+      search:
+        index: ff_px
+        body: { stored_fields: _none_, fields: [ keyword ] }
+
+  # A token_count field gives its analyzer's count of each value, sorted, from its doc values.
+  - do:
+      search:
+        index: ff_px
+        body: { sort: [ { rank: asc } ], fields: [ count, count_without_dv, title.length ] }
+  - match: { hits.hits.0.fields.count: [ 2 ] }
+  - is_false: hits.hits.0.fields.count_without_dv
+  - match: { hits.hits.0.fields.title\.length: [ 3 ] }
+  - match: { hits.hits.1.fields.count: [ 1, 3 ] }
+  - match: { hits.hits.1.fields.title\.length: [ 4 ] }
+  - match: { hits.hits.2.fields.count: [ 0 ] }
+  - do:
+      search:
+        index: ff_px
+        body: { sort: [ { rank: asc } ], _source: false, docvalue_fields: [ count, title.length ] }
+  - match: { hits.hits.0.fields.count: [ 2 ] }
+  - match: { hits.hits.0.fields.title\.length: [ 3 ] }
+  - match: { hits.hits.1.fields.count: [ 1, 3 ] }
+  - do:
+      search:
+        index: ff_px
+        body: { sort: [ { rank: asc } ], _source: false, docvalue_fields: [ { field: count, format: "#.0" } ], fields: [ { field: title.length, format: "#.00" } ] }
+  - match: { hits.hits.1.fields.count: [ "1.0", "3.0" ] }
+  - match: { hits.hits.1.fields.title\.length: [ "4.00" ] }
+  # A token_count field without doc values shows nothing, on hits with a value for it and without.
+  - do:
+      search:
+        index: ff_px
+        body: { sort: [ { rank: asc } ], fields: [ count_without_dv ] }
+  - length: { hits.hits: 3 }
+  - is_false: hits.hits.0.fields
+  - is_false: hits.hits.1.fields
+  - do:
+      catch: /Can't load fielddata on \[count_without_dv\]/
+      search:
+        index: ff_px
+        body: { docvalue_fields: [ count_without_dv ] }
+
+---
+"Lucene twin: fields without _source, stored_fields _none_ and token_count":
+  - do:
+      indices.create:
+        index: ff_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              keyword: { type: keyword }
+              title: { type: text, fields: { raw: { type: keyword }, length: { type: token_count, analyzer: standard } } }
+              count: { type: token_count, analyzer: standard }
+              count_without_dv: { type: token_count, analyzer: standard, doc_values: false }
+              day: { type: date, format: yyyy-MM-dd }
+              rank: { type: long }
+  - do:
+      bulk:
+        refresh: true
+        index: ff_luc
+        body:
+          - { index: { _id: "1" } }
+          - { keyword: a, title: "quick brown fox", count: "some text", count_without_dv: "one two three", day: "2024-01-02", rank: 5 }
+          - { index: { _id: "2" } }
+          - { keyword: b, title: "the lazy dog jumps", count: [ "one two three", "four" ], day: "2024-03-04", rank: 7 }
+          - { index: { _id: "3" } }
+          - { keyword: c, title: "over", count: "", day: "2024-05-06", rank: 9 }
+  - match: { errors: false }
+
+  # fields read the document when the source is not returned, formatted as with it.
+  - do:
+      search:
+        index: ff_luc
+        body:
+          _source: false
+          sort: [ { rank: asc } ]
+          fields: [ keyword, { field: day, format: dd/MM/yyyy }, "title*", rank ]
+  - match: { hits.total.value: 3 }
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.fields.keyword: [ a ] }
+  - match: { hits.hits.0.fields.day: [ "02/01/2024" ] }
+  - match: { hits.hits.0.fields.title: [ "quick brown fox" ] }
+  - match: { hits.hits.0.fields.title\.raw: [ "quick brown fox" ] }
+  - match: { hits.hits.0.fields.title\.length: [ 3 ] }
+  - match: { hits.hits.0.fields.rank: [ 5 ] }
+  - match: { hits.hits.2.fields.keyword: [ c ] }
+  - do:
+      search:
+        index: ff_luc
+        body:
+          _source: false
+          query: { term: { keyword: b } }
+          fields: [ keyword ]
+          docvalue_fields: [ rank, { field: day, format: epoch_millis } ]
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.keyword: [ b ] }
+  - match: { hits.hits.0.fields.rank: [ 7 ] }
+  - match: { hits.hits.0.fields.day: [ "1709510400000" ] }
+
+  # A search_after page and a scroll read them the same way.
+  - do:
+      search:
+        index: ff_luc
+        body:
+          _source: false
+          size: 1
+          sort: [ { rank: asc } ]
+          search_after: [ 5 ]
+          fields: [ keyword ]
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.keyword: [ b ] }
+  - do:
+      search:
+        index: ff_luc
+        scroll: 1m
+        body:
+          _source: false
+          size: 2
+          sort: [ { rank: asc } ]
+          fields: [ keyword ]
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.keyword: [ a ] }
+  - match: { hits.hits.1.fields.keyword: [ b ] }
+  - set: { _scroll_id: scroll_id }
+  - do:
+      scroll:
+        scroll_id: $scroll_id
+        scroll: 1m
+  - length: { hits.hits: 1 }
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.keyword: [ c ] }
+  - do:
+      clear_scroll:
+        scroll_id: $scroll_id
+
+  # And so does a top_hits hit.
+  - do:
+      search:
+        index: ff_luc
+        body:
+          size: 0
+          aggs: { top: { top_hits: { size: 1, sort: [ { rank: desc } ], _source: false, fields: [ keyword ] } } }
+  - is_false: aggregations.top.hits.hits.0._source
+  - match: { aggregations.top.hits.hits.0.fields.keyword: [ c ] }
+
+  # stored_fields _none_ leaves out the id and the source.
+  - do:
+      search:
+        index: ff_luc
+        body: { sort: [ { rank: asc } ], stored_fields: _none_ }
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - is_false: hits.hits.0._id
+  - is_false: hits.hits.0._source
+  - do:
+      search:
+        index: ff_luc
+        body: { sort: [ { rank: asc } ], stored_fields: _none_, docvalue_fields: [ rank ] }
+  - is_false: hits.hits.0._id
+  - is_false: hits.hits.0._source
+  - match: { hits.hits.0.fields.rank: [ 5 ] }
+  - match: { hits.hits.2.fields.rank: [ 9 ] }
+  - do:
+      search:
+        index: ff_luc
+        body: { size: 1, sort: [ { rank: asc } ], search_after: [ 5 ], stored_fields: _none_, docvalue_fields: [ rank ] }
+  - is_false: hits.hits.0._id
+  - match: { hits.hits.0.fields.rank: [ 7 ] }
+  - do:
+      search:
+        index: ff_luc
+        scroll: 1m
+        body: { size: 2, sort: [ { rank: asc } ], stored_fields: _none_, docvalue_fields: [ rank ] }
+  - is_false: hits.hits.1._id
+  - match: { hits.hits.1.fields.rank: [ 7 ] }
+  - set: { _scroll_id: scroll_id }
+  - do:
+      scroll:
+        scroll_id: $scroll_id
+        scroll: 1m
+  - length: { hits.hits: 1 }
+  - is_false: hits.hits.0._id
+  - match: { hits.hits.0.fields.rank: [ 9 ] }
+  - do:
+      clear_scroll:
+        scroll_id: $scroll_id
+  - do:
+      catch: /\[stored_fields\] cannot be disabled if \[_source\] is requested/
+      search:
+        index: ff_luc
+        body: { stored_fields: _none_, _source: true }
+  - do:
+      catch: /\[stored_fields\] cannot be disabled when using the \[fields\] option/
+      search:
+        index: ff_luc
+        body: { stored_fields: _none_, fields: [ keyword ] }
+
+  # A token_count field gives its analyzer's count of each value, sorted, from its doc values.
+  - do:
+      search:
+        index: ff_luc
+        body: { sort: [ { rank: asc } ], fields: [ count, count_without_dv, title.length ] }
+  - match: { hits.hits.0.fields.count: [ 2 ] }
+  - is_false: hits.hits.0.fields.count_without_dv
+  - match: { hits.hits.0.fields.title\.length: [ 3 ] }
+  - match: { hits.hits.1.fields.count: [ 1, 3 ] }
+  - match: { hits.hits.1.fields.title\.length: [ 4 ] }
+  - match: { hits.hits.2.fields.count: [ 0 ] }
+  - do:
+      search:
+        index: ff_luc
+        body: { sort: [ { rank: asc } ], _source: false, docvalue_fields: [ count, title.length ] }
+  - match: { hits.hits.0.fields.count: [ 2 ] }
+  - match: { hits.hits.0.fields.title\.length: [ 3 ] }
+  - match: { hits.hits.1.fields.count: [ 1, 3 ] }
+  - do:
+      search:
+        index: ff_luc
+        body: { sort: [ { rank: asc } ], _source: false, docvalue_fields: [ { field: count, format: "#.0" } ], fields: [ { field: title.length, format: "#.00" } ] }
+  - match: { hits.hits.1.fields.count: [ "1.0", "3.0" ] }
+  - match: { hits.hits.1.fields.title\.length: [ "4.00" ] }
+  # A token_count field without doc values shows nothing, on hits with a value for it and without.
+  - do:
+      search:
+        index: ff_luc
+        body: { sort: [ { rank: asc } ], fields: [ count_without_dv ] }
+  - length: { hits.hits: 3 }
+  - is_false: hits.hits.0.fields
+  - is_false: hits.hits.1.fields
+  - do:
+      catch: /Can't load fielddata on \[count_without_dv\]/
+      search:
+        index: ff_luc
+        body: { docvalue_fields: [ count_without_dv ] }

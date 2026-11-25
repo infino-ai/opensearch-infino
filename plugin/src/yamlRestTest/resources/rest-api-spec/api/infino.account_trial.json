@@ -1,7 +1,7 @@
 {
   "infino.account_trial": {
     "documentation": {
-      "description": "Create a free hosted account for the cluster and store it; the body must carry the acceptance."
+      "description": "Create a trial hosted account for the cluster and store it; the body must carry the acceptance."
     },
     "stability": "experimental",
     "url": {

@@ -62,9 +62,9 @@ use infino::arrow_array::{
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
 use infino::{
-    connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions,
-    Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions,
-    SchemaError, SchemaPatch, Supertable,
+    connect_with, rows_to_batch, Analyzer, Bm25SearchOptions, BoolMode, ColumnIndex,
+    ConnectOptions, Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric,
+    OptimizeOptions, SchemaError, SchemaPatch, Supertable, TableSchema,
 };
 use rayon::prelude::*;
 
@@ -502,6 +502,20 @@ fn out_json(v: Value) -> *mut c_char {
 pub struct Bridge {
     conn: Connection,
     tables: RwLock<HashMap<String, Supertable>>,
+    /// The schema document of each table, on a hosted connection, where
+    /// reading it is a request to the service ([`Bridge::table_schema`]).
+    /// Dropped with the table's handle ([`Bridge::forget`]), and replaced on
+    /// its own after a write that added a column ([`Bridge::reread_schema`]),
+    /// so it may hold columns the handle's Arrow schema, fixed when the
+    /// handle is opened, lacks.
+    schemas: RwLock<HashMap<String, TableSchema>>,
+    /// How many times each table's kept handle or schema document has been
+    /// dropped ([`Bridge::forget`]) or set to be replaced
+    /// ([`Bridge::replace_schema`]). A read keeps what it read only if the
+    /// count has not moved meanwhile ([`Bridge::keep_unless_moved`]). Never
+    /// reset, not even when a table is dropped: a read from before the drop
+    /// must not find the count it started from again.
+    forgets: Mutex<HashMap<String, u64>>,
     /// Whether the connection forwards to the hosted service (an `http(s)://`
     /// URI) rather than running the engine over storage of its own.
     hosted: bool,
@@ -765,21 +779,130 @@ impl Bridge {
     }
 
     fn table(&self, name: &str) -> Result<Supertable, InfinoError> {
-        if let Some(t) = self.tables.read().map_err(poisoned)?.get(name) {
-            return Ok(t.clone());
+        self.kept_or_read(name, &self.tables, || self.conn.open_table(name))
+    }
+
+    /// The schema document of `name`. On a hosted connection, reading it is
+    /// a request to the service, so it is kept until the table's handle is
+    /// dropped ([`Bridge::forget`], which every change to the table's schema
+    /// here makes) or a write adds a column to it
+    /// ([`Bridge::reread_schema`]): preparing a batch then waits on the
+    /// service only right after such a change, not for each batch. A
+    /// connection over storage answers from the handle it holds open, and is
+    /// asked each time.
+    fn table_schema(&self, name: &str) -> Result<TableSchema, InfinoError> {
+        if !self.hosted {
+            return self.conn.schema(name);
         }
-        let t = self.conn.open_table(name)?;
-        self.tables
-            .write()
-            .map_err(poisoned)?
-            .insert(name.to_string(), t.clone());
-        Ok(t)
+        self.kept_or_read(name, &self.schemas, || self.conn.schema(name))
+    }
+
+    /// What `kept` holds for `name`, or else what `read` gives, which is
+    /// kept unless `name` was forgotten while `read` ran. A read that began
+    /// before a schema change and ends after the change's forget would
+    /// otherwise keep the table as it was before, until the next forget.
+    fn kept_or_read<T: Clone>(
+        &self,
+        name: &str,
+        kept: &RwLock<HashMap<String, T>>,
+        read: impl FnOnce() -> Result<T, InfinoError>,
+    ) -> Result<T, InfinoError> {
+        if let Some(v) = kept.read().map_err(poisoned)?.get(name) {
+            return Ok(v.clone());
+        }
+        let seen = self.forgets_of(name);
+        let v = read()?;
+        self.keep_unless_moved(name, kept, seen, &v)?;
+        Ok(v)
+    }
+
+    /// Keep `v` for `name` in `kept` if `name`'s count is still `seen`, the
+    /// count when the read that gave `v` began ([`Bridge::forgets`]).
+    fn keep_unless_moved<T: Clone>(
+        &self,
+        name: &str,
+        kept: &RwLock<HashMap<String, T>>,
+        seen: u64,
+        v: &T,
+    ) -> Result<(), InfinoError> {
+        // Held while the value is kept, so a forget runs wholly before the
+        // check or wholly after the insert.
+        let forgets = self.forgets.lock().unwrap_or_else(PoisonError::into_inner);
+        if forgets.get(name).copied().unwrap_or(0) == seen {
+            kept.write()
+                .map_err(poisoned)?
+                .insert(name.to_string(), v.clone());
+        }
+        Ok(())
+    }
+
+    /// How many times `name`'s kept handle or schema document has been
+    /// dropped ([`Bridge::forgets`]).
+    fn forgets_of(&self, name: &str) -> u64 {
+        self.forgets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Count a forget of `name` and run `drop`, the dropping of what is kept
+    /// for it, under the count's lock ([`Bridge::keep_unless_moved`]).
+    /// Returns the count after this forget.
+    fn forgetting(&self, name: &str, drop: impl FnOnce()) -> u64 {
+        let mut forgets = self.forgets.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = forgets.entry(name.to_string()).or_default();
+        *count += 1;
+        drop();
+        *count
     }
 
     fn forget(&self, name: &str) {
-        if let Ok(mut tables) = self.tables.write() {
-            tables.remove(name);
+        self.forgetting(name, || {
+            if let Ok(mut tables) = self.tables.write() {
+                tables.remove(name);
+            }
+            if let Ok(mut schemas) = self.schemas.write() {
+                schemas.remove(name);
+            }
+        });
+    }
+
+    /// Read `name`'s schema document again after a write that added a
+    /// column to it: the engine adds one during an append as well as during
+    /// a declaration (a geo_point's first values, a flat_object's members, a
+    /// path the mapping does not declare), and the kept document would
+    /// otherwise lack it until the next declaration. Read on the writing
+    /// thread, which has just been answered by the service, and swapped in
+    /// once read ([`Bridge::replace_schema`]). The handle is kept: a path
+    /// its Arrow schema lacks is converted to the column this document holds
+    /// ([`rows_to_batch`]).
+    fn reread_schema(&self, name: &str) {
+        if !self.hosted {
+            return;
         }
+        let _ = self.replace_schema(name, || self.conn.schema(name));
+    }
+
+    /// Replace `name`'s kept schema document with what `read` gives. The old
+    /// document stays kept while `read` runs, so a thread that stages a bulk
+    /// meanwhile reads it rather than asking the service, and stays kept if
+    /// `read` fails: a stalled service then costs stale columns until the
+    /// next write that adds one, not a staging thread waiting on the
+    /// service. The count is moved before `read` begins, so a read that
+    /// began earlier, a miss or another replace, keeps nothing, and the
+    /// replace that began last is the one kept; a forget while `read` runs
+    /// moves the count again, and this replace keeps nothing either.
+    fn replace_schema(
+        &self,
+        name: &str,
+        read: impl FnOnce() -> Result<TableSchema, InfinoError>,
+    ) -> Result<TableSchema, InfinoError> {
+        let seen = self.forgetting(name, || {});
+        let doc = read()?;
+        self.keep_unless_moved(name, &self.schemas, seen, &doc)?;
+        Ok(doc)
     }
 
     /// Keep [`Bridge::latest`]'s connection open until the hold is let go
@@ -855,6 +978,17 @@ impl Bridge {
         } else {
             usize::MAX
         }
+    }
+
+    /// Whether a keyword field's index takes the engine's `keyword`
+    /// analyzer, one term per value. Not on the hosted service, which
+    /// refuses a table that declares it: there a keyword field keeps the
+    /// default analyzer without positions, and a terms aggregation counts
+    /// its values with a statement ([`infino_value_counts_top`] declines).
+    /// Drop this once the hosted service takes the analyzer (#274); hosted
+    /// tables made before then keep the default analyzer until reloaded.
+    fn keyword_analyzer(&self) -> bool {
+        !self.hosted
     }
 
     /// The [`Gate`] of `name`'s writes on this node.
@@ -972,6 +1106,8 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
     Ok(Bridge {
         conn,
         tables: RwLock::new(HashMap::new()),
+        schemas: RwLock::new(HashMap::new()),
+        forgets: Mutex::new(HashMap::new()),
         hosted,
         kept: RwLock::new(HashMap::new()),
         stamps: RwLock::new(HashMap::new()),
@@ -1810,8 +1946,31 @@ fn declare_table(
                     }
                     _ => None,
                 });
-            // The index a keyword field added now gets: the same, without positions.
-            let exact_index = text_index.clone().map(|index| with_positions(index, false));
+            // The index a keyword field added now gets: the `keyword`
+            // analyzer, each value one term exactly as written, so `=` and
+            // `IN` look a value up whole and the column's term counts are its
+            // value counts. It takes no stopwords or stemmer, and no positions.
+            // Where the connection cannot declare that analyzer
+            // ([`Bridge::keyword_analyzer`]), the text index without positions.
+            let exact_index = text_index.as_ref().map(|index| {
+                if !bridge.keyword_analyzer() {
+                    return with_positions(index.clone(), false);
+                }
+                let mut exact = ColumnIndex::fts(Analyzer::Keyword);
+                if let (
+                    ColumnIndex::Fts { stored, bm25, .. },
+                    ColumnIndex::Fts {
+                        stored: from_stored,
+                        bm25: from_bm25,
+                        ..
+                    },
+                ) = (&mut exact, index)
+                {
+                    *stored = *from_stored;
+                    *bm25 = *from_bm25;
+                }
+                exact
+            });
             let mut conflicts: Vec<String> = Vec::new();
             for f in &mapped {
                 let present = schema.field_with_name(&f.path).is_ok();
@@ -1938,7 +2097,12 @@ fn declare_table(
                 let patch = SchemaPatch::new(patches);
                 let gate = bridge.gate(name);
                 let _pass = gate.whole();
-                waiting(|| table.apply_schema(&patch, None)).map_err(|e| e.to_string())?;
+                let applied = waiting(|| table.apply_schema(&patch, None));
+                // A batch prepared while this ran may have cached the handle (and
+                // schema) from before the change; drop it either way. A read
+                // still in flight then keeps nothing ([`Bridge::kept_or_read`]).
+                bridge.forget(name);
+                applied.map_err(|e| e.to_string())?;
             }
             Ok(json!({ "created": false, "added": added }))
         }
@@ -1963,7 +2127,14 @@ fn declare_table(
                     // order (match_phrase, quoted atoms of a query_string).
                     spec = spec.fts(FtsField::new(f.path.clone()).positions(true));
                 } else if f.exact {
-                    spec = spec.fts(FtsField::new(f.path.clone()));
+                    // One term per value where the connection can declare
+                    // it (see `exact_index` above).
+                    let field = FtsField::new(f.path.clone());
+                    spec = spec.fts(if bridge.keyword_analyzer() {
+                        field.analyzer("keyword")
+                    } else {
+                        field
+                    });
                 }
                 if let Some((dim, metric)) = f.vector {
                     spec = spec.vector(f.path.clone(), dim, metric);
@@ -2099,9 +2270,11 @@ fn is_text_index(column: &str, index: &Option<ColumnIndex>) -> bool {
     }
 }
 
-/// Columns of a table as JSON `[{"name","type","elem","fts","vector"}]`,
+/// Columns of a table as JSON `[{"name","type","elem","fts","vector","range"}]`,
 /// type in {i64,f64,bool,str,ts,vec,list,other}, `elem` a list column's
-/// element type (null for any other). `""` if the table is absent.
+/// element type (null for any other), `range` whether the column has a range
+/// index (a numeric or date field mapped `"index": false` has none). `""` if
+/// the table is absent.
 #[no_mangle]
 pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
@@ -2114,7 +2287,10 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
         // field, or none, a column whose index has no positions is a
         // keyword, as it is in a table of the plugin's own.
         let attached = conn.is_attached(name);
-        match conn.conn.schema(name) {
+        // The plugin asks for the columns again after each append, on the
+        // thread that stages a bulk: on a hosted table, the kept document
+        // answers ([`Bridge::table_schema`]) rather than the service.
+        match conn.table_schema(name) {
             Ok(schema) => {
                 let mut cols: Vec<Value> = schema
                     .fields()
@@ -2136,6 +2312,7 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                                     && matches!(f.index, Some(ColumnIndex::Fts { .. }))
                                     && conn.attached_text(name, &f.name)),
                             "vector": matches!(f.index, Some(ColumnIndex::Vector { .. })),
+                            "range": matches!(f.index, Some(ColumnIndex::Range)),
                         })
                     })
                     .collect();
@@ -2151,6 +2328,7 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                             "elem": null,
                             "fts": false,
                             "vector": false,
+                            "range": false,
                         }));
                     }
                 }
@@ -2469,6 +2647,30 @@ fn unify_new_paths(rows: &mut [Map<String, Value>], schema: &Schema) {
                 scalar => widen_scalar(scalar, to_string, to_float),
             };
         }
+    }
+}
+
+/// Whether `rows` hold a path `schema` has no column for, with a value the
+/// engine adds a column for when they land. A path whose values are all
+/// `null`, `[]` or lists of nulls carries no type, and the engine adds
+/// nothing for it ([`types_a_column`]); counting it would re-read the
+/// schema after every write of such a document, since no write or
+/// declaration ever gives the path a column.
+fn adds_columns(schema: &TableSchema, rows: &[Map<String, Value>]) -> bool {
+    rows.iter().any(|row| {
+        row.iter()
+            .any(|(path, value)| types_a_column(value) && schema.id_of(path).is_none())
+    })
+}
+
+/// Whether `value`, at a path no column declares, gives the engine a type
+/// to add a column with: anything but a `null`, or a list holding nothing
+/// but nulls.
+fn types_a_column(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Array(items) => items.iter().any(|item| !item.is_null()),
+        _ => true,
     }
 }
 
@@ -3565,6 +3767,10 @@ pub unsafe extern "C" fn infino_index_batch(
             Err(why) => return err_json(&why),
         };
         unify_new_paths(&mut maps, &schema);
+        let adds_columns = conn.hosted
+            && conn
+                .table_schema(name)
+                .is_ok_and(|doc| adds_columns(&doc, &maps));
         let indexed: Vec<(usize, Value)> = rows
             .iter()
             .zip(maps)
@@ -3572,6 +3778,9 @@ pub unsafe extern "C" fn infino_index_batch(
             .collect();
         append_checked(&table, &conn.gate(name), &indexed, &mut failed);
         let ok = n - failed.len();
+        if adds_columns && ok > 0 {
+            conn.reread_schema(name);
+        }
         out_json(json!({ "ok": ok, "failed": failed }))
     }))
     .unwrap_or(ptr::null_mut())
@@ -3623,6 +3832,7 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             Err(e) => return err_json(&e.to_string()),
         };
         let n = prepared.n;
+        let adds_columns = prepared.adds_columns;
         let failed = append_prepared(
             &table,
             &conn.gate(name),
@@ -3638,6 +3848,9 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             })
             .collect();
         let ok = n - failed.len();
+        if adds_columns && ok > 0 {
+            conn.reread_schema(name);
+        }
         out_json(json!({ "ok": ok, "failed": failed }))
     }))
     .unwrap_or(ptr::null_mut())
@@ -3653,6 +3866,10 @@ pub struct Prepared {
     values: Vec<Value>,
     index_of: Vec<usize>,
     failed: Vec<(usize, String)>,
+    /// Whether the rows hold a path the kept schema document lacks, so the
+    /// append adds a column to it ([`Bridge::reread_schema`]). Only a hosted
+    /// connection keeps a document; over storage this is false.
+    adds_columns: bool,
 }
 
 /// One row of a buffer handed to [`prepare`]: its id, source, routing value
@@ -3711,7 +3928,7 @@ unsafe fn prepare(
     // it is refused as the append it prepares is.
     conn.refuse_write(name)?;
     let table = conn.table(name).map_err(|e| e.to_string())?;
-    let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
+    let table_schema = conn.table_schema(name).map_err(|e| e.to_string())?;
     let schema = table.schema();
     let kept = conn.kept(name);
     let engine = conn.engine_columns(name);
@@ -3802,13 +4019,14 @@ unsafe fn prepare(
     // the rows are then converted against the schema that holds it.
     let (table_schema, schema) = if ensure_list_columns(conn, name, &schema, &rows)? {
         (
-            conn.conn.schema(name).map_err(|e| e.to_string())?,
+            conn.table_schema(name).map_err(|e| e.to_string())?,
             conn.table(name).map_err(|e| e.to_string())?.schema(),
         )
     } else {
         (table_schema, schema)
     };
     unify_new_paths(&mut rows, &schema);
+    let adds_columns = conn.hosted && adds_columns(&table_schema, &rows);
     let values: Vec<Value> = rows.into_iter().map(Value::Object).collect();
     let batch = if values.is_empty() {
         None
@@ -3821,6 +4039,7 @@ unsafe fn prepare(
         values,
         index_of,
         failed,
+        adds_columns,
     })
 }
 
@@ -4282,6 +4501,7 @@ pub unsafe extern "C" fn infino_append_prepared(
                 })
                 .collect()
         };
+        let adds_columns = owned.iter().any(|p| p.adds_columns);
         let failed = append_prepared(
             &table,
             &conn.gate(name),
@@ -4291,6 +4511,11 @@ pub unsafe extern "C" fn infino_append_prepared(
             conn.id_list_bytes(),
         );
         let ok = n.saturating_sub(failed.len());
+        // A write adds its columns only when it lands, so one that landed
+        // nothing changed nothing, and asks the service nothing more.
+        if adds_columns && ok > 0 {
+            conn.reread_schema(name);
+        }
         let failed: Vec<Value> = failed
             .into_iter()
             .map(|(b, i, reason, permanent)| {
@@ -5483,7 +5708,7 @@ pub unsafe extern "C" fn infino_value_counts(
             // Where the engine's own count fails (the hosted service's does,
             // on a count it declares non-null and gives null), the grouped
             // count as a statement gives the same rows.
-            Err(e) => match conn.conn.query_sql(&grouped_count(name, column, max)) {
+            Err(e) => match conn.conn.query_sql(&grouped_count(name, column, Some(max))) {
                 Ok(b) if b.iter().map(RecordBatch::num_rows).sum::<usize>() > max => {
                     out_string("null".to_string())
                 }
@@ -5495,17 +5720,150 @@ pub unsafe extern "C" fn infino_value_counts(
     .unwrap_or(ptr::null_mut())
 }
 
+/// The `top` most frequent values of a keyword column over the whole table,
+/// by count and then by value (its UTF-8 bytes), with what a terms
+/// aggregation needs to count the rest: `{"rows":[{column, "count(*)"}...],
+/// "keyed_total":n, "nulls":n, "groups":n}`, where `keyed_total` is the rows
+/// with a value, `nulls` the rows without one and `groups` how many values
+/// the column has. One call: the engine reads a keyword column's counts from
+/// its term index, so only `top` rows cross, however many values it has.
+/// `null`, for the caller's own statement to run, for a column without the
+/// `keyword` analyzer (the engine would run the grouped count there, which
+/// the statement runs as well; every column on a hosted connection, see
+/// [`Bridge::keyword_analyzer`]), and where the engine's count fails. The
+/// engine counts every value in memory before the top `n` are picked;
+/// bounding that is infino-ai/infino#1459.
+#[no_mangle]
+pub unsafe extern "C" fn infino_value_counts_top(
+    h: *mut Bridge,
+    name: *const c_char,
+    column: *const c_char,
+    top: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(column)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(column)
+            })
+        else {
+            return ptr::null_mut();
+        };
+        match value_counts_top(conn, name, column, top.max(0) as usize) {
+            Ok(Some(out)) => out_string(out.to_string()),
+            Ok(None) => out_string("null".to_string()),
+            Err(e) => err_json(&e),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// [`infino_value_counts_top`]'s answer, None for a column without the
+/// `keyword` analyzer or where the engine's count fails.
+fn value_counts_top(
+    conn: &Bridge,
+    name: &str,
+    column: &str,
+    top: usize,
+) -> Result<Option<Value>, String> {
+    // No column over this connection has the analyzer: decline without
+    // asking the hosted service for the table's schema.
+    if !conn.keyword_analyzer() {
+        return Ok(None);
+    }
+    let keyword = conn
+        .conn
+        .schema(name)
+        .map_err(|e| e.to_string())?
+        .fields()
+        .iter()
+        .any(|f| {
+            f.name == column
+                && matches!(
+                    f.index,
+                    Some(ColumnIndex::Fts {
+                        analyzer: Analyzer::Keyword,
+                        ..
+                    })
+                )
+        });
+    if !keyword {
+        return Ok(None);
+    }
+    let table = conn.table(name).map_err(|e| e.to_string())?;
+    // Where the engine's own count fails, decline: the caller's bounded
+    // statement gives the same answer, where a grouped count here would
+    // bring every value of the column across the bridge.
+    match table.value_counts(column) {
+        Ok(b) => Ok(top_values(&[b], column, top)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// [`infino_value_counts_top`]'s answer from a column's value counts
+/// (`batches`, each the value then its count). None when the values are not
+/// strings or the counts not integers.
+fn top_values(batches: &[RecordBatch], column: &str, top: usize) -> Option<Value> {
+    let is_text =
+        |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+    let mut values: Vec<LargeStringArray> = Vec::with_capacity(batches.len());
+    let mut counts: Vec<Int64Array> = Vec::with_capacity(batches.len());
+    for b in batches {
+        if b.num_columns() < 2 {
+            return None;
+        }
+        let text = match b.column(0).data_type() {
+            DataType::Dictionary(_, v) => is_text(v),
+            t => is_text(t),
+        };
+        if !text {
+            return None;
+        }
+        let v = datafusion::arrow::compute::cast(b.column(0), &DataType::LargeUtf8).ok()?;
+        let n = datafusion::arrow::compute::cast(b.column(1), &DataType::Int64).ok()?;
+        values.push(v.as_any().downcast_ref::<LargeStringArray>()?.clone());
+        counts.push(n.as_any().downcast_ref::<Int64Array>()?.clone());
+    }
+    let groups: usize = values.iter().map(|v| v.len() - v.null_count()).sum();
+    let (mut nulls, mut keyed_total) = (0i64, 0i64);
+    let mut keyed: Vec<(i64, &str)> = Vec::with_capacity(groups);
+    for (v, n) in values.iter().zip(&counts) {
+        for i in 0..v.len() {
+            let count = if n.is_null(i) { 0 } else { n.value(i) };
+            if v.is_null(i) {
+                nulls += count;
+            } else {
+                keyed_total += count;
+                keyed.push((count, v.value(i)));
+            }
+        }
+    }
+    let top = top.min(groups);
+    // Count descending, then the value's bytes ascending: a terms
+    // aggregation's default order, as the plugin's window statement ranks.
+    let order = |a: &(i64, &str), b: &(i64, &str)| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1));
+    if top > 0 && top < groups {
+        keyed.select_nth_unstable_by(top - 1, order);
+    }
+    keyed.truncate(top);
+    keyed.sort_unstable_by(order);
+    let rows: Vec<Value> = keyed
+        .into_iter()
+        .map(|(n, v)| json!({ column: v, "count(*)": n }))
+        .collect();
+    Some(json!({ "rows": rows, "keyed_total": keyed_total, "nulls": nulls, "groups": groups }))
+}
+
 /// The grouped count [`infino_value_counts`] gives, as a statement: each
 /// value of `column` in `name` and its rows, under the names the engine's
-/// own count gives them. It stops one group past `max`, which is all the
-/// caller needs to know the column holds too many values to carry.
-fn grouped_count(name: &str, column: &str, max: usize) -> String {
+/// own count gives them. With a `max`, it stops one group past it, which is
+/// all the caller needs to know the column holds too many values to carry.
+fn grouped_count(name: &str, column: &str, max: Option<usize>) -> String {
     let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
     let (table, column) = (quote(name), quote(column));
-    let limit = max.saturating_add(1);
-    format!(
-        "SELECT {column}, count(*) AS \"count(*)\" FROM {table} GROUP BY {column} LIMIT {limit}"
-    )
+    let limit = max.map_or(String::new(), |max| {
+        format!(" LIMIT {}", max.saturating_add(1))
+    });
+    format!("SELECT {column}, count(*) AS \"count(*)\" FROM {table} GROUP BY {column}{limit}")
 }
 
 /// Unranked full-text match set: the osids of every row matching `query` on
@@ -5787,6 +6145,14 @@ mod tests {
     /// A fresh catalog on local disk: `memory://` tables have no durable
     /// storage, and delete / update need one.
     fn open_logs() -> *mut Bridge {
+        let h = open_storage();
+        let out = ensure(h, MAPPING);
+        assert!(out.contains("\"created\":true"), "{out}");
+        h
+    }
+
+    /// A connection over a fresh directory, with no table declared yet.
+    fn open_storage() -> *mut Bridge {
         let dir = std::env::temp_dir().join(format!(
             "infino-capi-test-{}-{}-{}",
             std::process::id(),
@@ -5800,9 +6166,204 @@ mod tests {
         let uri = format!("file://{}", dir.display());
         let h = unsafe { infino_open(c(&uri).as_ptr()) };
         assert!(!h.is_null());
-        let out = ensure(h, MAPPING);
-        assert!(out.contains("\"created\":true"), "{out}");
         h
+    }
+
+    /// On a hosted connection the schema document a batch is prepared
+    /// against is kept with the table's handle, so preparing batch after
+    /// batch asks the service nothing; a declaration that changes the table
+    /// drops it, and the next batch reads the new one.
+    #[test]
+    fn a_hosted_tables_schema_is_kept_until_a_declaration_changes_it() {
+        let h = open_logs();
+        let names = |s: &TableSchema| s.fields().iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+        // Storage answers the same document a hosted service would; the flag
+        // is what makes the bridge keep it.
+        unsafe { (*h).hosted = true };
+        let bridge = unsafe { &*h };
+        let before = names(&bridge.table_schema("logs").unwrap());
+        // A column added behind the bridge is not seen: the document is kept.
+        let behind = SchemaPatch::new(vec![FieldPatch::named("behind".to_string())
+            .with_type(DataType::Int64)
+            .with_nullable(true)]);
+        let table = bridge.conn.open_table("logs").unwrap();
+        table.apply_schema(&behind, None).unwrap();
+        assert_eq!(names(&bridge.table_schema("logs").unwrap()), before);
+        // A declaration that adds a column drops it.
+        let out = ensure(h, r#"{"properties":{"added":{"type":"long"}}}"#);
+        assert!(!out.contains("error"), "{out}");
+        let after = names(&bridge.table_schema("logs").unwrap());
+        assert!(after.contains(&"added".to_string()), "{after:?}");
+        assert!(after.contains(&"behind".to_string()), "{after:?}");
+    }
+
+    /// The names of the columns [`infino_columns`] reports for `logs`.
+    fn column_names(h: *mut Bridge) -> Vec<String> {
+        columns(h)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|col| col["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// The names of `schema`'s fields.
+    fn field_names(schema: &TableSchema) -> Vec<String> {
+        schema.fields().iter().map(|f| f.name.clone()).collect()
+    }
+
+    /// Add a nullable long column `column` to `logs` behind the bridge, as
+    /// another node's declaration would: a hosted bridge's kept schema
+    /// document lacks it until the bridge reads the document again, so
+    /// whether a read sees it tells whether that read asked the service.
+    fn add_column_behind(h: *mut Bridge, column: &str) {
+        let patch = SchemaPatch::new(vec![FieldPatch::named(column.to_string())
+            .with_type(DataType::Int64)
+            .with_nullable(true)]);
+        let table = unsafe { &*h }.conn.open_table("logs").unwrap();
+        table.apply_schema(&patch, None).unwrap();
+    }
+
+    /// The engine adds columns during an append as well as during a
+    /// declaration: a geo_point's first values, a flat_object's members, a
+    /// path the mapping does not declare. On a hosted table the kept schema
+    /// document is read again after an append that added one, so the
+    /// table's columns hold it right away, as they do over storage; an
+    /// append that adds none keeps the document, so staging the next batch
+    /// still asks the service nothing.
+    #[test]
+    fn a_column_an_append_adds_is_among_the_columns_right_after_it() {
+        for hosted in [false, true] {
+            let h = open_logs();
+            unsafe { (*h).hosted = hosted };
+            let out = ensure(h, r#"{"properties":{"fo":{"type":"flat_object"}}}"#);
+            assert!(!out.contains("error"), "{out}");
+            let doc = r#"{"level":"info","geo":[1.0,2.0],"fo":{"a":1},"un":7}"#;
+            let p = prepared(h, &[("y", doc)]);
+            assert_eq!(append_replacing(h, p, &[])["ok"], 1);
+            let cols = column_names(h);
+            for added in ["geo", "fo.a", "un"] {
+                assert!(
+                    cols.contains(&added.to_string()),
+                    "hosted = {hosted}: {added} missing from {cols:?}"
+                );
+            }
+            if hosted {
+                // A column added behind the bridge stays unseen through an
+                // append that adds none: that append kept the document.
+                add_column_behind(h, "behind");
+                let p = prepared(h, &[("z", r#"{"level":"warn","un":8}"#)]);
+                assert_eq!(append_replacing(h, p, &[])["ok"], 1);
+                let cols = column_names(h);
+                assert!(!cols.contains(&"behind".to_string()), "{cols:?}");
+            }
+            close(h);
+        }
+    }
+
+    /// The engine adds no column for a path that holds only `null`, `[]` or
+    /// a list of nulls, so an append of such a document adds none either,
+    /// and keeps the hosted table's schema document: were it read again,
+    /// every later write of the document would read it again too, since
+    /// nothing ever gives the path a column.
+    #[test]
+    fn a_path_holding_only_nulls_or_empty_lists_keeps_the_schema_document() {
+        for doc in [
+            r#"{"level":"info","nul":null}"#,
+            r#"{"level":"info","emp":[]}"#,
+            r#"{"level":"info","nuls":[null,null]}"#,
+        ] {
+            let h = open_logs();
+            unsafe { (*h).hosted = true };
+            let p = prepared(h, &[("a", doc)]);
+            assert_eq!(append_replacing(h, p, &[])["ok"], 1, "{doc}");
+            add_column_behind(h, "behind");
+            let p = prepared(h, &[("b", doc)]);
+            assert!(!unsafe { &*p }.adds_columns, "{doc}");
+            assert_eq!(append_replacing(h, p, &[])["ok"], 1, "{doc}");
+            let cols = column_names(h);
+            assert!(!cols.contains(&"behind".to_string()), "{doc}: {cols:?}");
+            close(h);
+        }
+    }
+
+    /// A read of a hosted table's schema document that begins before a
+    /// declaration changes the table and ends after the declaration's last
+    /// forget returns what it read, but keeps nothing: the next read asks
+    /// again and finds the declared column.
+    #[test]
+    fn a_schema_read_a_declaration_overtakes_keeps_nothing() {
+        let h = open_logs();
+        unsafe { (*h).hosted = true };
+        let bridge = unsafe { &*h };
+        let read = bridge
+            .kept_or_read("logs", &bridge.schemas, || {
+                let before = bridge.conn.schema("logs");
+                // The declaration runs wholly between the read and its keep.
+                let out = ensure(h, r#"{"properties":{"added":{"type":"long"}}}"#);
+                assert!(out.contains("\"added\":1"), "{out}");
+                before
+            })
+            .unwrap();
+        assert!(!field_names(&read).contains(&"added".to_string()));
+        let now = field_names(&bridge.table_schema("logs").unwrap());
+        assert!(now.contains(&"added".to_string()), "{now:?}");
+        close(h);
+    }
+
+    /// Re-reading a hosted table's schema document after a write leaves the
+    /// old document kept while the read runs and if it fails: a stalled
+    /// service must not leave a thread that stages a bulk with nothing kept,
+    /// asking the service itself. Once a read succeeds, its document is
+    /// swapped in.
+    #[test]
+    fn a_failed_schema_reread_keeps_the_old_document() {
+        let h = open_logs();
+        unsafe { (*h).hosted = true };
+        let bridge = unsafe { &*h };
+        bridge.table_schema("logs").unwrap();
+        add_column_behind(h, "behind");
+        let failed = bridge.replace_schema("logs", || {
+            // The old document is still what staging reads mid-read.
+            let mid = field_names(&bridge.table_schema("logs").unwrap());
+            assert!(!mid.contains(&"behind".to_string()), "{mid:?}");
+            Err(InfinoError::Backend("the service did not answer".into()))
+        });
+        assert!(failed.is_err());
+        // Staging still reads the kept document, not the service.
+        let p = prepared(h, &[("a", r#"{"level":"info"}"#)]);
+        unsafe { infino_free_prepared(p) };
+        let kept = field_names(&bridge.table_schema("logs").unwrap());
+        assert!(!kept.contains(&"behind".to_string()), "{kept:?}");
+        bridge
+            .replace_schema("logs", || bridge.conn.schema("logs"))
+            .unwrap();
+        let now = field_names(&bridge.table_schema("logs").unwrap());
+        assert!(now.contains(&"behind".to_string()), "{now:?}");
+        close(h);
+    }
+
+    /// A read on a miss that a re-read overtakes keeps nothing, so it cannot
+    /// put back a document older than the one the re-read swapped in.
+    #[test]
+    fn a_schema_read_a_reread_overtakes_keeps_nothing() {
+        let h = open_logs();
+        unsafe { (*h).hosted = true };
+        let bridge = unsafe { &*h };
+        let read = bridge
+            .kept_or_read("logs", &bridge.schemas, || {
+                let before = bridge.conn.schema("logs");
+                add_column_behind(h, "behind");
+                bridge
+                    .replace_schema("logs", || bridge.conn.schema("logs"))
+                    .unwrap();
+                before
+            })
+            .unwrap();
+        assert!(!field_names(&read).contains(&"behind".to_string()));
+        let now = field_names(&bridge.table_schema("logs").unwrap());
+        assert!(now.contains(&"behind".to_string()), "{now:?}");
+        close(h);
     }
 
     /// An array of arrays at a path without a column (a geo_point given
@@ -5844,10 +6405,13 @@ mod tests {
             assert_eq!(out["ok"], 1, "{doc}: {out}");
         }
         // Those writes gave geo and fo.a list columns typed from their values.
-        let cols = take(unsafe { infino_columns(h, c("logs").as_ptr()) });
+        let cols = columns(h);
         for path in ["geo", "fo.a"] {
             assert!(
-                cols.contains(&format!("\"name\":\"{path}\",\"type\":\"list\"")),
+                cols.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|cc| cc["name"] == path && cc["type"] == "list"),
                 "{path}: {cols}"
             );
         }
@@ -6181,6 +6745,146 @@ mod tests {
             counted(&value_counts(h, "level", GROUPS), "level", "count(*)"),
             counted(&sql(h, grouped_sql), "level", "n")
         );
+        close(h);
+    }
+
+    fn value_counts_top(h: *mut Bridge, column: &str, top: c_int) -> Value {
+        let out = take(unsafe {
+            infino_value_counts_top(h, c("logs").as_ptr(), c(column).as_ptr(), top)
+        });
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
+    /// `(value, count)` pairs of a top answer's rows, in its order.
+    fn top_rows(out: &Value) -> Vec<(String, i64)> {
+        out["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["level"].as_str().unwrap().to_string(),
+                    r["count(*)"].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn value_counts_top_ranks_by_count_then_value_and_counts_the_rest() {
+        let h = open_logs();
+        // b and a tie at 2, e, c and d at 1; two rows have no level.
+        index(
+            h,
+            &[
+                ("1", r#"{"level":"b"}"#),
+                ("2", r#"{"level":"a"}"#),
+                ("3", r#"{"level":"e"}"#),
+                ("4", r#"{"level":"b"}"#),
+                ("5", r#"{"level":"c"}"#),
+                ("6", r#"{"level":"a"}"#),
+                ("7", r#"{"level":"d"}"#),
+                ("8", r#"{"message":"no level"}"#),
+                ("9", r#"{"message":"no level"}"#),
+            ],
+        );
+        let pairs = |v: &[(&str, i64)]| -> Vec<(String, i64)> {
+            v.iter().map(|(k, n)| (k.to_string(), *n)).collect()
+        };
+        let out = value_counts_top(h, "level", 3);
+        // Ties break by value ascending, as a terms aggregation orders them.
+        assert_eq!(top_rows(&out), pairs(&[("a", 2), ("b", 2), ("c", 1)]));
+        assert_eq!(out["keyed_total"], json!(7));
+        assert_eq!(out["nulls"], json!(2));
+        assert_eq!(out["groups"], json!(5));
+        // More asked for than there are values: every value, in order.
+        let all = value_counts_top(h, "level", 50);
+        assert_eq!(
+            top_rows(&all),
+            pairs(&[("a", 2), ("b", 2), ("c", 1), ("d", 1), ("e", 1)])
+        );
+        assert_eq!(all["keyed_total"], json!(7));
+        // None asked for: no rows, the counts still whole.
+        let none = value_counts_top(h, "level", 0);
+        assert!(top_rows(&none).is_empty());
+        assert_eq!(none["keyed_total"], json!(7));
+        assert_eq!(none["groups"], json!(5));
+        // A column without the keyword analyzer declines too: a number, and
+        // a text field (its own analyzer splits values into words).
+        index(h, &[("10", r#"{"status":200,"message":"no level here"}"#)]);
+        assert_eq!(value_counts_top(h, "status", 3), Value::Null);
+        assert_eq!(value_counts_top(h, "message", 3), Value::Null);
+        // After a delete the engine's term counts leave the deleted row out
+        // themselves; same ranking.
+        assert_eq!(delete(h, &["1"]), 0);
+        let out = value_counts_top(h, "level", 2);
+        assert_eq!(top_rows(&out), pairs(&[("a", 2), ("b", 1)]));
+        assert_eq!(out["keyed_total"], json!(6));
+        assert_eq!(out["nulls"], json!(3));
+        close(h);
+    }
+
+    /// The hosted service refuses a table that declares the `keyword`
+    /// analyzer, so a hosted connection declares keyword fields as it did
+    /// before that analyzer: the default analyzer, without positions, at
+    /// creation and when mapped later. The top call then declines and the
+    /// value counts still answer. Such a table read over storage of its own
+    /// declines too, since its columns lack the analyzer.
+    #[test]
+    fn a_hosted_connection_declares_keyword_fields_without_the_keyword_analyzer() {
+        let h = open_storage();
+        // Storage answers as the hosted service would; the flag picks the path.
+        unsafe { (*h).hosted = true };
+        let out = ensure(h, MAPPING);
+        assert!(out.contains("\"created\":true"), "{out}");
+        let out = ensure(h, r#"{"properties":{"host":{"type":"keyword"}}}"#);
+        assert!(out.contains("\"added\":1"), "{out}");
+        let schema = unsafe { &*h }.conn.schema("logs").unwrap();
+        for name in ["level", "http.method", "host"] {
+            let index = schema
+                .fields()
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.index.clone())
+                .unwrap();
+            assert!(
+                matches!(
+                    &index,
+                    Some(ColumnIndex::Fts {
+                        positions: false,
+                        analyzer,
+                        ..
+                    }) if !matches!(analyzer, Analyzer::Keyword)
+                ),
+                "{name}: {index:?}"
+            );
+        }
+        index(
+            h,
+            &[
+                ("1", r#"{"level":"b","host":"x"}"#),
+                ("2", r#"{"level":"a","host":"x"}"#),
+                ("3", r#"{"level":"b","host":"y"}"#),
+                ("4", r#"{"message":"no level"}"#),
+            ],
+        );
+        assert_eq!(value_counts_top(h, "level", 5), Value::Null);
+        assert_eq!(value_counts_top(h, "host", 5), Value::Null);
+        assert_eq!(
+            counted(&value_counts(h, "level", 10), "level", "count(*)"),
+            [
+                ("\"a\"".to_string(), 1),
+                ("\"b\"".to_string(), 2),
+                ("null".to_string(), 1)
+            ]
+        );
+        // `=` still matches a whole value.
+        let hits = sql(h, "SELECT osid FROM logs WHERE level = 'b' ORDER BY osid");
+        assert_eq!(hits, json!([{"osid":"1"},{"osid":"3"}]));
+        // Over storage of its own, the table's keyword columns still lack the
+        // analyzer: the top call declines rather than read empty term counts.
+        unsafe { (*h).hosted = false };
+        assert_eq!(value_counts_top(h, "level", 5), Value::Null);
         close(h);
     }
 
@@ -6687,12 +7391,12 @@ mod tests {
     #[test]
     fn the_grouped_count_stops_one_group_past_what_the_caller_carries() {
         assert_eq!(
-            grouped_count("t", "a\"b", 10),
+            grouped_count("t", "a\"b", Some(10)),
             "SELECT \"a\"\"b\", count(*) AS \"count(*)\" FROM \"t\" GROUP BY \"a\"\"b\" LIMIT 11"
         );
         let h = open_logs();
         plain_table(bridge_ref(h).unwrap());
-        let groups = sql(h, &grouped_count("plain", "status", 1));
+        let groups = sql(h, &grouped_count("plain", "status", Some(1)));
         assert_eq!(groups.as_array().unwrap().len(), 2, "one past the two a caller of 1 carries");
         close(h);
     }
@@ -6749,6 +7453,33 @@ mod tests {
             .collect();
         ranged.sort();
         assert_eq!(ranged, ["@timestamp", "http.code", "status", "took"]);
+    }
+
+    /// The columns say which have a range index, at creation and when a
+    /// later mapping adds a field: an unindexed numeric field has none.
+    #[test]
+    fn the_columns_say_which_have_a_range_index() {
+        let h = open_logs();
+        let out = ensure(
+            h,
+            r#"{"properties":{"added":{"type":"long"},"unread":{"type":"long","index":false}}}"#,
+        );
+        assert!(!out.contains("error"), "{out}");
+        let cols = columns(h);
+        let range = |n: &str| {
+            cols.as_array()
+                .unwrap()
+                .iter()
+                .find(|cc| cc["name"] == n)
+                .unwrap_or_else(|| panic!("no column {n} in {cols}"))["range"]
+                .clone()
+        };
+        assert_eq!(range("@timestamp"), true);
+        assert_eq!(range("status"), true);
+        assert_eq!(range("added"), true);
+        assert_eq!(range("unread"), false);
+        assert_eq!(range("level"), false);
+        close(h);
     }
 
     #[test]
@@ -7079,6 +7810,7 @@ mod tests {
                 matches!(
                     index_of(name),
                     Some(ColumnIndex::Fts {
+                        analyzer: Analyzer::Keyword,
                         positions: false,
                         ..
                     })
