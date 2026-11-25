@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -273,12 +274,14 @@ public class InfinoEngineTests extends OpenSearchTestCase {
 
             assertEquals(1, appends.get());
             assertEquals("every write comes back to retry after a " + status, Set.copyOf(ids), first.retry().entries.keySet());
+            assertNotNull("the commit says the service did not answer, so a replay waits", first.unavailable());
 
             InfinoEngine.Batch open = new InfinoEngine.Batch();
             open.putBack(first.retry()); // as the commit puts back what it did not take
             InfinoEngine.Written second = InfinoEngine.write("t", 1, open, held -> {}, () -> {}, (id, v) -> null);
 
             assertTrue("the next commit takes every write", second.retry().isEmpty());
+            assertNull(second.unavailable());
             assertEquals(2, appends.get());
             assertEquals("the retried rows replace the ones the first append landed", Set.copyOf(ids), replacedByAppend.get(1));
         } finally {
@@ -537,16 +540,65 @@ public class InfinoEngineTests extends OpenSearchTestCase {
         assertTrue(batch.isEmpty());
     }
 
-    /** A 502, 503 or 504 from the bridge is the hosted service not answering; any other failure is not. */
-    public void testOnlyAServiceThatDidNotAnswerIsUnanswered() {
-        for (RestStatus status : List.of(RestStatus.BAD_GATEWAY, RestStatus.SERVICE_UNAVAILABLE, RestStatus.GATEWAY_TIMEOUT)) {
-            assertTrue(status.name(), InfinoEngine.unanswered(new InfinoNative.InfinoException("no answer", status)));
-        }
-        assertTrue(InfinoEngine.unanswered(new IllegalStateException("wrapped", new InfinoNative.InfinoException("x", RestStatus.GATEWAY_TIMEOUT))));
-        for (RestStatus status : List.of(RestStatus.REQUEST_ENTITY_TOO_LARGE, RestStatus.BAD_REQUEST, RestStatus.INTERNAL_SERVER_ERROR)) {
+    /**
+     * A failure is the hosted service not answering when the bridge marks it
+     * so, whatever status it carries: a refused or broken connection and a
+     * request past its deadline as well as a 502, 503 or 504. Wrapped, too.
+     * A failure without the mark is not, a 503 included.
+     */
+    public void testAServiceIsUnansweredByTheBridgesMarkNotByStatus() {
+        for (RestStatus status : List.of(
+            RestStatus.INTERNAL_SERVER_ERROR,
+            RestStatus.BAD_GATEWAY,
+            RestStatus.SERVICE_UNAVAILABLE,
+            RestStatus.GATEWAY_TIMEOUT
+        )) {
+            assertTrue(status.name(), InfinoEngine.unanswered(new InfinoNative.InfinoException("no answer", status, true)));
             assertFalse(status.name(), InfinoEngine.unanswered(new InfinoNative.InfinoException("refused", status)));
         }
+        assertTrue(InfinoEngine.unanswered(new IllegalStateException("wrapped", new InfinoNative.InfinoException("x", RestStatus.SERVICE_UNAVAILABLE, true))));
         assertFalse(InfinoEngine.unanswered(new IllegalStateException("the bridge could not prepare a batch")));
+    }
+
+    /**
+     * A refused connection reaches the engine as the bridge reports it, an
+     * error marked {@code unavailable}: the commit keeps its batch and says
+     * the service did not answer, so a replay waits rather than stops. Any
+     * other failure of the append is thrown, and is no outage.
+     */
+    public void testARefusedConnectionIsAnUnansweredCommitNotARefusal() {
+        String refused = "{\"error\":\"the hosted service could not be reached or did not answer in time; try again later: "
+            + "append: transport error: Connection Failed: Connect error: Connection refused (os error 111)\",\"unavailable\":true,\"status\":503}";
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with", "infino_prepare_batch_meta" -> new Memory(1);
+            case "infino_append_prepared" -> string(refused);
+            default -> null;
+        }));
+        try {
+            InfinoEngine.Batch batch = new InfinoEngine.Batch();
+            batch.add("a", InfinoEngine.Base.ABSENT, write(0, "{}"));
+            InfinoEngine.Written w = InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null);
+            assertEquals(Set.of("a"), w.retry().entries.keySet());
+            assertTrue(w.unavailable(), w.unavailable().contains("Connection refused"));
+        } finally {
+            InfinoNative.useLib(null);
+        }
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with", "infino_prepare_batch_meta" -> new Memory(1);
+            case "infino_append_prepared" -> string("{\"error\":\"append: server returned 413: too large\",\"status\":413}");
+            default -> null;
+        }));
+        try {
+            InfinoEngine.Batch batch = new InfinoEngine.Batch();
+            batch.add("a", InfinoEngine.Base.ABSENT, write(0, "{}"));
+            InfinoNative.InfinoException e = expectThrows(
+                InfinoNative.InfinoException.class,
+                () -> InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null)
+            );
+            assertFalse(InfinoEngine.unanswered(e));
+        } finally {
+            InfinoNative.useLib(null);
+        }
     }
 
     /**
@@ -586,6 +638,23 @@ public class InfinoEngineTests extends OpenSearchTestCase {
         assertTrue("held at the bound: " + replay.most, replay.most <= BOUND + 1);
     }
 
+    /**
+     * The same when a commit throws a failure the bridge marks
+     * {@code unavailable}, whatever its status (a refused connection carries
+     * none of 502, 503 or 504): it is noted as unanswered, and the replay
+     * waits and goes on.
+     */
+    public void testAReplayWaitsWhenACommitFailsMarkedUnavailable() {
+        FakeReplay replay = new FakeReplay(UNANSWERED_COMMITS, false);
+        replay.throwsUnanswered = true;
+        long ops = 3 * BOUND;
+        replay.run(ops);
+        assertEquals(ops, replay.added);
+        assertEquals(0, replay.unansweredLeft);
+        assertTrue("it waited on its own thread", replay.parks > 0);
+        assertTrue("held at the bound: " + replay.most, replay.most <= BOUND + 1);
+    }
+
     /** A replay waiting for the hosted service stops once the engine closes. */
     public void testAReplayWaitingForTheServiceStopsWhenTheEngineCloses() {
         FakeReplay replay = new FakeReplay(Integer.MAX_VALUE, false);
@@ -610,39 +679,58 @@ public class InfinoEngineTests extends OpenSearchTestCase {
     }
 
     /**
-     * A replay that may not wait (it runs under the commit lock) goes on
-     * while the hosted service does not answer, and its full batches commit
-     * after each wait.
+     * The history a copy writes into the table on becoming primary is never
+     * held: a promotion writes it while every operation on the shard is
+     * blocked. Whether the hosted service does not answer or the table
+     * refuses the writes, the fill neither sleeps nor throws, goes through
+     * the whole history, and backs its commits off: once two have stalled
+     * (here the clock does not move), it commits no more, and the writes stay
+     * in the batch. A recovery held in the same state stops instead.
      */
-    public void testAReplayThatMayNotWaitGoesOnWhileTheServiceDoesNotAnswer() {
-        AtomicLong clock = new AtomicLong();
-        InfinoEngine.Stalls stalls = new InfinoEngine.Stalls(clock::get, n -> fail("a replay that may not wait slept"));
-        stalls.noteStall(true, "no answer");
-        stalls.noteStall(true, "no answer");
-        AtomicLong commits = new AtomicLong();
-        stalls.hold(new InfinoEngine.Replay() {
-            @Override
-            public String name() {
-                return "replaying a test history";
-            }
-
-            @Override
-            public String backlog() {
-                return "every write";
-            }
-
-            @Override
-            public void commit() {
+    public void testAPromotionsFillNeitherWaitsNorFailsWhileTheTableTakesNothing() {
+        for (boolean refuses : new boolean[] { false, true }) {
+            AtomicLong clock = new AtomicLong();
+            InfinoEngine.Stalls stalls = new InfinoEngine.Stalls(clock::get, n -> fail("a fill slept"));
+            AtomicLong waiting = new AtomicLong();
+            AtomicLong commits = new AtomicLong();
+            List<RuntimeException> failures = new ArrayList<>();
+            BooleanSupplier commit = () -> {
                 commits.incrementAndGet();
-            }
-
-            @Override
-            public boolean closing() {
+                if (refuses) {
+                    stalls.noteStall(false, "the table refused them");
+                    throw new IllegalStateException("the table refused them");
+                }
+                stalls.noteStall(true, "the hosted service did not answer");
                 return false;
+            };
+            long ops = 3 * BOUND;
+            for (long op = 0; op < ops; op++) {
+                if (waiting.incrementAndGet() % BATCH_DOCS == 0) {
+                    InfinoEngine.fillCommit(stalls, () -> InfinoEngine.pastBound(waiting.get(), 0), commit, failures::add);
+                }
             }
-        }, false);
-        assertEquals(0, commits.get());
-        assertFalse(stalls.fullBatchMayCommit(true));
+            InfinoEngine.fillCommit(stalls, () -> InfinoEngine.pastBound(waiting.get(), 0), commit, failures::add);
+            assertEquals("every operation of the history is written to the batch", ops, waiting.get());
+            assertEquals("backed off after two stalls", 2, commits.get());
+            assertEquals(refuses ? 2 : 0, failures.size());
+
+            FakeReplay recovery = new FakeReplay(0, true);
+            expectThrows(IllegalStateException.class, () -> recovery.run(3 * BOUND));
+        }
+    }
+
+    /** A fill commits as often as full batches ask while the table takes its commits. */
+    public void testAFillCommitsEachFullBatchWhileTheTableTakesThem() {
+        InfinoEngine.Stalls stalls = new InfinoEngine.Stalls(System::nanoTime, n -> fail("a fill slept"));
+        AtomicLong commits = new AtomicLong();
+        for (int i = 0; i < 5; i++) {
+            InfinoEngine.fillCommit(stalls, () -> false, () -> {
+                commits.incrementAndGet();
+                stalls.noteProgress();
+                return true;
+            }, e -> fail(e.getMessage()));
+        }
+        assertEquals(5, commits.get());
     }
 
     /** A write of operation {@code seq} that is not gated: a replay's; {@code source} null for a delete. */
@@ -671,6 +759,7 @@ public class InfinoEngineTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong();
         final InfinoEngine.Stalls stalls;
         final boolean refuses;
+        boolean throwsUnanswered = false;
         int unansweredLeft;
         int closeAfterParks = Integer.MAX_VALUE;
         int parks = 0;
@@ -692,7 +781,7 @@ public class InfinoEngineTests extends OpenSearchTestCase {
                 waiting++;
                 added++;
                 most = Math.max(most, waiting);
-                stalls.hold(this, true);
+                stalls.hold(this);
                 if (waiting >= BATCH_DOCS && stalls.fullBatchMayCommit(InfinoEngine.pastBound(waiting, 0))) {
                     try {
                         commit();
@@ -721,9 +810,19 @@ public class InfinoEngineTests extends OpenSearchTestCase {
             }
             if (unansweredLeft > 0) {
                 unansweredLeft--;
-                InfinoNative.InfinoException e = new InfinoNative.InfinoException("no answer", RestStatus.SERVICE_UNAVAILABLE);
-                stalls.noteStall(InfinoEngine.unanswered(e), e.getMessage());
-                throw e;
+                if (throwsUnanswered) {
+                    // As the engine's commit notes a failure it throws: by the bridge's mark.
+                    InfinoNative.InfinoException e = new InfinoNative.InfinoException(
+                        "transport error: Connection refused",
+                        RestStatus.INTERNAL_SERVER_ERROR,
+                        true
+                    );
+                    stalls.noteStall(InfinoEngine.unanswered(e), e.getMessage());
+                    throw e;
+                }
+                // As the engine's commit does: the batch comes back, and the stall is noted as unanswered.
+                stalls.noteStall(true, "the hosted service did not answer: transport error: Connection refused");
+                return;
             }
             waiting -= Math.min(waiting, BATCH_DOCS);
             stalls.noteProgress();

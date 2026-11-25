@@ -45,7 +45,6 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
-import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -60,6 +59,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiFunction;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
@@ -198,11 +198,6 @@ public class InfinoEngine extends InternalEngine {
     private static final int STALL_REASON_MAX = 512;
     /** The longest a held replay sleeps before it looks again whether the engine is closing. */
     private static final long HOLD_POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
-    /**
-     * The statuses of a hosted service that did not answer: a gateway that
-     * could not reach it, the service unavailable, a gateway's timeout.
-     */
-    private static final Set<RestStatus> UNANSWERED = EnumSet.of(RestStatus.BAD_GATEWAY, RestStatus.SERVICE_UNAVAILABLE, RestStatus.GATEWAY_TIMEOUT);
     /** Locks over ids that order each id's skeleton write with its record in the batch. */
     private static final int ID_LOCK_STRIPES = 1024;
     /** Skeleton readers whose covered sequence number is remembered; a search on an older one sees no stamped row. */
@@ -508,9 +503,11 @@ public class InfinoEngine extends InternalEngine {
      * commit again: a second after the first, twice as long after each
      * further one, up to thirty seconds ({@link InfinoEngine#stallBackoffNanos}).
      *
-     * <p>A replay (a translog recovery, or the history a copy writes into the
-     * table on becoming primary) is not refused write by write as a client's
-     * write is (see {@link InfinoEngine#refuseWhileBacklogged}); this holds it instead.
+     * <p>A replay (a translog recovery, or a peer recovery's operations) is
+     * not refused write by write as a client's write is (see
+     * {@link InfinoEngine#refuseWhileBacklogged}); this holds it instead. The
+     * history a copy writes into the table on becoming primary is not held
+     * (see {@link InfinoEngine#fillTable}): its commits only back off.
      * While commits stall, a full batch past the bound a client's write is
      * refused at commits at once until {@link InfinoEngine#STALLS_BEFORE_REPLAY_HOLDS}
      * commits have stalled, and from then {@link #hold} holds the replay
@@ -581,18 +578,14 @@ public class InfinoEngine extends InternalEngine {
          * outage, which passes on its own), the replay waits on its own
          * thread for the next try, tries the commit then, and goes on once a
          * commit takes a write: the shard recovers by itself when the
-         * service is back. It stops when the engine closes. A replay that
-         * may not wait ({@code mayWait} false: it runs under the commit lock,
-         * which every commit and the engine's close need) goes on instead,
-         * and its full batches commit after each wait: it holds at most the
-         * history from where the table's lease holds it, which it reads once.
+         * service is back. It stops when the engine closes.
          *
          * <p>Any other failure (the table refusing what the writes carry, a
          * request too large) recurs on every try, so the replay stops with
          * its reason: the shard's recovery fails, and the history stays in
          * the translog for the next try.
          */
-        void hold(Replay replay, boolean mayWait) {
+        void hold(Replay replay) {
             boolean waited = false;
             while (count >= STALLS_BEFORE_REPLAY_HOLDS) {
                 String backlog = replay.backlog();
@@ -603,9 +596,6 @@ public class InfinoEngine extends InternalEngine {
                     throw new IllegalStateException(
                         "[infino] " + replay.name() + " stopped: the last " + count + " commits took none of its writes (" + last + "), and " + backlog + " wait in memory"
                     );
-                }
-                if (!mayWait) {
-                    return;
                 }
                 if (replay.closing()) {
                     throw new IllegalStateException(
@@ -1833,8 +1823,11 @@ public class InfinoEngine extends InternalEngine {
                 recordLock.writeLock().unlock();
             }
             Batch retry = null;
+            String unavailable = null;
             try {
-                retry = commit(b);
+                Written w = commit(b);
+                retry = w.retry();
+                unavailable = w.unavailable();
             } catch (RuntimeException e) {
                 stalls.noteStall(unanswered(e), "the commit failed: " + e.getMessage());
                 throw e;
@@ -1848,7 +1841,10 @@ public class InfinoEngine extends InternalEngine {
                     }
                 }
             }
-            if (tookNone(b, retry)) {
+            if (unavailable != null) {
+                // The whole batch came back: the hosted service did not answer (see #write).
+                stalls.noteStall(true, "the hosted service did not answer: " + unavailable);
+            } else if (tookNone(b, retry)) {
                 stalls.noteStall(false, "the table took none of the " + b.entries.size() + " ids it was sent");
             } else {
                 stalls.noteProgress();
@@ -1883,12 +1879,15 @@ public class InfinoEngine extends InternalEngine {
 
     /**
      * Whether a commit's failure is the hosted service not answering: the
-     * bridge reports a 502, 503 or 504. An outage passes on its own, so a
-     * replay waits it out rather than stopping (see {@link Stalls#hold}).
+     * bridge marks it {@link InfinoNative.InfinoException#unavailable}, for
+     * a refused or broken connection, a request past its deadline, or a 502,
+     * 503 or 504, whatever status it carries. It is the mark {@link #write}
+     * keeps a batch on. An outage passes on its own, so a replay waits it out
+     * rather than stopping (see {@link Stalls#hold}).
      */
     static boolean unanswered(Throwable e) {
         for (Throwable t = e; t != null; t = t.getCause()) {
-            if (t instanceof InfinoNative.InfinoException ie && UNANSWERED.contains(ie.status())) {
+            if (t instanceof InfinoNative.InfinoException ie && ie.unavailable()) {
                 return true;
             }
         }
@@ -1919,12 +1918,13 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /**
-     * Hold this engine's replay while its commits stall past the bound
-     * ({@link Stalls#hold}). It waits only off the commit lock: a fill after
-     * a move runs under it, on whatever thread asked for a commit.
+     * Hold this engine's translog or peer recovery while its commits stall
+     * past the bound ({@link Stalls#hold}). The fill of a copy becoming
+     * primary is never held (see {@link #fillTable}).
      */
     private void holdReplay() {
-        stalls.hold(replay, !Thread.holdsLock(commitLock));
+        assert !Thread.holdsLock(commitLock) : "a held replay commits, which needs the commit lock free";
+        stalls.hold(replay);
     }
 
     /** The table's lease on this shard's history as this copy was last given it, or null when it has none. */
@@ -2094,10 +2094,10 @@ public class InfinoEngine extends InternalEngine {
     /**
      * Commit {@code b}'s writes to the table; the writes the table did not
      * take and may take on a later try, to be retried (see
-     * {@link #notTaken} and {@link #write}). A failure that takes nothing is
-     * thrown.
+     * {@link #notTaken} and {@link #write}), with why the hosted service did
+     * not answer when it did not. A failure that takes nothing is thrown.
      */
-    private Batch commit(Batch b) {
+    private Written commit(Batch b) {
         long start = System.nanoTime();
         Written w = write(
             table,
@@ -2114,11 +2114,16 @@ public class InfinoEngine extends InternalEngine {
             holdLatestWhileLookingUp(false);
         }
         log.debug("[infino] engine committed {} writes and {} deletes to {} in {} ms", w.writes(), w.deletes(), table, (System.nanoTime() - start) / 1_000_000L);
-        return w.retry();
+        return w;
     }
 
-    /** What {@link #write} did: the writes to retry, the ids it wrote or deleted, and how many of each. */
-    record Written(Batch retry, Set<String> touched, int writes, int deletes) {}
+    /**
+     * What {@link #write} did: the writes to retry, the ids it wrote or
+     * deleted, and how many of each; and, when the hosted service could not
+     * be reached or did not answer, why (null otherwise), the whole batch
+     * being the writes to retry then.
+     */
+    record Written(Batch retry, Set<String> touched, int writes, int deletes, String unavailable) {}
 
     /**
      * Write {@code b} to {@code table}: its deletes, then its rows in one
@@ -2180,6 +2185,7 @@ public class InfinoEngine extends InternalEngine {
             }
         }
         Batch retry = new Batch();
+        String unavailable = null;
         try {
             // An id this node has no record of may be a row another node wrote:
             // a replayed operation, after a takeover, of a write that node
@@ -2235,10 +2241,11 @@ public class InfinoEngine extends InternalEngine {
             // client that retried an auto-id bulk would get its documents twice.
             log.warn("[infino] the hosted service did not take a commit of {} writes and {} deletes to {}; the next commit tries again: {}", ids.size(), deleted.size(), table, e.getMessage());
             retry = b;
+            unavailable = e.getMessage();
         }
         Set<String> touched = new HashSet<>(ids);
         touched.addAll(deleted);
-        return new Written(retry, touched, ids.size(), deleted.size());
+        return new Written(retry, touched, ids.size(), deleted.size(), unavailable);
     }
 
     /**
@@ -2454,7 +2461,10 @@ public class InfinoEngine extends InternalEngine {
      * its history the table may not hold (see {@link #fillTable}): the writes
      * its old primary had not committed, which are now the shard's. The table
      * may hold some of them already; a write is looked up, so writing it
-     * again leaves one row.
+     * again leaves one row. Every operation on the shard is blocked while
+     * this runs, so it does not wait for the table, nor fail when the table
+     * does not take the history: the writes stay in the batch for a later
+     * commit.
      */
     @Override
     public int fillSeqNoGaps(long primaryTerm) throws IOException {
@@ -2536,6 +2546,19 @@ public class InfinoEngine extends InternalEngine {
      * given one) starts past the highest operation a row records, as far as
      * its history reaches. It writes through operation {@code to}, skipping
      * an operation whose id the batch holds a write of at least as new.
+     *
+     * <p>It neither waits for the table nor fails for it. A promotion runs
+     * it while every operation on the shard is blocked ({@link #fillSeqNoGaps},
+     * inside {@code IndexShard#bumpPrimaryTerm}), and a fill after a move
+     * runs it under {@link #commitLock}, so it is not held as a recovery is
+     * ({@link Stalls#hold}). Its commits back off as a full batch's do while
+     * the table takes nothing, and a commit that fails, or that the hosted
+     * service does not answer, leaves its writes in the batch for the
+     * engine's next commit. The copy takes over either way: it holds at most
+     * the history from where the table's lease holds it, read once, and a
+     * client's write is refused past the bound while they wait
+     * ({@link #refuseWhileBacklogged}). A commit it does try waits for its
+     * answer, up to the hosted request's deadline.
      */
     private void fillTable(long to) throws IOException {
         long retained = getMinRetainedSeqNo();
@@ -2606,23 +2629,23 @@ public class InfinoEngine extends InternalEngine {
                     }
                 }
                 written++;
-                holdReplay();
-                if (full && fullBatchMayCommit()) {
-                    try {
-                        commitBatch();
-                    } catch (RuntimeException e) {
-                        // The writes stay in the batch for the next commit, as the last one's do.
-                        log.warn("[infino] committing part of the history {} took over to {} failed", shardId, table, e);
-                    }
+                if (full) {
+                    fillCommit(
+                        stalls,
+                        () -> backlog() != null,
+                        this::commitBatch,
+                        e -> log.warn("[infino] committing part of the history {} took over to {} failed", shardId, table, e)
+                    );
                 }
             }
         }
-        try {
-            commitBatch();
-        } catch (RuntimeException e) {
-            // The writes stay in the batch for the next commit; the shard takes over regardless.
-            log.warn("[infino] committing the history {} took over to {} failed", shardId, table, e);
-        }
+        // The shard takes over whether or not this commit runs or lands.
+        fillCommit(
+            stalls,
+            () -> backlog() != null,
+            this::commitBatch,
+            e -> log.warn("[infino] committing the history {} took over to {} failed", shardId, table, e)
+        );
         log.info(
             "[infino] {} wrote {} operations of its history from {} to {} into {} on becoming primary in {} ms",
             shardId,
@@ -2632,5 +2655,26 @@ public class InfinoEngine extends InternalEngine {
             table,
             (System.nanoTime() - start) / 1_000_000L
         );
+    }
+
+    /**
+     * A commit of a fill ({@link #fillTable}): {@code commit} runs when a
+     * full batch may commit ({@link Stalls#fullBatchMayCommit}, with
+     * {@code pastBound} saying whether the writes waiting are past the
+     * bound), so it backs off while the table takes nothing. A failure goes
+     * to {@code failed}, and the writes stay in the batch. It never holds or
+     * waits as a recovery does ({@link Stalls#hold}), and never throws for
+     * the table: a promotion runs a fill while every operation on the shard
+     * is blocked.
+     */
+    static void fillCommit(Stalls stalls, BooleanSupplier pastBound, BooleanSupplier commit, Consumer<RuntimeException> failed) {
+        if (stalls.count() != 0 && !stalls.fullBatchMayCommit(pastBound.getAsBoolean())) {
+            return;
+        }
+        try {
+            commit.getAsBoolean();
+        } catch (RuntimeException e) {
+            failed.accept(e);
+        }
     }
 }
