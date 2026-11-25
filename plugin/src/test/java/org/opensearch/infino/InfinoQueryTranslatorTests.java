@@ -1569,6 +1569,8 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
         assertEquals("token_match('os_logs_0', 'message', 'monkey jackal bear', 'or')", filtered.from());
         assertEquals(1, reads.size());
+        // The read asks only among the rows the range keeps: the others are no hits.
+        assertTrue(reads.get(0), reads.get(0).contains(" AND (\"@timestamp\" >= '2023-01-03T00:00:00Z' AND \"@timestamp\" < '2023-01-03T10:00:00Z') LIMIT 1"));
         // A lone word: ranked by the text column.
         assertEquals(
             "token_match('os_logs_0', 'message', 'monkey', 'or')",
@@ -1661,6 +1663,59 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
                 .scoring()
                 .unrankable()
         );
+    }
+
+    /**
+     * The read that asks whether a keyword field matches is made only where
+     * it could change the answer, and among the rows the query may return:
+     * patterns alone score every match the same either way, so are not read;
+     * a filter or must clause around the query narrows the read.
+     */
+    public void testTheKeywordReadIsMadeWhereItMatters() {
+        List<String> reads = new java.util.ArrayList<>();
+        java.util.function.Function<String, List<Map<String, Object>>> none = sql -> {
+            reads.add(sql);
+            return List.of();
+        };
+        for (String patterns : List.of("/pay-[0-9]+/", "pay*", "pay* OR /n.*/")) {
+            reads.clear();
+            String where = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery(patterns), columns(), TABLE, NOW, none).where();
+            assertEquals(patterns, 0, reads.size());
+            assertTrue(where, where.contains("\"level\""));
+        }
+        // Discover's shape with Lucene syntax: a query string and a time filter.
+        reads.clear();
+        Translation discover = InfinoQueryTranslator.translate(
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.queryStringQuery("disk"))
+                .filter(QueryBuilders.rangeQuery("@timestamp").gte("2026-10-24T00:00:00Z").lte("2026-10-24T12:00:00Z"))
+                .filter(QueryBuilders.matchAllQuery()),
+            columns(),
+            TABLE,
+            NOW,
+            none
+        );
+        assertEquals(List.of(
+            "SELECT 1 AS infino_hit FROM \"os_logs_0\" WHERE (\"level\" = 'disk' OR \"host.name\" = 'disk') "
+                + "AND (\"@timestamp\" >= '2026-10-24T00:00:00Z' AND \"@timestamp\" <= '2026-10-24T12:00:00.999Z') LIMIT 1"
+        ), reads);
+        assertEquals("token_match('os_logs_0', 'message', 'disk', 'or')", discover.from());
+        // A clause read by its text, or a nested bool's own filter, narrows as it can: the text clause
+        // is left out, the inner filter and the outer one kept.
+        reads.clear();
+        InfinoQueryTranslator.translate(
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.matchQuery("message", "full"))
+                .must(QueryBuilders.boolQuery().must(QueryBuilders.queryStringQuery("disk")).filter(QueryBuilders.termQuery("status", 500)))
+                .filter(QueryBuilders.termQuery("host.name", "n1")),
+            columns(),
+            TABLE,
+            NOW,
+            none
+        );
+        assertEquals(1, reads.size());
+        assertTrue(reads.get(0), reads.get(0).contains("AND \"host.name\" = 'n1'") && reads.get(0).contains("AND \"status\" = 500"));
+        assertFalse(reads.get(0), reads.get(0).contains("text_match"));
     }
 
     public void testARunIsOneTermWhenAsked() {

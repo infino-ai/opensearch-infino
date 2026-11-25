@@ -7,6 +7,7 @@ package org.opensearch.infino;
 import org.apache.lucene.analysis.standard.StandardTokenizer;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.apache.lucene.search.join.ScoreMode;
+import org.opensearch.OpenSearchException;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.common.collect.Tuple;
@@ -77,6 +78,7 @@ import java.util.Set;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.function.ToIntFunction;
 import java.util.regex.Pattern;
 
@@ -521,6 +523,16 @@ final class InfinoQueryTranslator {
      * no filter): what {@link #valueRanking} reads it as. Null otherwise.
      */
     private ValueRanking onFields;
+    /**
+     * The bool clauses enclosing the clause being translated, each with its
+     * child on the way to it: every hit of that clause that the query
+     * returns also matches each such bool's other must and filter clauses
+     * ({@link #enclosingConstraints}).
+     */
+    private final List<Enclosing> enclosing = new ArrayList<>();
+
+    /** A bool enclosing the clause being translated, and its clause that holds it. */
+    private record Enclosing(BoolQueryBuilder bool, QueryBuilder child) {}
     /** Each nested clause's matching documents with their scores, read once whether it filters, scores or both. */
     private final Map<NestedQueryBuilder, Map<String, Double>> nestedScores = new java.util.IdentityHashMap<>();
     /** Each BM25-scored term clause's score ({@link #bm25TermScore}), read once per clause. */
@@ -576,12 +588,12 @@ final class InfinoQueryTranslator {
     private boolean scoresText(QueryBuilder qb) {
         if (qb instanceof BoolQueryBuilder b) {
             for (QueryBuilder c : b.must()) {
-                if (scoresText(c)) {
+                if (within(b, c, () -> scoresText(c))) {
                     return true;
                 }
             }
             for (QueryBuilder c : b.should()) {
-                if (scoresText(c)) {
+                if (within(b, c, () -> scoresText(c))) {
                     return true;
                 }
             }
@@ -604,9 +616,52 @@ final class InfinoQueryTranslator {
         return alone.principal != null;
     }
 
-    /** A translator of a clause of this query on its own. */
+    /** A translator of a clause of this query on its own, within the same enclosing bools ({@link #enclosing}). */
     private InfinoQueryTranslator alone() {
-        return new InfinoQueryTranslator(cols, table, nowMillis, trusted, columnValuesOnly, rows);
+        InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, trusted, columnValuesOnly, rows);
+        t.enclosing.addAll(enclosing);
+        return t;
+    }
+
+    /** {@code read}, with {@code child} of {@code bool} the clause being translated ({@link #enclosing}). */
+    private <T> T within(BoolQueryBuilder bool, QueryBuilder child, Supplier<T> read) {
+        enclosing.add(new Enclosing(bool, child));
+        try {
+            return read.get();
+        } finally {
+            enclosing.remove(enclosing.size() - 1);
+        }
+    }
+
+    /**
+     * What every hit of the clause being translated that the query returns
+     * also matches: each enclosing bool's other must and filter clauses
+     * ({@link #enclosing}), those the table reads by column values alone. A
+     * clause read by its text, a nested one (read entry by entry) or one the
+     * table cannot take is left out, which only narrows less.
+     */
+    private List<String> enclosingConstraints() {
+        List<String> out = new ArrayList<>();
+        for (Enclosing e : enclosing) {
+            List<QueryBuilder> clauses = new ArrayList<>(e.bool().must());
+            clauses.addAll(e.bool().filter());
+            for (QueryBuilder c : clauses) {
+                if (c == e.child() || c instanceof NestedQueryBuilder) {
+                    continue;
+                }
+                InfinoQueryTranslator values = new InfinoQueryTranslator(cols, table, nowMillis, trusted, true, rows);
+                String p;
+                try {
+                    p = values.predicate(c, false);
+                } catch (IllegalArgumentException | OpenSearchException ignored) {
+                    continue;
+                }
+                if (p != null && !ALL.equals(p) && !out.contains(p)) {
+                    out.add(p);
+                }
+            }
+        }
+        return out;
     }
 
     /**
@@ -709,7 +764,10 @@ final class InfinoQueryTranslator {
             }
             // A filter or must_not clause scores nothing.
             for (QueryBuilder c : b.must()) {
-                required(c, offset, bonuses, texts, summed, unscored, stray);
+                within(b, c, () -> {
+                    required(c, offset, bonuses, texts, summed, unscored, stray);
+                    return null;
+                });
             }
             for (QueryBuilder c : b.should()) {
                 int known = texts.size();
@@ -1657,7 +1715,7 @@ final class InfinoQueryTranslator {
     private String bool(BoolQueryBuilder b, boolean positive) {
         List<String> and = new ArrayList<>();
         for (QueryBuilder c : b.must()) {
-            and.add(predicate(c, positive));
+            and.add(within(b, c, () -> predicate(c, positive)));
         }
         for (QueryBuilder c : b.filter()) {
             filtering++;
@@ -2940,8 +2998,14 @@ final class InfinoQueryTranslator {
                 text.add(f);
             }
         }
+        List<Node> leaves = defaultFieldLeaves(parsed, new ArrayList<>());
+        if (leaves.stream().noneMatch(l -> l instanceof Term)) {
+            // Patterns alone: stock scores each match the same, and over the text
+            // columns alone they rank no better, so the read could change nothing.
+            return targets;
+        }
         List<String> or = new ArrayList<>();
-        for (Node leaf : defaultFieldLeaves(parsed, new ArrayList<>())) {
+        for (Node leaf : leaves) {
             String p = node(leaf, values, false, q, op);
             if (p == null) {
                 // A clause the table cannot take on those columns is refused as the query is read.
@@ -2951,7 +3015,14 @@ final class InfinoQueryTranslator {
                 or.add(p);
             }
         }
-        if (!or.isEmpty() && !rows.apply("SELECT 1 AS infino_hit FROM " + quoteIdent(table) + " WHERE " + String.join(" OR ", or) + " LIMIT 1").isEmpty()) {
+        if (or.isEmpty()) {
+            return text;
+        }
+        // Only the rows the query may return matter: those its enclosing must and filter clauses keep.
+        List<String> and = new ArrayList<>();
+        and.add(or.size() == 1 ? or.get(0) : "(" + String.join(" OR ", or) + ")");
+        and.addAll(enclosingConstraints());
+        if (!rows.apply("SELECT 1 AS infino_hit FROM " + quoteIdent(table) + " WHERE " + String.join(" AND ", and) + " LIMIT 1").isEmpty()) {
             return targets;
         }
         return text;
