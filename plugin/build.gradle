@@ -147,9 +147,11 @@ test {
 // a task of their own, on a cluster of the archive with the k-NN plugin, and
 // every other suite keeps the integration-test distribution without it. The
 // knn cluster keeps its own catalog, so neither cluster sees the other's tables.
+// The skeleton rebuild of an index with a vector field runs there too: the
+// k-NN plugin writes the source of each of its writes anew.
 def knnTask = 'knnYamlRestTest'
 def knnSuite = 'infino/100_knn'
-def knnTests = 'org.opensearch.infino.InfinoStockKnnIT'
+def knnTests = 'org.opensearch.infino.Infino*KnnIT'
 def knnData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-knn"
 
 // Default mode with a replica needs a second node: a copy recovers from the

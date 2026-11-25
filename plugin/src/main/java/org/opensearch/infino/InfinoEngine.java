@@ -1209,15 +1209,16 @@ public class InfinoEngine extends InternalEngine {
 
     @Override
     public IndexResult index(Index index) throws IOException {
-        // A skeleton rebuild's create, whose row the table holds already, carries
-        // a mark in its source that the translog and the shard's history keep,
-        // so no copy writes it to the table: not the primary taking it, not a
-        // replay after a restart, not a copy taking over (see fillTable). A
-        // primary takes the mark only on a create this node's rebuild of the
-        // shard sent, and refuses any other write that carries it, so a client
-        // cannot keep a write out of the table with it.
-        boolean skeletonOnly = InfinoSkeletonAdopter.isMarked(index.source());
-        if (skeletonOnly && index.origin() == Operation.Origin.PRIMARY && !InfinoSkeletonAdopter.claim(shardId, index.id(), index.source())) {
+        // A skeleton rebuild's create, whose row the table holds already, is
+        // written to Lucene alone. The primary knows it by content: this node's
+        // rebuild of the shard has it in flight. It carries a mark in its source
+        // that the translog and the shard's history keep (the primary puts it
+        // back when a plugin wrote the source anew), so a replay after a restart
+        // and a copy taking over leave the table alone for it too (see
+        // fillTable). A primary write that carries the mark but is no rebuild's
+        // is refused, so a client cannot keep a write out of the table with it.
+        InfinoSkeletonAdopter.Kind kind = InfinoSkeletonAdopter.kind(shardId, index);
+        if (kind == InfinoSkeletonAdopter.Kind.FORGED) {
             return new IndexResult(
                 new MapperParsingException(
                     "[infino] a document may not open with " + InfinoSkeletonAdopter.MARK + ": it marks the documents a rebuild creates"
@@ -1225,7 +1226,7 @@ public class InfinoEngine extends InternalEngine {
                 index.version()
             );
         }
-        boolean toTable = writesTable(index.origin()) && !skeletonOnly;
+        boolean toTable = writesTable(index.origin()) && kind != InfinoSkeletonAdopter.Kind.REBUILD;
         if (toTable) {
             refuseWhileBacklogged(index.origin());
         }

@@ -7,7 +7,6 @@ package org.opensearch.infino;
 import org.opensearch.client.ResponseException;
 
 import java.io.IOException;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -48,12 +47,10 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     /** The table of the untouched-rows test's indices, and its rows. */
     private static final String KEPT_TABLE = "emr5_rows";
     private static final int KEPT_ROWS = 200;
-    /**
-     * How long a read waits before it compares the table's rows: a read of
-     * the table may trail its latest commit by up to a second, and a write
-     * the test looks for may have been committed just before.
-     */
-    private static final long SETTLE_MILLIS = 3_000;
+    /** The table of the final-pipeline test's indices, its rows, and the pipeline. */
+    private static final String PIPELINE_TABLE = "emr7_rows";
+    private static final int PIPELINE_ROWS = 50;
+    private static final String FINAL_PIPELINE = "emr7_final";
     /** The mark a rebuild's creates open their source with, which a client's write may not carry. */
     private static final String MARK = "/*infino:skeleton*/";
 
@@ -202,20 +199,17 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         }, REBUILD_SECONDS, TimeUnit.SECONDS);
         assertEquals("every row keeps its engine id through the rebuild", before, rowIds("emr5"));
 
-        // Fail the primary and allocate it again from its own store: as it
-        // becomes primary it writes the table the operations of its history the
-        // table may not hold, the rebuild's creates among them, as a restarted
-        // node's primary does.
-        List<Object> shard = callList("GET", "/_cat/shards/emr5?format=json&h=node", null);
-        String node = ((Map<String, Object>) shard.get(0)).get("node").toString();
-        call(
-            "POST",
-            "/_cluster/reroute",
-            "{\"commands\":[{\"cancel\":{\"index\":\"emr5\",\"shard\":0,\"node\":\"" + node + "\",\"allow_primary\":true}}]}"
-        );
-        call("GET", "/_cluster/health/emr5?wait_for_status=green&timeout=60s", null);
-        assertEquals("and through the primary's start from its store", before, rowIds("emr5"));
+        // Fail the primary and allocate it again from its own store, as a node
+        // killed and started again does. The rebuild's creates are in its
+        // translog and not in a Lucene commit yet, so the start replays them;
+        // then, as it becomes primary, it writes the table the operations of its
+        // history the table may not hold, the rebuild's creates among them.
+        assertEquals("every create waits in the translog for the replay", KEPT_ROWS, uncommittedOperations("emr5"));
+        failPrimary("emr5");
+        assertEquals("and through the replay of its translog and its history", before, rowIds("emr5"));
 
+        // Closing flushes: the reopened index replays nothing and writes the
+        // table from its history alone.
         call("POST", "/emr5/_close", null);
         call("POST", "/emr5/_open?wait_for_active_shards=1", null);
         call("GET", "/_cluster/health/emr5?wait_for_status=green&timeout=60s", null);
@@ -231,17 +225,61 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         call("DELETE", "/emr5", null);
     }
 
-    /** Each row of {@code index}'s table by its document id: the engine's id of the row, as the latest commit holds it. */
+    /**
+     * An index with a final pipeline: a rebuild's creates run no pipeline,
+     * the final one included, because the table's rows went through it when
+     * they were written. Run again, it would apply twice, and write each
+     * create's source anew, which drops the mark the replay and the history
+     * look for.
+     */
     @SuppressWarnings("unchecked")
-    private Map<String, Object> rowIds(String index) throws IOException, InterruptedException {
-        Thread.sleep(SETTLE_MILLIS);
-        Map<String, Object> out = call("POST", "/_plugins/_infino/sql", "{\"query\":\"SELECT osid, _id FROM " + index + "\"}");
-        Map<String, Object> ids = new HashMap<>();
-        for (Object row : (List<?>) out.get("rows")) {
-            Map<String, Object> r = (Map<String, Object>) row;
-            assertNull("each document id once", ids.put(r.get("osid").toString(), r.get("_id")));
+    public void testARebuildRunsNoFinalPipeline() throws Exception {
+        call("PUT", "/_ingest/pipeline/" + FINAL_PIPELINE, "{\"processors\":[{\"append\":{\"field\":\"seen\",\"value\":[\"final\"]}}]}");
+        String withPipeline = ",\"index.final_pipeline\":\"" + FINAL_PIPELINE + "\"";
+        createIndex("emr7_old", false, PIPELINE_TABLE, 1, withPipeline);
+        StringBuilder bulk = new StringBuilder();
+        for (int i = 0; i < PIPELINE_ROWS; i++) {
+            bulk.append("{\"index\":{\"_index\":\"emr7_old\",\"_id\":\"p").append(i).append("\"}}\n");
+            bulk.append("{\"n\":").append(i).append("}\n");
         }
-        return ids;
+        assertEquals(false, call("POST", "/_bulk?refresh=true", bulk.toString()).get("errors"));
+        Map<String, Object> before = rowIds("emr7_old");
+        assertEquals(PIPELINE_ROWS, before.size());
+        assertEquals(List.of("final"), ((Map<String, Object>) call("GET", "/emr7_old/_doc/p0", null).get("_source")).get("seen"));
+        call("DELETE", "/emr7_old", null);
+
+        createIndex("emr7", true, PIPELINE_TABLE, 1, withPipeline);
+        assertBusy(() -> {
+            Map<String, Object> index = (Map<String, Object>) callList("GET", "/_cat/indices/emr7?format=json&h=docs.count", null).get(0);
+            assertEquals(String.valueOf(PIPELINE_ROWS), index.get("docs.count"));
+        }, REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertEquals("every row keeps its engine id through the rebuild", before, rowIds("emr7"));
+        assertEquals("the pipeline ran once", List.of("final"), ((Map<String, Object>) call("GET", "/emr7/_doc/p0", null).get("_source")).get("seen"));
+        failPrimary("emr7");
+        assertEquals("and through the replay of its translog and its history", before, rowIds("emr7"));
+        call("DELETE", "/emr7", null);
+        call("DELETE", "/_ingest/pipeline/" + FINAL_PIPELINE, null);
+    }
+
+    /** The operations of {@code index}'s primary that its translog holds and no Lucene commit does yet. */
+    @SuppressWarnings("unchecked")
+    private int uncommittedOperations(String index) throws IOException {
+        Map<String, Object> indices = (Map<String, Object>) call("GET", "/" + index + "/_stats/translog", null).get("indices");
+        Map<String, Object> primaries = (Map<String, Object>) ((Map<String, Object>) indices.get(index)).get("primaries");
+        return ((Number) ((Map<String, Object>) primaries.get("translog")).get("uncommitted_operations")).intValue();
+    }
+
+    /** Fail {@code index}'s one primary and wait until it is allocated again from its own store. */
+    @SuppressWarnings("unchecked")
+    private void failPrimary(String index) throws IOException {
+        List<Object> shard = callList("GET", "/_cat/shards/" + index + "?format=json&h=node", null);
+        String node = ((Map<String, Object>) shard.get(0)).get("node").toString();
+        call(
+            "POST",
+            "/_cluster/reroute",
+            "{\"commands\":[{\"cancel\":{\"index\":\"" + index + "\",\"shard\":0,\"node\":\"" + node + "\",\"allow_primary\":true}}]}"
+        );
+        call("GET", "/_cluster/health/" + index + "?wait_for_status=green&timeout=60s", null);
     }
 
     /** The hits of a search of the held-rebuild test's index, room left for every row. */
@@ -261,6 +299,11 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     }
 
     private void createIndex(String index, boolean rebuilt, String table, int shards) throws IOException {
+        createIndex(index, rebuilt, table, shards, "");
+    }
+
+    /** {@code settings} adds index settings, each led by a comma. */
+    private void createIndex(String index, boolean rebuilt, String table, int shards, String settings) throws IOException {
         call(
             "PUT",
             "/" + index,
@@ -270,7 +313,9 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
                 + rebuilt
                 + ",\"number_of_shards\":"
                 + shards
-                + ",\"number_of_replicas\":0},"
+                + ",\"number_of_replicas\":0"
+                + settings
+                + "},"
                 + "\"mappings\":{\"properties\":{\"n\":{\"type\":\"long\"}}}}"
         );
     }

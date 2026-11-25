@@ -21,13 +21,18 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.OperationRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Randomness;
+import org.opensearch.common.lucene.uid.Versions;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.util.concurrent.ThreadContext;
+import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.xcontent.MediaType;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.mapper.IdFieldMapper;
 import org.opensearch.index.mapper.Uid;
@@ -36,14 +41,20 @@ import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -58,11 +69,22 @@ import java.util.function.Supplier;
  * skeleton lacks is created through the cluster's own write path, from the
  * row's own source, so each of the shard's copies gets it as it gets any
  * write, routed by the routing value the row was written with when it was
- * written with one. The table already holds these rows, so no copy's
- * engine writes them to the table: each create's source carries
- * {@link #MARK} (see {@link #isMarked}), which the shard's translog and its
- * history keep with the document, so a translog replay after a restart and
- * a copy taking over as primary leave the table alone for them too.
+ * written with one. No ingest pipeline runs on them, a final or a system
+ * one included: the row went through those when it was written. The table
+ * already holds these rows, so no copy's engine writes them to the table.
+ * The primary's engine takes a create as the rebuild's when this node's
+ * rebuild of the shard has it in flight with the same content ({@link
+ * #claim}), compared as bytes and then as a parsed document, because a
+ * plugin may write the source anew before the engine sees it (the k-NN
+ * plugin's derived source does for an index with a vector field). Each
+ * create's source also carries {@link #MARK} (see {@link #isMarked}), which
+ * the primary puts back when such a plugin dropped it ({@link #kind}), so
+ * the primary's translog and its history keep it: a translog replay after a
+ * restart and a copy taking over as primary leave the table alone for them
+ * too. Where a plugin writes the source anew, it may do so again on a
+ * replica and on a translog replay after the node restarts, which then lack
+ * the mark: a replica promoted to primary, or the replay, writes those rows
+ * to the table once more, as a replace with the same content.
  * Each is a create, so a client's write of the same id wins; a row a client
  * deleted while its create was in flight is deleted again through the
  * shard, so the skeleton and the translog end where the table is. Until a
@@ -73,14 +95,19 @@ import java.util.function.Supplier;
  * table: the index's searches miss the rows written before the rebuild, and
  * its engine goes on looking ids up in the table.
  *
- * <p>A request that fails for a reason that passes (a rate limit, a server
- * error, a transport error, a shard or thread pool that is busy) is tried
- * again, after a wait that grows to {@link #MAX_BACKOFF_MILLIS}, until it
- * goes through ({@link Retrier}): a hosted service answers a long rebuild
- * with some of these, and a rebuild that stopped at the first would leave
- * the index's searches short until the node starts again. Only a refusal
- * (a key or a statement the service refuses) stops it, with an error; the
- * shard closing (the index deleted, the node stopping) stops it quietly.
+ * <p>A request that fails for a reason that passes (a rate limit, the
+ * hosted service not reached or not answering, a shard or thread pool that
+ * is busy: see {@link #retryable(Throwable)}) is tried again, after a wait
+ * that grows to {@link #MAX_BACKOFF_MILLIS} ({@link Retrier}): a hosted
+ * service answers a long rebuild with some of these, and a rebuild that
+ * stopped at the first would leave the index's searches short until the
+ * node starts again. Any other failure, or one that passes but goes on for
+ * {@link #GIVE_UP_MILLIS} with no request going through, stops the rebuild
+ * with an error; the shard closing (the index deleted, the node stopping)
+ * stops it quietly. A create the shard refuses (a conflict aside, which is
+ * a client's write that got there first) is logged and counted, and leaves
+ * the skeleton incomplete, so the engine goes on looking ids up in the
+ * table rather than taking the refused row's id as new.
  */
 final class InfinoSkeletonAdopter {
 
@@ -88,14 +115,16 @@ final class InfinoSkeletonAdopter {
 
     /**
      * The comment a skeleton-only create's JSON source opens with, right
-     * after its first brace, so every engine that applies it writes Lucene
-     * alone. It is part of the operation itself, not of the request around
-     * it: a thread-context header does not survive the hop to the primary's
-     * shard (the security plugin's transport interceptor forwards its own
-     * headers only), and an operation replayed from the translog or read
-     * from the shard's history never carries one. The mapper reads JSON with
-     * comments allowed, so the document is parsed as if it were not there,
-     * and the content type is still detected from the leading brace.
+     * after its first brace, so an engine that replays it, or writes the
+     * table from the shard's history, leaves the table alone for it. It is
+     * part of the operation itself, not of the request around it: a
+     * thread-context header does not survive the hop to the primary's shard
+     * (the security plugin's transport interceptor forwards its own headers
+     * only), and an operation replayed from the translog or read from the
+     * shard's history never carries one. The mapper reads JSON with comments
+     * allowed, so the document is parsed as if it were not there, and the
+     * content type is still detected from the leading brace. The primary
+     * does not trust it: it claims a create by content ({@link #claim}).
      */
     static final String MARK = "/*infino:skeleton*/";
     /** The bytes a marked source opens with. */
@@ -103,10 +132,16 @@ final class InfinoSkeletonAdopter {
     /** The pipeline name that runs no ingest pipeline: the table's row was written through them already. */
     private static final String NO_PIPELINE = "_none";
     /**
+     * {@code IndexRequest#setSystemIngestPipeline} on the releases that run
+     * a system ingest pipeline (3.1 and later), else null: a request whose
+     * pipelines are resolved already runs that one too unless it names none.
+     */
+    private static final Method SET_SYSTEM_PIPELINE = systemPipelineSetter();
+    /**
      * The skeleton-only creates this node's rebuilds have in flight, by
-     * shard, id and marked source: a primary takes a marked create as
-     * skeleton-only only when it is one of these (see {@link #claim}), so a
-     * client cannot send the mark to keep its write out of the table.
+     * shard, id and source as sent: a primary takes a create as
+     * skeleton-only only when it is one of these with the same content (see
+     * {@link #claim}), so a client's write never is.
      */
     private static final Map<ShardId, Map<String, String>> IN_FLIGHT = new ConcurrentHashMap<>();
     /** Rows read from the table per page. */
@@ -139,6 +174,14 @@ final class InfinoSkeletonAdopter {
     static final long MAX_BACKOFF_MILLIS = 30_000;
     /** How often a rebuild whose requests keep failing says so, after it says so for the first failure. */
     static final long RETRY_LOG_INTERVAL_MILLIS = 60_000;
+    /**
+     * How long a rebuild's requests may go on failing, each for a reason
+     * that passes, with none going through, before the rebuild stops with an
+     * error: a service that answers none of them for this long is down or
+     * refusing, not busy, and a rebuild left trying would hold its shard's
+     * place and a generic thread with no end.
+     */
+    static final long GIVE_UP_MILLIS = 30 * 60_000L;
 
     /** The shards whose skeleton is being rebuilt on this node, so a second start does not run beside the first. */
     private static final Set<ShardId> RUNNING = ConcurrentHashMap.newKeySet();
@@ -163,8 +206,9 @@ final class InfinoSkeletonAdopter {
                     return;
                 }
                 log.error(
-                    "[infino] the skeleton of {} could not be rebuilt from table {}: a request failed in a way no retry changes, so the "
-                        + "rebuild stops and the index's searches miss the rows written before it until the shard starts again",
+                    "[infino] the skeleton of {} could not be rebuilt from table {}: a request was refused, or failed for longer than the "
+                        + "rebuild tries again; the rebuild stops and the index's searches miss the rows written before it until the shard "
+                        + "starts again (close and open the index, or restart the node)",
                     shardId,
                     table,
                     e
@@ -202,6 +246,8 @@ final class InfinoSkeletonAdopter {
         boolean routed = retrier.call("reading its columns", () -> columnsOf(table)).containsKey(InfinoQueryTranslator.ROUTING);
         long created = 0;
         long unroutable = 0;
+        long refused = 0;
+        String firstRefusal = null;
         String after = null;
         while (true) {
             String sql = pageSql(table, after, routed);
@@ -229,13 +275,29 @@ final class InfinoSkeletonAdopter {
                 }
             }
             if (!missing.isEmpty()) {
-                created += createMissing(shardId, table, missing, retrier);
+                Created out = createMissing(shardId, table, missing, retrier, InfinoSkeletonAdopter::run, ids -> InfinoNative.existingOsidsLatest(table, ids));
+                created += out.created();
+                refused += out.refused();
+                firstRefusal = firstRefusal == null ? out.firstRefusal() : firstRefusal;
             }
             if (page.size() < PAGE_ROWS) {
                 break;
             }
         }
-        InfinoEngine.skeletonComplete(shardId);
+        if (refused > 0) {
+            // Taken as whole, the skeleton would let a client's write of a refused
+            // row's id be appended as a new row beside the table's.
+            log.error(
+                "[infino] the skeleton of {} misses {} rows of table {} that it could not create (the first: {}); it stays incomplete, so "
+                    + "its engine goes on looking ids up in the table, and the index's searches miss those rows",
+                shardId,
+                refused,
+                table,
+                firstRefusal
+            );
+        } else {
+            InfinoEngine.skeletonComplete(shardId);
+        }
         if (unroutable > 0) {
             log.warn("[infino] {} rows of table {} route to another shard of {} by their id and keep no routing value; they are left out of its skeleton", unroutable, table, shardId);
         }
@@ -279,12 +341,22 @@ final class InfinoSkeletonAdopter {
     }
 
     /** A row the skeleton lacks: its source, and the routing value it was written with (null for none). */
-    private record Row(String source, String routing) {}
+    record Row(String source, String routing) {}
+
+    /**
+     * What {@link #createMissing} did: the documents created (or found
+     * created by an earlier send of the same create), and the rows left out
+     * of the skeleton, with the first one's reason.
+     */
+    record Created(long created, long refused, String firstRefusal) {}
 
     /**
      * The table's columns. The bridge answers none when it cannot read
-     * them, as it does for a table that does not exist; a table the rebuild
-     * reads holds rows, so none means the read failed, and it is tried again.
+     * them, as it does for a table that does not exist. A table that does
+     * not exist fails the row count first, which is read just before; so
+     * none here is a read that failed (on a hosted table, a request to the
+     * service), and it is tried again, for no longer than
+     * {@link #GIVE_UP_MILLIS}.
      */
     private static Map<String, InfinoNative.Column> columnsOf(String table) {
         Map<String, InfinoNative.Column> columns = InfinoNative.columns(table);
@@ -320,79 +392,172 @@ final class InfinoSkeletonAdopter {
     /**
      * Create a skeleton document for each id, as a skeleton-only write; then
      * delete through the shard any whose row the table lost meanwhile.
-     * Returns the documents created. A create that fails for a reason that
-     * passes (a full write pool, a shard not ready) is sent again; one a
-     * client's write of the same id beat is not.
+     * {@code bulk} runs a bulk as the node and {@code kept} says which of
+     * some ids the table holds as of its latest commit. A create that fails
+     * for a reason that passes (a full write pool, a shard not ready) is sent
+     * again. One that meets a document of its id (a conflict) is done: a
+     * client's write got there first, or, when it was sent before, this very
+     * create did and its answer was lost, so it is checked against the table
+     * as a created one is. Any other refusal leaves the row out of the
+     * skeleton, counted.
      */
-    private static long createMissing(ShardId shardId, String table, Map<String, Row> missing, Retrier retrier) {
-        Map<String, IndexRequest> pending = new LinkedHashMap<>();
+    static Created createMissing(
+        ShardId shardId,
+        String table,
+        Map<String, Row> missing,
+        Retrier retrier,
+        Function<BulkRequest, BulkResponse> bulk,
+        Function<List<String>, Set<String>> kept
+    ) {
+        Map<String, IndexRequest> creates = new LinkedHashMap<>();
         Map<String, String> sources = new LinkedHashMap<>();
+        long refused = 0;
+        String firstRefusal = null;
         for (Map.Entry<String, Row> row : missing.entrySet()) {
             String source = marked(row.getValue().source());
             if (source == null) {
                 log.warn("[infino] the row of {} in table {} holds no JSON object; it is left out of the skeleton of {}", row.getKey(), table, shardId);
+                refused++;
+                firstRefusal = firstRefusal == null ? row.getKey() + ": no JSON object" : firstRefusal;
                 continue;
             }
             sources.put(row.getKey(), source);
-            pending.put(
-                row.getKey(),
-                new IndexRequest(shardId.getIndexName()).id(row.getKey())
-                    .routing(row.getValue().routing())
-                    .source(source, XContentType.JSON)
-                    .opType(DocWriteRequest.OpType.CREATE)
-                    .setPipeline(NO_PIPELINE)
-            );
+            creates.put(row.getKey(), createOf(shardId.getIndexName(), row.getKey(), row.getValue().routing(), source));
         }
-        if (pending.isEmpty()) {
-            return 0;
+        Map<String, Integer> sends = new HashMap<>();
+        Map<String, String> inFlight = new ConcurrentHashMap<>();
+        Map<String, BulkItemResponse.Failure> failed;
+        track(shardId, inFlight);
+        try {
+            failed = sendAll("creating documents", creates, retrier, bulk, ids -> {
+                for (String id : ids) {
+                    // A claim is taken once: a create sent again is claimable again.
+                    inFlight.put(id, sources.get(id));
+                    sends.merge(id, 1, Integer::sum);
+                }
+            });
+        } finally {
+            untrack(shardId, inFlight);
         }
         List<String> created = new ArrayList<>();
-        Map<String, String> inFlight = new ConcurrentHashMap<>();
-        IN_FLIGHT.put(shardId, inFlight);
-        try {
-            while (true) {
-                BulkRequest creates = new BulkRequest();
-                for (Map.Entry<String, IndexRequest> create : pending.entrySet()) {
-                    // A claim is taken once: a create sent again is claimable again.
-                    inFlight.put(create.getKey(), sources.get(create.getKey()));
-                    creates.add(create.getValue());
-                }
-                BulkItemResponse.Failure again = null;
-                for (BulkItemResponse item : retrier.call("creating documents", () -> run(creates)).getItems()) {
-                    if (!item.isFailed()) {
-                        created.add(item.getId());
-                        pending.remove(item.getId());
-                    } else if (retryable(item.getFailure().getStatus())) {
-                        again = item.getFailure();
-                    } else {
-                        pending.remove(item.getId());
-                    }
-                }
-                if (again == null) {
-                    break;
-                }
-                retrier.failed("creating documents", again.getCause());
+        for (String id : creates.keySet()) {
+            BulkItemResponse.Failure failure = failed.get(id);
+            if (failure == null || (failure.getStatus() == RestStatus.CONFLICT && sends.getOrDefault(id, 0) > 1)) {
+                created.add(id);
+            } else if (failure.getStatus() != RestStatus.CONFLICT) {
+                refused++;
+                firstRefusal = firstRefusal == null ? id + ": " + failure.getMessage() : firstRefusal;
+                log.debug("[infino] the skeleton document of {} in {} was refused", id, shardId, failure.getCause());
             }
-        } finally {
-            IN_FLIGHT.remove(shardId, inFlight);
         }
         if (created.isEmpty()) {
-            return 0;
+            return new Created(0, refused, firstRefusal);
         }
         // As of the table's latest commit: a row another node deleted within the
         // engine's staleness window would otherwise read as kept, and its
         // skeleton stay.
-        Set<String> kept = retrier.call("reading which of its rows are kept", () -> InfinoNative.existingOsidsLatest(table, created));
-        BulkRequest deletes = new BulkRequest();
+        Set<String> keptIds = retrier.call("reading which of its rows are kept", () -> kept.apply(created));
+        Map<String, DeleteRequest> deletes = new LinkedHashMap<>();
         for (String id : created) {
-            if (!kept.contains(id)) {
-                deletes.add(new DeleteRequest(shardId.getIndexName(), id).routing(missing.get(id).routing()));
+            if (!keptIds.contains(id)) {
+                deletes.put(id, new DeleteRequest(shardId.getIndexName(), id).routing(missing.get(id).routing()));
             }
         }
-        if (deletes.numberOfActions() > 0) {
-            retrier.call("deleting documents whose rows were deleted", () -> run(deletes));
+        if (!deletes.isEmpty()) {
+            Map<String, BulkItemResponse.Failure> notDeleted = sendAll("deleting documents whose rows were deleted", deletes, retrier, bulk, ids -> {});
+            if (!notDeleted.isEmpty()) {
+                BulkItemResponse.Failure first = notDeleted.values().iterator().next();
+                log.warn(
+                    "[infino] {} documents of {} whose rows table {} deleted during the rebuild could not be deleted (the first: {}); "
+                        + "a search may name them until they are",
+                    notDeleted.size(),
+                    shardId,
+                    table,
+                    first.getMessage()
+                );
+            }
         }
-        return created.size();
+        return new Created(created.size(), refused, firstRefusal);
+    }
+
+    /**
+     * The create of {@code id} from the table's row: no ingest pipeline runs
+     * on it, not even the index's final or system one, which the table's row
+     * went through when it was written. A pipeline would run again on it,
+     * and write the source anew without the mark.
+     */
+    static IndexRequest createOf(String index, String id, String routing, String source) {
+        IndexRequest create = new IndexRequest(index).id(id)
+            .routing(routing)
+            .source(source, XContentType.JSON)
+            .opType(DocWriteRequest.OpType.CREATE)
+            .setPipeline(NO_PIPELINE)
+            .setFinalPipeline(NO_PIPELINE);
+        if (SET_SYSTEM_PIPELINE != null) {
+            try {
+                SET_SYSTEM_PIPELINE.invoke(create, NO_PIPELINE);
+            } catch (IllegalAccessException | InvocationTargetException e) {
+                throw new IllegalStateException("[infino] a rebuild's create could not be kept from the system ingest pipeline", e);
+            }
+        }
+        // Resolved already, so the bulk does not read the pipelines from the index's settings.
+        return create.isPipelineResolved(true);
+    }
+
+    private static Method systemPipelineSetter() {
+        try {
+            return IndexRequest.class.getMethod("setSystemIngestPipeline", String.class);
+        } catch (NoSuchMethodException e) {
+            return null; // a release with no system ingest pipeline
+        }
+    }
+
+    /**
+     * Send {@code requests} (by id) as bulks until each has an answer that is
+     * not a failure that passes: the items that fail for a reason that passes
+     * are sent again together after the retrier's wait. Returns the failure
+     * each id ended with; an id that went through is absent. {@code sending}
+     * is told the ids of each bulk before it is sent, a bulk sent again after
+     * a lost answer included.
+     */
+    static Map<String, BulkItemResponse.Failure> sendAll(
+        String request,
+        Map<String, ? extends DocWriteRequest<?>> requests,
+        Retrier retrier,
+        Function<BulkRequest, BulkResponse> bulk,
+        Consumer<Collection<String>> sending
+    ) {
+        Map<String, DocWriteRequest<?>> pending = new LinkedHashMap<>(requests);
+        Map<String, BulkItemResponse.Failure> failed = new HashMap<>();
+        while (!pending.isEmpty()) {
+            BulkRequest sent = new BulkRequest();
+            pending.values().forEach(sent::add);
+            BulkResponse response = retrier.attempt(request, () -> {
+                sending.accept(pending.keySet());
+                return bulk.apply(sent);
+            });
+            boolean answered = false;
+            BulkItemResponse.Failure again = null;
+            for (BulkItemResponse item : response.getItems()) {
+                if (item.isFailed() && retryable(item.getFailure().getStatus())) {
+                    again = item.getFailure();
+                    continue;
+                }
+                if (item.isFailed()) {
+                    failed.put(item.getId(), item.getFailure());
+                }
+                pending.remove(item.getId());
+                answered = true;
+            }
+            if (answered) {
+                retrier.progress();
+            }
+            if (again == null) {
+                break;
+            }
+            retrier.failed(request, again.getCause());
+        }
+        return failed;
     }
 
     /**
@@ -410,7 +575,7 @@ final class InfinoSkeletonAdopter {
     /**
      * Whether {@code source} is a skeleton-only create's (see {@link #MARK}).
      * A replayed operation or one of a shard's history that is was taken by
-     * a primary as one of its rebuild's creates ({@link #claim}), whose row
+     * a primary as one of its rebuild's creates ({@link #kind}), whose row
      * the table holds.
      */
     static boolean isMarked(BytesReference source) {
@@ -425,20 +590,86 @@ final class InfinoSkeletonAdopter {
         return true;
     }
 
+    /** Whose write an index operation is, as the engine of {@link #kind} decides it. */
+    enum Kind {
+        /** A client's write, which the engine writes to the table. */
+        CLIENT,
+        /** A skeleton rebuild's create, whose row the table holds already. */
+        REBUILD,
+        /** A write that carries the rebuild's mark but is no create of a rebuild: refused. */
+        FORGED
+    }
+
     /**
-     * Whether a marked create of {@code id} the primary of {@code shard}
-     * applies is one this node's rebuild of the shard sent, with this very
-     * source; it is claimed once. The rebuild runs on the node of the
-     * shard's primary, so its creates reach this node's engine. One that is
-     * not (a client's write that carries the mark) is refused by the engine.
+     * Whose write {@code index}, applied by an engine of {@code shard}, is.
+     * On the primary, a create is the rebuild's when this node's rebuild of
+     * the shard has it in flight with the same content ({@link #claim}); the
+     * mark is then put back on its source when a plugin dropped it, so the
+     * translog and the shard's history keep it. A primary write that carries
+     * the mark but is not claimed is forged: a client cannot keep a write out
+     * of the table with it. Any other copy takes the mark as the primary
+     * left it: a replay, a replica, a recovery.
      */
-    static boolean claim(ShardId shard, String id, BytesReference source) {
+    static Kind kind(ShardId shard, Engine.Index index) {
+        boolean marked = isMarked(index.source());
+        if (index.origin() != Engine.Operation.Origin.PRIMARY) {
+            return marked ? Kind.REBUILD : Kind.CLIENT;
+        }
+        MediaType type = index.parsedDoc() == null ? null : index.parsedDoc().getMediaType();
+        if (index.version() == Versions.MATCH_DELETED && claim(shard, index.id(), index.source(), type)) {
+            if (!marked && (type == null || type == MediaTypeRegistry.JSON)) {
+                String source = marked(index.source().utf8ToString());
+                if (source != null) {
+                    index.parsedDoc().setSource(new BytesArray(source), XContentType.JSON);
+                }
+            }
+            return Kind.REBUILD;
+        }
+        return marked ? Kind.FORGED : Kind.CLIENT;
+    }
+
+    /**
+     * Whether a create of {@code id} that the primary of {@code shard}
+     * applies is one this node's rebuild of the shard has in flight, with the
+     * same content, so its row is in the table already; it is claimed once.
+     * The rebuild runs on the node of the shard's primary, so its creates
+     * reach this node's engine. The content is compared as bytes first, then
+     * as parsed documents ({@code type} is the source's, null for JSON): a
+     * plugin may have written the source anew. A create with other content,
+     * or one the rebuild does not have in flight, is a client's write.
+     */
+    static boolean claim(ShardId shard, String id, BytesReference source, MediaType type) {
         Map<String, String> inFlight = IN_FLIGHT.get(shard);
         if (inFlight == null || source == null) {
             return false;
         }
-        String expected = inFlight.get(id);
-        return expected != null && expected.equals(source.utf8ToString()) && inFlight.remove(id, expected);
+        String sent = inFlight.get(id);
+        return sent != null && sameContent(sent, source, type) && inFlight.remove(id, sent);
+    }
+
+    /** Whether {@code source} (of media type {@code type}, null for JSON) holds the JSON document {@code sent}. */
+    static boolean sameContent(String sent, BytesReference source, MediaType type) {
+        BytesArray sentBytes = new BytesArray(sent);
+        if ((type == null || type == MediaTypeRegistry.JSON) && sentBytes.equals(source)) {
+            return true;
+        }
+        try {
+            return XContentHelper.convertToMap(sentBytes, false, MediaTypeRegistry.JSON)
+                .v2()
+                .equals(XContentHelper.convertToMap(source, false, type == null ? MediaTypeRegistry.JSON : type).v2());
+        } catch (RuntimeException e) {
+            return false; // a source that does not parse is no rebuild's
+        }
+    }
+
+    /** Hold {@code inFlight} (source by id) as the creates the rebuild of {@code shard} has in flight, for {@link #claim}. */
+    static void track(ShardId shard, Map<String, String> inFlight) {
+        IN_FLIGHT.put(shard, inFlight);
+    }
+
+    /** Let go of {@code inFlight}, once its creates have been answered. */
+    static void untrack(ShardId shard, Map<String, String> inFlight) {
+        IN_FLIGHT.remove(shard, inFlight);
     }
 
     /** Run {@code bulk} as the node and wait for it. */
@@ -463,27 +694,48 @@ final class InfinoSkeletonAdopter {
     }
 
     /**
-     * Whether a request that failed with {@code status} may go through when
-     * tried again: a rate limit, or a server error. The bridge reports a
-     * transport error (a timeout, a connection refused or reset) as a 500,
-     * and a write pool that is full or a shard that is not ready answer 429
-     * and 503. Any other status is a refusal that no retry changes.
+     * Whether a request answered {@code status} may go through when tried
+     * again: a rate limit or a full thread pool (429), or a service, a shard
+     * or a gateway not ready or not answering (502, 503, 504). Any other
+     * status, a 500 among them, says the request failed, and trying it again
+     * would fail it again.
      */
     static boolean retryable(RestStatus status) {
-        return status == RestStatus.TOO_MANY_REQUESTS || status.getStatus() >= RestStatus.INTERNAL_SERVER_ERROR.getStatus();
+        return status == RestStatus.TOO_MANY_REQUESTS
+            || status == RestStatus.BAD_GATEWAY
+            || status == RestStatus.SERVICE_UNAVAILABLE
+            || status == RestStatus.GATEWAY_TIMEOUT;
     }
 
     /**
-     * Whether {@code e} may pass when its request is tried again
-     * ({@link #retryable(RestStatus)}). Only a failure that carries a status
-     * (and a full thread pool, which answers 429) is the answer of the
-     * service or the cluster; any other is a fault of the rebuild itself,
+     * Whether {@code e} may pass when its request is tried again. A bridge
+     * error passes when the bridge marks it as the hosted service not reached
+     * or not answering ({@link InfinoNative.InfinoException#unavailable}: a
+     * transport failure, or a 502, 503 or 504), or when its status is one
+     * that passes ({@link #retryable(RestStatus)}), as the service's 429 is;
+     * one without a status reads as a 500 and does not. A failure of the
+     * cluster passes when it is a full thread pool or carries a status that
+     * passes. Anything else is a fault of the request or of the rebuild,
      * which a retry would only repeat.
      */
     static boolean retryable(Throwable e) {
         Throwable cause = ExceptionsHelper.unwrapCause(e);
-        return (cause instanceof OpenSearchException || cause instanceof OpenSearchRejectedExecutionException)
-            && retryable(ExceptionsHelper.status(cause));
+        if (cause instanceof InfinoNative.InfinoException infino) {
+            return infino.unavailable() || retryable(infino.status());
+        }
+        return cause instanceof OpenSearchRejectedExecutionException
+            || (cause instanceof OpenSearchException && retryable(ExceptionsHelper.status(cause)));
+    }
+
+    /**
+     * A rebuild whose requests went on failing, each for a reason that
+     * passes, for {@link #GIVE_UP_MILLIS} with none going through: it stops
+     * with an error, as a refusal does.
+     */
+    static final class GaveUp extends RuntimeException {
+        GaveUp(String what, String request, long millis, Throwable last) {
+            super("the skeleton rebuild of " + what + " gave up after " + millis + " ms with no request going through; " + request + " failed last", last);
+        }
     }
 
     /**
@@ -496,7 +748,9 @@ final class InfinoSkeletonAdopter {
      * answering 429 is not sent the next request at once. It says so for
      * the first failure and then at most once per
      * {@link #RETRY_LOG_INTERVAL_MILLIS}, with the failures since. A refusal
-     * is thrown as it is. Once {@code stopped} answers true it throws
+     * is thrown as it is; failures that pass but go on for its give-up time
+     * ({@link #GIVE_UP_MILLIS}) with nothing going through ({@link #progress})
+     * throw {@link GaveUp}. Once {@code stopped} answers true it throws
      * {@link Stopped}: it asks before each try and every
      * {@link #PAUSE_POLL_MILLIS} of a wait, so a closed shard or a stopping
      * node ends the loop within that.
@@ -512,27 +766,46 @@ final class InfinoSkeletonAdopter {
         private final BooleanSupplier stopped;
         private final Sleeper sleeper;
         private final LongSupplier clock;
+        private final long giveUpMillis;
         private long backoff = FIRST_BACKOFF_MILLIS;
         private long retried;
         private long failedSinceLog;
         private long loggedAt;
         private boolean logged;
+        /** When the failures since the last request that went through began, or -1 for none. */
+        private long failingSince = -1;
 
         /** For the rebuild of {@code what}, as the log names it; {@code clock} answers milliseconds. */
         Retrier(String what, BooleanSupplier stopped, Sleeper sleeper, LongSupplier clock) {
+            this(what, stopped, sleeper, clock, GIVE_UP_MILLIS);
+        }
+
+        /** As above, giving up after {@code giveUpMillis} of failures with nothing going through. */
+        Retrier(String what, BooleanSupplier stopped, Sleeper sleeper, LongSupplier clock, long giveUpMillis) {
             this.what = what;
             this.stopped = stopped;
             this.sleeper = sleeper;
             this.clock = clock;
+            this.giveUpMillis = giveUpMillis;
         }
 
-        /** What {@code call} answers, tried until it goes through; {@code request} names it in the log. */
+        /** What {@code call} answers, tried until it goes through, which counts as {@link #progress}; {@code request} names it in the log. */
         <T> T call(String request, Supplier<T> call) {
+            T out = attempt(request, call);
+            progress();
+            return out;
+        }
+
+        /**
+         * What {@code call} answers, tried until it goes through, with no
+         * {@link #progress} counted: for a bulk whose answer may still hold
+         * failures of its items, whose caller says whether it got anywhere.
+         */
+        <T> T attempt(String request, Supplier<T> call) {
             while (true) {
                 stopIfStopped();
-                T out;
                 try {
-                    out = call.get();
+                    return call.get();
                 } catch (RuntimeException e) {
                     // The shard closing under a request fails it too: that is no refusal.
                     stopIfStopped();
@@ -540,19 +813,32 @@ final class InfinoSkeletonAdopter {
                         throw e;
                     }
                     failed(request, e);
-                    continue;
                 }
-                backoff = Math.max(FIRST_BACKOFF_MILLIS, backoff / 2);
-                return out;
             }
         }
 
-        /** Count a failure of {@code request} that may pass, with {@code cause}, and wait before it is tried again. */
+        /** A request went through: the give-up time starts again, and the wait halves. */
+        void progress() {
+            failingSince = -1;
+            backoff = Math.max(FIRST_BACKOFF_MILLIS, backoff / 2);
+        }
+
+        /**
+         * Count a failure of {@code request} that may pass, with {@code cause},
+         * and wait before it is tried again; throws {@link GaveUp} when the
+         * failures since the last {@link #progress} have gone on for the
+         * give-up time.
+         */
         void failed(String request, Throwable cause) {
+            long now = clock.getAsLong();
+            if (failingSince < 0) {
+                failingSince = now;
+            } else if (now - failingSince >= giveUpMillis) {
+                throw new GaveUp(what, request, now - failingSince, cause);
+            }
             retried++;
             failedSinceLog++;
             long wait = backoff / 2 + Randomness.get().nextLong(backoff / 2 + 1);
-            long now = clock.getAsLong();
             if (!logged || now - loggedAt >= RETRY_LOG_INTERVAL_MILLIS) {
                 log.warn(
                     "[infino] the skeleton rebuild of {} tries again in {} ms: {} failed, {} failures since the last report, the last: {}",
