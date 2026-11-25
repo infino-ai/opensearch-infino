@@ -9,6 +9,7 @@ import org.opensearch.Version;
 import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
+import org.opensearch.action.delete.DeleteRequest;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.support.AutoCreateIndex;
 import org.opensearch.cluster.ClusterName;
@@ -20,14 +21,18 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.IndexNotFoundException;
+import org.opensearch.index.VersionType;
 import org.opensearch.indices.SystemIndices;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** How a bulk's items that require their index be an alias are answered. */
 public class InfinoBulkActionFilterTests extends OpenSearchTestCase {
@@ -166,6 +171,80 @@ public class InfinoBulkActionFilterTests extends OpenSearchTestCase {
         // Only the names the items the pipelines left write to are created; a failed flagged item blocks none.
         assertEquals(List.of("kept", "flag_failed"), InfinoBulkActionFilter.missingIndices(state, rule, bulk, answered));
         assertEquals(List.of("dropped_only", "kept"), InfinoBulkActionFilter.missingIndices(state, rule, bulk, null));
+    }
+
+    /** An index that cannot be created fails the items that write to it, each in its own slot; the rest go on. */
+    public void testAnIndexThatCannotBeCreatedFailsOnlyItsOwnItems() {
+        BulkRequest bulk = new BulkRequest().add(write("bad", false)).add(write("good", false)).add(write("bad", false)).add(write("bad", false));
+        BulkItemResponse[] answered = new BulkItemResponse[4];
+        BulkItemResponse byPipeline = new BulkItemResponse(
+            3,
+            DocWriteRequest.OpType.INDEX,
+            new BulkItemResponse.Failure("bad", "1", new IllegalStateException("pipeline failed"))
+        );
+        answered[3] = byPipeline;
+        InfinoBulkActionFilter.failItemsOf("bad", new IllegalArgumentException("cannot create"), bulk, answered);
+        for (int slot : new int[] { 0, 2 }) {
+            assertTrue(answered[slot].isFailed());
+            assertEquals(slot, answered[slot].getItemId());
+            assertEquals("bad", answered[slot].getFailure().getIndex());
+            assertEquals("cannot create", answered[slot].getFailure().getCause().getMessage());
+            assertEquals(400, answered[slot].getFailure().getStatus().getStatus());
+        }
+        assertNull(answered[1]);
+        // An item already answered keeps its answer.
+        assertSame(byPipeline, answered[3]);
+    }
+
+    /**
+     * Every missing index is asked for at once; one that cannot be created
+     * fails its own items, and the bulk goes on once, after the last answer.
+     */
+    public void testMissingIndicesAreCreatedTogetherAndTheBulkGoesOnOnce() {
+        BulkRequest bulk = new BulkRequest().add(write("a", false)).add(write("bad", false)).add(write("b", false)).add(write("bad", false));
+        BulkItemResponse[] answered = new BulkItemResponse[4];
+        Map<String, ActionListener<Void>> asked = new LinkedHashMap<>();
+        AtomicInteger ran = new AtomicInteger();
+        InfinoBulkActionFilter.createMissing(
+            List.of("a", "bad", "b"),
+            bulk,
+            answered,
+            ran::incrementAndGet,
+            (index, timeout, listener) -> asked.put(index, listener)
+        );
+        // None waits on another's answer.
+        assertEquals(List.of("a", "bad", "b"), List.copyOf(asked.keySet()));
+        asked.get("bad").onFailure(new IllegalArgumentException("cannot create"));
+        asked.get("a").onResponse(null);
+        assertEquals(0, ran.get());
+        asked.get("b").onResponse(null);
+        assertEquals(1, ran.get());
+        // A second answer to a creation already answered changes nothing.
+        asked.get("a").onFailure(new IllegalStateException("late"));
+        asked.get("b").onResponse(null);
+        assertEquals(1, ran.get());
+        assertNull(answered[0]);
+        assertNull(answered[2]);
+        assertEquals("cannot create", answered[1].getFailure().getCause().getMessage());
+        assertEquals("cannot create", answered[3].getFailure().getCause().getMessage());
+    }
+
+    /** As the stock bulk: a delete creates no index unless it carries an external version. */
+    public void testADeleteCreatesNoIndexWithoutAnExternalVersion() {
+        IndexNameExpressionResolver resolver = new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY));
+        AutoCreateIndex rule = new AutoCreateIndex(
+            Settings.EMPTY,
+            new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS),
+            resolver,
+            new SystemIndices(Map.of())
+        );
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT).metadata(Metadata.builder().build()).build();
+        BulkRequest bulk = new BulkRequest().add(new DeleteRequest("plain", "1"))
+            .add(new DeleteRequest("external", "1").version(3).versionType(VersionType.EXTERNAL))
+            .add(new DeleteRequest("external_gte", "1").version(3).versionType(VersionType.EXTERNAL_GTE))
+            .add(new DeleteRequest("written", "1"))
+            .add(write("written", false));
+        assertEquals(List.of("external", "external_gte", "written"), InfinoBulkActionFilter.missingIndices(state, rule, bulk, null));
     }
 
     public void testADateMathNameIsCheckedAsTheIndexItResolvesTo() {

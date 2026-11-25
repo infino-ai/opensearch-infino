@@ -1,0 +1,338 @@
+---
+setup:
+  - do:
+      indices.create:
+        index: tl_proxy
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { user: { type: keyword }, num: { type: integer } } }
+  - do:
+      indices.create:
+        index: tl_default
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { user: { type: keyword }, num: { type: integer } } }
+  # The lookup documents, in an index the plugin backs and in a stock one.
+  - do:
+      indices.create:
+        index: tl_users
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              followers: { type: keyword, store: true }
+              profile: { properties: { follows: { type: keyword } } }
+  - do:
+      indices.create:
+        index: tl_users_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { followers: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: tl_proxy, _id: "1" }
+          - { user: a, num: 111 }
+          - index: { _index: tl_proxy, _id: "2" }
+          - { user: b, num: 222 }
+          - index: { _index: tl_proxy, _id: "3" }
+          - { user: c, num: 333 }
+          - index: { _index: tl_default, _id: "1" }
+          - { user: a, num: 111 }
+          - index: { _index: tl_default, _id: "2" }
+          - { user: b, num: 222 }
+          - index: { _index: tl_default, _id: "3" }
+          - { user: c, num: 333 }
+          - index: { _index: tl_users, _id: u1 }
+          - { followers: [a, b] }
+          - index: { _index: tl_users, _id: u2 }
+          - { profile: { follows: [c] } }
+          - index: { _index: tl_users_luc, _id: u1 }
+          - { followers: [b, c] }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: tl_proxy,tl_default,tl_users,tl_users_luc,sec_tl,sec_tl_d,sec_tl_users
+        ignore_unavailable: true
+
+---
+"A terms lookup is read first, as the user, then searched as the terms it holds, in both modes":
+  # The lookup document is read through the cluster's get, so one in an
+  # index the plugin backs comes from its table and one in a stock index
+  # from its shard; either way the search is then a plain terms query.
+  - do:
+      search:
+        index: tl_proxy
+        body: { query: { terms: { user: { index: tl_users, id: u1, path: followers } } }, sort: [ { num: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: tl_default
+        body: { query: { terms: { user: { index: tl_users, id: u1, path: followers } } }, sort: [ { num: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: tl_default
+        body: { query: { terms: { user: { index: tl_users_luc, id: u1, path: followers } } }, sort: [ { num: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  # The documents a query matches in the lookup index, and a lookup document in a default-mode index.
+  - do:
+      search:
+        index: tl_proxy
+        body: { query: { terms: { user: { index: tl_users, query: { match_all: {} }, path: followers } } }, sort: [ { num: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: tl_default
+        body: { query: { terms: { user: { index: tl_users, query: { match_all: {} }, path: followers } } }, sort: [ { num: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: tl_proxy
+        body: { query: { terms: { user: { index: tl_default, id: "3", path: user } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "3" }
+  # A path into an object, inside a bool, and in a filter aggregation.
+  - do:
+      search:
+        index: tl_proxy
+        body: { query: { bool: { filter: [ { terms: { user: { index: tl_users, id: u2, path: profile.follows } } } ] } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - do:
+      search:
+        index: tl_default
+        body:
+          size: 0
+          aggs: { followed: { filter: { terms: { user: { index: tl_users, id: u1, path: followers } } } } }
+  - match: { hits.total.value: 3 }
+  - match: { aggregations.followed.doc_count: 2 }
+  - do:
+      search:
+        index: tl_proxy
+        body:
+          size: 0
+          aggs: { followed: { filter: { terms: { user: { index: tl_users, id: u1, path: followers } } } } }
+  - match: { hits.total.value: 3 }
+  - match: { aggregations.followed.doc_count: 2 }
+
+---
+"A lookup of a missing document finds nothing, and one into a missing index is not found":
+  - do:
+      search:
+        index: tl_proxy
+        body: { query: { terms: { user: { index: tl_users, id: nobody, path: followers } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search:
+        index: tl_default
+        body: { query: { terms: { user: { index: tl_users, id: nobody, path: followers } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      catch: missing
+      search:
+        index: tl_proxy
+        body: { query: { terms: { user: { index: tl_no_such_index, id: u1, path: followers } } } }
+  - do:
+      catch: missing
+      search:
+        index: tl_default
+        body: { query: { terms: { user: { index: tl_no_such_index, id: u1, path: followers } } } }
+
+---
+"A lookup in an aggregation counts toward index.max_terms_count":
+  - do:
+      indices.put_settings:
+        index: tl_proxy,tl_default
+        body: { index.max_terms_count: 1 }
+  - do:
+      search:
+        index: tl_proxy
+        body: { size: 0, aggs: { f: { filter: { terms: { user: { index: tl_users, id: u2, path: profile.follows } } } } } }
+  - match: { aggregations.f.doc_count: 1 }
+  - do:
+      catch: /The number of terms \[2\] used in the Terms Query request has exceeded the allowed maximum of \[1\]/
+      search:
+        index: tl_proxy
+        body: { size: 0, aggs: { f: { filter: { terms: { user: { index: tl_users, id: u1, path: followers } } } } } }
+  - match: { status: 400 }
+  - do:
+      catch: bad_request
+      search:
+        index: tl_default
+        body: { size: 0, aggs: { f: { filter: { terms: { user: { index: tl_users, id: u1, path: followers } } } } } }
+
+---
+"A search mixing a proxy index with a stock one is refused before its lookup is read":
+  # The lookup's index does not exist, so reading it first would answer not found.
+  - do:
+      catch: /a search mixing Infino-backed indices with others is not served/
+      search:
+        index: tl_proxy,tl_users_luc
+        body: { query: { terms: { user: { index: tl_no_such_index, id: u1, path: followers } } } }
+  - match: { status: 400 }
+
+---
+"A lookup of a stored field from a table, and a bitmap of terms, are refused as bad requests":
+  # The table keeps each document's source, not a stored field's values apart from it.
+  - do:
+      catch: /the stored field \[followers\] of \[tl_users\] is not served by the table/
+      search:
+        index: tl_proxy
+        body: { query: { terms: { user: { index: tl_users, id: u1, path: followers, store: true } } } }
+  - match: { status: 400 }
+  - do:
+      catch: /the stored field \[followers\] of \[tl_users\] is not served by the table/
+      search:
+        index: tl_default
+        body: { query: { terms: { user: { index: tl_users, id: u1, path: followers, store: true } } } }
+  - match: { status: 400 }
+  - do:
+      catch: /the stored field \[followers\] of \[tl_users\] is not served by the table/
+      search:
+        index: tl_default
+        body: { query: { terms: { user: { index: tl_users, query: { match_all: {} }, path: followers, store: true } } } }
+  - match: { status: 400 }
+  # So is a get of it, and a multi-get item asking for it fails alone.
+  - do:
+      catch: /the stored field \[followers\] of \[tl_users\] is not served by the table/
+      get:
+        index: tl_users
+        id: u1
+        stored_fields: followers
+  - match: { status: 400 }
+  - do:
+      mget:
+        body:
+          docs:
+            - { _index: tl_users, _id: u1, stored_fields: [ followers ] }
+            - { _index: tl_users, _id: u1 }
+  - match: { docs.0.error.reason: "/.*the.stored.field.\\[followers\\].of.\\[tl_users\\].is.not.served.by.the.table.*/" }
+  - match: { docs.1.found: true }
+  - match: { docs.1._source.followers: [ a, b ] }
+  # A bitmap value is a serialized set of terms the table does not decode.
+  - do:
+      catch: /a terms query on \[num\] with value_type \[bitmap\] is not served by the table/
+      search:
+        index: tl_proxy
+        body: { query: { terms: { num: [ "OjAAAAEAAAAAAAEAEAAAAG8A3gA=" ], value_type: bitmap } } }
+  - match: { status: 400 }
+  - do:
+      catch: /a terms query on \[num\] with value_type \[bitmap\] is not served by the table/
+      search:
+        index: tl_default
+        body: { query: { terms: { num: [ "OjAAAAEAAAAAAAEAEAAAAG8A3gA=" ], value_type: bitmap } } }
+  - match: { status: 400 }
+
+---
+"A lookup reads its document as the user: what they may not read of the lookup index, they cannot look up":
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: sec_tl
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { user: { type: keyword }, tag: { type: keyword } } }
+  - do:
+      indices.create:
+        index: sec_tl_d
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { user: { type: keyword }, tag: { type: keyword } } }
+  - do:
+      indices.create:
+        index: sec_tl_users
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { followers: { type: keyword }, tag: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec_tl, _id: "1" }
+          - { user: a, tag: x }
+          - index: { _index: sec_tl, _id: "2" }
+          - { user: b, tag: x }
+          - index: { _index: sec_tl_users, _id: u1 }
+          - { followers: [a], tag: x }
+          - index: { _index: sec_tl_users, _id: u2 }
+          - { followers: [b], tag: y }
+  - match: { errors: false }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec_tl_d, _id: "1" }
+          - { user: a, tag: x }
+          - index: { _index: sec_tl_d, _id: "2" }
+          - { user: b, tag: x }
+  - match: { errors: false }
+  # A user who reads sec* looks up a document there, in both modes.
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      search:
+        index: sec_tl
+        body: { query: { terms: { user: { index: sec_tl_users, id: u2, path: followers } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do:
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      search:
+        index: sec_tl_d
+        body: { query: { terms: { user: { index: sec_tl_users, id: u2, path: followers } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+  # ... but not one in an index they may not read.
+  - do:
+      catch: forbidden
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      search:
+        index: sec_tl
+        body: { query: { terms: { user: { index: tl_users, id: u1, path: followers } } } }
+  - do:
+      catch: forbidden
+      headers: { Authorization: "Basic cGxhaW5fdXNlcjphZG1pbg==" }
+      search:
+        index: sec_tl_d
+        body: { query: { terms: { user: { index: tl_users, id: u1, path: followers } } } }
+  # A document rule hides a lookup document as it hides a hit: tag y is not the user's.
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec_tl
+        body: { query: { terms: { user: { index: sec_tl_users, id: u2, path: followers } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec_tl
+        body: { query: { terms: { user: { index: sec_tl_users, id: u1, path: followers } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec_tl_d
+        body: { query: { terms: { user: { index: sec_tl_users, id: u2, path: followers } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      search:
+        index: sec_tl_d
+        body: { query: { terms: { user: { index: sec_tl_users, id: u1, path: followers } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }

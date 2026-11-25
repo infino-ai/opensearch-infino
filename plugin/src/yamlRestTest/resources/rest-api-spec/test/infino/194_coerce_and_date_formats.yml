@@ -1,0 +1,541 @@
+# A fractional number in an integer field, and dates in the formats a
+# field's mapping names, as stock answers them (issues #132 and #218), in
+# default mode, proxy mode and on a Lucene index. With coerce on, the value
+# is truncated in the column and _source keeps what the client sent; with
+# coerce: false the write is refused. A date in any format its mapping
+# accepts, including the slash dates dynamic mapping detects, is stored as
+# its instant and found by get, search, sort, range and date_histogram.
+
+---
+"Default mode: a fractional number in an integer field is truncated, and refused with coerce false":
+  - do:
+      indices.create:
+        index: co_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              status: { type: long }
+              small: { type: short }
+              strict: { type: integer, coerce: false }
+  - do: { index: { index: co_def, id: "1", refresh: true, body: { status: 200.7, small: 3.9 } } }
+  - match: { result: created }
+  - do: { get: { index: co_def, id: "1" } }
+  - match: { _source.status: 200.7 }
+  - match: { _source.small: 3.9 }
+  - do: { search: { index: co_def, rest_total_hits_as_int: true, body: { query: { term: { status: 200 } } } } }
+  - match: { hits.total: 1 }
+  - do: { search: { index: co_def, rest_total_hits_as_int: true, body: { query: { term: { small: 3 } } } } }
+  - match: { hits.total: 1 }
+  - do:
+      search:
+        index: co_def
+        body: { size: 1, sort: [ { status: asc } ], aggs: { total: { sum: { field: status } }, codes: { terms: { field: status } } } }
+  - match: { hits.hits.0.sort.0: 200 }
+  - match: { aggregations.total.value: 200.0 }
+  - match: { aggregations.codes.buckets.0.key: 200 }
+  - do:
+      catch: bad_request
+      index: { index: co_def, id: "2", body: { strict: 3.5 } }
+  - match: { error.type: mapper_parsing_exception }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: co_def, _id: "3" } }
+          - { strict: 3.5 }
+          - { index: { _index: co_def, _id: "4" } }
+          - { strict: 4, status: 9.99 }
+  - is_true: errors
+  - match: { items.0.index.status: 400 }
+  - match: { items.0.index.error.type: mapper_parsing_exception }
+  - match: { items.1.index.status: 201 }
+  - do: { count: { index: co_def } }
+  - match: { count: 2 }
+  - do: { search: { index: co_def, rest_total_hits_as_int: true, body: { query: { term: { status: 9 } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - do:
+      catch: missing
+      get: { index: co_def, id: "3" }
+  # A partial update merges a fraction into the document the same way.
+  - do: { update: { index: co_def, id: "4", refresh: true, body: { doc: { small: 7.2 } } } }
+  - match: { result: updated }
+  - do: { get: { index: co_def, id: "4" } }
+  - match: { _source.small: 7.2 }
+  - match: { _source.status: 9.99 }
+  - do: { search: { index: co_def, rest_total_hits_as_int: true, body: { query: { term: { small: 7 } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - do:
+      catch: bad_request
+      update: { index: co_def, id: "4", body: { doc: { strict: 1.5 } } }
+  - match: { error.type: mapper_parsing_exception }
+  - do: { get: { index: co_def, id: "4" } }
+  - match: { _source.strict: 4 }
+
+---
+"Proxy mode: a fractional number in an integer field is truncated, and refused with coerce false":
+  - do:
+      indices.create:
+        index: co_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              status: { type: long }
+              small: { type: short }
+              strict: { type: integer, coerce: false }
+  - do: { index: { index: co_px, id: "1", refresh: true, body: { status: 200.7, small: 3.9 } } }
+  - match: { result: created }
+  - do: { get: { index: co_px, id: "1" } }
+  - match: { _source.status: 200.7 }
+  - match: { _source.small: 3.9 }
+  - do: { search: { index: co_px, rest_total_hits_as_int: true, body: { query: { term: { status: 200 } } } } }
+  - match: { hits.total: 1 }
+  - do: { search: { index: co_px, rest_total_hits_as_int: true, body: { query: { term: { small: 3 } } } } }
+  - match: { hits.total: 1 }
+  - do:
+      search:
+        index: co_px
+        body: { size: 1, sort: [ { status: asc } ], aggs: { total: { sum: { field: status } }, codes: { terms: { field: status } } } }
+  - match: { hits.hits.0.sort.0: 200 }
+  - match: { aggregations.total.value: 200.0 }
+  - match: { aggregations.codes.buckets.0.key: 200 }
+  - do:
+      catch: bad_request
+      index: { index: co_px, id: "2", body: { strict: 3.5 } }
+  - match: { error.type: mapper_parsing_exception }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: co_px, _id: "3" } }
+          - { strict: 3.5 }
+          - { index: { _index: co_px, _id: "4" } }
+          - { strict: 4, status: 9.99 }
+  - is_true: errors
+  - match: { items.0.index.status: 400 }
+  - match: { items.0.index.error.type: mapper_parsing_exception }
+  - match: { items.1.index.status: 201 }
+  - do: { count: { index: co_px } }
+  - match: { count: 2 }
+  - do: { search: { index: co_px, rest_total_hits_as_int: true, body: { query: { term: { status: 9 } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - do:
+      catch: missing
+      get: { index: co_px, id: "3" }
+  # A partial update merges a fraction into the document the same way.
+  - do: { update: { index: co_px, id: "4", refresh: true, body: { doc: { small: 7.2 } } } }
+  - match: { result: updated }
+  - do: { get: { index: co_px, id: "4" } }
+  - match: { _source.small: 7.2 }
+  - match: { _source.status: 9.99 }
+  - do: { search: { index: co_px, rest_total_hits_as_int: true, body: { query: { term: { small: 7 } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - do:
+      catch: bad_request
+      update: { index: co_px, id: "4", body: { doc: { strict: 1.5 } } }
+  - match: { error.type: mapper_parsing_exception }
+  - do: { get: { index: co_px, id: "4" } }
+  - match: { _source.strict: 4 }
+
+---
+"Lucene: a fractional number in an integer field is truncated, and refused with coerce false":
+  - do:
+      indices.create:
+        index: co_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              status: { type: long }
+              small: { type: short }
+              strict: { type: integer, coerce: false }
+  - do: { index: { index: co_luc, id: "1", refresh: true, body: { status: 200.7, small: 3.9 } } }
+  - match: { result: created }
+  - do: { get: { index: co_luc, id: "1" } }
+  - match: { _source.status: 200.7 }
+  - match: { _source.small: 3.9 }
+  - do: { search: { index: co_luc, rest_total_hits_as_int: true, body: { query: { term: { status: 200 } } } } }
+  - match: { hits.total: 1 }
+  - do: { search: { index: co_luc, rest_total_hits_as_int: true, body: { query: { term: { small: 3 } } } } }
+  - match: { hits.total: 1 }
+  - do:
+      search:
+        index: co_luc
+        body: { size: 1, sort: [ { status: asc } ], aggs: { total: { sum: { field: status } }, codes: { terms: { field: status } } } }
+  - match: { hits.hits.0.sort.0: 200 }
+  - match: { aggregations.total.value: 200.0 }
+  - match: { aggregations.codes.buckets.0.key: 200 }
+  - do:
+      catch: bad_request
+      index: { index: co_luc, id: "2", body: { strict: 3.5 } }
+  - match: { error.type: mapper_parsing_exception }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: co_luc, _id: "3" } }
+          - { strict: 3.5 }
+          - { index: { _index: co_luc, _id: "4" } }
+          - { strict: 4, status: 9.99 }
+  - is_true: errors
+  - match: { items.0.index.status: 400 }
+  - match: { items.0.index.error.type: mapper_parsing_exception }
+  - match: { items.1.index.status: 201 }
+  - do: { count: { index: co_luc } }
+  - match: { count: 2 }
+  - do: { search: { index: co_luc, rest_total_hits_as_int: true, body: { query: { term: { status: 9 } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - do:
+      catch: missing
+      get: { index: co_luc, id: "3" }
+  # A partial update merges a fraction into the document the same way.
+  - do: { update: { index: co_luc, id: "4", refresh: true, body: { doc: { small: 7.2 } } } }
+  - match: { result: updated }
+  - do: { get: { index: co_luc, id: "4" } }
+  - match: { _source.small: 7.2 }
+  - match: { _source.status: 9.99 }
+  - do: { search: { index: co_luc, rest_total_hits_as_int: true, body: { query: { term: { small: 7 } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - do:
+      catch: bad_request
+      update: { index: co_luc, id: "4", body: { doc: { strict: 1.5 } } }
+  - match: { error.type: mapper_parsing_exception }
+  - do: { get: { index: co_luc, id: "4" } }
+  - match: { _source.strict: 4 }
+
+---
+"Default mode: dates in custom formats and epoch_second are stored as their instants":
+  - do:
+      indices.create:
+        index: fmt_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              t: { type: date, format: "yyyy-MM-dd HH:mm:ss" }
+              t2: { type: date, format: "dd/MMM/yyyy:HH:mm:ss Z" }
+              t3: { type: date, format: epoch_second }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: fmt_def, _id: "1" } }
+          - { t: "2026-11-24 10:00:00", t2: "24/Nov/2026:10:00:00 +0000", t3: 1795514400 }
+          - { index: { _index: fmt_def, _id: "2" } }
+          - { t: "2026-11-25 08:30:00", t2: "25/Nov/2026:09:30:00 +0100", t3: "1795595400" }
+  - is_false: errors
+  - do: { get: { index: fmt_def, id: "1" } }
+  - match: { _source.t2: "24/Nov/2026:10:00:00 +0000" }
+  - do: { get: { index: fmt_def, id: "2" } }
+  - match: { _source.t2: "25/Nov/2026:09:30:00 +0100" }
+  - match: { _source.t3: "1795595400" }
+  - do: { search: { index: fmt_def, rest_total_hits_as_int: true, body: { query: { ids: { values: ["1", "2"] } } } } }
+  - match: { hits.total: 2 }
+  - do: { search: { index: fmt_def, body: { sort: [ { t: desc } ] } } }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.0.sort.0: 1795595400000 }
+  - match: { hits.hits.1.sort.0: 1795514400000 }
+  - do: { search: { index: fmt_def, body: { sort: [ { t2: desc } ] } } }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.0.sort.0: 1795595400000 }
+  - match: { hits.hits.1.sort.0: 1795514400000 }
+  - do: { search: { index: fmt_def, body: { sort: [ { t3: asc } ] } } }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.sort.0: 1795514400000 }
+  - match: { hits.hits.1.sort.0: 1795595400000 }
+  - do: { search: { index: fmt_def, rest_total_hits_as_int: true, body: { query: { range: { t: { gte: "2026-11-25 00:00:00" } } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do: { search: { index: fmt_def, rest_total_hits_as_int: true, body: { query: { range: { t2: { gte: "25/Nov/2026:00:00:00 +0000" } } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do: { search: { index: fmt_def, rest_total_hits_as_int: true, body: { query: { range: { t3: { lt: 1795564800 } } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: fmt_def
+        body: { size: 0, aggs: { by_t2: { date_histogram: { field: t2, calendar_interval: day } }, by_t3: { date_histogram: { field: t3, calendar_interval: day } } } }
+  - length: { aggregations.by_t2.buckets: 2 }
+  - match: { aggregations.by_t2.buckets.0.key: 1795478400000 }
+  - match: { aggregations.by_t2.buckets.0.doc_count: 1 }
+  - match: { aggregations.by_t2.buckets.1.key: 1795564800000 }
+  - match: { aggregations.by_t2.buckets.1.doc_count: 1 }
+  - match: { aggregations.by_t3.buckets.0.key: 1795478400000 }
+  - match: { aggregations.by_t3.buckets.1.key: 1795564800000 }
+
+---
+"Proxy mode: dates in custom formats and epoch_second are stored as their instants":
+  - do:
+      indices.create:
+        index: fmt_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              t: { type: date, format: "yyyy-MM-dd HH:mm:ss" }
+              t2: { type: date, format: "dd/MMM/yyyy:HH:mm:ss Z" }
+              t3: { type: date, format: epoch_second }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: fmt_px, _id: "1" } }
+          - { t: "2026-11-24 10:00:00", t2: "24/Nov/2026:10:00:00 +0000", t3: 1795514400 }
+          - { index: { _index: fmt_px, _id: "2" } }
+          - { t: "2026-11-25 08:30:00", t2: "25/Nov/2026:09:30:00 +0100", t3: "1795595400" }
+  - is_false: errors
+  - do: { get: { index: fmt_px, id: "1" } }
+  - match: { _source.t2: "24/Nov/2026:10:00:00 +0000" }
+  - do: { get: { index: fmt_px, id: "2" } }
+  - match: { _source.t2: "25/Nov/2026:09:30:00 +0100" }
+  - match: { _source.t3: "1795595400" }
+  - do: { search: { index: fmt_px, rest_total_hits_as_int: true, body: { query: { ids: { values: ["1", "2"] } } } } }
+  - match: { hits.total: 2 }
+  - do: { search: { index: fmt_px, body: { sort: [ { t: desc } ] } } }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.0.sort.0: 1795595400000 }
+  - match: { hits.hits.1.sort.0: 1795514400000 }
+  - do: { search: { index: fmt_px, body: { sort: [ { t2: desc } ] } } }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.0.sort.0: 1795595400000 }
+  - match: { hits.hits.1.sort.0: 1795514400000 }
+  - do: { search: { index: fmt_px, body: { sort: [ { t3: asc } ] } } }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.sort.0: 1795514400000 }
+  - match: { hits.hits.1.sort.0: 1795595400000 }
+  - do: { search: { index: fmt_px, rest_total_hits_as_int: true, body: { query: { range: { t: { gte: "2026-11-25 00:00:00" } } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do: { search: { index: fmt_px, rest_total_hits_as_int: true, body: { query: { range: { t2: { gte: "25/Nov/2026:00:00:00 +0000" } } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do: { search: { index: fmt_px, rest_total_hits_as_int: true, body: { query: { range: { t3: { lt: 1795564800 } } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: fmt_px
+        body: { size: 0, aggs: { by_t2: { date_histogram: { field: t2, calendar_interval: day } }, by_t3: { date_histogram: { field: t3, calendar_interval: day } } } }
+  - length: { aggregations.by_t2.buckets: 2 }
+  - match: { aggregations.by_t2.buckets.0.key: 1795478400000 }
+  - match: { aggregations.by_t2.buckets.0.doc_count: 1 }
+  - match: { aggregations.by_t2.buckets.1.key: 1795564800000 }
+  - match: { aggregations.by_t2.buckets.1.doc_count: 1 }
+  - match: { aggregations.by_t3.buckets.0.key: 1795478400000 }
+  - match: { aggregations.by_t3.buckets.1.key: 1795564800000 }
+
+---
+"Lucene: dates in custom formats and epoch_second are stored as their instants":
+  - do:
+      indices.create:
+        index: fmt_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              t: { type: date, format: "yyyy-MM-dd HH:mm:ss" }
+              t2: { type: date, format: "dd/MMM/yyyy:HH:mm:ss Z" }
+              t3: { type: date, format: epoch_second }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: fmt_luc, _id: "1" } }
+          - { t: "2026-11-24 10:00:00", t2: "24/Nov/2026:10:00:00 +0000", t3: 1795514400 }
+          - { index: { _index: fmt_luc, _id: "2" } }
+          - { t: "2026-11-25 08:30:00", t2: "25/Nov/2026:09:30:00 +0100", t3: "1795595400" }
+  - is_false: errors
+  - do: { get: { index: fmt_luc, id: "1" } }
+  - match: { _source.t2: "24/Nov/2026:10:00:00 +0000" }
+  - do: { get: { index: fmt_luc, id: "2" } }
+  - match: { _source.t2: "25/Nov/2026:09:30:00 +0100" }
+  - match: { _source.t3: "1795595400" }
+  - do: { search: { index: fmt_luc, rest_total_hits_as_int: true, body: { query: { ids: { values: ["1", "2"] } } } } }
+  - match: { hits.total: 2 }
+  - do: { search: { index: fmt_luc, body: { sort: [ { t: desc } ] } } }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.0.sort.0: 1795595400000 }
+  - match: { hits.hits.1.sort.0: 1795514400000 }
+  - do: { search: { index: fmt_luc, body: { sort: [ { t2: desc } ] } } }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.0.sort.0: 1795595400000 }
+  - match: { hits.hits.1.sort.0: 1795514400000 }
+  - do: { search: { index: fmt_luc, body: { sort: [ { t3: asc } ] } } }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.sort.0: 1795514400000 }
+  - match: { hits.hits.1.sort.0: 1795595400000 }
+  - do: { search: { index: fmt_luc, rest_total_hits_as_int: true, body: { query: { range: { t: { gte: "2026-11-25 00:00:00" } } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do: { search: { index: fmt_luc, rest_total_hits_as_int: true, body: { query: { range: { t2: { gte: "25/Nov/2026:00:00:00 +0000" } } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do: { search: { index: fmt_luc, rest_total_hits_as_int: true, body: { query: { range: { t3: { lt: 1795564800 } } } } } }
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      search:
+        index: fmt_luc
+        body: { size: 0, aggs: { by_t2: { date_histogram: { field: t2, calendar_interval: day } }, by_t3: { date_histogram: { field: t3, calendar_interval: day } } } }
+  - length: { aggregations.by_t2.buckets: 2 }
+  - match: { aggregations.by_t2.buckets.0.key: 1795478400000 }
+  - match: { aggregations.by_t2.buckets.0.doc_count: 1 }
+  - match: { aggregations.by_t2.buckets.1.key: 1795564800000 }
+  - match: { aggregations.by_t2.buckets.1.doc_count: 1 }
+  - match: { aggregations.by_t3.buckets.0.key: 1795478400000 }
+  - match: { aggregations.by_t3.buckets.1.key: 1795564800000 }
+
+---
+"Default mode: a slash date dynamic mapping detects is stored as its instant":
+  - do:
+      indices.create:
+        index: dyn_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: dyn_def, _id: "1" } }
+          - { ts: "2026/11/24 10:00:00" }
+  - is_false: errors
+  - do: { indices.get_mapping: { index: dyn_def } }
+  - match: { dyn_def.mappings.properties.ts.type: date }
+  - match: { dyn_def.mappings.properties.ts.format: "yyyy/MM/dd HH:mm:ss||yyyy/MM/dd||epoch_millis" }
+  # Once the field is mapped, later documents carry no new field.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: dyn_def, _id: "2" } }
+          - { ts: "2026/11/25 08:30:00" }
+          - { index: { _index: dyn_def, _id: "3" } }
+          - { ts: "2026/11/26" }
+  - is_false: errors
+  - do: { index: { index: dyn_def, id: "4", refresh: true, body: { ts: "2026/11/26 12:00:00" } } }
+  - match: { result: created }
+  - do: { count: { index: dyn_def } }
+  - match: { count: 4 }
+  - do: { get: { index: dyn_def, id: "2" } }
+  - match: { _source.ts: "2026/11/25 08:30:00" }
+  - do: { search: { index: dyn_def, body: { sort: [ { ts: asc } ] } } }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.sort.0: 1795514400000 }
+  - match: { hits.hits.1.sort.0: 1795595400000 }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "4" }
+  - do: { search: { index: dyn_def, rest_total_hits_as_int: true, body: { query: { range: { ts: { gte: "2026/11/25 00:00:00" } } } } } }
+  - match: { hits.total: 3 }
+  - do:
+      search:
+        index: dyn_def
+        body: { size: 0, aggs: { by_day: { date_histogram: { field: ts, calendar_interval: day } } } }
+  - length: { aggregations.by_day.buckets: 3 }
+  - match: { aggregations.by_day.buckets.0.key: 1795478400000 }
+  - match: { aggregations.by_day.buckets.2.doc_count: 2 }
+
+---
+"Proxy mode: a slash date dynamic mapping detects is stored as its instant":
+  - do:
+      indices.create:
+        index: dyn_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: dyn_px, _id: "1" } }
+          - { ts: "2026/11/24 10:00:00" }
+  - is_false: errors
+  - do: { indices.get_mapping: { index: dyn_px } }
+  - match: { dyn_px.mappings.properties.ts.type: date }
+  - match: { dyn_px.mappings.properties.ts.format: "yyyy/MM/dd HH:mm:ss||yyyy/MM/dd||epoch_millis" }
+  # Once the field is mapped, later documents carry no new field.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: dyn_px, _id: "2" } }
+          - { ts: "2026/11/25 08:30:00" }
+          - { index: { _index: dyn_px, _id: "3" } }
+          - { ts: "2026/11/26" }
+  - is_false: errors
+  - do: { index: { index: dyn_px, id: "4", refresh: true, body: { ts: "2026/11/26 12:00:00" } } }
+  - match: { result: created }
+  - do: { count: { index: dyn_px } }
+  - match: { count: 4 }
+  - do: { get: { index: dyn_px, id: "2" } }
+  - match: { _source.ts: "2026/11/25 08:30:00" }
+  - do: { search: { index: dyn_px, body: { sort: [ { ts: asc } ] } } }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.sort.0: 1795514400000 }
+  - match: { hits.hits.1.sort.0: 1795595400000 }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "4" }
+  - do: { search: { index: dyn_px, rest_total_hits_as_int: true, body: { query: { range: { ts: { gte: "2026/11/25 00:00:00" } } } } } }
+  - match: { hits.total: 3 }
+  - do:
+      search:
+        index: dyn_px
+        body: { size: 0, aggs: { by_day: { date_histogram: { field: ts, calendar_interval: day } } } }
+  - length: { aggregations.by_day.buckets: 3 }
+  - match: { aggregations.by_day.buckets.0.key: 1795478400000 }
+  - match: { aggregations.by_day.buckets.2.doc_count: 2 }
+
+---
+"Lucene: a slash date dynamic mapping detects is stored as its instant":
+  - do:
+      indices.create:
+        index: dyn_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: dyn_luc, _id: "1" } }
+          - { ts: "2026/11/24 10:00:00" }
+  - is_false: errors
+  - do: { indices.get_mapping: { index: dyn_luc } }
+  - match: { dyn_luc.mappings.properties.ts.type: date }
+  - match: { dyn_luc.mappings.properties.ts.format: "yyyy/MM/dd HH:mm:ss||yyyy/MM/dd||epoch_millis" }
+  # Once the field is mapped, later documents carry no new field.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - { index: { _index: dyn_luc, _id: "2" } }
+          - { ts: "2026/11/25 08:30:00" }
+          - { index: { _index: dyn_luc, _id: "3" } }
+          - { ts: "2026/11/26" }
+  - is_false: errors
+  - do: { index: { index: dyn_luc, id: "4", refresh: true, body: { ts: "2026/11/26 12:00:00" } } }
+  - match: { result: created }
+  - do: { count: { index: dyn_luc } }
+  - match: { count: 4 }
+  - do: { get: { index: dyn_luc, id: "2" } }
+  - match: { _source.ts: "2026/11/25 08:30:00" }
+  - do: { search: { index: dyn_luc, body: { sort: [ { ts: asc } ] } } }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.0.sort.0: 1795514400000 }
+  - match: { hits.hits.1.sort.0: 1795595400000 }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "4" }
+  - do: { search: { index: dyn_luc, rest_total_hits_as_int: true, body: { query: { range: { ts: { gte: "2026/11/25 00:00:00" } } } } } }
+  - match: { hits.total: 3 }
+  - do:
+      search:
+        index: dyn_luc
+        body: { size: 0, aggs: { by_day: { date_histogram: { field: ts, calendar_interval: day } } } }
+  - length: { aggregations.by_day.buckets: 3 }
+  - match: { aggregations.by_day.buckets.0.key: 1795478400000 }
+  - match: { aggregations.by_day.buckets.2.doc_count: 2 }

@@ -6,11 +6,26 @@ package org.opensearch.infino;
 
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Work a request starts beside its own, and how a failed request lets go of it. */
+/** Work a request starts beside its own, how a failed request lets go of it, and what starting the services checks. */
 public class InfinoServicesTests extends OpenSearchTestCase {
+
+    /** Starting the services checks the node's storage: a directory the node may not write stops the start. */
+    public void testStartingTheServicesChecksTheStorage() {
+        String uri = "file:///var/lib/infino/data";
+        String answer = "{\"error\":\"Permission denied (os error 13)\",\"permanent\":true}";
+        InfinoNativeTests.withBridge(
+            new InfinoNative.Target(uri, null, false, uri),
+            Map.of("infino_check_storage", () -> InfinoNativeTests.cString(answer)),
+            () -> {
+                IllegalStateException e = expectThrows(IllegalStateException.class, () -> new InfinoServices().start());
+                assertTrue(e.getMessage(), e.getMessage().contains("cannot use its storage at " + uri));
+            }
+        );
+    }
 
     /** A failed caller returns only once the started work has finished, and its own failure is the one kept. */
     public void testDrainWaitsForTheStartedWorkAndKeepsTheCallersFailure() throws Exception {

@@ -1,0 +1,389 @@
+# A range or date_range aggregation's missing value stands in for a document
+# that has no value of the field, as stock reads it: such a document falls in
+# whichever bucket the missing value does. A date_range reads its missing
+# value as it reads its bounds, in the aggregation's format (else the field's)
+# and time zone, with date math. Each request runs on a Lucene twin too, so
+# the answers are stock's.
+setup:
+  - do:
+      indices.create:
+        index: rm_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              s: { type: date, format: epoch_second }
+              t: { type: date }
+              n: { type: double }
+              k: { type: keyword }
+              m: { type: date }
+  - do:
+      indices.create:
+        index: rm_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              s: { type: date, format: epoch_second }
+              t: { type: date }
+              n: { type: double }
+              k: { type: keyword }
+              m: { type: date }
+  - do:
+      indices.create:
+        index: rm_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              s: { type: date, format: epoch_second }
+              t: { type: date }
+              n: { type: double }
+              k: { type: keyword }
+              m: { type: date }
+  - do:
+      bulk:
+        refresh: true
+        index: rm_luc
+        body:
+          - index: { _id: "1" }
+          - { "s": "100000", "t": "2020-01-01T00:00:00Z", "n": 5 }
+          - index: { _id: "2" }
+          - { "s": "300000", "t": "2020-06-01T00:00:00Z", "n": 20 }
+          - index: { _id: "3" }
+          - { "s": "10000", "t": "2019-12-31T23:00:00Z", "n": 1 }
+          - index: { _id: "4" }
+          - { "k": "x" }
+          - index: { _id: "5" }
+          - { "k": "y" }
+  - do:
+      bulk:
+        refresh: true
+        index: rm_prx
+        body:
+          - index: { _id: "1" }
+          - { "s": "100000", "t": "2020-01-01T00:00:00Z", "n": 5 }
+          - index: { _id: "2" }
+          - { "s": "300000", "t": "2020-06-01T00:00:00Z", "n": 20 }
+          - index: { _id: "3" }
+          - { "s": "10000", "t": "2019-12-31T23:00:00Z", "n": 1 }
+          - index: { _id: "4" }
+          - { "k": "x" }
+          - index: { _id: "5" }
+          - { "k": "y" }
+  - do:
+      bulk:
+        refresh: true
+        index: rm_def
+        body:
+          - index: { _id: "1" }
+          - { "s": "100000", "t": "2020-01-01T00:00:00Z", "n": 5 }
+          - index: { _id: "2" }
+          - { "s": "300000", "t": "2020-06-01T00:00:00Z", "n": 20 }
+          - index: { _id: "3" }
+          - { "s": "10000", "t": "2019-12-31T23:00:00Z", "n": 1 }
+          - index: { _id: "4" }
+          - { "k": "x" }
+          - index: { _id: "5" }
+          - { "k": "y" }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: rm_luc,rm_prx,rm_def
+        ignore_unavailable: true
+
+---
+"A date_range's missing value is read in the field's format":
+  - do:
+      search: { index: rm_luc, body: { size: 0, aggs: { r: { date_range: { field: s, missing: "0", ranges: [ { key: low, to: "200000" }, { key: high, from: "200000" } ] } } } } }
+  - match: { aggregations.r.buckets.0.key: low }
+  - match: { aggregations.r.buckets.0.doc_count: 4 }
+  - match: { aggregations.r.buckets.1.key: high }
+  - match: { aggregations.r.buckets.1.doc_count: 1 }
+  - do:
+      search: { index: rm_prx, body: { size: 0, aggs: { r: { date_range: { field: s, missing: "0", ranges: [ { key: low, to: "200000" }, { key: high, from: "200000" } ] } } } } }
+  - match: { aggregations.r.buckets.0.key: low }
+  - match: { aggregations.r.buckets.0.doc_count: 4 }
+  - match: { aggregations.r.buckets.1.key: high }
+  - match: { aggregations.r.buckets.1.doc_count: 1 }
+  - do:
+      search: { index: rm_def, body: { size: 0, aggs: { r: { date_range: { field: s, missing: "0", ranges: [ { key: low, to: "200000" }, { key: high, from: "200000" } ] } } } } }
+  - match: { aggregations.r.buckets.0.key: low }
+  - match: { aggregations.r.buckets.0.doc_count: 4 }
+  - match: { aggregations.r.buckets.1.key: high }
+  - match: { aggregations.r.buckets.1.doc_count: 1 }
+
+---
+"A date_range's missing value is read in the aggregation's format and time zone":
+  - do:
+      search: { index: rm_luc, body: { size: 0, aggs: { r: { date_range: { field: t, format: "yyyy-MM-dd'T'HH:mm", time_zone: "+01:00", missing: "2020-01-01T00:30", ranges: [ { to: "2020-01-01T00:00" }, { from: "2020-01-01T00:00", to: "2020-01-01T01:00" }, { from: "2020-01-01T01:00" } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 0 }
+  - match: { aggregations.r.buckets.1.key: "2020-01-01T00:00-2020-01-01T01:00" }
+  - match: { aggregations.r.buckets.1.doc_count: 3 }
+  - match: { aggregations.r.buckets.2.doc_count: 2 }
+  - do:
+      search: { index: rm_prx, body: { size: 0, aggs: { r: { date_range: { field: t, format: "yyyy-MM-dd'T'HH:mm", time_zone: "+01:00", missing: "2020-01-01T00:30", ranges: [ { to: "2020-01-01T00:00" }, { from: "2020-01-01T00:00", to: "2020-01-01T01:00" }, { from: "2020-01-01T01:00" } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 0 }
+  - match: { aggregations.r.buckets.1.key: "2020-01-01T00:00-2020-01-01T01:00" }
+  - match: { aggregations.r.buckets.1.doc_count: 3 }
+  - match: { aggregations.r.buckets.2.doc_count: 2 }
+  - do:
+      search: { index: rm_def, body: { size: 0, aggs: { r: { date_range: { field: t, format: "yyyy-MM-dd'T'HH:mm", time_zone: "+01:00", missing: "2020-01-01T00:30", ranges: [ { to: "2020-01-01T00:00" }, { from: "2020-01-01T00:00", to: "2020-01-01T01:00" }, { from: "2020-01-01T01:00" } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 0 }
+  - match: { aggregations.r.buckets.1.key: "2020-01-01T00:00-2020-01-01T01:00" }
+  - match: { aggregations.r.buckets.1.doc_count: 3 }
+  - match: { aggregations.r.buckets.2.doc_count: 2 }
+
+---
+"A date_range's missing value may be date math, and stands in under a sub-aggregation":
+  - do:
+      search: { index: rm_luc, body: { size: 0, aggs: { r: { date_range: { field: t, missing: "2020-01-01||-1d", ranges: [ { key: before, to: "2020-01-01" }, { key: after, from: "2020-01-01" } ] }, aggs: { c: { value_count: { field: k } } } } } } }
+  - match: { aggregations.r.buckets.0.key: before }
+  - match: { aggregations.r.buckets.0.doc_count: 3 }
+  - match: { aggregations.r.buckets.0.c.value: 2 }
+  - match: { aggregations.r.buckets.1.key: after }
+  - match: { aggregations.r.buckets.1.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.c.value: 0 }
+  - do:
+      search: { index: rm_prx, body: { size: 0, aggs: { r: { date_range: { field: t, missing: "2020-01-01||-1d", ranges: [ { key: before, to: "2020-01-01" }, { key: after, from: "2020-01-01" } ] }, aggs: { c: { value_count: { field: k } } } } } } }
+  - match: { aggregations.r.buckets.0.key: before }
+  - match: { aggregations.r.buckets.0.doc_count: 3 }
+  - match: { aggregations.r.buckets.0.c.value: 2 }
+  - match: { aggregations.r.buckets.1.key: after }
+  - match: { aggregations.r.buckets.1.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.c.value: 0 }
+  - do:
+      search: { index: rm_def, body: { size: 0, aggs: { r: { date_range: { field: t, missing: "2020-01-01||-1d", ranges: [ { key: before, to: "2020-01-01" }, { key: after, from: "2020-01-01" } ] }, aggs: { c: { value_count: { field: k } } } } } } }
+  - match: { aggregations.r.buckets.0.key: before }
+  - match: { aggregations.r.buckets.0.doc_count: 3 }
+  - match: { aggregations.r.buckets.0.c.value: 2 }
+  - match: { aggregations.r.buckets.1.key: after }
+  - match: { aggregations.r.buckets.1.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.c.value: 0 }
+
+---
+"A date_range's missing value over a field no document holds":
+  - do:
+      search: { index: rm_luc, body: { size: 0, aggs: { r: { date_range: { field: m, missing: "2020-01-01", ranges: [ { to: "2020-01-01" }, { from: "2020-01-01" } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 0 }
+  - match: { aggregations.r.buckets.1.doc_count: 5 }
+  - do:
+      search: { index: rm_prx, body: { size: 0, aggs: { r: { date_range: { field: m, missing: "2020-01-01", ranges: [ { to: "2020-01-01" }, { from: "2020-01-01" } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 0 }
+  - match: { aggregations.r.buckets.1.doc_count: 5 }
+  - do:
+      search: { index: rm_def, body: { size: 0, aggs: { r: { date_range: { field: m, missing: "2020-01-01", ranges: [ { to: "2020-01-01" }, { from: "2020-01-01" } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 0 }
+  - match: { aggregations.r.buckets.1.doc_count: 5 }
+
+---
+"A date_range's missing value over an unmapped field":
+  - do:
+      search: { index: rm_luc, body: { size: 0, aggs: { r: { date_range: { field: nope, missing: "2020-01-01", ranges: [ { to: "2020-01-01" }, { from: "2020-01-01" } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 0 }
+  - match: { aggregations.r.buckets.1.doc_count: 5 }
+  - do:
+      search: { index: rm_prx, body: { size: 0, aggs: { r: { date_range: { field: nope, missing: "2020-01-01", ranges: [ { to: "2020-01-01" }, { from: "2020-01-01" } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 0 }
+  - match: { aggregations.r.buckets.1.doc_count: 5 }
+  - do:
+      search: { index: rm_def, body: { size: 0, aggs: { r: { date_range: { field: nope, missing: "2020-01-01", ranges: [ { to: "2020-01-01" }, { from: "2020-01-01" } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 0 }
+  - match: { aggregations.r.buckets.1.doc_count: 5 }
+
+---
+"A range's missing value stands in for a document with no value":
+  - do:
+      search: { index: rm_luc, body: { size: 0, aggs: { r: { range: { field: n, missing: 10, ranges: [ { to: 10 }, { from: 10 } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.doc_count: 3 }
+  - do:
+      search: { index: rm_prx, body: { size: 0, aggs: { r: { range: { field: n, missing: 10, ranges: [ { to: 10 }, { from: 10 } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.doc_count: 3 }
+  - do:
+      search: { index: rm_def, body: { size: 0, aggs: { r: { range: { field: n, missing: 10, ranges: [ { to: 10 }, { from: 10 } ] } } } } }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.doc_count: 3 }
+
+---
+"Range buckets come back ordered by their bounds, and bounds outside 1677-2262 are served":
+  - do:
+      search: { index: rm_luc, body: { size: 0, aggs: { r: { date_range: { field: t, ranges: [ { key: late, from: "2020-03-01" }, { key: ancient, to: "1000-01-01" }, { key: far, from: 400000000000000 }, { key: mid, from: "1000-01-01", to: "2020-03-01" } ] } } } } }
+  - length: { aggregations.r.buckets: 4 }
+  - match: { aggregations.r.buckets.0.key: ancient }
+  - match: { aggregations.r.buckets.0.doc_count: 0 }
+  - match: { aggregations.r.buckets.1.key: mid }
+  - match: { aggregations.r.buckets.1.doc_count: 2 }
+  - match: { aggregations.r.buckets.2.key: late }
+  - match: { aggregations.r.buckets.2.doc_count: 1 }
+  - match: { aggregations.r.buckets.3.key: far }
+  - match: { aggregations.r.buckets.3.doc_count: 0 }
+  - do:
+      search: { index: rm_prx, body: { size: 0, aggs: { r: { date_range: { field: t, ranges: [ { key: late, from: "2020-03-01" }, { key: ancient, to: "1000-01-01" }, { key: far, from: 400000000000000 }, { key: mid, from: "1000-01-01", to: "2020-03-01" } ] } } } } }
+  - length: { aggregations.r.buckets: 4 }
+  - match: { aggregations.r.buckets.0.key: ancient }
+  - match: { aggregations.r.buckets.0.doc_count: 0 }
+  - match: { aggregations.r.buckets.1.key: mid }
+  - match: { aggregations.r.buckets.1.doc_count: 2 }
+  - match: { aggregations.r.buckets.2.key: late }
+  - match: { aggregations.r.buckets.2.doc_count: 1 }
+  - match: { aggregations.r.buckets.3.key: far }
+  - match: { aggregations.r.buckets.3.doc_count: 0 }
+  - do:
+      search: { index: rm_def, body: { size: 0, aggs: { r: { date_range: { field: t, ranges: [ { key: late, from: "2020-03-01" }, { key: ancient, to: "1000-01-01" }, { key: far, from: 400000000000000 }, { key: mid, from: "1000-01-01", to: "2020-03-01" } ] } } } } }
+  - length: { aggregations.r.buckets: 4 }
+  - match: { aggregations.r.buckets.0.key: ancient }
+  - match: { aggregations.r.buckets.0.doc_count: 0 }
+  - match: { aggregations.r.buckets.1.key: mid }
+  - match: { aggregations.r.buckets.1.doc_count: 2 }
+  - match: { aggregations.r.buckets.2.key: late }
+  - match: { aggregations.r.buckets.2.doc_count: 1 }
+  - match: { aggregations.r.buckets.3.key: far }
+  - match: { aggregations.r.buckets.3.doc_count: 0 }
+
+---
+"A date_range's missing value outside 1677-2262 stands in under a terms sub-aggregation":
+  - do:
+      search: { index: rm_luc, body: { size: 0, aggs: { r: { date_range: { field: t, missing: "1000-01-01", ranges: [ { key: old, to: "1000-01-02" }, { key: new, from: "1000-01-02", to: 400000000000000 } ] }, aggs: { k: { terms: { field: k } } } } } } }
+  - match: { aggregations.r.buckets.0.key: old }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - length: { aggregations.r.buckets.0.k.buckets: 2 }
+  - match: { aggregations.r.buckets.0.k.buckets.0.key: x }
+  - match: { aggregations.r.buckets.1.key: new }
+  - match: { aggregations.r.buckets.1.doc_count: 3 }
+  - length: { aggregations.r.buckets.1.k.buckets: 0 }
+  - do:
+      search: { index: rm_prx, body: { size: 0, aggs: { r: { date_range: { field: t, missing: "1000-01-01", ranges: [ { key: old, to: "1000-01-02" }, { key: new, from: "1000-01-02", to: 400000000000000 } ] }, aggs: { k: { terms: { field: k } } } } } } }
+  - match: { aggregations.r.buckets.0.key: old }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - length: { aggregations.r.buckets.0.k.buckets: 2 }
+  - match: { aggregations.r.buckets.0.k.buckets.0.key: x }
+  - match: { aggregations.r.buckets.1.key: new }
+  - match: { aggregations.r.buckets.1.doc_count: 3 }
+  - length: { aggregations.r.buckets.1.k.buckets: 0 }
+  - do:
+      search: { index: rm_def, body: { size: 0, aggs: { r: { date_range: { field: t, missing: "1000-01-01", ranges: [ { key: old, to: "1000-01-02" }, { key: new, from: "1000-01-02", to: 400000000000000 } ] }, aggs: { k: { terms: { field: k } } } } } } }
+  - match: { aggregations.r.buckets.0.key: old }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - length: { aggregations.r.buckets.0.k.buckets: 2 }
+  - match: { aggregations.r.buckets.0.k.buckets.0.key: x }
+  - match: { aggregations.r.buckets.1.key: new }
+  - match: { aggregations.r.buckets.1.doc_count: 3 }
+  - length: { aggregations.r.buckets.1.k.buckets: 0 }
+
+---
+"A range's buckets come back ordered by their bounds":
+  - do:
+      search: { index: rm_luc, body: { size: 0, aggs: { r: { range: { field: n, ranges: [ { key: high, from: 10 }, { key: low, to: 10 } ] } } } } }
+  - match: { aggregations.r.buckets.0.key: low }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.key: high }
+  - match: { aggregations.r.buckets.1.doc_count: 1 }
+  - do:
+      search: { index: rm_prx, body: { size: 0, aggs: { r: { range: { field: n, ranges: [ { key: high, from: 10 }, { key: low, to: 10 } ] } } } } }
+  - match: { aggregations.r.buckets.0.key: low }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.key: high }
+  - match: { aggregations.r.buckets.1.doc_count: 1 }
+  - do:
+      search: { index: rm_def, body: { size: 0, aggs: { r: { range: { field: n, ranges: [ { key: high, from: 10 }, { key: low, to: 10 } ] } } } } }
+  - match: { aggregations.r.buckets.0.key: low }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.key: high }
+  - match: { aggregations.r.buckets.1.doc_count: 1 }
+
+---
+"A range's bounds may be strings, read as numbers":
+  - do:
+      search: { index: rm_luc, body: { size: 0, aggs: { r: { range: { field: n, missing: "10", ranges: [ { key: high, from: "10" }, { key: low, to: "10" } ] } } } } }
+  - match: { aggregations.r.buckets.0.key: low }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.key: high }
+  - match: { aggregations.r.buckets.1.doc_count: 3 }
+  - do:
+      search: { index: rm_prx, body: { size: 0, aggs: { r: { range: { field: n, missing: "10", ranges: [ { key: high, from: "10" }, { key: low, to: "10" } ] } } } } }
+  - match: { aggregations.r.buckets.0.key: low }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.key: high }
+  - match: { aggregations.r.buckets.1.doc_count: 3 }
+  - do:
+      search: { index: rm_def, body: { size: 0, aggs: { r: { range: { field: n, missing: "10", ranges: [ { key: high, from: "10" }, { key: low, to: "10" } ] } } } } }
+  - match: { aggregations.r.buckets.0.key: low }
+  - match: { aggregations.r.buckets.0.doc_count: 2 }
+  - match: { aggregations.r.buckets.1.key: high }
+  - match: { aggregations.r.buckets.1.doc_count: 3 }
+
+---
+"A range's bound that is not a number is a bad request":
+  - do:
+      catch: bad_request
+      search: { index: rm_luc, body: { size: 0, aggs: { r: { range: { field: n, ranges: [ { from: "ten" } ] } } } } }
+  - do:
+      catch: bad_request
+      search: { index: rm_prx, body: { size: 0, aggs: { r: { range: { field: n, ranges: [ { from: "ten" } ] } } } } }
+  - do:
+      catch: bad_request
+      search: { index: rm_def, body: { size: 0, aggs: { r: { range: { field: n, ranges: [ { from: "ten" } ] } } } } }
+
+---
+"A numeric missing value over a date field is read in the field's format":
+  - do:
+      search: { index: rm_luc, body: { size: 0, aggs: { lo: { min: { field: s, missing: 1000 } }, t: { terms: { field: s, missing: 0, order: { _key: asc } } } } } }
+  - match: { aggregations.lo.value: 1000000 }
+  - length: { aggregations.t.buckets: 4 }
+  - match: { aggregations.t.buckets.0.key: 0 }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.1.key: 10000000 }
+  - do:
+      search: { index: rm_prx, body: { size: 0, aggs: { lo: { min: { field: s, missing: 1000 } }, t: { terms: { field: s, missing: 0, order: { _key: asc } } } } } }
+  - match: { aggregations.lo.value: 1000000 }
+  - length: { aggregations.t.buckets: 4 }
+  - match: { aggregations.t.buckets.0.key: 0 }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.1.key: 10000000 }
+  - do:
+      search: { index: rm_def, body: { size: 0, aggs: { lo: { min: { field: s, missing: 1000 } }, t: { terms: { field: s, missing: 0, order: { _key: asc } } } } } }
+  - match: { aggregations.lo.value: 1000000 }
+  - length: { aggregations.t.buckets: 4 }
+  - match: { aggregations.t.buckets.0.key: 0 }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.1.key: 10000000 }
+
+---
+"A date_histogram's missing value is read as a date":
+  - do:
+      search: { index: rm_luc, body: { size: 0, aggs: { h: { date_histogram: { field: t, calendar_interval: year, missing: "2020-02-01" } } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.key: 1546300800000 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 1577836800000 }
+  - match: { aggregations.h.buckets.1.doc_count: 4 }
+  - do:
+      search: { index: rm_prx, body: { size: 0, aggs: { h: { date_histogram: { field: t, calendar_interval: year, missing: "2020-02-01" } } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.key: 1546300800000 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 1577836800000 }
+  - match: { aggregations.h.buckets.1.doc_count: 4 }
+  - do:
+      search: { index: rm_def, body: { size: 0, aggs: { h: { date_histogram: { field: t, calendar_interval: year, missing: "2020-02-01" } } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.key: 1546300800000 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 1577836800000 }
+  - match: { aggregations.h.buckets.1.doc_count: 4 }
+
+---
+"A date_range's missing value that is not a date is a bad request":
+  - do:
+      catch: bad_request
+      search: { index: rm_luc, body: { size: 0, aggs: { r: { date_range: { field: t, missing: "not a date", ranges: [ { to: "2020-01-01" } ] } } } } }
+  - do:
+      catch: bad_request
+      search: { index: rm_prx, body: { size: 0, aggs: { r: { date_range: { field: t, missing: "not a date", ranges: [ { to: "2020-01-01" } ] } } } } }
+  - do:
+      catch: bad_request
+      search: { index: rm_def, body: { size: 0, aggs: { r: { date_range: { field: t, missing: "not a date", ranges: [ { to: "2020-01-01" } ] } } } } }
