@@ -2939,22 +2939,34 @@ public final class InfinoSearch {
         // over both: over several indices such an aggregation is answered once,
         // over every index's rows read as one (overAll), as the coordinating
         // node answers it over default-mode shards (InfinoExactAggregation).
+        // An index the search reads no row of (the security plugin's own index)
+        // adds nothing to such an answer, so it takes no part in it: over one
+        // index that reads rows, each index answers its own, as for any other
+        // aggregation.
+        List<Index> read = new ArrayList<>();
+        for (Index index : indices) {
+            if (!accessOf.apply(index).readsNothing()) {
+                read.add(index);
+            }
+        }
         List<AggregationBuilder> perIndexBuilders = new ArrayList<>();
         List<AggregationBuilder> overAll = new ArrayList<>();
         for (AggregationBuilder b : builders) {
-            if (indices.size() > 1 && InfinoAggregationProcessor.needsExactValues(List.of(b))) {
+            if (read.size() > 1 && InfinoAggregationProcessor.needsExactValues(List.of(b))) {
                 overAll.add(b);
             } else {
                 perIndexBuilders.add(b);
             }
         }
-        List<Plan> plans = new ArrayList<>();
+        List<Plan> readPlans = new ArrayList<>();
         List<SortSpec> sorts = List.of();
         boolean terminatedEarly = false;
         for (Index index : indices) {
             SearchSourceBuilder perIndex = after == null || after.get(index) == null ? source : withSearchAfter(source, after.get(index));
             Plan plan = plan(tableOf.apply(index), perIndex, now, accessOf.apply(index));
-            plans.add(plan);
+            if (read.contains(index)) {
+                readPlans.add(plan);
+            }
             if (after != null && plan.ranksByScore()) {
                 throw new IllegalArgumentException(SCORE_SORT_SCROLL);
             }
@@ -3010,7 +3022,7 @@ public final class InfinoSearch {
             hits = withoutIds(hits);
         }
         if (!overAll.isEmpty()) {
-            aggs.set(0, withOverAll(aggs.get(0), overAll, builders, indices, plans, accessOf));
+            aggs.set(0, withOverAll(aggs.get(0), overAll, builders, read, readPlans, accessOf));
         }
         InternalAggregations reduced = null;
         if (!aggs.isEmpty()) {
@@ -3043,8 +3055,9 @@ public final class InfinoSearch {
 
     /**
      * {@code first}, the first index's aggregations, with each of
-     * {@code overAll} answered over the rows every index's plan matches, read
-     * as one ({@link InfinoAggregationProcessor#evaluateOver}), all in the
+     * {@code overAll} answered over the rows each of {@code indices} (those
+     * the search reads rows of) matches under its plan, of {@code plans},
+     * read as one ({@link InfinoAggregationProcessor#evaluateOver}), all in the
      * order {@code builders} names them. No other index holds a part of those
      * answers, so the reduce takes each as it is. Refused as over default-mode
      * shards: with a top_hits under it, or over an index read under a
