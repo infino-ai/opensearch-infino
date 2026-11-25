@@ -310,26 +310,39 @@ final class InfinoQueryTranslator {
      * {@code across} when a required query string over several text columns
      * is the one scoring clause, or when a ranked principal shares the score
      * with other match clauses: its hits rank by the sum of the clauses'
-     * BM25 ({@link Across}), beside {@code offset}.
+     * BM25 ({@link Across}), beside {@code offset}. {@code refused}, set on
+     * an unrankable scoring, is why: the one clause that would rank the hits
+     * is a multi_match whose score the table cannot give
+     * ({@link #unscorable}). A request that reads the hits by their score
+     * is refused with it; one that pages them in another order is served.
      */
-    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable, boolean zero, Across across) {
+    record Scoring(
+        TextClause text,
+        double offset,
+        List<Bonus> bonuses,
+        boolean ascending,
+        boolean unrankable,
+        boolean zero,
+        Across across,
+        String refused
+    ) {
         static final Scoring NONE = new Scoring(null, 0, List.of());
-        static final Scoring ZERO = new Scoring(null, 0, List.of(), false, false, true, null);
+        static final Scoring ZERO = new Scoring(null, 0, List.of(), false, false, true, null, null);
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses) {
-            this(text, offset, bonuses, false, false, false, null);
+            this(text, offset, bonuses, false, false, false, null, null);
         }
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending) {
-            this(text, offset, bonuses, ascending, false, false, null);
+            this(text, offset, bonuses, ascending, false, false, null, null);
         }
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable) {
-            this(text, offset, bonuses, ascending, unrankable, false, null);
+            this(text, offset, bonuses, ascending, unrankable, false, null, null);
         }
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable, boolean zero) {
-            this(text, offset, bonuses, ascending, unrankable, zero, null);
+            this(text, offset, bonuses, ascending, unrankable, zero, null, null);
         }
 
         /** Whether hits rank by more than the principal's BM25 alone: then {@code offset} only shifts every score alike. */
@@ -375,7 +388,7 @@ final class InfinoQueryTranslator {
             if (ranked() != null || scoring.text() != null || scoring.across() != null) {
                 return unscored();
             }
-            Scoring up = new Scoring(null, scoring.offset(), scoring.bonuses(), true, scoring.unrankable(), scoring.zero());
+            Scoring up = new Scoring(null, scoring.offset(), scoring.bonuses(), true, scoring.unrankable(), scoring.zero(), null, scoring.refused());
             return new Translation(table, where, principal, ranks, up, span);
         }
 
@@ -500,6 +513,12 @@ final class InfinoQueryTranslator {
     private boolean filterTextIsPredicate;
     /** A required query string's ranking across its columns ({@link #across(QueryStringQueryBuilder)}), found while scoring. */
     private Across across;
+    /**
+     * The refusals of the required multi_match clauses that would rank the
+     * hits but whose score the table cannot give ({@link #unscorable}), found
+     * while scoring.
+     */
+    private final List<String> unscorable = new ArrayList<>();
     /** Each nested clause's matching documents with their scores, read once whether it filters, scores or both. */
     private final Map<NestedQueryBuilder, Map<String, Double>> nestedScores = new java.util.IdentityHashMap<>();
     /** Each BM25-scored term clause's score ({@link #bm25TermScore}), read once per clause. */
@@ -620,17 +639,28 @@ final class InfinoQueryTranslator {
         if (scoresNothing(root)) {
             return Scoring.ZERO;
         }
+        unscorable.clear();
         required(root, offset, bonuses, texts, summed, unscored, stray);
+        String refused = null;
+        if (!unscorable.isEmpty()) {
+            // Such a multi_match is refused only when it alone would rank the
+            // hits; beside another scoring clause the hits are unranked, as
+            // they are beside any clause the table cannot score.
+            if (unscorable.size() == 1 && across == null && !unscored[0] && texts.isEmpty() && bonuses.isEmpty()) {
+                refused = unscorable.get(0);
+            }
+            unscored[0] = true;
+        }
         TextClause ranked = principalRanks ? principal : null;
         Across clauses = ranked == null || across != null || stray[0] || !bonuses.isEmpty() ? null : summedClauses(summed);
         if (clauses != null) {
             // The principal's BM25 and every other match clause's, summed where each matches.
-            return new Scoring(null, offset[0], List.of(), false, false, false, clauses);
+            return new Scoring(null, offset[0], List.of(), false, false, false, clauses, null);
         }
         if (across != null) {
             if (principal == null && !unscored[0] && texts.isEmpty() && bonuses.isEmpty()) {
                 // The query string's BM25 across its columns is the only score beside the offset.
-                return new Scoring(null, offset[0], List.of(), false, false, false, across);
+                return new Scoring(null, offset[0], List.of(), false, false, false, across, null);
             }
             // Beside another scoring clause the sum is no longer the query string's alone.
             unscored[0] = true;
@@ -640,7 +670,7 @@ final class InfinoQueryTranslator {
             // which would add its BM25 beside the first) would leave some of the
             // hits it matches at 0, under hits it outscores in stock: with no
             // ranked clause, the hits keep the one score they all had.
-            return new Scoring(null, offset[0], List.of(), false, true);
+            return new Scoring(null, offset[0], List.of(), false, true, false, null, refused);
         }
         // Beside a ranked clause a should clause the table cannot score adds
         // nothing, as before; the others add theirs.
@@ -714,11 +744,12 @@ final class InfinoQueryTranslator {
             if (t == null || !principalRanks || !t.equals(principal)) {
                 // A query string or a multi_match over several columns ranks across them when it is the one text clause.
                 boolean ranks = principal == null && across == null;
-                if (ranks && qb instanceof MultiMatchQueryBuilder mm) {
-                    refuseUnscorable(mm);
-                }
-                Across a = ranks ? across(qb) : null;
-                if (a != null) {
+                String why = ranks && qb instanceof MultiMatchQueryBuilder mm ? unscorable(mm) : null;
+                Across a = ranks && why == null ? across(qb) : null;
+                if (why != null) {
+                    // Whether it is the one clause ranking the hits is known once every clause is read (scoring).
+                    unscorable.add(why);
+                } else if (a != null) {
                     across = a;
                 } else {
                     unscored[0] = true;
@@ -877,30 +908,31 @@ final class InfinoQueryTranslator {
     }
 
     /**
-     * Refuses a scored multi_match over several text columns whose score the
-     * table cannot give, rather than leave its hits unranked: cross_fields,
+     * Why a scored multi_match over several text columns has a score the
+     * table cannot give, to refuse it rather than leave its hits unranked
+     * ({@link Scoring#refused}): cross_fields,
      * which scores each word as if the fields were one, blending their term
      * statistics, and a tie_breaker between 0 and 1, which adds that share
      * of the other fields' scores to the best field's. The engine scores a
-     * clause by its best column or sums the columns, nothing between.
+     * clause by its best column or sums the columns, nothing between. Null
+     * when the table gives its score.
      */
-    private void refuseUnscorable(MultiMatchQueryBuilder mm) {
+    private String unscorable(MultiMatchQueryBuilder mm) {
         if (textColumns(mm) < 2) {
-            return;
+            return null;
         }
         if (mm.type() == MultiMatchQueryBuilder.Type.CROSS_FIELDS) {
-            throw crossFieldsRefused(mm);
+            return crossFieldsRefused(mm).getMessage();
         }
         float tieBreaker = tieBreaker(mm);
         if (tieBreaker != 0f && tieBreaker != 1f) {
-            throw new IllegalArgumentException(
-                "[infino] multi_match on ["
-                    + String.join(", ", mm.fields().keySet())
-                    + "] with tie_breaker ["
-                    + tieBreaker
-                    + "] is not served: the table scores several text fields by the best one (tie_breaker 0) or by their sum (tie_breaker 1)"
-            );
+            return "[infino] multi_match on ["
+                + String.join(", ", mm.fields().keySet())
+                + "] with tie_breaker ["
+                + tieBreaker
+                + "] is not served: the table scores several text fields by the best one (tie_breaker 0) or by their sum (tie_breaker 1)";
         }
+        return null;
     }
 
     /** A cross_fields multi_match over several text fields, refused: the table scores and matches each field apart. */

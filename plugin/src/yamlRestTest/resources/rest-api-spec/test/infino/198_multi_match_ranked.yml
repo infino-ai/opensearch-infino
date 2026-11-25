@@ -10,36 +10,36 @@
         index: mm_luc
         body:
           settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
-          mappings: { dynamic: strict, properties: { title: { type: text }, body: { type: text } } }
+          mappings: { dynamic: strict, properties: { title: { type: text }, body: { type: text }, n: { type: integer } } }
   - do:
       indices.create:
         index: mm_proxy
         body:
           settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
-          mappings: { dynamic: strict, properties: { title: { type: text }, body: { type: text } } }
+          mappings: { dynamic: strict, properties: { title: { type: text }, body: { type: text }, n: { type: integer } } }
   - do:
       indices.create:
         index: mm_default
         body:
           settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
-          mappings: { dynamic: strict, properties: { title: { type: text }, body: { type: text } } }
+          mappings: { dynamic: strict, properties: { title: { type: text }, body: { type: text }, n: { type: integer } } }
   - do:
       bulk:
         refresh: true
         index: mm_luc
         body:
           - index: { _id: "d1" }
-          - {"title": "disk", "body": "error on the old disk"}
+          - {"title": "disk", "body": "error on the old disk", "n": 1}
           - index: { _id: "d2" }
-          - {"title": "disk error", "body": "fan noise"}
+          - {"title": "disk error", "body": "fan noise", "n": 2}
           - index: { _id: "d3" }
-          - {"title": "cpu", "body": "disk error disk"}
+          - {"title": "cpu", "body": "disk error disk", "n": 3}
           - index: { _id: "d4" }
-          - {"title": "error report", "body": "error log"}
+          - {"title": "error report", "body": "error log", "n": 4}
           - index: { _id: "d5" }
-          - {"title": "fan", "body": "noise"}
+          - {"title": "fan", "body": "noise", "n": 5}
           - index: { _id: "d6" }
-          - {"title": "disk full", "body": "disk error now gone"}
+          - {"title": "disk full", "body": "disk error now gone", "n": 6}
   - match: { errors: false }
   - do:
       bulk:
@@ -47,17 +47,17 @@
         index: mm_proxy
         body:
           - index: { _id: "d1" }
-          - {"title": "disk", "body": "error on the old disk"}
+          - {"title": "disk", "body": "error on the old disk", "n": 1}
           - index: { _id: "d2" }
-          - {"title": "disk error", "body": "fan noise"}
+          - {"title": "disk error", "body": "fan noise", "n": 2}
           - index: { _id: "d3" }
-          - {"title": "cpu", "body": "disk error disk"}
+          - {"title": "cpu", "body": "disk error disk", "n": 3}
           - index: { _id: "d4" }
-          - {"title": "error report", "body": "error log"}
+          - {"title": "error report", "body": "error log", "n": 4}
           - index: { _id: "d5" }
-          - {"title": "fan", "body": "noise"}
+          - {"title": "fan", "body": "noise", "n": 5}
           - index: { _id: "d6" }
-          - {"title": "disk full", "body": "disk error now gone"}
+          - {"title": "disk full", "body": "disk error now gone", "n": 6}
   - match: { errors: false }
   - do:
       bulk:
@@ -65,17 +65,17 @@
         index: mm_default
         body:
           - index: { _id: "d1" }
-          - {"title": "disk", "body": "error on the old disk"}
+          - {"title": "disk", "body": "error on the old disk", "n": 1}
           - index: { _id: "d2" }
-          - {"title": "disk error", "body": "fan noise"}
+          - {"title": "disk error", "body": "fan noise", "n": 2}
           - index: { _id: "d3" }
-          - {"title": "cpu", "body": "disk error disk"}
+          - {"title": "cpu", "body": "disk error disk", "n": 3}
           - index: { _id: "d4" }
-          - {"title": "error report", "body": "error log"}
+          - {"title": "error report", "body": "error log", "n": 4}
           - index: { _id: "d5" }
-          - {"title": "fan", "body": "noise"}
+          - {"title": "fan", "body": "noise", "n": 5}
           - index: { _id: "d6" }
-          - {"title": "disk full", "body": "disk error now gone"}
+          - {"title": "disk full", "body": "disk error now gone", "n": 6}
   - match: { errors: false }
   # best_fields by default: the best field scores, its boost applied; d04 leads d01 on its title alone.
   - do:
@@ -531,12 +531,110 @@
       search:
         index: mm_default
         body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "tie_breaker": 0.3}}}
-  # The refusal does not depend on whether the request reads the scores.
+  # Ordered by score ascending the hits still read the score, and track_scores
+  # hands it out beside a field sort.
   - do:
       catch: /multi_match of type \[cross_fields\] on \[body, title\] is not served/
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}, "sort": [{"_score": "asc"}]}
+  - do:
+      catch: /multi_match of type \[cross_fields\] on \[body, title\] is not served/
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}, "sort": [{"n": "asc"}], "track_scores": true}
+  # A request that never reads the score is served: sorted by a field, paged
+  # by _doc as a scroll is, or a count. Stock scores none of them.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}, "sort": [{"n": "desc"}]}
+  - match: { hits.total.value: 5 }
+  - match: { hits.hits.0._id: "d6" }
+  - match: { hits.hits.4._id: "d1" }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}, "sort": [{"n": "desc"}]}
+  - match: { hits.total.value: 5 }
+  - match: { hits.hits.0._id: "d6" }
+  - match: { hits.hits.1._id: "d4" }
+  - match: { hits.hits.2._id: "d3" }
+  - match: { hits.hits.3._id: "d2" }
+  - match: { hits.hits.4._id: "d1" }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "tie_breaker": 0.3}}, "sort": [{"n": "desc"}]}
+  - match: { hits.total.value: 5 }
+  - match: { hits.hits.0._id: "d6" }
+  - match: { hits.hits.1._id: "d4" }
+  - match: { hits.hits.2._id: "d3" }
+  - match: { hits.hits.3._id: "d2" }
+  - match: { hits.hits.4._id: "d1" }
+  - do:
+      search:
+        index: mm_luc
+        scroll: 1m
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}, "sort": ["_doc"]}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - do:
+      search:
+        index: mm_proxy
+        scroll: 1m
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}, "sort": ["_doc"]}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - do:
+      search:
+        index: mm_default
+        scroll: 1m
+        body: {"size": 10, "query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}, "sort": ["_doc"]}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - do:
+      count:
+        index: mm_luc
+        body: {"query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}
+  - match: { count: 5 }
+  - do:
+      count:
+        index: mm_proxy
+        body: {"query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}
+  - match: { count: 5 }
+  - do:
       count:
         index: mm_default
         body: {"query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}
+  - match: { count: 5 }
+  # Beside another multi_match it is not the one clause ranking the hits, in
+  # either order: they are served unranked, as beside any clause the table
+  # cannot score, and match as stock.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "query": {"bool": {"must": [{"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}, {"multi_match": {"query": "fan noise", "fields": ["title", "body"]}}]}}}
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d2" }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"bool": {"must": [{"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}, {"multi_match": {"query": "fan noise", "fields": ["title", "body"]}}]}}}
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d2" }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "query": {"bool": {"must": [{"multi_match": {"query": "fan noise", "fields": ["title", "body"]}}, {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}]}}}
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d2" }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "query": {"bool": {"must": [{"multi_match": {"query": "fan noise", "fields": ["title", "body"]}}, {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}]}}}
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "d2" }
   # In should, the multi_match is served as any multi_match over several
   # fields is there: it matches as stock, and is left unranked.
   - do:
@@ -571,3 +669,26 @@
         index: mm_default
         body: {"size": 10, "query": {"bool": {"filter": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}}}
   - match: { hits.total.value: 5 }
+  # A delete_by_query pages the matches by _doc and scores nothing: served.
+  - do:
+      delete_by_query:
+        index: mm_luc
+        refresh: true
+        body: {"query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}
+  - match: { deleted: 5 }
+  - do:
+      delete_by_query:
+        index: mm_proxy
+        refresh: true
+        body: {"query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}
+  - match: { deleted: 5 }
+  - do:
+      delete_by_query:
+        index: mm_default
+        refresh: true
+        body: {"query": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}
+  - match: { deleted: 5 }
+  - do:
+      count:
+        index: mm_default
+  - match: { count: 1 }

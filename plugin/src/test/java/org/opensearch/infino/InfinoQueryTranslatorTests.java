@@ -906,10 +906,11 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
 
     /**
      * A multi_match over several text columns that would rank the hits, with
-     * a score the table cannot give, is refused rather than answered
-     * unranked: cross_fields, and a tie_breaker between 0 and 1. In filter
+     * a score the table cannot give, carries its refusal rather than be
+     * answered unranked: cross_fields, and a tie_breaker between 0 and 1. The
+     * search refuses it when it reads the hits by their score. In filter
      * context it scores nothing and is served, except cross_fields under
-     * operator and, which matches other rows.
+     * operator and, which matches other rows and is refused outright.
      */
     public void testMultiMatchScoresTheTableCannotGiveAreRefused() {
         Map<String, Column> cols = columns();
@@ -921,11 +922,25 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             cross,
             QueryBuilders.boolQuery().must(cross),
             QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error")).must(cross),
-            QueryBuilders.boolQuery().filter(QueryBuilders.multiMatchQuery("red", "title", "message").type(MultiMatchQueryBuilder.Type.CROSS_FIELDS).operator(Operator.AND))
+            QueryBuilders.boolQuery().must(QueryBuilders.constantScoreQuery(QueryBuilders.termQuery("level", "error"))).must(cross)
         )) {
-            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> InfinoQueryTranslator.translate(q, cols, TABLE, NOW));
-            assertEquals(q.toString(), crossRefused, e.getMessage());
+            Translation t = InfinoQueryTranslator.translate(q, cols, TABLE, NOW);
+            assertTrue(q.toString(), t.scoring().unrankable());
+            assertEquals(q.toString(), crossRefused, t.scoring().refused());
+            // Ordered by score ascending the hits still read the score; unscored (a _doc page) they do not.
+            assertEquals(q.toString(), crossRefused, t.ascending().scoring().refused());
+            assertNull(q.toString(), t.unscored().scoring().refused());
         }
+        IllegalArgumentException andRefused = expectThrows(
+            IllegalArgumentException.class,
+            () -> InfinoQueryTranslator.translate(
+                QueryBuilders.boolQuery().filter(QueryBuilders.multiMatchQuery("red", "title", "message").type(MultiMatchQueryBuilder.Type.CROSS_FIELDS).operator(Operator.AND)),
+                cols,
+                TABLE,
+                NOW
+            )
+        );
+        assertEquals(crossRefused, andRefused.getMessage());
         // A pattern names every text column it matches: over title and message, cross_fields under operator and keeps other rows.
         org.opensearch.index.query.QueryBuilder crossPattern = QueryBuilders.boolQuery()
             .filter(QueryBuilders.multiMatchQuery("red", "title", "mess*").type(MultiMatchQueryBuilder.Type.CROSS_FIELDS).operator(Operator.AND));
@@ -933,25 +948,36 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertTrue(patternRefused.getMessage(), patternRefused.getMessage().startsWith("[infino] multi_match of type [cross_fields] on [mess*, title] is not served"));
         // Where the multi_match would not rank the hits it is served as a multi_match of any type is there: in
         // should, left unranked; beside a ranked text clause, which alone ranks the hits.
+        // Beside another clause that scores, in either order, it is not the one ranking the hits: they are unranked, as
+        // beside any clause the table cannot score, and served. So in should, and beside a ranked text clause.
+        MultiMatchQueryBuilder other = QueryBuilders.multiMatchQuery("blue", "title", "message");
         for (org.opensearch.index.query.QueryBuilder q : List.<org.opensearch.index.query.QueryBuilder>of(
             QueryBuilders.boolQuery().should(cross),
-            QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error")).should(cross)
+            QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error")).should(cross),
+            QueryBuilders.boolQuery().must(cross).must(other),
+            QueryBuilders.boolQuery().must(other).must(cross),
+            QueryBuilders.boolQuery().must(cross).must(QueryBuilders.multiMatchQuery("blue", "title", "message").type(MultiMatchQueryBuilder.Type.CROSS_FIELDS)),
+            QueryBuilders.boolQuery().must(cross).should(QueryBuilders.matchQuery("message", "blue"))
         )) {
-            assertTrue(q.toString(), InfinoQueryTranslator.translate(q, cols, TABLE, NOW).scoring().unrankable());
+            Translation t = InfinoQueryTranslator.translate(q, cols, TABLE, NOW);
+            assertTrue(q.toString(), t.scoring().unrankable());
+            assertNull(q.toString(), t.scoring().refused());
+            assertNull(q.toString(), t.scoring().across());
         }
         Translation beside = InfinoQueryTranslator.translate(QueryBuilders.boolQuery().must(QueryBuilders.matchQuery("message", "disk")).must(cross), cols, TABLE, NOW);
         assertEquals(new InfinoQueryTranslator.TextClause("message", "disk", "or"), beside.principal());
         assertNull(beside.scoring().across());
+        assertNull(beside.scoring().refused());
         MultiMatchQueryBuilder tie = QueryBuilders.multiMatchQuery("red", "title", "message").tieBreaker(0.3f);
-        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> InfinoQueryTranslator.translate(tie, cols, TABLE, NOW));
         assertEquals(
             "[infino] multi_match on [message, title] with tie_breaker [0.3] is not served: "
                 + "the table scores several text fields by the best one (tie_breaker 0) or by their sum (tie_breaker 1)",
-            e.getMessage()
+            InfinoQueryTranslator.translate(tie, cols, TABLE, NOW).scoring().refused()
         );
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.boolQuery().must(tie).must(cross), cols, TABLE, NOW).scoring().refused());
         // In filter context neither scores; cross_fields under operator or matches the rows best_fields does.
-        assertNotNull(InfinoQueryTranslator.translate(QueryBuilders.boolQuery().filter(cross), cols, TABLE, NOW));
-        assertNotNull(InfinoQueryTranslator.translate(QueryBuilders.boolQuery().filter(tie), cols, TABLE, NOW));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.boolQuery().filter(cross), cols, TABLE, NOW).scoring().refused());
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.boolQuery().filter(tie), cols, TABLE, NOW).scoring().refused());
         // On one text column there is nothing to blend or break ties between: it is a match on that column.
         Translation one = InfinoQueryTranslator.translate(
             QueryBuilders.multiMatchQuery("red", "message", "level").type(MultiMatchQueryBuilder.Type.CROSS_FIELDS).tieBreaker(0.3f),

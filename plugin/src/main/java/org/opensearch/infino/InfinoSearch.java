@@ -592,6 +592,7 @@ public final class InfinoSearch {
         }
         log.debug("[infino] query {} -> FROM {} WHERE {}", qb, query.from(), query.where());
         List<SortSpec> sorts = sorts(source.sorts(), cols, InfinoNative.floatFields(table), InfinoNative.intFields(table), nowMillis, true);
+        checkScoreRead(source, sorts, query);
         if (sorts.stream().anyMatch(SortSpec::isScore)) {
             checkScoreSort(source, sorts, query, vector != null);
         }
@@ -679,6 +680,26 @@ public final class InfinoSearch {
     private static boolean scored(Translation query) {
         Scoring scoring = query.scoring();
         return query.ranked() != null || scoring.reorders() || scoring.unrankable() || scoring.across() != null;
+    }
+
+    /**
+     * Refuse a query whose one ranking clause has a score the table cannot
+     * give ({@link Scoring#refused}) when the request reads its hits by that
+     * score: ranked by it (no sort, or {@code _score} among the sorts), or
+     * carrying it beside a field sort ({@code track_scores}). Hits paged in
+     * another order, by fields or by {@code _doc} (a scroll, a
+     * delete_by_query), score nothing in stock and are served, as is a
+     * request for no hits.
+     */
+    private static void checkScoreRead(SearchSourceBuilder source, List<SortSpec> sorts, Translation query) {
+        String refused = query.scoring().refused();
+        if (refused == null || source.size() == 0) {
+            return;
+        }
+        boolean byScore = sorts.isEmpty() ? !sortsByDocFirst(source) : sorts.stream().anyMatch(SortSpec::isScore);
+        if (byScore || source.trackScores()) {
+            throw new IllegalArgumentException(refused);
+        }
     }
 
     /**
