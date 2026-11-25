@@ -2191,7 +2191,9 @@ public final class InfinoSearch {
      * best of those. When the text clause is optional (a should beside no
      * ranked clause), the hits it does not match score their bonus alone,
      * the best of them read by it. With no text clause at all, the bonus is
-     * the score.
+     * the score. Under {@link Scoring#best} a hit scores the greater of its
+     * BM25 and its bonus rather than their sum, as a dis_max of the two; a
+     * band shares one bonus, so its least score still bounds what it cut off.
      *
      * <p>Sorted by the score then fields, hits that tie on the score come in
      * the fields' order, so a band's ranked search reads {@code window}
@@ -2258,7 +2260,8 @@ public final class InfinoSearch {
         int k = window;
         // The greatest score a hit a band's ranked read cut off could have,
         // past the least of those it read: a band's hits share their bonus.
-        String bandFloorOf = "MIN(infino_bm25 + infino_bonus) OVER (PARTITION BY infino_band)";
+        String score = scoring.best() ? "GREATEST(infino_bm25, infino_bonus)" : "infino_bm25 + infino_bonus";
+        String bandFloorOf = "MIN(" + score + ") OVER (PARTITION BY infino_band)";
         if (text == null) {
             branches.add(
                 "SELECT " + hit + ", 0.0 AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row" + unbanded + " FROM " + q.from() + joins + " WHERE " + where
@@ -2277,7 +2280,9 @@ public final class InfinoSearch {
                 for (Bonus b : scoring.bonuses()) {
                     maxBonus += Math.max(0, b.values().stream().mapToDouble(Double::doubleValue).max().orElse(0));
                 }
-                bandFloorOf = "MIN(infino_bm25) OVER (PARTITION BY infino_band) + " + InfinoQueryTranslator.scoreLiteral(maxBonus);
+                String least = "MIN(infino_bm25) OVER (PARTITION BY infino_band)";
+                String most = InfinoQueryTranslator.scoreLiteral(maxBonus);
+                bandFloorOf = scoring.best() ? "GREATEST(" + least + ", " + most + ")" : least + " + " + most;
                 branches.add(
                     "SELECT " + hit + ", score AS infino_bm25, " + bonus + " AS infino_bonus, " + rowId + " AS infino_row" + (banded ? ", 0 AS infino_band" : "") + " FROM "
                         + q.rankedFrom(text, window) + joins + " WHERE " + ranked
@@ -2315,7 +2320,7 @@ public final class InfinoSearch {
         // they were written, as stock orders them by their place in the index.
         String order = "score " + (scoring.ascending() ? "ASC" : "DESC") + ", " + tieOrder;
         if (!banded) {
-            return "SELECT " + String.join(", ", names) + ", infino_bm25 + infino_bonus AS score FROM (" + union + ") AS infino_scored ORDER BY " + order + " LIMIT " + fetch;
+            return "SELECT " + String.join(", ", names) + ", " + score + " AS score FROM (" + union + ") AS infino_scored ORDER BY " + order + " LIMIT " + fetch;
         }
         // A band whose ranked read came back full (or was narrowed after it,
         // so may have been) cut hits scoring no more than its least. A
@@ -2328,7 +2333,7 @@ public final class InfinoSearch {
             ? ", CASE WHEN infino_band >= 0 AND infino_row = MIN(infino_row) OVER (PARTITION BY infino_band) THEN 1 ELSE 0 END AS infino_band_seen"
             : "";
         String bands = afterRanking ? ", SUM(infino_band_seen) OVER () AS " + SCORE_BANDS : "";
-        return "SELECT " + String.join(", ", names) + ", score, MAX(infino_band_floor) OVER () AS " + SCORE_FLOOR + bands + " FROM (SELECT *, infino_bm25 + infino_bonus AS score, "
+        return "SELECT " + String.join(", ", names) + ", score, MAX(infino_band_floor) OVER () AS " + SCORE_FLOOR + bands + " FROM (SELECT *, " + score + " AS score, "
             + bandFloor + " AS infino_band_floor" + seen + " FROM (" + union + ") AS infino_scored) AS infino_banded ORDER BY " + order + " LIMIT " + fetch;
     }
 

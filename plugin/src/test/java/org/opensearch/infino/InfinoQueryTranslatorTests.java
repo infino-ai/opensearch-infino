@@ -1609,6 +1609,60 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals(0, reads.size());
     }
 
+    /**
+     * A query naming no field, one clause over one text column and keyword
+     * fields, ranks as stock's dis_max does whether or not a keyword value
+     * matches: by the text's BM25, a keyword match competing with it (the
+     * better of the two, tie_breaker 0) or adding to it (tie_breaker 1).
+     * No row matching, the keyword fields are dropped and the text ranks
+     * alone: the same scores.
+     */
+    public void testAKeywordMatchRanksBesideTheText() {
+        InfinoQueryTranslator.TextClause disk = new InfinoQueryTranslator.TextClause("message", "disk", "or");
+        String bonus = "CASE WHEN (\"level\" = 'disk' OR \"host.name\" = 'disk') THEN 1.0 ELSE 0.0 END";
+        for (org.opensearch.index.query.QueryBuilder qb : List.of(
+            QueryBuilders.queryStringQuery("disk"),
+            QueryBuilders.multiMatchQuery("disk"),
+            QueryBuilders.multiMatchQuery("disk").type(MultiMatchQueryBuilder.Type.BEST_FIELDS).lenient(true),
+            QueryBuilders.boolQuery().must(QueryBuilders.multiMatchQuery("disk")).filter(QueryBuilders.rangeQuery("@timestamp").gte("2026-10-24T00:00:00Z"))
+        )) {
+            Translation t = translate(qb);
+            assertNull(qb.toString(), t.principal());
+            InfinoQueryTranslator.Scoring scoring = t.scoring();
+            assertFalse(qb.toString(), scoring.unrankable());
+            assertEquals(qb.toString(), disk, scoring.text());
+            assertEquals(qb.toString(), List.of(bonus), scoring.bonuses().stream().map(InfinoQueryTranslator.Bonus::expr).toList());
+            assertTrue(qb.toString(), scoring.best());
+            String sql = InfinoSearch.scoredStatement(unsortedPlan(t, columns()), "osid", t.where(), 10, false);
+            assertTrue(sql, sql.contains("GREATEST(infino_bm25, infino_bonus) AS score"));
+        }
+        // most_fields sums its fields.
+        InfinoQueryTranslator.Scoring most = translate(QueryBuilders.multiMatchQuery("disk").type(MultiMatchQueryBuilder.Type.MOST_FIELDS)).scoring();
+        assertEquals(disk, most.text());
+        assertFalse(most.best());
+        Translation mostTranslation = translate(QueryBuilders.multiMatchQuery("disk").type(MultiMatchQueryBuilder.Type.MOST_FIELDS));
+        String summed = InfinoSearch.scoredStatement(unsortedPlan(mostTranslation, columns()), "osid", mostTranslation.where(), 10, false);
+        assertTrue(summed, summed.contains("infino_bm25 + infino_bonus AS score"));
+        // No row has the value: a query string drops the keyword fields, ranked by the text alone.
+        java.util.function.Function<String, List<Map<String, Object>>> none = sql -> List.of();
+        Translation alone = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("disk"), columns(), TABLE, NOW, none);
+        assertEquals(disk, alone.ranked());
+        assertEquals(InfinoQueryTranslator.Scoring.NONE, alone.scoring());
+        // A multi_match reads no row: the keyword fields stay, their bonus never taken, the same order.
+        assertEquals(disk, InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk"), columns(), TABLE, NOW, none).scoring().text());
+        // Left unranked: a tie_breaker between 0 and 1 (no combination the table gives),
+        // several clauses (stock sums each clause's dis_max), and a boost.
+        assertTrue(translate(QueryBuilders.multiMatchQuery("disk").tieBreaker(0.3f)).scoring().unrankable());
+        assertTrue(translate(QueryBuilders.queryStringQuery("disk OR full")).scoring().unrankable());
+        assertTrue(translate(QueryBuilders.queryStringQuery("disk").boost(2f)).scoring().unrankable());
+        // Beside another scoring clause it no longer scores alone.
+        assertTrue(
+            translate(QueryBuilders.boolQuery().must(QueryBuilders.queryStringQuery("disk")).should(QueryBuilders.matchQuery("message", "full")))
+                .scoring()
+                .unrankable()
+        );
+    }
+
     public void testARunIsOneTermWhenAsked() {
         assertEquals(
             new InfinoLuceneQuery.Bool(

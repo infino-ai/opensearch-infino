@@ -231,6 +231,28 @@ final class InfinoQueryTranslator {
     }
 
     /**
+     * A full-text query that is one clause over one text column and some
+     * columns that read a value whole (keyword, number, date): {@code text}
+     * the clause on the text column, {@code values} the predicates of the
+     * others, and {@code match} the predicate the query translated to, any
+     * of them. Stock scores such a clause as a {@code dis_max} of its
+     * fields: the text field's BM25, and on another field the boost (1)
+     * where the value matches, as a term query there scores. So the hits
+     * rank by the text's BM25 with a value match as a bonus
+     * ({@link #valueRanking}), combined by the query's tie_breaker:
+     * {@code best} (0) takes the greater, otherwise (1) the sum.
+     */
+    record ValueRanking(TextClause text, List<String> values, String match, boolean best) {
+        /** The bonus a hit takes where one of {@link #values} matches it. */
+        Bonus bonus() {
+            return new Bonus("CASE WHEN (" + String.join(" OR ", values) + ") THEN " + scoreLiteral(VALUE_MATCH_SCORE) + " ELSE 0.0 END", List.of(VALUE_MATCH_SCORE));
+        }
+    }
+
+    /** What a term query on a field other than a text one scores in stock: its boost, 1 (a constant-score query). */
+    private static final double VALUE_MATCH_SCORE = 1.0;
+
+    /**
      * A query string's BM25 over several text columns, as stock scores it:
      * each of {@code clauses} scores the best of its columns' BM25 (a
      * {@code dis_max} with tie_breaker 0, one {@link TextClause} per column),
@@ -295,26 +317,30 @@ final class InfinoQueryTranslator {
      * {@code across} when a required query string over several text columns
      * is the one scoring clause, or when a ranked principal shares the score
      * with other match clauses: its hits rank by the sum of the clauses'
-     * BM25 ({@link Across}), beside {@code offset}.
+     * BM25 ({@link Across}), beside {@code offset}. {@code best} when
+     * {@code text}'s BM25 and the bonuses compete rather than add: a hit
+     * scores the greater of the two, as stock's {@code dis_max} with
+     * tie_breaker 0 scores a clause over a text field and a keyword field
+     * by the better of its fields ({@link ValueRanking}).
      */
-    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable, boolean zero, Across across) {
+    record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable, boolean zero, Across across, boolean best) {
         static final Scoring NONE = new Scoring(null, 0, List.of());
-        static final Scoring ZERO = new Scoring(null, 0, List.of(), false, false, true, null);
+        static final Scoring ZERO = new Scoring(null, 0, List.of(), false, false, true, null, false);
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses) {
-            this(text, offset, bonuses, false, false, false, null);
+            this(text, offset, bonuses, false, false, false, null, false);
         }
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending) {
-            this(text, offset, bonuses, ascending, false, false, null);
+            this(text, offset, bonuses, ascending, false, false, null, false);
         }
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable) {
-            this(text, offset, bonuses, ascending, unrankable, false, null);
+            this(text, offset, bonuses, ascending, unrankable, false, null, false);
         }
 
         Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable, boolean zero) {
-            this(text, offset, bonuses, ascending, unrankable, zero, null);
+            this(text, offset, bonuses, ascending, unrankable, zero, null, false);
         }
 
         /** Whether hits rank by more than the principal's BM25 alone: then {@code offset} only shifts every score alike. */
@@ -487,6 +513,14 @@ final class InfinoQueryTranslator {
     private boolean filterTextIsPredicate;
     /** A required query string's ranking across its columns ({@link #across(QueryStringQueryBuilder)}), found while scoring. */
     private Across across;
+    /** A required full-text query's ranking by its text column and value matches ({@link #valueRanking}), found while scoring. */
+    private ValueRanking valueRanking;
+    /**
+     * The clause the last {@link #textOnFields} call wrote when it was one
+     * clause over one text column and value columns, ranked (positive, in
+     * no filter): what {@link #valueRanking} reads it as. Null otherwise.
+     */
+    private ValueRanking onFields;
     /** Each nested clause's matching documents with their scores, read once whether it filters, scores or both. */
     private final Map<NestedQueryBuilder, Map<String, Double>> nestedScores = new java.util.IdentityHashMap<>();
     /** Each BM25-scored term clause's score ({@link #bm25TermScore}), read once per clause. */
@@ -560,7 +594,7 @@ final class InfinoQueryTranslator {
             || qb instanceof SimpleQueryStringBuilder)) {
             return false;
         }
-        InfinoQueryTranslator alone = new InfinoQueryTranslator(cols, table, nowMillis, trusted, columnValuesOnly, rows);
+        InfinoQueryTranslator alone = alone();
         try {
             alone.predicate(qb, true);
         } catch (RuntimeException e) {
@@ -568,6 +602,11 @@ final class InfinoQueryTranslator {
             return false;
         }
         return alone.principal != null;
+    }
+
+    /** A translator of a clause of this query on its own. */
+    private InfinoQueryTranslator alone() {
+        return new InfinoQueryTranslator(cols, table, nowMillis, trusted, columnValuesOnly, rows);
     }
 
     /**
@@ -614,12 +653,20 @@ final class InfinoQueryTranslator {
         Across clauses = ranked == null || across != null || stray[0] || !bonuses.isEmpty() ? null : summedClauses(summed);
         if (clauses != null) {
             // The principal's BM25 and every other match clause's, summed where each matches.
-            return new Scoring(null, offset[0], List.of(), false, false, false, clauses);
+            return new Scoring(null, offset[0], List.of(), false, false, false, clauses, false);
+        }
+        if (valueRanking != null) {
+            if (principal == null && across == null && !unscored[0] && texts.isEmpty() && bonuses.isEmpty()) {
+                // The text column's BM25 and a value match, combined as stock's dis_max combines its fields.
+                return new Scoring(valueRanking.text(), offset[0], List.of(valueRanking.bonus()), false, false, false, null, valueRanking.best());
+            }
+            // Beside another scoring clause the hits no longer score by this one alone.
+            unscored[0] = true;
         }
         if (across != null) {
             if (principal == null && !unscored[0] && texts.isEmpty() && bonuses.isEmpty()) {
                 // The query string's BM25 across its columns is the only score beside the offset.
-                return new Scoring(null, offset[0], List.of(), false, false, false, across);
+                return new Scoring(null, offset[0], List.of(), false, false, false, across, false);
             }
             // Beside another scoring clause the sum is no longer the query string's alone.
             unscored[0] = true;
@@ -701,10 +748,15 @@ final class InfinoQueryTranslator {
                 stray[0] = true;
             }
             if (t == null || !principalRanks || !t.equals(principal)) {
-                // A query string over several columns ranks across them when it is the one text clause.
-                Across a = principal == null && across == null && qb instanceof QueryStringQueryBuilder qs ? across(qs) : null;
+                // A query string over several columns ranks across them when it is the one text clause;
+                // a query string or multi_match over one text column and value columns, by that column.
+                boolean ranks = principal == null && across == null && valueRanking == null;
+                Across a = ranks && qb instanceof QueryStringQueryBuilder qs ? across(qs) : null;
+                ValueRanking v = ranks && a == null ? valueRanking(qb) : null;
                 if (a != null) {
                     across = a;
+                } else if (v != null) {
+                    valueRanking = v;
                 } else {
                     unscored[0] = true;
                 }
@@ -753,6 +805,57 @@ final class InfinoQueryTranslator {
             && m.analyzer() == null;
     }
 
+    /**
+     * How stock ranks {@code qb} when it is one clause over one text column
+     * and columns that read a value whole ({@link ValueRanking}), or null
+     * when the plugin does not rank it that way. Stock combines the
+     * clause's fields by the query's tie_breaker: a query string's (0
+     * unless set), a multi_match's (its type's unless set: 0 for
+     * best_fields and phrase, 1 for most_fields). Read here: tie_breaker 0
+     * or 1, no boost on the query or its fields, and no option that changes
+     * which words it reads (minimum_should_match, an analyzer, slop).
+     */
+    private ValueRanking valueRanking(QueryBuilder qb) {
+        Float tieBreaker = null;
+        if (qb instanceof QueryStringQueryBuilder qs) {
+            if (qs.minimumShouldMatch() == null && BEST_FIELDS.matcher(qs.toString()).find() && qs.analyzer() == null && qs.boost() == 1f && unboosted(qs.fields())) {
+                tieBreaker = qs.tieBreaker() == null ? 0f : qs.tieBreaker();
+            }
+        } else if (qb instanceof MultiMatchQueryBuilder mm) {
+            MultiMatchQueryBuilder.Type type = mm.type();
+            if ((type == MultiMatchQueryBuilder.Type.BEST_FIELDS || type == MultiMatchQueryBuilder.Type.MOST_FIELDS || type == MultiMatchQueryBuilder.Type.PHRASE)
+                && mm.minimumShouldMatch() == null
+                && mm.analyzer() == null
+                && mm.slop() == 0
+                && mm.cutoffFrequency() == null
+                && mm.boost() == 1f
+                && unboosted(mm.fields())) {
+                tieBreaker = mm.tieBreaker() != null ? mm.tieBreaker() : type.tieBreaker();
+            }
+        }
+        if (tieBreaker == null || (tieBreaker != 0f && tieBreaker != 1f)) {
+            return null;
+        }
+        InfinoQueryTranslator alone = alone();
+        String match;
+        try {
+            match = alone.predicate(qb, true);
+        } catch (IllegalArgumentException | OpenSearchSecurityException e) {
+            return null;
+        }
+        ValueRanking v = alone.onFields;
+        // The query is that one clause, not one of several (each would score its own dis_max, summed).
+        if (v == null || alone.principal != null || !v.match().equals(match)) {
+            return null;
+        }
+        return new ValueRanking(v.text(), v.values(), v.match(), tieBreaker == 0f);
+    }
+
+    /** Whether every field of a query weighs 1 (no {@code field^boost}). */
+    private static boolean unboosted(Map<String, Float> fields) {
+        return fields.values().stream().allMatch(b -> b == 1f);
+    }
+
     /** How a query string's JSON names its default type, best_fields: the builder has no getter for it. */
     private static final Pattern BEST_FIELDS = Pattern.compile("\"type\"\\s*:\\s*\"best_fields\"");
 
@@ -798,7 +901,7 @@ final class InfinoQueryTranslator {
             }
         }
         // The predicate the query string is; one that set a principal is ranked by it.
-        InfinoQueryTranslator alone = new InfinoQueryTranslator(cols, table, nowMillis, trusted, columnValuesOnly, rows);
+        InfinoQueryTranslator alone = alone();
         String match;
         try {
             match = alone.predicate(qs, true);
@@ -1118,7 +1221,7 @@ final class InfinoQueryTranslator {
         if (!(qb instanceof MatchQueryBuilder || qb instanceof MatchPhraseQueryBuilder)) {
             return null;
         }
-        InfinoQueryTranslator alone = new InfinoQueryTranslator(cols, table, nowMillis, trusted, columnValuesOnly, rows);
+        InfinoQueryTranslator alone = alone();
         String p = alone.predicate(qb, true);
         return ALL.equals(p) ? alone.principal : null;
     }
@@ -2610,6 +2713,7 @@ final class InfinoQueryTranslator {
      * built itself (a query string's clauses with their sigils), sent as it is.
      */
     private String textOnFields(List<String> fields, String value, Operator op, boolean positive, boolean asPhrase, boolean exactToo, boolean composed) {
+        onFields = null;
         List<String> indexed = new ArrayList<>();
         List<String> exact = new ArrayList<>();
         for (String f : fields) {
@@ -2645,7 +2749,12 @@ final class InfinoQueryTranslator {
         for (String column : indexed) {
             or.add(textClause(column, query, mode, false));
         }
-        return or.size() == 1 ? or.get(0) : "(" + String.join(" OR ", or) + ")";
+        String p = or.size() == 1 ? or.get(0) : "(" + String.join(" OR ", or) + ")";
+        if (indexed.size() == 1 && !exact.isEmpty() && positive && filtering == 0 && !composed) {
+            // One text column beside value columns: it may rank, the values a bonus (see valueRanking).
+            onFields = new ValueRanking(new TextClause(indexed.get(0), query, mode), List.copyOf(exact), p, true);
+        }
+        return p;
     }
 
     /** The query that matches {@code value} as a phrase: the engine reads a quoted run as adjacent terms in order. */

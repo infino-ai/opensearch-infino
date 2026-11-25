@@ -119,7 +119,7 @@ setup:
 teardown:
   - do:
       indices.delete:
-        index: dfs_luc,dfs_prx,dfs_def
+        index: dfs_luc,dfs_prx,dfs_def,dfr_luc,dfr_prx,dfr_def
         ignore_unavailable: true
 
 ---
@@ -957,3 +957,375 @@ teardown:
   - do:
       catch: bad_request
       search: { index: dfs_def, body: { query: { query_string: { query: "5*", fields: [ status ] } } } }
+
+---
+"A query naming no field ranks as stock's dis_max does, whether a keyword value matches or not":
+  # Stock scores one clause over every field as a dis_max of its fields:
+  # the text field's BM25, and a keyword field's match its boost, 1. So a
+  # hit scores the better of the two (most_fields, tie_breaker 1: the sum).
+  # The text hits keep their BM25 order whether a keyword value matches
+  # (disk: documents 2 and 3 hold it in level) or not (full). Every
+  # document is under 16 tokens, so the engine keeps Lucene's lengths and
+  # the scores agree.
+  - do:
+      indices.create:
+        index: dfr_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, level: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dfr_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, level: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dfr_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, level: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: dfr_luc
+        body:
+          - index: { _id: "1" }
+          - { "message": "disk full disk", "level": "info" }
+          - index: { _id: "2" }
+          - { "message": "disk", "level": "disk" }
+          - index: { _id: "3" }
+          - { "message": "memory full", "level": "disk" }
+          - index: { _id: "4" }
+          - { "message": "cpu hot", "level": "warn" }
+          - index: { _id: "5" }
+          - { "message": "disk failure on the second volume", "level": "info" }
+          - index: { _id: "6" }
+          - { "message": "full", "level": "warn" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfr_prx
+        body:
+          - index: { _id: "1" }
+          - { "message": "disk full disk", "level": "info" }
+          - index: { _id: "2" }
+          - { "message": "disk", "level": "disk" }
+          - index: { _id: "3" }
+          - { "message": "memory full", "level": "disk" }
+          - index: { _id: "4" }
+          - { "message": "cpu hot", "level": "warn" }
+          - index: { _id: "5" }
+          - { "message": "disk failure on the second volume", "level": "info" }
+          - index: { _id: "6" }
+          - { "message": "full", "level": "warn" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfr_def
+        body:
+          - index: { _id: "1" }
+          - { "message": "disk full disk", "level": "info" }
+          - index: { _id: "2" }
+          - { "message": "disk", "level": "disk" }
+          - index: { _id: "3" }
+          - { "message": "memory full", "level": "disk" }
+          - index: { _id: "4" }
+          - { "message": "cpu hot", "level": "warn" }
+          - index: { _id: "5" }
+          - { "message": "disk failure on the second volume", "level": "info" }
+          - index: { _id: "6" }
+          - { "message": "full", "level": "warn" }
+  # A keyword value matches: 2 and 3 score the keyword match, 1 and 5 their BM25.
+  - do:
+      search:
+        index: dfr_luc
+        body: { query: { query_string: { query: disk } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_prx
+        body: { query: { query_string: { query: disk } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_def
+        body: { query: { query_string: { query: disk } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  # A multi_match naming no field, alone and as Discover sends it, beside a filter.
+  - do:
+      search:
+        index: dfr_luc
+        body: { query: { multi_match: { query: disk } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_prx
+        body: { query: { multi_match: { query: disk } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_def
+        body: { query: { multi_match: { query: disk } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_luc
+        body: { query: { bool: { must: [ { multi_match: { query: disk, type: best_fields, lenient: true } } ], filter: [ { exists: { field: level } } ] } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_prx
+        body: { query: { bool: { must: [ { multi_match: { query: disk, type: best_fields, lenient: true } } ], filter: [ { exists: { field: level } } ] } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_def
+        body: { query: { bool: { must: [ { multi_match: { query: disk, type: best_fields, lenient: true } } ], filter: [ { exists: { field: level } } ] } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  # most_fields sums the fields: 2 matches both.
+  - do:
+      search:
+        index: dfr_luc
+        body: { query: { multi_match: { query: disk, type: most_fields } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 1.4166 }
+  - lt: { hits.hits.0._score: 1.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_prx
+        body: { query: { multi_match: { query: disk, type: most_fields } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 1.4166 }
+  - lt: { hits.hits.0._score: 1.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_def
+        body: { query: { multi_match: { query: disk, type: most_fields } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 1.4166 }
+  - lt: { hits.hits.0._score: 1.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  # No keyword value matches: the text's BM25 alone, the same either way.
+  - do:
+      search:
+        index: dfr_luc
+        body: { query: { query_string: { query: full } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - gt: { hits.hits.0._score: 0.4166 }
+  - lt: { hits.hits.0._score: 0.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.3421 }
+  - lt: { hits.hits.1._score: 0.3441 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.2902 }
+  - lt: { hits.hits.2._score: 0.2922 }
+  - do:
+      search:
+        index: dfr_prx
+        body: { query: { query_string: { query: full } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - gt: { hits.hits.0._score: 0.4166 }
+  - lt: { hits.hits.0._score: 0.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.3421 }
+  - lt: { hits.hits.1._score: 0.3441 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.2902 }
+  - lt: { hits.hits.2._score: 0.2922 }
+  - do:
+      search:
+        index: dfr_def
+        body: { query: { query_string: { query: full } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - gt: { hits.hits.0._score: 0.4166 }
+  - lt: { hits.hits.0._score: 0.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.3421 }
+  - lt: { hits.hits.1._score: 0.3441 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.2902 }
+  - lt: { hits.hits.2._score: 0.2922 }
+  - do:
+      search:
+        index: dfr_luc
+        body: { query: { multi_match: { query: full } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - gt: { hits.hits.0._score: 0.4166 }
+  - lt: { hits.hits.0._score: 0.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.3421 }
+  - lt: { hits.hits.1._score: 0.3441 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.2902 }
+  - lt: { hits.hits.2._score: 0.2922 }
+  - do:
+      search:
+        index: dfr_prx
+        body: { query: { multi_match: { query: full } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - gt: { hits.hits.0._score: 0.4166 }
+  - lt: { hits.hits.0._score: 0.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.3421 }
+  - lt: { hits.hits.1._score: 0.3441 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.2902 }
+  - lt: { hits.hits.2._score: 0.2922 }
+  - do:
+      search:
+        index: dfr_def
+        body: { query: { multi_match: { query: full } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - gt: { hits.hits.0._score: 0.4166 }
+  - lt: { hits.hits.0._score: 0.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.3421 }
+  - lt: { hits.hits.1._score: 0.3441 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.2902 }
+  - lt: { hits.hits.2._score: 0.2922 }
+
