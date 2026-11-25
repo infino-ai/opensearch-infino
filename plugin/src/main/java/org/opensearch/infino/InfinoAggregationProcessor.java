@@ -184,9 +184,9 @@ public class InfinoAggregationProcessor {
      * each bucket reads its own.
      */
     private static final int MAX_BATCHED_FOREGROUND_ROWS = 100_000;
-    /** The earliest and latest epoch milliseconds date_bin can take: it works in nanoseconds, in an i64. */
-    private static final long DATE_BIN_MIN_MILLIS = Long.MIN_VALUE / 1_000_000L;
-    private static final long DATE_BIN_MAX_MILLIS = Long.MAX_VALUE / 1_000_000L;
+    /** The earliest and latest epoch milliseconds a nanosecond timestamp in an i64 holds: what date_bin works in, and what date text is read as. */
+    private static final long NANOS_MIN_MILLIS = Long.MIN_VALUE / 1_000_000L;
+    private static final long NANOS_MAX_MILLIS = Long.MAX_VALUE / 1_000_000L;
     /** The Arrow type of a date in UTC epoch milliseconds, as a cast names it: what a date key is computed in. */
     private static final String UTC_MILLIS = "'Timestamp(Millisecond, Some(\"UTC\"))'";
     /** The Arrow type a mapped date's column holds, which a date the index does not map is read as. */
@@ -879,12 +879,27 @@ public class InfinoAggregationProcessor {
             if (source.masked()) {
                 throw new Unsupported("aggregation [" + b.getName() + "] has [missing] over " + source.label() + ", a field masked for this user");
             }
-            String literal = InfinoQueryTranslator.literalForType(source.type(), b.missing(), now);
+            String literal = source.type() == SqlType.DATE
+                ? missingDate(b, source, now)
+                : InfinoQueryTranslator.literalForType(source.type(), b.missing(), now);
             if (literal == null) {
                 throw new Unsupported("aggregation [" + b.getName() + "] has [missing: " + b.missing() + "], which " + source.label() + " cannot hold");
             }
             // No column: the fast paths that read a column's own values would skip the stand-in.
             return new Source("COALESCE(" + source.expr() + ", " + literal + ")", source.type(), source.label(), null, null, source.dateFormat(), null, source.onlyWhere());
+        }
+
+        /**
+         * The aggregation's {@code missing} date as a value of a date column's type, read as
+         * stock reads it: as text in the aggregation's format (else the field's) and time zone,
+         * with date math, so an {@code epoch_second} field's {@code 0} is the epoch. Null when
+         * it is not a date. A typed value, not text: {@code COALESCE} does not cast text to a
+         * timestamp as a comparison does.
+         */
+        static String missingDate(ValuesSourceAggregationBuilder<?> b, Source source, long now) {
+            ZoneId tz = b.timeZone() == null ? ZoneOffset.UTC : b.timeZone();
+            Long ms = InfinoQueryTranslator.dateMathMillis(b.missing().toString(), Grouped.dateFormatName(b.format(), source), false, tz, now);
+            return ms == null ? null : "arrow_cast(" + ms + ", " + UTC_MILLIS + ")";
         }
 
         /** The type an aggregation reads an unmapped field as: what its values would have been. */
@@ -1941,8 +1956,8 @@ public class InfinoAggregationProcessor {
             String origin = offset == 0 ? "" : ", TIMESTAMP '1970-01-01T00:00:00Z' + INTERVAL '" + offset + " milliseconds'";
             String binned = "date_bin(INTERVAL '" + ms + " milliseconds', " + millis + origin + ")";
             long margin = ms + (offset < 0 ? -offset : offset);
-            long lo = DATE_BIN_MIN_MILLIS + margin;
-            long hi = DATE_BIN_MAX_MILLIS - margin;
+            long lo = NANOS_MIN_MILLIS + margin;
+            long hi = NANOS_MAX_MILLIS - margin;
             String epoch = "arrow_cast(" + millis + ", 'Int64')";
             String shifted = "(" + epoch + " - (" + offset + "))";
             String floored = "arrow_cast(" + shifted + " - ((" + shifted + " % " + ms + ") + " + ms + ") % " + ms + " + (" + offset + "), "
@@ -2241,18 +2256,35 @@ public class InfinoAggregationProcessor {
             return new Explicit(f, leaves, child, ExplicitKind.FILTERS, buckets, f.isKeyed(), DocValueFormat.RAW);
         }
 
+        /** Range buckets in stock's order: by {@code from}, then {@code to}, ties as requested (the sort is stable). */
+        static final Comparator<ExplicitBucket> BY_BOUNDS = Comparator.comparingDouble(ExplicitBucket::from).thenComparingDouble(ExplicitBucket::to);
+
         static Explicit range(RangeAggregationBuilder r, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child, long now) {
             Source c = sourceOf(r, cols, table, now);
             if (!c.isNumeric()) {
                 throw new Unsupported("aggregation [" + r.getName() + "] needs a numeric value, " + c.label() + " is " + c.typeName());
             }
+            DocValueFormat format = r.format() == null ? DocValueFormat.RAW : new DocValueFormat.Decimal(r.format());
             List<ExplicitBucket> buckets = new ArrayList<>();
             for (RangeAggregator.Range range : r.ranges()) {
-                double from = range.getFrom();
-                double to = range.getTo();
+                double from = number(range.getFromAsString(), range.getFrom(), format, now, r.getName());
+                double to = number(range.getToAsString(), range.getTo(), format, now, r.getName());
                 buckets.add(new ExplicitBucket(range.getKey(), between(c, from, to), from, to));
             }
+            buckets.sort(BY_BOUNDS);
             return new Explicit(r, leaves, child, ExplicitKind.RANGE, buckets, r.keyed(), DocValueFormat.RAW);
+        }
+
+        /** A range bound as stock reads it: the string, in the aggregation's format, when given, else the number. */
+        private static double number(String asString, double asNumber, DocValueFormat format, long now, String agg) {
+            if (asString == null) {
+                return asNumber;
+            }
+            try {
+                return format.parseDouble(asString, false, () -> now);
+            } catch (RuntimeException e) {
+                throw new Unsupported("aggregation [" + agg + "] has a bound [" + asString + "] that is not a number");
+            }
         }
 
         static Explicit dateRange(DateRangeAggregationBuilder r, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child, long now) {
@@ -2270,6 +2302,7 @@ public class InfinoAggregationProcessor {
                 double to = bound(range.getToAsString(), range.getTo(), fmt, false, tz, now, r.getName());
                 buckets.add(new ExplicitBucket(range.getKey(), between(c, from, to), from, to));
             }
+            buckets.sort(BY_BOUNDS);
             return new Explicit(r, leaves, child, ExplicitKind.DATE_RANGE, buckets, r.keyed(), format);
         }
 
@@ -2313,9 +2346,12 @@ public class InfinoAggregationProcessor {
             });
         }
 
-        private static String bound(Source c, double v) {
+        static String bound(Source c, double v) {
             if (c.isTimestamp()) {
-                return literal(Instant.ofEpochMilli((long) v).toString());
+                long ms = (long) v;
+                // Text is read as a nanosecond timestamp, which holds only 1677 to 2262; the
+                // epoch value as a millisecond timestamp reads any instant the same.
+                return ms > NANOS_MIN_MILLIS && ms < NANOS_MAX_MILLIS ? literal(Instant.ofEpochMilli(ms).toString()) : "arrow_cast(" + ms + ", " + UTC_MILLIS + ")";
             }
             return v == Math.rint(v) && Math.abs(v) < 9.0e15 ? Long.toString((long) v) : Double.toString(v);
         }
