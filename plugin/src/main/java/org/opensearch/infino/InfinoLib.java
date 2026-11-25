@@ -111,6 +111,12 @@ public interface InfinoLib extends Library {
      */
     Pointer infino_prepared_failed(Pointer prepared);
 
+    /**
+     * Tombstone every row under one of {@code osids}: 0, or a negative code,
+     * -3 when the hosted service turned the delete away for the account's
+     * request rate and -4 when it could not be reached or did not answer
+     * (see {@link InfinoNative#deleteFailed}).
+     */
     int infino_delete_osids(Pointer h, String name, String[] osids, int count);
 
     /** One id's source as {@code {"source": ..}}, null when the table holds no such id; {@code {"error": ..}} when the lookup fails. */

@@ -5,6 +5,7 @@
 package org.opensearch.infino;
 
 import org.opensearch.ExceptionsHelper;
+import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.delete.DeleteRequest;
 import org.opensearch.action.index.IndexRequest;
@@ -28,7 +29,9 @@ import com.sun.jna.Pointer;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
@@ -362,9 +365,9 @@ public class InfinoWriterTests extends OpenSearchTestCase {
 
     /**
      * A bulk whose batch cannot be prepared because the hosted service could
-     * not be reached or did not answer in time is answered with 503 and the
-     * bridge's reason, which a client retries; before, it was a 500 that
-     * named no cause.
+     * not be reached or did not answer in time has each write answered with
+     * 503 and the bridge's reason, which a client retries; before, it was a
+     * 500 that named no cause.
      */
     public void testABulkTheUnreachableServiceCannotPrepareIsAnswered503WithTheCause() {
         String reason = "the hosted service could not be reached or did not answer in time; try again later: "
@@ -376,7 +379,7 @@ public class InfinoWriterTests extends OpenSearchTestCase {
         }));
         try {
             InfinoWriter writer = new InfinoWriter(() -> task -> fail("an unprepared bulk started an append"), 10, Long.MAX_VALUE);
-            AtomicReference<Exception> failure = new AtomicReference<>();
+            AtomicReference<BulkResponse> answered = new AtomicReference<>();
             InfinoWriter.Write index = new InfinoWriter.Write("d1", "{\"n\":1}", false, false);
             InfinoWriter.Waiter bulk = new InfinoWriter.Waiter(
                 new ShardId("i", "_na_", 0),
@@ -384,16 +387,17 @@ public class InfinoWriterTests extends OpenSearchTestCase {
                 List.of(new InfinoWriter.Outcome(0, new IndexRequest("i").id("d1"), index, null)),
                 new BulkItemResponse[1],
                 System.nanoTime(),
-                ActionListener.wrap(r -> fail("an unprepared bulk answered"), failure::set)
+                ActionListener.wrap(answered::set, e -> fail("the bulk failed whole: " + e))
             );
 
             writer.submit("t", bulk);
 
-            Exception e = failure.get();
-            assertNotNull("the bulk was not answered", e);
-            assertEquals(RestStatus.SERVICE_UNAVAILABLE, ExceptionsHelper.status(e));
-            assertTrue(e.getMessage(), e.getMessage().contains("the batch for t could not be prepared"));
-            assertTrue(e.getMessage(), e.getMessage().contains("did not answer in time"));
+            assertNotNull("the bulk was not answered", answered.get());
+            BulkItemResponse item = answered.get().getItems()[0];
+            assertTrue(item.isFailed());
+            assertEquals(RestStatus.SERVICE_UNAVAILABLE, item.status());
+            assertTrue(item.getFailureMessage(), item.getFailureMessage().contains("the batch for t could not be prepared"));
+            assertTrue(item.getFailureMessage(), item.getFailureMessage().contains("did not answer in time"));
         } finally {
             InfinoNative.useLib(null);
         }
@@ -423,6 +427,133 @@ public class InfinoWriterTests extends OpenSearchTestCase {
         } finally {
             InfinoNative.useLib(null);
         }
+    }
+
+    /** The bridge's reason for a document the hosted service turned away for the account's request rate. */
+    private static final String RATE_LIMITED = "backend: append: server returned 429: rate limit exceeded";
+
+    /** A generated-id document written to slot {@code slot} of a bulk: it names no id, so nothing is looked up. */
+    private static InfinoWriter.Outcome generated(int slot, String id) {
+        IndexRequest request = new IndexRequest("i").id(id).source("{\"n\":1}", MediaTypeRegistry.JSON);
+        return new InfinoWriter.Outcome(slot, request, new InfinoWriter.Write(id, "{\"n\":1}", false, false), null);
+    }
+
+    /**
+     * A bulk of three generated-id documents (slots 0, 1 and 3) and an item
+     * refused up front with 400 (slot 2), written through the writer by an
+     * append the bridge answers with {@code append}: the bulk's response, or
+     * null when it failed whole, with the failure in {@code failed}.
+     */
+    private static BulkResponse bulkAnswered(String append, AtomicReference<Exception> failed) {
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with", "infino_prepare_batch" -> new Memory(1);
+            case "infino_prepared_failed", "infino_sql_latest" -> nativeString("[]"); // every row converts; the table is empty
+            case "infino_append_prepared" -> nativeString(append);
+            default -> null; // the latest hold and its release, and the frees
+        }));
+        try {
+            InfinoWriter writer = new InfinoWriter(() -> Runnable::run, 100, Long.MAX_VALUE);
+            BulkItemResponse refusedUpFront = new BulkItemResponse(
+                2,
+                DocWriteRequest.OpType.INDEX,
+                new BulkItemResponse.Failure("i", "bad", new IllegalArgumentException("[infino] scripted updates are not served"), RestStatus.BAD_REQUEST)
+            );
+            List<InfinoWriter.Outcome> outcomes = List.of(
+                generated(0, "g1"),
+                generated(1, "g2"),
+                new InfinoWriter.Outcome(2, new IndexRequest("i").id("bad"), null, refusedUpFront),
+                generated(3, "g3")
+            );
+            AtomicReference<BulkResponse> answered = new AtomicReference<>();
+            writer.submit("t", new InfinoWriter.Waiter(SHARD, "i", outcomes, new BulkItemResponse[4], System.nanoTime(), ActionListener.wrap(answered::set, failed::set)));
+            assertTrue("the bulk was not answered", answered.get() != null || failed.get() != null);
+            return answered.get();
+        } finally {
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /**
+     * A document of a bulk the hosted service turned away for the account's
+     * request rate is answered 429, which Logstash, Beats, Fluent Bit and
+     * Data Prepper send again, and not 400, which they drop as a bad
+     * document. A document the table refuses is still a 400, the bulk says
+     * {@code errors: true}, the documents written are 201 and the item
+     * refused up front keeps its answer.
+     */
+    public void testADocumentTheServiceRateLimitsIs429AndARefusedOneStays400() {
+        AtomicReference<Exception> failed = new AtomicReference<>();
+        BulkResponse response = bulkAnswered(
+            "{\"ok\":1,\"failed\":["
+                + "{\"b\":0,\"i\":1,\"reason\":\"" + RATE_LIMITED + "\",\"permanent\":false,\"status\":429},"
+                + "{\"b\":0,\"i\":2,\"reason\":\"field [n] takes no string\",\"permanent\":true,\"status\":null}]}",
+            failed
+        );
+        assertNull(String.valueOf(failed.get()), failed.get());
+        assertTrue("errors: true", response.hasFailures());
+        BulkItemResponse[] items = response.getItems();
+        assertFalse(items[0].getFailureMessage(), items[0].isFailed());
+        assertEquals(RestStatus.CREATED, items[0].status());
+        assertEquals(RestStatus.TOO_MANY_REQUESTS, items[1].status());
+        assertTrue(items[1].getFailure().getCause() instanceof OpenSearchRejectedExecutionException);
+        assertTrue(items[1].getFailureMessage(), items[1].getFailureMessage().contains("rate limit exceeded"));
+        assertEquals("the item refused up front keeps its answer", "bad", items[2].getId());
+        assertEquals(RestStatus.BAD_REQUEST, items[2].status());
+        assertEquals(RestStatus.BAD_REQUEST, items[3].status());
+        assertTrue(items[3].getFailure().getCause() instanceof IllegalArgumentException);
+        assertTrue(items[3].getFailureMessage(), items[3].getFailureMessage().contains("takes no string"));
+    }
+
+    /**
+     * An append the hosted service did not answer (no answer at all, or a
+     * 502, 503 or 504, which the bridge marks {@code unavailable}) has each
+     * of its writes answered 503, and one it turned away whole for the
+     * account's request rate each answered 429: item by item, so the bulk
+     * says {@code errors: true}, the item refused up front keeps its 400 and
+     * a client sends again only the writes. Any other failure still fails
+     * the bulk whole.
+     */
+    public void testAnAppendTheServiceDidNotTakeAnswersEachWrite503Or429() {
+        String unavailable = "{\"error\":\"the hosted service could not be reached or did not answer in time; try again later: "
+            + "unavailable: append(t): transport error: timeout\",\"unavailable\":true}";
+        Map<String, RestStatus> cases = new LinkedHashMap<>();
+        cases.put(unavailable, RestStatus.SERVICE_UNAVAILABLE);
+        for (int status : new int[] { 502, 503, 504 }) {
+            cases.put(
+                "{\"error\":\"the hosted service could not be reached or did not answer in time; try again later: "
+                    + "unavailable: append: server returned " + status + ": x\",\"unavailable\":true,\"status\":" + status + "}",
+                RestStatus.SERVICE_UNAVAILABLE
+            );
+        }
+        cases.put("{\"error\":\"" + RATE_LIMITED + "\",\"status\":429}", RestStatus.TOO_MANY_REQUESTS);
+        for (Map.Entry<String, RestStatus> c : cases.entrySet()) {
+            AtomicReference<Exception> failed = new AtomicReference<>();
+            BulkResponse response = bulkAnswered(c.getKey(), failed);
+            assertNull(c.getKey() + ": " + failed.get(), failed.get());
+            assertTrue(c.getKey(), response.hasFailures());
+            BulkItemResponse[] items = response.getItems();
+            for (int slot : new int[] { 0, 1, 3 }) {
+                assertEquals(c.getKey(), c.getValue(), items[slot].status());
+            }
+            assertEquals(c.getKey(), RestStatus.BAD_REQUEST, items[2].status());
+        }
+
+        AtomicReference<Exception> failed = new AtomicReference<>();
+        assertNull(bulkAnswered("{\"error\":\"append: storage failed\"}", failed));
+        assertEquals(RestStatus.INTERNAL_SERVER_ERROR, ExceptionsHelper.status(failed.get()));
+    }
+
+    /**
+     * A delete the hosted service turned away for the account's request
+     * rate is a 429, one it did not answer a 503, and any other failure a
+     * 500, as each delete of the bulk is answered.
+     */
+    public void testADeleteTheServiceDidNotTakeIs429Or503() {
+        assertEquals(RestStatus.TOO_MANY_REQUESTS, ExceptionsHelper.status(InfinoNative.deleteFailed("t", 2, InfinoNative.DELETE_RATE_LIMITED)));
+        RuntimeException unavailable = InfinoNative.deleteFailed("t", 2, InfinoNative.DELETE_UNAVAILABLE);
+        assertEquals(RestStatus.SERVICE_UNAVAILABLE, ExceptionsHelper.status(unavailable));
+        assertTrue(((InfinoNative.InfinoException) unavailable).unavailable());
+        assertEquals(RestStatus.INTERNAL_SERVER_ERROR, ExceptionsHelper.status(InfinoNative.deleteFailed("t", 2, -2)));
     }
 
     private static Pointer nativeString(String s) {

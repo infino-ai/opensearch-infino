@@ -167,7 +167,9 @@ const SERVICE_UNAVAILABLE: u16 = 503;
 const STATUS_BAD_REQUEST: u16 = 400;
 /// HTTP status of a caller's statement naming a column or table that is not there.
 const STATUS_NOT_FOUND: u16 = 404;
-/// HTTP status of a caller's statement past the connection's memory budget.
+/// HTTP status of a caller's statement past the connection's memory budget,
+/// and of a call the hosted service turned away for the account's request
+/// rate ([`rate_limited`]).
 const STATUS_TOO_MANY_REQUESTS: u16 = 429;
 /// HTTP status of a request the hosted service refuses for its size.
 const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
@@ -3312,9 +3314,11 @@ fn hosted_schema_refusal(e: &InfinoError) -> Option<&str> {
 /// reported with the engine's reason, and as `permanent` when the engine
 /// refused what it carries ([`refuses_content`]), while every accepted half
 /// is one write. A write the hosted service could not take
-/// ([`InfinoError::Unavailable`]) says nothing of the rows, and every half
-/// would meet the same service: it ends the call with that error, so a
-/// stalled service costs one timed-out write rather than one per document.
+/// ([`ends_the_write`]: it did not answer, or turned the call away for the
+/// account's request rate) says nothing of the rows, and every half would
+/// meet the same service: it ends the call with that error, so a stalled or
+/// throttled service costs one write rather than one per document. A rate
+/// limit reports every document not written ([`untried`]).
 fn write_checked(
     rows: &[(usize, Value)],
     failed: &mut Vec<Value>,
@@ -3326,7 +3330,10 @@ fn write_checked(
     let values: Vec<Value> = rows.iter().map(|(_, v)| v.clone()).collect();
     match write(&values) {
         Ok(()) => {}
-        Err(e @ InfinoError::Unavailable(_)) => return Err(e),
+        Err(e) if ends_the_write(&e) => {
+            untried(rows, &e, failed);
+            return Err(e);
+        }
         Err(e) if rows.len() == 1 => {
             failed.push(json!({
                 "i": rows[0].0,
@@ -3336,8 +3343,9 @@ fn write_checked(
         }
         Err(_) => {
             let (a, b) = rows.split_at(rows.len() / 2);
-            write_checked(a, failed, write)?;
-            write_checked(b, failed, write)?;
+            each_run(&[a, b], failed, |half, failed| {
+                write_checked(half, failed, write)
+            })?;
         }
     }
     Ok(())
@@ -3373,10 +3381,12 @@ fn append_checked(
 /// every document its update carried, for a later try. A refused document
 /// keeps whatever row the table holds.
 ///
-/// A replace the hosted service could not take ([`InfinoError::Unavailable`]:
-/// it could not be reached, or did not answer in time) says nothing of the
-/// rows, and every later call would meet the same service: it ends the write
-/// with that error, with no further call, and no document is blamed.
+/// A replace the hosted service could not take ([`ends_the_write`]: it could
+/// not be reached, did not answer in time, or turned the call away for the
+/// account's request rate) says nothing of the rows, and every later call
+/// would meet the same service: it ends the write with that error, with no
+/// further call, and no document is blamed. A rate limit reports every
+/// document not written ([`untried`]).
 fn replace_rows_checked(
     table: &Supertable,
     gate: &Gate,
@@ -3395,8 +3405,9 @@ fn replace_rows_checked(
     ids.sort_unstable();
     ids.dedup();
     let replace_each = |runs: &[&[(usize, Value)]], failed: &mut Vec<Value>| {
-        runs.iter()
-            .try_for_each(|run| replace_rows_checked(table, gate, run, failed, id_bytes))
+        each_run(runs, failed, |run, failed| {
+            replace_rows_checked(table, gate, run, failed, id_bytes)
+        })
     };
     // More ids than one call may name: each run of them replaces on its own.
     if let Some(runs) = rows_by_id_run(rows, &ids, id_bytes) {
@@ -3410,7 +3421,10 @@ fn replace_rows_checked(
     };
     let e = match replace {
         Ok(_) => return Ok(()),
-        Err(e @ InfinoError::Unavailable(_)) => return Err(e),
+        Err(e) if ends_the_write(&e) => {
+            untried(rows, &e, failed);
+            return Err(e);
+        }
         Err(e) => e,
     };
     let reason = short_reason(format_args!("replace: {e}"));
@@ -3435,11 +3449,17 @@ fn replace_rows_checked(
                             .is_some_and(|id| single.contains(id))
                     });
                 if !miscounted.is_empty() {
-                    rewrite_rows(table, gate, &miscounted, failed, id_bytes)?;
+                    if let Err(stop) = rewrite_rows(table, gate, &miscounted, failed, id_bytes) {
+                        untried(&once, &stop, failed);
+                        return Err(stop);
+                    }
                     return replace_rows_checked(table, gate, &once, failed, id_bytes);
                 }
             }
-            Err(count @ InfinoError::Unavailable(_)) => return Err(count),
+            Err(count) if ends_the_write(&count) => {
+                untried(rows, &count, failed);
+                return Err(count);
+            }
             Err(_) => {}
         }
     }
@@ -3459,6 +3479,65 @@ fn not_taken(rows: &[(usize, Value)], reason: &str, failed: &mut Vec<Value>) {
     for (i, _) in rows {
         failed.push(json!({"i": i, "reason": reason, "permanent": false}));
     }
+}
+
+/// Whether the hosted service turned a call away for the account's request
+/// rate: it answers `429` at its edge, before the call reaches the table, so
+/// the call wrote nothing and a later try may pass. The engine's hosted
+/// client passes the status on as an untyped backend error
+/// (`<op>: server returned 429: <body>`).
+fn rate_limited(e: &InfinoError) -> bool {
+    matches!(e, InfinoError::Backend(m) if status_in(m) == Some(STATUS_TOO_MANY_REQUESTS))
+}
+
+/// Whether a failed call ends the write it is part of: the hosted service
+/// could not be reached or did not answer ([`InfinoError::Unavailable`]), or
+/// turned the call away for the account's request rate ([`rate_limited`]).
+/// Neither says anything of the rows the call carried, and every later call
+/// of the write would meet the same service, so none is made.
+fn ends_the_write(e: &InfinoError) -> bool {
+    matches!(e, InfinoError::Unavailable(_)) || rate_limited(e)
+}
+
+/// Report `rows`, which a write ended by `stop` ([`ends_the_write`]) did not
+/// write, when `stop` is a rate limit: each not taken, under status 429, so
+/// the plugin answers 429 for it and the client sends it again. None of them
+/// is in the table, as the service wrote nothing of a call it turned away,
+/// so the retry stores each once. An unavailable service reports nothing
+/// here: it fails the whole call, since a write it did not answer may have
+/// landed.
+fn untried(rows: &[(usize, Value)], stop: &InfinoError, failed: &mut Vec<Value>) {
+    if !rate_limited(stop) {
+        return;
+    }
+    let reason = short_reason(stop);
+    for (i, _) in rows {
+        failed.push(json!({
+            "i": i,
+            "reason": reason,
+            "permanent": false,
+            "status": STATUS_TOO_MANY_REQUESTS,
+        }));
+    }
+}
+
+/// Write each of `runs` with `write`, in order, until one ends the write
+/// ([`ends_the_write`]): the documents of every run after it are reported
+/// as not written ([`untried`]), and the error is returned.
+fn each_run(
+    runs: &[&[(usize, Value)]],
+    failed: &mut Vec<Value>,
+    mut write: impl FnMut(&[(usize, Value)], &mut Vec<Value>) -> Result<(), InfinoError>,
+) -> Result<(), InfinoError> {
+    for (k, run) in runs.iter().enumerate() {
+        if let Err(stop) = write(run, failed) {
+            for rest in &runs[k + 1..] {
+                untried(rest, &stop, failed);
+            }
+            return Err(stop);
+        }
+    }
+    Ok(())
 }
 
 /// How many bytes of ids one mutation over the hosted service may name. The
@@ -3633,8 +3712,8 @@ fn rows_under(table: &Supertable, ids: &[&str]) -> Result<Vec<u64>, InfinoError>
 /// the append lands a read finds no row under the ids, and a document whose
 /// append fails is reported for a later try, which finds no row and
 /// appends it. A delete that fails reports its documents for a later try,
-/// and one the hosted service could not take ([`InfinoError::Unavailable`])
-/// ends the write with that error, as every later delete would meet it.
+/// and one the hosted service could not take ([`ends_the_write`]) ends the
+/// write with that error, as every later delete would meet it.
 fn rewrite_rows(
     table: &Supertable,
     gate: &Gate,
@@ -3657,7 +3736,8 @@ fn rewrite_rows(
     // on its own: a run whose delete fails reports its documents alone.
     let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
     let groups = rows_by_id_run(rows, &id_refs, id_bytes).unwrap_or_else(|| vec![rows.to_vec()]);
-    groups.iter().try_for_each(|group| {
+    let groups: Vec<&[(usize, Value)]> = groups.iter().map(Vec::as_slice).collect();
+    each_run(&groups, failed, |group, failed| {
         let mut run: Vec<String> = group
             .iter()
             .filter_map(|(_, v)| v.get(OSID).and_then(Value::as_str))
@@ -3672,7 +3752,10 @@ fn rewrite_rows(
         };
         match deleted {
             Ok(_) => append_checked(table, gate, group, failed),
-            Err(e @ InfinoError::Unavailable(_)) => Err(e),
+            Err(e) if ends_the_write(&e) => {
+                untried(group, &e, failed);
+                Err(e)
+            }
             Err(e) => {
                 not_taken(group, &short_reason(format_args!("replace: {e}")), failed);
                 Ok(())
@@ -3683,9 +3766,11 @@ fn rewrite_rows(
 
 /// Index many documents in one append. `osids` and `sources` are parallel
 /// arrays of length `count`. Returns
-/// `{"ok":n,"failed":[{"i":..,"reason":..,"permanent":..}]}`, where `i`
-/// indexes the input arrays and `permanent` says every later try is refused
-/// the same way ([`NotTaken`]), or `{"error":..}` when nothing ran.
+/// `{"ok":n,"failed":[{"i":..,"reason":..,"permanent":..,"status"?:..}]}`,
+/// where `i` indexes the input arrays, `permanent` says every later try is
+/// refused the same way ([`NotTaken`]) and `status` (429) marks a document
+/// the hosted service turned away for the account's request rate
+/// ([`untried`]); or `{"error":..}` when nothing ran.
 #[no_mangle]
 pub unsafe extern "C" fn infino_index_batch(
     h: *mut Bridge,
@@ -3756,8 +3841,11 @@ pub unsafe extern "C" fn infino_index_batch(
             .zip(maps)
             .map(|((i, _), m)| (*i, Value::Object(m)))
             .collect();
-        if let Err(e) = append_checked(&table, &conn.gate(name), &indexed, &mut failed) {
-            return engine_err_json(&e);
+        // A rate limit reports what it did not write ([`untried`]); only an
+        // unavailable service, or a failure of no document, fails the call.
+        match append_checked(&table, &conn.gate(name), &indexed, &mut failed) {
+            Err(e) if !rate_limited(&e) => return engine_err_json(&e),
+            _ => {}
         }
         let ok = n - failed.len();
         if adds_columns && ok > 0 {
@@ -3828,8 +3916,8 @@ pub unsafe extern "C" fn infino_index_batch_buf(
         };
         let failed: Vec<Value> = failed
             .into_iter()
-            .map(|(_, i, reason, permanent)| {
-                json!({ "i": i, "reason": reason, "permanent": permanent })
+            .map(|(_, i, reason, permanent, status)| {
+                json!({ "i": i, "reason": reason, "permanent": permanent, "status": status })
             })
             .collect();
         let ok = n - failed.len();
@@ -4118,10 +4206,13 @@ fn osids_of(batch: &RecordBatch) -> Vec<String> {
 }
 
 /// A document an append did not take: (batch index, document index, reason,
-/// permanent). It is permanent when the table refuses what the document
-/// carries, so every later try is refused the same way; otherwise it failed
-/// for a reason of the moment and a later try may take it.
-type NotTaken = (usize, usize, String, bool);
+/// permanent, status). It is permanent when the table refuses what the
+/// document carries, so every later try is refused the same way; otherwise
+/// it failed for a reason of the moment and a later try may take it. The
+/// status is the one the caller answers for it when it is not a refusal of
+/// the document: 429 for a write the hosted service turned away for the
+/// account's request rate ([`untried`]), which the client sends again.
+type NotTaken = (usize, usize, String, bool, Option<u16>);
 
 /// Stamp each document of a prepared batch with its sequence number,
 /// `seqs[i]` for document `i` of the batch: in the row it falls back to, and
@@ -4158,11 +4249,21 @@ fn stamp_seqs(p: &mut Prepared, seqs: &[i64]) -> Result<(), String> {
 }
 
 /// Whether a write landed. A write that found the hosted service
-/// unavailable is the error: the caller stops there.
-fn landed<T>(result: Result<T, InfinoError>) -> Result<bool, InfinoError> {
+/// unavailable is the error: the caller stops there. One the service turned
+/// away for the account's request rate ([`rate_limited`]) did not land and
+/// is kept in `stop`: the caller makes no further call, and reports every
+/// document it has not written under it ([`untried`]).
+fn landed<T>(
+    result: Result<T, InfinoError>,
+    stop: &mut Option<InfinoError>,
+) -> Result<bool, InfinoError> {
     match result {
         Ok(_) => Ok(true),
         Err(e @ InfinoError::Unavailable(_)) => Err(e),
+        Err(e) if rate_limited(&e) => {
+            *stop = Some(e);
+            Ok(false)
+        }
         Err(_) => Ok(false),
     }
 }
@@ -4192,6 +4293,12 @@ fn landed<T>(result: Result<T, InfinoError>) -> Result<bool, InfinoError> {
 /// gone. A retry looks its ids up and replaces those rows, so they are not
 /// stored twice; a retry with `op_type=create` is answered 409 for them, as
 /// they exist.
+///
+/// A write the service turned away for the account's request rate
+/// ([`rate_limited`]) is not an error: it wrote nothing, so the documents
+/// the calls before it wrote are taken, and it and every document after it
+/// are reported under status 429 ([`untried`]), with no further call. Only
+/// those are sent again, so none is stored twice.
 fn append_prepared(
     table: &Supertable,
     gate: &Gate,
@@ -4204,12 +4311,12 @@ fn append_prepared(
     for (b, p) in prepared.iter_mut().enumerate() {
         // Refused by the columns before conversion, as every try would be.
         for (i, why) in &p.failed {
-            failed.push((b, *i, why.clone(), true));
+            failed.push((b, *i, why.clone(), true, None));
         }
         if let Some(seqs) = seqs.get(b) {
             if let Err(why) = stamp_seqs(p, seqs) {
                 for i in &p.index_of {
-                    failed.push((b, *i, format!("sequence number: {why}"), false));
+                    failed.push((b, *i, format!("sequence number: {why}"), false, None));
                 }
                 p.batch = None;
                 p.values.clear();
@@ -4224,7 +4331,7 @@ fn append_prepared(
             for (b, p) in prepared.iter().enumerate() {
                 if p.batch.is_some() {
                     for i in &p.index_of {
-                        failed.push((b, *i, why.clone(), false));
+                        failed.push((b, *i, why.clone(), false, None));
                     }
                 }
             }
@@ -4235,10 +4342,13 @@ fn append_prepared(
     // replace, landed as Arrow.
     let mut fresh_landed = joined.is_none();
     let mut replaced_landed = joined.is_none();
+    // A rate limit that ended the write ([`landed`]): no call is made after
+    // it, and every document not yet written is reported under it.
+    let mut stop: Option<InfinoError> = None;
     if let Some(batch) = &joined {
         if replaced.is_empty() {
             let _pass = gate.append();
-            fresh_landed = landed(waiting(|| table.append(batch)))?;
+            fresh_landed = landed(waiting(|| table.append(batch)), &mut stop)?;
             replaced_landed = true;
         } else {
             match split_by_osid(batch, replaced) {
@@ -4254,20 +4364,24 @@ fn append_prepared(
                         id_runs(&ids, id_bytes).len() < 2 && {
                             let pred = col(OSID).in_list(ids.into_iter().map(lit).collect(), false);
                             let _pass = gate.whole();
-                            landed(waiting(|| table.update(pred.clone(), &replacing)))?
+                            landed(
+                                waiting(|| table.update(pred.clone(), &replacing)),
+                                &mut stop,
+                            )?
                         }
                     };
-                    fresh_landed = fresh.num_rows() == 0 || {
-                        let _pass = gate.append();
-                        landed(waiting(|| table.append(&fresh)))?
-                    };
+                    fresh_landed = fresh.num_rows() == 0
+                        || (stop.is_none() && {
+                            let _pass = gate.append();
+                            landed(waiting(|| table.append(&fresh)), &mut stop)?
+                        });
                 }
                 None => {
                     let why = "the batch carries no readable id column".to_string();
                     for (b, p) in prepared.iter().enumerate() {
                         if p.batch.is_some() {
                             for i in &p.index_of {
-                                failed.push((b, *i, why.clone(), false));
+                                failed.push((b, *i, why.clone(), false, None));
                             }
                         }
                     }
@@ -4307,8 +4421,25 @@ fn append_prepared(
             }
         }
         let mut refused: Vec<Value> = Vec::new();
-        replace_rows_checked(table, gate, &replacing, &mut refused, id_bytes)?;
-        append_checked(table, gate, &indexed, &mut refused)?;
+        if let Some(limit) = &stop {
+            untried(&replacing, limit, &mut refused);
+            untried(&indexed, limit, &mut refused);
+        } else {
+            let wrote = match replace_rows_checked(table, gate, &replacing, &mut refused, id_bytes)
+            {
+                Ok(()) => append_checked(table, gate, &indexed, &mut refused),
+                Err(e) => {
+                    untried(&indexed, &e, &mut refused);
+                    Err(e)
+                }
+            };
+            match wrote {
+                Ok(()) => {}
+                // Every document it did not write is reported ([`untried`]).
+                Err(e) if rate_limited(&e) => stop = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
         for r in refused {
             let i = r["i"].as_u64().unwrap_or(0) as usize;
             failed.push((
@@ -4316,6 +4447,7 @@ fn append_prepared(
                 i,
                 r["reason"].as_str().unwrap_or("refused").to_string(),
                 r["permanent"].as_bool().unwrap_or(false),
+                r["status"].as_u64().and_then(|s| u16::try_from(s).ok()),
             ));
         }
     }
@@ -4451,10 +4583,12 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
 /// in the same mutation. `seqs` (null for none) holds `seqs_count` sequence
 /// numbers, one per document of every batch, batch after batch in order: the
 /// number each document is written under. Returns
-/// `{"ok":n,"failed":[{"b":batch,"i":doc,"reason":..,"permanent":..}]}`,
-/// where `b` indexes `prepared`, `i` the documents of that batch and
-/// `permanent` says every later try is refused the same way ([`NotTaken`]),
-/// or `{"error":..}` when nothing ran (the handles are released either way).
+/// `{"ok":n,"failed":[{"b":batch,"i":doc,"reason":..,"permanent":..,"status":..}]}`,
+/// where `b` indexes `prepared`, `i` the documents of that batch,
+/// `permanent` says every later try is refused the same way ([`NotTaken`])
+/// and `status` is 429 for a document the hosted service turned away for the
+/// account's request rate ([`untried`]), else null; or `{"error":..}` when
+/// nothing ran (the handles are released either way).
 #[no_mangle]
 pub unsafe extern "C" fn infino_append_prepared(
     h: *mut Bridge,
@@ -4532,8 +4666,8 @@ pub unsafe extern "C" fn infino_append_prepared(
         }
         let failed: Vec<Value> = failed
             .into_iter()
-            .map(|(b, i, reason, permanent)| {
-                json!({ "b": b, "i": i, "reason": reason, "permanent": permanent })
+            .map(|(b, i, reason, permanent, status)| {
+                json!({ "b": b, "i": i, "reason": reason, "permanent": permanent, "status": status })
             })
             .collect();
         out_json(json!({ "ok": ok, "failed": failed }))
@@ -4580,9 +4714,31 @@ pub unsafe extern "C" fn infino_prepared_failed(p: *const Prepared) -> *mut c_ch
     .unwrap_or(ptr::null_mut())
 }
 
+/// What [`infino_delete_osids`] returns for a delete the hosted service
+/// turned away for the account's request rate ([`rate_limited`]).
+const DELETE_RATE_LIMITED: c_int = -3;
+/// What [`infino_delete_osids`] returns for a delete the hosted service
+/// could not be reached for, or did not answer ([`InfinoError::Unavailable`]).
+const DELETE_UNAVAILABLE: c_int = -4;
+/// What [`infino_delete_osids`] returns for any other failed delete.
+const DELETE_FAILED: c_int = -2;
+
+/// The code [`infino_delete_osids`] returns for a delete that failed with `e`.
+fn delete_code(e: &InfinoError) -> c_int {
+    if rate_limited(e) {
+        DELETE_RATE_LIMITED
+    } else if matches!(e, InfinoError::Unavailable(_)) {
+        DELETE_UNAVAILABLE
+    } else {
+        DELETE_FAILED
+    }
+}
+
 /// Tombstone every row whose `osid` is in the list, in one mutation. Backs the
 /// upsert path (translog replay, updates): delete the ids of a batch, then
-/// append the batch.
+/// append the batch. Returns 0, or a negative code: -1 for a null argument,
+/// [`DELETE_RATE_LIMITED`] or [`DELETE_UNAVAILABLE`] for a delete the
+/// caller tries again later, and [`DELETE_FAILED`] for any other failure.
 #[no_mangle]
 pub unsafe extern "C" fn infino_delete_osids(
     h: *mut Bridge,
@@ -4596,7 +4752,7 @@ pub unsafe extern "C" fn infino_delete_osids(
         };
         if let Err(refused) = conn.refuse_write(name) {
             eprintln!("[capi] delete_osids: {refused}");
-            return -2;
+            return DELETE_FAILED;
         }
         if osids.is_null() || count <= 0 {
             return 0;
@@ -4604,10 +4760,15 @@ pub unsafe extern "C" fn infino_delete_osids(
         let n = count as usize;
         let os_p = unsafe { std::slice::from_raw_parts(osids, n) };
         let ids: Vec<&str> = os_p.iter().filter_map(|p| unsafe { cstr(*p) }).collect();
-        // No table yet means nothing to delete.
+        // No table yet means nothing to delete. A table the hosted service
+        // could not be asked for is a failure, not an empty table.
         let table = match conn.table(name) {
             Ok(t) => t,
-            Err(_) => return 0,
+            Err(InfinoError::NotFound(_)) => return 0,
+            Err(e) => {
+                eprintln!("[capi] delete_osids: {}", short_reason(&e));
+                return delete_code(&e);
+            }
         };
         // A run of ids at a time ([`id_runs`]); a failed run fails the call,
         // which the caller tries again whole (a delete is idempotent).
@@ -4620,7 +4781,7 @@ pub unsafe extern "C" fn infino_delete_osids(
             };
             if let Err(e) = deleted {
                 eprintln!("[capi] delete_osids: {}", short_reason(&e));
-                return -2;
+                return delete_code(&e);
             }
         }
         0
@@ -10927,6 +11088,27 @@ mod tests {
     /// answer never arrived. Returns the bridge open on it and what it
     /// dropped.
     fn dropping_service() -> (*mut Bridge, Arc<Dropped>) {
+        let dropped = Arc::new(Dropped::default());
+        let seen = Arc::clone(&dropped);
+        let h = logs_service(move |request| {
+            if request.contains("/v1/append/") {
+                seen.appends.fetch_add(1, Ordering::SeqCst);
+            } else if request.contains("/v1/update/") {
+                seen.updates.fetch_add(1, Ordering::SeqCst);
+            }
+            None
+        });
+        (h, dropped)
+    }
+
+    /// A hosted service that serves the table `logs` (as [`open_logs`]
+    /// declares it) to the open and to a prepare, and answers every other
+    /// request with what `write` says for its request line: a status and a
+    /// body, or None to close the connection without an answer. Returns the
+    /// bridge open on it.
+    fn logs_service(
+        write: impl Fn(&str) -> Option<(u16, Vec<u8>)> + Send + 'static,
+    ) -> *mut Bridge {
         let local = open_logs();
         let bridge = unsafe { &*local };
         let document = bridge.conn.schema("logs").unwrap().to_json().to_string();
@@ -10939,8 +11121,6 @@ mod tests {
         }
         unsafe { infino_close(local) };
 
-        let dropped = Arc::new(Dropped::default());
-        let seen = Arc::clone(&dropped);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -10948,25 +11128,20 @@ mod tests {
                 let Ok(mut stream) = stream else { return };
                 let (text, body) = read_head_and_body(&mut stream);
                 let request = text.lines().next().unwrap_or("").to_string();
-                let answer: Option<(&str, Vec<u8>)> = if request.contains("/v1/list_tables/") {
-                    Some(("application/json", b"[]".to_vec()))
+                let answer: Option<(u16, &str, Vec<u8>)> = if request.contains("/v1/list_tables/") {
+                    Some((200, "application/json", b"[]".to_vec()))
                 } else if request.contains("/v1/schema/") {
                     if String::from_utf8_lossy(&body).contains("\"document\"") {
-                        Some(("application/json", document.clone().into_bytes()))
+                        Some((200, "application/json", document.clone().into_bytes()))
                     } else {
-                        Some(("application/vnd.apache.arrow.stream", ipc.clone()))
+                        Some((200, "application/vnd.apache.arrow.stream", ipc.clone()))
                     }
                 } else {
-                    if request.contains("/v1/append/") {
-                        seen.appends.fetch_add(1, Ordering::SeqCst);
-                    } else if request.contains("/v1/update/") {
-                        seen.updates.fetch_add(1, Ordering::SeqCst);
-                    }
-                    None
+                    write(&request).map(|(status, bytes)| (status, "application/json", bytes))
                 };
-                if let Some((kind, bytes)) = answer {
+                if let Some((status, kind, bytes)) = answer {
                     let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 {status} X\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         bytes.len()
                     );
                     let _ = std::io::Write::write_all(&mut stream, head.as_bytes());
@@ -10978,7 +11153,7 @@ mod tests {
         let key = c("ik_test");
         let h = unsafe { infino_open_with(uri.as_ptr(), key.as_ptr(), ptr::null()) };
         assert!(!h.is_null(), "the open lists the tables");
-        (h, dropped)
+        h
     }
 
     /// A prepared batch of `ids` for `logs`, each document `{"level":"info"}`.
@@ -11099,6 +11274,214 @@ mod tests {
             "one update request"
         );
         unsafe { infino_close(h) };
+    }
+
+    /// The body the hosted service answers a call it turns away for the
+    /// account's request rate with.
+    const RATE_LIMIT_BODY: &str = r#"{"error":"rate limit exceeded"}"#;
+
+    /// The error the engine's hosted client returns for a call the service
+    /// turned away for the account's request rate.
+    fn rate_limit() -> InfinoError {
+        InfinoError::Backend(format!(
+            "append: server returned {STATUS_TOO_MANY_REQUESTS}: {RATE_LIMIT_BODY}"
+        ))
+    }
+
+    /// `failed` reports exactly the documents `expected` names, each not
+    /// taken, not permanent, under status 429 and the service's reason.
+    fn assert_rate_limited(failed: &[Value], expected: std::ops::Range<u64>) {
+        let mut seen: Vec<u64> = failed.iter().filter_map(|f| f["i"].as_u64()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, expected.collect::<Vec<_>>(), "{failed:?}");
+        for f in failed {
+            assert_eq!(f["status"], STATUS_TOO_MANY_REQUESTS, "{f}");
+            assert_eq!(f["permanent"], false, "{f}");
+            let reason = f["reason"].as_str().unwrap_or_default();
+            assert!(reason.contains("server returned 429"), "{f}");
+        }
+    }
+
+    /// A rate limit (a 429 the hosted client passes on as an untyped backend
+    /// error) is told apart from a refusal of the rows: like a service that
+    /// did not answer, it ends the write. A refusal of the rows, their size,
+    /// the key or the account's row limit does not; nor does a statement
+    /// past the memory budget, which the caller is answered 429 for too.
+    #[test]
+    fn a_rate_limit_is_told_from_a_refusal_and_ends_the_write() {
+        assert!(rate_limited(&rate_limit()));
+        assert!(ends_the_write(&rate_limit()));
+        let unavailable = InfinoError::Unavailable("append: server returned 503: x".into());
+        assert!(!rate_limited(&unavailable));
+        assert!(ends_the_write(&unavailable));
+        let others = [
+            InfinoError::Backend("append: server returned 400: append error: schema: x".into()),
+            InfinoError::Backend("update: server returned 413: ".into()),
+            InfinoError::Backend("append: server returned 500: x".into()),
+            InfinoError::Backend(
+                "append: server returned 403: the key was refused for this call: account row limit reached"
+                    .into(),
+            ),
+            InfinoError::OverBudget("past the budget".into()),
+        ];
+        for e in &others {
+            assert!(!rate_limited(e), "{e}");
+            assert!(!ends_the_write(e), "{e}");
+        }
+    }
+
+    /// A write the hosted service turns away for the account's request rate
+    /// is not split into halves, each of which would spend more of the rate
+    /// on the same rows: it stops at that call, and every document it did
+    /// not write is reported under 429, while the documents an earlier call
+    /// wrote are not reported, so a retry sends each missing one once.
+    #[test]
+    fn a_rate_limited_write_stops_and_reports_429_for_what_it_did_not_write() {
+        let rows: Vec<(usize, Value)> = (0..8).map(|i| (i, json!({ "n": i }))).collect();
+        let calls = std::cell::Cell::new(0);
+        let mut failed = Vec::new();
+        let out = write_checked(&rows, &mut failed, &|_| {
+            calls.set(calls.get() + 1);
+            Err(rate_limit())
+        });
+        assert!(matches!(&out, Err(e) if rate_limited(e)), "{out:?}");
+        assert_eq!(calls.get(), 1, "one call for the whole batch");
+        assert_rate_limited(&failed, 0..8);
+
+        // Refused for what it carries, the write goes in halves: the first
+        // lands, the second is turned away and not split further.
+        calls.set(0);
+        let mut failed = Vec::new();
+        let out = write_checked(&rows, &mut failed, &|_| {
+            calls.set(calls.get() + 1);
+            match calls.get() {
+                1 => Err(InfinoError::Backend(
+                    "append: server returned 400: failing".into(),
+                )),
+                2 => Ok(()),
+                _ => Err(rate_limit()),
+            }
+        });
+        assert!(matches!(&out, Err(e) if rate_limited(e)), "{out:?}");
+        assert_eq!(calls.get(), 3, "{failed:?}");
+        assert_rate_limited(&failed, 4..8);
+    }
+
+    /// A replace, or a rewrite, the hosted service turns away for the
+    /// account's request rate stops at that call, with no count of rows,
+    /// and reports every document, those of the runs not tried included,
+    /// under 429.
+    #[test]
+    fn a_rate_limited_replace_or_rewrite_reports_429_for_every_document() {
+        let rows = fake_rows();
+        let all = 0..FAKE_ROWS as u64;
+        let budget = FAKE_IDS_PER_RUN * id_cost(&fake_id(0));
+        let (table, calls) = fake_hosted(Answer::Status(STATUS_TOO_MANY_REQUESTS), usize::MAX);
+        let mut failed = Vec::new();
+        let out = replace_rows_checked(&table, &Gate::default(), &rows, &mut failed, budget);
+        assert!(matches!(&out, Err(e) if rate_limited(e)), "{out:?}");
+        assert_eq!(ops(&calls), vec!["update"]);
+        assert_rate_limited(&failed, all.clone());
+
+        let (table, calls) = fake_hosted(Answer::Status(STATUS_TOO_MANY_REQUESTS), usize::MAX);
+        let mut failed = Vec::new();
+        let out = rewrite_rows(&table, &Gate::default(), &rows, &mut failed, budget);
+        assert!(matches!(&out, Err(e) if rate_limited(e)), "{out:?}");
+        assert_eq!(ops(&calls), vec!["delete"]);
+        assert_rate_limited(&failed, all);
+    }
+
+    /// A hosted service that answers its appends in turn with `answers`, a
+    /// status each, and with 429 once they run out; with the appends it took.
+    fn appends_answered(answers: &'static [u16]) -> (*mut Bridge, Arc<AtomicUsize>) {
+        let appends = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&appends);
+        let h = logs_service(move |request| {
+            if !request.contains("/v1/append/") {
+                return None;
+            }
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            match answers.get(n) {
+                Some(&status) => Some((status, b"append error: failing".to_vec())),
+                None => Some((
+                    STATUS_TOO_MANY_REQUESTS,
+                    RATE_LIMIT_BODY.as_bytes().to_vec(),
+                )),
+            }
+        });
+        (h, appends)
+    }
+
+    /// An append the hosted service turns away for the account's request
+    /// rate is answered document by document, not as an error: each document
+    /// not written carries status 429, which the plugin answers its bulk item
+    /// with, and the documents an earlier call wrote are taken. Turned away
+    /// at once, the batch costs one append and no document is taken. When
+    /// the joined batch is refused for its content and its documents go in
+    /// halves, the first half lands and the second is turned away: two taken,
+    /// two 429, four appends in all, and none stored twice by the retry.
+    #[test]
+    fn an_append_the_service_rate_limits_answers_429_for_what_it_did_not_write() {
+        let name = c("logs");
+        let ids = ["a", "b", "c", "d"];
+        let append = |h: *mut Bridge| -> Value {
+            let p = prepare_logs(h, &ids);
+            let out = take(unsafe {
+                infino_append_prepared(h, name.as_ptr(), &p, 1, ptr::null(), 0, ptr::null(), 0)
+            });
+            serde_json::from_str(&out).unwrap()
+        };
+
+        let (h, appends) = appends_answered(&[]);
+        let out = append(h);
+        assert!(out.get("error").is_none(), "{out}");
+        assert_eq!(out["ok"], 0, "{out}");
+        assert_rate_limited(out["failed"].as_array().unwrap(), 0..4);
+        assert_eq!(appends.load(Ordering::SeqCst), 1, "one append request");
+        unsafe { infino_close(h) };
+
+        let (h, appends) = appends_answered(&[STATUS_BAD_REQUEST, STATUS_BAD_REQUEST, 200]);
+        let out = append(h);
+        assert!(out.get("error").is_none(), "{out}");
+        assert_eq!(out["ok"], 2, "{out}");
+        assert_rate_limited(out["failed"].as_array().unwrap(), 2..4);
+        assert_eq!(appends.load(Ordering::SeqCst), 4, "{out}");
+        unsafe { infino_close(h) };
+    }
+
+    /// A delete the hosted service turns away for the account's request rate,
+    /// or does not answer, returns its own code, so the plugin answers 429 or
+    /// 503 rather than an internal error; any other failure returns the
+    /// general one. A table that does not exist has nothing to delete.
+    #[test]
+    fn a_delete_the_service_turns_away_or_does_not_answer_says_which() {
+        let name = c("logs");
+        let ids = [c("a")];
+        let ids: Vec<*const c_char> = ids.iter().map(|id| id.as_ptr()).collect();
+        let h = open_storage();
+        let missing = c("no_such_table");
+        assert_eq!(
+            unsafe { infino_delete_osids(h, missing.as_ptr(), ids.as_ptr(), 1) },
+            0
+        );
+        unsafe { infino_close(h) };
+        let cases: [(Option<u16>, c_int); 3] = [
+            (Some(STATUS_TOO_MANY_REQUESTS), DELETE_RATE_LIMITED),
+            (None, DELETE_UNAVAILABLE),
+            (Some(STATUS_SERVER_ERROR), DELETE_FAILED),
+        ];
+        for (status, code) in cases {
+            let h = logs_service(move |request| {
+                request
+                    .contains("/v1/delete/")
+                    .then_some(status)
+                    .flatten()
+                    .map(|s| (s, b"failing".to_vec()))
+            });
+            let rc = unsafe { infino_delete_osids(h, name.as_ptr(), ids.as_ptr(), 1) };
+            assert_eq!(rc, code, "{status:?}");
+            unsafe { infino_close(h) };
+        }
     }
 
     /// A read by id the hosted service does not answer is a 503 the caller

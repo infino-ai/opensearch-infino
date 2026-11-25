@@ -96,13 +96,12 @@ import java.util.function.Predicate;
  * in the table. A commit that fails keeps its batch for the next one and
  * fails what asked for it: the write's sync, or the flush, so the translog
  * keeps the writes the table lacks. A hosted service that could not be
- * reached or did not answer fails neither: the batch is kept for the next
- * commit, as a write the table did not take is, so the write is
- * acknowledged and the table's hold on the shard's history stays below it
- * (see {@link #commitBeforeSync} and {@link #holdHistoryThrough}). A batch
- * of deletes alone still fails the sync then, since the bridge answers a
- * delete with a code and not the reason; a delete retried does no harm.
- * Writes wait rather than pile up past a bound while commits fail.
+ * reached, did not answer, or turned the commit away for the account's
+ * request rate fails neither: the batch is kept for the next commit, as a
+ * write the table did not take is, so the write is acknowledged and the
+ * table's hold on the shard's history stays below it (see
+ * {@link #commitBeforeSync} and {@link #holdHistoryThrough}). Writes wait
+ * rather than pile up past a bound while commits fail.
  *
  * <p>A search sees what the skeleton's reader sees, as on a stock index: a
  * write is visible after the refresh that follows it. A row a write creates
@@ -1752,14 +1751,17 @@ public class InfinoEngine extends InternalEngine {
      * from its source, or null when there are none (see {@link #notTaken}).
      *
      * <p>When the hosted service could not be reached or did not answer the
-     * lookup, the prepare or the append (the bridge marks the error
-     * {@link InfinoNative.InfinoException#unavailable}, whether its status is
-     * 502, 503 or 504), the whole batch is
-     * returned to retry rather than the failure thrown: the write's sync is
-     * acknowledged and the next commit writes the batch, looking each row up
-     * first since the service may have committed the append and only its
-     * answer was lost, so a retried row replaces the one already there
-     * rather than being added again.
+     * lookup, the delete, the prepare or the append (the bridge marks the
+     * error {@link InfinoNative.InfinoException#unavailable}, whether its
+     * status is 502, 503 or 504), or turned one away for the account's
+     * request rate (429), the whole batch is returned to retry rather than
+     * the failure thrown ({@link InfinoNative.InfinoException#retryStatus}):
+     * the write's sync is acknowledged and the next commit writes the batch,
+     * looking each row up first since the service may have committed the
+     * append and only its answer was lost, so a retried row replaces the one
+     * already there rather than being added again. An append whose
+     * documents the service turned away for the rate reports them one by one
+     * instead, as not taken ({@link #notTaken}), and they are retried alike.
      */
     static Written write(
         String table,
@@ -1817,7 +1819,7 @@ public class InfinoEngine extends InternalEngine {
             if (!deleted.isEmpty()) {
                 int rc = InfinoNative.deleteOsids(table, deleted.toArray(new String[0]), deleted.size());
                 if (rc != 0) {
-                    throw new IllegalStateException("[infino] delete of " + deleted.size() + " ids from " + table + " returned " + rc);
+                    throw InfinoNative.deleteFailed(table, deleted.size(), rc);
                 }
             }
             if (!ids.isEmpty()) {
@@ -1846,13 +1848,14 @@ public class InfinoEngine extends InternalEngine {
                 retry = notTaken(table, result.failed(), ids, written, withMapped);
             }
         } catch (InfinoNative.InfinoException e) {
-            if (!e.unavailable()) {
+            if (e.retryStatus() == null) {
                 throw e;
             }
             // The hosted service could not be reached or did not answer (a 502, 503
-            // or 504, or no answer at all: the bridge marks each alike). The whole
-            // batch is kept for the next commit, which looks each row up, since the
-            // service may have committed the append and only its answer was lost.
+            // or 504, or no answer at all: the bridge marks each alike), or turned a
+            // call away for the account's request rate (429). The whole batch is kept
+            // for the next commit, which looks each row up, since the service may
+            // have committed the append and only its answer was lost.
             // The write's sync is not failed for it (see commitBeforeSync): a
             // client that retried an auto-id bulk would get its documents twice.
             log.warn("[infino] the hosted service did not take a commit of {} writes and {} deletes to {}; the next commit tries again: {}", ids.size(), deleted.size(), table, e.getMessage());
@@ -1891,7 +1894,8 @@ public class InfinoEngine extends InternalEngine {
             String id = ids.get(f.index());
             Version v = written.get(f.index());
             String refused = f.permanent() ? f.reason() : null;
-            if (refused == null && checkable) {
+            // A document turned away for the account's request rate carries a status: nothing to check.
+            if (refused == null && checkable && f.status() == null) {
                 try {
                     refused = InfinoNative.checkDoc(table, v.forTable(), v.ignored());
                 } catch (InfinoNative.InfinoException e) {

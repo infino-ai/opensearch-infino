@@ -353,6 +353,48 @@ public class InfinoEngineTests extends OpenSearchTestCase {
     }
 
     /**
+     * In default mode a commit the hosted service turned away for the
+     * account's request rate is not a failure either: turned away whole (a
+     * lookup or a prepare answered 429), the batch comes back to retry; with
+     * its documents turned away one by one, those come back, unchecked,
+     * since the service refused nothing they carry. The next commit takes
+     * them, once.
+     */
+    public void testADefaultModeCommitTheServiceRateLimitsIsRetried() {
+        String whole = "{\"error\":\"backend: append: server returned 429: rate limit exceeded\",\"status\":429}";
+        String each = "{\"ok\":0,\"failed\":["
+            + "{\"b\":0,\"i\":0,\"reason\":\"backend: append: server returned 429: rate limit exceeded\",\"permanent\":false,\"status\":429},"
+            + "{\"b\":0,\"i\":1,\"reason\":\"backend: append: server returned 429: rate limit exceeded\",\"permanent\":false,\"status\":429}]}";
+        for (String first : new String[] { whole, each }) {
+            List<String> ids = List.of("a", "b");
+            AtomicInteger appends = new AtomicInteger();
+            InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+                case "infino_open_with", "infino_prepare_batch_meta" -> new Memory(1);
+                case "infino_sql_latest" -> string("[]");
+                case "infino_append_prepared" -> string(appends.incrementAndGet() == 1 ? first : "{\"ok\":2,\"failed\":[]}");
+                case "infino_check_doc" -> throw new AssertionError("a document turned away for the rate was checked");
+                default -> null; // the latest hold and its release, and the frees
+            }));
+            try {
+                InfinoEngine.Batch batch = new InfinoEngine.Batch();
+                for (int i = 0; i < ids.size(); i++) {
+                    batch.add(ids.get(i), InfinoEngine.Base.ABSENT, new InfinoEngine.Version(i, true, "{\"n\":" + i + "}", null, -1, null));
+                }
+
+                InfinoEngine.Written written = InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null);
+                assertEquals(first, Set.copyOf(ids), written.retry().entries.keySet());
+
+                InfinoEngine.Batch open = new InfinoEngine.Batch();
+                open.putBack(written.retry());
+                assertTrue(first, InfinoEngine.write("t", 1, open, held -> {}, () -> {}, (id, v) -> null).retry().isEmpty());
+                assertEquals(first, 2, appends.get());
+            } finally {
+                InfinoNative.useLib(null);
+            }
+        }
+    }
+
+    /**
      * A commit that fails for any other reason than an unanswered hosted
      * service still fails, a 503 the bridge did not mark {@code unavailable}
      * included.
