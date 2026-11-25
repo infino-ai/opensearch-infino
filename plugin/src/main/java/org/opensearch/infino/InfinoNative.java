@@ -908,10 +908,17 @@ public final class InfinoNative {
         if (!explicit.isEmpty()) {
             return explicit;
         }
-        return tableFor(indexName);
+        String table = tableFor(indexName);
+        // A shard's table adds to this name, so only an index served from one table can land on the registry's.
+        return InfinoTables.oneTable(indexSettings) ? unreserved(table) : table;
     }
 
-    /** The table an index of this name is served from when none is named explicitly. */
+    /**
+     * The name an index of this name takes its tables' names from when none
+     * is named explicitly: the stem of its shards' tables (see
+     * {@link InfinoTables#tablesOf}), and the name of its one table unless
+     * that is reserved ({@link #unreserved}).
+     */
     public static String tableFor(String indexName) {
         // An index name may carry characters a table name may not (the security
         // plugin's and Dashboards' own indices start with a dot); each becomes '_'.
@@ -919,6 +926,20 @@ public final class InfinoNative {
         return TABLE_PREFIX + TABLE_NAME_OTHER.matcher(indexName).replaceAll("_");
     }
 
+    /**
+     * {@code table}, unless it is the registry's ({@link InfinoRegistry#TABLE}),
+     * which the index named {@code index} would take: that index is served
+     * from the same name with {@code -} after the prefix instead. OpenSearch
+     * refuses an index name that starts with {@code -}, and every other
+     * character a table name may not hold becomes {@code _}, so no other
+     * index name maps to it, while every other index keeps its table.
+     */
+    static String unreserved(String table) {
+        return InfinoRegistry.TABLE.equals(table) ? TABLE_PREFIX + RESERVED_ESCAPE + table.substring(TABLE_PREFIX.length()) : table;
+    }
+
+    /** What the table of an index whose name maps to a reserved table carries after the prefix: a character no index name starts with. */
+    private static final String RESERVED_ESCAPE = "-";
     /** What the engine does not take in a table name: anything outside letters, digits, '_' and '-'. */
     private static final Pattern TABLE_NAME_OTHER = Pattern.compile("[^A-Za-z0-9_-]");
     /** Every table behind an index starts with this, so the registry and the tables of other users of a database stay apart. */

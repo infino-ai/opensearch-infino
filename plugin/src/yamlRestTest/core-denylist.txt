@@ -84,9 +84,6 @@ search.aggregation/230_composite/Composite aggregation and array size  # [bug] t
 search/110_field_collapsing/field collapsing with search_after - _score and _doc sorts  # [bug:default] the error message differs from stock (https://github.com/infino-ai/opensearch-infino/issues/211)
 search/30_limits/Regexp length limit  # [bug] the error message differs from stock (https://github.com/infino-ai/opensearch-infino/issues/211)
 
-# --- An index named "index" never starts
-search/260_sort_geopoint/*  # [bug] an index named index is refused at create: its table would be the registry's (https://github.com/infino-ai/opensearch-infino/issues/171)
-
 # --- Gaps: tests that need a feature Infino does not have yet. Remove the entry when the feature lands.
 # Derived from the stock tests' own requests, checked against what the query and aggregation translators serve;
 # the inventory is in the parent issue (https://github.com/infino-ai/opensearch-infino/issues/51).
@@ -215,6 +212,7 @@ search/210_rescore_explain/Score should match explanation in rescore  # [gap] no
 search/230_interval_query/*  # [gap] not served: query intervals
 search/250_distance_feature/*  # [gap] not served: query distance_feature
 search/260_sort_double/*  # [gap] not served: sort mode median/avg/sum
+search/260_sort_geopoint/*  # [gap] not served: sort _geo_distance
 search/260_sort_long/*  # [gap] not served: sort mode median/avg/sum
 search/260_sort_unsigned_long/*  # [gap] not served: sort mode median/avg/sum
 search/270_wildcard_fieldtype_queries/term query matches lowercase-normalized value  # [gap] query on a normalized multi-field, which has no column
