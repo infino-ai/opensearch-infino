@@ -1178,13 +1178,6 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /**
-     * Wait until every write of {@code id} that {@code table}'s shard has
-     * applied on this node is recorded for the table. A write holds the id's
-     * lock from its apply to its record, so once the lock is free, a read of
-     * the document sees every write that a get of the shard made before this
-     * call found. A node that holds no copy of the shard has nothing to wait for.
-     */
-    /**
      * The version, sequence number and primary term of a document's latest
      * write, as its shard's skeleton holds them and a stock get reports them.
      */
@@ -1210,6 +1203,13 @@ public class InfinoEngine extends InternalEngine {
         }
     }
 
+    /**
+     * Wait until every write of {@code id} that {@code table}'s shard has
+     * applied on this node is recorded for the table. A write holds the id's
+     * lock from its apply to its record, so once the lock is free, a read of
+     * the document sees every write that a get of the shard made before this
+     * call found. A node that holds no copy of the shard has nothing to wait for.
+     */
     static void awaitRecorded(String table, String id) {
         InfinoEngine engine = BY_TABLE.get(table);
         if (engine == null) {
