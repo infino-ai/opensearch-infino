@@ -1673,7 +1673,7 @@ final class InfinoQueryTranslator {
             boolean was = lenient;
             lenient = lenient(LENIENT_SET.matcher(mm.toString()).find() ? mm.lenient() : null, named, false);
             try {
-                return textOnFields(searchedFields(named), String.valueOf(mm.value()), mm.operator(), positive, asPhrase, true);
+                return textOnFields(searchedFields(named, mm.fields().isEmpty()), String.valueOf(mm.value()), mm.operator(), positive, asPhrase, true);
             } finally {
                 lenient = was;
             }
@@ -2897,15 +2897,18 @@ final class InfinoQueryTranslator {
         boolean was = lenient;
         lenient = lenient(asked, named, !simple && IndexSettings.QUERY_STRING_LENIENT_SETTING.get(indexSettings()));
         try {
-            return queryString(q, named, op, minimumShouldMatch, simple, positive);
+            return queryString(q, named, defaultField == null && fields.isEmpty(), op, minimumShouldMatch, simple, positive);
         } finally {
             lenient = was;
         }
     }
 
-    /** {@link #queryString(String, String, List, Operator, String, boolean, Boolean, boolean)} over the fields {@code named}, its leniency set. */
-    private String queryString(String q, List<String> named, Operator op, String minimumShouldMatch, boolean simple, boolean positive) {
-        List<String> fields = searchedFields(named);
+    /**
+     * {@link #queryString(String, String, List, Operator, String, boolean, Boolean, boolean)} over the fields {@code named}, its leniency set;
+     * {@code byDefault} when they are the index's default fields, the query naming none.
+     */
+    private String queryString(String q, List<String> named, boolean byDefault, Operator op, String minimumShouldMatch, boolean simple, boolean positive) {
+        List<String> fields = searchedFields(named, byDefault);
         // Stock's parser splits on operators, not on white space: a run of
         // words with no operator between them is one clause, its words read
         // together, which on a keyword, number or date field is one value
@@ -3118,10 +3121,15 @@ final class InfinoQueryTranslator {
      * out the metadata fields too. A field and an alias of it are one field.
      * A keyword multi-field ({@code message.keyword}) is a field of its own,
      * its whole value. A multi-field the table keeps no column of (a text
-     * one with its own analyzer, or a normalized keyword) that a pattern
-     * matches is refused, as a query naming it is: stock would search it.
+     * one with its own analyzer, or a normalized keyword) is left out under
+     * {@code *} and under the index's default fields ({@code byDefault}),
+     * which reach every field, so the search reads the fields it can rather
+     * than failing for one the request never named; stock would search it
+     * too, so such a field's own matches (a stemmed word) are missed. A
+     * pattern the request names that matches one is refused, as a query
+     * naming the field is.
      */
-    private List<String> searchedFields(List<String> named) {
+    private List<String> searchedFields(List<String> named, boolean byDefault) {
         List<String> out = new ArrayList<>();
         List<Column> seen = new ArrayList<>();
         for (String f : named) {
@@ -3134,7 +3142,7 @@ final class InfinoQueryTranslator {
             }
             boolean every = ALL_FIELDS.equals(f);
             for (String sub : InfinoNative.multiFields(table)) {
-                if (!cols.containsKey(sub) && org.opensearch.common.regex.Regex.simpleMatch(f, sub)) {
+                if (!every && !byDefault && !cols.containsKey(sub) && org.opensearch.common.regex.Regex.simpleMatch(f, sub)) {
                     refuseColumnless(sub);
                 }
             }

@@ -21,11 +21,14 @@ import java.util.Map;
  * tables. Over one text field and a keyword field it ranks as stock ranks
  * it: each hit scores the better of its text BM25 and the keyword match's
  * score (1), a {@code dis_max} of the two fields, whether a keyword value
- * matches or not.
+ * matches or not. A multi-field the table keeps no column of is left out
+ * of every field rather than failing the search.
  */
 public class InfinoDefaultFieldSearchTests extends OpenSearchTestCase {
 
     private static final String TABLE = "value_ranking";
+    /** A table whose mapping has multi-fields it keeps no column of: a text one with its own analyzer, a normalized keyword. */
+    private static final String MULTI = "columnless_multi_fields";
     /** What a keyword match scores in stock: a term query there scores its boost. */
     private static final double KEYWORD_MATCH = 1.0;
     private static final String[] MESSAGES = {
@@ -55,6 +58,7 @@ public class InfinoDefaultFieldSearchTests extends OpenSearchTestCase {
     @Override
     public void tearDown() throws Exception {
         InfinoNative.dropTable(TABLE);
+        InfinoNative.dropTable(MULTI);
         super.tearDown();
     }
 
@@ -146,4 +150,48 @@ public class InfinoDefaultFieldSearchTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A multi-field the table keeps no column of is left out of {@code *}
+     * and of the index's default fields, so a search naming no field reads
+     * the fields it can; a pattern or a name the request gives that reaches
+     * one is refused, as before.
+     */
+    public void testEveryFieldLeavesOutAColumnlessMultiField() {
+        InfinoNative.dropTable(MULTI);
+        InfinoNative.ensureTable(
+            MULTI,
+            "{\"properties\":{\"title\":{\"type\":\"text\",\"fields\":{"
+                + "\"english\":{\"type\":\"text\",\"analyzer\":\"english\"},"
+                + "\"lower\":{\"type\":\"keyword\",\"normalizer\":\"lowercase\"}}},"
+                + "\"level\":{\"type\":\"keyword\"}}}"
+        );
+        assertEquals(1, InfinoNative.indexBatch(MULTI, new String[] { "a" }, new String[] { "{\"title\":\"disk full\",\"level\":\"info\"}" }, 1).ok());
+        Map<String, InfinoNative.Column> cols = InfinoNative.columns(MULTI);
+        assertFalse(cols.containsKey("title.english"));
+        assertFalse(cols.containsKey("title.lower"));
+        long now = System.currentTimeMillis();
+        for (QueryBuilder qb : List.of(
+            QueryBuilders.multiMatchQuery("disk"),
+            QueryBuilders.multiMatchQuery("disk", "*"),
+            QueryBuilders.queryStringQuery("disk"),
+            QueryBuilders.queryStringQuery("disk").defaultField("*"),
+            QueryBuilders.simpleQueryStringQuery("disk")
+        )) {
+            String where = InfinoQueryTranslator.translate(qb, cols, MULTI, now).where();
+            assertFalse(where, where.contains("title.english") || where.contains("title.lower"));
+            List<Map<String, Object>> hits = InfinoNative.sqlRows(
+                InfinoSearch.hitStatement(InfinoSearch.plan(MULTI, new SearchSourceBuilder().query(qb), now), 10, false)
+            );
+            assertEquals(qb.toString(), List.of("a"), hits.stream().map(r -> r.get(InfinoQueryTranslator.OSID).toString()).toList());
+        }
+        for (QueryBuilder qb : List.of(
+            QueryBuilders.multiMatchQuery("disk", "title.*"),
+            QueryBuilders.queryStringQuery("disk").field("title.*"),
+            QueryBuilders.multiMatchQuery("disk", "title.english"),
+            QueryBuilders.queryStringQuery("disk").field("title.lower")
+        )) {
+            IllegalArgumentException refused = expectThrows(IllegalArgumentException.class, () -> InfinoQueryTranslator.translate(qb, cols, MULTI, now));
+            assertTrue(refused.getMessage(), refused.getMessage().contains("is not served"));
+        }
+    }
 }

@@ -119,7 +119,7 @@ setup:
 teardown:
   - do:
       indices.delete:
-        index: dfs_luc,dfs_prx,dfs_def,dfr_luc,dfr_prx,dfr_def
+        index: dfs_luc,dfs_prx,dfs_def,dfr_luc,dfr_prx,dfr_def,dfm_luc,dfm_prx,dfm_def
         ignore_unavailable: true
 
 ---
@@ -1329,3 +1329,142 @@ teardown:
   - gt: { hits.hits.2._score: 0.2902 }
   - lt: { hits.hits.2._score: 0.2922 }
 
+---
+"A multi-field the table keeps no column of is left out of every field, and refused where named":
+  # title.english (its own analyzer) and title.lower (a normalizer) have no
+  # column of their own. A query naming no field reads the fields the table
+  # can rather than failing; here their matches are title's own, so the hits
+  # and scores are the twin's. A pattern or a name the request gives that
+  # reaches one is refused, as a query on the field is.
+  - do:
+      indices.create:
+        index: dfm_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { title: { type: text, fields: { english: { type: text, analyzer: english }, lower: { type: keyword, normalizer: lowercase } } }, level: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dfm_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { title: { type: text, fields: { english: { type: text, analyzer: english }, lower: { type: keyword, normalizer: lowercase } } }, level: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dfm_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { title: { type: text, fields: { english: { type: text, analyzer: english }, lower: { type: keyword, normalizer: lowercase } } }, level: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: dfm_luc
+        body:
+          - index: { _id: "1" }
+          - { "title": "disk full", "level": "error" }
+          - index: { _id: "2" }
+          - { "title": "user login", "level": "disk" }
+          - index: { _id: "3" }
+          - { "title": "cache miss", "level": "info" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfm_prx
+        body:
+          - index: { _id: "1" }
+          - { "title": "disk full", "level": "error" }
+          - index: { _id: "2" }
+          - { "title": "user login", "level": "disk" }
+          - index: { _id: "3" }
+          - { "title": "cache miss", "level": "info" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfm_def
+        body:
+          - index: { _id: "1" }
+          - { "title": "disk full", "level": "error" }
+          - index: { _id: "2" }
+          - { "title": "user login", "level": "disk" }
+          - index: { _id: "3" }
+          - { "title": "cache miss", "level": "info" }
+  - do:
+      search:
+        index: dfm_luc
+        body: { query: { multi_match: { query: disk } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4448 }
+  - lt: { hits.hits.1._score: 0.4468 }
+  - do:
+      search:
+        index: dfm_prx
+        body: { query: { multi_match: { query: disk } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4448 }
+  - lt: { hits.hits.1._score: 0.4468 }
+  - do:
+      search:
+        index: dfm_def
+        body: { query: { multi_match: { query: disk } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4448 }
+  - lt: { hits.hits.1._score: 0.4468 }
+  - do:
+      search:
+        index: dfm_luc
+        body: { query: { query_string: { query: disk } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4448 }
+  - lt: { hits.hits.1._score: 0.4468 }
+  - do:
+      search:
+        index: dfm_prx
+        body: { query: { query_string: { query: disk } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4448 }
+  - lt: { hits.hits.1._score: 0.4468 }
+  - do:
+      search:
+        index: dfm_def
+        body: { query: { query_string: { query: disk } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4448 }
+  - lt: { hits.hits.1._score: 0.4468 }
+  - do:
+      catch: bad_request
+      search: { index: dfm_prx, body: { query: { multi_match: { query: disk, fields: [ "title.*" ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfm_prx, body: { query: { query_string: { query: disk, fields: [ title.english ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfm_def, body: { query: { multi_match: { query: disk, fields: [ "title.*" ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfm_def, body: { query: { query_string: { query: disk, fields: [ title.english ] } } } }
+  - do:
+      search: { index: dfm_luc, body: { query: { multi_match: { query: disk, fields: [ "title.*" ] } } } }
+  - match: { hits.total.value: 1 }
