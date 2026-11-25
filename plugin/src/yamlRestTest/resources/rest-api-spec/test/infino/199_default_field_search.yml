@@ -648,6 +648,109 @@ teardown:
   - match: { hits.hits.2._id: "1" }
 
 ---
+"A field pattern among the fields searches every field it matches, beside named fields too":
+  # me* is the text field message (and its keyword sub-field), se* the keyword
+  # field service, matched by its whole value. Before, a pattern matched
+  # nothing: the pattern list found no document and the mixed list only the
+  # named field's.
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout, fields: [ "me*", "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout, fields: [ "me*", "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout, fields: [ "me*", "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout, fields: [ message, "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout, fields: [ message, "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout, fields: [ message, "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: timeout, fields: [ "me*", "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: timeout, fields: [ "me*", "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: timeout, fields: [ "me*", "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: timeout, fields: [ message, "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: timeout, fields: [ message, "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: timeout, fields: [ message, "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+
+---
 "index.query.default_field names the fields a query naming none searches":
   - do:
       indices.put_settings:
