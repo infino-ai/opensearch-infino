@@ -266,6 +266,21 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
     );
 
     /**
+     * How long one request to the hosted service may take before it fails as
+     * a service that did not answer (a 503). Zero, the default, leaves the
+     * engine's own bound of several minutes. The time bounds every request, a
+     * write as much as a read, and a write that runs out of it may still land
+     * on the service: a short one suits a node whose searches must not wait
+     * and whose writes are few or none, such as one serving attached indices.
+     */
+    public static final Setting<TimeValue> PLATFORM_REQUEST_TIMEOUT = Setting.timeSetting(
+        "infino.platform.request_timeout",
+        TimeValue.ZERO,
+        TimeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * The most a SQL result may hold, as the JSON the route answers with (see
      * {@link InfinoSql}). The engine's memory budget bounds a statement while
      * it runs, not the answer handed to the node: a statement whose result
@@ -310,6 +325,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
         InfinoRequestCache.configure(settings);
         InfinoSql.configure(settings);
         InfinoNative.readWindow(PLATFORM_READ_WINDOW.get(settings));
+        InfinoNative.requestTimeout(PLATFORM_REQUEST_TIMEOUT.get(settings));
         String url = PLATFORM_URL.get(settings);
         if (url.isEmpty()) {
             return;
@@ -721,6 +737,7 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             PLATFORM_DEFAULT_URL,
             CACHE_DIR,
             PLATFORM_READ_WINDOW,
+            PLATFORM_REQUEST_TIMEOUT,
             SQL_MAX_RESULT_SIZE
         );
     }

@@ -139,6 +139,8 @@ public final class InfinoNative {
     private static volatile Target wanted = Target.node();
     /** How long a read on the hosted service may trail a write ({@link InfinoPlugin#PLATFORM_READ_WINDOW}), in nanoseconds. */
     private static volatile long readWindowNanos = InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY).nanos();
+    /** How long one request to the hosted service may take ({@link InfinoPlugin#PLATFORM_REQUEST_TIMEOUT}), in milliseconds; 0 for the engine's own bound. */
+    private static volatile long requestTimeoutMillis;
     /** When each table was last written on the hosted service ({@link System#nanoTime}), until a wait sees the window pass. */
     private static final Map<String, Long> WRITTEN = new ConcurrentHashMap<>();
     private static final Map<String, Map<String, Column>> COLUMNS = new ConcurrentHashMap<>();
@@ -525,6 +527,9 @@ public final class InfinoNative {
                         log.warn("[infino] connections read under a staleness window of {} ms, for tests", READ_STALENESS_MS);
                         loaded.infino_set_read_staleness_ms(READ_STALENESS_MS);
                     }
+                    if (requestTimeoutMillis > 0) {
+                        loaded.infino_set_request_timeout_ms(requestTimeoutMillis);
+                    }
                     lib = loaded;
                 }
             }
@@ -811,6 +816,19 @@ public final class InfinoNative {
     /** Take {@code window} as how long a hosted read may trail a write, at boot. */
     static void readWindow(TimeValue window) {
         readWindowNanos = window.nanos();
+    }
+
+    /**
+     * Take {@code timeout} as how long one request to the hosted service may
+     * take ({@link InfinoPlugin#PLATFORM_REQUEST_TIMEOUT}), at boot: the
+     * connections opened after it hold to it. Zero leaves the engine's own.
+     */
+    static void requestTimeout(TimeValue timeout) {
+        requestTimeoutMillis = timeout.millis();
+        InfinoLib loaded = lib;
+        if (loaded != null && requestTimeoutMillis > 0) {
+            loaded.infino_set_request_timeout_ms(requestTimeoutMillis);
+        }
     }
 
     /**
