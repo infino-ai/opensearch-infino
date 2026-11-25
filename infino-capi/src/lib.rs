@@ -5185,7 +5185,7 @@ pub unsafe extern "C" fn infino_sql(h: *mut Bridge, sql: *const c_char) -> *mut 
         };
         match conn.query_viewed(sql) {
             Ok(b) => out_string(batches_to_json(&b)),
-            Err(e) => err_json(&e.to_string()),
+            Err(e) => engine_err_json(&e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -5193,6 +5193,9 @@ pub unsafe extern "C" fn infino_sql(h: *mut Bridge, sql: *const c_char) -> *mut 
 
 /// Run `sql` as [`infino_sql`] does, reading each table's latest commit
 /// ([`Bridge::latest`]): for a read whose answer decides what a write does.
+/// Both answer an error as [`engine_error_value`] does, so a read the
+/// hosted service did not answer is marked `unavailable`: the lookup ahead
+/// of a commit is one, and a commit keeps its batch on that mark.
 #[no_mangle]
 pub unsafe extern "C" fn infino_sql_latest(h: *mut Bridge, sql: *const c_char) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
@@ -5201,7 +5204,7 @@ pub unsafe extern "C" fn infino_sql_latest(h: *mut Bridge, sql: *const c_char) -
         };
         match bridge.query_latest(sql) {
             Ok(b) => out_string(batches_to_json(&b)),
-            Err(e) => err_json(&e.to_string()),
+            Err(e) => engine_err_json(&e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -11117,6 +11120,24 @@ mod tests {
             let message = out["error"].as_str().unwrap();
             assert!(message.contains(" a: "), "{message}");
             assert!(message.contains("did not answer in time"), "{message}");
+        }
+        unsafe { infino_close(h) };
+    }
+
+    /// A SQL read the hosted service does not answer, the lookup ahead of a
+    /// commit among them, is marked `unavailable` with status 503, as a
+    /// write is: the commit keeps its batch on that mark rather than fail.
+    #[test]
+    fn a_sql_read_the_service_does_not_answer_is_marked_unavailable() {
+        let (h, _) = dropping_service();
+        let sql = c("SELECT osid FROM logs WHERE osid IN ('a')");
+        for out in [
+            take(unsafe { infino_sql(h, sql.as_ptr()) }),
+            take(unsafe { infino_sql_latest(h, sql.as_ptr()) }),
+        ] {
+            let out: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(out["unavailable"], true, "{out}");
+            assert_eq!(out["status"], 503, "{out}");
         }
         unsafe { infino_close(h) };
     }

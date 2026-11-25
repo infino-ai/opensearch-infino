@@ -602,6 +602,35 @@ public class InfinoEngineTests extends OpenSearchTestCase {
     }
 
     /**
+     * The lookup ahead of a commit (a replay's writes, whose rows the table
+     * may hold already) is the first call a commit makes. When the hosted
+     * service does not answer it, the bridge marks the read
+     * {@code unavailable} as it marks a write, so the commit keeps its batch
+     * and says why rather than throwing: a recovery that throws there fails
+     * the shard. Nothing is prepared or appended.
+     */
+    public void testALookupTheServiceDidNotAnswerKeepsTheBatch() {
+        String refused = "{\"error\":\"the hosted service could not be reached or did not answer in time; try again later: "
+            + "query_sql: transport error: Connection Failed: Connect error: Connection refused (os error 111)\",\"unavailable\":true,\"status\":503}";
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with" -> new Memory(1);
+            case "infino_sql_latest" -> string(refused);
+            case "infino_prepare_batch_meta", "infino_append_prepared" -> throw new AssertionError("a write after a lookup that was not answered");
+            default -> null;
+        }));
+        try {
+            InfinoEngine.Batch batch = new InfinoEngine.Batch();
+            batch.add("a", InfinoEngine.Base.UNKNOWN, write(0, "{}"));
+            batch.add("b", InfinoEngine.Base.UNKNOWN, write(1, "{}"));
+            InfinoEngine.Written w = InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null);
+            assertEquals(Set.of("a", "b"), w.retry().entries.keySet());
+            assertTrue(w.unavailable(), w.unavailable().contains("Connection refused"));
+        } finally {
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /**
      * While commits stall, a full batch commits after each wait; past the
      * bound it commits at once until the replay is held there.
      */
