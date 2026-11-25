@@ -185,7 +185,8 @@ final class InfinoSearchChecks {
     /**
      * A {@code docvalue_fields} entry, by name or pattern, naming a
      * {@code token_count} field without doc values ({@link InfinoTokenCounts}):
-     * stock has no field data to read its counts from.
+     * stock has no field data to read its counts from. Stock keeps a token count as an
+     * {@code integer} field, so its message names that type.
      */
     static void checkTokenCountDocValues(SearchSourceBuilder source, Map<String, Object> properties) {
         if (source.docValueFields() == null || source.docValueFields().isEmpty()) {
@@ -194,7 +195,7 @@ final class InfinoSearchChecks {
         for (Map.Entry<String, Boolean> e : InfinoTokenCounts.fields(properties).entrySet()) {
             if (!e.getValue() && source.docValueFields().stream().anyMatch(f -> Regex.simpleMatch(f.field, e.getKey()))) {
                 throw new IllegalArgumentException(
-                    "Can't load fielddata on [" + e.getKey() + "] because fielddata is unsupported on fields of type [" + InfinoTokenCounts.TYPE + "]. Use doc values instead."
+                    "Can't load fielddata on [" + e.getKey() + "] because fielddata is unsupported on fields of type [integer]. Use doc values instead."
                 );
             }
         }

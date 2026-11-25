@@ -86,7 +86,7 @@ public class InfinoFetchFieldsTests extends OpenSearchTestCase {
             () -> InfinoSearchChecks.checkTokenCountDocValues(new SearchSourceBuilder().docValueField("count_*"), PROPERTIES)
         );
         assertEquals(
-            "Can't load fielddata on [count_without_dv] because fielddata is unsupported on fields of type [token_count]. Use doc values instead.",
+            "Can't load fielddata on [count_without_dv] because fielddata is unsupported on fields of type [integer]. Use doc values instead.",
             e.getMessage()
         );
         InfinoSearchChecks.checkTokenCountDocValues(new SearchSourceBuilder().docValueField("count"), PROPERTIES);
