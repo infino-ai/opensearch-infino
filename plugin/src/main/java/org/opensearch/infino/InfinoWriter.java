@@ -407,19 +407,26 @@ public final class InfinoWriter {
      * commits, and the listener gets the whole bulk's response then.
      */
     void submit(String table, Waiter waiter) {
-        Pointer prepared = prepareRows(table, waiter);
-        if (prepared != null) {
-            boolean changed;
-            try {
-                changed = withMapperValues(waiter, prepared);
-            } catch (RuntimeException e) {
-                InfinoNative.freePrepared(prepared);
-                throw e;
+        Pointer prepared;
+        try {
+            prepared = prepareRows(table, waiter);
+            if (prepared != null) {
+                boolean changed;
+                try {
+                    changed = withMapperValues(waiter, prepared);
+                } catch (RuntimeException e) {
+                    InfinoNative.freePrepared(prepared);
+                    throw e;
+                }
+                if (changed) {
+                    InfinoNative.freePrepared(prepared);
+                    prepared = prepareRows(table, waiter);
+                }
             }
-            if (changed) {
-                InfinoNative.freePrepared(prepared);
-                prepared = prepareRows(table, waiter);
-            }
+        } catch (InfinoNative.InfinoException e) {
+            // With its status: a 503 when the hosted service could not be reached or did not answer in time.
+            waiter.listener().onFailure(e);
+            return;
         }
         List<String> ids = new ArrayList<>();
         long bytes = 0;
@@ -436,10 +443,6 @@ public final class InfinoWriter {
             } else if (o.write() != null && o.write().update() != null) {
                 updates++;
             }
-        }
-        if (!ids.isEmpty() && prepared == null) {
-            waiter.listener().onFailure(new IllegalStateException("[infino] the bridge could not prepare the batch for " + table));
-            return;
         }
         Staged staged = new Staged(waiter, prepared, ids, ids.size() + updates, bytes, named);
 
@@ -1074,9 +1077,6 @@ public final class InfinoWriter {
             return new Appended(refused, false);
         }
         Pointer prepared = InfinoNative.prepare(table, ids, sources, ignored);
-        if (prepared == null) {
-            throw new IllegalStateException("[infino] the bridge could not prepare the folded batch for " + table);
-        }
         long[] numbers = seqs.stream().mapToLong(Long::longValue).toArray();
         InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced, numbers);
         for (InfinoNative.PreparedFailure f : result.failed()) {
