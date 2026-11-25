@@ -1459,9 +1459,16 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         cols.put("tags[]", Column.list("tags[]", "str"));
         cols.put("embedding", new Column("embedding", "vec", false, true));
         cols.put("source", new Column("source", "str", false, false));
+        // A metadata field (its name starts with _): * leaves it out, as stock does.
+        cols.put("_note", new Column("_note", "str", false, false));
         assertEquals(
             "(\"level\" = 'disk' OR \"host.name\" = 'disk' OR \"message\" = 'disk' OR text_match(\"message\", 'disk', 'or'))",
             InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk"), cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).where()
+        );
+        // A pattern that names it reaches it.
+        assertEquals(
+            "\"_note\" = 'disk'",
+            InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("disk", "_n*"), cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).where()
         );
     }
 
