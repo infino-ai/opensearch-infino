@@ -29,10 +29,10 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
     private static Map<String, Column> columns() {
         Map<String, Column> cols = new LinkedHashMap<>();
         cols.put("osid", new Column("osid", "str", false, false));
-        cols.put("@timestamp", new Column("@timestamp", "ts", false, false));
+        cols.put("@timestamp", new Column("@timestamp", "ts", false, false).rangeIndexed());
         cols.put("level", new Column("level", "str", false, false));
         cols.put("message", new Column("message", "str", true, false));
-        cols.put("status", new Column("status", "i64", false, false));
+        cols.put("status", new Column("status", "i64", false, false).rangeIndexed());
         cols.put("host.name", new Column("host.name", "str", false, false));
         return cols;
     }
@@ -220,6 +220,97 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         // A collapse keeps the first row of each value through a window, whose rows carry their sources.
         String collapsed = sortedHits(columns().get("level"));
         assertTrue(collapsed, collapsed.startsWith("SELECT osid, source, "));
+    }
+
+    /** {@code t} over {@code sorts} then the row id, as a request's plan orders it. */
+    private static InfinoSearch.Plan sortedPlan(Translation t, java.util.List<InfinoSearch.SortSpec> sorts) {
+        return sortedPlan(columns(), t, sorts, null);
+    }
+
+    /** As {@link #sortedPlan(Translation, java.util.List)}, over {@code cols} and with {@code postWhere} (null for none). */
+    private static InfinoSearch.Plan sortedPlan(Map<String, Column> cols, Translation t, java.util.List<InfinoSearch.SortSpec> sorts, String postWhere) {
+        java.util.List<InfinoSearch.SortSpec> all = new java.util.ArrayList<>(sorts);
+        all.add(InfinoSearch.SortSpec.rowId());
+        return new InfinoSearch.Plan(TABLE, cols, t, all, null, postWhere, null, null, java.util.List.of(), InfinoAccess.NONE, NOW);
+    }
+
+    public void testASortedPageTheRangeIndexAloneAnswersReadsItsSourcesInItsStatement() {
+        org.opensearch.search.sort.SortOrder desc = org.opensearch.search.sort.SortOrder.DESC;
+        InfinoSearch.Keyset whole = InfinoSearch.Keyset.WHOLE;
+        // A range-indexed numeric or date column then the row id, over every
+        // row: the range index picks the page's rows, and the engine reads
+        // the sources of those rows alone.
+        InfinoSearch.Plan plan = sortedPlan(translate(QueryBuilders.matchAllQuery()), statusSort(desc, null));
+        assertTrue(InfinoSearch.sourceInSortedStatement(plan, 10, whole));
+        assertTrue(InfinoSearch.selectsSource(plan, 10, whole, true));
+        String sql = InfinoSearch.hitStatement(plan, 10, false, whole, 10_000, InfinoSearch.selectsSource(plan, 10, whole, true));
+        assertTrue(sql, sql.startsWith("SELECT osid, source, \"status\" AS \"status\", \"_id\" AS \"_id\" FROM \"os_logs_0\" WHERE 1=1 ORDER BY "));
+        // A page whose hits need no source selects none.
+        assertFalse(InfinoSearch.selectsSource(plan, 10, whole, false));
+        String bare = InfinoSearch.hitStatement(plan, 10, false, whole, 10_000, InfinoSearch.selectsSource(plan, 10, whole, false));
+        assertFalse(bare, bare.contains("source"));
+        // One bounded range on the sort column is the range index's too.
+        java.util.List<InfinoSearch.SortSpec> byTime = java.util.List.of(InfinoSearch.SortSpec.of(columns().get("@timestamp"), false));
+        Translation span = translate(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00").lt("2023-01-03T00:00:00"));
+        assertTrue(InfinoSearch.sourceInSortedStatement(sortedPlan(span, byTime), 10, whole));
+        // The same range under a post_filter, or on another column than the sort's, is checked on each row.
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(columns(), span, byTime, "\"status\" = 500"), 10, whole));
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(span, statusSort(desc, null)), 10, whole));
+        // Any other predicate has the engine walk the index checking each row,
+        // and a walk that gives up reads every matching row: a term, plain
+        // words, a phrase, or a range nested in a bool.
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.termQuery("level", "error")), byTime), 10, whole));
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchQuery("message", "error timeout")), byTime), 10, whole));
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchPhraseQuery("message", "error timeout")), byTime), 10, whole));
+        Translation nested = translate(
+            QueryBuilders.boolQuery().filter(QueryBuilders.rangeQuery("@timestamp").gte("2023-01-02T00:00:00").lt("2023-01-03T00:00:00"))
+        );
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(nested, byTime), 10, whole));
+        // A selective filter, whose walk would give up, reads its sources by id.
+        InfinoSearch.Plan rare = sortedPlan(translate(QueryBuilders.termQuery("level", "fatal")), byTime);
+        String rareSql = InfinoSearch.hitStatement(rare, 10, false, whole, 10_000, InfinoSearch.selectsSource(rare, 10, whole, true));
+        assertFalse(rareSql, rareSql.contains("source"));
+        // A keyword column has no range index; a missing value or missing first is not the column's own order.
+        java.util.List<InfinoSearch.SortSpec> byLevel = java.util.List.of(InfinoSearch.SortSpec.of(columns().get("level"), false));
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchAllQuery()), byLevel), 10, whole));
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchAllQuery()), statusSort(desc, "_first")), 10, whole));
+        assertFalse(InfinoSearch.sourceInSortedStatement(sortedPlan(translate(QueryBuilders.matchAllQuery()), statusSort(desc, 0)), 10, whole));
+        // A deep page reads its rows first and the returned ones' sources by id.
+        assertFalse(InfinoSearch.sourceInSortedStatement(plan, InfinoSearch.SORTED_SOURCE_ROWS + 1, whole));
+        int deepFetch = InfinoSearch.SORTED_SOURCE_ROWS + 1;
+        String deep = InfinoSearch.hitStatement(plan, deepFetch, false, whole, 10_000, InfinoSearch.selectsSource(plan, deepFetch, whole, true));
+        assertFalse(deep, deep.contains("source"));
+        // After the sort's value alone, the present part is one more range on the column.
+        InfinoSearch.Plan afterValue = afterPlan(new Object[] { 404 }, null);
+        assertTrue(InfinoSearch.sourceInSortedStatement(afterValue, 10, InfinoSearch.Keyset.PRESENT));
+        assertFalse(InfinoSearch.sourceInSortedStatement(afterValue, 10, InfinoSearch.Keyset.MISSING));
+        // A keyset that also breaks ties by id is a predicate the engine walks, in either part.
+        InfinoSearch.Plan after = afterPlan(new Object[] { 404, "7" }, null);
+        assertFalse(InfinoSearch.sourceInSortedStatement(after, 10, InfinoSearch.Keyset.PRESENT));
+        assertFalse(InfinoSearch.sourceInSortedStatement(after, 10, InfinoSearch.Keyset.MISSING));
+        InfinoSearch.Keyset presentPart = InfinoSearch.Keyset.PRESENT;
+        String present = InfinoSearch.hitStatement(after, 10, false, presentPart, 10_000, InfinoSearch.selectsSource(after, 10, presentPart, true));
+        assertFalse(present, present.contains("source"));
+        assertFalse(InfinoSearch.sourceInSortedStatement(afterPlan(new Object[] { null, "7" }, null), 10, whole));
+        // A collapse's statement reads its sources as before.
+        assertFalse(InfinoSearch.sourceInSortedStatement(afterPlan(null, columns().get("level")), 10, whole));
+    }
+
+    public void testAColumnWithNoRangeIndexReadsItsSourcesById() {
+        // A numeric field mapped "index": false: the table keeps no range index on its column.
+        Map<String, Column> cols = columns();
+        cols.put("bytes", new Column("bytes", "i64", false, false));
+        Translation all = InfinoQueryTranslator.translate(QueryBuilders.matchAllQuery(), cols, TABLE, NOW);
+        java.util.List<InfinoSearch.SortSpec> byBytes = java.util.List.of(InfinoSearch.SortSpec.of(cols.get("bytes"), true));
+        InfinoSearch.Plan plan = sortedPlan(cols, all, byBytes, null);
+        InfinoSearch.Keyset whole = InfinoSearch.Keyset.WHOLE;
+        assertFalse(InfinoSearch.sourceInSortedStatement(plan, 10, whole));
+        String sql = InfinoSearch.hitStatement(plan, 10, false, whole, 10_000, InfinoSearch.selectsSource(plan, 10, whole, true));
+        assertFalse(sql, sql.contains("source"));
+        // The same column with its range index does.
+        cols.put("bytes", cols.get("bytes").rangeIndexed());
+        byBytes = java.util.List.of(InfinoSearch.SortSpec.of(cols.get("bytes"), true));
+        assertTrue(InfinoSearch.sourceInSortedStatement(sortedPlan(cols, all, byBytes, null), 10, whole));
     }
 
     /** The sorts of a request sorted on {@code status} in {@code order}, with {@code missing} (null for none). */
@@ -2566,5 +2657,146 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
         assertFalse(InfinoSearch.ranksAcross(sorted));
         assertNull(t.ascending().scoring().across());
+    }
+
+    private static Map<String, Column> typedColumns() {
+        Map<String, Column> cols = columns();
+        cols.put("f", new Column("f", "f64", false, false).typed(new InfinoNative.FieldType("float", 0)));
+        cols.put("h", new Column("h", "f64", false, false).typed(new InfinoNative.FieldType("half_float", 0)));
+        cols.put("s", new Column("s", "f64", false, false).typed(new InfinoNative.FieldType("scaled_float", 100)));
+        cols.put("d", new Column("d", "f64", false, false));
+        cols.put("ip", new Column("ip", "str", false, false).typed(new InfinoNative.FieldType("ip", 0)));
+        return cols;
+    }
+
+    private static String typedWhere(org.opensearch.index.query.QueryBuilder qb) {
+        return InfinoQueryTranslator.translate(qb, typedColumns(), TABLE, NOW).where();
+    }
+
+    /** A half float's value, rounded to the nearest as the field keeps it. */
+    private static double half(float v) {
+        return (double) org.apache.lucene.sandbox.document.HalfFloatPoint.sortableShortToHalfFloat(
+            org.apache.lucene.sandbox.document.HalfFloatPoint.halfFloatToSortableShort(v)
+        );
+    }
+
+    /**
+     * A float field keeps 0.3 as the 32-bit float nearest it, so a term compares that float and
+     * a range's bounds are the first floats within it, as stock reads them; a double field's
+     * number is its own.
+     */
+    public void testFloatLiteralsAreReadAtTheFieldsPrecision() {
+        assertEquals("\"f\" = " + (double) 0.3f, typedWhere(QueryBuilders.termQuery("f", 0.3)));
+        assertEquals("\"f\" = " + (double) 0.3f, typedWhere(QueryBuilders.termQuery("f", "0.3")));
+        assertEquals("\"f\" IN (" + (double) 0.3f + ", 1.5)", typedWhere(QueryBuilders.termsQuery("f", List.of(0.3, 1.5))));
+        assertEquals("(\"f\" >= " + (double) Math.nextUp(0.3f) + ")", typedWhere(QueryBuilders.rangeQuery("f").gt(0.3)));
+        assertEquals("(\"f\" <= " + (double) 2.7f + ")", typedWhere(QueryBuilders.rangeQuery("f").lte(2.7)));
+        assertEquals(
+            "(\"f\" >= " + (double) 0.3f + " AND \"f\" <= " + (double) 0.3f + ")",
+            typedWhere(QueryBuilders.rangeQuery("f").gte(0.3).lte(0.3))
+        );
+        assertEquals("(\"f\" <= " + (double) Math.nextDown(0.3f) + ")", typedWhere(QueryBuilders.rangeQuery("f").lt(0.3)));
+        // Past the greatest float, nothing; below the least, every value.
+        assertEquals("1=0", typedWhere(QueryBuilders.rangeQuery("f").gt(Float.MAX_VALUE)));
+        assertEquals("(\"f\" >= 1)", typedWhere(QueryBuilders.rangeQuery("f").gte(1)));
+        // A value the field cannot hold has no translation, as text on a double field has none.
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("f", "1e39"), typedColumns(), TABLE, NOW));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("f", "abc"), typedColumns(), TABLE, NOW));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.termQuery("d", "abc"), typedColumns(), TABLE, NOW));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.rangeQuery("f").gte("abc"), typedColumns(), TABLE, NOW));
+        assertNull(InfinoQueryTranslator.translate(QueryBuilders.rangeQuery("s").lt("abc"), typedColumns(), TABLE, NOW));
+        // Text across a text and a float field reads the float field as it reads a double one.
+        assertEquals(
+            typedWhere(QueryBuilders.multiMatchQuery("disk", "message", "d")).replace("\"d\"", "\"f\""),
+            typedWhere(QueryBuilders.multiMatchQuery("disk", "message", "f"))
+        );
+        assertEquals("\"d\" = 0.3", typedWhere(QueryBuilders.termQuery("d", 0.3)));
+        assertEquals("(\"d\" > 0.3)", typedWhere(QueryBuilders.rangeQuery("d").gt(0.3)));
+    }
+
+    /** A half_float field keeps the nearest 16-bit float: a term compares it, a range's bounds are the first halves within it. */
+    public void testHalfFloatLiteralsAreReadAtTheFieldsPrecision() {
+        assertEquals("\"h\" = " + half(0.3f), typedWhere(QueryBuilders.termQuery("h", 0.3)));
+        // 0.3 is kept as its nearest half, which lies above 0.3: gte and gt 0.3 admit it, lte 0.3 does not.
+        assertEquals("(\"h\" >= " + half(0.3f) + ")", typedWhere(QueryBuilders.rangeQuery("h").gte(0.3)));
+        assertEquals("(\"h\" >= " + half(0.3f) + ")", typedWhere(QueryBuilders.rangeQuery("h").gt(0.3)));
+        assertEquals(
+            "(\"h\" <= " + (double) org.apache.lucene.sandbox.document.HalfFloatPoint.nextDown(0.3f) + ")",
+            typedWhere(QueryBuilders.rangeQuery("h").lte(0.3))
+        );
+        // 1.5 is a half: gt 1.5 starts at the next one, lte 1.5 ends at it.
+        assertEquals(
+            "(\"h\" >= " + (double) org.apache.lucene.sandbox.document.HalfFloatPoint.nextUp(1.5f) + ")",
+            typedWhere(QueryBuilders.rangeQuery("h").gt(1.5))
+        );
+        assertEquals("(\"h\" <= 1.5)", typedWhere(QueryBuilders.rangeQuery("h").lte(1.5)));
+    }
+
+    /** A scaled_float field keeps multiples of 1/scaling_factor: a term compares the rounded value, a range the first multiples within it. */
+    public void testScaledFloatLiteralsAreReadAtTheFieldsPrecision() {
+        assertEquals("\"s\" = 1.23", typedWhere(QueryBuilders.termQuery("s", 1.234)));
+        assertEquals("\"s\" = 1.24", typedWhere(QueryBuilders.termQuery("s", 1.235)));
+        assertEquals("(\"s\" >= 1.24)", typedWhere(QueryBuilders.rangeQuery("s").gt(1.234)));
+        assertEquals("(\"s\" >= 1.24)", typedWhere(QueryBuilders.rangeQuery("s").gt(1.23)));
+        assertEquals("(\"s\" >= 1.23)", typedWhere(QueryBuilders.rangeQuery("s").gte(1.23)));
+        assertEquals("(\"s\" <= 1.24)", typedWhere(QueryBuilders.rangeQuery("s").lt(1.25)));
+        // A bound is rounded to the nearest multiple first, so gte 1.234 admits the 1.23 that term 1.234 finds.
+        assertEquals("(\"s\" >= 1.23)", typedWhere(QueryBuilders.rangeQuery("s").gte(1.234)));
+        assertEquals("(\"s\" >= 1.24)", typedWhere(QueryBuilders.rangeQuery("s").gte(1.235)));
+        assertEquals("(\"s\" <= 1.23)", typedWhere(QueryBuilders.rangeQuery("s").lte(1.234)));
+        assertEquals("(\"s\" <= 1.26)", typedWhere(QueryBuilders.rangeQuery("s").lte(1.259)));
+    }
+
+    /** A CIDR block in a term on an ip field is the addresses it covers, a prefix of their text; an IPv6 block is refused. */
+    public void testCidrTermsOnAnIpField() {
+        assertEquals("\"ip\" LIKE '10.%'", typedWhere(QueryBuilders.termQuery("ip", "10.0.0.0/8")));
+        assertEquals("\"ip\" LIKE '10.%'", typedWhere(QueryBuilders.termQuery("ip", "10.9.8.7/8")));
+        assertEquals("\"ip\" LIKE '192.168.%'", typedWhere(QueryBuilders.termQuery("ip", "192.168.0.0/16")));
+        assertEquals("\"ip\" = '192.168.1.9'", typedWhere(QueryBuilders.termQuery("ip", "192.168.1.9/32")));
+        assertEquals("\"ip\" NOT LIKE '%:%'", typedWhere(QueryBuilders.termQuery("ip", "0.0.0.0/0")));
+        StringBuilder sixteen = new StringBuilder();
+        for (int i = 0; i < 16; i++) {
+            sixteen.append(i == 0 ? "" : "|").append(i);
+        }
+        assertEquals("regexp_like(\"ip\", '^10\\.(?:" + sixteen + ")\\.')", typedWhere(QueryBuilders.termQuery("ip", "10.1.2.3/12")));
+        assertEquals(
+            "regexp_like(\"ip\", '^192\\.168\\.1\\.(?:8|9|10|11)$')",
+            typedWhere(QueryBuilders.termQuery("ip", "192.168.1.9/30"))
+        );
+        assertEquals(
+            "(\"ip\" LIKE '10.%' OR \"ip\" = '192.168.1.9')",
+            typedWhere(QueryBuilders.termsQuery("ip", List.of("10.0.0.0/8", "192.168.1.9")))
+        );
+        assertEquals("\"ip\" = '10.0.0.1'", typedWhere(QueryBuilders.termQuery("ip", "10.0.0.1")));
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> typedWhere(QueryBuilders.termQuery("ip", "2001:db8::/32"))
+        );
+        assertEquals("[infino] a term with the IPv6 CIDR block [2001:db8::/32] on [ip] is not served", e.getMessage());
+        expectThrows(IllegalArgumentException.class, () -> typedWhere(QueryBuilders.termQuery("ip", "10.0.0.0/33")));
+        // On a keyword field the text is the value.
+        assertEquals("\"level\" = 'a/8'", typedWhere(QueryBuilders.termQuery("level", "a/8")));
+    }
+
+    /** A match asking for fuzziness is refused, naming it; a fuzziness of 0 asks for none and is served. */
+    public void testFuzzyMatchIsRefused() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.matchQuery("message", "dsk").fuzziness(org.opensearch.common.unit.Fuzziness.AUTO))
+        );
+        assertEquals("[infino] match on [message] asks for fuzziness [AUTO], which is not served", e.getMessage());
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("level", "eror").fuzziness(org.opensearch.common.unit.Fuzziness.ONE)))
+        );
+        e = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.multiMatchQuery("dsk", "message").fuzziness(org.opensearch.common.unit.Fuzziness.ONE))
+        );
+        assertEquals("[infino] multi_match on [message] asks for fuzziness [1], which is not served", e.getMessage());
+        assertEquals(
+            translate(QueryBuilders.matchQuery("message", "disk")).where(),
+            translate(QueryBuilders.matchQuery("message", "disk").fuzziness(org.opensearch.common.unit.Fuzziness.ZERO)).where()
+        );
     }
 }

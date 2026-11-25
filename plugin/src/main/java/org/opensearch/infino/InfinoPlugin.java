@@ -20,6 +20,7 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.settings.SecureString;
@@ -45,6 +46,8 @@ import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.fetch.FetchSubPhase;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.query.QueryPhaseSearcher;
+import org.opensearch.threadpool.ExecutorBuilder;
+import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.nio.file.Files;
@@ -656,6 +659,43 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
                 return out.build();
             }
         });
+    }
+
+    /**
+     * The pool a proxy-mode table's appends run on, apart from the
+     * {@code write} pool its bulks are staged on. An append to the hosted
+     * service can wait for as long as a hosted request may last (up to ten
+     * minutes); on the {@code write} pool, a few appends waiting that long
+     * would hold every thread of it, and every write on the node, a stock
+     * index's included, would wait behind them. Here they hold this pool's
+     * threads only: further bulks are staged until their table's batch is
+     * full and then refused with 429, and an append its full queue turns away
+     * answers its bulks with 429 too.
+     */
+    public static final String APPEND_POOL = "infino_append";
+    /** Appends that may wait for a thread of {@link #APPEND_POOL}; past this, the next is refused with 429. */
+    private static final int APPEND_QUEUE = 1_000;
+
+    @Override
+    public List<ExecutorBuilder<?>> getExecutorBuilders(Settings settings) {
+        return List.of(appendPool(settings));
+    }
+
+    /**
+     * {@link #APPEND_POOL}: one thread per allocated processor, the {@code write}
+     * pool's default size, sized with its own settings under
+     * {@code thread_pool.infino_append}. A node that sets
+     * {@code thread_pool.write.size} does not carry that over: set
+     * {@code thread_pool.infino_append.size} as well.
+     */
+    static ExecutorBuilder<?> appendPool(Settings settings) {
+        return new FixedExecutorBuilder(
+            settings,
+            APPEND_POOL,
+            OpenSearchExecutors.allocatedProcessors(settings),
+            APPEND_QUEUE,
+            "thread_pool." + APPEND_POOL
+        );
     }
 
     @Override

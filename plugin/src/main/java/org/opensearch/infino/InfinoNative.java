@@ -10,6 +10,8 @@ import com.sun.jna.Pointer;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.document.FloatPoint;
+import org.apache.lucene.sandbox.document.HalfFloatPoint;
 import org.opensearch.OpenSearchException;
 import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
@@ -24,6 +26,7 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.seqno.SequenceNumbers;
 
 import java.io.IOException;
@@ -186,6 +189,118 @@ public final class InfinoNative {
         .build();
 
     /**
+     * A field's mapping type where its column's own type does not carry it.
+     * A {@code float}, {@code half_float} or {@code scaled_float} field's
+     * column holds each value as the field keeps it, rounded to the field's
+     * precision (a 32-bit float, a 16-bit float, or a multiple of
+     * {@code 1 / scalingFactor}), so a query's number is read at that
+     * precision, as stock's field mapper reads it: a term is the rounded
+     * value, and a range's bounds are the kept values stock reads them as. An
+     * {@code ip} field's column holds its addresses as written, so a CIDR
+     * block in a term is the addresses it covers, not that text.
+     */
+    public record FieldType(String type, double scalingFactor) {
+        static final String FLOAT = "float";
+        static final String HALF_FLOAT = "half_float";
+        static final String SCALED_FLOAT = "scaled_float";
+        static final String IP = "ip";
+
+        /** The field type a mapping's field declares, or null for one whose column carries its type. */
+        static FieldType of(Map<?, ?> field) {
+            Object type = field.get(TYPE);
+            if (FLOAT.equals(type) || HALF_FLOAT.equals(type) || IP.equals(type)) {
+                return new FieldType((String) type, 0);
+            }
+            if (SCALED_FLOAT.equals(type)) {
+                Object factor = field.get("scaling_factor");
+                try {
+                    double f = factor instanceof Number n ? n.doubleValue() : Double.parseDouble(String.valueOf(factor));
+                    return Double.isFinite(f) && f > 0 ? new FieldType(SCALED_FLOAT, f) : null;
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+            }
+            return null;
+        }
+
+        boolean isIp() {
+            return IP.equals(type);
+        }
+
+        /** Whether the field's numbers are kept rounded to its precision. */
+        boolean rounds() {
+            return !isIp();
+        }
+
+        /** {@code value} as the field keeps it, the value a term on the field compares. */
+        double kept(Object value) {
+            return switch (type) {
+                case FLOAT -> NumberFieldMapper.NumberType.FLOAT.parse(value, false).floatValue();
+                case HALF_FLOAT -> HalfFloatPoint.sortableShortToHalfFloat(
+                    HalfFloatPoint.halfFloatToSortableShort(NumberFieldMapper.NumberType.HALF_FLOAT.parse(value, false).floatValue())
+                );
+                case SCALED_FLOAT -> Math.round(scaled(value)) / scalingFactor;
+                default -> throw new IllegalStateException(type);
+            };
+        }
+
+        /**
+         * The least kept value a range's lower bound {@code value} admits, as
+         * stock reads the bound: {@code >=} it is the range's lower side.
+         * Infinite when the bound admits every value (negative) or none
+         * (positive).
+         */
+        double lower(Object value, boolean inclusive) {
+            return switch (type) {
+                case FLOAT -> {
+                    float l = NumberFieldMapper.NumberType.FLOAT.parse(value, false).floatValue();
+                    yield inclusive ? l : FloatPoint.nextUp(l);
+                }
+                case HALF_FLOAT -> {
+                    float l = NumberFieldMapper.NumberType.HALF_FLOAT.parse(value, false).floatValue();
+                    yield HalfFloatPoint.nextUp(inclusive ? HalfFloatPoint.nextDown(l) : l);
+                }
+                case SCALED_FLOAT -> {
+                    // Stock rounds the bound to a multiple, then reads it as a long bound: past it starts one later.
+                    long l = Math.round(scaled(value));
+                    if (inclusive == false && l == Long.MAX_VALUE) {
+                        yield Double.POSITIVE_INFINITY;
+                    }
+                    yield (inclusive ? l : l + 1) / scalingFactor;
+                }
+                default -> throw new IllegalStateException(type);
+            };
+        }
+
+        /** The greatest kept value a range's upper bound {@code value} admits, as stock reads the bound: {@code <=} it is the range's upper side. */
+        double upper(Object value, boolean inclusive) {
+            return switch (type) {
+                case FLOAT -> {
+                    float u = NumberFieldMapper.NumberType.FLOAT.parse(value, false).floatValue();
+                    yield inclusive ? u : FloatPoint.nextDown(u);
+                }
+                case HALF_FLOAT -> {
+                    float u = NumberFieldMapper.NumberType.HALF_FLOAT.parse(value, false).floatValue();
+                    yield HalfFloatPoint.nextDown(inclusive ? HalfFloatPoint.nextUp(u) : u);
+                }
+                case SCALED_FLOAT -> {
+                    long u = Math.round(scaled(value));
+                    if (inclusive == false && u == Long.MIN_VALUE) {
+                        yield Double.NEGATIVE_INFINITY;
+                    }
+                    yield (inclusive ? u : u - 1) / scalingFactor;
+                }
+                default -> throw new IllegalStateException(type);
+            };
+        }
+
+        /** A scaled_float's number in units of {@code 1 / scalingFactor}, as stock scales it. */
+        private double scaled(Object value) {
+            return NumberFieldMapper.NumberType.DOUBLE.parse(value, false).doubleValue() * scalingFactor;
+        }
+    }
+
+    /**
      * One column of a table, as the bridge describes it. {@code mask} is the
      * security plugin's field masking for the request, when the field is
      * masked for the user: how a value of the column is hashed before it
@@ -196,7 +311,11 @@ public final class InfinoNative {
      * {@code use_similarity}, whose terms Lucene scores by BM25.
      * {@code otherSimilarity} is whether its field scores by a similarity
      * other than the default BM25: its mapping names one, or the index's
-     * default is another.
+     * default is another. {@code ranged} is whether the table keeps a range
+     * index on the column, which a numeric or date field mapped with
+     * {@code "index": false} has none of. {@code fieldType} is its field's
+     * mapping type when the column's own type does not carry it
+     * ({@link FieldType}; null for any other field).
      */
     public record Column(
         String name,
@@ -207,8 +326,24 @@ public final class InfinoNative {
         String dateFormat,
         String elem,
         boolean similarity,
-        boolean otherSimilarity
+        boolean otherSimilarity,
+        boolean ranged,
+        FieldType fieldType
     ) {
+        public Column(
+            String name,
+            String type,
+            boolean fts,
+            boolean vector,
+            UnaryOperator<String> mask,
+            String dateFormat,
+            String elem,
+            boolean similarity,
+            boolean otherSimilarity
+        ) {
+            this(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, false, null);
+        }
+
         public Column(
             String name,
             String type,
@@ -237,22 +372,32 @@ public final class InfinoNative {
 
         /** This column as the request sees it, its values masked by {@code mask}. */
         Column masked(UnaryOperator<String> mask) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, ranged, fieldType);
         }
 
         /** This column with the date format its mapping declares. */
         Column dated(String dateFormat) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, ranged, fieldType);
+        }
+
+        /** This column with its field's mapping type ({@link FieldType}). */
+        Column typed(FieldType fieldType) {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, ranged, fieldType);
         }
 
         /** This column as a keyword field with {@code use_similarity} maps it. */
         Column scoredBySimilarity() {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, true, otherSimilarity);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, true, otherSimilarity, ranged, fieldType);
         }
 
         /** This column as a field scored by a similarity other than the default BM25. */
         Column scoredByOtherSimilarity() {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, true);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, true, ranged, fieldType);
+        }
+
+        /** This column with a range index the table keeps on it. */
+        Column rangeIndexed() {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, true, fieldType);
         }
 
         /**
@@ -275,12 +420,12 @@ public final class InfinoNative {
          * mapping's, not its field's: neither here.
          */
         Column exact() {
-            return fts || similarity || otherSimilarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false, false) : this;
+            return fts || similarity || otherSimilarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false, false, ranged, fieldType) : this;
         }
 
         /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */
         Column element() {
-            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null, similarity, otherSimilarity) : this;
+            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null, similarity, otherSimilarity, ranged, fieldType) : this;
         }
 
         public boolean isList() {
@@ -365,8 +510,8 @@ public final class InfinoNative {
 
     private InfinoNative() {}
 
-    /** The bridge library, loaded once per node. */
-    private static InfinoLib lib() {
+    /** The bridge library, loaded once per node (tests wrap it with {@link #useLib}). */
+    static InfinoLib lib() {
         InfinoLib loaded = lib;
         if (loaded == null) {
             synchronized (InfinoNative.class) {
@@ -788,10 +933,17 @@ public final class InfinoNative {
         if (!explicit.isEmpty()) {
             return explicit;
         }
-        return tableFor(indexName);
+        String table = tableFor(indexName);
+        // A shard's table adds to this name, so only an index served from one table can land on the registry's.
+        return InfinoTables.oneTable(indexSettings) ? unreserved(table) : table;
     }
 
-    /** The table an index of this name is served from when none is named explicitly. */
+    /**
+     * The name an index of this name takes its tables' names from when none
+     * is named explicitly: the stem of its shards' tables (see
+     * {@link InfinoTables#tablesOf}), and the name of its one table unless
+     * that is reserved ({@link #unreserved}).
+     */
     public static String tableFor(String indexName) {
         // An index name may carry characters a table name may not (the security
         // plugin's and Dashboards' own indices start with a dot); each becomes '_'.
@@ -799,6 +951,20 @@ public final class InfinoNative {
         return TABLE_PREFIX + TABLE_NAME_OTHER.matcher(indexName).replaceAll("_");
     }
 
+    /**
+     * {@code table}, unless it is the registry's ({@link InfinoRegistry#TABLE}),
+     * which the index named {@code index} would take: that index is served
+     * from the same name with {@code -} after the prefix instead. OpenSearch
+     * refuses an index name that starts with {@code -}, and every other
+     * character a table name may not hold becomes {@code _}, so no other
+     * index name maps to it, while every other index keeps its table.
+     */
+    static String unreserved(String table) {
+        return InfinoRegistry.TABLE.equals(table) ? TABLE_PREFIX + RESERVED_ESCAPE + table.substring(TABLE_PREFIX.length()) : table;
+    }
+
+    /** What the table of an index whose name maps to a reserved table carries after the prefix: a character no index name starts with. */
+    private static final String RESERVED_ESCAPE = "-";
     /** What the engine does not take in a table name: anything outside letters, digits, '_' and '-'. */
     private static final Pattern TABLE_NAME_OTHER = Pattern.compile("[^A-Za-z0-9_-]");
     /** Every table behind an index starts with this, so the registry and the tables of other users of a database stay apart. */
@@ -941,8 +1107,9 @@ public final class InfinoNative {
      * {@code request.raw} under the text field {@code request}, as a dynamic
      * mapping's {@code name.keyword}); each date field's declared format;
      * each {@code float} or {@code half_float} field ({@code floatFields});
-     * and each {@code integer}, {@code short} or {@code byte} field
-     * ({@code intFields}).
+     * each {@code integer}, {@code short} or {@code byte} field
+     * ({@code intFields}); and each field whose type its column does not
+     * carry ({@code fieldTypes}, {@link FieldType}).
      * A wildcard multi-field reads as a keyword one. {@code multiFields} are
      * every multi-field's path, and {@code normalized} the keyword and
      * wildcard fields with a normalizer, whose values the table keeps as
@@ -957,6 +1124,7 @@ public final class InfinoNative {
         Set<String> otherSimilarityFields,
         Set<String> floatFields,
         Set<String> intFields,
+        Map<String, FieldType> fieldTypes,
         Set<String> multiFields,
         Set<String> normalized,
         boolean defaultBm25
@@ -983,6 +1151,7 @@ public final class InfinoNative {
                 new HashSet<>(),
                 new HashSet<>(),
                 new HashSet<>(),
+                new LinkedHashMap<>(),
                 new HashSet<>(),
                 new HashSet<>(),
                 defaultBm25
@@ -1018,6 +1187,10 @@ public final class InfinoNative {
                 }
                 if (field.get(TYPE) instanceof String type && INT_TYPES.contains(type)) {
                     intFields.add(path);
+                }
+                FieldType fieldType = FieldType.of(field);
+                if (fieldType != null) {
+                    fieldTypes.put(path, fieldType);
                 }
                 if (scoresBySimilarity(field)) {
                     similarityFields.add(path);
@@ -1163,11 +1336,18 @@ public final class InfinoNative {
             String key = InfinoQueryTranslator.keyOf(column);
             // A list column of a mapped field reads its dates as the field's do.
             String format = mapping == null ? null : mapping.dateFormats().get(InfinoQueryTranslator.fieldOf(column));
+            if (Boolean.TRUE.equals(c.get("range"))) {
+                described = described.rangeIndexed();
+            }
             if (mapping != null && mapping.similarityFields().contains(key)) {
                 described = described.scoredBySimilarity();
             }
             if (mapping != null && mapping.otherSimilarityFields().contains(InfinoQueryTranslator.fieldOf(column))) {
                 described = described.scoredByOtherSimilarity();
+            }
+            FieldType fieldType = mapping == null ? null : mapping.fieldTypes().get(InfinoQueryTranslator.fieldOf(column));
+            if (fieldType != null) {
+                described = described.typed(fieldType);
             }
             Column kept = format == null ? described : described.dated(format);
             // A field named like a reserved column is looked up by its name, in place of the reserved column.
@@ -1186,7 +1366,8 @@ public final class InfinoNative {
         for (Map.Entry<String, String> sub : (mapping == null ? Map.<String, String>of() : mapping.keywordFields()).entrySet()) {
             Column field = out.get(sub.getValue());
             if (field != null && field.isString()) {
-                Column exact = field.exact();
+                // A keyword multi-field compares its text as written, whatever its field's type.
+                Column exact = field.exact().typed(null);
                 Column scored = mapping.similarityFields().contains(sub.getKey()) ? exact.scoredBySimilarity() : exact;
                 if (mapping.otherSimilarityFields().contains(sub.getKey())) {
                     scored = scored.scoredByOtherSimilarity();
@@ -1946,6 +2127,30 @@ public final class InfinoNative {
         init();
         String out = takeOrThrow(lib.infino_value_counts(conn, n, column, maxRows)).trim();
         return out.equals("null") ? null : rows(out);
+    }
+
+    /**
+     * A keyword column's {@code top} most frequent values over the whole
+     * table, by count and then by value (its UTF-8 bytes), in one call:
+     * {@code rows} (each value under the column's name, its count under
+     * {@link #VALUE_COUNT}), {@code keyed_total} (rows with a value),
+     * {@code nulls} (rows without one) and {@code groups} (how many values).
+     * The engine counts a keyword column from its term index, so only
+     * {@code top} rows cross however many values it has. Null, for the
+     * caller's own statement to run, for a column without the keyword
+     * analyzer (a table made before it, or a field that is not a keyword).
+     */
+    public static Map<String, Object> valueCountsTop(String n, String column, int top) {
+        init();
+        String out = takeOrThrow(lib.infino_value_counts_top(conn, n, column, top)).trim();
+        if (out.equals("null")) {
+            return null;
+        }
+        try (XContentParser parser = parser(out)) {
+            return parser.map();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /**

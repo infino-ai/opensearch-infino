@@ -1,0 +1,169 @@
+---
+"A sorted page carries each hit's own source, read in its statement or by id":
+  # A page sorted on a numeric field reads its sources in its hit statement;
+  # the rows missing the sort's value are read by id. A search_after page that
+  # ends among the present values and continues into the missing ones joins
+  # both, and every hit carries its own source.
+  - do:
+      indices.create:
+        index: sps
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              k: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: sps
+        body:
+          - index: { _id: "p1" }
+          - { n: 5, k: "p1" }
+          - index: { _id: "p2" }
+          - { n: 4, k: "p2" }
+          - index: { _id: "p3" }
+          - { n: 3, k: "p3" }
+          - index: { _id: "p4" }
+          - { n: 2, k: "p4" }
+          - index: { _id: "m1" }
+          - { k: "m1" }
+          - index: { _id: "m2" }
+          - { k: "m2" }
+  - match: { errors: false }
+
+  - do:
+      search:
+        index: sps
+        body:
+          size: 3
+          sort: [ { n: desc } ]
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p1" }
+  - match: { hits.hits.0._source: { n: 5, k: "p1" } }
+  - match: { hits.hits.1._source: { n: 4, k: "p2" } }
+  - match: { hits.hits.2._id: "p3" }
+  - match: { hits.hits.2._source: { n: 3, k: "p3" } }
+  - set: { hits.hits.2.sort: after }
+
+  - do:
+      search:
+        index: sps
+        body:
+          size: 3
+          sort: [ { n: desc } ]
+          search_after: $after
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "p4" }
+  - match: { hits.hits.0._source: { n: 2, k: "p4" } }
+  - match: { hits.hits.1._id: "m1" }
+  - match: { hits.hits.1._source: { k: "m1" } }
+  - match: { hits.hits.2._id: "m2" }
+  - match: { hits.hits.2._source: { k: "m2" } }
+
+  # A page that returns no source reads none; includes keep their fields.
+  - do:
+      search:
+        index: sps
+        body:
+          size: 2
+          _source: false
+          sort: [ { n: asc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "p4" }
+  - is_false: hits.hits.0._source
+  - do:
+      search:
+        index: sps
+        body:
+          size: 2
+          _source: { includes: [ "k" ] }
+          seq_no_primary_term: true
+          sort: [ { n: asc } ]
+  - match: { hits.hits.0._id: "p4" }
+  - match: { hits.hits.0._source: { k: "p4" } }
+  - is_true: hits.hits.0._primary_term
+  - match: { hits.hits.1._source: { k: "p3" } }
+
+---
+"A sorted page on a column with no range index, or under a filter, carries each hit's own source":
+  # A numeric field mapped "index": false has no range index, and a filter
+  # other than a range on the sort column is checked row by row: such pages
+  # read their sources by id, with the same answers.
+  - do:
+      indices.create:
+        index: spf
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+              u: { type: long, index: false }
+              t: { type: date }
+              k: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: spf
+        body:
+          - index: { _id: "a" }
+          - { n: 1, u: 40, t: "2024-01-01T00:00:00Z", k: "rare" }
+          - index: { _id: "b" }
+          - { n: 2, u: 30, t: "2024-01-02T00:00:00Z", k: "common" }
+          - index: { _id: "c" }
+          - { n: 3, u: 20, t: "2024-01-03T00:00:00Z", k: "common" }
+          - index: { _id: "d" }
+          - { n: 4, u: 10, t: "2024-01-04T00:00:00Z", k: "common" }
+  - match: { errors: false }
+
+  - do:
+      search:
+        index: spf
+        body:
+          size: 2
+          query: { term: { k: "common" } }
+          sort: [ { u: desc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "b" }
+  - match: { hits.hits.0._source: { n: 2, u: 30, t: "2024-01-02T00:00:00Z", k: "common" } }
+  - match: { hits.hits.1._id: "c" }
+  - match: { hits.hits.1._source.u: 20 }
+
+  - do:
+      search:
+        index: spf
+        body:
+          size: 2
+          seq_no_primary_term: true
+          sort: [ { u: asc } ]
+  - match: { hits.hits.0._id: "d" }
+  - match: { hits.hits.0._source.u: 10 }
+  - match: { hits.hits.1._id: "c" }
+  - match: { hits.hits.1._source.k: "common" }
+
+  # A selective term, sorted newest first: the rare row is the oldest.
+  - do:
+      search:
+        index: spf
+        body:
+          size: 10
+          query: { term: { k: "rare" } }
+          sort: [ { t: desc } ]
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "a" }
+  - match: { hits.hits.0._source: { n: 1, u: 40, t: "2024-01-01T00:00:00Z", k: "rare" } }
+
+  # One bounded range on the sort column: the range index answers it alone.
+  - do:
+      search:
+        index: spf
+        body:
+          size: 2
+          seq_no_primary_term: true
+          query: { range: { t: { gte: "2024-01-02T00:00:00Z", lt: "2024-01-04T00:00:00Z" } } }
+          sort: [ { t: desc } ]
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "c" }
+  - match: { hits.hits.0._source: { n: 3, u: 20, t: "2024-01-03T00:00:00Z", k: "common" } }
+  - match: { hits.hits.1._id: "b" }
+  - match: { hits.hits.1._source.n: 2 }

@@ -49,6 +49,31 @@ public class InfinoNativeTests extends OpenSearchTestCase {
         assertEquals(Map.of("when", "yyyy-MM-dd HH:mm:ss||strict_date_optional_time"), m.dateFormats());
     }
 
+    /** The float, half_float, scaled_float and ip fields carry their type, which their columns do not; a malformed scaling factor none. */
+    public void testFieldTypesTheColumnsDoNotCarryAreRead() {
+        Mapping m = Mapping.of("""
+            {"properties":{
+              "f":{"type":"float"},"h":{"type":"half_float"},"d":{"type":"double"},
+              "s":{"type":"scaled_float","scaling_factor":100},"t":{"type":"scaled_float","scaling_factor":"10"},
+              "bad":{"type":"scaled_float","scaling_factor":"x"},
+              "obj":{"properties":{"ip":{"type":"ip"}}}}}""");
+        assertEquals(
+            Map.of(
+                "f",
+                new InfinoNative.FieldType("float", 0),
+                "h",
+                new InfinoNative.FieldType("half_float", 0),
+                "s",
+                new InfinoNative.FieldType("scaled_float", 100),
+                "t",
+                new InfinoNative.FieldType("scaled_float", 10),
+                "obj.ip",
+                new InfinoNative.FieldType("ip", 0)
+            ),
+            m.fieldTypes()
+        );
+    }
+
     /**
      * A keyword multi-field is read by its own name, whatever the mapping calls it (the logs
      * track's {@code request.raw}); one of another type indexes the value differently and is

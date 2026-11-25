@@ -22,9 +22,12 @@ crate-type = ["cdylib", "rlib"]
 # reads a top-k on _id by id block and skips the row groups its bound rules
 # out; 0.11.36 adds `bm25_search_fields`, which ranks a query string across its
 # text columns, and reads a limited scan of at most two batches in file order,
-# which the unsorted pages rely on. Since 0.11.26 the engine writes the manifest
-# list format 4.0, which builds before 0.11.26 cannot read.
-infino = { git = "https://github.com/infino-ai/infino", rev = "76ce8d6ccd166e07a9a061e2e2239afebffb5fa9", features = ["remote", "graph-index"] }
+# which the unsorted pages rely on; 0.12.0 hands up at most LIMIT rows from each
+# superfile in an ordered `token_match` / `exact_match` walk, and answers =, IN,
+# GROUP BY and DISTINCT on a keyword column from its term index. Since 0.11.26
+# the engine writes the manifest list format 4.0, which builds before 0.11.26
+# cannot read.
+infino = { version = "=0.12.0", features = ["remote", "graph-index"] }
 # serde_json comes re-exported from infino, so the two never disagree.
 # Same major as infino so the delete-predicate Expr is the same type infino expects.
 datafusion = "54"
