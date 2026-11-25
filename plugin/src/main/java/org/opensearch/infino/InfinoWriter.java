@@ -649,21 +649,6 @@ public final class InfinoWriter {
     }
 
     /**
-     * Write the batch: the rows of ids the table already holds replace
-     * those rows in the same mutation as the append (so a failed write
-     * leaves the old rows), ids whose last write is a delete are tombstoned
-     * in a mutation after it (the engine replaces rows one for one, so a
-     * delete with no row in its place is a mutation of its own), and a write
-     * that meets a conflict (a create over a document, or a sequence-number
-     * condition the document does not meet) is left out.
-     *
-     * <p>Owns the prepared handles. The engine releases every handle it is
-     * handed, on success and on failure alike, and the folded path releases
-     * them before it prepares afresh; so a handle is released here only when
-     * this fails before either, on the reads of the table that come first.
-     * Releasing one twice corrupts the native heap.
-     */
-    /**
      * The documents the updates among {@code writes} merge into: each update's
      * id the table holds ({@code existed}) to its source, read by {@code read}
      * in one call for them all, and null for an id the read no longer finds.
@@ -695,6 +680,21 @@ public final class InfinoWriter {
         return bases;
     }
 
+    /**
+     * Write the batch: the rows of ids the table already holds replace
+     * those rows in the same mutation as the append (so a failed write
+     * leaves the old rows), ids whose last write is a delete are tombstoned
+     * in a mutation after it (the engine replaces rows one for one, so a
+     * delete with no row in its place is a mutation of its own), and a write
+     * that meets a conflict (a create over a document, or a sequence-number
+     * condition the document does not meet) is left out.
+     *
+     * <p>Owns the prepared handles. The engine releases every handle it is
+     * handed, on success and on failure alike, and the folded path releases
+     * them before it prepares afresh; so a handle is released here only when
+     * this fails before either, on the reads of the table that come first.
+     * Releasing one twice corrupts the native heap.
+     */
     private static Applied apply(String table, Batch batch, List<Staged> staged) {
         Set<String> lookups = new HashSet<>();
         boolean conditioned = false;
