@@ -1474,6 +1474,8 @@ public class InfinoEngine extends InternalEngine {
                 if (result.getResultType() != Result.Type.SUCCESS || source == null) {
                     return result;
                 }
+                // Read before the batch lock: it reads the shard's leases, under their own lock.
+                boolean knowsIds = skeletonKnowsIds();
                 synchronized (batchLock) {
                     boolean recovery = index.origin().isRecovery();
                     // A row a reader may not hold the id of yet carries the sequence number that
@@ -1498,7 +1500,7 @@ public class InfinoEngine extends InternalEngine {
                     }
                     // What the table holds for the id, when the batch has no write of it: a
                     // replay, or a write a rebuilt skeleton takes as new, may find a row there.
-                    Base base = recovery || (!skeletonKnowsIds() && result.isCreated())
+                    Base base = recovery || (!knowsIds && result.isCreated())
                         ? Base.UNKNOWN
                         : result.isCreated() ? Base.ABSENT : Base.PRESENT;
                     batch.add(id, base, new Version(result.getSeqNo(), !recovery, source, index.routing(), stamp, ignored, mapped));
