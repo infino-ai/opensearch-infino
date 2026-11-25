@@ -4,14 +4,20 @@
 
 package org.opensearch.infino;
 
+import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoScriptTranslator.SqlType;
 import org.opensearch.common.Rounding;
+import org.opensearch.search.aggregations.bucket.composite.CompositeAggregationBuilder;
+import org.opensearch.search.aggregations.bucket.composite.CompositeValuesSourceBuilder;
+import org.opensearch.search.aggregations.bucket.composite.DateHistogramValuesSourceBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.histogram.DateIntervalWrapper;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.time.Instant;
 import java.time.ZoneId;
+import java.util.List;
+import java.util.Map;
 
 public class InfinoDateKeyTests extends OpenSearchTestCase {
 
@@ -156,6 +162,42 @@ public class InfinoDateKeyTests extends OpenSearchTestCase {
                 }
             }
         }
+    }
+
+    /**
+     * A composite date source's after key is read with the source's format,
+     * as stock reads it. A date with no offset of its own is local time in the
+     * source's zone: "2017-10-20" in -02:00 is 02:00Z, so the page after it
+     * leaves out that day's bucket. One with an offset is that instant. A
+     * source with no format, whose key is epoch milliseconds, reads only
+     * those, and date math on now is refused.
+     */
+    public void testCompositeAfterKeyIsReadWithTheSourcesFormat() {
+        DateHistogramValuesSourceBuilder iso = new DateHistogramValuesSourceBuilder("d").field("d")
+            .calendarInterval(DateHistogramInterval.DAY)
+            .timeZone(ZoneId.of("-02:00"))
+            .format("iso8601");
+        assertEquals("'2017-10-20T02:00:00Z'", afterLiteral(iso, "2017-10-20"));
+        assertEquals("'2017-10-21T02:00:00Z'", afterLiteral(iso, "2017-10-21T00:00:00.000-02:00"));
+        assertEquals("'2017-10-20T02:00:00Z'", afterLiteral(iso, "2017-10-20T15:00:00||/d"));
+        Exception now = expectThrows(InfinoAggregationProcessor.Unsupported.class, () -> afterLiteral(iso, "now-1d"));
+        assertTrue(now.getMessage(), now.getMessage().contains("after key [now-1d] for [d] that its format does not read"));
+        DateHistogramValuesSourceBuilder raw = new DateHistogramValuesSourceBuilder("d").field("d")
+            .calendarInterval(DateHistogramInterval.HOUR)
+            .timeZone(ZoneId.of("America/New_York"));
+        assertEquals("'2017-11-05T06:00:00Z'", afterLiteral(raw, 1509861600000L));
+        assertEquals("'2017-11-05T06:00:00Z'", afterLiteral(raw, "1509861600000"));
+        Exception date = expectThrows(InfinoAggregationProcessor.Unsupported.class, () -> afterLiteral(raw, "2017-11-04T23:00"));
+        assertTrue(date.getMessage(), date.getMessage().contains("after key [2017-11-04T23:00] for [d] that its format does not read"));
+    }
+
+    /** The after literal a composite over a date column [d] makes of {@code after} for its one source. */
+    private static String afterLiteral(CompositeValuesSourceBuilder<?> source, Object after) {
+        CompositeAggregationBuilder c = new CompositeAggregationBuilder("c", List.of(source)).aggregateAfter(Map.of("d", after));
+        Map<String, Column> cols = Map.of("d", new Column("d", "ts", false, false));
+        long now = Instant.parse("2026-01-01T00:00:00Z").toEpochMilli();
+        InfinoAggregationProcessor.Composite composite = InfinoAggregationProcessor.Composite.of(c, cols, "t", InfinoAggregationProcessor.Leaves.NONE, null, now);
+        return (String) composite.after[0];
     }
 
     private static long key(ZoneId tz, String at, long ms, long offset) {
