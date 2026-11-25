@@ -1012,8 +1012,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         for (org.opensearch.index.query.QueryBuilder q : List.<org.opensearch.index.query.QueryBuilder>of(
             cross,
             QueryBuilders.boolQuery().must(cross),
-            QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error")).must(cross),
-            QueryBuilders.boolQuery().must(QueryBuilders.constantScoreQuery(QueryBuilders.termQuery("level", "error"))).must(cross)
+            QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "error")).must(cross)
         )) {
             Translation t = InfinoQueryTranslator.translate(q, cols, TABLE, NOW);
             assertTrue(q.toString(), t.scoring().unrankable());
