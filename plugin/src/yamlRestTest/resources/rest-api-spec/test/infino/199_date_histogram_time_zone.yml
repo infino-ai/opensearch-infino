@@ -1,0 +1,497 @@
+# A date_histogram with a time_zone puts its bucket boundaries on local time
+# in that zone, top-level and as a composite source alike: a fixed offset
+# (-01:00, +05:30) or a named zone that changes offset (America/New_York, whose
+# clocks went forward on 2017-03-12 and back on 2017-11-05), at a calendar
+# interval of a day or a month or at a fixed interval, with an offset and with
+# a format for the key. A composite's after key is read with the source's
+# format, as stock reads it: a date with no offset of its own is local time in
+# the source's zone, and a source with no format reads epoch milliseconds only.
+# Each request runs on a Lucene twin too, and the table's answer must be the twin's.
+setup:
+  - do:
+      indices.create:
+        index: tz_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { d: { type: date } } }
+  - do:
+      indices.create:
+        index: tz_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { d: { type: date } } }
+  - do:
+      indices.create:
+        index: tz_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: strict, properties: { d: { type: date } } }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: tz_luc, _id: "1" }
+          - { "d": "2017-10-20T03:08:45Z" }
+          - index: { _index: tz_luc, _id: "2" }
+          - { "d": "2017-10-21T07:00:00Z" }
+          - index: { _index: tz_luc, _id: "3" }
+          - { "d": "2017-10-22T01:00:00Z" }
+          - index: { _index: tz_luc, _id: "4" }
+          - { "d": "2017-10-31T23:30:00Z" }
+          - index: { _index: tz_luc, _id: "5" }
+          - { "d": "2017-11-05T03:30:00Z" }
+          - index: { _index: tz_luc, _id: "6" }
+          - { "d": "2017-11-05T04:30:00Z" }
+          - index: { _index: tz_luc, _id: "7" }
+          - { "d": "2017-11-05T05:30:00Z" }
+          - index: { _index: tz_luc, _id: "8" }
+          - { "d": "2017-11-05T06:30:00Z" }
+          - index: { _index: tz_luc, _id: "9" }
+          - { "d": "2017-03-12T04:59:59Z" }
+          - index: { _index: tz_luc, _id: "10" }
+          - { "d": "2017-03-12T06:30:00Z" }
+          - index: { _index: tz_luc, _id: "11" }
+          - { "d": "2017-03-12T07:30:00Z" }
+          - index: { _index: tz_prx, _id: "1" }
+          - { "d": "2017-10-20T03:08:45Z" }
+          - index: { _index: tz_prx, _id: "2" }
+          - { "d": "2017-10-21T07:00:00Z" }
+          - index: { _index: tz_prx, _id: "3" }
+          - { "d": "2017-10-22T01:00:00Z" }
+          - index: { _index: tz_prx, _id: "4" }
+          - { "d": "2017-10-31T23:30:00Z" }
+          - index: { _index: tz_prx, _id: "5" }
+          - { "d": "2017-11-05T03:30:00Z" }
+          - index: { _index: tz_prx, _id: "6" }
+          - { "d": "2017-11-05T04:30:00Z" }
+          - index: { _index: tz_prx, _id: "7" }
+          - { "d": "2017-11-05T05:30:00Z" }
+          - index: { _index: tz_prx, _id: "8" }
+          - { "d": "2017-11-05T06:30:00Z" }
+          - index: { _index: tz_prx, _id: "9" }
+          - { "d": "2017-03-12T04:59:59Z" }
+          - index: { _index: tz_prx, _id: "10" }
+          - { "d": "2017-03-12T06:30:00Z" }
+          - index: { _index: tz_prx, _id: "11" }
+          - { "d": "2017-03-12T07:30:00Z" }
+          - index: { _index: tz_def, _id: "1" }
+          - { "d": "2017-10-20T03:08:45Z" }
+          - index: { _index: tz_def, _id: "2" }
+          - { "d": "2017-10-21T07:00:00Z" }
+          - index: { _index: tz_def, _id: "3" }
+          - { "d": "2017-10-22T01:00:00Z" }
+          - index: { _index: tz_def, _id: "4" }
+          - { "d": "2017-10-31T23:30:00Z" }
+          - index: { _index: tz_def, _id: "5" }
+          - { "d": "2017-11-05T03:30:00Z" }
+          - index: { _index: tz_def, _id: "6" }
+          - { "d": "2017-11-05T04:30:00Z" }
+          - index: { _index: tz_def, _id: "7" }
+          - { "d": "2017-11-05T05:30:00Z" }
+          - index: { _index: tz_def, _id: "8" }
+          - { "d": "2017-11-05T06:30:00Z" }
+          - index: { _index: tz_def, _id: "9" }
+          - { "d": "2017-03-12T04:59:59Z" }
+          - index: { _index: tz_def, _id: "10" }
+          - { "d": "2017-03-12T06:30:00Z" }
+          - index: { _index: tz_def, _id: "11" }
+          - { "d": "2017-03-12T07:30:00Z" }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: tz_luc,tz_prx,tz_def
+        ignore_unavailable: true
+
+---
+"A day in a fixed offset zone starts at local midnight":
+  - do:
+      search:
+        index: tz_luc
+        body:
+          size: 0
+          query: { range: { d: { gte: "2017-10-01", lt: "2017-11-01" } } }
+          aggs:
+            minus1: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "-01:00" } }
+            plus530: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "+05:30", min_doc_count: 1 } }
+  - length: { aggregations.minus1.buckets: 12 }
+  - match: { aggregations.minus1.buckets.0: { key_as_string: "2017-10-20T00:00:00.000-01:00", key: 1508461200000, doc_count: 1 } }
+  - match: { aggregations.minus1.buckets.1: { key_as_string: "2017-10-21T00:00:00.000-01:00", key: 1508547600000, doc_count: 1 } }
+  - match: { aggregations.minus1.buckets.11: { key_as_string: "2017-10-31T00:00:00.000-01:00", key: 1509411600000, doc_count: 1 } }
+  - match: { aggregations.plus530.buckets.0: { key_as_string: "2017-10-20T00:00:00.000+05:30", key: 1508437800000, doc_count: 1 } }
+  - match: { aggregations.plus530.buckets.1: { key_as_string: "2017-10-21T00:00:00.000+05:30", key: 1508524200000, doc_count: 1 } }
+  - match: { aggregations.plus530.buckets.2: { key_as_string: "2017-10-22T00:00:00.000+05:30", key: 1508610600000, doc_count: 1 } }
+  - match: { aggregations.plus530.buckets.3: { key_as_string: "2017-11-01T00:00:00.000+05:30", key: 1509474600000, doc_count: 1 } }
+  - set: { aggregations: stock }
+  - do:
+      search:
+        index: tz_prx
+        body:
+          size: 0
+          query: { range: { d: { gte: "2017-10-01", lt: "2017-11-01" } } }
+          aggs:
+            minus1: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "-01:00" } }
+            plus530: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "+05:30", min_doc_count: 1 } }
+  - match: { aggregations: $stock }
+  - do:
+      search:
+        index: tz_def
+        body:
+          size: 0
+          query: { range: { d: { gte: "2017-10-01", lt: "2017-11-01" } } }
+          aggs:
+            minus1: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "-01:00" } }
+            plus530: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "+05:30", min_doc_count: 1 } }
+  - match: { aggregations: $stock }
+
+---
+"A day with an offset, a month and a fixed interval in a fixed offset zone":
+  - do:
+      search:
+        index: tz_luc
+        body:
+          size: 0
+          aggs:
+            shifted: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "+05:30", offset: "+2h", min_doc_count: 1, format: "yyyy-MM-dd HH:mm" } }
+            month: { date_histogram: { field: d, calendar_interval: 1M, time_zone: "+05:30" } }
+            month_west: { date_histogram: { field: d, calendar_interval: 1M, time_zone: "-01:00", min_doc_count: 1 } }
+            hours: { date_histogram: { field: d, fixed_interval: 6h, time_zone: "+05:30", min_doc_count: 1 } }
+  - match: { aggregations.shifted.buckets.0: { key_as_string: "2017-03-12 02:00", key: 1489264200000, doc_count: 3 } }
+  - match: { aggregations.month.buckets.0: { key_as_string: "2017-03-01T00:00:00.000+05:30", key: 1488306600000, doc_count: 3 } }
+  - match: { aggregations.month.buckets.7: { key_as_string: "2017-10-01T00:00:00.000+05:30", key: 1506796200000, doc_count: 3 } }
+  - match: { aggregations.month.buckets.8: { key_as_string: "2017-11-01T00:00:00.000+05:30", key: 1509474600000, doc_count: 5 } }
+  - match: { aggregations.month_west.buckets.1: { key_as_string: "2017-10-01T00:00:00.000-01:00", key: 1506819600000, doc_count: 4 } }
+  - match: { aggregations.month_west.buckets.2: { key_as_string: "2017-11-01T00:00:00.000-01:00", key: 1509498000000, doc_count: 4 } }
+  - set: { aggregations: stock }
+  - do:
+      search:
+        index: tz_prx
+        body:
+          size: 0
+          aggs:
+            shifted: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "+05:30", offset: "+2h", min_doc_count: 1, format: "yyyy-MM-dd HH:mm" } }
+            month: { date_histogram: { field: d, calendar_interval: 1M, time_zone: "+05:30" } }
+            month_west: { date_histogram: { field: d, calendar_interval: 1M, time_zone: "-01:00", min_doc_count: 1 } }
+            hours: { date_histogram: { field: d, fixed_interval: 6h, time_zone: "+05:30", min_doc_count: 1 } }
+  - match: { aggregations: $stock }
+  - do:
+      search:
+        index: tz_def
+        body:
+          size: 0
+          aggs:
+            shifted: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "+05:30", offset: "+2h", min_doc_count: 1, format: "yyyy-MM-dd HH:mm" } }
+            month: { date_histogram: { field: d, calendar_interval: 1M, time_zone: "+05:30" } }
+            month_west: { date_histogram: { field: d, calendar_interval: 1M, time_zone: "-01:00", min_doc_count: 1 } }
+            hours: { date_histogram: { field: d, fixed_interval: 6h, time_zone: "+05:30", min_doc_count: 1 } }
+  - match: { aggregations: $stock }
+
+---
+"A day, an hour and a month in a zone whose offset changes":
+  - do:
+      search:
+        index: tz_luc
+        body:
+          size: 0
+          aggs:
+            day: { date_histogram: { field: d, calendar_interval: 1d, time_zone: America/New_York, min_doc_count: 1 } }
+            hour:
+              filter: { range: { d: { gte: "2017-11-05T03:00:00Z", lt: "2017-11-05T08:00:00Z" } } }
+              aggs:
+                h: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York } }
+            spring:
+              filter: { range: { d: { gte: "2017-03-12T00:00:00Z", lt: "2017-03-13T00:00:00Z" } } }
+              aggs:
+                h: { date_histogram: { field: d, fixed_interval: 3h, time_zone: America/New_York } }
+            month: { date_histogram: { field: d, calendar_interval: 1M, time_zone: America/New_York, min_doc_count: 1 } }
+  - match: { aggregations.day.buckets.0: { key_as_string: "2017-03-11T00:00:00.000-05:00", key: 1489208400000, doc_count: 1 } }
+  - match: { aggregations.day.buckets.1: { key_as_string: "2017-03-12T00:00:00.000-05:00", key: 1489294800000, doc_count: 2 } }
+  - match: { aggregations.day.buckets.5: { key_as_string: "2017-11-04T00:00:00.000-04:00", key: 1509768000000, doc_count: 1 } }
+  - match: { aggregations.day.buckets.6: { key_as_string: "2017-11-05T00:00:00.000-04:00", key: 1509854400000, doc_count: 3 } }
+  - length: { aggregations.hour.h.buckets: 4 }
+  - match: { aggregations.hour.h.buckets.2: { key_as_string: "2017-11-05T01:00:00.000-04:00", key: 1509858000000, doc_count: 1 } }
+  - match: { aggregations.hour.h.buckets.3: { key_as_string: "2017-11-05T01:00:00.000-05:00", key: 1509861600000, doc_count: 1 } }
+  - set: { aggregations: stock }
+  - do:
+      search:
+        index: tz_prx
+        body:
+          size: 0
+          aggs:
+            day: { date_histogram: { field: d, calendar_interval: 1d, time_zone: America/New_York, min_doc_count: 1 } }
+            hour:
+              filter: { range: { d: { gte: "2017-11-05T03:00:00Z", lt: "2017-11-05T08:00:00Z" } } }
+              aggs:
+                h: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York } }
+            spring:
+              filter: { range: { d: { gte: "2017-03-12T00:00:00Z", lt: "2017-03-13T00:00:00Z" } } }
+              aggs:
+                h: { date_histogram: { field: d, fixed_interval: 3h, time_zone: America/New_York } }
+            month: { date_histogram: { field: d, calendar_interval: 1M, time_zone: America/New_York, min_doc_count: 1 } }
+  - match: { aggregations: $stock }
+  - do:
+      search:
+        index: tz_def
+        body:
+          size: 0
+          aggs:
+            day: { date_histogram: { field: d, calendar_interval: 1d, time_zone: America/New_York, min_doc_count: 1 } }
+            hour:
+              filter: { range: { d: { gte: "2017-11-05T03:00:00Z", lt: "2017-11-05T08:00:00Z" } } }
+              aggs:
+                h: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York } }
+            spring:
+              filter: { range: { d: { gte: "2017-03-12T00:00:00Z", lt: "2017-03-13T00:00:00Z" } } }
+              aggs:
+                h: { date_histogram: { field: d, fixed_interval: 3h, time_zone: America/New_York } }
+            month: { date_histogram: { field: d, calendar_interval: 1M, time_zone: America/New_York, min_doc_count: 1 } }
+  - match: { aggregations: $stock }
+
+---
+"A composite date source buckets in its zone and reads its after key there":
+  - do:
+      search:
+        index: tz_luc
+        body:
+          size: 0
+          query: { range: { d: { gte: "2017-10-01", lt: "2017-11-01" } } }
+          aggs:
+            c:
+              composite:
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "-02:00", format: iso8601 } }
+  - length: { aggregations.c.buckets: 3 }
+  - match: { aggregations.c.buckets.0: { key: { date: "2017-10-20T00:00:00.000-02:00" }, doc_count: 1 } }
+  - match: { aggregations.c.buckets.1: { key: { date: "2017-10-21T00:00:00.000-02:00" }, doc_count: 2 } }
+  - match: { aggregations.c.buckets.2: { key: { date: "2017-10-31T00:00:00.000-02:00" }, doc_count: 1 } }
+  - set: { aggregations: stock }
+  - do:
+      search:
+        index: tz_prx
+        body:
+          size: 0
+          query: { range: { d: { gte: "2017-10-01", lt: "2017-11-01" } } }
+          aggs:
+            c:
+              composite:
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "-02:00", format: iso8601 } }
+  - match: { aggregations: $stock }
+  - do:
+      search:
+        index: tz_def
+        body:
+          size: 0
+          query: { range: { d: { gte: "2017-10-01", lt: "2017-11-01" } } }
+          aggs:
+            c:
+              composite:
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "-02:00", format: iso8601 } }
+  - match: { aggregations: $stock }
+
+  - do:
+      search:
+        index: tz_luc
+        body:
+          size: 0
+          query: { range: { d: { gte: "2017-10-01", lt: "2017-11-01" } } }
+          aggs:
+            c:
+              composite:
+                after: { date: "2017-10-20" }
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "-02:00", format: iso8601 } }
+  - length: { aggregations.c.buckets: 2 }
+  - match: { aggregations.c.buckets.0: { key: { date: "2017-10-21T00:00:00.000-02:00" }, doc_count: 2 } }
+  - set: { aggregations: stock }
+  - do:
+      search:
+        index: tz_prx
+        body:
+          size: 0
+          query: { range: { d: { gte: "2017-10-01", lt: "2017-11-01" } } }
+          aggs:
+            c:
+              composite:
+                after: { date: "2017-10-20" }
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "-02:00", format: iso8601 } }
+  - match: { aggregations: $stock }
+  - do:
+      search:
+        index: tz_def
+        body:
+          size: 0
+          query: { range: { d: { gte: "2017-10-01", lt: "2017-11-01" } } }
+          aggs:
+            c:
+              composite:
+                after: { date: "2017-10-20" }
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "-02:00", format: iso8601 } }
+  - match: { aggregations: $stock }
+
+---
+"A composite date source with an offset, a month, a fixed interval and a zone whose offset changes":
+  - do:
+      search:
+        index: tz_luc
+        body:
+          size: 0
+          aggs:
+            shifted:
+              composite:
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "+05:30", offset: "+2h", format: "yyyy-MM-dd HH:mm" } }
+            month:
+              composite:
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1M, time_zone: "-01:00" } }
+            hours:
+              composite:
+                sources:
+                  - date: { date_histogram: { field: d, fixed_interval: 6h, time_zone: "+05:30", format: "yyyy-MM-dd'T'HH:mmXXX" } }
+            ny:
+              composite:
+                size: 3
+                after: { date: "2017-11-04T23:00" }
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York, format: "yyyy-MM-dd'T'HH:mmXXX||yyyy-MM-dd'T'HH:mm" } }
+  - match: { aggregations.shifted.buckets.0: { key: { date: "2017-03-12 02:00" }, doc_count: 3 } }
+  - match: { aggregations.month.buckets.1: { key: { date: 1506819600000 }, doc_count: 4 } }
+  - match: { aggregations.ny.buckets.0: { key: { date: "2017-11-05T00:00-04:00" }, doc_count: 1 } }
+  - match: { aggregations.ny.buckets.1: { key: { date: "2017-11-05T01:00-04:00" }, doc_count: 1 } }
+  - match: { aggregations.ny.buckets.2: { key: { date: "2017-11-05T01:00-05:00" }, doc_count: 1 } }
+  - match: { aggregations.ny.after_key: { date: "2017-11-05T01:00-05:00" } }
+  - set: { aggregations: stock }
+  - do:
+      search:
+        index: tz_prx
+        body:
+          size: 0
+          aggs:
+            shifted:
+              composite:
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "+05:30", offset: "+2h", format: "yyyy-MM-dd HH:mm" } }
+            month:
+              composite:
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1M, time_zone: "-01:00" } }
+            hours:
+              composite:
+                sources:
+                  - date: { date_histogram: { field: d, fixed_interval: 6h, time_zone: "+05:30", format: "yyyy-MM-dd'T'HH:mmXXX" } }
+            ny:
+              composite:
+                size: 3
+                after: { date: "2017-11-04T23:00" }
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York, format: "yyyy-MM-dd'T'HH:mmXXX||yyyy-MM-dd'T'HH:mm" } }
+  - match: { aggregations: $stock }
+  - do:
+      search:
+        index: tz_def
+        body:
+          size: 0
+          aggs:
+            shifted:
+              composite:
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1d, time_zone: "+05:30", offset: "+2h", format: "yyyy-MM-dd HH:mm" } }
+            month:
+              composite:
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1M, time_zone: "-01:00" } }
+            hours:
+              composite:
+                sources:
+                  - date: { date_histogram: { field: d, fixed_interval: 6h, time_zone: "+05:30", format: "yyyy-MM-dd'T'HH:mmXXX" } }
+            ny:
+              composite:
+                size: 3
+                after: { date: "2017-11-04T23:00" }
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York, format: "yyyy-MM-dd'T'HH:mmXXX||yyyy-MM-dd'T'HH:mm" } }
+  - match: { aggregations: $stock }
+
+---
+"A composite date source with no format reads its after key as epoch milliseconds only":
+  - do:
+      search:
+        index: tz_luc
+        body:
+          size: 0
+          aggs:
+            c:
+              composite:
+                after: { date: "1509854400000" }
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York } }
+  - length: { aggregations.c.buckets: 2 }
+  - match: { aggregations.c.buckets.0: { key: { date: 1509858000000 }, doc_count: 1 } }
+  - match: { aggregations.c.buckets.1: { key: { date: 1509861600000 }, doc_count: 1 } }
+  - set: { aggregations: stock }
+  - do:
+      search:
+        index: tz_prx
+        body:
+          size: 0
+          aggs:
+            c:
+              composite:
+                after: { date: "1509854400000" }
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York } }
+  - match: { aggregations: $stock }
+  - do:
+      search:
+        index: tz_def
+        body:
+          size: 0
+          aggs:
+            c:
+              composite:
+                after: { date: "1509854400000" }
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York } }
+  - match: { aggregations: $stock }
+
+  - do:
+      catch: bad_request
+      search:
+        index: tz_luc
+        body:
+          size: 0
+          aggs:
+            c:
+              composite:
+                after: { date: "2017-11-04T23:00" }
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York } }
+  - do:
+      catch: bad_request
+      search:
+        index: tz_prx
+        body:
+          size: 0
+          aggs:
+            c:
+              composite:
+                after: { date: "2017-11-04T23:00" }
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York } }
+  - do:
+      catch: bad_request
+      search:
+        index: tz_def
+        body:
+          size: 0
+          aggs:
+            c:
+              composite:
+                after: { date: "2017-11-04T23:00" }
+                sources:
+                  - date: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York } }

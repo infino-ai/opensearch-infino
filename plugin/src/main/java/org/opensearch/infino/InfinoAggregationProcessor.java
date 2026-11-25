@@ -2582,8 +2582,11 @@ public class InfinoAggregationProcessor {
         }
     }
 
-    /** One source of a composite aggregation: a key expression and how its values order and print. */
-    /** One source of a composite; {@code rounding} is a date histogram source's buckets, null for any other. */
+    /**
+     * One source of a composite aggregation: a key expression and how its
+     * values order, print and read back as an after key. {@code rounding} is
+     * a date histogram source's buckets, null for any other.
+     */
     record CompositeSource(
         String name,
         Source source,
@@ -2640,7 +2643,7 @@ public class InfinoAggregationProcessor {
                     if (v == null && !s.missingBucket()) {
                         throw new Unsupported("aggregation [" + c.getName() + "] has a null after key for [" + s.name() + "], which has no missing bucket");
                     }
-                    after[i] = v == null ? null : afterLiteral(c.getName(), s, v, now);
+                    after[i] = v == null ? null : afterLiteral(c.getName(), s, v);
                 }
             }
             return new Composite(c, leaves, child, sources, c.size(), after);
@@ -2717,7 +2720,8 @@ public class InfinoAggregationProcessor {
                 DateHistogramInterval calendar = calendarOf(dh);
                 DateHistogramInterval fixed = calendar == null ? dh.getIntervalAsFixed() : null;
                 Grouped.DateExpr expr = Grouped.dateExpr(agg, c, tz, fixed, calendar, dh.offset());
-                // As stock: the key is epoch milliseconds unless the source names a format.
+                // As stock: the key is epoch milliseconds unless the source names a format,
+                // and then it is a date in that format and the source's zone.
                 DocValueFormat format = s.format() == null ? DocValueFormat.RAW : Grouped.dateFormat(s.format(), c, tz);
                 return new CompositeSource(s.name(), c, expr.keyExpr(), KeyKind.DATE, format, desc, s.missingBucket(), missing, expr.rounding());
             }
@@ -2743,11 +2747,20 @@ public class InfinoAggregationProcessor {
         }
 
         /** The after value of a source as an SQL literal, read as the source's key kind. */
-        private static String afterLiteral(String agg, CompositeSource s, Object v, long now) {
+        private static String afterLiteral(String agg, CompositeSource s, Object v) {
             if (s.keyKind() == KeyKind.DATE && v instanceof String text) {
-                Long ms = InfinoQueryTranslator.dateMathMillis(text, null, false, ZoneOffset.UTC, now);
-                if (ms == null) {
-                    throw new Unsupported("aggregation [" + agg + "] has an after key [" + text + "] for [" + s.name() + "] that is not a date");
+                // As stock: the source's format reads the key, so a date with no offset of
+                // its own is local time in the source's zone, a date histogram source with
+                // no format reads epoch milliseconds only, and date math may not use now.
+                long ms;
+                try {
+                    ms = s.format().parseLong(text, false, () -> {
+                        throw new IllegalArgumentException("now() is not supported in [after] key");
+                    });
+                } catch (RuntimeException e) {
+                    throw new Unsupported(
+                        "aggregation [" + agg + "] has an after key [" + text + "] for [" + s.name() + "] that its format does not read: " + e.getMessage()
+                    );
                 }
                 return Grouped.keyLiteral(KeyKind.DATE, ms);
             }
