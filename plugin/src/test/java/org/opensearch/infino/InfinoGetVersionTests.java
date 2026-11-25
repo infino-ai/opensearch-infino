@@ -349,11 +349,11 @@ public class InfinoGetVersionTests extends OpenSearchTestCase {
     public void testAReadOfAShardThatIsNotOpenHereIsUnavailable() {
         InfinoNative.InfinoException notOpen = expectThrows(InfinoNative.InfinoException.class, () -> InfinoEngine.shardReads("os_not_open"));
         assertEquals(RestStatus.SERVICE_UNAVAILABLE, notOpen.status());
-        InfinoNative.InfinoException noCommit = expectThrows(
+        InfinoNative.InfinoException ruleRead = expectThrows(
             InfinoNative.InfinoException.class,
             () -> InfinoEngine.commitForRead("os_not_open", List.of(ID))
         );
-        assertEquals(RestStatus.SERVICE_UNAVAILABLE, noCommit.status());
+        assertEquals(RestStatus.SERVICE_UNAVAILABLE, ruleRead.status());
     }
 
     /** A get that asks for a version meets a conflict, as a stock get does, unless the document is at it. */
