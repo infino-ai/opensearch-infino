@@ -20,6 +20,7 @@ import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.OperationRouting;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.Randomness;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentType;
@@ -42,7 +43,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -551,7 +551,7 @@ final class InfinoSkeletonAdopter {
         void failed(String request, Throwable cause) {
             retried++;
             failedSinceLog++;
-            long wait = backoff / 2 + ThreadLocalRandom.current().nextLong(backoff / 2 + 1);
+            long wait = backoff / 2 + Randomness.get().nextLong(backoff / 2 + 1);
             long now = clock.getAsLong();
             if (!logged || now - loggedAt >= RETRY_LOG_INTERVAL_MILLIS) {
                 log.warn(
