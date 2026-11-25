@@ -1189,10 +1189,10 @@ public class InfinoEngine extends InternalEngine {
      * The version, sequence number and primary term of a document's latest
      * write, as its shard's skeleton holds them and a stock get reports them.
      */
-    record Written(long version, long seqNo, long primaryTerm) {}
+    record WrittenNumbers(long version, long seqNo, long primaryTerm) {}
 
     /**
-     * {@code id}'s {@link Written} in {@code table}'s shard on this node, as
+     * {@code id}'s {@link WrittenNumbers} in {@code table}'s shard on this node, as
      * a stock get reads it: realtime, from the shard's live version map and
      * translog, or from what the latest refresh made visible; null when the
      * shard holds no such document. Read through the engine's own searcher,
@@ -1200,14 +1200,14 @@ public class InfinoEngine extends InternalEngine {
      * the user's document rule, which the skeleton cannot answer (it holds no
      * user field); the plugin applies that rule to the table's row instead.
      */
-    static Written written(String table, String id, boolean realtime) {
+    static WrittenNumbers written(String table, String id, boolean realtime) {
         InfinoEngine engine = BY_TABLE.get(table);
         if (engine == null) {
             throw new IllegalStateException("[infino] the shard of " + table + " is not open on this node");
         }
         Get get = new Get(realtime, true, id, new Term(IdFieldMapper.NAME, Uid.encodeId(id)));
         try (GetResult got = engine.get(get, engine::acquireSearcher)) {
-            return got.exists() ? new Written(got.version(), got.docIdAndVersion().seqNo, got.docIdAndVersion().primaryTerm) : null;
+            return got.exists() ? new WrittenNumbers(got.version(), got.docIdAndVersion().seqNo, got.docIdAndVersion().primaryTerm) : null;
         }
     }
 

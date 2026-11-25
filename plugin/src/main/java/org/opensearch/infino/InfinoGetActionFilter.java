@@ -145,7 +145,7 @@ public class InfinoGetActionFilter implements ActionFilter {
                     refresh(index, table);
                 }
                 InfinoNative.Doc doc;
-                InfinoEngine.Written written = null;
+                InfinoEngine.WrittenNumbers written = null;
                 if (defaultMode) {
                     Read read = reads(table, List.of(get.id()), skeleton(table, get.realtime()), docReader(index, table, access, get.realtime())).get(
                         get.id()
@@ -253,14 +253,14 @@ public class InfinoGetActionFilter implements ActionFilter {
      * for it, which a stock get reports, and {@code doc}, its row (each null
      * when no document is found).
      */
-    record Read(InfinoEngine.Written written, InfinoNative.Doc doc) {}
+    record Read(InfinoEngine.WrittenNumbers written, InfinoNative.Doc doc) {}
 
     /**
-     * How a default-mode get reads an id's {@link InfinoEngine.Written} from
+     * How a default-mode get reads an id's {@link InfinoEngine.WrittenNumbers} from
      * the shard behind {@code table} on this node, realtime or not as the
      * request asks.
      */
-    static Function<String, InfinoEngine.Written> skeleton(String table, boolean realtime) {
+    static Function<String, InfinoEngine.WrittenNumbers> skeleton(String table, boolean realtime) {
         return id -> InfinoEngine.written(table, id, realtime);
     }
 
@@ -312,18 +312,18 @@ public class InfinoGetActionFilter implements ActionFilter {
     static Map<String, Read> reads(
         String table,
         Collection<String> ids,
-        Function<String, InfinoEngine.Written> skeleton,
+        Function<String, InfinoEngine.WrittenNumbers> skeleton,
         Function<Collection<String>, Map<String, InfinoNative.Doc>> docs
     ) {
         Map<String, Read> out = new HashMap<>();
         // Null values stand for a document the skeleton does not hold.
-        Map<String, InfinoEngine.Written> before = new LinkedHashMap<>();
+        Map<String, InfinoEngine.WrittenNumbers> before = new LinkedHashMap<>();
         for (String id : ids) {
             before.put(id, skeleton.apply(id));
         }
         for (int tries = 1; !before.isEmpty(); tries++) {
             List<String> found = new ArrayList<>();
-            for (Map.Entry<String, InfinoEngine.Written> e : before.entrySet()) {
+            for (Map.Entry<String, InfinoEngine.WrittenNumbers> e : before.entrySet()) {
                 if (e.getValue() != null) {
                     InfinoEngine.awaitRecorded(table, e.getKey());
                     found.add(e.getKey());
@@ -332,10 +332,10 @@ public class InfinoGetActionFilter implements ActionFilter {
                 }
             }
             Map<String, InfinoNative.Doc> rows = found.isEmpty() ? Map.of() : docs.apply(found);
-            Map<String, InfinoEngine.Written> moved = new LinkedHashMap<>();
+            Map<String, InfinoEngine.WrittenNumbers> moved = new LinkedHashMap<>();
             for (String id : found) {
                 boolean last = tries == READ_TRIES;
-                InfinoEngine.Written after = last ? null : skeleton.apply(id);
+                InfinoEngine.WrittenNumbers after = last ? null : skeleton.apply(id);
                 if (last || before.get(id).equals(after)) {
                     out.put(id, new Read(before.get(id), rows.get(id)));
                 } else {
@@ -440,7 +440,7 @@ public class InfinoGetActionFilter implements ActionFilter {
         String index,
         String id,
         InfinoNative.Doc doc,
-        InfinoEngine.Written written,
+        InfinoEngine.WrittenNumbers written,
         InfinoAccess access,
         InfinoMappingSource stored,
         FetchSourceContext fetch,

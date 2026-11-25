@@ -40,8 +40,8 @@ public class InfinoGetVersionTests extends OpenSearchTestCase {
     private static final long STORED_SEQ = 0L;
 
     /** What the skeleton holds of a document's latest write at {@code seq} and {@code version}. */
-    private static InfinoEngine.Written found(long seq, long version) {
-        return new InfinoEngine.Written(version, seq, TERM);
+    private static InfinoEngine.WrittenNumbers found(long seq, long version) {
+        return new InfinoEngine.WrittenNumbers(version, seq, TERM);
     }
 
     /** A row of the document holding {@code source}, with the sequence number the table stored beside it. */
@@ -50,8 +50,8 @@ public class InfinoGetVersionTests extends OpenSearchTestCase {
     }
 
     /** The skeleton's answers for the document, one per read, the last repeated once they run out; null for none. */
-    private static Function<String, InfinoEngine.Written> shardAnswering(InfinoEngine.Written... answers) {
-        List<InfinoEngine.Written> left = new ArrayList<>(Arrays.asList(answers));
+    private static Function<String, InfinoEngine.WrittenNumbers> shardAnswering(InfinoEngine.WrittenNumbers... answers) {
+        List<InfinoEngine.WrittenNumbers> left = new ArrayList<>(Arrays.asList(answers));
         return id -> left.size() > 1 ? left.remove(0) : left.get(0);
     }
 
@@ -107,7 +107,7 @@ public class InfinoGetVersionTests extends OpenSearchTestCase {
     /** A document the skeleton does not hold is missing, and its row is not read. */
     public void testADocumentTheShardDoesNotHoldIsMissing() {
         List<List<String>> asked = new ArrayList<>();
-        InfinoGetActionFilter.Read read = InfinoGetActionFilter.reads(TABLE, List.of(ID), shardAnswering((InfinoEngine.Written) null), rowsAnswering(asked, "{}"))
+        InfinoGetActionFilter.Read read = InfinoGetActionFilter.reads(TABLE, List.of(ID), shardAnswering((InfinoEngine.WrittenNumbers) null), rowsAnswering(asked, "{}"))
             .get(ID);
         assertNull(read.doc());
         GetResult got = answer(read);

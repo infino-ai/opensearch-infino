@@ -283,7 +283,7 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             IndexMetadata md = indices.get(item.index());
             InfinoGetActionFilter.Read read = readsOf.containsKey(tableOfItem[i]) ? readsOf.get(tableOfItem[i]).get(item.id()) : null;
             InfinoNative.Doc doc = read != null ? read.doc() : docsOf.get(tableOfItem[i]).get(item.id());
-            InfinoEngine.Written written = read != null ? read.written() : null;
+            InfinoEngine.WrittenNumbers written = read != null ? read.written() : null;
             String routing = InfinoGetActionFilter.routingOf(md, doc);
             GetResponse get = new GetResponse(
                 InfinoGetActionFilter.result(
