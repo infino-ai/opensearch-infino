@@ -9,9 +9,12 @@ import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.apache.lucene.search.join.ScoreMode;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.OpenSearchSecurityException;
+import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.lucene.search.Queries;
+import org.opensearch.common.network.InetAddresses;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateMathParser;
+import org.opensearch.common.unit.Fuzziness;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.bytes.BytesArray;
@@ -56,6 +59,8 @@ import java.io.StringReader;
 import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -126,6 +131,13 @@ final class InfinoQueryTranslator {
      */
     static final String GEN = "osgen";
     /**
+     * The reserved list column holding the paths of a document's fields that OpenSearch's mapper ignored for a
+     * malformed value ({@link InfinoIgnored}), served as {@code _ignored}; null for a document with none.
+     */
+    static final String IGNORED = "osignored";
+    /** The metadata field listing a document's ignored fields. */
+    static final String IGNORED_FIELD = "_ignored";
+    /**
      * What the bridge adds to a field's column name for the list column that
      * holds the field's values for a document that gives it several; the
      * field's own column is then null for that document (a string field's
@@ -133,8 +145,8 @@ final class InfinoQueryTranslator {
      */
     static final String LIST_SUFFIX = "[]";
     /**
-     * What the bridge puts before the name of a field named like {@link #OSID}, {@link #SOURCE} or {@link #SEQ}
-     * for the column holding it: no mapping names a field so.
+     * What the bridge puts before the name of a field named like {@link #OSID}, {@link #SOURCE}, {@link #SEQ} or
+     * {@link #IGNORED} for the column holding it: no mapping names a field so.
      */
     static final String OWN_COLUMN_PREFIX = ".";
     /**
@@ -208,6 +220,10 @@ final class InfinoQueryTranslator {
      * and a hit scores the sum over the clauses it matches (a bool's should
      * clauses). {@code match} is the predicate the query string translated
      * to, every row any clause matches; the ranked clauses read the same rows.
+     * {@code match} is null for a bool's match clauses beside a ranked
+     * principal, each on one column ({@link #summedClauses}): the
+     * translation's predicate and the principal's own keep the rows they
+     * match, and the clauses only score them.
      */
     record Across(List<List<TextClause>> clauses, String match) {
         /** The columns of a clause share its query, and every clause matches any of its words ({@code or}). */
@@ -260,8 +276,9 @@ final class InfinoQueryTranslator {
      * query scores at all (a bool of filter and must_not clauses alone,
      * {@link #scoresNothing}): every hit scores 0, as in stock.
      * {@code across} when a required query string over several text columns
-     * is the one scoring clause: its hits rank by its BM25 across the
-     * columns ({@link Across}), beside {@code offset}.
+     * is the one scoring clause, or when a ranked principal shares the score
+     * with other match clauses: its hits rank by the sum of the clauses'
+     * BM25 ({@link Across}), beside {@code offset}.
      */
     record Scoring(TextClause text, double offset, List<Bonus> bonuses, boolean ascending, boolean unrankable, boolean zero, Across across) {
         static final Scoring NONE = new Scoring(null, 0, List.of());
@@ -555,12 +572,19 @@ final class InfinoQueryTranslator {
         double[] offset = { 0 };
         List<Bonus> bonuses = new ArrayList<>();
         List<TextClause> texts = new ArrayList<>();
+        List<TextClause> summed = new ArrayList<>();
         boolean[] unscored = { false };
+        boolean[] stray = { false };
         if (scoresNothing(root)) {
             return Scoring.ZERO;
         }
-        required(root, offset, bonuses, texts, unscored);
+        required(root, offset, bonuses, texts, summed, unscored, stray);
         TextClause ranked = principalRanks ? principal : null;
+        Across clauses = ranked == null || across != null || stray[0] || !bonuses.isEmpty() ? null : summedClauses(summed);
+        if (clauses != null) {
+            // The principal's BM25 and every other match clause's, summed where each matches.
+            return new Scoring(null, offset[0], List.of(), false, false, false, clauses);
+        }
         if (across != null) {
             if (principal == null && !unscored[0] && texts.isEmpty() && bonuses.isEmpty()) {
                 // The query string's BM25 across its columns is the only score beside the offset.
@@ -582,17 +606,47 @@ final class InfinoQueryTranslator {
         return offset[0] == 0 && bonuses.isEmpty() && text == null ? Scoring.NONE : new Scoring(text, offset[0], List.copyOf(bonuses));
     }
 
-    /** A clause every hit matches: the root, or a must clause of a bool every hit matches. */
-    private void required(QueryBuilder qb, double[] offset, List<Bonus> bonuses, List<TextClause> texts, boolean[] unscored) {
+    /**
+     * A clause every hit matches: the root, or a must clause of a bool every
+     * hit matches. {@code summed} gathers the text clauses whose BM25 the
+     * hits may sum ({@link #summedClauses}), required and optional, null for
+     * one that scores otherwise than plain BM25 ({@link #summable});
+     * {@code stray} is set by a clause that scores and is no text clause,
+     * which no sum of them holds.
+     */
+    private void required(
+        QueryBuilder qb,
+        double[] offset,
+        List<Bonus> bonuses,
+        List<TextClause> texts,
+        List<TextClause> summed,
+        boolean[] unscored,
+        boolean[] stray
+    ) {
         // A bool with no clause is a match_all: it scores its boost (constantScore).
         if (qb instanceof BoolQueryBuilder b && b.hasClauses()) {
+            if (b.boost() != 1f) {
+                // A boosted bool weighs its clauses' sum, which no sum of them keeps.
+                summed.add(null);
+            }
             // A filter or must_not clause scores nothing.
             for (QueryBuilder c : b.must()) {
-                required(c, offset, bonuses, texts, unscored);
+                required(c, offset, bonuses, texts, summed, unscored, stray);
             }
             for (QueryBuilder c : b.should()) {
+                int known = texts.size();
                 if (!optional(c, bonuses, texts)) {
                     unscored[0] = true;
+                    stray[0] = true;
+                } else if (texts.size() == known + 1) {
+                    // An optional clause scores where it matches: all its words
+                    // under operator and, which a sum over any of them would not keep.
+                    TextClause t = texts.get(known);
+                    summed.add(summable(c) && "or".equals(t.mode()) ? t : null);
+                } else if (texts.size() > known) {
+                    // A clause that reads as several text clauses scores as their
+                    // combination, which no plain sum of them keeps.
+                    summed.add(null);
                 }
             }
             return;
@@ -610,6 +664,11 @@ final class InfinoQueryTranslator {
             // other (a text clause on a second column, a query string over
             // several, a script) scores nothing here, where stock scores it.
             TextClause t = textOnly(qb);
+            if (t != null) {
+                summed.add(summable(qb) ? t : null);
+            } else {
+                stray[0] = true;
+            }
             if (t == null || !principalRanks || !t.equals(principal)) {
                 // A query string over several columns ranks across them when it is the one text clause.
                 Across a = principal == null && across == null && qb instanceof QueryStringQueryBuilder qs ? across(qs) : null;
@@ -620,6 +679,47 @@ final class InfinoQueryTranslator {
                 }
             }
         }
+    }
+
+    /**
+     * How the hits rank when a bool's match clauses each score, as Lucene
+     * sums a bool's scoring clauses: the ranked principal and the other
+     * text clauses in {@code summed} (required ones, which the predicate
+     * keeps, and optional ones, which score where they match), each on its
+     * one column ({@link Across}). Null when the principal's BM25 alone is
+     * the score: no other text clause, one that scores otherwise
+     * ({@link #summable}), one past plain words or the principal's own
+     * predicate ({@link #plainQuery}), or past {@link #MAX_ACROSS_SEARCHES}.
+     * A clause scores in {@code or}: within the rows a required clause's
+     * predicate keeps, all of its words, the sum is the same.
+     */
+    private Across summedClauses(List<TextClause> summed) {
+        List<TextClause> others = new ArrayList<>(summed);
+        if (others.contains(null) || !others.remove(principal) || others.isEmpty() || summed.size() > MAX_ACROSS_SEARCHES) {
+            return null;
+        }
+        others.add(0, principal);
+        List<List<TextClause>> clauses = new ArrayList<>();
+        for (TextClause t : others) {
+            if (!plainQuery(t.query())) {
+                return null;
+            }
+            clauses.add(List.of(new TextClause(t.column(), t.query(), "or")));
+        }
+        return new Across(List.copyOf(clauses), null);
+    }
+
+    /**
+     * Whether {@code qb} scores as the plain BM25 of its words: a match with
+     * boost 1 and no option that changes which words it reads or how they
+     * score (minimum_should_match, fuzziness, an analyzer).
+     */
+    private static boolean summable(QueryBuilder qb) {
+        return qb instanceof MatchQueryBuilder m
+            && m.boost() == 1f
+            && m.minimumShouldMatch() == null
+            && m.fuzziness() == null
+            && m.analyzer() == null;
     }
 
     /** How a query string's JSON names its default type, best_fields: the builder has no getter for it. */
@@ -1182,7 +1282,7 @@ final class InfinoQueryTranslator {
         List<String> present = new ArrayList<>();
         for (Column sub : cols.values()) {
             String name = sub.name();
-            if (name.equals(OSID) || name.equals(SOURCE) || name.equals(SEQ)) {
+            if (name.equals(OSID) || name.equals(SOURCE) || name.equals(SEQ) || name.equals(IGNORED)) {
                 continue;
             }
             String held = fieldOf(name);
@@ -1197,7 +1297,8 @@ final class InfinoQueryTranslator {
      * The rows an exists on a metadata field matches, as stock's: every
      * document has an {@code _id}, {@code _index}, {@code _seq_no} and
      * {@code _version}; {@code _routing} is the documents written with a
-     * routing value, which only a default-mode table keeps. {@code _source}
+     * routing value, which only a default-mode table keeps; {@code _ignored}
+     * is the documents with a field the mapper ignored. {@code _source}
      * cannot be searched, and stock says so. Null for any other field.
      */
     private String metadataExists(String field) {
@@ -1210,6 +1311,9 @@ final class InfinoQueryTranslator {
                     throw new IllegalArgumentException("[infino] exists on [_routing] is not served: the table keeps no routing values");
                 }
                 return quoteIdent(ROUTING) + " IS NOT NULL";
+            }
+            case IGNORED_FIELD -> {
+                return ignoredColumn(cols) == null ? NONE : quoteIdent(IGNORED) + " IS NOT NULL";
             }
             case "_source" -> throw new QueryShardException((Index) null, "The _source field is not searchable", (Throwable) null);
             default -> {
@@ -1237,17 +1341,19 @@ final class InfinoQueryTranslator {
      * on such a column: one the engine applies above a ranked search, so the
      * rows it removes go after the ranking. A string literal that happens to
      * hold the same text only costs that search a wider candidate window.
+     * The summed search of several text clauses ({@link Across}) takes a
+     * text_match into the rows it ranks; only {@link #joinsById} falls after it.
      */
     static boolean joinsAfterRanking(String predicate) {
-        return predicate.contains(ID_SUBQUERY) || predicate.contains(TEXT_PREDICATE);
+        return joinsById(predicate) || predicate.contains(TEXT_PREDICATE);
     }
 
     /**
      * Whether a predicate holds a subquery by id (a text clause the token
      * index answers, or a field's list values), which the engine plans as a
-     * join that reads the whole table before it returns a row. A string
-     * literal that happens to hold the same text only costs a page an order
-     * by row id.
+     * join that reads the whole table before it returns a row, and joins to
+     * the rows above any search it ranks. A string literal that happens to
+     * hold the same text only costs a page an order by row id.
      */
     static boolean joinsById(String predicate) {
         return predicate.contains(ID_SUBQUERY);
@@ -1290,6 +1396,7 @@ final class InfinoQueryTranslator {
             return equality(t.fieldName(), t.value());
         }
         if (qb instanceof TermsQueryBuilder ts) {
+            refuseBitmap(ts);
             if (ts.termsLookup() != null) {
                 if (!trusted) {
                     throw new IllegalArgumentException("[infino] a terms lookup into [" + ts.termsLookup().index() + "] is not served by the table");
@@ -1351,6 +1458,7 @@ final class InfinoQueryTranslator {
             return OSID + " IN (" + String.join(", ", lits) + ")";
         }
         if (qb instanceof MatchQueryBuilder m) {
+            unfuzzy("match", m.fieldName(), m.fuzziness());
             return text(m.fieldName(), String.valueOf(m.value()), m.operator(), positive);
         }
         if (qb instanceof MatchPhraseQueryBuilder mp) {
@@ -1365,6 +1473,7 @@ final class InfinoQueryTranslator {
                     "[infino] multi_match of type [" + mm.type().parseField().getPreferredName() + "] is not served"
                 );
             }
+            unfuzzy("multi_match", String.join(", ", mm.fields().keySet()), mm.fuzziness());
             boolean asPhrase = mm.type() == MultiMatchQueryBuilder.Type.PHRASE;
             return textOnFields(new ArrayList<>(mm.fields().keySet()), String.valueOf(mm.value()), mm.operator(), positive, asPhrase, true);
         }
@@ -1715,6 +1824,7 @@ final class InfinoQueryTranslator {
             return scoring(entryValue(t.fieldName(), qb, path, scope, (c, v) -> sameValue(c, v, q)), qb.boost());
         }
         if (qb instanceof TermsQueryBuilder ts) {
+            refuseBitmap(ts);
             if (ts.termsLookup() != null) {
                 throw notInNested(qb, path, "a terms lookup");
             }
@@ -1730,6 +1840,7 @@ final class InfinoQueryTranslator {
         }
         if (qb instanceof MatchQueryBuilder m) {
             // A match on an exact field is an equality, as the translator reads it elsewhere.
+            unfuzzy("match", m.fieldName(), m.fuzziness());
             Object q = m.value();
             return scoring(entryValue(m.fieldName(), qb, path, scope, (c, v) -> sameValue(c, v, q)), qb.boost());
         }
@@ -1807,6 +1918,13 @@ final class InfinoQueryTranslator {
             return e -> combined(mode, entries(e, sub), score) * boost;
         }
         throw notInNested(qb, path, null);
+    }
+
+    /** Refuse a terms query whose one value is a serialized bitmap of the terms, which the table does not decode. */
+    private static void refuseBitmap(TermsQueryBuilder ts) {
+        if (ts.valueType() == TermsQueryBuilder.ValueType.BITMAP) {
+            throw new IllegalArgumentException("[infino] a terms query on [" + ts.fieldName() + "] with value_type [bitmap] is not served by the table");
+        }
     }
 
     /** The refusal of a clause inside a nested query the entry check does not read. */
@@ -1952,8 +2070,16 @@ final class InfinoQueryTranslator {
         if (v == null || q == null) {
             return false;
         }
+        if (isCidr(c, q)) {
+            return inBlock(v.toString(), q.toString());
+        }
         if (c.isString()) {
             return v.toString().equals(q.toString());
+        }
+        if (c.isNumeric() && c.fieldType() != null && c.fieldType().rounds()) {
+            Double a = kept(c, v);
+            Double b = kept(c, q);
+            return a != null && b != null && a.doubleValue() == b.doubleValue();
         }
         if (c.isNumeric()) {
             BigDecimal a = indexed(c, v);
@@ -1975,6 +2101,12 @@ final class InfinoQueryTranslator {
         if (c.isString()) {
             byte[] x = v.toString().getBytes(StandardCharsets.UTF_8);
             return within(r, b -> Arrays.compareUnsigned(x, b.toString().getBytes(StandardCharsets.UTF_8)));
+        }
+        if (c.isNumeric() && c.fieldType() != null && c.fieldType().rounds()) {
+            Double x = kept(c, v);
+            return x != null
+                && (r.from() == null || x >= c.fieldType().lower(r.from(), r.includeLower()))
+                && (r.to() == null || x <= c.fieldType().upper(r.to(), r.includeUpper()));
         }
         if (c.isNumeric()) {
             BigDecimal x = indexed(c, v);
@@ -2013,6 +2145,93 @@ final class InfinoQueryTranslator {
     private static BigDecimal indexed(Column c, Object v) {
         BigDecimal d = decimal(v);
         return d != null && "i64".equals(c.type()) ? d.setScale(0, RoundingMode.DOWN) : d;
+    }
+
+    /** A source value as a float, half_float or scaled_float field keeps it; null for one that is not a number. */
+    private static Double kept(Column c, Object v) {
+        if (v instanceof Map<?, ?> || v instanceof List<?> || v instanceof Boolean) {
+            return null;
+        }
+        try {
+            return c.fieldType().kept(v);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    /** Whether {@code value}, in a term on {@code c}, is a CIDR block: on an ip field, text with a prefix length. */
+    private static boolean isCidr(Column c, Object value) {
+        InfinoNative.FieldType type = c.element().fieldType();
+        return type != null && type.isIp() && value != null && value.toString().indexOf('/') >= 0;
+    }
+
+    /**
+     * The test a CIDR block in a term on the ip field {@code field} makes of
+     * a value of its column, which holds each address as written: whether
+     * it lies in the block, as stock reads such a term (the addresses the
+     * block covers, its host bits ignored). An IPv4 address is written as
+     * four decimal octets, so the block is a prefix of that text: its whole
+     * octets as written, then a partial octet as the values it allows. An
+     * IPv6 block is refused: an IPv6 address has several textual forms
+     * (zeros compressed or not, an embedded IPv4 tail), so no pattern over
+     * the text finds every address in the block.
+     */
+    static Function<String, String> cidr(String field, String block) {
+        // A malformed block is refused with stock's message.
+        Tuple<InetAddress, Integer> parsed = InetAddresses.parseCidr(block);
+        if (!(parsed.v1() instanceof Inet4Address)) {
+            throw new IllegalArgumentException("[infino] a term with the IPv6 CIDR block [" + block + "] on [" + field + "] is not served");
+        }
+        byte[] address = parsed.v1().getAddress();
+        int bits = parsed.v2();
+        if (bits == 0) {
+            return v -> v + " NOT LIKE '%:%'";
+        }
+        StringBuilder whole = new StringBuilder();
+        for (int i = 0; i < bits / 8; i++) {
+            whole.append(address[i] & 0xff).append('.');
+        }
+        if (bits == 32) {
+            String lit = literal(whole.substring(0, whole.length() - 1));
+            return v -> v + " = " + lit;
+        }
+        if (bits % 8 == 0) {
+            String lit = literal(whole + "%");
+            return v -> v + " LIKE " + lit;
+        }
+        int octet = bits / 8;
+        int free = 8 - bits % 8;
+        int first = (address[octet] & 0xff) >> free << free;
+        List<String> allowed = new ArrayList<>(1 << free);
+        for (int i = 0; i < 1 << free; i++) {
+            allowed.add(Integer.toString(first + i));
+        }
+        String pattern = "^" + whole.toString().replace(".", "\\.") + "(?:" + String.join("|", allowed) + ")" + (octet < 3 ? "\\." : "$");
+        String lit = literal(pattern);
+        return v -> "regexp_like(" + v + ", " + lit + ")";
+    }
+
+    /** Whether the address {@code address} lies in the CIDR block {@code block}; false for text that is not an address. */
+    private static boolean inBlock(String address, String block) {
+        Tuple<InetAddress, Integer> parsed = InetAddresses.parseCidr(block);
+        byte[] net = parsed.v1().getAddress();
+        byte[] ip;
+        try {
+            ip = InetAddresses.forString(address).getAddress();
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+        if (ip.length != net.length) {
+            return false;
+        }
+        int bits = parsed.v2();
+        for (int i = 0; i < net.length && bits > 0; i++, bits -= 8) {
+            int mask = bits >= 8 ? 0xff : 0xff << (8 - bits) & 0xff;
+            if ((ip[i] & mask) != (net[i] & mask)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static BigDecimal decimal(Object v) {
@@ -3064,15 +3283,34 @@ final class InfinoQueryTranslator {
         return equality(a.field(), a.text());
     }
 
+    /**
+     * Refuses a match that asks for fuzziness: the table matches a query's
+     * terms as written, so a misspelled term would find nothing where stock
+     * finds its near matches. A fuzziness of 0 asks for none.
+     */
+    private static void unfuzzy(String query, String fields, Fuzziness fuzziness) {
+        if (fuzziness != null && !Fuzziness.ZERO.asString().equals(fuzziness.asString())) {
+            throw new IllegalArgumentException(
+                "[infino] " + query + " on [" + fields + "] asks for fuzziness [" + fuzziness.asString() + "], which is not served"
+            );
+        }
+    }
+
     // ---- scalars ----
 
     private String equality(String field, Object value) {
         if ("_id".equals(field)) {
             return value == null ? NONE : OSID + " = " + literal(String.valueOf(value));
         }
+        if (IGNORED_FIELD.equals(field)) {
+            return value == null ? NONE : ignoredHas(" = " + literal(String.valueOf(value)));
+        }
         Column c = column(field);
         if (c == null || value == null) {
             return c == null ? NONE : null;
+        }
+        if (isCidr(c, value)) {
+            return anyValue(c, cidr(field, value.toString()));
         }
         String lit = scalar(c.element(), value, false);
         return lit == null ? null : anyValue(c, v -> v + " = " + lit);
@@ -3086,12 +3324,41 @@ final class InfinoQueryTranslator {
             }
             return OSID + " IN (" + String.join(", ", ids) + ")";
         }
+        if (IGNORED_FIELD.equals(field)) {
+            if (values == null || values.isEmpty()) {
+                return NONE;
+            }
+            List<String> paths = new ArrayList<>();
+            for (Object v : values) {
+                paths.add(literal(String.valueOf(v)));
+            }
+            return ignoredHas(" IN (" + String.join(", ", paths) + ")");
+        }
         Column c = column(field);
         if (c == null) {
             return NONE;
         }
         if (values == null || values.isEmpty()) {
             return NONE;
+        }
+        if (values.stream().anyMatch(v -> isCidr(c, v))) {
+            // Each value its own test, a block's addresses or one address, any of them a match.
+            List<Function<String, String>> tests = new ArrayList<>();
+            for (Object v : values) {
+                if (isCidr(c, v)) {
+                    tests.add(cidr(field, v.toString()));
+                } else if (v != null) {
+                    String lit = scalar(c.element(), v, false);
+                    tests.add(x -> x + " = " + lit);
+                }
+            }
+            return anyValue(c, x -> {
+                List<String> any = new ArrayList<>(tests.size());
+                for (Function<String, String> test : tests) {
+                    any.add(test.apply(x));
+                }
+                return "(" + String.join(" OR ", any) + ")";
+            });
         }
         List<String> lits = new ArrayList<>();
         for (Object v : values) {
@@ -3103,6 +3370,35 @@ final class InfinoQueryTranslator {
         }
         String in = " IN (" + String.join(", ", lits) + ")";
         return anyValue(c, v -> v + in);
+    }
+
+    /**
+     * The rows whose ignored fields include a path {@code test} (an SQL
+     * comparison of it) holds for; null, as for any list column, where the
+     * clause may only compare column values ({@link #columnValuesOnly}).
+     */
+    private String ignoredHas(String test) {
+        if (ignoredColumn(cols) == null) {
+            return NONE;
+        }
+        return columnValuesOnly ? null : anyValue(table, null, quoteIdent(IGNORED), v -> v + test);
+    }
+
+    /**
+     * The table's {@link #IGNORED} column, or null when no document has had a
+     * field ignored: the column is added with the first. A document field of
+     * that name is not it ({@link #OWN_COLUMN_PREFIX}), nor is a column that
+     * holds no list.
+     */
+    static Column ignoredColumn(Map<String, Column> cols) {
+        Column c = cols.get(IGNORED);
+        return c != null && c.name().equals(IGNORED) && c.isList() ? c : null;
+    }
+
+    /** The select item reading the {@link #IGNORED} column as one string, a path per line ({@link InfinoIgnored#SEPARATOR}). */
+    static String ignoredPaths() {
+        String column = quoteIdent(IGNORED);
+        return "array_to_string(" + column + ", chr(10)) AS " + column;
     }
 
     private String range(RangeQueryBuilder r) {
@@ -3119,7 +3415,41 @@ final class InfinoQueryTranslator {
         ZoneId zone = r.timeZone() == null ? null : ZoneId.of(r.timeZone());
         // A date bound is read as OpenSearch reads it: in the request's format, else the field's own.
         String format = r.format() != null ? r.format() : typed.dateFormat();
-        if (r.from() != null) {
+        InfinoNative.FieldType rounded = typed.isNumeric() && typed.fieldType() != null && typed.fieldType().rounds() ? typed.fieldType() : null;
+        if (rounded != null) {
+            // Each bound as the kept value it admits, inclusive, as stock reads a float, half_float
+            // or scaled_float range; an infinite one admits every value or none.
+            double lower;
+            double upper;
+            try {
+                lower = r.from() == null ? Double.NEGATIVE_INFINITY : rounded.lower(r.from(), r.includeLower());
+                upper = r.to() == null ? Double.POSITIVE_INFINITY : rounded.upper(r.to(), r.includeUpper());
+            } catch (IllegalArgumentException e) {
+                // A bound that is not a number, as for any other numeric field.
+                return null;
+            }
+            if (r.from() != null) {
+                if (lower == Double.POSITIVE_INFINITY) {
+                    return NONE;
+                }
+                if (lower != Double.NEGATIVE_INFINITY) {
+                    bounds.add(" >= " + number(lower));
+                }
+            }
+            if (r.to() != null) {
+                if (upper == Double.NEGATIVE_INFINITY) {
+                    return NONE;
+                }
+                if (upper != Double.POSITIVE_INFINITY) {
+                    bounds.add(" <= " + number(upper));
+                }
+            }
+            if (bounds.isEmpty() && (r.from() != null || r.to() != null)) {
+                // Bounds past every finite value still ask for a value.
+                bounds.add(" IS NOT NULL");
+            }
+        }
+        if (rounded == null && r.from() != null) {
             // An exclusive lower date bound rounds up (gt 2026-10-24 means after that day).
             String lit = typed.isTimestamp() ? dateBound(r.from(), format, !r.includeLower(), zone) : scalar(typed, r.from(), false);
             if (lit == null) {
@@ -3127,7 +3457,7 @@ final class InfinoQueryTranslator {
             }
             bounds.add((r.includeLower() ? " >= " : " > ") + lit);
         }
-        if (r.to() != null) {
+        if (rounded == null && r.to() != null) {
             String lit = typed.isTimestamp() ? dateBound(r.to(), format, r.includeUpper(), zone) : scalar(typed, r.to(), false);
             if (lit == null) {
                 return null;
@@ -3277,6 +3607,11 @@ final class InfinoQueryTranslator {
             return Boolean.parseBoolean(value.toString()) ? "true" : "false";
         }
         if (c.isNumeric()) {
+            if (c.fieldType() != null && c.fieldType().rounds()) {
+                // A float, half_float or scaled_float field compares the value as it keeps it, rounded.
+                Double kept = kept(c, value);
+                return kept == null ? null : number(kept);
+            }
             return number(value);
         }
         if (c.isTimestamp()) {

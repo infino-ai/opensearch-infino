@@ -184,9 +184,9 @@ public class InfinoAggregationProcessor {
      * each bucket reads its own.
      */
     private static final int MAX_BATCHED_FOREGROUND_ROWS = 100_000;
-    /** The earliest and latest epoch milliseconds date_bin can take: it works in nanoseconds, in an i64. */
-    private static final long DATE_BIN_MIN_MILLIS = Long.MIN_VALUE / 1_000_000L;
-    private static final long DATE_BIN_MAX_MILLIS = Long.MAX_VALUE / 1_000_000L;
+    /** The earliest and latest epoch milliseconds a nanosecond timestamp in an i64 holds: what date_bin works in, and what date text is read as. */
+    private static final long NANOS_MIN_MILLIS = Long.MIN_VALUE / 1_000_000L;
+    private static final long NANOS_MAX_MILLIS = Long.MAX_VALUE / 1_000_000L;
     /** The Arrow type of a date in UTC epoch milliseconds, as a cast names it: what a date key is computed in. */
     private static final String UTC_MILLIS = "'Timestamp(Millisecond, Some(\"UTC\"))'";
     /** The Arrow type a mapped date's column holds, which a date the index does not map is read as. */
@@ -281,8 +281,9 @@ public class InfinoAggregationProcessor {
 
     /**
      * For a statement of {@link #readAhead} whose groups were read with the
-     * foreground ({@link #fusedTopTerms}), the count of every group with a
-     * key: those groups are the level's best only, picked however many.
+     * foreground ({@link #fusedTopTerms}) or picked by the engine
+     * ({@link #topValueCounts}), the count of every group with a key: those
+     * groups are the level's best only, picked however many.
      */
     private final Map<String, Long> fusedKeyedTotals = new HashMap<>();
 
@@ -395,6 +396,19 @@ public class InfinoAggregationProcessor {
             throw new Unsupported("aggregation [" + f.getName() + "] has a filter the table cannot answer: " + f.getFilter());
         }
         return p;
+    }
+
+    /**
+     * Refuses an aggregation on a field whose column does not hold the values
+     * it aggregates: a keyword whose normalizer changes the indexed terms, which
+     * the table keeps as written, so buckets would group the written values; or
+     * a multi-field the table keeps no column of.
+     */
+    static void refuseUnserved(String what, String table, String field) {
+        String why = InfinoNative.unservedField(table, field);
+        if (why != null) {
+            throw new Unsupported(what + " on [" + field + "], " + why + ", is not served");
+        }
     }
 
     /** An aggregation the table cannot serve; the request fails with this reason. */
@@ -828,6 +842,7 @@ public class InfinoAggregationProcessor {
         static Source sourceOf(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols, String table, long now) {
             Column c = null;
             if (b.field() != null) {
+                refuseUnserved("aggregation [" + b.getName() + "]", table, b.field());
                 c = InfinoSearch.columnFor(cols, b.field());
                 if (c == null) {
                     if (!InfinoNative.maps(table, b.field())) {
@@ -864,12 +879,27 @@ public class InfinoAggregationProcessor {
             if (source.masked()) {
                 throw new Unsupported("aggregation [" + b.getName() + "] has [missing] over " + source.label() + ", a field masked for this user");
             }
-            String literal = InfinoQueryTranslator.literalForType(source.type(), b.missing(), now);
+            String literal = source.type() == SqlType.DATE
+                ? missingDate(b, source, now)
+                : InfinoQueryTranslator.literalForType(source.type(), b.missing(), now);
             if (literal == null) {
                 throw new Unsupported("aggregation [" + b.getName() + "] has [missing: " + b.missing() + "], which " + source.label() + " cannot hold");
             }
             // No column: the fast paths that read a column's own values would skip the stand-in.
             return new Source("COALESCE(" + source.expr() + ", " + literal + ")", source.type(), source.label(), null, null, source.dateFormat(), null, source.onlyWhere());
+        }
+
+        /**
+         * The aggregation's {@code missing} date as a value of a date column's type, read as
+         * stock reads it: as text in the aggregation's format (else the field's) and time zone,
+         * with date math, so an {@code epoch_second} field's {@code 0} is the epoch. Null when
+         * it is not a date. A typed value, not text: {@code COALESCE} does not cast text to a
+         * timestamp as a comparison does.
+         */
+        static String missingDate(ValuesSourceAggregationBuilder<?> b, Source source, long now) {
+            ZoneId tz = b.timeZone() == null ? ZoneOffset.UTC : b.timeZone();
+            Long ms = InfinoQueryTranslator.dateMathMillis(b.missing().toString(), Grouped.dateFormatName(b.format(), source), false, tz, now);
+            return ms == null ? null : "arrow_cast(" + ms + ", " + UTC_MILLIS + ")";
         }
 
         /** The type an aggregation reads an unmapped field as: what its values would have been. */
@@ -1509,7 +1539,7 @@ public class InfinoAggregationProcessor {
             );
         }
 
-        /** The columns a hit row carries beyond the id and the source. */
+        /** The columns a hit row carries beyond the id and the source: its sort values and its ignored fields. */
         List<String> rowColumns() {
             List<String> out = new ArrayList<>();
             for (SortSpec s : sorts) {
@@ -1517,6 +1547,9 @@ public class InfinoAggregationProcessor {
                     continue; // the id is selected already
                 }
                 out.add(s.expr() + " AS " + quoteIdent(s.name()));
+            }
+            if (InfinoQueryTranslator.ignoredColumn(cols) != null) {
+                out.add(InfinoQueryTranslator.ignoredPaths());
             }
             return out;
         }
@@ -1923,8 +1956,8 @@ public class InfinoAggregationProcessor {
             String origin = offset == 0 ? "" : ", TIMESTAMP '1970-01-01T00:00:00Z' + INTERVAL '" + offset + " milliseconds'";
             String binned = "date_bin(INTERVAL '" + ms + " milliseconds', " + millis + origin + ")";
             long margin = ms + (offset < 0 ? -offset : offset);
-            long lo = DATE_BIN_MIN_MILLIS + margin;
-            long hi = DATE_BIN_MAX_MILLIS - margin;
+            long lo = NANOS_MIN_MILLIS + margin;
+            long hi = NANOS_MAX_MILLIS - margin;
             String epoch = "arrow_cast(" + millis + ", 'Int64')";
             String shifted = "(" + epoch + " - (" + offset + "))";
             String floored = "arrow_cast(" + shifted + " - ((" + shifted + " % " + ms + ") + " + ms + ") % " + ms + " + (" + offset + "), "
@@ -2223,18 +2256,35 @@ public class InfinoAggregationProcessor {
             return new Explicit(f, leaves, child, ExplicitKind.FILTERS, buckets, f.isKeyed(), DocValueFormat.RAW);
         }
 
+        /** Range buckets in stock's order: by {@code from}, then {@code to}, ties as requested (the sort is stable). */
+        static final Comparator<ExplicitBucket> BY_BOUNDS = Comparator.comparingDouble(ExplicitBucket::from).thenComparingDouble(ExplicitBucket::to);
+
         static Explicit range(RangeAggregationBuilder r, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child, long now) {
             Source c = sourceOf(r, cols, table, now);
             if (!c.isNumeric()) {
                 throw new Unsupported("aggregation [" + r.getName() + "] needs a numeric value, " + c.label() + " is " + c.typeName());
             }
+            DocValueFormat format = r.format() == null ? DocValueFormat.RAW : new DocValueFormat.Decimal(r.format());
             List<ExplicitBucket> buckets = new ArrayList<>();
             for (RangeAggregator.Range range : r.ranges()) {
-                double from = range.getFrom();
-                double to = range.getTo();
+                double from = number(range.getFromAsString(), range.getFrom(), format, now, r.getName());
+                double to = number(range.getToAsString(), range.getTo(), format, now, r.getName());
                 buckets.add(new ExplicitBucket(range.getKey(), between(c, from, to), from, to));
             }
+            buckets.sort(BY_BOUNDS);
             return new Explicit(r, leaves, child, ExplicitKind.RANGE, buckets, r.keyed(), DocValueFormat.RAW);
+        }
+
+        /** A range bound as stock reads it: the string, in the aggregation's format, when given, else the number. */
+        private static double number(String asString, double asNumber, DocValueFormat format, long now, String agg) {
+            if (asString == null) {
+                return asNumber;
+            }
+            try {
+                return format.parseDouble(asString, false, () -> now);
+            } catch (RuntimeException e) {
+                throw new Unsupported("aggregation [" + agg + "] has a bound [" + asString + "] that is not a number");
+            }
         }
 
         static Explicit dateRange(DateRangeAggregationBuilder r, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child, long now) {
@@ -2252,6 +2302,7 @@ public class InfinoAggregationProcessor {
                 double to = bound(range.getToAsString(), range.getTo(), fmt, false, tz, now, r.getName());
                 buckets.add(new ExplicitBucket(range.getKey(), between(c, from, to), from, to));
             }
+            buckets.sort(BY_BOUNDS);
             return new Explicit(r, leaves, child, ExplicitKind.DATE_RANGE, buckets, r.keyed(), format);
         }
 
@@ -2295,9 +2346,12 @@ public class InfinoAggregationProcessor {
             });
         }
 
-        private static String bound(Source c, double v) {
+        static String bound(Source c, double v) {
             if (c.isTimestamp()) {
-                return literal(Instant.ofEpochMilli((long) v).toString());
+                long ms = (long) v;
+                // Text is read as a nanosecond timestamp, which holds only 1677 to 2262; the
+                // epoch value as a millisecond timestamp reads any instant the same.
+                return ms > NANOS_MIN_MILLIS && ms < NANOS_MAX_MILLIS ? literal(Instant.ofEpochMilli(ms).toString()) : "arrow_cast(" + ms + ", " + UTC_MILLIS + ")";
             }
             return v == Math.rint(v) && Math.abs(v) < 9.0e15 ? Long.toString((long) v) : Double.toString(v);
         }
@@ -2564,8 +2618,11 @@ public class InfinoAggregationProcessor {
         }
     }
 
-    /** One source of a composite aggregation: a key expression and how its values order and print. */
-    /** One source of a composite; {@code rounding} is a date histogram source's buckets, null for any other. */
+    /**
+     * One source of a composite aggregation: a key expression and how its
+     * values order, print and read back as an after key. {@code rounding} is
+     * a date histogram source's buckets, null for any other.
+     */
     record CompositeSource(
         String name,
         Source source,
@@ -2622,7 +2679,7 @@ public class InfinoAggregationProcessor {
                     if (v == null && !s.missingBucket()) {
                         throw new Unsupported("aggregation [" + c.getName() + "] has a null after key for [" + s.name() + "], which has no missing bucket");
                     }
-                    after[i] = v == null ? null : afterLiteral(c.getName(), s, v, now);
+                    after[i] = v == null ? null : afterLiteral(c.getName(), s, v);
                 }
             }
             return new Composite(c, leaves, child, sources, c.size(), after);
@@ -2652,6 +2709,7 @@ public class InfinoAggregationProcessor {
             Column column = null;
             Source unmapped = null;
             if (s.field() != null) {
+                refuseUnserved("aggregation [" + agg + "] source [" + s.name() + "]", table, s.field());
                 column = InfinoSearch.columnFor(cols, s.field());
                 if (column == null && !InfinoNative.maps(table, s.field())) {
                     // As for any aggregation: a field the index does not map has no value here.
@@ -2698,7 +2756,8 @@ public class InfinoAggregationProcessor {
                 DateHistogramInterval calendar = calendarOf(dh);
                 DateHistogramInterval fixed = calendar == null ? dh.getIntervalAsFixed() : null;
                 Grouped.DateExpr expr = Grouped.dateExpr(agg, c, tz, fixed, calendar, dh.offset());
-                // As stock: the key is epoch milliseconds unless the source names a format.
+                // As stock: the key is epoch milliseconds unless the source names a format,
+                // and then it is a date in that format and the source's zone.
                 DocValueFormat format = s.format() == null ? DocValueFormat.RAW : Grouped.dateFormat(s.format(), c, tz);
                 return new CompositeSource(s.name(), c, expr.keyExpr(), KeyKind.DATE, format, desc, s.missingBucket(), missing, expr.rounding());
             }
@@ -2724,11 +2783,20 @@ public class InfinoAggregationProcessor {
         }
 
         /** The after value of a source as an SQL literal, read as the source's key kind. */
-        private static String afterLiteral(String agg, CompositeSource s, Object v, long now) {
+        private static String afterLiteral(String agg, CompositeSource s, Object v) {
             if (s.keyKind() == KeyKind.DATE && v instanceof String text) {
-                Long ms = InfinoQueryTranslator.dateMathMillis(text, null, false, ZoneOffset.UTC, now);
-                if (ms == null) {
-                    throw new Unsupported("aggregation [" + agg + "] has an after key [" + text + "] for [" + s.name() + "] that is not a date");
+                // As stock: the source's format reads the key, so a date with no offset of
+                // its own is local time in the source's zone, a date histogram source with
+                // no format reads epoch milliseconds only, and date math may not use now.
+                long ms;
+                try {
+                    ms = s.format().parseLong(text, false, () -> {
+                        throw new IllegalArgumentException("now() is not supported in [after] key");
+                    });
+                } catch (RuntimeException e) {
+                    throw new Unsupported(
+                        "aggregation [" + agg + "] has an after key [" + text + "] for [" + s.name() + "] that its format does not read: " + e.getMessage()
+                    );
                 }
                 return Grouped.keyLiteral(KeyKind.DATE, ms);
             }
@@ -4131,6 +4199,10 @@ public class InfinoAggregationProcessor {
         }
         List<Map<String, Object>> groups;
         if (readsValueCounts(level, q)) {
+            Long topTotal = topValueCounts(level, q, picked);
+            if (topTotal != null) {
+                return topTotal;
+            }
             groups = valueCounts(level, q);
         } else {
             groups = InfinoNative.sqlRows(levelInner(chain, 0, q.from(), q.where(), "", false) + " LIMIT " + (MAX_GROUPS_PICKED_HERE + 2));
@@ -4215,6 +4287,80 @@ public class InfinoAggregationProcessor {
     }
 
     /**
+     * The request's total and a top terms level's best groups over the whole
+     * table in one engine call ({@link InfinoNative#valueCountsTop}), however
+     * many values the column has: the engine counts a keyword column's values
+     * from its term index, keeps the level's first
+     * {@code size} in its order, and gives the count of every row with a
+     * value and of every row without. Those groups are read ahead for the
+     * level to pick its buckets from ({@link #pickTopTerms}), with the count
+     * of every row with a value as their keyed total, so
+     * {@code sum_other_doc_count} counts the groups left out exactly, as the
+     * window statement does. Without this, a column of more values than are
+     * picked here counted them all once and then ran the window statement
+     * over the table.
+     *
+     * <p>Only for a level whose groups are the table's value counts
+     * ({@link #readsValueCounts}), keyed by a string shown as stored, in the
+     * default order (count descending, then key ascending, which the engine
+     * ranks by too), and taking no more groups than are picked here. Null
+     * otherwise, and when the bridge declines (a column without the keyword
+     * analyzer, as on a table made before it), for the level's own reads.
+     */
+    private Long topValueCounts(Grouped level, Translation q, String picked) {
+        if (!takesTopValueCounts(level)) {
+            return null;
+        }
+        Map<String, Object> top = InfinoNative.valueCountsTop(q.table(), level.source.column(), level.size);
+        List<Map<String, Object>> groups = topGroups(top, level.source.column());
+        if (groups == null) {
+            return null;
+        }
+        long keyedTotal = asLong(top.get("keyed_total"));
+        readAhead.put(picked, groups);
+        fusedKeyedTotals.put(picked, keyedTotal);
+        return keyedTotal + asLong(top.get("nulls"));
+    }
+
+    /**
+     * Whether a terms level over the whole table may take its groups from
+     * {@link InfinoNative#valueCountsTop}: keyed by a string column shown as
+     * stored, in the default order (count descending, then key ascending,
+     * which the engine ranks by too), and taking no more groups than are
+     * picked here.
+     */
+    static boolean takesTopValueCounts(Grouped level) {
+        return level.terms
+            && level.keyKind == KeyKind.STR
+            && level.source.column() != null
+            && !level.source.masked()
+            && level.size <= MAX_GROUPS_PICKED_HERE
+            && "doc_count DESC, {key} ASC".equals(level.orderTemplate)
+            // The engine's value counts name their count column so, and refuse a field of that name.
+            && !InfinoNative.VALUE_COUNT.equals(level.source.column());
+    }
+
+    /**
+     * The groups of {@link InfinoNative#valueCountsTop}'s answer, in its
+     * order, as a level's GROUP BY names them ({@code k0}, {@code doc_count}).
+     * Null for no answer.
+     */
+    static List<Map<String, Object>> topGroups(Map<String, Object> top, String column) {
+        if (top == null || !(top.get("rows") instanceof List<?> rows)) {
+            return null;
+        }
+        List<Map<String, Object>> groups = new ArrayList<>(rows.size());
+        for (Object o : rows) {
+            Map<?, ?> row = (Map<?, ?>) o;
+            Map<String, Object> group = new HashMap<>();
+            group.put("k0", row.get(column));
+            group.put("doc_count", row.get(InfinoNative.VALUE_COUNT));
+            groups.add(group);
+        }
+        return groups;
+    }
+
+    /**
      * Whether a top terms level's groups are the table's value counts: a
      * request that does not filter the table, over a column no document gives
      * several values (the counts are the column's own, not its list's), with
@@ -4264,7 +4410,7 @@ public class InfinoAggregationProcessor {
      * only, read with its foreground ({@link #fusedTopTerms}), however many,
      * and that is the count of every group.
      */
-    private static List<Map<String, Object>> pickTopTerms(
+    static List<Map<String, Object>> pickTopTerms(
         Grouped level,
         String inner,
         Map<String, List<Map<String, Object>>> readAhead,

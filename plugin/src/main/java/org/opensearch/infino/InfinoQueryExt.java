@@ -122,6 +122,10 @@ public final class InfinoQueryExt extends SearchExtBuilder {
             // Whether to return the source; its filter, if any, goes with the copy.
             routed.fetchSource(source.fetchSource().fetchSource());
         }
+        if (source.storedFields() != null && !source.storedFields().fetchFields()) {
+            // stored_fields: _none_ leaves the id off each hit the shard fetches.
+            routed.storedFields(source.storedFields());
+        }
         if (source.aggregations() != null) {
             for (AggregationBuilder b : source.aggregations().getAggregatorFactories()) {
                 routed.aggregation(b);

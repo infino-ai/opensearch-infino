@@ -27,6 +27,14 @@ public interface InfinoLib extends Library {
     int infino_hosted(Pointer h);
 
     /**
+     * Check once that the node can use the connection's own storage: for
+     * local storage, write a small file in the root and delete it; then list
+     * the tables. "" when both work, else {@code {"error", "permanent"}},
+     * where {@code permanent} says the failure will not pass on its own.
+     */
+    Pointer infino_check_storage(Pointer h);
+
+    /**
      * Ask the hosted service for a trial account, made without a key: the
      * service's response ({@code api_key}, {@code database}, {@code credit_cents},
      * {@code console_url}) or {@code {"error", "status"}}.
@@ -44,20 +52,29 @@ public interface InfinoLib extends Library {
 
     Pointer infino_columns(Pointer h, String name);
 
-    Pointer infino_check_doc(Pointer h, String name, String source);
+    /**
+     * The reason one document would be refused by the declared columns, or an empty string; {@code ignored} holds
+     * the paths of the fields left out of it, separated by newlines (null for none).
+     */
+    Pointer infino_check_doc(Pointer h, String name, String source, String ignored);
 
     Pointer infino_index_batch(Pointer h, String name, String[] osids, String[] sources, int count);
 
     /** One buffer of ids and sources with their end offsets: three native arrays instead of one allocation per string. */
     Pointer infino_index_batch_buf(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
 
-    /** Parse and convert a batch ahead of its append; null when the table is unknown. */
-    Pointer infino_prepare_batch(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
+    /**
+     * Parse and convert a batch ahead of its append; null when the table is unknown. With {@code igEnds}, each
+     * row's source is followed by the paths of its fields left out of the row, separated by newlines and ending
+     * at {@code igEnds} (null for none).
+     */
+    Pointer infino_prepare_batch(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int[] igEnds, int count);
 
     /**
      * {@link #infino_prepare_batch} with each row's routing value after its source (empty for none), ending
      * at {@code rtEnds}, its stamp in {@code seqs} and the operation that wrote it in {@code ops} (each
-     * negative for none), by writer {@code gen}.
+     * negative for none), by writer {@code gen}; with {@code igEnds}, the paths of a row's fields left out of
+     * it follow its routing value.
      */
     Pointer infino_prepare_batch_meta(
         Pointer h,
@@ -70,6 +87,7 @@ public interface InfinoLib extends Library {
         long[] seqs,
         long[] ops,
         long gen,
+        int[] igEnds,
         int count
     );
 
@@ -84,6 +102,12 @@ public interface InfinoLib extends Library {
 
     void infino_free_prepared(Pointer prepared);
 
+    /**
+     * The rows of a prepared batch the table refuses, as {@code [{"i": .., "reason": ..}]};
+     * null for a null handle. The handle stays the caller's.
+     */
+    Pointer infino_prepared_failed(Pointer prepared);
+
     int infino_delete_osids(Pointer h, String name, String[] osids, int count);
 
     /** One id's source as {@code {"source": ..}}, null when the table holds no such id; {@code {"error": ..}} when the lookup fails. */
@@ -95,8 +119,19 @@ public interface InfinoLib extends Library {
     /** The sources of several osids at once, as a JSON object from each id the table holds to its source. */
     Pointer infino_get_many(Pointer h, String name, String[] osids, int count);
 
-    /** One id's document as {@code {"doc": {"source", "seq"}}}, null when the table holds no such id; {@code {"error": ..}} when the lookup fails. */
+    /** One id's document as {@code {"doc": {"source", "seq", "routing"}}} ({@code routing} left out for none), null when the table holds no such id; {@code {"error": ..}} when the lookup fails. */
     Pointer infino_get_doc(Pointer h, String name, String osid);
+
+    /**
+     * The documents of several osids, as {@code {"docs": {id: doc}}} with each
+     * doc {@code {"source", "seq", "routing"}} as {@link #infino_get_doc} gives
+     * it; an id the table does not hold is absent. {@code {"error": ..}} when a
+     * lookup fails.
+     */
+    Pointer infino_get_docs(Pointer h, String name, String[] osids, int count);
+
+    /** {@link #infino_get_docs} as of the table's latest commit. */
+    Pointer infino_get_docs_latest(Pointer h, String name, String[] osids, int count);
 
     int infino_drop(Pointer h, String name);
 
@@ -115,6 +150,12 @@ public interface InfinoLib extends Library {
     /** Let go of a hold {@link #infino_hold_latest} took. */
     void infino_release_latest(Pointer h);
 
+    /** Close the connection the latest reads go through, held or not, so the next opens it afresh without the table handles it held. */
+    void infino_forget_latest(Pointer h);
+
+    /** For tests: open the connections from here on under a read staleness window of {@code ms} milliseconds (0 for the engine's default). */
+    void infino_set_read_staleness_ms(long ms);
+
     /** The indices a caller's read-only statement reads, as {@code {"indices": [..]}}, or an error with its status. */
     Pointer infino_sql_indices(String sql);
 
@@ -130,6 +171,8 @@ public interface InfinoLib extends Library {
     Pointer infino_count_where(Pointer h, String name, String predicatesJson);
 
     Pointer infino_value_counts(Pointer h, String name, String column, int maxRows);
+
+    Pointer infino_value_counts_top(Pointer h, String name, String column, int top);
 
     Pointer infino_token_match(Pointer h, String name, String column, String query);
 

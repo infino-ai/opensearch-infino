@@ -119,36 +119,36 @@ public class InfinoMappingSourceTests extends OpenSearchTestCase {
         List<FieldAndFormat> note = List.of(new FieldAndFormat("note", null));
 
         SearchHit fields = new SearchHit(0, "d1", Map.of(), Map.of());
-        InfinoSearch.fillRequested(fields, DOC, ex, List.of(), note, Map.of());
+        InfinoSearch.fillRequested(fields, DOC, ex, List.of(), note, Map.of(), List.of());
         assertNull(fields.field("note"));
 
         SearchHit docValues = new SearchHit(0, "d1", Map.of(), Map.of());
-        InfinoSearch.fillRequested(docValues, DOC, ex, note, List.of(), Map.of());
+        InfinoSearch.fillRequested(docValues, DOC, ex, note, List.of(), Map.of(), List.of());
         assertEquals(List.of("a"), docValues.field("note").getValues());
 
         // Asked for both ways, the doc value stays when the source leaves the field out.
         SearchHit both = new SearchHit(0, "d1", Map.of(), Map.of());
-        InfinoSearch.fillRequested(both, DOC, ex, note, note, Map.of());
+        InfinoSearch.fillRequested(both, DOC, ex, note, note, Map.of(), List.of());
         assertEquals(List.of("a"), both.field("note").getValues());
 
         // A whole source, read once for both: each group keeps its own fields.
         SearchHit whole = new SearchHit(0, "d1", Map.of(), Map.of());
-        InfinoSearch.fillRequested(whole, DOC, InfinoMappingSource.WHOLE, note, List.of(new FieldAndFormat("rank", null)), Map.of());
+        InfinoSearch.fillRequested(whole, DOC, InfinoMappingSource.WHOLE, note, List.of(new FieldAndFormat("rank", null)), Map.of(), List.of());
         assertEquals(List.of("a"), whole.field("note").getValues());
         assertEquals(List.of(1), whole.field("rank").getValues());
         assertNull(whole.field("items.name"));
 
         SearchHit kept = new SearchHit(0, "d1", Map.of(), Map.of());
-        InfinoSearch.fillRequested(kept, DOC, ex, List.of(), List.of(new FieldAndFormat("rank", null)), Map.of());
+        InfinoSearch.fillRequested(kept, DOC, ex, List.of(), List.of(new FieldAndFormat("rank", null)), Map.of(), List.of());
         assertEquals(List.of(1), kept.field("rank").getValues());
 
         InfinoMappingSource off = of(Map.of("enabled", false));
         // A disabled source fills no fields; the hits a response carries are refused (see refuse).
         SearchHit offFields = new SearchHit(0, "d1", Map.of(), Map.of());
-        InfinoSearch.fillRequested(offFields, DOC, off, List.of(), note, Map.of());
+        InfinoSearch.fillRequested(offFields, DOC, off, List.of(), note, Map.of(), List.of());
         assertNull(offFields.field("note"));
         SearchHit offDocValues = new SearchHit(0, "d1", Map.of(), Map.of());
-        InfinoSearch.fillRequested(offDocValues, DOC, off, note, List.of(), Map.of());
+        InfinoSearch.fillRequested(offDocValues, DOC, off, note, List.of(), Map.of(), List.of());
         assertEquals(List.of("a"), offDocValues.field("note").getValues());
     }
 }

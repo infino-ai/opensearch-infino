@@ -11,20 +11,20 @@ import org.opensearch.ExceptionsHelper;
 import org.opensearch.Version;
 import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.bulk.BulkItemResponse;
-import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.update.UpdateRequest;
-import org.opensearch.cluster.ClusterName;
-import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -57,6 +57,59 @@ public class InfinoReadByIdTests extends OpenSearchTestCase {
         expectThrows(InfinoNative.InfinoException.class, () -> InfinoNative.docOf("{}"));
     }
 
+    /**
+     * The documents of a read of many ids are read from under {@code docs}:
+     * an id {@code error}, or a source whose first field is {@code error},
+     * is a document; an answer without {@code docs} is not taken for ids the
+     * table does not hold.
+     */
+    public void testADocumentIdErrorReadsAsADocumentFromManyIds() {
+        Map<String, InfinoNative.Doc> docs = InfinoNative.docsFrom(
+            "{\"docs\":{\"error\":{\"source\":\"{\\\"error\\\":\\\"boom\\\"}\",\"seq\":4,\"routing\":\"r\"},\"b\":{\"source\":\"{}\",\"seq\":1}}}"
+        );
+        assertEquals(Map.of("error", new InfinoNative.Doc("{\"error\":\"boom\"}", 4, "r"), "b", new InfinoNative.Doc("{}", 1, null)), docs);
+        assertEquals(Map.of(), InfinoNative.docsFrom("{\"docs\":{}}"));
+        expectThrows(InfinoNative.InfinoException.class, () -> InfinoNative.docsFrom("{}"));
+    }
+
+    /**
+     * A read of many ids that fails, from the latest commit or through the
+     * node's own connection, throws with 503 rather than answering the ids
+     * as missing.
+     */
+    public void testAFailedReadOfManyIdsThrowsARetryableStatus() {
+        for (String answer : new String[] { FAILED, null }) {
+            for (boolean latest : new boolean[] { true, false }) {
+                FakeBridge bridge = new FakeBridge(answer);
+                InfinoNative.useLib(bridge.lib());
+                InfinoNative.InfinoException e = expectThrows(
+                    InfinoNative.InfinoException.class,
+                    () -> InfinoNative.docsOf("os_logs", List.of("1", "2"), latest)
+                );
+                assertEquals(RestStatus.SERVICE_UNAVAILABLE, e.status());
+                assertEquals(List.of(latest ? "infino_get_docs_latest" : "infino_get_docs"), bridge.reads);
+            }
+        }
+    }
+
+    /**
+     * A realtime get in default mode on a node that may not have read the
+     * last commit reads the latest commit; when that read fails the get
+     * fails with 503, never 404.
+     */
+    public void testAFailedLatestReadIsUnavailableNotMissing() {
+        FakeBridge bridge = new FakeBridge(FAILED);
+        InfinoNative.useLib(bridge.lib());
+        IndexMetadata md = index(InfinoPlugin.MODE_DEFAULT);
+        InfinoNative.InfinoException e = expectThrows(
+            InfinoNative.InfinoException.class,
+            () -> InfinoGetActionFilter.docOf(md, "os_logs", "1", true)
+        );
+        assertEquals(RestStatus.SERVICE_UNAVAILABLE, e.status());
+        assertNotEquals(RestStatus.NOT_FOUND, e.status());
+        assertEquals(List.of("infino_get_docs_latest"), bridge.reads);
+    }
+
     /** A lookup the bridge fails, or answers with nothing at all, throws with 503 from both reads. */
     public void testAFailedLookupThrowsARetryableStatus() {
         for (String answer : new String[] { FAILED, null }) {
@@ -84,27 +137,39 @@ public class InfinoReadByIdTests extends OpenSearchTestCase {
     }
 
     /**
-     * An update in default mode whose document cannot be read fails with 503
-     * and writes nothing: neither a partial document as the upsert
-     * ({@code doc_as_upsert}) nor the upsert body, either of which would
-     * create the document or overwrite the one the table holds.
+     * An update in default mode whose document cannot be read on the primary
+     * that merges it fails with 503 and writes nothing: neither a partial
+     * document as the upsert ({@code doc_as_upsert}) nor the upsert body,
+     * either of which would create the document or overwrite the one the
+     * table holds. The source to merge into is read from the table, from
+     * its latest commit, or not at all when the shard is not open here;
+     * each failure is the update's answer, and the update does not run
+     * again, as it would on a version conflict.
      */
     public void testAnUpdateWhoseDocumentCannotBeReadFailsRatherThanWrites() {
         InfinoNative.useLib(new FakeBridge(FAILED).lib());
-        IndexMetadata md = index(InfinoPlugin.MODE_DEFAULT);
-        ClusterState state = ClusterState.builder(ClusterName.DEFAULT).metadata(Metadata.builder().put(md, false)).build();
-        BulkRequest bulk = new BulkRequest().add(new UpdateRequest("logs", "1").doc(Map.of("f", 2)).docAsUpsert(true))
-            .add(new UpdateRequest("logs", "2").doc(Map.of("f", 2)).upsert(Map.of("f", 1)));
-        InfinoBulkActionFilter.EngineBulk routed = InfinoBulkActionFilter.engineUpdates(state, bulk, List.of("logs", "logs"), new InfinoTables());
-        assertNotNull(routed);
-        assertTrue(routed.bulk().requests().toString(), routed.bulk().requests().isEmpty());
-        assertEquals(2, routed.answered().size());
-        for (BulkItemResponse item : routed.answered().values()) {
-            assertTrue(item.isFailed());
-            assertEquals(DocWriteRequest.OpType.UPDATE, item.getOpType());
-            assertEquals(RestStatus.SERVICE_UNAVAILABLE, item.status());
-            assertEquals(RestStatus.SERVICE_UNAVAILABLE, ExceptionsHelper.status(item.getFailure().getCause()));
+        List<Exception> failedReads = List.of(
+            expectThrows(InfinoNative.InfinoException.class, () -> InfinoNative.getSourceFresh("os_logs", "1")),
+            expectThrows(InfinoNative.InfinoException.class, () -> InfinoNative.getSourceLatest("os_logs", "1")),
+            expectThrows(InfinoNative.InfinoException.class, () -> InfinoEngine.sourceForMerge("os_logs", "1", true))
+        );
+        List<UpdateRequest> updates = List.of(
+            new UpdateRequest("logs", "1").doc(Map.of("f", 2)).docAsUpsert(true).retryOnConflict(3),
+            new UpdateRequest("logs", "2").doc(Map.of("f", 2)).upsert(Map.of("f", 1)).retryOnConflict(3)
+        );
+        for (Exception read : failedReads) {
+            for (UpdateRequest update : updates) {
+                BulkItemResponse item = InfinoBulkActionFilter.unmerged(0, update, "logs", read, new HashMap<>());
+                assertNotNull(read.getMessage(), item);
+                assertTrue(item.isFailed());
+                assertEquals(DocWriteRequest.OpType.UPDATE, item.getOpType());
+                assertEquals(RestStatus.SERVICE_UNAVAILABLE, item.status());
+                assertEquals(RestStatus.SERVICE_UNAVAILABLE, ExceptionsHelper.status(item.getFailure().getCause()));
+            }
         }
+        // A conflict, unlike a failed read, runs the update again.
+        Exception conflict = new VersionConflictEngineException(new ShardId("logs", "logs-uuid", 0), "1", "moved");
+        assertNull(InfinoBulkActionFilter.unmerged(0, updates.get(0), "logs", conflict, new HashMap<>()));
     }
 
     private static IndexMetadata index(String mode) {
@@ -121,9 +186,11 @@ public class InfinoReadByIdTests extends OpenSearchTestCase {
             .build();
     }
 
-    /** A bridge that opens and declares tables, and answers every lookup by id with {@code answer} (null for none). */
+    /** A bridge that opens and declares tables, and answers every read by id, of one id or many, with {@code answer} (null for none). */
     private static final class FakeBridge implements InvocationHandler {
         private final String answer;
+        /** The reads by id asked of the bridge, in order. */
+        final List<String> reads = new ArrayList<>();
 
         FakeBridge(String answer) {
             this.answer = answer;
@@ -142,6 +209,9 @@ public class InfinoReadByIdTests extends OpenSearchTestCase {
                     return string("{}");
                 case "infino_get":
                 case "infino_get_doc":
+                case "infino_get_docs":
+                case "infino_get_docs_latest":
+                    reads.add(method.getName());
                     return answer == null ? null : string(answer);
                 default:
                     return null; // the frees

@@ -56,7 +56,7 @@ import java.util.regex.Pattern;
  * GET    /_plugins/_infino/account          what the tables are served from; the notice when no account is set
  * GET    /_plugins/_infino/account/indices  the indices the registry would bring back on a fresh cluster, and the cluster state registered with them
  * POST   /_plugins/_infino/account/indices  bring them back now: apply the registered cluster state, then create every index the cluster lacks (with ?name=, that one)
- * POST   /_plugins/_infino/account/trial    {"accept": true, "platform"?, "database"?}: create a free account and use it
+ * POST   /_plugins/_infino/account/trial    {"accept": true, "platform"?, "database"?}: create a trial account and use it
  * PUT    /_plugins/_infino/account          {"platform", "api_key", "database"?}: use an account you have
  * DELETE /_plugins/_infino/account          stop using the account on this node; the tables stay on the service
  * </pre>
@@ -129,7 +129,7 @@ public final class InfinoAccount {
             "The hosted service holds every document of this cluster.",
             "With an account in use, every index this cluster creates is served from a table on " + platform
                 + ": the documents themselves, not names or metrics, leave the cluster on every write, and nothing is kept in any shard.",
-            "This node has no account, so one will be created for it: no email, no password and no card, with free credit to start on."
+            "This node has no account, so one will be created for it: no email, no password and no card, with starting credit."
                 + " The key is returned once, to you; the node uses it for its life, and the configuration lines in the response make it the node's own after a restart.",
             "When the credit runs out, writes stop and say so; adding billing details then is a choice, not a renewal you have agreed to.",
             "Nothing is uploaded until an account is in use. To accept: POST " + TRIAL_ROUTE + " {\"accept\": true}."
@@ -376,7 +376,7 @@ public final class InfinoAccount {
             Object credit = response.get("credit_cents");
             long creditCents = credit instanceof Number n ? n.longValue() : 0L;
             use(platform, registered, key, consoleUrl, by);
-            log.info("[infino] a free account was created on {} for database {} and is in use, accepted by {}", platform, registered, by);
+            log.info("[infino] a trial account was created on {} for database {} and is in use, accepted by {}", platform, registered, by);
             XContentBuilder b = channel.newBuilder().startObject();
             b.field("created", true);
             b.field("platform", platform);
@@ -396,13 +396,13 @@ public final class InfinoAccount {
     private static InfinoNative.InfinoException refused(InfinoNative.InfinoException e, String platform) {
         if (e.status() == NO_TRIAL) {
             return new InfinoNative.InfinoException(
-                platform + " does not offer free accounts. With a key from its operator: PUT " + ROUTE + " {\"platform\": \"" + platform + "\", \"api_key\": \"...\"}",
+                platform + " does not offer trial accounts. With a key from its operator: PUT " + ROUTE + " {\"platform\": \"" + platform + "\", \"api_key\": \"...\"}",
                 NO_TRIAL
             );
         }
         if (e.status() == TRIAL_USED) {
             return new InfinoNative.InfinoException(
-                "this cluster's network address has already used its free account on " + platform + ". Use that account's key instead: PUT " + ROUTE
+                "this cluster's network address has already used its trial account on " + platform + ". Use that account's key instead: PUT " + ROUTE
                     + " {\"platform\": \"" + platform + "\", \"api_key\": \"...\"}",
                 TRIAL_USED
             );

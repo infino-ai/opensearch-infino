@@ -152,6 +152,9 @@ public class InfinoScrollActionFilter extends InfinoActionFilter {
         if (source.collapse() != null) {
             throw new IllegalArgumentException("[infino] collapse is not served with a scroll");
         }
+        if (source.terminateAfter() > 0) {
+            throw new IllegalArgumentException(InfinoSearch.TERMINATE_AFTER_SCROLL);
+        }
         if (source.searchAfter() != null) {
             throw new IllegalArgumentException("[infino] search_after is not served with a scroll; a scroll keeps its own place");
         }

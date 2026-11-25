@@ -7,6 +7,7 @@ package org.opensearch.infino;
 import org.apache.lucene.index.LeafReaderContext;
 import org.opensearch.common.document.DocumentField;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.fieldvisitor.FieldsVisitor;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -15,6 +16,7 @@ import org.opensearch.search.fetch.FetchSubPhase;
 import org.opensearch.search.fetch.FetchSubPhaseProcessor;
 import org.opensearch.search.fetch.subphase.FieldAndFormat;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 
@@ -46,6 +48,7 @@ public class InfinoFetchSubPhase implements FetchSubPhase {
         // _source is refused here, on the hits the coordinating node fetches.
         InfinoMappingSource stored = InfinoMappingSource.of(context.getIndexSettings().getIndexMetadata().mapping());
         List<FieldAndFormat> fetchFields = InfinoSearch.requestedFields(null, written.fetchFields());
+        boolean noStoredFields = written.storedFields() != null && !written.storedFields().fetchFields();
         return new FetchSubPhaseProcessor() {
             @Override
             public void setNextReader(LeafReaderContext readerContext) {
@@ -53,8 +56,9 @@ public class InfinoFetchSubPhase implements FetchSubPhase {
             }
 
             @Override
-            public void process(HitContext hit) {
-                String id = hit.hit().getId();
+            public void process(HitContext hit) throws IOException {
+                // Under stored_fields: _none_ the hit shows no id, but the kept copy is still found by it.
+                String id = noStoredFields ? idOf(hit) : hit.hit().getId();
                 if (id == null) {
                     return;
                 }
@@ -73,11 +77,19 @@ public class InfinoFetchSubPhase implements FetchSubPhase {
                 if (kept.getSourceRef() != null) {
                     hit.hit().sourceRef(kept.getSourceRef());
                 }
-                for (Map.Entry<String, DocumentField> field : kept.getFields().entrySet()) {
+                // The document fields alone: the metadata fields, _ignored among them, come from the shard's own document.
+                for (Map.Entry<String, DocumentField> field : kept.getDocumentFields().entrySet()) {
                     hit.hit().setDocumentField(field.getKey(), field.getValue());
                 }
             }
         };
+    }
+
+    /** The id of a hit's document in the shard's skeleton, which stores it for every document. */
+    private static String idOf(HitContext hit) throws IOException {
+        FieldsVisitor visitor = new FieldsVisitor(false);
+        hit.reader().storedFields().document(hit.docId(), visitor);
+        return visitor.id();
     }
 
     /**
@@ -89,6 +101,9 @@ public class InfinoFetchSubPhase implements FetchSubPhase {
         SearchSourceBuilder one = new SearchSourceBuilder().query(QueryBuilders.idsQuery().addIds(id)).size(1);
         if (written.fetchSource() != null) {
             one.fetchSource(written.fetchSource());
+        }
+        if (written.storedFields() != null) {
+            one.storedFields(written.storedFields());
         }
         if (written.scriptFields() != null) {
             for (SearchSourceBuilder.ScriptField sf : written.scriptFields()) {

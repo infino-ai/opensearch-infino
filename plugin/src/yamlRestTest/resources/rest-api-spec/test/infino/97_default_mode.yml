@@ -909,7 +909,7 @@
         index: rc_default
 
 ---
-"Default mode: a document the table refuses at commit is dropped, not retried, and the writes after it land":
+"Default mode: a malformed value its field ignores is left out of the row, a document the table cannot hold is refused as its own item, and the writes after both land":
   - do:
       indices.create:
         index: ep
@@ -928,9 +928,8 @@
 
   # The mapper takes both bad documents (a malformed date it ignores, an
   # array of arrays in a flat_object). The array of arrays is refused as its
-  # own bulk item when it is written. The malformed date passes that check
-  # and the table refuses it at commit; retried, it would hold every later
-  # write to the shard behind it, so it is dropped.
+  # own bulk item when it is written. The malformed date is indexed without
+  # the field, as stock indexes it, and listed under _ignored.
   - do:
       bulk:
         body:
@@ -965,10 +964,20 @@
         body:
           track_total_hits: true
           sort: [ { status: asc } ]
-  - match: { hits.total.value: 3 }
+  - match: { hits.total.value: 4 }
   - match: { hits.hits.0._id: a }
-  - match: { hits.hits.1._id: b }
-  - match: { hits.hits.2._id: c }
+  - match: { hits.hits.1._id: bad_date }
+  - match: { hits.hits.1._ignored: [ when ] }
+  - match: { hits.hits.1._source.when: bar }
+  - match: { hits.hits.2._id: b }
+  - match: { hits.hits.3._id: c }
+
+  - do:
+      count:
+        index: ep
+        body:
+          query: { exists: { field: when } }
+  - match: { count: 3 }
 
   - do:
       indices.delete:
@@ -1041,9 +1050,10 @@
               status: { type: long }
               counter: { type: unsigned_long }
 
-  # The mapper takes a fractional number for a long and an unsigned_long past
-  # the largest signed 64-bit integer; the table's columns cannot hold either,
-  # so each is refused as its own bulk item, and the writes beside it land.
+  # The mapper takes an unsigned_long past the largest signed 64-bit integer,
+  # which the table's column cannot hold, so it is refused as its own bulk
+  # item and the writes beside it land. A fractional number for a long is
+  # coerced by the mapper, truncated, and lands with its source as given.
   - do:
       bulk:
         refresh: true
@@ -1058,7 +1068,7 @@
           - { status: 204, counter: 3 }
   - match: { errors: true }
   - match: { items.0.index.status: 201 }
-  - match: { items.1.index.status: 400 }
+  - match: { items.1.index.status: 201 }
   - match: { items.2.index.status: 400 }
   - match: { items.3.index.status: 201 }
 
@@ -1067,15 +1077,23 @@
         index: er
         body:
           track_total_hits: true
-          sort: [ { status: asc } ]
+          sort: [ { status: asc }, { counter: asc } ]
+          query: { term: { status: 200 } }
   - match: { hits.total.value: 2 }
   - match: { hits.hits.0._id: a }
-  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.1._id: frac }
+  - match: { hits.hits.1._source.status: 200.7 }
+  - do:
+      search:
+        index: er
+        body:
+          track_total_hits: true
+  - match: { hits.total.value: 3 }
 
   - do:
       get:
         index: er
-        id: frac
+        id: big
       catch: missing
   - match: { found: false }
   - do:
@@ -1167,28 +1185,29 @@
             properties:
               status: { type: long }
 
-  # A field added by a put-mapping: a fractional number for it is refused as
-  # it would be for a field mapped at create.
+  # A field added by a put-mapping: an unsigned_long past the largest signed
+  # 64-bit integer is refused as it would be for a field mapped at create.
   - do:
       indices.put_mapping:
         index: lm
         body:
           properties:
-            n: { type: long }
+            n: { type: unsigned_long }
   - do:
       bulk:
         refresh: true
         body:
           - index: { _index: lm, _id: put_ok }
           - { status: 1, n: 2 }
-          - index: { _index: lm, _id: put_frac }
-          - { status: 2, n: 2.5 }
+          - index: { _index: lm, _id: put_big }
+          - { status: 2, n: 10223372036854775807 }
   - match: { errors: true }
   - match: { items.0.index.status: 201 }
   - match: { items.1.index.status: 400 }
 
   # A field mapped dynamically by the first write of a bulk: the second write
-  # is checked by the column the first one's mapping declared.
+  # is read by the column the first one's mapping declared, a long, which
+  # coerces a fractional number as OpenSearch does.
   - do:
       bulk:
         refresh: true
@@ -1197,9 +1216,9 @@
           - { status: 3, d: 1 }
           - index: { _index: lm, _id: dyn_frac }
           - { status: 4, d: 2.5 }
-  - match: { errors: true }
+  - match: { errors: false }
   - match: { items.0.index.status: 201 }
-  - match: { items.1.index.status: 400 }
+  - match: { items.1.index.status: 201 }
 
   # An array of arrays in a field mapped dynamically by that same document
   # is read through by the field's column, as OpenSearch reads it, whether
@@ -1233,11 +1252,15 @@
         body:
           track_total_hits: true
           sort: [ { status: asc } ]
-  - match: { hits.total.value: 4 }
+          aggs: { d: { sum: { field: d } } }
+  - match: { hits.total.value: 5 }
   - match: { hits.hits.0._id: put_ok }
   - match: { hits.hits.1._id: dyn_ok }
-  - match: { hits.hits.2._id: grid1 }
-  - match: { hits.hits.3._id: grid2 }
+  - match: { hits.hits.2._id: dyn_frac }
+  - match: { hits.hits.2._source.d: 2.5 }
+  - match: { hits.hits.3._id: grid1 }
+  - match: { hits.hits.4._id: grid2 }
+  - match: { aggregations.d.value: 3.0 }
 
   - do:
       indices.delete:
@@ -1301,3 +1324,149 @@
   - do:
       indices.delete:
         index: gs
+
+---
+"Default mode: an update writes on the document's sequence number, as stock does":
+  - do:
+      indices.create:
+        index: eu
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+            refresh_interval: -1
+
+  - do:
+      index:
+        index: eu
+        id: x
+        body: { a: 0 }
+  - set: { _seq_no: seq0, _primary_term: term0 }
+
+  # An update the client conditions on the number the document stands at is
+  # applied; one on the number before is refused.
+  - do:
+      update:
+        index: eu
+        id: x
+        if_seq_no: $seq0
+        if_primary_term: $term0
+        body: { doc: { a: 1 } }
+  - match: { result: updated }
+  - set: { _seq_no: seq1 }
+  - do:
+      catch: conflict
+      update:
+        index: eu
+        id: x
+        if_seq_no: $seq0
+        if_primary_term: $term0
+        body: { doc: { a: 2 } }
+
+  # The same once a refresh: the shard checks the number its skeleton keeps.
+  - do:
+      indices.refresh:
+        index: eu
+  - do:
+      catch: conflict
+      index:
+        index: eu
+        id: x
+        if_seq_no: $seq0
+        if_primary_term: $term0
+        body: { a: 3 }
+  - do:
+      catch: conflict
+      update:
+        index: eu
+        id: x
+        if_seq_no: $seq0
+        if_primary_term: $term0
+        body: { doc: { a: 3 } }
+  - do:
+      update:
+        index: eu
+        id: x
+        if_seq_no: $seq1
+        if_primary_term: $term0
+        retry_on_conflict: 0
+        body: { doc: { b: 1 } }
+  - match: { result: updated }
+
+  # An update conditioned on a document that is missing is answered missing.
+  - do:
+      catch: missing
+      update:
+        index: eu
+        id: none
+        if_seq_no: $seq0
+        if_primary_term: $term0
+        body: { doc: { a: 1 } }
+
+  # An upsert creates the document and the next merges into it; a doc as
+  # upsert creates its own.
+  - do:
+      update:
+        index: eu
+        id: y
+        body: { doc: { a: 1 }, upsert: { a: 0, made: true } }
+  - match: { result: created }
+  - do:
+      update:
+        index: eu
+        id: y
+        retry_on_conflict: 3
+        body: { doc: { a: 1 }, upsert: { a: 0, made: true } }
+  - match: { result: updated }
+  - do:
+      update:
+        index: eu
+        id: z
+        body: { doc: { c: 1 }, doc_as_upsert: true }
+  - match: { result: created }
+
+  # Two updates of one document in one bulk, and a write followed by an
+  # update of its document: each merges into the write before it.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - update: { _index: eu, _id: x }
+          - { doc: { c: 1 } }
+          - update: { _index: eu, _id: x, retry_on_conflict: 2 }
+          - { doc: { d: 1 } }
+          - index: { _index: eu, _id: n }
+          - { e: 1 }
+          - update: { _index: eu, _id: n }
+          - { doc: { f: 1 } }
+  - match: { errors: false }
+  - match: { items.0.update.result: updated }
+  - match: { items.1.update.result: updated }
+  - match: { items.2.index.result: created }
+  - match: { items.3.update.result: updated }
+  - do:
+      get:
+        index: eu
+        id: x
+  - match: { _source: { a: 1, b: 1, c: 1, d: 1 } }
+  - do:
+      get:
+        index: eu
+        id: y
+  - match: { _source: { a: 1, made: true } }
+  - do:
+      get:
+        index: eu
+        id: z
+  - match: { _source: { c: 1 } }
+  - do:
+      get:
+        index: eu
+        id: n
+  - match: { _source: { e: 1, f: 1 } }
+
+  - do:
+      indices.delete:
+        index: eu

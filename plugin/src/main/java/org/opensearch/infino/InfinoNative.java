@@ -10,6 +10,8 @@ import com.sun.jna.Pointer;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.document.FloatPoint;
+import org.apache.lucene.sandbox.document.HalfFloatPoint;
 import org.opensearch.OpenSearchException;
 import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
@@ -24,6 +26,7 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.seqno.SequenceNumbers;
 
 import java.io.IOException;
@@ -38,10 +41,15 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BooleanSupplier;
 import java.util.function.UnaryOperator;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -68,6 +76,31 @@ public final class InfinoNative {
     // URI, -Dinfino.uri=file:///abs/path or s3://bucket/prefix for tables that
     // survive restart. The default is in-process and non-persistent.
     private static final String NODE_URI = System.getProperty("infino.uri", "memory://");
+    /** The URIs of a catalog held in the node's memory, as the engine reads them: there is no storage to check. */
+    private static final Set<String> MEMORY_URIS = Set.of("memory://", "memory:", "memory");
+    /** The scheme of local storage; a URI with no scheme at all is a local path too. */
+    private static final String FILE_SCHEME = "file://";
+    /** What separates a URI's scheme from the rest. */
+    private static final String SCHEME_END = "://";
+    /**
+     * How long the node's start waits for its storage check ({@link #checkStorage}),
+     * the hosted open included: a storage that has not answered by then is reported
+     * and the node keeps starting, rather than waiting out the client's own retries
+     * and timeouts, which can run for minutes.
+     */
+    static final TimeValue STORAGE_CHECK_TIMEOUT = TimeValue.timeValueSeconds(30);
+    /** What a user and password in a URI, or the key, are shown as in a message. */
+    private static final String HIDDEN = "***";
+    /** A user, and a password, between a URI's scheme and its host. */
+    private static final Pattern URI_USER = Pattern.compile("://[^/@\\s]*@");
+    /**
+     * For tests only: the read staleness window the node's connections read
+     * under, in milliseconds, in place of the engine's default (0 for that).
+     * A wide window makes a read that should have read the table's latest
+     * commit, and read the node's own connection instead, answer from the
+     * commit before every time rather than now and then.
+     */
+    private static final long READ_STALENESS_MS = Long.getLong("infino.engine.read.staleness.ms", 0L);
 
     /**
      * What a connection is opened to: the URI, its bearer key (null for none:
@@ -156,6 +189,118 @@ public final class InfinoNative {
         .build();
 
     /**
+     * A field's mapping type where its column's own type does not carry it.
+     * A {@code float}, {@code half_float} or {@code scaled_float} field's
+     * column holds each value as the field keeps it, rounded to the field's
+     * precision (a 32-bit float, a 16-bit float, or a multiple of
+     * {@code 1 / scalingFactor}), so a query's number is read at that
+     * precision, as stock's field mapper reads it: a term is the rounded
+     * value, and a range's bounds are the kept values stock reads them as. An
+     * {@code ip} field's column holds its addresses as written, so a CIDR
+     * block in a term is the addresses it covers, not that text.
+     */
+    public record FieldType(String type, double scalingFactor) {
+        static final String FLOAT = "float";
+        static final String HALF_FLOAT = "half_float";
+        static final String SCALED_FLOAT = "scaled_float";
+        static final String IP = "ip";
+
+        /** The field type a mapping's field declares, or null for one whose column carries its type. */
+        static FieldType of(Map<?, ?> field) {
+            Object type = field.get(TYPE);
+            if (FLOAT.equals(type) || HALF_FLOAT.equals(type) || IP.equals(type)) {
+                return new FieldType((String) type, 0);
+            }
+            if (SCALED_FLOAT.equals(type)) {
+                Object factor = field.get("scaling_factor");
+                try {
+                    double f = factor instanceof Number n ? n.doubleValue() : Double.parseDouble(String.valueOf(factor));
+                    return Double.isFinite(f) && f > 0 ? new FieldType(SCALED_FLOAT, f) : null;
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+            }
+            return null;
+        }
+
+        boolean isIp() {
+            return IP.equals(type);
+        }
+
+        /** Whether the field's numbers are kept rounded to its precision. */
+        boolean rounds() {
+            return !isIp();
+        }
+
+        /** {@code value} as the field keeps it, the value a term on the field compares. */
+        double kept(Object value) {
+            return switch (type) {
+                case FLOAT -> NumberFieldMapper.NumberType.FLOAT.parse(value, false).floatValue();
+                case HALF_FLOAT -> HalfFloatPoint.sortableShortToHalfFloat(
+                    HalfFloatPoint.halfFloatToSortableShort(NumberFieldMapper.NumberType.HALF_FLOAT.parse(value, false).floatValue())
+                );
+                case SCALED_FLOAT -> Math.round(scaled(value)) / scalingFactor;
+                default -> throw new IllegalStateException(type);
+            };
+        }
+
+        /**
+         * The least kept value a range's lower bound {@code value} admits, as
+         * stock reads the bound: {@code >=} it is the range's lower side.
+         * Infinite when the bound admits every value (negative) or none
+         * (positive).
+         */
+        double lower(Object value, boolean inclusive) {
+            return switch (type) {
+                case FLOAT -> {
+                    float l = NumberFieldMapper.NumberType.FLOAT.parse(value, false).floatValue();
+                    yield inclusive ? l : FloatPoint.nextUp(l);
+                }
+                case HALF_FLOAT -> {
+                    float l = NumberFieldMapper.NumberType.HALF_FLOAT.parse(value, false).floatValue();
+                    yield HalfFloatPoint.nextUp(inclusive ? HalfFloatPoint.nextDown(l) : l);
+                }
+                case SCALED_FLOAT -> {
+                    // Stock rounds the bound to a multiple, then reads it as a long bound: past it starts one later.
+                    long l = Math.round(scaled(value));
+                    if (inclusive == false && l == Long.MAX_VALUE) {
+                        yield Double.POSITIVE_INFINITY;
+                    }
+                    yield (inclusive ? l : l + 1) / scalingFactor;
+                }
+                default -> throw new IllegalStateException(type);
+            };
+        }
+
+        /** The greatest kept value a range's upper bound {@code value} admits, as stock reads the bound: {@code <=} it is the range's upper side. */
+        double upper(Object value, boolean inclusive) {
+            return switch (type) {
+                case FLOAT -> {
+                    float u = NumberFieldMapper.NumberType.FLOAT.parse(value, false).floatValue();
+                    yield inclusive ? u : FloatPoint.nextDown(u);
+                }
+                case HALF_FLOAT -> {
+                    float u = NumberFieldMapper.NumberType.HALF_FLOAT.parse(value, false).floatValue();
+                    yield HalfFloatPoint.nextDown(inclusive ? HalfFloatPoint.nextUp(u) : u);
+                }
+                case SCALED_FLOAT -> {
+                    long u = Math.round(scaled(value));
+                    if (inclusive == false && u == Long.MIN_VALUE) {
+                        yield Double.NEGATIVE_INFINITY;
+                    }
+                    yield (inclusive ? u : u - 1) / scalingFactor;
+                }
+                default -> throw new IllegalStateException(type);
+            };
+        }
+
+        /** A scaled_float's number in units of {@code 1 / scalingFactor}, as stock scales it. */
+        private double scaled(Object value) {
+            return NumberFieldMapper.NumberType.DOUBLE.parse(value, false).doubleValue() * scalingFactor;
+        }
+    }
+
+    /**
      * One column of a table, as the bridge describes it. {@code mask} is the
      * security plugin's field masking for the request, when the field is
      * masked for the user: how a value of the column is hashed before it
@@ -166,7 +311,11 @@ public final class InfinoNative {
      * {@code use_similarity}, whose terms Lucene scores by BM25.
      * {@code otherSimilarity} is whether its field scores by a similarity
      * other than the default BM25: its mapping names one, or the index's
-     * default is another.
+     * default is another. {@code ranged} is whether the table keeps a range
+     * index on the column, which a numeric or date field mapped with
+     * {@code "index": false} has none of. {@code fieldType} is its field's
+     * mapping type when the column's own type does not carry it
+     * ({@link FieldType}; null for any other field).
      */
     public record Column(
         String name,
@@ -177,8 +326,24 @@ public final class InfinoNative {
         String dateFormat,
         String elem,
         boolean similarity,
-        boolean otherSimilarity
+        boolean otherSimilarity,
+        boolean ranged,
+        FieldType fieldType
     ) {
+        public Column(
+            String name,
+            String type,
+            boolean fts,
+            boolean vector,
+            UnaryOperator<String> mask,
+            String dateFormat,
+            String elem,
+            boolean similarity,
+            boolean otherSimilarity
+        ) {
+            this(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, false, null);
+        }
+
         public Column(
             String name,
             String type,
@@ -207,22 +372,32 @@ public final class InfinoNative {
 
         /** This column as the request sees it, its values masked by {@code mask}. */
         Column masked(UnaryOperator<String> mask) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, ranged, fieldType);
         }
 
         /** This column with the date format its mapping declares. */
         Column dated(String dateFormat) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, ranged, fieldType);
+        }
+
+        /** This column with its field's mapping type ({@link FieldType}). */
+        Column typed(FieldType fieldType) {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, ranged, fieldType);
         }
 
         /** This column as a keyword field with {@code use_similarity} maps it. */
         Column scoredBySimilarity() {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, true, otherSimilarity);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, true, otherSimilarity, ranged, fieldType);
         }
 
         /** This column as a field scored by a similarity other than the default BM25. */
         Column scoredByOtherSimilarity() {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, true);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, true, ranged, fieldType);
+        }
+
+        /** This column with a range index the table keeps on it. */
+        Column rangeIndexed() {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, true, fieldType);
         }
 
         /**
@@ -245,12 +420,12 @@ public final class InfinoNative {
          * mapping's, not its field's: neither here.
          */
         Column exact() {
-            return fts || similarity || otherSimilarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false, false) : this;
+            return fts || similarity || otherSimilarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false, false, ranged, fieldType) : this;
         }
 
         /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */
         Column element() {
-            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null, similarity, otherSimilarity) : this;
+            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null, similarity, otherSimilarity, ranged, fieldType) : this;
         }
 
         public boolean isList() {
@@ -310,8 +485,8 @@ public final class InfinoNative {
 
     private InfinoNative() {}
 
-    /** The bridge library, loaded once per node. */
-    private static InfinoLib lib() {
+    /** The bridge library, loaded once per node (tests wrap it with {@link #useLib}). */
+    static InfinoLib lib() {
         InfinoLib loaded = lib;
         if (loaded == null) {
             synchronized (InfinoNative.class) {
@@ -321,6 +496,10 @@ public final class InfinoNative {
                     // default is the platform encoding, which under LANG=C turns every
                     // non-ASCII character of a statement into '?'.
                     loaded = Native.load(LIB, InfinoLib.class, Map.of(Library.OPTION_STRING_ENCODING, StandardCharsets.UTF_8.name()));
+                    if (READ_STALENESS_MS > 0) {
+                        log.warn("[infino] connections read under a staleness window of {} ms, for tests", READ_STALENESS_MS);
+                        loaded.infino_set_read_staleness_ms(READ_STALENESS_MS);
+                    }
                     lib = loaded;
                 }
             }
@@ -422,6 +601,181 @@ public final class InfinoNative {
     /** The target the node is configured for. */
     static Target target() {
         return wanted;
+    }
+
+    /** Why the node's storage check failed, and whether the failure will not pass on its own. */
+    record StorageFailure(String reason, boolean permanent) {}
+
+    /**
+     * Open the storage the node is configured for and check once that the
+     * node can use it, as the node starts. Opening the node's own storage
+     * reads nothing, so a store it cannot use would otherwise fail each table
+     * operation on its own, the security plugin's index first, and the node
+     * would never become ready with nothing in its log naming the cause.
+     *
+     * <p>Waits at most {@link #STORAGE_CHECK_TIMEOUT}. On a failure it logs one
+     * ERROR naming the storage, the reason and what to check. It stops the node
+     * (throws) only for a failure that will not pass on its own: the key was
+     * refused, the storage refused the node's credentials or its user. On any
+     * other failure (a timeout, a 5xx, a dropped connection) the node keeps
+     * starting and each index tries the storage again when it is used. While
+     * a hosted open that outlived the wait is still running, it holds the lock
+     * {@link #init} opens under, so an index's {@code init()} waits for that
+     * open to return (up to the client's read timeout) rather than trying
+     * again at once. A node in memory has nothing to check.
+     *
+     * <p>The bridge library is loaded here, on the starting thread, before the
+     * check: a library that cannot be loaded (a wrong {@code -Dinfino.lib})
+     * stops the node with the loader's own error, as an {@link Error} raised
+     * on the check's thread does.
+     *
+     * @return the ERROR it logged and the node did not stop for; null when the storage is usable
+     */
+    static String checkStorage() {
+        return checkStorage(STORAGE_CHECK_TIMEOUT);
+    }
+
+    static String checkStorage(TimeValue timeout) {
+        lib();
+        Target target = wanted;
+        if (MEMORY_URIS.contains(target.uri())) {
+            return null;
+        }
+        StorageFailure failure = within(timeout, () -> probeStorage(target));
+        if (failure == null) {
+            log.info("[infino] the storage at {} is usable", scrubbed(target, target.name()));
+            return null;
+        }
+        String message = unusableStorage(target, failure);
+        log.error(message);
+        if (failure.permanent()) {
+            throw new IllegalStateException(message);
+        }
+        return message;
+    }
+
+    /**
+     * Run {@code check} on a thread of its own and wait at most {@code timeout}
+     * for it: the hosted open and a store's own retries can take minutes, and
+     * the node's start should not. A check still running is left to finish.
+     * An {@link Error} the check raised (a library that does not link, say) is
+     * thrown again here: no retry fixes it, so it stops the node.
+     */
+    private static StorageFailure within(TimeValue timeout, Callable<StorageFailure> check) {
+        FutureTask<StorageFailure> task = new FutureTask<>(check);
+        Thread thread = new Thread(task, "infino-storage-check");
+        thread.setDaemon(true);
+        thread.start();
+        try {
+            return task.get(timeout.millis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            return new StorageFailure("it did not answer within " + timeout, false);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new StorageFailure("the check was interrupted", false);
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof Error error) {
+                throw error;
+            }
+            return new StorageFailure(String.valueOf(e.getCause()), false);
+        }
+    }
+
+    /**
+     * Open {@code target} and, for the node's own storage, run the bridge's
+     * check of it. For a hosted account the open is the check: it lists the
+     * database's tables before it hands the connection back.
+     */
+    private static StorageFailure probeStorage(Target target) {
+        try {
+            init();
+        } catch (InfinoException e) {
+            String opening = "cannot open " + target.name() + ": ";
+            String why = e.getMessage().startsWith(opening) ? e.getMessage().substring(opening.length()) : e.getMessage();
+            return new StorageFailure(why, refused(e.status()));
+        }
+        if (target.hosted()) {
+            return null;
+        }
+        InfinoLib loaded = lib();
+        return storageFailure(take(loaded, loaded.infino_check_storage(conn)));
+    }
+
+    /**
+     * The failure in the bridge's answer to {@code infino_check_storage}: none
+     * for "", the reason for {@code {"error", "permanent"}}. No answer at all
+     * (the bridge failed) is a failure too, though not one that stops the node.
+     */
+    static StorageFailure storageFailure(String answer) {
+        if (answer == null) {
+            return new StorageFailure("the bridge returned no answer", false);
+        }
+        if (answer.isEmpty()) {
+            return null;
+        }
+        Map<String, Object> error = object(answer);
+        Object reason = error.get("error");
+        return new StorageFailure(reason == null ? answer : reason.toString(), Boolean.TRUE.equals(error.get("permanent")));
+    }
+
+    /** Whether the service refused the key: it will not take it however often it is sent. */
+    private static boolean refused(RestStatus status) {
+        return status == RestStatus.UNAUTHORIZED || status == RestStatus.FORBIDDEN;
+    }
+
+    /**
+     * The message the node logs when it cannot use its storage: the storage,
+     * the reason, what to check for its kind, and whether the node stops.
+     * Never shows a user or password in a URI, or the key.
+     */
+    static String unusableStorage(Target target, StorageFailure failure) {
+        String then = failure.permanent()
+            ? " The node stops: every Infino-backed index it serves, the security plugin's included, lives there."
+            : " The node keeps starting, and each index tries the storage again when it is used,"
+                + " after any open still in progress returns.";
+        return scrubbed(
+            target,
+            "[infino] this node cannot use its storage at "
+                + target.name()
+                + ": "
+                + failure.reason()
+                + ". "
+                + storageHint(target, failure)
+                + then
+        );
+    }
+
+    /** What to check for a storage of {@code target}'s kind that failed with {@code failure}. */
+    static String storageHint(Target target, StorageFailure failure) {
+        String uri = target.uri();
+        if (target.hosted()) {
+            if (failure.permanent()) {
+                return "The service refused the key. A key belongs to one platform URL: check that "
+                    + InfinoPlugin.PLATFORM_URL.getKey()
+                    + " is the one the key was made on.";
+            }
+            return "Check that the node can reach the service.";
+        }
+        if (uri.startsWith("s3://")) {
+            return "Check the node's AWS credentials and that they may list the bucket. On Docker on EC2 with an instance role, "
+                + "set the instance metadata hop limit to 2: at 1 the container gets no credentials.";
+        }
+        if (local(uri)) {
+            return "Check that the directory exists and that the user the node runs as may read and write it.";
+        }
+        return "Check the node's credentials for this storage and that they may list it.";
+    }
+
+    /** Whether {@code uri} names local storage: {@code file://}, or a path with no scheme. */
+    private static boolean local(String uri) {
+        return uri.startsWith(FILE_SCHEME) || (!uri.contains(SCHEME_END) && !MEMORY_URIS.contains(uri));
+    }
+
+    /** {@code text} without any user or password a URI in it carries, or {@code target}'s key. */
+    static String scrubbed(Target target, String text) {
+        String out = URI_USER.matcher(text).replaceAll(Matcher.quoteReplacement("://" + HIDDEN + "@"));
+        String key = target.apiKey();
+        return key == null || key.isEmpty() ? out : out.replace(key, HIDDEN);
     }
 
     /** Whether the tables are served from the hosted service rather than the node's own storage. */
@@ -554,10 +908,17 @@ public final class InfinoNative {
         if (!explicit.isEmpty()) {
             return explicit;
         }
-        return tableFor(indexName);
+        String table = tableFor(indexName);
+        // A shard's table adds to this name, so only an index served from one table can land on the registry's.
+        return InfinoTables.oneTable(indexSettings) ? unreserved(table) : table;
     }
 
-    /** The table an index of this name is served from when none is named explicitly. */
+    /**
+     * The name an index of this name takes its tables' names from when none
+     * is named explicitly: the stem of its shards' tables (see
+     * {@link InfinoTables#tablesOf}), and the name of its one table unless
+     * that is reserved ({@link #unreserved}).
+     */
     public static String tableFor(String indexName) {
         // An index name may carry characters a table name may not (the security
         // plugin's and Dashboards' own indices start with a dot); each becomes '_'.
@@ -565,6 +926,20 @@ public final class InfinoNative {
         return TABLE_PREFIX + TABLE_NAME_OTHER.matcher(indexName).replaceAll("_");
     }
 
+    /**
+     * {@code table}, unless it is the registry's ({@link InfinoRegistry#TABLE}),
+     * which the index named {@code index} would take: that index is served
+     * from the same name with {@code -} after the prefix instead. OpenSearch
+     * refuses an index name that starts with {@code -}, and every other
+     * character a table name may not hold becomes {@code _}, so no other
+     * index name maps to it, while every other index keeps its table.
+     */
+    static String unreserved(String table) {
+        return InfinoRegistry.TABLE.equals(table) ? TABLE_PREFIX + RESERVED_ESCAPE + table.substring(TABLE_PREFIX.length()) : table;
+    }
+
+    /** What the table of an index whose name maps to a reserved table carries after the prefix: a character no index name starts with. */
+    private static final String RESERVED_ESCAPE = "-";
     /** What the engine does not take in a table name: anything outside letters, digits, '_' and '-'. */
     private static final Pattern TABLE_NAME_OTHER = Pattern.compile("[^A-Za-z0-9_-]");
     /** Every table behind an index starts with this, so the registry and the tables of other users of a database stay apart. */
@@ -707,8 +1082,9 @@ public final class InfinoNative {
      * {@code request.raw} under the text field {@code request}, as a dynamic
      * mapping's {@code name.keyword}); each date field's declared format;
      * each {@code float} or {@code half_float} field ({@code floatFields});
-     * and each {@code integer}, {@code short} or {@code byte} field
-     * ({@code intFields}).
+     * each {@code integer}, {@code short} or {@code byte} field
+     * ({@code intFields}); and each field whose type its column does not
+     * carry ({@code fieldTypes}, {@link FieldType}).
      * A wildcard multi-field reads as a keyword one. {@code multiFields} are
      * every multi-field's path, and {@code normalized} the keyword and
      * wildcard fields with a normalizer, whose values the table keeps as
@@ -723,6 +1099,7 @@ public final class InfinoNative {
         Set<String> otherSimilarityFields,
         Set<String> floatFields,
         Set<String> intFields,
+        Map<String, FieldType> fieldTypes,
         Set<String> multiFields,
         Set<String> normalized,
         boolean defaultBm25
@@ -749,6 +1126,7 @@ public final class InfinoNative {
                 new HashSet<>(),
                 new HashSet<>(),
                 new HashSet<>(),
+                new LinkedHashMap<>(),
                 new HashSet<>(),
                 new HashSet<>(),
                 defaultBm25
@@ -784,6 +1162,10 @@ public final class InfinoNative {
                 }
                 if (field.get(TYPE) instanceof String type && INT_TYPES.contains(type)) {
                     intFields.add(path);
+                }
+                FieldType fieldType = FieldType.of(field);
+                if (fieldType != null) {
+                    fieldTypes.put(path, fieldType);
                 }
                 if (scoresBySimilarity(field)) {
                     similarityFields.add(path);
@@ -929,11 +1311,18 @@ public final class InfinoNative {
             String key = InfinoQueryTranslator.keyOf(column);
             // A list column of a mapped field reads its dates as the field's do.
             String format = mapping == null ? null : mapping.dateFormats().get(InfinoQueryTranslator.fieldOf(column));
+            if (Boolean.TRUE.equals(c.get("range"))) {
+                described = described.rangeIndexed();
+            }
             if (mapping != null && mapping.similarityFields().contains(key)) {
                 described = described.scoredBySimilarity();
             }
             if (mapping != null && mapping.otherSimilarityFields().contains(InfinoQueryTranslator.fieldOf(column))) {
                 described = described.scoredByOtherSimilarity();
+            }
+            FieldType fieldType = mapping == null ? null : mapping.fieldTypes().get(InfinoQueryTranslator.fieldOf(column));
+            if (fieldType != null) {
+                described = described.typed(fieldType);
             }
             Column kept = format == null ? described : described.dated(format);
             // A field named like a reserved column is looked up by its name, in place of the reserved column.
@@ -952,7 +1341,8 @@ public final class InfinoNative {
         for (Map.Entry<String, String> sub : (mapping == null ? Map.<String, String>of() : mapping.keywordFields()).entrySet()) {
             Column field = out.get(sub.getValue());
             if (field != null && field.isString()) {
-                Column exact = field.exact();
+                // A keyword multi-field compares its text as written, whatever its field's type.
+                Column exact = field.exact().typed(null);
                 Column scored = mapping.similarityFields().contains(sub.getKey()) ? exact.scoredBySimilarity() : exact;
                 if (mapping.otherSimilarityFields().contains(sub.getKey())) {
                     scored = scored.scoredByOtherSimilarity();
@@ -1017,8 +1407,17 @@ public final class InfinoNative {
      * for the next commit rather than dropped.
      */
     public static String checkDoc(String name, String source) {
+        return checkDoc(name, source, List.of());
+    }
+
+    /**
+     * {@link #checkDoc(String, String)} with the fields at {@code ignored}
+     * left out of the document, as OpenSearch's mapper leaves out a field
+     * with a malformed value it ignores.
+     */
+    public static String checkDoc(String name, String source, List<String> ignored) {
         init();
-        Pointer p = lib.infino_check_doc(conn, name, source);
+        Pointer p = lib.infino_check_doc(conn, name, source, ignored.isEmpty() ? null : InfinoIgnored.join(ignored));
         if (p == null) {
             throw new InfinoException("the bridge failed while checking the document", RestStatus.SERVICE_UNAVAILABLE);
         }
@@ -1029,27 +1428,35 @@ public final class InfinoNative {
     /**
      * The ids and sources of a batch as one UTF-8 buffer with the end offset
      * of each id and each source; with routing values, each row's follows its
-     * source (empty for none) and {@code rtEnds} holds where it ends.
+     * source (empty for none) and {@code rtEnds} holds where it ends. With
+     * ignored fields, the paths of each row's follow ({@link InfinoIgnored#join},
+     * empty for none) and {@code igEnds} holds where they end; null when no
+     * row has any.
      */
-    private record Packed(byte[] buf, int[] idEnds, int[] srcEnds, int[] rtEnds) {
-        static Packed of(List<String> osids, List<String> sources) {
-            return of(osids, sources, null);
+    private record Packed(byte[] buf, int[] idEnds, int[] srcEnds, int[] rtEnds, int[] igEnds) {
+        static Packed of(List<String> osids, List<String> sources, List<List<String>> ignored) {
+            return of(osids, sources, null, ignored);
         }
 
-        static Packed of(List<String> osids, List<String> sources, List<String> routings) {
+        static Packed of(List<String> osids, List<String> sources, List<String> routings, List<List<String>> ignored) {
             int n = osids.size();
             int[] idEnds = new int[n];
             int[] srcEnds = new int[n];
             int[] rtEnds = routings == null ? null : new int[n];
+            boolean anyIgnored = ignored != null && ignored.stream().anyMatch(paths -> paths != null && paths.isEmpty() == false);
+            int[] igEnds = anyIgnored ? new int[n] : null;
             byte[][] idBytes = new byte[n][];
             byte[][] srcBytes = new byte[n][];
             byte[][] rtBytes = new byte[n][];
+            byte[][] igBytes = new byte[n][];
             int total = 0;
             for (int i = 0; i < n; i++) {
                 idBytes[i] = osids.get(i).getBytes(StandardCharsets.UTF_8);
                 srcBytes[i] = sources.get(i).getBytes(StandardCharsets.UTF_8);
                 String routing = routings == null ? null : routings.get(i);
                 rtBytes[i] = routing == null ? new byte[0] : routing.getBytes(StandardCharsets.UTF_8);
+                List<String> paths = anyIgnored ? ignored.get(i) : null;
+                igBytes[i] = paths == null || paths.isEmpty() ? new byte[0] : InfinoIgnored.join(paths).getBytes(StandardCharsets.UTF_8);
                 total += idBytes[i].length;
                 idEnds[i] = total;
                 total += srcBytes[i].length;
@@ -1057,6 +1464,10 @@ public final class InfinoNative {
                 if (rtEnds != null) {
                     total += rtBytes[i].length;
                     rtEnds[i] = total;
+                }
+                if (igEnds != null) {
+                    total += igBytes[i].length;
+                    igEnds[i] = total;
                 }
             }
             byte[] buf = new byte[total];
@@ -1070,8 +1481,12 @@ public final class InfinoNative {
                     System.arraycopy(rtBytes[i], 0, buf, at, rtBytes[i].length);
                     at += rtBytes[i].length;
                 }
+                if (igEnds != null) {
+                    System.arraycopy(igBytes[i], 0, buf, at, igBytes[i].length);
+                    at += igBytes[i].length;
+                }
             }
-            return new Packed(buf, idEnds, srcEnds, rtEnds);
+            return new Packed(buf, idEnds, srcEnds, rtEnds, igEnds);
         }
     }
 
@@ -1092,9 +1507,19 @@ public final class InfinoNative {
      * or {@link #freePrepared}. Null when the table is unknown.
      */
     public static Pointer prepare(String name, List<String> osids, List<String> sources) {
+        return prepare(name, osids, sources, (List<List<String>>) null);
+    }
+
+    /**
+     * {@link #prepare(String, List, List)} with the paths of each row's
+     * fields that OpenSearch's mapper ignored (null, or an empty list, for
+     * none): the row leaves them out and keeps them in the
+     * {@link InfinoQueryTranslator#IGNORED} column.
+     */
+    public static Pointer prepare(String name, List<String> osids, List<String> sources, List<List<String>> ignored) {
         init();
-        Packed p = Packed.of(osids, sources);
-        return lib.infino_prepare_batch(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), osids.size());
+        Packed p = Packed.of(osids, sources, ignored);
+        return lib.infino_prepare_batch(conn, name, p.buf(), p.buf().length, p.idEnds(), p.srcEnds(), p.igEnds(), osids.size());
     }
 
     /**
@@ -1102,7 +1527,8 @@ public final class InfinoNative {
      * and the operation that wrote it (each negative for none), by writer
      * {@code gen}, kept in the {@link InfinoQueryTranslator#ROUTING},
      * {@link InfinoQueryTranslator#SEQ}, {@link InfinoQueryTranslator#OP} and
-     * {@link InfinoQueryTranslator#GEN} columns.
+     * {@link InfinoQueryTranslator#GEN} columns, and the paths of its
+     * ignored fields as {@link #prepare(String, List, List, List)} keeps them.
      */
     public static Pointer prepare(
         String name,
@@ -1111,10 +1537,11 @@ public final class InfinoNative {
         List<String> routings,
         long[] seqs,
         long[] ops,
-        long gen
+        long gen,
+        List<List<String>> ignored
     ) {
         init();
-        Packed p = Packed.of(osids, sources, routings);
+        Packed p = Packed.of(osids, sources, routings, ignored);
         return lib.infino_prepare_batch_meta(
             conn,
             name,
@@ -1126,6 +1553,7 @@ public final class InfinoNative {
             seqs,
             ops,
             gen,
+            p.igEnds(),
             osids.size()
         );
     }
@@ -1196,6 +1624,23 @@ public final class InfinoNative {
     }
 
     /**
+     * The rows of a prepared batch the table refuses, each by its place in
+     * the batch and why; empty for a null handle. The handle stays the
+     * caller's.
+     */
+    public static List<Failure> preparedFailed(Pointer prepared) {
+        if (prepared == null) {
+            return List.of();
+        }
+        init();
+        List<Failure> failed = new ArrayList<>();
+        for (Map<String, Object> f : rows(takeOrThrow(lib.infino_prepared_failed(prepared)))) {
+            failed.add(new Failure(((Number) f.get("i")).intValue(), (String) f.get("reason")));
+        }
+        return failed;
+    }
+
+    /**
      * Index many documents in one append (parallel arrays of length n). The
      * ids and sources cross to the bridge as one UTF-8 buffer with end
      * offsets, so the call marshals three arrays rather than one native
@@ -1205,7 +1650,7 @@ public final class InfinoNative {
     public static BatchResult indexBatch(String name, String[] osids, String[] sources, int n) {
         init();
         COLUMNS.remove(name); // the batch may have added paths to the schema
-        Packed p = Packed.of(List.of(osids).subList(0, n), List.of(sources).subList(0, n));
+        Packed p = Packed.of(List.of(osids).subList(0, n), List.of(sources).subList(0, n), null);
         InfinoRequestCache.changed(name);
         Map<String, Object> out;
         try {
@@ -1308,8 +1753,12 @@ public final class InfinoNative {
         lib.infino_release_latest(conn);
     }
 
-    /** One document as the table holds it: its source and the sequence number it was written under. */
-    public record Doc(String source, long seq) {}
+    /**
+     * One document as the table holds it: its source, the sequence number it
+     * was written under, and the routing value it was written with (null for
+     * none), which a get reports as {@code _routing}.
+     */
+    public record Doc(String source, long seq, String routing) {}
 
     /**
      * One id's document from the table, never from the prefetch; null when
@@ -1322,17 +1771,68 @@ public final class InfinoNative {
         return docOf(takeOrThrow(lib.infino_get_doc(conn, name, osid), READ_FAILED));
     }
 
-    /** The document of a {@code get_doc} answer, {@code {"doc": {"source": .., "seq": n}}}; null when the table holds no such id. */
+    /**
+     * The documents of these ids, by id, for a realtime get or multi-get: as
+     * of the table's latest commit when {@code latest} ({@link #latestRows}),
+     * for a node that may not have read the last commit another node made,
+     * else through the node's own connection. One open of the table serves
+     * every id. An id the table does not hold is absent; a lookup that fails
+     * throws ({@link #READ_FAILED}) rather than answering that the table
+     * holds no such id.
+     */
+    public static Map<String, Doc> docsOf(String name, Collection<String> osids, boolean latest) {
+        if (osids.isEmpty()) {
+            return new HashMap<>();
+        }
+        init();
+        String[] ids = osids.toArray(new String[0]);
+        Pointer p = latest ? lib.infino_get_docs_latest(conn, name, ids, ids.length) : lib.infino_get_docs(conn, name, ids, ids.length);
+        return docsFrom(takeOrThrow(p, READ_FAILED));
+    }
+
+    /** Close the connection the latest reads go through, so the next opens it afresh without the table handles it held. */
+    public static void forgetLatest() {
+        init();
+        lib.infino_forget_latest(conn);
+    }
+
+    /**
+     * The document of a {@code get_doc} answer, {@code {"doc": {"source": .., "seq": n, "routing": ..}}};
+     * null when the table holds no such id. The document sits under {@code doc},
+     * never at the top, so no document can make the answer read as an error.
+     */
     static Doc docOf(String json) {
         Map<String, Object> answer = object(json);
         if (!answer.containsKey("doc")) {
             throw new InfinoException("the bridge answered no document", RestStatus.INTERNAL_SERVER_ERROR);
         }
-        if (!(answer.get("doc") instanceof Map<?, ?> doc)) {
-            return null;
+        return answer.get("doc") instanceof Map<?, ?> doc ? doc(doc) : null;
+    }
+
+    /**
+     * The documents of a {@code get_docs} answer, {@code {"docs": {id: doc}}},
+     * by id; an id the table does not hold is absent. The ids sit under
+     * {@code docs}, never at the top, so an id such as {@code error} reads as
+     * a document.
+     */
+    static Map<String, Doc> docsFrom(String json) {
+        if (!(object(json).get("docs") instanceof Map<?, ?> byId)) {
+            throw new InfinoException("the bridge answered no documents", RestStatus.INTERNAL_SERVER_ERROR);
         }
+        Map<String, Doc> out = new HashMap<>();
+        for (Map.Entry<?, ?> e : byId.entrySet()) {
+            if (e.getValue() instanceof Map<?, ?> doc) {
+                out.put(e.getKey().toString(), doc(doc));
+            }
+        }
+        return out;
+    }
+
+    /** The document of one {@code {"source", "seq", "routing"}} answer. */
+    private static Doc doc(Map<?, ?> doc) {
         Object source = doc.get("source");
-        return new Doc(source == null ? null : source.toString(), seq(doc.get("seq")));
+        Object routing = doc.get("routing");
+        return new Doc(source == null ? null : source.toString(), seq(doc.get("seq")), routing == null ? null : routing.toString());
     }
 
     /**
@@ -1347,11 +1847,15 @@ public final class InfinoNative {
             return out;
         }
         String columns = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.SOURCE + ", " + InfinoQueryTranslator.SEQ;
+        if (columns(name).containsKey(InfinoQueryTranslator.ROUTING)) {
+            columns += ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING);
+        }
         for (Map<String, Object> row : sqlRows(byIds(name, columns, osids, where))) {
             Object id = row.get(InfinoQueryTranslator.OSID);
             Object source = row.get(InfinoQueryTranslator.SOURCE);
+            Object routing = row.get(InfinoQueryTranslator.ROUTING);
             if (id != null && source != null) {
-                out.put(id.toString(), new Doc(source.toString(), seq(row.get(InfinoQueryTranslator.SEQ))));
+                out.put(id.toString(), new Doc(source.toString(), seq(row.get(InfinoQueryTranslator.SEQ)), routing == null ? null : routing.toString()));
             }
         }
         return out;
@@ -1576,6 +2080,30 @@ public final class InfinoNative {
     }
 
     /**
+     * A keyword column's {@code top} most frequent values over the whole
+     * table, by count and then by value (its UTF-8 bytes), in one call:
+     * {@code rows} (each value under the column's name, its count under
+     * {@link #VALUE_COUNT}), {@code keyed_total} (rows with a value),
+     * {@code nulls} (rows without one) and {@code groups} (how many values).
+     * The engine counts a keyword column from its term index, so only
+     * {@code top} rows cross however many values it has. Null, for the
+     * caller's own statement to run, for a column without the keyword
+     * analyzer (a table made before it, or a field that is not a keyword).
+     */
+    public static Map<String, Object> valueCountsTop(String n, String column, int top) {
+        init();
+        String out = takeOrThrow(lib.infino_value_counts_top(conn, n, column, top)).trim();
+        if (out.equals("null")) {
+            return null;
+        }
+        try (XContentParser parser = parser(out)) {
+            return parser.map();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
      * Sources for one page of ids in one statement, kept for the fetch phase
      * that follows the query phase. The table has no index on ids, so this
      * scans the id column; the SQL hit paths carry the source in the hit
@@ -1727,28 +2255,51 @@ public final class InfinoNative {
         return id.codePoints().anyMatch(Character::isLetterOrDigit);
     }
 
+    /** The paths of the fields the mapper ignored in {@code id}'s document, as the table holds them ({@link InfinoIgnored}); none when it ignored none. */
+    public static List<String> ignoredOf(String name, String id) {
+        return ignoredOf(name, List.of(id)).getOrDefault(id, List.of());
+    }
+
     /**
-     * The routing value the table's row for {@code id} was written with,
-     * through the id column's term index; null when the row was written with
-     * none, when there is no row, or when the table never took a routed write.
+     * {@link #ignoredOf(String, String)} for each of these ids that has any,
+     * by id: through the id column's term index as {@link #existingOsids}
+     * finds ids, and only over rows that hold the column; none when the
+     * table holds no such column.
      */
-    public static String routingOf(String name, String id) {
-        if (!columns(name).containsKey(InfinoQueryTranslator.ROUTING)) {
-            return null;
+    public static Map<String, List<String>> ignoredOf(String name, Collection<String> ids) {
+        if (ids.isEmpty() || InfinoQueryTranslator.ignoredColumn(columns(name)) == null) {
+            return Map.of();
         }
-        String columns = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING);
-        String sql = hasTerm(id)
-            ? "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
-                + InfinoQueryTranslator.literal(idTerms(List.of(id))) + ", 'and')"
-            : byIds(name, columns, List.of(id), null);
-        for (Map<String, Object> row : sqlRows(sql)) {
-            Object rowId = row.get(InfinoQueryTranslator.OSID);
-            Object routing = row.get(InfinoQueryTranslator.ROUTING);
-            if (rowId != null && id.equals(rowId.toString())) {
-                return routing == null ? null : routing.toString();
+        Set<String> wanted = new HashSet<>(ids);
+        String columns = InfinoQueryTranslator.OSID + ", " + InfinoQueryTranslator.ignoredPaths();
+        String held = InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.IGNORED) + " IS NOT NULL";
+        List<String> termed = new ArrayList<>(wanted.size());
+        List<String> bare = new ArrayList<>();
+        for (String id : wanted) {
+            (hasTerm(id) ? termed : bare).add(id);
+        }
+        List<String> statements = new ArrayList<>(2);
+        for (int from = 0; from < termed.size(); from += PROBE_IDS_PER_STATEMENT) {
+            List<String> batch = termed.subList(from, Math.min(termed.size(), from + PROBE_IDS_PER_STATEMENT));
+            statements.add(
+                "SELECT " + columns + " FROM token_match(" + InfinoQueryTranslator.literal(name) + ", '" + InfinoQueryTranslator.OSID + "', "
+                    + InfinoQueryTranslator.literal(idTerms(batch)) + ", 'or') WHERE " + held
+            );
+        }
+        if (!bare.isEmpty()) {
+            statements.add(byIds(name, columns, bare, held));
+        }
+        Map<String, List<String>> out = new HashMap<>();
+        for (String sql : statements) {
+            for (Map<String, Object> row : sqlRows(sql)) {
+                Object id = row.get(InfinoQueryTranslator.OSID);
+                List<String> paths = InfinoIgnored.split(row.get(InfinoQueryTranslator.IGNORED));
+                if (id != null && wanted.contains(id.toString()) && !paths.isEmpty()) {
+                    out.put(id.toString(), paths);
+                }
             }
         }
-        return null;
+        return out;
     }
 
     /** Keep the sources of rows a hit statement returned (id and source columns), for the fetch phase. */
