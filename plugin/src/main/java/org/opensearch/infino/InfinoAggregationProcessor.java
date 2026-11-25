@@ -111,11 +111,13 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.function.Function;
@@ -455,8 +457,9 @@ public class InfinoAggregationProcessor {
      * values, which cannot be merged from the shards' parts; the
      * coordinating node answers such an aggregation once this way (see
      * {@link InfinoExactAggregation}). {@code plan} is the first shard's,
-     * which the aggregations are planned against. {@code shardIndices} names
-     * the index of each plan's table, which an aggregation on
+     * whose access and time the aggregations are planned under; they read
+     * the columns of every plan ({@link #columnsOver}). {@code shardIndices}
+     * names the index of each plan's table, which an aggregation on
      * {@code _index} reads per row.
      */
     Counted evaluateOver(Collection<AggregationBuilder> builders, Plan plan, List<Plan> shardPlans, List<String> shardIndices) {
@@ -467,12 +470,88 @@ public class InfinoAggregationProcessor {
         }
         Function<QueryBuilder, String> predicates = qb -> perShard(qb, shardPlans);
         Supplier<Long> counter = () -> asLong(oneRow("SELECT COUNT(*) AS c FROM " + from).get("c"));
-        // The aggregations are planned against the first plan's columns, and
-        // read _index from the union's own column rather than as that plan's name.
-        Map<String, Column> cols = new LinkedHashMap<>(plan.cols());
+        // The aggregations read every plan's columns, and _index from the
+        // union's own column rather than as the first plan's name.
+        Map<String, Column> cols = columnsOver(builders, shardPlans);
         cols.put(INDEX_COLUMN, new Column(INDEX_COLUMN, "str", false, false));
         // One answer for the whole index: each terms level at its final size.
         return evaluate(builders, plan, cols, shardTables, from, InfinoQueryTranslator.ALL, predicates, counter, null, false, null);
+    }
+
+    /**
+     * The columns aggregations over several plans' tables read as one
+     * ({@link #unionOf}) are planned against: every column any of the plans
+     * has. A field one index does not map is then read from the indices that
+     * map it, as stock reads a field unmapped in some of the indices it
+     * searches; planned against one plan's columns, the field read as
+     * unmapped in all of them and the answer came back empty.
+     *
+     * <p>A field the aggregations read that two of the tables hold as
+     * different kinds of value (a keyword in one, a number in the other; a
+     * long and a double) is refused: stock answers each index by its own
+     * mapping and merges the parts by value type, so a cardinality counts a
+     * keyword "5" and a long 5 as two values, while the union holds one type.
+     * Integers of any width are one kind, as stock reads them all as longs.
+     * Such a column is left out, so a script cannot read it either.
+     */
+    static Map<String, Column> columnsOver(Collection<AggregationBuilder> builders, List<Plan> plans) {
+        Map<String, Column> cols = new LinkedHashMap<>();
+        Set<String> mixed = new HashSet<>();
+        for (Plan p : plans) {
+            for (Column c : p.cols().values()) {
+                Column seen = cols.putIfAbsent(c.name(), c);
+                if (seen != null && !sameKind(seen, c)) {
+                    mixed.add(c.name());
+                }
+            }
+        }
+        refuseMixed(builders, plans, cols, mixed);
+        cols.keySet().removeAll(mixed);
+        return cols;
+    }
+
+    /** Whether two tables' columns of one field hold the same kind of value, which one union column can carry for both. */
+    static boolean sameKind(Column a, Column b) {
+        return a.type().equals(b.type())
+            && Objects.equals(a.elem(), b.elem())
+            && a.fts() == b.fts()
+            && Objects.equals(a.fieldType(), b.fieldType());
+    }
+
+    /**
+     * Refuses an aggregation of {@code builders}, at any depth, whose field
+     * is of {@code mixed} (see {@link #columnsOver}) or is one a plan's table
+     * does not serve.
+     */
+    private static void refuseMixed(Collection<AggregationBuilder> builders, List<Plan> plans, Map<String, Column> cols, Set<String> mixed) {
+        for (AggregationBuilder b : builders) {
+            List<String> fields = new ArrayList<>();
+            if (b instanceof ValuesSourceAggregationBuilder<?> v && v.field() != null) {
+                fields.add(v.field());
+            }
+            if (b instanceof CompositeAggregationBuilder c) {
+                for (CompositeValuesSourceBuilder<?> s : c.sources()) {
+                    if (s.field() != null) {
+                        fields.add(s.field());
+                    }
+                }
+            }
+            for (String field : fields) {
+                if (InfinoIndexField.NAME.equals(field)) {
+                    continue;
+                }
+                for (Plan p : plans) {
+                    refuseUnserved("aggregation [" + b.getName() + "]", p.table(), field);
+                }
+                Column c = InfinoSearch.columnFor(cols, field);
+                if (c != null && mixed.contains(c.name())) {
+                    throw new Unsupported(
+                        "aggregation [" + b.getName() + "] on [" + field + "] over several indices that map it as different types is not served"
+                    );
+                }
+            }
+            refuseMixed(b.getSubAggregations(), plans, cols, mixed);
+        }
     }
 
     /**
@@ -578,9 +657,10 @@ public class InfinoAggregationProcessor {
     /**
      * The rows of each plan's relation, every column any of the tables has
      * but vectors (which no aggregation reads), as one relation: a column a
-     * table lacks is null in its rows, {@link #SHARD_COLUMN} says which plan
-     * a row came from, and {@link #INDEX_COLUMN} holds its index's name, of
-     * {@code indices} (one per plan).
+     * table lacks is null in its rows, typed as the column ({@link #nullOf}),
+     * {@link #SHARD_COLUMN} says which plan a row came from, and
+     * {@link #INDEX_COLUMN} holds its index's name, of {@code indices} (one
+     * per plan).
      */
     static String unionOf(List<Plan> plans, List<String> indices) {
         Map<String, Column> all = new LinkedHashMap<>();
@@ -600,12 +680,23 @@ public class InfinoAggregationProcessor {
             select.add(i + " AS " + quoteIdent(SHARD_COLUMN));
             select.add(literal(indices.get(i)) + " AS " + quoteIdent(INDEX_COLUMN));
             for (String name : all.keySet()) {
-                select.add(each.get(i).containsKey(name) ? quoteIdent(name) : "NULL AS " + quoteIdent(name));
+                select.add(each.get(i).containsKey(name) ? quoteIdent(name) : nullOf(all.get(name)) + " AS " + quoteIdent(name));
             }
             Translation q = plans.get(i).query();
             branches.add("SELECT " + String.join(", ", select) + " FROM " + q.from() + " WHERE " + q.where());
         }
         return "(" + String.join(" UNION ALL ", branches) + ") AS " + quoteIdent(UNION_ALIAS);
+    }
+
+    /**
+     * A null of {@code c}'s type, which a table without the column gives in
+     * {@link #unionOf}. An untyped null in the union's first branch would type
+     * the column as null, which a numeric function such as a percentile
+     * refuses to read.
+     */
+    private static String nullOf(Column c) {
+        SqlType type = InfinoScriptTranslator.typeOf(c);
+        return type == SqlType.UNKNOWN ? "NULL" : Source.unmapped(c.name(), type).expr();
     }
 
     /**
