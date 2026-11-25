@@ -27,7 +27,7 @@ use infino::arrow_array::{
     TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
     UInt8Array,
 };
-use infino::arrow_schema::Schema;
+use infino::arrow_schema::{DataType, Schema};
 
 use crate::{json_str, OSID, SEQ, SOURCE};
 
@@ -38,11 +38,20 @@ pub(crate) const ROW_ID: &str = "_id";
 pub(crate) const SCORE: &str = "score";
 
 /// The columns of a table a document read from it is made of: every one but
-/// the row id.
+/// the row id, and but a vector or a list, which a source does not hold
+/// ([`value_json`]). Those are left unread as well as unshown: a hosted
+/// table searches its vector column but does not return it, so a statement
+/// that named one to build a document would be refused whole.
 pub(crate) fn columns_of(schema: &Schema) -> Vec<String> {
     schema
         .fields()
         .iter()
+        .filter(|f| {
+            !matches!(
+                f.data_type(),
+                DataType::FixedSizeList(..) | DataType::List(..) | DataType::LargeList(..)
+            )
+        })
         .map(|f| f.name().clone())
         .filter(|c| c != ROW_ID)
         .collect()
@@ -529,6 +538,21 @@ mod tests {
 
     fn columns_of(table: &str) -> Option<Vec<String>> {
         (table == "plain").then(|| vec!["title".to_string(), "hits".to_string()])
+    }
+
+    #[test]
+    fn a_document_is_made_of_no_vector_or_list_column() {
+        use infino::arrow_schema::Field;
+        use std::sync::Arc;
+        let item = || Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Schema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new("title", DataType::LargeUtf8, true),
+            Field::new("emb", DataType::FixedSizeList(item(), 4), true),
+            Field::new("tags", DataType::List(item()), true),
+            Field::new("hits", DataType::UInt64, true),
+        ]);
+        assert_eq!(super::columns_of(&schema), vec!["title", "hits"]);
     }
 
     #[test]
