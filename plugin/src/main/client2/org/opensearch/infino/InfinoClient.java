@@ -9,6 +9,7 @@ import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.admin.cluster.reroute.ClusterRerouteRequest;
 import org.opensearch.action.admin.indices.create.AutoCreateAction;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
+import org.opensearch.action.admin.indices.refresh.RefreshRequest;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.client.Client;
@@ -17,10 +18,10 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 
 /**
- * The node client, for the one thing the plugin asks the cluster to do:
- * create an index — one a write names before it exists, as a stock bulk
- * would, or one the registry names on a fresh cluster. The client's package
- * moved in 3.0, so this class has a copy per major.
+ * The node client, for what the plugin asks the cluster to do: create an
+ * index — one a write names before it exists, as a stock bulk would, or one
+ * the registry names on a fresh cluster — run a bulk, and refresh an index.
+ * The client's package moved in 3.0, so this class has a copy per major.
  */
 final class InfinoClient {
     private static volatile Client client;
@@ -87,6 +88,25 @@ final class InfinoClient {
             return;
         }
         c.bulk(request, listener);
+    }
+
+    /**
+     * Refresh every copy of {@code index}, as the caller: a refresh that
+     * fails on any shard copy fails, naming the first failure.
+     */
+    static void refresh(String index, ActionListener<Void> listener) {
+        Client c = client;
+        if (c == null) {
+            listener.onFailure(new IllegalStateException("[infino] the node client is not available yet"));
+            return;
+        }
+        c.admin().indices().refresh(new RefreshRequest(index), ActionListener.wrap(response -> {
+            if (response.getShardFailures().length > 0) {
+                listener.onFailure(new IllegalStateException("[infino] a copy of " + index + " was not refreshed", response.getShardFailures()[0].getCause()));
+            } else {
+                listener.onResponse(null);
+            }
+        }, listener::onFailure));
     }
 
     /** Create the index {@code request} describes; one that appeared meanwhile counts as created. */

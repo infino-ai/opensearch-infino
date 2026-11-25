@@ -8,6 +8,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.search.SearchAction;
+import org.opensearch.action.search.SearchPhaseExecutionException;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.ShardSearchFailure;
@@ -23,6 +24,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.index.Index;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.Rewriteable;
@@ -234,7 +236,7 @@ public class InfinoSearchActionFilter extends InfinoActionFilter {
             // as stock hands them, and so is each page of a scroll it opens.
             int sortValues = InfinoSearch.requestedSortValues(written);
             TimeValue keepAlive = search.scroll() == null ? null : search.scroll().keepAlive();
-            ActionListener<Response> answered = ActionListener.map(listener, response -> {
+            ActionListener<Response> answered = ActionListener.map(ActionListener.wrap(listener::onResponse, e -> listener.onFailure(retryAfter(e))), response -> {
                 if (response instanceof SearchResponse r) {
                     refuseIfAnyShardRefused(r);
                     InfinoSearch.handOut(r, sortValues);
@@ -317,6 +319,53 @@ public class InfinoSearchActionFilter extends InfinoActionFilter {
 
     /** How every refusal of the plugin's starts. */
     private static final String REFUSAL_PREFIX = "[infino] ";
+    /** The response header that says how long to wait before trying a request again. */
+    static final String RETRY_AFTER = "Retry-After";
+    /**
+     * The seconds a search refused while a shard rebuilds its skeleton is
+     * told to wait: a rebuild takes a few seconds per hundred thousand rows.
+     */
+    static final int REBUILD_RETRY_AFTER_SECONDS = 5;
+
+    /**
+     * {@code e}, or, when a shard refused the search because it is rebuilding
+     * its skeleton ({@link InfinoQueryPhaseSearcher#SKELETON_INCOMPLETE}),
+     * that refusal as the search's own 503 with a {@link #RETRY_AFTER}
+     * header. The shard's refusal fails the search whole however many shards
+     * it reaches ({@link #refuseIfAnyShardRefused}), and when every shard
+     * failed it arrives inside the search's failure; either way, the client
+     * sees the same 503.
+     */
+    static Exception retryAfter(Exception e) {
+        String message = null;
+        if (e instanceof SearchPhaseExecutionException failed) {
+            for (ShardSearchFailure failure : failed.shardFailures()) {
+                message = rebuilding(failure.getCause());
+                if (message != null) {
+                    break;
+                }
+            }
+        } else {
+            message = rebuilding(e);
+        }
+        if (message == null) {
+            return e;
+        }
+        InfinoNative.InfinoException refused = new InfinoNative.InfinoException(message, RestStatus.SERVICE_UNAVAILABLE);
+        refused.addHeader(RETRY_AFTER, String.valueOf(REBUILD_RETRY_AFTER_SECONDS));
+        return refused;
+    }
+
+    /** The refusal of a shard rebuilding its skeleton among {@code cause}'s, or null when it is none. */
+    private static String rebuilding(Throwable cause) {
+        Throwable refusal = refusal(cause);
+        if (refusal == null) {
+            return null;
+        }
+        // One read back from another node carries its type's name before it.
+        int at = refusal.getMessage().indexOf(InfinoQueryPhaseSearcher.SKELETON_INCOMPLETE);
+        return at < 0 ? null : refusal.getMessage().substring(at);
+    }
 
     /**
      * Whether the shard request cache may keep a default-mode search's
