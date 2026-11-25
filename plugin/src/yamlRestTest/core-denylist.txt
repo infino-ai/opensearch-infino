@@ -58,9 +58,6 @@ update/80_source_filtering/Source filtering  # [bug] an update with _source filt
 bulk/40_source/Source filtering  # [bug] an update with _source filtering returns no get._source (https://github.com/infino-ai/opensearch-infino/issues/203)
 
 # --- Search and get response fields
-search/100_stored_fields/Stored fields  # [bug] stored_fields: _none_ still returns _id (https://github.com/infino-ai/opensearch-infino/issues/204)
-search/330_fetch_fields/Test disable _source loading  # [bug] fields returns nothing when _source is not loaded (https://github.com/infino-ai/opensearch-infino/issues/204)
-search/330_fetch_fields/Test token count  # [bug] fields returns the wrong token_count (https://github.com/infino-ai/opensearch-infino/issues/204)
 search/190_index_prefix_search/search with index prefixes  # [bug] max_score differs from stock scoring (https://github.com/infino-ai/opensearch-infino/issues/212)
 search/50_multi_match/Cross fields do not return negative scores  # [bug] multi_match over several text fields is answered unranked: field boosts, tie_breaker and the cross_fields type are ignored, so hits come back in write order, not by score (https://github.com/infino-ai/opensearch-infino/issues/230)
 
@@ -280,6 +277,7 @@ get/20_stored_fields/Stored fields  # [gap] not served: stored_fields; the table
 mget/20_stored_fields/Stored fields  # [gap] not served: stored_fields; the table keeps no stored fields
 get/70_source_filtering/Source filtering  # [gap] not served: stored_fields; the table keeps no stored fields
 search/200_ignore_malformed/_ignored is still returned with explicit list of stored fields  # [gap] not served: stored_fields; the table keeps no stored fields
+search/330_fetch_fields/Test disable _source loading  # [gap] not served: stored_fields; the table keeps no stored fields
 search/330_fetch_fields/Test basic field retrieval  # [gap] fields on a range field, which has no column
 search/350_matched_queries/*  # [gap] not served: matched_queries
 search/40_indices_boost/Indices boost using object  # [gap] not served: indices_boost

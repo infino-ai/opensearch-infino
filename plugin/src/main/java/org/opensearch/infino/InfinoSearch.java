@@ -1357,6 +1357,9 @@ public final class InfinoSearch {
         List<FieldAndFormat> docValueFields = requestedFields(source.docValueFields(), null);
         List<FieldAndFormat> fetchFields = requestedFields(null, source.fetchFields());
         InfinoMappingSource stored = withSource || !fetchFields.isEmpty() ? InfinoMappingSource.of(mapping(index)) : InfinoMappingSource.WHOLE;
+        InfinoTokenCounts tokenCounts = index == null || docValueFields.isEmpty() && fetchFields.isEmpty()
+            ? null
+            : InfinoTokenCounts.of(index, mapping(index), docValueFields, fetchFields);
         boolean version = Boolean.TRUE.equals(source.version());
         SearchShardTarget target = target(index);
         List<SearchHit> hits = new ArrayList<>();
@@ -1448,6 +1451,9 @@ public final class InfinoSearch {
                         }
                     }
                     fillRequested(h, src, stored, docValueFields, fetchFields, plan.cols(), ignoredFields);
+                    if (tokenCounts != null) {
+                        tokenCounts.add(h, id.toString(), src);
+                    }
                 }
             }
             if (!plan.sorts().isEmpty()) {
@@ -1473,6 +1479,9 @@ public final class InfinoSearch {
                 h.setDocumentField(sf.name(), new DocumentField(sf.name(), value == null ? List.of() : List.of(value)));
             }
             hits.add(h);
+        }
+        if (tokenCounts != null) {
+            tokenCounts.fill();
         }
         if (sortsByScoreAscending(source) && !source.trackScores()) {
             // Stock keeps a max_score only for a sort that leads with the score, best first.
@@ -2496,6 +2505,9 @@ public final class InfinoSearch {
         InfinoMappingSource stored = (withSource || !fetchFields.isEmpty()) && index != null
             ? InfinoMappingSource.of(mapping(index))
             : InfinoMappingSource.WHOLE;
+        InfinoTokenCounts tokenCounts = index == null || docValueFields.isEmpty() && fetchFields.isEmpty()
+            ? null
+            : InfinoTokenCounts.of(index, mapping(index), docValueFields, fetchFields);
         float score = sorts.isEmpty() ? 1.0f : Float.NaN;
         SearchShardTarget target = index == null ? null : target(index);
         List<SearchHit> hits = new ArrayList<>();
@@ -2522,6 +2534,9 @@ public final class InfinoSearch {
                         }
                     }
                     fillRequested(h, src, stored, docValueFields, fetchFields, cols, ignoredFields);
+                    if (tokenCounts != null) {
+                        tokenCounts.add(h, id.toString(), src);
+                    }
                 }
             }
             if (!sorts.isEmpty()) {
@@ -2534,6 +2549,9 @@ public final class InfinoSearch {
                 h.sortValues(values, formats);
             }
             hits.add(h);
+        }
+        if (tokenCounts != null) {
+            tokenCounts.fill();
         }
         ScoreDoc[] docs = new ScoreDoc[hits.size()];
         for (int i = 0; i < docs.length; i++) {
@@ -2554,7 +2572,7 @@ public final class InfinoSearch {
      * per hit.
      */
     /** The docvalue_fields format that stands for the field's own: no format. */
-    private static final String USE_FIELD_MAPPING = "use_field_mapping";
+    static final String USE_FIELD_MAPPING = "use_field_mapping";
 
     static List<FieldAndFormat> requestedFields(List<FieldAndFormat> docValues, List<FieldAndFormat> fetch) {
         Map<String, FieldAndFormat> byField = new LinkedHashMap<>();
@@ -2972,6 +2990,9 @@ public final class InfinoSearch {
                 }
             }
         }
+        if (source.storedFields() != null && !source.storedFields().fetchFields()) {
+            hits = withoutIds(hits);
+        }
         InternalAggregations reduced = null;
         if (!aggs.isEmpty()) {
             // The buckets are counted against search.max_buckets as a stock reduce
@@ -3053,6 +3074,35 @@ public final class InfinoSearch {
         return response;
     }
 
+    /**
+     * {@code hits} as {@code stored_fields: _none_} shows them: each without
+     * its id or metadata fields, the rest of it as it is. Its sort values are
+     * kept as formatted, as {@link #handOut} keeps them.
+     */
+    static SearchHits withoutIds(SearchHits hits) {
+        SearchHit[] bare = new SearchHit[hits.getHits().length];
+        for (int i = 0; i < bare.length; i++) {
+            SearchHit h = hits.getHits()[i];
+            SearchHit b = new SearchHit(h.docId(), null, h.getNestedIdentity(), h.getDocumentFields(), Map.of());
+            b.score(h.getScore());
+            b.version(h.getVersion());
+            b.setSeqNo(h.getSeqNo());
+            b.setPrimaryTerm(h.getPrimaryTerm());
+            b.sourceRef(h.getSourceRef());
+            Object[] values = h.getSortValues();
+            DocValueFormat[] asFormatted = new DocValueFormat[values.length];
+            Arrays.fill(asFormatted, DocValueFormat.RAW);
+            b.sortValues(values, asFormatted);
+            b.explanation(h.getExplanation());
+            b.highlightFields(h.getHighlightFields());
+            b.matchedQueriesWithScores(h.getMatchedQueriesAndScores());
+            b.setInnerHits(h.getInnerHits());
+            b.shard(h.getShard());
+            bare[i] = b;
+        }
+        return new SearchHits(bare, hits.getTotalHits(), hits.getMaxScore(), hits.getSortFields(), hits.getCollapseField(), hits.getCollapseValues());
+    }
+
     /** The request with its page starting after {@code values}, the rest as it is. */
     private static SearchSourceBuilder withSearchAfter(SearchSourceBuilder source, Object[] values) {
         return source.shallowCopy().searchAfter(values);
@@ -3098,11 +3148,11 @@ public final class InfinoSearch {
 
     /**
      * The request a scroll's later pages run: the first page's query, sorts,
-     * window and fields, without its aggregations (a scroll computes them
-     * once) and without a count (the first page's total is repeated). A
-     * scroll pages in a fixed order, so a request that names no sort is
-     * ordered by the id; {@code _doc}, which the reindex family sends,
-     * reads the same way. {@code _score} beside a field keeps its place, its
+     * window, fields and stored fields, without its aggregations (a scroll
+     * computes them once) and without a count (the first page's total is
+     * repeated). A scroll pages in a fixed order, so a request that names no
+     * sort is ordered by the id; {@code _doc}, which the reindex family
+     * sends, reads the same way. {@code _score} beside a field keeps its place, its
      * value among the hits' sort values.
      */
     static SearchSourceBuilder scrollSource(SearchSourceBuilder source) {
@@ -3140,6 +3190,9 @@ public final class InfinoSearch {
             for (SearchSourceBuilder.ScriptField sf : source.scriptFields()) {
                 out.scriptField(sf.fieldName(), sf.script(), sf.ignoreFailure());
             }
+        }
+        if (source.storedFields() != null) {
+            out.storedFields(source.storedFields());
         }
         if (Boolean.TRUE.equals(source.version())) {
             out.version(true);
