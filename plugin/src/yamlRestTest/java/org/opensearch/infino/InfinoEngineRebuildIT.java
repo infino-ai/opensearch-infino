@@ -42,6 +42,9 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     private static final String HELD_TABLE = "emr3_rows";
     private static final int HELD_ROWS = 20;
     private static final String HELD_DELETED = "h1";
+    /** The table of the untouched-rows test's indices, and its rows. */
+    private static final String KEPT_TABLE = "emr6_rows";
+    private static final int KEPT_ROWS = 200;
     /** The cluster setting that holds skeleton rebuilds. */
     private static final String PAUSED = "infino.skeleton_rebuild.paused";
 
@@ -158,6 +161,36 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         ResponseException gone = expectThrows(ResponseException.class, () -> call("GET", "/emr3/_doc/" + HELD_DELETED, null));
         assertEquals(404, gone.getResponse().getStatusLine().getStatusCode());
         call("DELETE", "/emr3", null);
+    }
+
+    /**
+     * A rebuild creates a document for each row and leaves the rows as they
+     * are: written to the table again, each would be a replace (a lookup, a
+     * delete and an append), whose memory grows with the table, and its row
+     * would get a new engine id.
+     */
+    @SuppressWarnings("unchecked")
+    public void testARebuildRewritesNoRow() throws Exception {
+        createIndex("emr6_old", false, KEPT_TABLE, 1);
+        StringBuilder bulk = new StringBuilder();
+        for (int i = 0; i < KEPT_ROWS; i++) {
+            bulk.append("{\"index\":{\"_index\":\"emr6_old\",\"_id\":\"k").append(i).append("\"}}\n");
+            bulk.append("{\"n\":").append(i).append("}\n");
+        }
+        assertEquals(false, call("POST", "/_bulk?refresh=true", bulk.toString()).get("errors"));
+        Map<String, Object> before = rowIds("emr6_old");
+        assertEquals(KEPT_ROWS, before.size());
+        call("DELETE", "/emr6_old", null);
+
+        createIndex("emr6", true, KEPT_TABLE, 1);
+        // The shard's own document count, which a search of a skeleton being rebuilt does not wait for.
+        assertBusy(() -> {
+            Map<String, Object> index = (Map<String, Object>) callList("GET", "/_cat/indices/emr6?format=json&h=docs.count", null).get(0);
+            assertEquals(String.valueOf(KEPT_ROWS), index.get("docs.count"));
+        }, REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertEquals("every row keeps its engine id through the rebuild", before, rowIds("emr6"));
+        assertEquals(KEPT_ROWS, ((Number) call("GET", "/emr6/_count", null).get("count")).intValue());
+        call("DELETE", "/emr6", null);
     }
 
     /** The hits of a search of the held-rebuild test's index, room left for every row. */
