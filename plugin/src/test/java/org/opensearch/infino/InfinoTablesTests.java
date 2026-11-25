@@ -24,8 +24,19 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.indices.InvalidIndexNameException;
 import org.opensearch.test.OpenSearchTestCase;
 
+import com.sun.jna.Memory;
+import com.sun.jna.Pointer;
+
+import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Which index a table backs when two live indices name it, and the tables no index is served from. */
 public class InfinoTablesTests extends OpenSearchTestCase {
@@ -379,5 +390,92 @@ public class InfinoTablesTests extends OpenSearchTestCase {
     public void testAnAttachedTableIsNeverCompacted() {
         // Answered before the bridge is loaded: the table is its owner's to compact.
         assertEquals(0, InfinoNative.optimize("pageviews", attaching("pageviews", Settings.EMPTY)));
+    }
+
+    /**
+     * A table whose declaration waits on the hosted service holds back no
+     * other table's: before, every declaration shared one lock, held across
+     * the call to the service, so one shard's start waiting there stopped
+     * every other shard's.
+     */
+    public void testADeclarationWaitingOnTheServiceHoldsBackNoOtherTable() throws Exception {
+        CountDownLatch stalled = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> {
+            switch (method.getName()) {
+                case "infino_open_with":
+                    return new Memory(1);
+                case "infino_ensure_table":
+                    if ("os_slow".equals(args[1])) {
+                        stalled.countDown();
+                        release.await();
+                    }
+                    return nativeString("{}");
+                default:
+                    return null;
+            }
+        }));
+        ExecutorService threads = Executors.newFixedThreadPool(2);
+        try {
+            InfinoTables tables = new InfinoTables();
+            Future<String> slow = threads.submit(() -> tables.ensure(index("slow", "u1", 1)));
+            assertTrue("the slow declaration reached the service", stalled.await(5, TimeUnit.SECONDS));
+            Future<String> other = threads.submit(() -> tables.ensure(index("other", "u2", 2)));
+            assertEquals("os_other", other.get(5, TimeUnit.SECONDS));
+            assertFalse(slow.isDone());
+            release.countDown();
+            assertEquals("os_slow", slow.get(5, TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+            threads.shutdownNow();
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /**
+     * A declaration during which another connection opens (the account
+     * changed while the service was being asked) was made over the old
+     * connection, which the new one does not share: it is not noted, so the
+     * table's next use declares it again over the new one.
+     */
+    public void testADeclarationOverAConnectionReplacedMidCallIsNotNoted() {
+        InfinoNative.Target other = new InfinoNative.Target("memory://other", null, false, "memory://other");
+        AtomicInteger declarations = new AtomicInteger();
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> {
+            switch (method.getName()) {
+                case "infino_open_with":
+                    return new Memory(1);
+                case "infino_ensure_table":
+                    if (declarations.getAndIncrement() == 0) {
+                        // Another connection opens while the first declaration runs.
+                        InfinoNative.configure(other);
+                    }
+                    return nativeString("{}");
+                default:
+                    return null;
+            }
+        }));
+        try {
+            InfinoTables tables = new InfinoTables();
+            IndexMetadata logs = index("logs", "u1", 1);
+            assertEquals("os_logs", tables.ensure(logs));
+            assertEquals(1, declarations.get());
+            assertFalse(tables.declaredAt("os_logs", logs.getMappingVersion()));
+            // The next use declares it again, over the new connection, and that one is noted.
+            assertEquals("os_logs", tables.ensure(logs));
+            assertEquals(2, declarations.get());
+            assertTrue(tables.declaredAt("os_logs", logs.getMappingVersion()));
+        } finally {
+            InfinoNative.configure(InfinoNative.Target.node());
+            InfinoNative.useLib(null);
+        }
+    }
+
+    private static Pointer nativeString(String s) {
+        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+        Memory m = new Memory(bytes.length + 1);
+        m.write(0, bytes, 0, bytes.length);
+        m.setByte(bytes.length, (byte) 0);
+        return m;
     }
 }

@@ -933,11 +933,13 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                 // The write lands on another node, which this node's request cache
                 // does not hear from: its responses over these tables move away here
                 // before the write, and once it is answered nothing read from them is
-                // kept until this node's reads are sure to see it.
+                // kept until this node's reads are sure to see it. The tables are only
+                // named here, not declared: declaring may wait on the hosted service, on
+                // the thread that delivered the bulk, and the node writing them declares them.
                 Map<String, IndexMetadata> written = new LinkedHashMap<>();
                 try {
                     for (IndexMetadata md : partInfino.values()) {
-                        written.put(tables.ensure(md), md);
+                        written.put(InfinoNative.tableFor(md.getIndex(), md.getSettings()), md);
                     }
                 } catch (Exception e) {
                     partListener.onFailure(e);

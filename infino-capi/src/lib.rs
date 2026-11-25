@@ -62,9 +62,9 @@ use infino::arrow_array::{
 use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
 use infino::{
-    connect_with, rows_to_batch, Bm25SearchOptions, BoolMode, ColumnIndex, ConnectOptions,
-    Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric, OptimizeOptions,
-    SchemaError, SchemaPatch, Supertable,
+    connect_with, rows_to_batch, Analyzer, Bm25SearchOptions, BoolMode, ColumnIndex,
+    ConnectOptions, Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric,
+    OptimizeOptions, SchemaError, SchemaPatch, Supertable, TableSchema,
 };
 use rayon::prelude::*;
 
@@ -166,6 +166,8 @@ const STATUS_BAD_REQUEST: u16 = 400;
 const STATUS_NOT_FOUND: u16 = 404;
 /// HTTP status of a caller's statement past the connection's memory budget.
 const STATUS_TOO_MANY_REQUESTS: u16 = 429;
+/// HTTP status of a request the hosted service refuses for its size.
+const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 /// The mapping type a column of the engine's row ids is declared with: no
 /// OpenSearch field type is the engine's `_id` type, so the plugin names it
 /// so for the id columns of an edge index.
@@ -500,6 +502,20 @@ fn out_json(v: Value) -> *mut c_char {
 pub struct Bridge {
     conn: Connection,
     tables: RwLock<HashMap<String, Supertable>>,
+    /// The schema document of each table, on a hosted connection, where
+    /// reading it is a request to the service ([`Bridge::table_schema`]).
+    /// Dropped with the table's handle ([`Bridge::forget`]), and replaced on
+    /// its own after a write that added a column ([`Bridge::reread_schema`]),
+    /// so it may hold columns the handle's Arrow schema, fixed when the
+    /// handle is opened, lacks.
+    schemas: RwLock<HashMap<String, TableSchema>>,
+    /// How many times each table's kept handle or schema document has been
+    /// dropped ([`Bridge::forget`]) or set to be replaced
+    /// ([`Bridge::replace_schema`]). A read keeps what it read only if the
+    /// count has not moved meanwhile ([`Bridge::keep_unless_moved`]). Never
+    /// reset, not even when a table is dropped: a read from before the drop
+    /// must not find the count it started from again.
+    forgets: Mutex<HashMap<String, u64>>,
     /// Whether the connection forwards to the hosted service (an `http(s)://`
     /// URI) rather than running the engine over storage of its own.
     hosted: bool,
@@ -763,21 +779,130 @@ impl Bridge {
     }
 
     fn table(&self, name: &str) -> Result<Supertable, InfinoError> {
-        if let Some(t) = self.tables.read().map_err(poisoned)?.get(name) {
-            return Ok(t.clone());
+        self.kept_or_read(name, &self.tables, || self.conn.open_table(name))
+    }
+
+    /// The schema document of `name`. On a hosted connection, reading it is
+    /// a request to the service, so it is kept until the table's handle is
+    /// dropped ([`Bridge::forget`], which every change to the table's schema
+    /// here makes) or a write adds a column to it
+    /// ([`Bridge::reread_schema`]): preparing a batch then waits on the
+    /// service only right after such a change, not for each batch. A
+    /// connection over storage answers from the handle it holds open, and is
+    /// asked each time.
+    fn table_schema(&self, name: &str) -> Result<TableSchema, InfinoError> {
+        if !self.hosted {
+            return self.conn.schema(name);
         }
-        let t = self.conn.open_table(name)?;
-        self.tables
-            .write()
-            .map_err(poisoned)?
-            .insert(name.to_string(), t.clone());
-        Ok(t)
+        self.kept_or_read(name, &self.schemas, || self.conn.schema(name))
+    }
+
+    /// What `kept` holds for `name`, or else what `read` gives, which is
+    /// kept unless `name` was forgotten while `read` ran. A read that began
+    /// before a schema change and ends after the change's forget would
+    /// otherwise keep the table as it was before, until the next forget.
+    fn kept_or_read<T: Clone>(
+        &self,
+        name: &str,
+        kept: &RwLock<HashMap<String, T>>,
+        read: impl FnOnce() -> Result<T, InfinoError>,
+    ) -> Result<T, InfinoError> {
+        if let Some(v) = kept.read().map_err(poisoned)?.get(name) {
+            return Ok(v.clone());
+        }
+        let seen = self.forgets_of(name);
+        let v = read()?;
+        self.keep_unless_moved(name, kept, seen, &v)?;
+        Ok(v)
+    }
+
+    /// Keep `v` for `name` in `kept` if `name`'s count is still `seen`, the
+    /// count when the read that gave `v` began ([`Bridge::forgets`]).
+    fn keep_unless_moved<T: Clone>(
+        &self,
+        name: &str,
+        kept: &RwLock<HashMap<String, T>>,
+        seen: u64,
+        v: &T,
+    ) -> Result<(), InfinoError> {
+        // Held while the value is kept, so a forget runs wholly before the
+        // check or wholly after the insert.
+        let forgets = self.forgets.lock().unwrap_or_else(PoisonError::into_inner);
+        if forgets.get(name).copied().unwrap_or(0) == seen {
+            kept.write()
+                .map_err(poisoned)?
+                .insert(name.to_string(), v.clone());
+        }
+        Ok(())
+    }
+
+    /// How many times `name`'s kept handle or schema document has been
+    /// dropped ([`Bridge::forgets`]).
+    fn forgets_of(&self, name: &str) -> u64 {
+        self.forgets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Count a forget of `name` and run `drop`, the dropping of what is kept
+    /// for it, under the count's lock ([`Bridge::keep_unless_moved`]).
+    /// Returns the count after this forget.
+    fn forgetting(&self, name: &str, drop: impl FnOnce()) -> u64 {
+        let mut forgets = self.forgets.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = forgets.entry(name.to_string()).or_default();
+        *count += 1;
+        drop();
+        *count
     }
 
     fn forget(&self, name: &str) {
-        if let Ok(mut tables) = self.tables.write() {
-            tables.remove(name);
+        self.forgetting(name, || {
+            if let Ok(mut tables) = self.tables.write() {
+                tables.remove(name);
+            }
+            if let Ok(mut schemas) = self.schemas.write() {
+                schemas.remove(name);
+            }
+        });
+    }
+
+    /// Read `name`'s schema document again after a write that added a
+    /// column to it: the engine adds one during an append as well as during
+    /// a declaration (a geo_point's first values, a flat_object's members, a
+    /// path the mapping does not declare), and the kept document would
+    /// otherwise lack it until the next declaration. Read on the writing
+    /// thread, which has just been answered by the service, and swapped in
+    /// once read ([`Bridge::replace_schema`]). The handle is kept: a path
+    /// its Arrow schema lacks is converted to the column this document holds
+    /// ([`rows_to_batch`]).
+    fn reread_schema(&self, name: &str) {
+        if !self.hosted {
+            return;
         }
+        let _ = self.replace_schema(name, || self.conn.schema(name));
+    }
+
+    /// Replace `name`'s kept schema document with what `read` gives. The old
+    /// document stays kept while `read` runs, so a thread that stages a bulk
+    /// meanwhile reads it rather than asking the service, and stays kept if
+    /// `read` fails: a stalled service then costs stale columns until the
+    /// next write that adds one, not a staging thread waiting on the
+    /// service. The count is moved before `read` begins, so a read that
+    /// began earlier, a miss or another replace, keeps nothing, and the
+    /// replace that began last is the one kept; a forget while `read` runs
+    /// moves the count again, and this replace keeps nothing either.
+    fn replace_schema(
+        &self,
+        name: &str,
+        read: impl FnOnce() -> Result<TableSchema, InfinoError>,
+    ) -> Result<TableSchema, InfinoError> {
+        let seen = self.forgetting(name, || {});
+        let doc = read()?;
+        self.keep_unless_moved(name, &self.schemas, seen, &doc)?;
+        Ok(doc)
     }
 
     /// Keep [`Bridge::latest`]'s connection open until the hold is let go
@@ -842,6 +967,28 @@ impl Bridge {
     /// for `conn`'s handles, which this bridge holds itself).
     fn forget_latest(&self) {
         *self.latest.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// How many bytes of ids one mutation may name ([`HOSTED_ID_LIST_BYTES`]
+    /// on the hosted service; no limit over storage of the bridge's own,
+    /// where a predicate never travels in a URL).
+    fn id_list_bytes(&self) -> usize {
+        if self.hosted {
+            HOSTED_ID_LIST_BYTES
+        } else {
+            usize::MAX
+        }
+    }
+
+    /// Whether a keyword field's index takes the engine's `keyword`
+    /// analyzer, one term per value. Not on the hosted service, which
+    /// refuses a table that declares it: there a keyword field keeps the
+    /// default analyzer without positions, and a terms aggregation counts
+    /// its values with a statement ([`infino_value_counts_top`] declines).
+    /// Drop this once the hosted service takes the analyzer (#274); hosted
+    /// tables made before then keep the default analyzer until reloaded.
+    fn keyword_analyzer(&self) -> bool {
+        !self.hosted
     }
 
     /// The [`Gate`] of `name`'s writes on this node.
@@ -959,6 +1106,8 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
     Ok(Bridge {
         conn,
         tables: RwLock::new(HashMap::new()),
+        schemas: RwLock::new(HashMap::new()),
+        forgets: Mutex::new(HashMap::new()),
         hosted,
         kept: RwLock::new(HashMap::new()),
         stamps: RwLock::new(HashMap::new()),
@@ -1797,8 +1946,31 @@ fn declare_table(
                     }
                     _ => None,
                 });
-            // The index a keyword field added now gets: the same, without positions.
-            let exact_index = text_index.clone().map(|index| with_positions(index, false));
+            // The index a keyword field added now gets: the `keyword`
+            // analyzer, each value one term exactly as written, so `=` and
+            // `IN` look a value up whole and the column's term counts are its
+            // value counts. It takes no stopwords or stemmer, and no positions.
+            // Where the connection cannot declare that analyzer
+            // ([`Bridge::keyword_analyzer`]), the text index without positions.
+            let exact_index = text_index.as_ref().map(|index| {
+                if !bridge.keyword_analyzer() {
+                    return with_positions(index.clone(), false);
+                }
+                let mut exact = ColumnIndex::fts(Analyzer::Keyword);
+                if let (
+                    ColumnIndex::Fts { stored, bm25, .. },
+                    ColumnIndex::Fts {
+                        stored: from_stored,
+                        bm25: from_bm25,
+                        ..
+                    },
+                ) = (&mut exact, index)
+                {
+                    *stored = *from_stored;
+                    *bm25 = *from_bm25;
+                }
+                exact
+            });
             let mut conflicts: Vec<String> = Vec::new();
             for f in &mapped {
                 let present = schema.field_with_name(&f.path).is_ok();
@@ -1925,7 +2097,12 @@ fn declare_table(
                 let patch = SchemaPatch::new(patches);
                 let gate = bridge.gate(name);
                 let _pass = gate.whole();
-                waiting(|| table.apply_schema(&patch, None)).map_err(|e| e.to_string())?;
+                let applied = waiting(|| table.apply_schema(&patch, None));
+                // A batch prepared while this ran may have cached the handle (and
+                // schema) from before the change; drop it either way. A read
+                // still in flight then keeps nothing ([`Bridge::kept_or_read`]).
+                bridge.forget(name);
+                applied.map_err(|e| e.to_string())?;
             }
             Ok(json!({ "created": false, "added": added }))
         }
@@ -1950,7 +2127,14 @@ fn declare_table(
                     // order (match_phrase, quoted atoms of a query_string).
                     spec = spec.fts(FtsField::new(f.path.clone()).positions(true));
                 } else if f.exact {
-                    spec = spec.fts(FtsField::new(f.path.clone()));
+                    // One term per value where the connection can declare
+                    // it (see `exact_index` above).
+                    let field = FtsField::new(f.path.clone());
+                    spec = spec.fts(if bridge.keyword_analyzer() {
+                        field.analyzer("keyword")
+                    } else {
+                        field
+                    });
                 }
                 if let Some((dim, metric)) = f.vector {
                     spec = spec.vector(f.path.clone(), dim, metric);
@@ -2086,9 +2270,11 @@ fn is_text_index(column: &str, index: &Option<ColumnIndex>) -> bool {
     }
 }
 
-/// Columns of a table as JSON `[{"name","type","elem","fts","vector"}]`,
+/// Columns of a table as JSON `[{"name","type","elem","fts","vector","range"}]`,
 /// type in {i64,f64,bool,str,ts,vec,list,other}, `elem` a list column's
-/// element type (null for any other). `""` if the table is absent.
+/// element type (null for any other), `range` whether the column has a range
+/// index (a numeric or date field mapped `"index": false` has none). `""` if
+/// the table is absent.
 #[no_mangle]
 pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> *mut c_char {
     catch_unwind(AssertUnwindSafe(|| {
@@ -2101,7 +2287,10 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
         // field, or none, a column whose index has no positions is a
         // keyword, as it is in a table of the plugin's own.
         let attached = conn.is_attached(name);
-        match conn.conn.schema(name) {
+        // The plugin asks for the columns again after each append, on the
+        // thread that stages a bulk: on a hosted table, the kept document
+        // answers ([`Bridge::table_schema`]) rather than the service.
+        match conn.table_schema(name) {
             Ok(schema) => {
                 let mut cols: Vec<Value> = schema
                     .fields()
@@ -2123,6 +2312,7 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                                     && matches!(f.index, Some(ColumnIndex::Fts { .. }))
                                     && conn.attached_text(name, &f.name)),
                             "vector": matches!(f.index, Some(ColumnIndex::Vector { .. })),
+                            "range": matches!(f.index, Some(ColumnIndex::Range)),
                         })
                     })
                     .collect();
@@ -2138,6 +2328,7 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                             "elem": null,
                             "fts": false,
                             "vector": false,
+                            "range": false,
                         }));
                     }
                 }
@@ -2456,6 +2647,30 @@ fn unify_new_paths(rows: &mut [Map<String, Value>], schema: &Schema) {
                 scalar => widen_scalar(scalar, to_string, to_float),
             };
         }
+    }
+}
+
+/// Whether `rows` hold a path `schema` has no column for, with a value the
+/// engine adds a column for when they land. A path whose values are all
+/// `null`, `[]` or lists of nulls carries no type, and the engine adds
+/// nothing for it ([`types_a_column`]); counting it would re-read the
+/// schema after every write of such a document, since no write or
+/// declaration ever gives the path a column.
+fn adds_columns(schema: &TableSchema, rows: &[Map<String, Value>]) -> bool {
+    rows.iter().any(|row| {
+        row.iter()
+            .any(|(path, value)| types_a_column(value) && schema.id_of(path).is_none())
+    })
+}
+
+/// Whether `value`, at a path no column declares, gives the engine a type
+/// to add a column with: anything but a `null`, or a list holding nothing
+/// but nulls.
+fn types_a_column(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Array(items) => items.iter().any(|item| !item.is_null()),
+        _ => true,
     }
 }
 
@@ -3078,7 +3293,7 @@ fn write_checked(
         Err(e) if rows.len() == 1 => {
             failed.push(json!({
                 "i": rows[0].0,
-                "reason": e.to_string(),
+                "reason": short_reason(&e),
                 "permanent": refuses_content(&e),
             }));
         }
@@ -3119,14 +3334,21 @@ fn append_checked(
 /// table. Any other refusal (a count that fails among them) is reported for
 /// every document its update carried, for a later try. A refused document
 /// keeps whatever row the table holds.
+///
+/// A failure that is not about the rows a call carried ([`stops_the_rest`]:
+/// the service unreachable, timed out or failing) stops the write there:
+/// its documents and every document not yet tried are reported for a later
+/// try, with no further call, and the stop is returned ([`Stopped`]) so a
+/// caller with more to write stops as well.
 fn replace_rows_checked(
     table: &Supertable,
     gate: &Gate,
     rows: &[(usize, Value)],
     failed: &mut Vec<Value>,
-) {
+    id_bytes: usize,
+) -> Result<(), Stopped> {
     if rows.is_empty() {
-        return;
+        return Ok(());
     }
     let values: Vec<Value> = rows.iter().map(|(_, v)| v.clone()).collect();
     let mut ids: Vec<&str> = values
@@ -3135,46 +3357,258 @@ fn replace_rows_checked(
         .collect();
     ids.sort_unstable();
     ids.dedup();
+    let replace_each = |runs: &[&[(usize, Value)]], failed: &mut Vec<Value>| {
+        each_run(runs, failed, |run, failed| {
+            replace_rows_checked(table, gate, run, failed, id_bytes)
+        })
+    };
+    // More ids than one call may name: each run of them replaces on its own.
+    if let Some(runs) = rows_by_id_run(rows, &ids, id_bytes) {
+        let runs: Vec<&[(usize, Value)]> = runs.iter().map(Vec::as_slice).collect();
+        return replace_each(&runs, failed);
+    }
     let pred = col(OSID).in_list(ids.iter().map(|s| lit(s.to_string())).collect(), false);
     let replace = {
         let _pass = gate.whole();
         waiting(|| table.update_rows(pred.clone(), &values))
     };
     let Err(e) = replace else {
-        return;
+        return Ok(());
     };
+    let reason = short_reason(format_args!("replace: {e}"));
+    if stops_the_rest(&e) {
+        not_taken(rows, &reason, failed);
+        return Err(Stopped(reason));
+    }
     let over_cap = over_field_cap(&e);
+    if rows.len() > 1 && refused_for_size(&e) {
+        let (a, b) = rows.split_at(rows.len() / 2);
+        return replace_each(&[a, b], failed);
+    }
     if counts_may_explain(&e) {
-        if let Ok(counts) = rows_under(table, &ids) {
-            let single: HashSet<&str> = ids
-                .iter()
-                .zip(&counts)
-                .filter(|(_, &n)| n == 1)
-                .map(|(id, _)| *id)
-                .collect();
-            let (once, miscounted): (Vec<_>, Vec<_>) = rows.iter().cloned().partition(|(_, v)| {
-                v.get(OSID)
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| single.contains(id))
-            });
-            if !miscounted.is_empty() {
-                rewrite_rows(table, gate, &miscounted, failed);
-                replace_rows_checked(table, gate, &once, failed);
-                return;
+        match rows_under(table, &ids) {
+            Ok(counts) => {
+                let single: HashSet<&str> = ids
+                    .iter()
+                    .zip(&counts)
+                    .filter(|(_, &n)| n == 1)
+                    .map(|(id, _)| *id)
+                    .collect();
+                let (once, miscounted): (Vec<_>, Vec<_>) =
+                    rows.iter().cloned().partition(|(_, v)| {
+                        v.get(OSID)
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| single.contains(id))
+                    });
+                if !miscounted.is_empty() {
+                    if let Err(stop) = rewrite_rows(table, gate, &miscounted, failed, id_bytes) {
+                        not_taken(&once, &stop.0, failed);
+                        return Err(stop);
+                    }
+                    return replace_rows_checked(table, gate, &once, failed, id_bytes);
+                }
             }
+            Err(count) if stops_the_rest(&count) => {
+                not_taken(rows, &reason, failed);
+                return Err(Stopped(short_reason(format_args!("replace: {count}"))));
+            }
+            Err(_) => {}
         }
     }
     if rows.len() > 1 && (over_cap || refuses_content(&e)) {
         let (a, b) = rows.split_at(rows.len() / 2);
-        replace_rows_checked(table, gate, a, failed);
-        replace_rows_checked(table, gate, b, failed);
-        return;
+        return replace_each(&[a, b], failed);
     }
     let permanent = rows.len() == 1 && refuses_content(&e);
-    let reason = format!("replace: {e}");
     for (i, _) in rows {
         failed.push(json!({"i": i, "reason": reason, "permanent": permanent}));
     }
+    Ok(())
+}
+
+/// A write cut short by a failure that every later call would meet as well
+/// ([`stops_the_rest`]), with the reason its untried documents are reported
+/// with.
+struct Stopped(String);
+
+/// Whether a failed call stops the calls of the same write after it: any
+/// failure but a refusal of the rows the call carried. The engine refuses
+/// rows for their content, the field cap, a schema that changed under the
+/// write, a count of rows its ids do not match, or a request too large, all
+/// of which another run of rows can pass; the local engine types each, and
+/// the hosted service answers each as a 400 or a 413. Anything else (a
+/// transport error, which a timeout is too, a 5xx, a key refused, a limit
+/// of the account) is about the service or the account, so a later run
+/// would only fail the same way, each call up to the client's timeout.
+fn stops_the_rest(e: &InfinoError) -> bool {
+    match e {
+        InfinoError::Schema(_) | InfinoError::Cardinality(_) => false,
+        InfinoError::Backend(m) => !matches!(
+            status_in(m),
+            Some(STATUS_BAD_REQUEST | STATUS_PAYLOAD_TOO_LARGE)
+        ),
+        _ => true,
+    }
+}
+
+/// Report each of `rows` as not taken, for a later try, with `reason`.
+fn not_taken(rows: &[(usize, Value)], reason: &str, failed: &mut Vec<Value>) {
+    for (i, _) in rows {
+        failed.push(json!({"i": i, "reason": reason, "permanent": false}));
+    }
+}
+
+/// Write each of `runs` with `write`, in order, until one stops the write
+/// ([`Stopped`]): the documents of every run after it are reported with its
+/// reason ([`not_taken`]), untried, and the stop is returned.
+fn each_run(
+    runs: &[&[(usize, Value)]],
+    failed: &mut Vec<Value>,
+    mut write: impl FnMut(&[(usize, Value)], &mut Vec<Value>) -> Result<(), Stopped>,
+) -> Result<(), Stopped> {
+    for (k, run) in runs.iter().enumerate() {
+        if let Err(stop) = write(run, failed) {
+            for rest in &runs[k + 1..] {
+                not_taken(rest, &stop.0, failed);
+            }
+            return Err(stop);
+        }
+    }
+    Ok(())
+}
+
+/// How many bytes of ids one mutation over the hosted service may name. The
+/// hosted transport sends an update's or a delete's predicate in the
+/// request's URL, and its front end refuses a long one (413 near 80 KB,
+/// a broken pipe a little past it), so a list of more ids is cut into runs
+/// of at most this many, each its own call. Measured as [`id_cost`] counts.
+const HOSTED_ID_LIST_BYTES: usize = 32 * 1024;
+
+/// Bytes of a URL a byte takes at most once percent-encoded (`%XX`).
+const ENCODED_BYTE: usize = 3;
+
+/// Bytes of a URL the frame around one id in an `IN` list takes once
+/// encoded: its two quotes (`%27` each), the comma after it (`%2C`) and the
+/// space (`+`).
+const ID_FRAME_BYTES: usize = 10;
+
+/// What one id adds to a predicate's URL, at most: each byte
+/// percent-encoded, a quote inside it twice (the SQL writes `'` as `''`),
+/// and its frame ([`ID_FRAME_BYTES`]).
+fn id_cost(id: &str) -> usize {
+    let quotes = id.bytes().filter(|&b| b == b'\'').count();
+    (id.len() + quotes) * ENCODED_BYTE + ID_FRAME_BYTES
+}
+
+/// `ids`, in order, cut into runs whose [`id_cost`] sums to at most
+/// `budget`; a run holds one id at least.
+fn id_runs<S: AsRef<str>>(ids: &[S], budget: usize) -> Vec<&[S]> {
+    let mut runs = Vec::new();
+    let (mut start, mut cost) = (0, 0usize);
+    for (i, id) in ids.iter().enumerate() {
+        let c = id_cost(id.as_ref());
+        if i > start && cost.saturating_add(c) > budget {
+            runs.push(&ids[start..i]);
+            start = i;
+            cost = 0;
+        }
+        cost = cost.saturating_add(c);
+    }
+    if start < ids.len() {
+        runs.push(&ids[start..]);
+    }
+    runs
+}
+
+/// `rows` grouped by the run of `ids` (sorted, without repeats) their id
+/// falls in ([`id_runs`]), in run order; `None` when every id fits one run.
+fn rows_by_id_run(
+    rows: &[(usize, Value)],
+    ids: &[&str],
+    budget: usize,
+) -> Option<Vec<Vec<(usize, Value)>>> {
+    let runs = id_runs(ids, budget);
+    if runs.len() < 2 {
+        return None;
+    }
+    let mut run_of: HashMap<&str, usize> = HashMap::new();
+    for (r, run) in runs.iter().enumerate() {
+        for id in *run {
+            run_of.insert(id, r);
+        }
+    }
+    let mut grouped = vec![Vec::new(); runs.len()];
+    for row in rows {
+        let r = row
+            .1
+            .get(OSID)
+            .and_then(Value::as_str)
+            .and_then(|id| run_of.get(id))
+            .copied()
+            .unwrap_or(0);
+        grouped[r].push(row.clone());
+    }
+    Some(grouped)
+}
+
+/// Whether the hosted service refused a request for its size (413): the
+/// same request in halves can pass. A transport error is not taken for one,
+/// though an oversized URL can break the connection too: a whole outage
+/// breaks it as well, and splitting a batch through an outage would only
+/// multiply the calls that fail. [`HOSTED_ID_LIST_BYTES`] keeps predicates
+/// short of either.
+fn refused_for_size(e: &InfinoError) -> bool {
+    matches!(e, InfinoError::Backend(m) if status_in(m) == Some(STATUS_PAYLOAD_TOO_LARGE))
+}
+
+/// The longest reason a refused document is reported with.
+const REASON_MAX_BYTES: usize = 1024;
+
+/// `e` as a refused document's reason: every URL in it without its query,
+/// which on the hosted service holds the request's predicate (every id it
+/// names, so as long as the batch), and the whole cut to
+/// [`REASON_MAX_BYTES`]. The reason is repeated for each document of a
+/// failed write, so its length must not grow with the write's.
+fn short_reason(e: impl std::fmt::Display) -> String {
+    let full = e.to_string();
+    let mut out = String::with_capacity(full.len().min(REASON_MAX_BYTES + 64));
+    let mut rest = full.as_str();
+    while let Some(at) = rest.find("http") {
+        let (head, from) = rest.split_at(at);
+        out.push_str(head);
+        if from.starts_with("http://") || from.starts_with("https://") {
+            let end = from.find(char::is_whitespace).unwrap_or(from.len());
+            let url = &from[..end];
+            // A transport error writes `url: kind`, so a trailing colon is the text's.
+            let (url, colon) = url.strip_suffix(':').map_or((url, ""), |u| (u, ":"));
+            match url.find('?') {
+                Some(q) => {
+                    out.push_str(&url[..q]);
+                    out.push_str("?<query left out>");
+                }
+                None => out.push_str(url),
+            }
+            out.push_str(colon);
+            rest = &from[end..];
+        } else {
+            out.push_str("http");
+            rest = &from[4..];
+        }
+        if out.len() > REASON_MAX_BYTES {
+            break;
+        }
+    }
+    out.push_str(rest);
+    if out.len() > REASON_MAX_BYTES {
+        let mut cut = REASON_MAX_BYTES;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let dropped = full.len().saturating_sub(cut);
+        out.truncate(cut);
+        out.push_str(&format!("... ({dropped} bytes left out)"));
+    }
+    out
 }
 
 /// Whether a refused update may have been refused for its count of rows:
@@ -3214,8 +3648,16 @@ fn rows_under(table: &Supertable, ids: &[&str]) -> Result<Vec<u64>, InfinoError>
 /// each id ends with the one row its document brings. Two mutations: until
 /// the append lands a read finds no row under the ids, and a document whose
 /// append fails is reported for a later try, which finds no row and
-/// appends it. A delete that fails reports every document for a later try.
-fn rewrite_rows(table: &Supertable, gate: &Gate, rows: &[(usize, Value)], failed: &mut Vec<Value>) {
+/// appends it. A delete that fails reports its documents for a later try,
+/// and one that fails for a reason a later delete would meet as well
+/// ([`stops_the_rest`]) stops the write there ([`Stopped`]).
+fn rewrite_rows(
+    table: &Supertable,
+    gate: &Gate,
+    rows: &[(usize, Value)],
+    failed: &mut Vec<Value>,
+    id_bytes: usize,
+) -> Result<(), Stopped> {
     let mut ids: Vec<String> = rows
         .iter()
         .filter_map(|(_, v)| v.get(OSID).and_then(Value::as_str))
@@ -3227,19 +3669,36 @@ fn rewrite_rows(table: &Supertable, gate: &Gate, rows: &[(usize, Value)], failed
         "[capi] replace: {} ids held no row or several; their rows are deleted and the documents appended",
         ids.len()
     );
-    let pred = col(OSID).in_list(ids.into_iter().map(lit).collect(), false);
-    let deleted = {
-        let _pass = gate.whole();
-        waiting(|| table.delete(pred.clone()))
-    };
-    if let Err(e) = deleted {
-        let reason = format!("replace: {e}");
-        for (i, _) in rows {
-            failed.push(json!({"i": i, "reason": reason, "permanent": false}));
+    // Each run of ids ([`id_runs`]) is deleted, then its documents appended,
+    // on its own: a run whose delete fails reports its documents alone.
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let groups = rows_by_id_run(rows, &id_refs, id_bytes).unwrap_or_else(|| vec![rows.to_vec()]);
+    let groups: Vec<&[(usize, Value)]> = groups.iter().map(Vec::as_slice).collect();
+    each_run(&groups, failed, |group, failed| {
+        let mut run: Vec<String> = group
+            .iter()
+            .filter_map(|(_, v)| v.get(OSID).and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        run.sort_unstable();
+        run.dedup();
+        let pred = col(OSID).in_list(run.into_iter().map(lit).collect(), false);
+        let deleted = {
+            let _pass = gate.whole();
+            waiting(|| table.delete(pred.clone()))
+        };
+        if let Err(e) = deleted {
+            let reason = short_reason(format_args!("replace: {e}"));
+            not_taken(group, &reason, failed);
+            return if stops_the_rest(&e) {
+                Err(Stopped(reason))
+            } else {
+                Ok(())
+            };
         }
-        return;
-    }
-    append_checked(table, gate, rows, failed);
+        append_checked(table, gate, group, failed);
+        Ok(())
+    })
 }
 
 /// Index many documents in one append. `osids` and `sources` are parallel
@@ -3308,6 +3767,10 @@ pub unsafe extern "C" fn infino_index_batch(
             Err(why) => return err_json(&why),
         };
         unify_new_paths(&mut maps, &schema);
+        let adds_columns = conn.hosted
+            && conn
+                .table_schema(name)
+                .is_ok_and(|doc| adds_columns(&doc, &maps));
         let indexed: Vec<(usize, Value)> = rows
             .iter()
             .zip(maps)
@@ -3315,6 +3778,9 @@ pub unsafe extern "C" fn infino_index_batch(
             .collect();
         append_checked(&table, &conn.gate(name), &indexed, &mut failed);
         let ok = n - failed.len();
+        if adds_columns && ok > 0 {
+            conn.reread_schema(name);
+        }
         out_json(json!({ "ok": ok, "failed": failed }))
     }))
     .unwrap_or(ptr::null_mut())
@@ -3366,7 +3832,15 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             Err(e) => return err_json(&e.to_string()),
         };
         let n = prepared.n;
-        let failed = append_prepared(&table, &conn.gate(name), vec![prepared], &[], &[]);
+        let adds_columns = prepared.adds_columns;
+        let failed = append_prepared(
+            &table,
+            &conn.gate(name),
+            vec![prepared],
+            &[],
+            &[],
+            conn.id_list_bytes(),
+        );
         let failed: Vec<Value> = failed
             .into_iter()
             .map(|(_, i, reason, permanent)| {
@@ -3374,6 +3848,9 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             })
             .collect();
         let ok = n - failed.len();
+        if adds_columns && ok > 0 {
+            conn.reread_schema(name);
+        }
         out_json(json!({ "ok": ok, "failed": failed }))
     }))
     .unwrap_or(ptr::null_mut())
@@ -3389,6 +3866,10 @@ pub struct Prepared {
     values: Vec<Value>,
     index_of: Vec<usize>,
     failed: Vec<(usize, String)>,
+    /// Whether the rows hold a path the kept schema document lacks, so the
+    /// append adds a column to it ([`Bridge::reread_schema`]). Only a hosted
+    /// connection keeps a document; over storage this is false.
+    adds_columns: bool,
 }
 
 /// One row of a buffer handed to [`prepare`]: its id, source, routing value
@@ -3447,7 +3928,7 @@ unsafe fn prepare(
     // it is refused as the append it prepares is.
     conn.refuse_write(name)?;
     let table = conn.table(name).map_err(|e| e.to_string())?;
-    let table_schema = conn.conn.schema(name).map_err(|e| e.to_string())?;
+    let table_schema = conn.table_schema(name).map_err(|e| e.to_string())?;
     let schema = table.schema();
     let kept = conn.kept(name);
     let engine = conn.engine_columns(name);
@@ -3538,13 +4019,14 @@ unsafe fn prepare(
     // the rows are then converted against the schema that holds it.
     let (table_schema, schema) = if ensure_list_columns(conn, name, &schema, &rows)? {
         (
-            conn.conn.schema(name).map_err(|e| e.to_string())?,
+            conn.table_schema(name).map_err(|e| e.to_string())?,
             conn.table(name).map_err(|e| e.to_string())?.schema(),
         )
     } else {
         (table_schema, schema)
     };
     unify_new_paths(&mut rows, &schema);
+    let adds_columns = conn.hosted && adds_columns(&table_schema, &rows);
     let values: Vec<Value> = rows.into_iter().map(Value::Object).collect();
     let batch = if values.is_empty() {
         None
@@ -3557,6 +4039,7 @@ unsafe fn prepare(
         values,
         index_of,
         failed,
+        adds_columns,
     })
 }
 
@@ -3700,6 +4183,7 @@ fn append_prepared(
     mut prepared: Vec<Prepared>,
     replaced: &[String],
     seqs: &[Vec<i64>],
+    id_bytes: usize,
 ) -> Vec<NotTaken> {
     let mut failed: Vec<NotTaken> = Vec::new();
     for (b, p) in prepared.iter_mut().enumerate() {
@@ -3750,9 +4234,13 @@ fn append_prepared(
                     // than it brings, which the engine refuses whole.
                     replaced_landed = replacing.num_rows() == 0 || {
                         let ids = osids_of(&replacing);
-                        let pred = col(OSID).in_list(ids.into_iter().map(lit).collect(), false);
-                        let _pass = gate.whole();
-                        waiting(|| table.update(pred.clone(), &replacing)).is_ok()
+                        // Ids past one call's list go a run at a time,
+                        // below ([`replace_rows_checked`]).
+                        id_runs(&ids, id_bytes).len() < 2 && {
+                            let pred = col(OSID).in_list(ids.into_iter().map(lit).collect(), false);
+                            let _pass = gate.whole();
+                            waiting(|| table.update(pred.clone(), &replacing)).is_ok()
+                        }
                     };
                     fresh_landed = fresh.num_rows() == 0 || {
                         let _pass = gate.append();
@@ -3780,7 +4268,10 @@ fn append_prepared(
     // batch that could not be converted, and the rows of the joined batch
     // whose append or replace the engine refused. A document that replaces a
     // row goes through the engine's replace ([`replace_rows_checked`]), never
-    // an append that would put a second row beside the one it replaces.
+    // an append that would put a second row beside the one it replaces. Once
+    // a replace stops ([`Stopped`]), every document left is reported with its
+    // reason, untried.
+    let mut stopped: Option<String> = None;
     for (b, p) in prepared.into_iter().enumerate() {
         let converted = p.batch.is_some();
         if converted && !joined_batches {
@@ -3804,8 +4295,17 @@ fn append_prepared(
             }
         }
         let mut refused: Vec<Value> = Vec::new();
-        replace_rows_checked(table, gate, &replacing, &mut refused);
-        append_checked(table, gate, &indexed, &mut refused);
+        if let Some(reason) = &stopped {
+            not_taken(&replacing, reason, &mut refused);
+            not_taken(&indexed, reason, &mut refused);
+        } else if let Err(Stopped(reason)) =
+            replace_rows_checked(table, gate, &replacing, &mut refused, id_bytes)
+        {
+            not_taken(&indexed, &reason, &mut refused);
+            stopped = Some(reason);
+        } else {
+            append_checked(table, gate, &indexed, &mut refused);
+        }
         for r in refused {
             let i = r["i"].as_u64().unwrap_or(0) as usize;
             failed.push((
@@ -4001,8 +4501,21 @@ pub unsafe extern "C" fn infino_append_prepared(
                 })
                 .collect()
         };
-        let failed = append_prepared(&table, &conn.gate(name), owned, &replaced, &per_batch);
+        let adds_columns = owned.iter().any(|p| p.adds_columns);
+        let failed = append_prepared(
+            &table,
+            &conn.gate(name),
+            owned,
+            &replaced,
+            &per_batch,
+            conn.id_list_bytes(),
+        );
         let ok = n.saturating_sub(failed.len());
+        // A write adds its columns only when it lands, so one that landed
+        // nothing changed nothing, and asks the service nothing more.
+        if adds_columns && ok > 0 {
+            conn.reread_schema(name);
+        }
         let failed: Vec<Value> = failed
             .into_iter()
             .map(|(b, i, reason, permanent)| {
@@ -4065,29 +4578,27 @@ pub unsafe extern "C" fn infino_delete_osids(
         }
         let n = count as usize;
         let os_p = unsafe { std::slice::from_raw_parts(osids, n) };
-        let ids: Vec<_> = os_p
-            .iter()
-            .filter_map(|p| unsafe { cstr(*p) })
-            .map(|s| lit(s.to_string()))
-            .collect();
+        let ids: Vec<&str> = os_p.iter().filter_map(|p| unsafe { cstr(*p) }).collect();
         // No table yet means nothing to delete.
         let table = match conn.table(name) {
             Ok(t) => t,
             Err(_) => return 0,
         };
-        let pred = col(OSID).in_list(ids, false);
-        let deleted = {
-            let gate = conn.gate(name);
-            let _pass = gate.whole();
-            waiting(|| table.delete(pred.clone()))
-        };
-        match deleted {
-            Ok(_) => 0,
-            Err(e) => {
-                eprintln!("[capi] delete_osids: {e}");
-                -2
+        // A run of ids at a time ([`id_runs`]); a failed run fails the call,
+        // which the caller tries again whole (a delete is idempotent).
+        let gate = conn.gate(name);
+        for run in id_runs(&ids, conn.id_list_bytes()) {
+            let pred = col(OSID).in_list(run.iter().map(|s| lit(s.to_string())).collect(), false);
+            let deleted = {
+                let _pass = gate.whole();
+                waiting(|| table.delete(pred.clone()))
+            };
+            if let Err(e) = deleted {
+                eprintln!("[capi] delete_osids: {}", short_reason(&e));
+                return -2;
             }
         }
+        0
     }))
     .unwrap_or(-99)
 }
@@ -5197,7 +5708,7 @@ pub unsafe extern "C" fn infino_value_counts(
             // Where the engine's own count fails (the hosted service's does,
             // on a count it declares non-null and gives null), the grouped
             // count as a statement gives the same rows.
-            Err(e) => match conn.conn.query_sql(&grouped_count(name, column, max)) {
+            Err(e) => match conn.conn.query_sql(&grouped_count(name, column, Some(max))) {
                 Ok(b) if b.iter().map(RecordBatch::num_rows).sum::<usize>() > max => {
                     out_string("null".to_string())
                 }
@@ -5209,17 +5720,150 @@ pub unsafe extern "C" fn infino_value_counts(
     .unwrap_or(ptr::null_mut())
 }
 
+/// The `top` most frequent values of a keyword column over the whole table,
+/// by count and then by value (its UTF-8 bytes), with what a terms
+/// aggregation needs to count the rest: `{"rows":[{column, "count(*)"}...],
+/// "keyed_total":n, "nulls":n, "groups":n}`, where `keyed_total` is the rows
+/// with a value, `nulls` the rows without one and `groups` how many values
+/// the column has. One call: the engine reads a keyword column's counts from
+/// its term index, so only `top` rows cross, however many values it has.
+/// `null`, for the caller's own statement to run, for a column without the
+/// `keyword` analyzer (the engine would run the grouped count there, which
+/// the statement runs as well; every column on a hosted connection, see
+/// [`Bridge::keyword_analyzer`]), and where the engine's count fails. The
+/// engine counts every value in memory before the top `n` are picked;
+/// bounding that is infino-ai/infino#1459.
+#[no_mangle]
+pub unsafe extern "C" fn infino_value_counts_top(
+    h: *mut Bridge,
+    name: *const c_char,
+    column: *const c_char,
+    top: c_int,
+) -> *mut c_char {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(conn), Some(name), Some(column)) =
+            (bridge_ref(h), unsafe { cstr(name) }, unsafe {
+                cstr(column)
+            })
+        else {
+            return ptr::null_mut();
+        };
+        match value_counts_top(conn, name, column, top.max(0) as usize) {
+            Ok(Some(out)) => out_string(out.to_string()),
+            Ok(None) => out_string("null".to_string()),
+            Err(e) => err_json(&e),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// [`infino_value_counts_top`]'s answer, None for a column without the
+/// `keyword` analyzer or where the engine's count fails.
+fn value_counts_top(
+    conn: &Bridge,
+    name: &str,
+    column: &str,
+    top: usize,
+) -> Result<Option<Value>, String> {
+    // No column over this connection has the analyzer: decline without
+    // asking the hosted service for the table's schema.
+    if !conn.keyword_analyzer() {
+        return Ok(None);
+    }
+    let keyword = conn
+        .conn
+        .schema(name)
+        .map_err(|e| e.to_string())?
+        .fields()
+        .iter()
+        .any(|f| {
+            f.name == column
+                && matches!(
+                    f.index,
+                    Some(ColumnIndex::Fts {
+                        analyzer: Analyzer::Keyword,
+                        ..
+                    })
+                )
+        });
+    if !keyword {
+        return Ok(None);
+    }
+    let table = conn.table(name).map_err(|e| e.to_string())?;
+    // Where the engine's own count fails, decline: the caller's bounded
+    // statement gives the same answer, where a grouped count here would
+    // bring every value of the column across the bridge.
+    match table.value_counts(column) {
+        Ok(b) => Ok(top_values(&[b], column, top)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// [`infino_value_counts_top`]'s answer from a column's value counts
+/// (`batches`, each the value then its count). None when the values are not
+/// strings or the counts not integers.
+fn top_values(batches: &[RecordBatch], column: &str, top: usize) -> Option<Value> {
+    let is_text =
+        |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+    let mut values: Vec<LargeStringArray> = Vec::with_capacity(batches.len());
+    let mut counts: Vec<Int64Array> = Vec::with_capacity(batches.len());
+    for b in batches {
+        if b.num_columns() < 2 {
+            return None;
+        }
+        let text = match b.column(0).data_type() {
+            DataType::Dictionary(_, v) => is_text(v),
+            t => is_text(t),
+        };
+        if !text {
+            return None;
+        }
+        let v = datafusion::arrow::compute::cast(b.column(0), &DataType::LargeUtf8).ok()?;
+        let n = datafusion::arrow::compute::cast(b.column(1), &DataType::Int64).ok()?;
+        values.push(v.as_any().downcast_ref::<LargeStringArray>()?.clone());
+        counts.push(n.as_any().downcast_ref::<Int64Array>()?.clone());
+    }
+    let groups: usize = values.iter().map(|v| v.len() - v.null_count()).sum();
+    let (mut nulls, mut keyed_total) = (0i64, 0i64);
+    let mut keyed: Vec<(i64, &str)> = Vec::with_capacity(groups);
+    for (v, n) in values.iter().zip(&counts) {
+        for i in 0..v.len() {
+            let count = if n.is_null(i) { 0 } else { n.value(i) };
+            if v.is_null(i) {
+                nulls += count;
+            } else {
+                keyed_total += count;
+                keyed.push((count, v.value(i)));
+            }
+        }
+    }
+    let top = top.min(groups);
+    // Count descending, then the value's bytes ascending: a terms
+    // aggregation's default order, as the plugin's window statement ranks.
+    let order = |a: &(i64, &str), b: &(i64, &str)| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1));
+    if top > 0 && top < groups {
+        keyed.select_nth_unstable_by(top - 1, order);
+    }
+    keyed.truncate(top);
+    keyed.sort_unstable_by(order);
+    let rows: Vec<Value> = keyed
+        .into_iter()
+        .map(|(n, v)| json!({ column: v, "count(*)": n }))
+        .collect();
+    Some(json!({ "rows": rows, "keyed_total": keyed_total, "nulls": nulls, "groups": groups }))
+}
+
 /// The grouped count [`infino_value_counts`] gives, as a statement: each
 /// value of `column` in `name` and its rows, under the names the engine's
-/// own count gives them. It stops one group past `max`, which is all the
-/// caller needs to know the column holds too many values to carry.
-fn grouped_count(name: &str, column: &str, max: usize) -> String {
+/// own count gives them. With a `max`, it stops one group past it, which is
+/// all the caller needs to know the column holds too many values to carry.
+fn grouped_count(name: &str, column: &str, max: Option<usize>) -> String {
     let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
     let (table, column) = (quote(name), quote(column));
-    let limit = max.saturating_add(1);
-    format!(
-        "SELECT {column}, count(*) AS \"count(*)\" FROM {table} GROUP BY {column} LIMIT {limit}"
-    )
+    let limit = max.map_or(String::new(), |max| {
+        format!(" LIMIT {}", max.saturating_add(1))
+    });
+    format!("SELECT {column}, count(*) AS \"count(*)\" FROM {table} GROUP BY {column}{limit}")
 }
 
 /// Unranked full-text match set: the osids of every row matching `query` on
@@ -5459,9 +6103,11 @@ mod tests {
     use super::*;
     use std::env;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt;
     use std::thread;
+
+    use datafusion::arrow::ipc::writer::StreamWriter;
 
     /// A directory its owner may read and enter but not write.
     const READ_ONLY_DIR: u32 = 0o555;
@@ -5499,6 +6145,14 @@ mod tests {
     /// A fresh catalog on local disk: `memory://` tables have no durable
     /// storage, and delete / update need one.
     fn open_logs() -> *mut Bridge {
+        let h = open_storage();
+        let out = ensure(h, MAPPING);
+        assert!(out.contains("\"created\":true"), "{out}");
+        h
+    }
+
+    /// A connection over a fresh directory, with no table declared yet.
+    fn open_storage() -> *mut Bridge {
         let dir = std::env::temp_dir().join(format!(
             "infino-capi-test-{}-{}-{}",
             std::process::id(),
@@ -5512,9 +6166,204 @@ mod tests {
         let uri = format!("file://{}", dir.display());
         let h = unsafe { infino_open(c(&uri).as_ptr()) };
         assert!(!h.is_null());
-        let out = ensure(h, MAPPING);
-        assert!(out.contains("\"created\":true"), "{out}");
         h
+    }
+
+    /// On a hosted connection the schema document a batch is prepared
+    /// against is kept with the table's handle, so preparing batch after
+    /// batch asks the service nothing; a declaration that changes the table
+    /// drops it, and the next batch reads the new one.
+    #[test]
+    fn a_hosted_tables_schema_is_kept_until_a_declaration_changes_it() {
+        let h = open_logs();
+        let names = |s: &TableSchema| s.fields().iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+        // Storage answers the same document a hosted service would; the flag
+        // is what makes the bridge keep it.
+        unsafe { (*h).hosted = true };
+        let bridge = unsafe { &*h };
+        let before = names(&bridge.table_schema("logs").unwrap());
+        // A column added behind the bridge is not seen: the document is kept.
+        let behind = SchemaPatch::new(vec![FieldPatch::named("behind".to_string())
+            .with_type(DataType::Int64)
+            .with_nullable(true)]);
+        let table = bridge.conn.open_table("logs").unwrap();
+        table.apply_schema(&behind, None).unwrap();
+        assert_eq!(names(&bridge.table_schema("logs").unwrap()), before);
+        // A declaration that adds a column drops it.
+        let out = ensure(h, r#"{"properties":{"added":{"type":"long"}}}"#);
+        assert!(!out.contains("error"), "{out}");
+        let after = names(&bridge.table_schema("logs").unwrap());
+        assert!(after.contains(&"added".to_string()), "{after:?}");
+        assert!(after.contains(&"behind".to_string()), "{after:?}");
+    }
+
+    /// The names of the columns [`infino_columns`] reports for `logs`.
+    fn column_names(h: *mut Bridge) -> Vec<String> {
+        columns(h)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|col| col["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// The names of `schema`'s fields.
+    fn field_names(schema: &TableSchema) -> Vec<String> {
+        schema.fields().iter().map(|f| f.name.clone()).collect()
+    }
+
+    /// Add a nullable long column `column` to `logs` behind the bridge, as
+    /// another node's declaration would: a hosted bridge's kept schema
+    /// document lacks it until the bridge reads the document again, so
+    /// whether a read sees it tells whether that read asked the service.
+    fn add_column_behind(h: *mut Bridge, column: &str) {
+        let patch = SchemaPatch::new(vec![FieldPatch::named(column.to_string())
+            .with_type(DataType::Int64)
+            .with_nullable(true)]);
+        let table = unsafe { &*h }.conn.open_table("logs").unwrap();
+        table.apply_schema(&patch, None).unwrap();
+    }
+
+    /// The engine adds columns during an append as well as during a
+    /// declaration: a geo_point's first values, a flat_object's members, a
+    /// path the mapping does not declare. On a hosted table the kept schema
+    /// document is read again after an append that added one, so the
+    /// table's columns hold it right away, as they do over storage; an
+    /// append that adds none keeps the document, so staging the next batch
+    /// still asks the service nothing.
+    #[test]
+    fn a_column_an_append_adds_is_among_the_columns_right_after_it() {
+        for hosted in [false, true] {
+            let h = open_logs();
+            unsafe { (*h).hosted = hosted };
+            let out = ensure(h, r#"{"properties":{"fo":{"type":"flat_object"}}}"#);
+            assert!(!out.contains("error"), "{out}");
+            let doc = r#"{"level":"info","geo":[1.0,2.0],"fo":{"a":1},"un":7}"#;
+            let p = prepared(h, &[("y", doc)]);
+            assert_eq!(append_replacing(h, p, &[])["ok"], 1);
+            let cols = column_names(h);
+            for added in ["geo", "fo.a", "un"] {
+                assert!(
+                    cols.contains(&added.to_string()),
+                    "hosted = {hosted}: {added} missing from {cols:?}"
+                );
+            }
+            if hosted {
+                // A column added behind the bridge stays unseen through an
+                // append that adds none: that append kept the document.
+                add_column_behind(h, "behind");
+                let p = prepared(h, &[("z", r#"{"level":"warn","un":8}"#)]);
+                assert_eq!(append_replacing(h, p, &[])["ok"], 1);
+                let cols = column_names(h);
+                assert!(!cols.contains(&"behind".to_string()), "{cols:?}");
+            }
+            close(h);
+        }
+    }
+
+    /// The engine adds no column for a path that holds only `null`, `[]` or
+    /// a list of nulls, so an append of such a document adds none either,
+    /// and keeps the hosted table's schema document: were it read again,
+    /// every later write of the document would read it again too, since
+    /// nothing ever gives the path a column.
+    #[test]
+    fn a_path_holding_only_nulls_or_empty_lists_keeps_the_schema_document() {
+        for doc in [
+            r#"{"level":"info","nul":null}"#,
+            r#"{"level":"info","emp":[]}"#,
+            r#"{"level":"info","nuls":[null,null]}"#,
+        ] {
+            let h = open_logs();
+            unsafe { (*h).hosted = true };
+            let p = prepared(h, &[("a", doc)]);
+            assert_eq!(append_replacing(h, p, &[])["ok"], 1, "{doc}");
+            add_column_behind(h, "behind");
+            let p = prepared(h, &[("b", doc)]);
+            assert!(!unsafe { &*p }.adds_columns, "{doc}");
+            assert_eq!(append_replacing(h, p, &[])["ok"], 1, "{doc}");
+            let cols = column_names(h);
+            assert!(!cols.contains(&"behind".to_string()), "{doc}: {cols:?}");
+            close(h);
+        }
+    }
+
+    /// A read of a hosted table's schema document that begins before a
+    /// declaration changes the table and ends after the declaration's last
+    /// forget returns what it read, but keeps nothing: the next read asks
+    /// again and finds the declared column.
+    #[test]
+    fn a_schema_read_a_declaration_overtakes_keeps_nothing() {
+        let h = open_logs();
+        unsafe { (*h).hosted = true };
+        let bridge = unsafe { &*h };
+        let read = bridge
+            .kept_or_read("logs", &bridge.schemas, || {
+                let before = bridge.conn.schema("logs");
+                // The declaration runs wholly between the read and its keep.
+                let out = ensure(h, r#"{"properties":{"added":{"type":"long"}}}"#);
+                assert!(out.contains("\"added\":1"), "{out}");
+                before
+            })
+            .unwrap();
+        assert!(!field_names(&read).contains(&"added".to_string()));
+        let now = field_names(&bridge.table_schema("logs").unwrap());
+        assert!(now.contains(&"added".to_string()), "{now:?}");
+        close(h);
+    }
+
+    /// Re-reading a hosted table's schema document after a write leaves the
+    /// old document kept while the read runs and if it fails: a stalled
+    /// service must not leave a thread that stages a bulk with nothing kept,
+    /// asking the service itself. Once a read succeeds, its document is
+    /// swapped in.
+    #[test]
+    fn a_failed_schema_reread_keeps_the_old_document() {
+        let h = open_logs();
+        unsafe { (*h).hosted = true };
+        let bridge = unsafe { &*h };
+        bridge.table_schema("logs").unwrap();
+        add_column_behind(h, "behind");
+        let failed = bridge.replace_schema("logs", || {
+            // The old document is still what staging reads mid-read.
+            let mid = field_names(&bridge.table_schema("logs").unwrap());
+            assert!(!mid.contains(&"behind".to_string()), "{mid:?}");
+            Err(InfinoError::Backend("the service did not answer".into()))
+        });
+        assert!(failed.is_err());
+        // Staging still reads the kept document, not the service.
+        let p = prepared(h, &[("a", r#"{"level":"info"}"#)]);
+        unsafe { infino_free_prepared(p) };
+        let kept = field_names(&bridge.table_schema("logs").unwrap());
+        assert!(!kept.contains(&"behind".to_string()), "{kept:?}");
+        bridge
+            .replace_schema("logs", || bridge.conn.schema("logs"))
+            .unwrap();
+        let now = field_names(&bridge.table_schema("logs").unwrap());
+        assert!(now.contains(&"behind".to_string()), "{now:?}");
+        close(h);
+    }
+
+    /// A read on a miss that a re-read overtakes keeps nothing, so it cannot
+    /// put back a document older than the one the re-read swapped in.
+    #[test]
+    fn a_schema_read_a_reread_overtakes_keeps_nothing() {
+        let h = open_logs();
+        unsafe { (*h).hosted = true };
+        let bridge = unsafe { &*h };
+        let read = bridge
+            .kept_or_read("logs", &bridge.schemas, || {
+                let before = bridge.conn.schema("logs");
+                add_column_behind(h, "behind");
+                bridge
+                    .replace_schema("logs", || bridge.conn.schema("logs"))
+                    .unwrap();
+                before
+            })
+            .unwrap();
+        assert!(!field_names(&read).contains(&"behind".to_string()));
+        let now = field_names(&bridge.table_schema("logs").unwrap());
+        assert!(now.contains(&"behind".to_string()), "{now:?}");
+        close(h);
     }
 
     /// An array of arrays at a path without a column (a geo_point given
@@ -5556,10 +6405,13 @@ mod tests {
             assert_eq!(out["ok"], 1, "{doc}: {out}");
         }
         // Those writes gave geo and fo.a list columns typed from their values.
-        let cols = take(unsafe { infino_columns(h, c("logs").as_ptr()) });
+        let cols = columns(h);
         for path in ["geo", "fo.a"] {
             assert!(
-                cols.contains(&format!("\"name\":\"{path}\",\"type\":\"list\"")),
+                cols.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|cc| cc["name"] == path && cc["type"] == "list"),
                 "{path}: {cols}"
             );
         }
@@ -5893,6 +6745,146 @@ mod tests {
             counted(&value_counts(h, "level", GROUPS), "level", "count(*)"),
             counted(&sql(h, grouped_sql), "level", "n")
         );
+        close(h);
+    }
+
+    fn value_counts_top(h: *mut Bridge, column: &str, top: c_int) -> Value {
+        let out = take(unsafe {
+            infino_value_counts_top(h, c("logs").as_ptr(), c(column).as_ptr(), top)
+        });
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"))
+    }
+
+    /// `(value, count)` pairs of a top answer's rows, in its order.
+    fn top_rows(out: &Value) -> Vec<(String, i64)> {
+        out["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["level"].as_str().unwrap().to_string(),
+                    r["count(*)"].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn value_counts_top_ranks_by_count_then_value_and_counts_the_rest() {
+        let h = open_logs();
+        // b and a tie at 2, e, c and d at 1; two rows have no level.
+        index(
+            h,
+            &[
+                ("1", r#"{"level":"b"}"#),
+                ("2", r#"{"level":"a"}"#),
+                ("3", r#"{"level":"e"}"#),
+                ("4", r#"{"level":"b"}"#),
+                ("5", r#"{"level":"c"}"#),
+                ("6", r#"{"level":"a"}"#),
+                ("7", r#"{"level":"d"}"#),
+                ("8", r#"{"message":"no level"}"#),
+                ("9", r#"{"message":"no level"}"#),
+            ],
+        );
+        let pairs = |v: &[(&str, i64)]| -> Vec<(String, i64)> {
+            v.iter().map(|(k, n)| (k.to_string(), *n)).collect()
+        };
+        let out = value_counts_top(h, "level", 3);
+        // Ties break by value ascending, as a terms aggregation orders them.
+        assert_eq!(top_rows(&out), pairs(&[("a", 2), ("b", 2), ("c", 1)]));
+        assert_eq!(out["keyed_total"], json!(7));
+        assert_eq!(out["nulls"], json!(2));
+        assert_eq!(out["groups"], json!(5));
+        // More asked for than there are values: every value, in order.
+        let all = value_counts_top(h, "level", 50);
+        assert_eq!(
+            top_rows(&all),
+            pairs(&[("a", 2), ("b", 2), ("c", 1), ("d", 1), ("e", 1)])
+        );
+        assert_eq!(all["keyed_total"], json!(7));
+        // None asked for: no rows, the counts still whole.
+        let none = value_counts_top(h, "level", 0);
+        assert!(top_rows(&none).is_empty());
+        assert_eq!(none["keyed_total"], json!(7));
+        assert_eq!(none["groups"], json!(5));
+        // A column without the keyword analyzer declines too: a number, and
+        // a text field (its own analyzer splits values into words).
+        index(h, &[("10", r#"{"status":200,"message":"no level here"}"#)]);
+        assert_eq!(value_counts_top(h, "status", 3), Value::Null);
+        assert_eq!(value_counts_top(h, "message", 3), Value::Null);
+        // After a delete the engine's term counts leave the deleted row out
+        // themselves; same ranking.
+        assert_eq!(delete(h, &["1"]), 0);
+        let out = value_counts_top(h, "level", 2);
+        assert_eq!(top_rows(&out), pairs(&[("a", 2), ("b", 1)]));
+        assert_eq!(out["keyed_total"], json!(6));
+        assert_eq!(out["nulls"], json!(3));
+        close(h);
+    }
+
+    /// The hosted service refuses a table that declares the `keyword`
+    /// analyzer, so a hosted connection declares keyword fields as it did
+    /// before that analyzer: the default analyzer, without positions, at
+    /// creation and when mapped later. The top call then declines and the
+    /// value counts still answer. Such a table read over storage of its own
+    /// declines too, since its columns lack the analyzer.
+    #[test]
+    fn a_hosted_connection_declares_keyword_fields_without_the_keyword_analyzer() {
+        let h = open_storage();
+        // Storage answers as the hosted service would; the flag picks the path.
+        unsafe { (*h).hosted = true };
+        let out = ensure(h, MAPPING);
+        assert!(out.contains("\"created\":true"), "{out}");
+        let out = ensure(h, r#"{"properties":{"host":{"type":"keyword"}}}"#);
+        assert!(out.contains("\"added\":1"), "{out}");
+        let schema = unsafe { &*h }.conn.schema("logs").unwrap();
+        for name in ["level", "http.method", "host"] {
+            let index = schema
+                .fields()
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.index.clone())
+                .unwrap();
+            assert!(
+                matches!(
+                    &index,
+                    Some(ColumnIndex::Fts {
+                        positions: false,
+                        analyzer,
+                        ..
+                    }) if !matches!(analyzer, Analyzer::Keyword)
+                ),
+                "{name}: {index:?}"
+            );
+        }
+        index(
+            h,
+            &[
+                ("1", r#"{"level":"b","host":"x"}"#),
+                ("2", r#"{"level":"a","host":"x"}"#),
+                ("3", r#"{"level":"b","host":"y"}"#),
+                ("4", r#"{"message":"no level"}"#),
+            ],
+        );
+        assert_eq!(value_counts_top(h, "level", 5), Value::Null);
+        assert_eq!(value_counts_top(h, "host", 5), Value::Null);
+        assert_eq!(
+            counted(&value_counts(h, "level", 10), "level", "count(*)"),
+            [
+                ("\"a\"".to_string(), 1),
+                ("\"b\"".to_string(), 2),
+                ("null".to_string(), 1)
+            ]
+        );
+        // `=` still matches a whole value.
+        let hits = sql(h, "SELECT osid FROM logs WHERE level = 'b' ORDER BY osid");
+        assert_eq!(hits, json!([{"osid":"1"},{"osid":"3"}]));
+        // Over storage of its own, the table's keyword columns still lack the
+        // analyzer: the top call declines rather than read empty term counts.
+        unsafe { (*h).hosted = false };
+        assert_eq!(value_counts_top(h, "level", 5), Value::Null);
         close(h);
     }
 
@@ -6399,12 +7391,12 @@ mod tests {
     #[test]
     fn the_grouped_count_stops_one_group_past_what_the_caller_carries() {
         assert_eq!(
-            grouped_count("t", "a\"b", 10),
+            grouped_count("t", "a\"b", Some(10)),
             "SELECT \"a\"\"b\", count(*) AS \"count(*)\" FROM \"t\" GROUP BY \"a\"\"b\" LIMIT 11"
         );
         let h = open_logs();
         plain_table(bridge_ref(h).unwrap());
-        let groups = sql(h, &grouped_count("plain", "status", 1));
+        let groups = sql(h, &grouped_count("plain", "status", Some(1)));
         assert_eq!(groups.as_array().unwrap().len(), 2, "one past the two a caller of 1 carries");
         close(h);
     }
@@ -6461,6 +7453,33 @@ mod tests {
             .collect();
         ranged.sort();
         assert_eq!(ranged, ["@timestamp", "http.code", "status", "took"]);
+    }
+
+    /// The columns say which have a range index, at creation and when a
+    /// later mapping adds a field: an unindexed numeric field has none.
+    #[test]
+    fn the_columns_say_which_have_a_range_index() {
+        let h = open_logs();
+        let out = ensure(
+            h,
+            r#"{"properties":{"added":{"type":"long"},"unread":{"type":"long","index":false}}}"#,
+        );
+        assert!(!out.contains("error"), "{out}");
+        let cols = columns(h);
+        let range = |n: &str| {
+            cols.as_array()
+                .unwrap()
+                .iter()
+                .find(|cc| cc["name"] == n)
+                .unwrap_or_else(|| panic!("no column {n} in {cols}"))["range"]
+                .clone()
+        };
+        assert_eq!(range("@timestamp"), true);
+        assert_eq!(range("status"), true);
+        assert_eq!(range("added"), true);
+        assert_eq!(range("unread"), false);
+        assert_eq!(range("level"), false);
+        close(h);
     }
 
     #[test]
@@ -6791,6 +7810,7 @@ mod tests {
                 matches!(
                     index_of(name),
                     Some(ColumnIndex::Fts {
+                        analyzer: Analyzer::Keyword,
                         positions: false,
                         ..
                     })
@@ -8433,6 +9453,474 @@ mod tests {
         assert_eq!(rows[0]["c"], 0, "{rows}");
         assert_eq!(optimize(h), 0);
         close(h);
+    }
+
+    /// Ids are cut into runs whose cost fits the budget, in order and with
+    /// none left out; an id past the budget alone is a run of its own.
+    #[test]
+    fn ids_are_cut_into_runs_that_fit_the_budget() {
+        let ids: Vec<String> = (0..10).map(|i| format!("id-{i}")).collect();
+        let per = id_cost("id-0");
+        let runs = id_runs(&ids, 3 * per);
+        assert_eq!(
+            runs.iter().map(|r| r.len()).collect::<Vec<_>>(),
+            vec![3, 3, 3, 1]
+        );
+        assert_eq!(runs.concat(), ids);
+        assert_eq!(id_runs(&ids, usize::MAX).len(), 1);
+        let long = vec!["x".repeat(1000), "y".to_string()];
+        assert_eq!(id_runs(&long, 10).len(), 2);
+        assert!(id_runs::<String>(&[], 10).is_empty());
+    }
+
+    /// A transport error names the whole request URL, whose query holds
+    /// every id of the write. The reason a document is reported with leaves
+    /// the query out and stays short, however many ids the write named; a
+    /// short reason is kept as it is.
+    #[test]
+    fn a_refused_write_s_reason_leaves_out_the_url_query_and_stays_short() {
+        let ids: Vec<String> = (0..5_000).map(|i| format!("%27doc-{i:06}%27")).collect();
+        let url = format!(
+            "https://api.example.test/v1/update/db?table=os_t&predicate=osid+IN+%28{}%29",
+            ids.join("%2C+")
+        );
+        let e = InfinoError::Backend(format!(
+            "update: transport error: {url}: Connection Failed: Broken pipe (os error 32)"
+        ));
+        let reason = short_reason(format_args!("replace: {e}"));
+        assert!(
+            reason.len() <= REASON_MAX_BYTES + 64,
+            "{} bytes",
+            reason.len()
+        );
+        assert!(!reason.contains("predicate="), "{reason}");
+        assert!(
+            reason.contains("https://api.example.test/v1/update/db?<query left out>:"),
+            "{reason}"
+        );
+        assert!(reason.contains("Broken pipe"), "{reason}");
+        let plain = "replace: backend: update: server returned 413: ";
+        assert_eq!(short_reason(plain), plain);
+        // A long reason with no URL is cut on a character boundary.
+        let wide = "é".repeat(2 * REASON_MAX_BYTES);
+        let cut = short_reason(&wide);
+        assert!(
+            cut.len() <= REASON_MAX_BYTES + 64 && cut.ends_with("bytes left out)"),
+            "{cut}"
+        );
+    }
+
+    /// Only a 413 is a refusal for size: a transport error, which an outage
+    /// gives too, is not split on.
+    #[test]
+    fn only_a_413_is_a_refusal_for_size() {
+        assert!(refused_for_size(&InfinoError::Backend(
+            "update: server returned 413: ".into()
+        )));
+        assert!(!refused_for_size(&InfinoError::Backend(
+            "update: transport error: https://h/v1/update/db?x: Connection Failed".into()
+        )));
+        assert!(!refused_for_size(&InfinoError::Backend(
+            "update: server returned 400: x".into()
+        )));
+    }
+
+    /// A replace of more ids than one call may name goes a run at a time,
+    /// and every document lands; so do documents whose ids hold several rows,
+    /// which are deleted and appended a run at a time.
+    #[test]
+    fn a_replace_of_more_ids_than_one_call_names_lands_a_run_at_a_time() {
+        let h = open_logs();
+        let docs: Vec<(String, String)> = (0..40)
+            .map(|i| {
+                (
+                    format!("d{i:02}"),
+                    format!(r#"{{"level":"info","message":"old {i}"}}"#),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let out = index(h, &refs);
+        assert_eq!(out["ok"], 40, "{out}");
+        let conn = bridge_ref(h).expect("bridge");
+        let table = conn.table("logs").expect("table");
+        let gate = Gate::default();
+        // Four ids per call: ten runs.
+        let budget = 4 * id_cost("d00");
+        let ids: Vec<String> = (0..40).map(|i| format!("d{i:02}")).collect();
+        assert_eq!(id_runs(&ids, budget).len(), 10);
+        let rows: Vec<(usize, Value)> = (0..40)
+            .map(|i| (i, json!({ OSID: format!("d{i:02}"), "level": "warn", "message": format!("new {i}") })))
+            .collect();
+        let mut failed = Vec::new();
+        assert!(replace_rows_checked(&table, &gate, &rows, &mut failed, budget).is_ok());
+        assert!(failed.is_empty(), "{failed:?}");
+        let rows_now = sql(h, "SELECT COUNT(*) AS c FROM logs");
+        assert_eq!(rows_now[0]["c"], 40, "{rows_now}");
+        let replaced = sql(h, "SELECT COUNT(*) AS c FROM logs WHERE level = 'warn'");
+        assert_eq!(replaced[0]["c"], 40, "{replaced}");
+
+        // Ids holding two rows each: the replace miscounts, and the rows are
+        // rewritten (deleted, then appended) a run at a time.
+        let twice: Vec<Value> = (0..12)
+            .flat_map(|i| {
+                let id = format!("t{i:02}");
+                [
+                    json!({ OSID: id.clone(), "level": "a" }),
+                    json!({ OSID: id, "level": "b" }),
+                ]
+            })
+            .collect();
+        table.append_rows(&twice).expect("append twice");
+        let ids: Vec<String> = (0..12).map(|i| format!("t{i:02}")).collect();
+        assert_eq!(id_runs(&ids, budget).len(), 3);
+        let rows: Vec<(usize, Value)> = (0..12)
+            .map(|i| (i, json!({ OSID: format!("t{i:02}"), "level": "one" })))
+            .collect();
+        let mut failed = Vec::new();
+        assert!(replace_rows_checked(&table, &gate, &rows, &mut failed, budget).is_ok());
+        assert!(failed.is_empty(), "{failed:?}");
+        let ones = sql(h, "SELECT COUNT(*) AS c FROM logs WHERE osid LIKE 't%'");
+        assert_eq!(ones[0]["c"], 12, "{ones}");
+        let ones = sql(h, "SELECT COUNT(*) AS c FROM logs WHERE level = 'one'");
+        assert_eq!(ones[0]["c"], 12, "{ones}");
+        close(h);
+    }
+
+    /// A replace through prepared batches whose replaced ids are more than
+    /// one call may name skips the one Arrow update and replaces a run at a
+    /// time: every document lands over storage of the bridge's own, and the
+    /// hosted service takes one update per run, never one naming every id.
+    #[test]
+    fn a_prepared_replace_of_more_ids_than_one_call_names_goes_a_run_at_a_time() {
+        let h = open_logs();
+        let old: Vec<(String, String)> = (0..FAKE_ROWS)
+            .map(|i| (fake_id(i), r#"{"level":"info"}"#.to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = old.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        assert_eq!(
+            index(h, &refs)["ok"],
+            FAKE_ROWS,
+            "every document lands first"
+        );
+        let new: Vec<(String, String)> = (0..FAKE_ROWS)
+            .map(|i| {
+                (
+                    fake_id(i),
+                    format!(r#"{{"level":"warn","message":"new {i}"}}"#),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = new.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let ids: Vec<String> = (0..FAKE_ROWS).map(fake_id).collect();
+        let budget = FAKE_IDS_PER_RUN * id_cost(&fake_id(0));
+        let runs = id_runs(&ids, budget).len();
+        assert!(runs > 1, "{runs} runs");
+        let take_prepared = || *unsafe { Box::from_raw(prepared(h, &refs)) };
+
+        let conn = bridge_ref(h).expect("bridge");
+        let table = conn.table("logs").expect("table");
+        let failed = append_prepared(
+            &table,
+            &Gate::default(),
+            vec![take_prepared()],
+            &ids,
+            &[],
+            budget,
+        );
+        assert!(failed.is_empty(), "{failed:?}");
+        let count = sql(h, "SELECT COUNT(*) AS c FROM logs");
+        assert_eq!(count[0]["c"], FAKE_ROWS, "{count}");
+        let warn = sql(h, "SELECT COUNT(*) AS c FROM logs WHERE level = 'warn'");
+        assert_eq!(warn[0]["c"], FAKE_ROWS, "{warn}");
+
+        let (hosted, calls) = fake_hosted(Answer::Lands, usize::MAX);
+        let failed = append_prepared(
+            &hosted,
+            &Gate::default(),
+            vec![take_prepared()],
+            &ids,
+            &[],
+            budget,
+        );
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(ops(&calls), vec!["update"; runs]);
+        close(h);
+    }
+
+    /// Only a refusal of the rows a call carried lets the calls after it
+    /// go on: of content, a miscount, a size, as the local engine types them
+    /// or the hosted service answers them. A transport error, a 5xx, a key
+    /// refused or any other failure stops them.
+    #[test]
+    fn only_a_refusal_of_a_call_s_own_rows_lets_the_calls_after_it_go_on() {
+        let goes_on = [
+            InfinoError::Cardinality("2 rows for 1 match".into()),
+            InfinoError::Backend("update: server returned 400: update error: x".into()),
+            InfinoError::Backend("update: server returned 413: ".into()),
+        ];
+        for e in &goes_on {
+            assert!(!stops_the_rest(e), "{e}");
+        }
+        let stops = [
+            InfinoError::Backend(
+                "update: transport error: http://h/v1/update/db?x: Connection Failed: timed out"
+                    .into(),
+            ),
+            InfinoError::Backend("update: server returned 503: unavailable".into()),
+            InfinoError::Backend("update: server returned 500: server returned 400".into()),
+            InfinoError::Backend("delete: server returned 403: the key was refused".into()),
+            InfinoError::Io("store unreachable".into()),
+        ];
+        for e in &stops {
+            assert!(stops_the_rest(e), "{e}");
+        }
+    }
+
+    /// A replace whose run the hosted service fails for a reason not about
+    /// its rows (a 5xx, or a connection that closes unanswered, as one does
+    /// past a timeout) stops there: one call in all, no count of rows, and
+    /// every document reported for a later try, where going on would cost
+    /// two calls a run.
+    #[test]
+    fn a_replace_stops_at_the_first_run_the_service_fails() {
+        let rows = fake_rows();
+        let budget = FAKE_IDS_PER_RUN * id_cost(&fake_id(0));
+        for answer in [Answer::Status(STATUS_UNAVAILABLE), Answer::Hangup] {
+            let (table, calls) = fake_hosted(answer, usize::MAX);
+            let mut failed = Vec::new();
+            let stopped =
+                replace_rows_checked(&table, &Gate::default(), &rows, &mut failed, budget);
+            assert!(stopped.is_err(), "{failed:?}");
+            assert_eq!(ops(&calls), vec!["update"]);
+            assert_all_not_taken(&failed);
+        }
+    }
+
+    /// The same for a rewrite: after the hosted service fails one run's
+    /// delete, no later run is deleted or appended.
+    #[test]
+    fn a_rewrite_stops_at_the_first_delete_the_service_fails() {
+        let rows = fake_rows();
+        let budget = FAKE_IDS_PER_RUN * id_cost(&fake_id(0));
+        let (table, calls) = fake_hosted(Answer::Status(STATUS_UNAVAILABLE), usize::MAX);
+        let mut failed = Vec::new();
+        assert!(rewrite_rows(&table, &Gate::default(), &rows, &mut failed, budget).is_err());
+        assert_eq!(ops(&calls), vec!["delete"]);
+        assert_all_not_taken(&failed);
+    }
+
+    /// Over the hosted service, a replace of more ids than
+    /// [`HOSTED_ID_LIST_BYTES`] names one run of them per call, each URL
+    /// within that budget (so [`id_cost`] is an upper bound, quotes inside
+    /// an id included), and the service refuses none for its size. A replace
+    /// it does refuse with 413 is split in halves, which land.
+    #[test]
+    fn a_hosted_replace_names_one_run_of_ids_per_call_and_splits_on_a_413() {
+        let ids: Vec<String> = (0..LONG_ROWS)
+            .map(|i| {
+                let quote = if i % 2 == 0 { "'" } else { " " };
+                format!("{i:04}{quote}{}", "x".repeat(LONG_ID_BYTES))
+            })
+            .collect();
+        let rows: Vec<(usize, Value)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (i, json!({ OSID: id, "level": "warn" })))
+            .collect();
+        let runs = id_runs(&ids, HOSTED_ID_LIST_BYTES).len();
+        assert!(runs > 1, "{runs} runs");
+        let limit = HOSTED_ID_LIST_BYTES + URL_HEAD_BYTES;
+        let (table, calls) = fake_hosted(Answer::Lands, limit);
+        let mut failed = Vec::new();
+        assert!(replace_rows_checked(
+            &table,
+            &Gate::default(),
+            &rows,
+            &mut failed,
+            HOSTED_ID_LIST_BYTES
+        )
+        .is_ok());
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(ops(&calls), vec!["update"; runs]);
+        let longest = calls.lock().unwrap().iter().map(|(_, len)| *len).max();
+        assert!(longest.is_some_and(|len| len <= limit), "{longest:?}");
+
+        // One call naming a run's ids, then the same call to a service that
+        // refuses anything that long: it goes in halves.
+        let run = &rows[..rows.len() / runs];
+        let (table, calls) = fake_hosted(Answer::Lands, usize::MAX);
+        let mut failed = Vec::new();
+        assert!(
+            replace_rows_checked(&table, &Gate::default(), run, &mut failed, usize::MAX).is_ok()
+        );
+        let whole = calls.lock().unwrap()[0].1;
+        let (table, calls) = fake_hosted(Answer::Lands, whole - 1);
+        assert!(
+            replace_rows_checked(&table, &Gate::default(), run, &mut failed, usize::MAX).is_ok()
+        );
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(ops(&calls), vec!["update"; 3]);
+    }
+
+    /// Rows a fake hosted service's tests replace.
+    const FAKE_ROWS: usize = 12;
+    /// Ids of [`fake_id`]'s length one call names in those tests.
+    const FAKE_IDS_PER_RUN: usize = 4;
+    /// Rows of ids long enough that a replace of them is past one call's list.
+    const LONG_ROWS: usize = 400;
+    /// The filler that makes each of those ids long.
+    const LONG_ID_BYTES: usize = 40;
+    /// What a hosted request's target holds besides the predicate's ids: its
+    /// path, the table, the predicate's column and parentheses.
+    const URL_HEAD_BYTES: usize = 256;
+    /// HTTP status of a service that cannot serve the call now.
+    const STATUS_UNAVAILABLE: u16 = 503;
+    /// The table a fake hosted service serves.
+    const FAKE_TABLE: &str = "t";
+    /// The key a test connects to a fake hosted service with.
+    const FAKE_KEY: &str = "ik_test";
+    /// The bytes that end an HTTP request's head.
+    const HEAD_END: &[u8] = b"\r\n\r\n";
+    /// How many bytes a fake hosted service reads at a time.
+    const READ_CHUNK: usize = 8 * 1024;
+
+    /// The `i`th id of a fake hosted service's tests, all of one length.
+    fn fake_id(i: usize) -> String {
+        format!("doc-{i:03}")
+    }
+
+    /// [`FAKE_ROWS`] documents replacing the rows of [`fake_id`]s.
+    fn fake_rows() -> Vec<(usize, Value)> {
+        (0..FAKE_ROWS)
+            .map(|i| (i, json!({ OSID: fake_id(i), "level": "warn" })))
+            .collect()
+    }
+
+    /// Every one of [`FAKE_ROWS`] documents is reported once, for a later try.
+    fn assert_all_not_taken(failed: &[Value]) {
+        let mut seen: Vec<u64> = failed.iter().filter_map(|f| f["i"].as_u64()).collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..FAKE_ROWS as u64).collect::<Vec<_>>(),
+            "{failed:?}"
+        );
+        assert!(failed.iter().all(|f| f["permanent"] == false), "{failed:?}");
+    }
+
+    /// What a fake hosted service answers an update or a delete with.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// The mutation lands.
+        Lands,
+        /// The service fails it with this status.
+        Status(u16),
+        /// The connection closes with no answer, as a service that went away.
+        Hangup,
+    }
+
+    /// The calls a fake hosted service took, as each one's operation and the
+    /// length of its request target (its path and query).
+    type Calls = Arc<Mutex<Vec<(String, usize)>>>;
+
+    /// The operation of each call in `calls`, in order.
+    fn ops(calls: &Calls) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(op, _)| op.clone())
+            .collect()
+    }
+
+    /// A fake hosted service on a local port serving one table: it answers
+    /// `list_tables` and `schema`, every `update` and `delete` with `answer`,
+    /// or with 413 when its request target is longer than `max_target`, and
+    /// anything else with 404. Returns the table, opened through the
+    /// engine's hosted client, and the calls taken after it opened.
+    fn fake_hosted(answer: Answer, max_target: usize) -> (Supertable, Calls) {
+        let schema = Schema::new(vec![
+            Field::new(OSID, DataType::Utf8, true),
+            Field::new("level", DataType::Utf8, true),
+            Field::new("message", DataType::Utf8, true),
+        ]);
+        let mut ipc = Vec::new();
+        StreamWriter::try_new(&mut ipc, &schema)
+            .and_then(|mut w| w.finish())
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/db", listener.local_addr().unwrap());
+        let calls: Calls = Arc::default();
+        let log = Arc::clone(&calls);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let Some(target) = read_request(&mut stream) else {
+                    continue;
+                };
+                let op = target
+                    .trim_start_matches("/v1/")
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                log.lock().unwrap().push((op.clone(), target.len()));
+                let lands = json!({ "matched": 0, "n_tombstoned": 0, "n_not_found": 0 });
+                let (status, body) = match op.as_str() {
+                    "list_tables" => (200, json!([FAKE_TABLE]).to_string().into_bytes()),
+                    "schema" => (200, ipc.clone()),
+                    "update" | "delete" if target.len() > max_target => {
+                        (STATUS_PAYLOAD_TOO_LARGE, b"too large".to_vec())
+                    }
+                    "update" | "delete" => match answer {
+                        Answer::Lands => (200, lands.to_string().into_bytes()),
+                        Answer::Status(code) => (code, b"failing".to_vec()),
+                        Answer::Hangup => continue,
+                    },
+                    _ => (STATUS_NOT_FOUND, Vec::new()),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream
+                    .write_all(head.as_bytes())
+                    .and_then(|()| stream.write_all(&body));
+            }
+        });
+        let conn = connect_with(&uri, ConnectOptions::new().with_api_key(FAKE_KEY)).unwrap();
+        let table = conn.open_table(FAKE_TABLE).unwrap();
+        calls.lock().unwrap().clear();
+        (table, calls)
+    }
+
+    /// Read one HTTP request off `stream`, its body included, and return its
+    /// target; None when the stream ends first.
+    fn read_request(stream: &mut TcpStream) -> Option<String> {
+        let mut got = Vec::new();
+        let mut buf = [0u8; READ_CHUNK];
+        let head_end = loop {
+            if let Some(at) = got.windows(HEAD_END.len()).position(|w| w == HEAD_END) {
+                break at + HEAD_END.len();
+            }
+            let n = stream.read(&mut buf).ok().filter(|&n| n > 0)?;
+            got.extend_from_slice(&buf[..n]);
+        };
+        let head = String::from_utf8_lossy(&got[..head_end]).to_string();
+        let length: usize = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse().ok())
+            .unwrap_or(0);
+        let mut body = got.len() - head_end;
+        while body < length {
+            body += stream.read(&mut buf).ok().filter(|&n| n > 0)?;
+        }
+        head.split_whitespace().nth(1).map(str::to_string)
     }
 
     /// A whole write (a replace, a delete, a schema change) waits for the

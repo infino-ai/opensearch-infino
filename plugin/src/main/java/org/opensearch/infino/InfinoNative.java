@@ -311,9 +311,11 @@ public final class InfinoNative {
      * {@code use_similarity}, whose terms Lucene scores by BM25.
      * {@code otherSimilarity} is whether its field scores by a similarity
      * other than the default BM25: its mapping names one, or the index's
-     * default is another. {@code fieldType} is its field's mapping type when
-     * the column's own type does not carry it ({@link FieldType}; null for
-     * any other field).
+     * default is another. {@code ranged} is whether the table keeps a range
+     * index on the column, which a numeric or date field mapped with
+     * {@code "index": false} has none of. {@code fieldType} is its field's
+     * mapping type when the column's own type does not carry it
+     * ({@link FieldType}; null for any other field).
      */
     public record Column(
         String name,
@@ -325,6 +327,7 @@ public final class InfinoNative {
         String elem,
         boolean similarity,
         boolean otherSimilarity,
+        boolean ranged,
         FieldType fieldType
     ) {
         public Column(
@@ -338,7 +341,7 @@ public final class InfinoNative {
             boolean similarity,
             boolean otherSimilarity
         ) {
-            this(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, null);
+            this(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, false, null);
         }
 
         public Column(
@@ -369,27 +372,32 @@ public final class InfinoNative {
 
         /** This column as the request sees it, its values masked by {@code mask}. */
         Column masked(UnaryOperator<String> mask) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, fieldType);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, ranged, fieldType);
         }
 
         /** This column with the date format its mapping declares. */
         Column dated(String dateFormat) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, fieldType);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, ranged, fieldType);
         }
 
         /** This column with its field's mapping type ({@link FieldType}). */
         Column typed(FieldType fieldType) {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, fieldType);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, ranged, fieldType);
         }
 
         /** This column as a keyword field with {@code use_similarity} maps it. */
         Column scoredBySimilarity() {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, true, otherSimilarity, fieldType);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, true, otherSimilarity, ranged, fieldType);
         }
 
         /** This column as a field scored by a similarity other than the default BM25. */
         Column scoredByOtherSimilarity() {
-            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, true, fieldType);
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, true, ranged, fieldType);
+        }
+
+        /** This column with a range index the table keeps on it. */
+        Column rangeIndexed() {
+            return new Column(name, type, fts, vector, mask, dateFormat, elem, similarity, otherSimilarity, true, fieldType);
         }
 
         /**
@@ -412,12 +420,12 @@ public final class InfinoNative {
          * mapping's, not its field's: neither here.
          */
         Column exact() {
-            return fts || similarity || otherSimilarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false, false, fieldType) : this;
+            return fts || similarity || otherSimilarity ? new Column(name, type, false, vector, mask, dateFormat, elem, false, false, ranged, fieldType) : this;
         }
 
         /** A list column as one of its values: the column typed as its element, for a literal or a comparison. */
         Column element() {
-            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null, similarity, otherSimilarity, fieldType) : this;
+            return isList() ? new Column(name, elem, false, false, mask, dateFormat, null, similarity, otherSimilarity, ranged, fieldType) : this;
         }
 
         public boolean isList() {
@@ -477,8 +485,8 @@ public final class InfinoNative {
 
     private InfinoNative() {}
 
-    /** The bridge library, loaded once per node. */
-    private static InfinoLib lib() {
+    /** The bridge library, loaded once per node (tests wrap it with {@link #useLib}). */
+    static InfinoLib lib() {
         InfinoLib loaded = lib;
         if (loaded == null) {
             synchronized (InfinoNative.class) {
@@ -1303,6 +1311,9 @@ public final class InfinoNative {
             String key = InfinoQueryTranslator.keyOf(column);
             // A list column of a mapped field reads its dates as the field's do.
             String format = mapping == null ? null : mapping.dateFormats().get(InfinoQueryTranslator.fieldOf(column));
+            if (Boolean.TRUE.equals(c.get("range"))) {
+                described = described.rangeIndexed();
+            }
             if (mapping != null && mapping.similarityFields().contains(key)) {
                 described = described.scoredBySimilarity();
             }
@@ -2066,6 +2077,30 @@ public final class InfinoNative {
         init();
         String out = takeOrThrow(lib.infino_value_counts(conn, n, column, maxRows)).trim();
         return out.equals("null") ? null : rows(out);
+    }
+
+    /**
+     * A keyword column's {@code top} most frequent values over the whole
+     * table, by count and then by value (its UTF-8 bytes), in one call:
+     * {@code rows} (each value under the column's name, its count under
+     * {@link #VALUE_COUNT}), {@code keyed_total} (rows with a value),
+     * {@code nulls} (rows without one) and {@code groups} (how many values).
+     * The engine counts a keyword column from its term index, so only
+     * {@code top} rows cross however many values it has. Null, for the
+     * caller's own statement to run, for a column without the keyword
+     * analyzer (a table made before it, or a field that is not a keyword).
+     */
+    public static Map<String, Object> valueCountsTop(String n, String column, int top) {
+        init();
+        String out = takeOrThrow(lib.infino_value_counts_top(conn, n, column, top)).trim();
+        if (out.equals("null")) {
+            return null;
+        }
+        try (XContentParser parser = parser(out)) {
+            return parser.map();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /**
