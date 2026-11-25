@@ -936,8 +936,12 @@ public final class InfinoSearch {
      * (see {@link #count(String, Translation, long)}).
      */
     private static long total(Plan plan, long cap) {
-        Translation q = plan.query();
-        return plan.postWhere() == null ? count(plan.table(), q, cap) : count(plan.table(), q.withWhere(plan.hitWhere()), cap);
+        return count(plan.table(), totalQuery(plan), cap);
+    }
+
+    /** What {@link #total} counts: the query, narrowed by the post_filter when there is one. */
+    static Translation totalQuery(Plan plan) {
+        return plan.postWhere() == null ? plan.query() : plan.query().withWhere(plan.hitWhere());
     }
 
     /** A page's rows, and its exact total when it was counted before them (null otherwise). */
@@ -970,11 +974,11 @@ public final class InfinoSearch {
      * Whether a page's exact total is counted beside its rows: an exact
      * total the request counts, not counted first, for a page whose short
      * read cannot be the total ({@link #shortPageIsTotal}), or whose total is
-     * counted from the token index under a cap ({@link #countsTokenIndex}).
-     * Otherwise the total is counted after the rows, and only when the page
-     * is full. A capped count from the token index costs little and stops at
-     * its cap, so it runs beside the page even where a short page would make
-     * it needless.
+     * counted from the token index under a cap ({@link #countsTokenIndex}),
+     * post_filter included ({@link #totalQuery}). Otherwise the total is
+     * counted after the rows, and only when the page is full. A capped count
+     * from the token index costs little and stops at its cap, so it runs
+     * beside the page even where a short page would make it needless.
      */
     static boolean countsBeside(Plan plan, boolean exact, boolean count, int size, boolean firstCount, long cap) {
         return plan.vector() == null
@@ -982,7 +986,7 @@ public final class InfinoSearch {
             && count
             && size > 0
             && !firstCount
-            && (!shortPageIsTotal(plan) || countsTokenIndex(plan.query(), cap));
+            && (!shortPageIsTotal(plan) || countsTokenIndex(totalQuery(plan), cap));
     }
 
     /**
@@ -1004,6 +1008,25 @@ public final class InfinoSearch {
      */
     static long besideTotal(long counted, int rows) {
         return Math.max(counted, rows);
+    }
+
+    /**
+     * The total of a page of {@code rows} whose exact total was counted
+     * beside it. A short page is its own total, as when nothing counts beside
+     * it: the count is waited out, so it does not run past the request, but
+     * it is not used, and its failure cannot fail a page whose answer is
+     * already in hand; it is logged instead. Otherwise the count is the total
+     * ({@link #besideTotal}), and its failure fails the page.
+     */
+    static long besidePageTotal(String table, CompletableFuture<Long> beside, boolean shortPage, int rows) {
+        if (!shortPage) {
+            return besideTotal(InfinoServices.await(beside), rows);
+        }
+        Throwable failure = InfinoServices.settle(beside);
+        if (failure != null) {
+            log.warn("[infino] a short page of {} is its own total; the count beside it failed: {}", table, failure.toString());
+        }
+        return rows;
     }
 
     /** How many times a page whose row lost its source between its two reads is read again. */
@@ -1364,10 +1387,8 @@ public final class InfinoSearch {
         } else if (exact && counted != null) {
             total = counted;
         } else if (exact && beside != null) {
-            // Already counting: it is not left running past the request. A
-            // short page is its own total, as when nothing counts beside it.
-            long besides = InfinoServices.await(beside);
-            total = shortPage ? rows.size() : besideTotal(besides, rows.size());
+            // Already counting: it is not left running past the request.
+            total = besidePageTotal(plan.table(), beside, shortPage, rows.size());
         } else if (exact && shortPage) {
             total = rows.size();
         } else if (exact) {

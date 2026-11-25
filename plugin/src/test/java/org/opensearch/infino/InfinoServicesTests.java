@@ -59,6 +59,14 @@ public class InfinoServicesTests extends OpenSearchTestCase {
         assertArrayEquals(new Throwable[] { count }, failure.getSuppressed());
     }
 
+    /** Settling waits for the started work, returns its failure rather than throwing it, and null when it succeeded. */
+    public void testSettleReturnsTheStartedWorksFailure() {
+        RuntimeException count = new IllegalStateException("count");
+        assertSame(count, InfinoServices.settle(CompletableFuture.failedFuture(count)));
+        assertNull(InfinoServices.settle(CompletableFuture.completedFuture(7L)));
+        assertNull(InfinoServices.settle(null));
+    }
+
     /** Nothing started, nothing to wait for. */
     public void testDrainOfNothingStartedLeavesTheFailureAlone() {
         RuntimeException failure = new IllegalArgumentException("page");

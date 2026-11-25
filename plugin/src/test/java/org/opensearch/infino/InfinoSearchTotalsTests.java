@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 
 /** The hits.total a proxy search reports, as a coordinator reports it under track_total_hits. */
@@ -131,6 +132,42 @@ public class InfinoSearchTotalsTests extends OpenSearchTestCase {
         assertEquals(1, InfinoSearch.besideTotal(0, 1));
         assertEquals(7, InfinoSearch.besideTotal(7, 3));
         assertEquals(0, InfinoSearch.besideTotal(0, 0));
+    }
+
+    /** A table a page is read from, named in the log when its count fails. */
+    private static final String TABLE = "os_logs_0";
+
+    /** A short page's rows: fewer than its size. */
+    private static final int SHORT_PAGE_ROWS = 3;
+
+    /** A count of more rows than a page holds. */
+    private static final long COUNTED = 42;
+
+    /**
+     * A short page is its own total: the count that ran beside it is waited
+     * out, and its failure does not fail the page, whose answer is already
+     * in hand. A full page's total is the count, so its failure fails the page.
+     */
+    public void testAFailedCountBesideAShortPageLeavesThePageItsTotal() {
+        RuntimeException failed = new IllegalStateException("count");
+        assertEquals(
+            SHORT_PAGE_ROWS,
+            InfinoSearch.besidePageTotal(TABLE, CompletableFuture.failedFuture(failed), true, SHORT_PAGE_ROWS)
+        );
+        RuntimeException thrown = expectThrows(
+            IllegalStateException.class,
+            () -> InfinoSearch.besidePageTotal(TABLE, CompletableFuture.failedFuture(failed), false, SHORT_PAGE_ROWS)
+        );
+        assertSame(failed, thrown);
+    }
+
+    /** A count beside a short page is waited for but not used; beside a full page it is the total. */
+    public void testACountBesideAPageIsTheTotalOnlyWhenThePageIsFull() {
+        assertEquals(
+            SHORT_PAGE_ROWS,
+            InfinoSearch.besidePageTotal(TABLE, CompletableFuture.completedFuture(COUNTED), true, SHORT_PAGE_ROWS)
+        );
+        assertEquals(COUNTED, InfinoSearch.besidePageTotal(TABLE, CompletableFuture.completedFuture(COUNTED), false, SHORT_PAGE_ROWS));
     }
 
     /** Rows of a page as its statement chose them: ids only. */
