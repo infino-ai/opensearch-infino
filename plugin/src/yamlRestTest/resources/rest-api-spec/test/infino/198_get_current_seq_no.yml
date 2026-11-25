@@ -2,7 +2,7 @@
 # sequence number and primary term of its latest write, as stock does, so a
 # write conditioned on what the read reported is applied. Each step runs on
 # an Infino-backed index and on a plain Lucene twin, given the same writes,
-# and the two must report the same values.
+# and the two must report the same values, except where a step says why not.
 setup:
   - do:
       indices.create:
@@ -27,7 +27,7 @@ setup:
 teardown:
   - do:
       indices.delete:
-        index: gq_inf,gq_luc
+        index: gq_inf,gq_luc,sec_gq
         ignore_unavailable: true
 
 ---
@@ -264,3 +264,262 @@ teardown:
         id: "index-pattern:p1"
   - match: { _source.n: 2 }
   - match: { _version: 3 }
+
+---
+"Default mode: a get that asks for a version is checked against the latest write's":
+  - do:
+      index:
+        index: gq_inf
+        id: v
+        body: { n: 1 }
+  - do:
+      index:
+        index: gq_inf
+        id: v
+        body: { n: 2 }
+  - match: { _version: 2 }
+  - do:
+      get:
+        index: gq_inf
+        id: v
+        version: 2
+  - match: { _source.n: 2 }
+  - do:
+      catch: conflict
+      get:
+        index: gq_inf
+        id: v
+        version: 1
+  - do:
+      get:
+        index: gq_inf
+        id: v
+        version: 2
+        version_type: external
+  - match: { _version: 2 }
+  - do:
+      catch: conflict
+      get:
+        index: gq_inf
+        id: v
+        version: 10
+        version_type: external_gte
+  # A multi-get fails the item whose version does not match, alone.
+  - do:
+      mget:
+        body: { docs: [ { _index: gq_inf, _id: v, version: 2 }, { _index: gq_inf, _id: v, version: 1 } ] }
+  - match: { docs.0.found: true }
+  - match: { docs.0._version: 2 }
+  - match: { docs.1.error.type: version_conflict_engine_exception }
+
+---
+"Default mode: a deleted document is missing, realtime or not":
+  - do:
+      indices.put_settings:
+        index: gq_inf,gq_luc
+        body: { index.refresh_interval: -1 }
+  - do:
+      index:
+        index: gq_inf
+        id: d
+        refresh: true
+        body: { n: 1 }
+  - do:
+      index:
+        index: gq_luc
+        id: d
+        refresh: true
+        body: { n: 1 }
+  - do:
+      delete:
+        index: gq_inf
+        id: d
+  - do:
+      delete:
+        index: gq_luc
+        id: d
+  - do:
+      catch: missing
+      get:
+        index: gq_luc
+        id: d
+  - do:
+      catch: missing
+      get:
+        index: gq_inf
+        id: d
+  - do:
+      mget:
+        body: { docs: [ { _index: gq_inf, _id: d } ] }
+  - is_false: docs.0.found
+  # Before a refresh, a read that is not realtime still finds the deleted
+  # document on the plain index. The table keeps no row older than its latest
+  # write, so the Infino index reports the delete already.
+  - do:
+      get:
+        index: gq_luc
+        id: d
+        realtime: false
+  - is_true: found
+  - do:
+      catch: missing
+      get:
+        index: gq_inf
+        id: d
+        realtime: false
+  - do:
+      indices.refresh:
+        index: gq_inf,gq_luc
+  - do:
+      catch: missing
+      get:
+        index: gq_luc
+        id: d
+        realtime: false
+  - do:
+      catch: missing
+      get:
+        index: gq_inf
+        id: d
+        realtime: false
+  - do:
+      mget:
+        realtime: false
+        body: { docs: [ { _index: gq_inf, _id: d } ] }
+  - is_false: docs.0.found
+
+---
+"Default mode: a get that is not realtime reports the numbers of the row it reads":
+  - do:
+      indices.put_settings:
+        index: gq_inf,gq_luc
+        body: { index.refresh_interval: -1 }
+  - do:
+      index:
+        index: gq_inf
+        id: x
+        refresh: true
+        body: { n: 1 }
+  - do:
+      index:
+        index: gq_luc
+        id: x
+        refresh: true
+        body: { n: 1 }
+  # An update on each, committed by a flush and not refreshed.
+  - do:
+      index:
+        index: gq_inf
+        id: x
+        body: { n: 2 }
+  - set: { _seq_no: inf_update, _version: inf_version }
+  - do:
+      index:
+        index: gq_luc
+        id: x
+        body: { n: 2 }
+  - do:
+      indices.flush:
+        index: gq_inf,gq_luc
+  # The plain index still answers the refreshed write, its source and its
+  # numbers. The table holds the update's row alone, so the Infino index
+  # answers the update, its source and its numbers together, never the
+  # update's source with the refreshed write's numbers.
+  - do:
+      get:
+        index: gq_luc
+        id: x
+        realtime: false
+  - match: { _version: 1 }
+  - match: { _source.n: 1 }
+  - do:
+      get:
+        index: gq_inf
+        id: x
+        realtime: false
+  - match: { _source.n: 2 }
+  - match: { _version: $inf_version }
+  - match: { _seq_no: $inf_update }
+  - do:
+      mget:
+        realtime: false
+        body: { docs: [ { _index: gq_inf, _id: x } ] }
+  - match: { docs.0._source.n: 2 }
+  - match: { docs.0._seq_no: $inf_update }
+  # A write conditioned on what it reported is applied.
+  - do:
+      index:
+        index: gq_inf
+        id: x
+        if_seq_no: $inf_update
+        if_primary_term: 1
+        body: { n: 3 }
+  - match: { result: updated }
+
+---
+"Default mode: under a document rule, a get reads the latest write without refreshing the index":
+  - skip:
+      features: headers
+  - do:
+      indices.create:
+        index: sec_gq
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0, refresh_interval: -1 }
+          mappings:
+            properties:
+              n: { type: long }
+              tag: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sec_gq, _id: x1 }
+          - { n: 1, tag: x }
+          - index: { _index: sec_gq, _id: y1 }
+          - { n: 1, tag: y }
+  - match: { errors: false }
+  # A replace and a new document, neither refreshed.
+  - do:
+      index:
+        index: sec_gq
+        id: x1
+        body: { n: 2, tag: x }
+  - set: { _seq_no: x1_seq, _version: x1_version }
+  - do:
+      index:
+        index: sec_gq
+        id: c1
+        body: { n: 1, tag: x }
+  # The security plugin reads a get under a document rule as not realtime, so
+  # it finds what the latest refresh made visible. The rule (tag is x) is read
+  # from the table, which takes the pending writes first, and the replace is
+  # reported with its own numbers and source.
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      get:
+        index: sec_gq
+        id: x1
+  - match: { _source.n: 2 }
+  - match: { _version: $x1_version }
+  - match: { _seq_no: $x1_seq }
+  - do:
+      catch: missing
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      get:
+        index: sec_gq
+        id: y1
+  - do:
+      headers: { Authorization: "Basic ZGxzX3VzZXI6YWRtaW4=" }
+      mget:
+        body: { docs: [ { _index: sec_gq, _id: x1 }, { _index: sec_gq, _id: y1 }, { _index: sec_gq, _id: c1 } ] }
+  - match: { docs.0._seq_no: $x1_seq }
+  - match: { docs.0._source.n: 2 }
+  - is_false: docs.1.found
+  - is_false: docs.2.found
+  # The index was not refreshed: a read that is not realtime still misses the new document.
+  - do:
+      catch: missing
+      get:
+        index: sec_gq
+        id: c1
+        realtime: false

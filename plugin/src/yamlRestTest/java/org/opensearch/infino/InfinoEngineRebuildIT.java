@@ -42,6 +42,9 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     private static final String HELD_TABLE = "emr3_rows";
     private static final int HELD_ROWS = 20;
     private static final String HELD_DELETED = "h1";
+    /** The held-rebuild test's id read while the rebuild is held, and the id it writes meanwhile. */
+    private static final String HELD_READ = "h2";
+    private static final String HELD_WRITTEN = "w1";
     /** The cluster setting that holds skeleton rebuilds. */
     private static final String PAUSED = "infino.skeleton_rebuild.paused";
 
@@ -78,8 +81,11 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         assertEquals(ROWS - 1, ((Number) call("GET", "/emr/_count", null).get("count")).intValue());
         Map<String, Object> rewritten = call("GET", "/emr/_doc/" + REWRITTEN, null);
         assertEquals(REWRITTEN_VALUE, ((Map<String, Object>) rewritten.get("_source")).get("n"));
-        ResponseException gone = expectThrows(ResponseException.class, () -> call("GET", "/emr/_doc/" + DELETED, null));
-        assertEquals(404, gone.getResponse().getStatusLine().getStatusCode());
+        // Once the rebuild is done, a get misses the deleted row: until then it may answer 503.
+        assertBusy(() -> {
+            ResponseException gone = expectThrows(ResponseException.class, () -> call("GET", "/emr/_doc/" + DELETED, null));
+            assertEquals(404, gone.getResponse().getStatusLine().getStatusCode());
+        }, REBUILD_SECONDS, TimeUnit.SECONDS);
 
         // Once rebuilt, the skeleton answers for every id.
         call("PUT", "/emr/_doc/r2?refresh=true", "{\"n\":2}");
@@ -121,7 +127,8 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     /**
      * A bulk delete of an id the table holds and a held rebuild has not put
      * in the skeleton yet: the table alone deletes the row, and the delete is
-     * acknowledged as found. A bulk requires a translog location of every
+     * acknowledged as found. A get of such an id answers 503 meanwhile: the
+     * skeleton cannot say the id is missing. A bulk requires a translog location of every
      * write it applied; a result without one fails an assertion that takes
      * the node down where assertions run.
      */
@@ -142,6 +149,19 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
             // The rebuild is held: the skeleton has no document yet.
             assertEquals("the rebuild is held", 0, heldHits().size());
 
+            // A get of a row the skeleton does not know yet cannot say it is missing:
+            // it answers 503, which a client tries again, alone and in a multi-get.
+            ResponseException unknown = expectThrows(ResponseException.class, () -> call("GET", "/emr3/_doc/" + HELD_READ, null));
+            assertEquals(503, unknown.getResponse().getStatusLine().getStatusCode());
+            Map<String, Object> mget = call("POST", "/emr3/_mget", "{\"ids\":[\"" + HELD_READ + "\",\"" + HELD_WRITTEN + "\"]}");
+            Map<String, Object> unknownItem = (Map<String, Object>) ((List<?>) mget.get("docs")).get(0);
+            Map<String, Object> error = (Map<String, Object>) unknownItem.get("error");
+            assertNotNull("the item is refused, not missing: " + unknownItem, error);
+            assertTrue("the item is refused for the rebuild: " + error, String.valueOf(error.get("reason")).contains("rebuilding"));
+            // A document written since, which the skeleton holds, is read as usual.
+            call("PUT", "/emr3/_doc/" + HELD_WRITTEN, "{\"n\":" + HELD_ROWS + "}");
+            assertEquals(true, call("GET", "/emr3/_doc/" + HELD_WRITTEN, null).get("found"));
+
             String delete = "{\"delete\":{\"_index\":\"emr3\",\"_id\":\"" + HELD_DELETED + "\"}}\n";
             Map<String, Object> bulk = call("POST", "/_bulk?refresh=true", delete);
             assertEquals(false, bulk.get("errors"));
@@ -152,11 +172,16 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
             call("PUT", "/_cluster/settings", "{\"persistent\":{\"" + PAUSED + "\":null}}");
         }
 
-        // Released, the rebuild brings back every row but the deleted one.
-        assertBusy(() -> assertEquals(HELD_ROWS - 1, heldHits().size()), REBUILD_SECONDS, TimeUnit.SECONDS);
-        assertEquals(HELD_ROWS - 1, ((Number) call("GET", "/emr3/_count", null).get("count")).intValue());
-        ResponseException gone = expectThrows(ResponseException.class, () -> call("GET", "/emr3/_doc/" + HELD_DELETED, null));
-        assertEquals(404, gone.getResponse().getStatusLine().getStatusCode());
+        // Released, the rebuild brings back every row but the deleted one, and the
+        // written one beside them; once it is done, a get finds a row and misses
+        // the deleted one.
+        assertBusy(() -> assertEquals(HELD_ROWS, heldHits().size()), REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertEquals(HELD_ROWS, ((Number) call("GET", "/emr3/_count", null).get("count")).intValue());
+        assertBusy(() -> {
+            ResponseException gone = expectThrows(ResponseException.class, () -> call("GET", "/emr3/_doc/" + HELD_DELETED, null));
+            assertEquals(404, gone.getResponse().getStatusLine().getStatusCode());
+        }, REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertEquals(true, call("GET", "/emr3/_doc/" + HELD_READ, null).get("found"));
         call("DELETE", "/emr3", null);
     }
 

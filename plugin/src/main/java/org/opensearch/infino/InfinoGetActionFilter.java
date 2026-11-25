@@ -30,6 +30,8 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.rest.RestStatus;
+import org.opensearch.index.VersionType;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.get.GetResult;
 import org.opensearch.index.mapper.IgnoredFieldMapper;
@@ -59,11 +61,14 @@ import java.util.function.Supplier;
  * <p>A default-mode document carries the version, sequence number and primary
  * term its shard reports for it, as a stock get does, read from the shard's
  * skeleton together with the document's row ({@link #reads}): a write
- * conditioned on what the get reported is checked against the same numbers.
- * Only the node holding the shard's primary sees the writes the table has not
- * taken yet, so a get that reaches another node is sent on to that one. A
- * proxy-mode document carries the sequence number the table stored with it,
- * at version 1 (see {@link InfinoDocumentVersion}).
+ * conditioned on what the get reported is checked against the same numbers,
+ * and so is a {@code version} the get asks for. Only the node holding the
+ * shard's primary sees the writes the table has not taken yet, so a get that
+ * reaches another node is sent on to that one, whatever its
+ * {@code preference}. A get that is not realtime finds only what the latest
+ * refresh made visible, and reports the latest write of what it finds (see
+ * {@link #numbers}). A proxy-mode document carries the sequence number the
+ * table stored with it, at version 1 (see {@link InfinoDocumentVersion}).
  */
 public class InfinoGetActionFilter implements ActionFilter {
 
@@ -146,27 +151,28 @@ public class InfinoGetActionFilter implements ActionFilter {
                 }
                 InfinoNative.Doc doc;
                 InfinoEngine.WrittenNumbers written = null;
+                Exception conflict;
                 if (defaultMode) {
-                    Read read = reads(table, List.of(get.id()), skeleton(table, get.realtime()), docReader(index, table, access, get.realtime())).get(
-                        get.id()
-                    );
+                    Read read = reads(InfinoEngine.shardReads(table), List.of(get.id()), get.realtime(), docReader(table, access)).get(get.id());
+                    if (read.failure() != null) {
+                        listener.onFailure(read.failure());
+                        return;
+                    }
                     doc = read.doc();
                     written = read.written();
+                    // A found document is at the version its shard reports.
+                    conflict = doc == null
+                        ? null
+                        : versionConflict(shardOf(index, get.id(), get.routing()), get.id(), get.versionType(), get.version(), written.version());
                 } else {
                     doc = access.restrictsDocuments() ? restrictedDocs(table, List.of(get.id()), access).get(get.id()) : docOf(index, table, get.id(), get.realtime());
+                    // A found document is at the version its writes report for every document.
+                    conflict = doc == null
+                        ? null
+                        : versionConflict(new ShardId(index.getIndex(), 0), get.id(), get.versionType(), get.version(), InfinoDocumentVersion.VERSION);
                 }
-                // In proxy mode a found document is at the version its writes report for
-                // every document; a default-mode get is at the version its shard reports.
-                if (doc != null
-                    && !defaultMode
-                    && get.versionType().isVersionConflictForReads(InfinoDocumentVersion.VERSION, get.version())) {
-                    listener.onFailure(
-                        new VersionConflictEngineException(
-                            new ShardId(index.getIndex(), 0),
-                            get.id(),
-                            get.versionType().explainConflictForReads(InfinoDocumentVersion.VERSION, get.version())
-                        )
-                    );
+                if (conflict != null) {
+                    listener.onFailure(conflict);
                     return;
                 }
                 @SuppressWarnings("unchecked")
@@ -180,7 +186,7 @@ public class InfinoGetActionFilter implements ActionFilter {
                         InfinoMappingSource.of(index.mapping()),
                         get.fetchSourceContext(),
                         routingOf(index, doc),
-                        ignoredOf(index, table, get.id(), doc, get.realtime())
+                        ignoredOf(index, table, get.id(), doc, defaultMode || get.realtime())
                     )
                 );
                 listener.onResponse(response);
@@ -237,7 +243,7 @@ public class InfinoGetActionFilter implements ActionFilter {
         TransportService transport = InfinoServices.transportService();
         ThreadContext context = InfinoServices.threadContext();
         if (transport == null || context == null) {
-            listener.onFailure(new IllegalStateException("[infino] the node that holds the primary cannot be reached"));
+            listener.onFailure(new InfinoNative.InfinoException("[infino] the node that holds the primary cannot be reached", RestStatus.SERVICE_UNAVAILABLE));
             return;
         }
         ActionListener<R> inCallerContext = new ContextPreservingActionListener<>(context.newRestorableContext(false), listener);
@@ -251,93 +257,99 @@ public class InfinoGetActionFilter implements ActionFilter {
      * A default-mode document as a get reads it: {@code written}, the
      * version, sequence number and primary term its shard's skeleton holds
      * for it, which a stock get reports, and {@code doc}, its row (each null
-     * when no document is found).
+     * when no document is found); or the {@code failure} the read of it is
+     * answered with instead.
      */
-    record Read(InfinoEngine.WrittenNumbers written, InfinoNative.Doc doc) {}
+    record Read(InfinoEngine.WrittenNumbers written, InfinoNative.Doc doc, Exception failure) {}
 
     /**
-     * How a default-mode get reads an id's {@link InfinoEngine.WrittenNumbers} from
-     * the shard behind {@code table} on this node, realtime or not as the
-     * request asks.
+     * The answer to a get of an id a rebuilt index's skeleton does not hold
+     * while it is rebuilt from the table, followed by the id: the table may
+     * hold it, so a "not found" could be wrong, and the client tries again.
      */
-    static Function<String, InfinoEngine.WrittenNumbers> skeleton(String table, boolean realtime) {
-        return id -> InfinoEngine.written(table, id, realtime);
-    }
+    static final String SKELETON_REBUILDING = "[infino] the index is rebuilding its documents from its table and cannot "
+        + "yet tell whether it holds this document; try again shortly: ";
 
     /**
-     * How a default-mode get reads documents' rows from {@code table}, by id:
-     * a realtime read counts a write the shard has not committed yet, and one
-     * that is not sees what the latest refresh made visible. Under a document
-     * rule the rows are read through the rule, which sees only what the table
-     * holds, so a realtime read first commits a write of those ids the table
-     * has not taken.
+     * How a default-mode get reads documents' rows from {@code table}, by id,
+     * as the latest write of each left it (see {@link #reads}): a write the
+     * shard has not committed yet is read from its batch. Under a document
+     * rule the rows are read through the rule, which sees only what the
+     * table holds, so a pending write of those ids is committed first
+     * ({@link InfinoEngine#commitForRead}); the skeleton is not refreshed.
      */
-    static Function<Collection<String>, Map<String, InfinoNative.Doc>> docReader(IndexMetadata index, String table, InfinoAccess access, boolean realtime) {
+    static Function<Collection<String>, Map<String, InfinoNative.Doc>> docReader(String table, InfinoAccess access) {
         if (access.restrictsDocuments()) {
             return ids -> {
-                if (realtime && ids.stream().anyMatch(id -> InfinoEngine.pending(table, id) != null)) {
-                    refresh(index, table);
+                if (ids.stream().anyMatch(id -> InfinoEngine.pending(table, id) != null)) {
+                    InfinoEngine.commitForRead(table, ids);
                 }
                 return restrictedDocs(table, ids, access);
             };
         }
-        if (realtime) {
-            return ids -> InfinoEngine.currentDocs(table, ids);
-        }
-        return ids -> {
-            Map<String, InfinoNative.Doc> out = new HashMap<>();
-            for (String id : ids) {
-                InfinoNative.Doc doc = InfinoEngine.refreshedDoc(table, id);
-                if (doc != null) {
-                    out.put(id, doc);
-                }
-            }
-            return out;
-        };
+        return ids -> InfinoEngine.currentDocs(table, ids);
     }
 
     /**
-     * Default-mode documents of {@code ids} from {@code table}, by id, each
-     * with what its shard's skeleton holds of its latest write
-     * ({@code skeleton}) and its row ({@code docs}), read on the node holding
-     * the shard's primary. The skeleton is read first, then the rows once
-     * every write it found is recorded for the table
-     * ({@link InfinoEngine#awaitRecorded}), so a row is never older than the
-     * numbers reported with it; the skeleton is read again after, and a
-     * document a write reached in between is read again, so the row is the
-     * one those numbers belong to. Should writes keep landing, the last read
-     * stands, its row as new as its numbers or newer, which a write
-     * conditioned on them meets as a conflict.
+     * The numbers a default-mode get of {@code id} reports: its latest
+     * write's; null when no document is found. A get that is not realtime
+     * finds only a document the latest refresh made visible, and reports its
+     * latest write too: the table keeps no row older than its latest commit,
+     * so the row of the write that refresh saw may be gone, and the numbers
+     * are always those of the row read with them.
+     */
+    static InfinoEngine.WrittenNumbers numbers(InfinoEngine.ShardReads shard, String id, boolean realtime) {
+        if (!realtime && shard.written(id, false) == null) {
+            return null;
+        }
+        return shard.written(id, true);
+    }
+
+    /**
+     * Default-mode documents of {@code ids}, by id, each with what its
+     * shard's skeleton holds of its latest write ({@link #numbers}) and its
+     * row ({@code docs}), read on the node holding the shard's primary. The
+     * skeleton is read first, then the rows once every write it found is
+     * recorded for the table ({@link InfinoEngine.ShardReads#awaitRecorded}),
+     * so a row is never older than the numbers reported with it; the
+     * skeleton is read again after, and a document a write reached in
+     * between is read again, so the row is the one those numbers belong to.
+     * Should writes keep landing, the last read stands, its row as new as
+     * its numbers or newer, which a write conditioned on them meets as a
+     * conflict. A document the skeleton does not hold is missing, unless the
+     * skeleton is being rebuilt and cannot tell, which answers 503.
      */
     static Map<String, Read> reads(
-        String table,
+        InfinoEngine.ShardReads shard,
         Collection<String> ids,
-        Function<String, InfinoEngine.WrittenNumbers> skeleton,
+        boolean realtime,
         Function<Collection<String>, Map<String, InfinoNative.Doc>> docs
     ) {
         Map<String, Read> out = new HashMap<>();
         // Null values stand for a document the skeleton does not hold.
         Map<String, InfinoEngine.WrittenNumbers> before = new LinkedHashMap<>();
         for (String id : ids) {
-            before.put(id, skeleton.apply(id));
+            before.put(id, numbers(shard, id, realtime));
         }
         for (int tries = 1; !before.isEmpty(); tries++) {
             List<String> found = new ArrayList<>();
             for (Map.Entry<String, InfinoEngine.WrittenNumbers> e : before.entrySet()) {
                 if (e.getValue() != null) {
-                    InfinoEngine.awaitRecorded(table, e.getKey());
+                    shard.awaitRecorded(e.getKey());
                     found.add(e.getKey());
+                } else if (shard.knowsIds()) {
+                    out.put(e.getKey(), new Read(null, null, null));
                 } else {
-                    out.put(e.getKey(), new Read(null, null));
+                    out.put(e.getKey(), new Read(null, null, new InfinoNative.InfinoException(SKELETON_REBUILDING + e.getKey(), RestStatus.SERVICE_UNAVAILABLE)));
                 }
             }
             Map<String, InfinoNative.Doc> rows = found.isEmpty() ? Map.of() : docs.apply(found);
             Map<String, InfinoEngine.WrittenNumbers> moved = new LinkedHashMap<>();
             for (String id : found) {
                 boolean last = tries == READ_TRIES;
-                InfinoEngine.WrittenNumbers after = last ? null : skeleton.apply(id);
+                InfinoEngine.WrittenNumbers after = last ? null : numbers(shard, id, realtime);
                 if (last || before.get(id).equals(after)) {
-                    out.put(id, new Read(before.get(id), rows.get(id)));
+                    out.put(id, new Read(before.get(id), rows.get(id), null));
                 } else {
                     moved.put(id, after);
                 }
@@ -345,6 +357,18 @@ public class InfinoGetActionFilter implements ActionFilter {
             before = moved;
         }
         return out;
+    }
+
+    /**
+     * The conflict a get of {@code id} asking for {@code version} under
+     * {@code type} meets, as a stock get's, when the document is at
+     * {@code current}; null when there is none (or no version was asked).
+     */
+    static Exception versionConflict(ShardId shard, String id, VersionType type, long version, long current) {
+        if (!type.isVersionConflictForReads(current, version)) {
+            return null;
+        }
+        return new VersionConflictEngineException(shard, id, type.explainConflictForReads(current, version));
     }
 
     /** The first of {@code names} that {@code index} maps with {@code store: true}, or null when none is. */

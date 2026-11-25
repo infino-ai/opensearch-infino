@@ -21,6 +21,7 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -43,8 +44,9 @@ import java.util.function.Supplier;
  * fails alone, as it does on the shards. A request that also names an index
  * the plugin does not back goes on to the shards as it is. Each document
  * carries the version, sequence number and primary term a single get
- * reports; the items of a default-mode shard whose primary is on another
- * node are sent on to that node, as one multi-get per node.
+ * reports, and an item that asks for another version fails alone; the items
+ * of a default-mode shard whose primary is on another node are sent on to
+ * that node, as one multi-get per node.
  */
 public class InfinoMultiGetActionFilter implements ActionFilter {
 
@@ -176,6 +178,29 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
         }
         @SuppressWarnings("unchecked")
         ActionListener<MultiGetResponse> answer = (ActionListener<MultiGetResponse>) listener;
+        gather(mget, responses, elsewhere, (node, part, partListener) -> InfinoGetActionFilter.forward(node, MultiGetAction.INSTANCE, part, partListener), answer);
+    }
+
+    /** How the items a node holds the primaries of are sent to it, as one multi-get. */
+    interface Sender {
+        void send(DiscoveryNode node, MultiGetRequest part, ActionListener<MultiGetResponse> listener);
+    }
+
+    /**
+     * Answer {@code mget} once every node in {@code elsewhere} has answered
+     * its items, sent with {@code sender} as one multi-get per node: each
+     * item's answer fills its slot of {@code responses}, which holds the
+     * items answered here already. A node that fails fails its own items
+     * alone, each with that failure, as a stock multi-get fails the items of
+     * a shard it cannot reach.
+     */
+    static void gather(
+        MultiGetRequest mget,
+        MultiGetItemResponse[] responses,
+        Map<DiscoveryNode, List<Integer>> elsewhere,
+        Sender sender,
+        ActionListener<MultiGetResponse> answer
+    ) {
         if (elsewhere.isEmpty()) {
             answer.onResponse(new MultiGetResponse(responses));
             return;
@@ -187,7 +212,7 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             for (int slot : slots) {
                 part.add(mget.getItems().get(slot));
             }
-            InfinoGetActionFilter.forward(e.getKey(), MultiGetAction.INSTANCE, part, ActionListener.<MultiGetResponse>wrap(got -> {
+            sender.send(e.getKey(), part, ActionListener.wrap(got -> {
                 for (int k = 0; k < slots.size(); k++) {
                     responses[slots.get(k)] = got.getResponses()[k];
                 }
@@ -243,33 +268,37 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
         }
         Map<String, Map<String, InfinoNative.Doc>> docsOf = new HashMap<>();
         Map<String, Map<String, InfinoGetActionFilter.Read>> readsOf = new HashMap<>();
+        // A default-mode table that cannot be read here (its engine is not open)
+        // fails its own items alone, with the reason, as a shard does.
+        Map<String, Exception> tableFailed = new HashMap<>();
         for (Map.Entry<String, List<String>> e : idsByTable.entrySet()) {
             String table = e.getKey();
-            String index = indexOfTable.get(table);
-            IndexMetadata md = indices.get(index);
-            InfinoAccess access = accessOf.get(index);
+            InfinoAccess access = accessOf.get(indexOfTable.get(table));
             if (defaultTables.contains(table)) {
-                readsOf.put(
-                    table,
-                    InfinoGetActionFilter.reads(
+                try {
+                    readsOf.put(
                         table,
-                        new LinkedHashSet<>(e.getValue()),
-                        InfinoGetActionFilter.skeleton(table, mget.realtime()),
-                        InfinoGetActionFilter.docReader(md, table, access, mget.realtime())
-                    )
-                );
+                        InfinoGetActionFilter.reads(
+                            InfinoEngine.shardReads(table),
+                            new LinkedHashSet<>(e.getValue()),
+                            mget.realtime(),
+                            InfinoGetActionFilter.docReader(table, access)
+                        )
+                    );
+                } catch (InfinoNative.InfinoException failure) {
+                    tableFailed.put(table, failure);
+                }
             } else if (access.restrictsDocuments()) {
                 docsOf.put(table, InfinoGetActionFilter.restrictedDocs(table, e.getValue(), access));
             } else {
                 docsOf.put(table, InfinoNative.docs(table, e.getValue(), null));
             }
         }
-        // The ignored fields of each table's ids, read once per table,
-        // except where a realtime default-mode read sees pending writes.
+        // The ignored fields of each proxy-mode table's ids, read once per
+        // table; a default-mode read sees a pending write's (see reads).
         Map<String, Map<String, List<String>>> ignoredOf = new HashMap<>();
         for (Map.Entry<String, List<String>> e : idsByTable.entrySet()) {
-            IndexMetadata md = indices.get(indexOfTable.get(e.getKey()));
-            if (!(mget.realtime() && InfinoPlugin.inDefaultMode(md.getSettings()))) {
+            if (!defaultTables.contains(e.getKey())) {
                 ignoredOf.put(e.getKey(), InfinoNative.ignoredOf(e.getKey(), e.getValue()));
             }
         }
@@ -282,8 +311,27 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
             MultiGetRequest.Item item = mget.getItems().get(i);
             IndexMetadata md = indices.get(item.index());
             InfinoGetActionFilter.Read read = readsOf.containsKey(tableOfItem[i]) ? readsOf.get(tableOfItem[i]).get(item.id()) : null;
-            InfinoNative.Doc doc = read != null ? read.doc() : docsOf.get(tableOfItem[i]).get(item.id());
+            Exception failed = tableFailed.get(tableOfItem[i]);
+            if (failed == null && read != null) {
+                failed = read.failure();
+            }
+            InfinoNative.Doc doc = failed != null ? null : read != null ? read.doc() : docsOf.get(tableOfItem[i]).get(item.id());
             InfinoEngine.WrittenNumbers written = read != null ? read.written() : null;
+            // A found document is at the version its shard reports in default
+            // mode, and at the one its writes report for every document in proxy mode.
+            if (failed == null && doc != null) {
+                failed = InfinoGetActionFilter.versionConflict(
+                    written != null ? InfinoGetActionFilter.shardOf(md, item.id(), item.routing()) : new ShardId(md.getIndex(), 0),
+                    item.id(),
+                    item.versionType(),
+                    item.version(),
+                    written != null ? written.version() : InfinoDocumentVersion.VERSION
+                );
+            }
+            if (failed != null) {
+                responses[i] = new MultiGetItemResponse(null, new MultiGetResponse.Failure(item.index(), item.id(), failed));
+                continue;
+            }
             String routing = InfinoGetActionFilter.routingOf(md, doc);
             GetResponse get = new GetResponse(
                 InfinoGetActionFilter.result(

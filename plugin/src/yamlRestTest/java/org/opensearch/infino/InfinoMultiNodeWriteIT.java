@@ -187,6 +187,111 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
     }
 
     /**
+     * A get and a multi-get sent to the node that does not hold the primary
+     * report the version, sequence number and primary term of the latest
+     * write, as the primary's node does, so a write conditioned on them,
+     * sent through that node, is applied. That node sends the read on to
+     * the primary's: only there are the writes the table has not taken yet.
+     */
+    @SuppressWarnings("unchecked")
+    public void testAReadThroughTheNodeWithoutThePrimaryReportsTheLatestWritesNumbers() throws IOException {
+        String index = "multi_get_numbers";
+        createIndex(index);
+        int primary = primaryNode(index);
+        int other = 1 - primary;
+        Request first = new Request("PUT", "/" + index + "/_doc/x");
+        first.setJsonEntity("{\"n\":1}");
+        on(other, first);
+        Request second = new Request("PUT", "/" + index + "/_doc/x");
+        second.setJsonEntity("{\"n\":2}");
+        Map<String, Object> written = on(primary, second);
+        assertEquals(2, ((Number) written.get("_version")).intValue());
+
+        for (int node : new int[] { other, primary }) {
+            Map<String, Object> got = on(node, new Request("GET", "/" + index + "/_doc/x"));
+            assertEquals("node " + node + ": " + got, 2, ((Map<String, Object>) got.get("_source")).get("n"));
+            assertNumbers("node " + node, written, got);
+            Request mget = new Request("POST", "/" + index + "/_mget");
+            mget.setJsonEntity("{\"ids\":[\"x\"]}");
+            Map<String, Object> item = (Map<String, Object>) ((List<?>) on(node, mget).get("docs")).get(0);
+            assertNumbers("node " + node + ", mget", written, item);
+        }
+        client().performRequest(new Request("POST", "/" + index + "/_refresh"));
+        Request notRealtime = new Request("GET", "/" + index + "/_doc/x");
+        notRealtime.addParameter("realtime", "false");
+        assertNumbers("not realtime", written, on(other, notRealtime));
+
+        Request cas = conditioned(
+            new Request("PUT", "/" + index + "/_doc/x"),
+            ((Number) written.get("_seq_no")).longValue(),
+            ((Number) written.get("_primary_term")).longValue()
+        );
+        cas.setJsonEntity("{\"n\":3}");
+        assertEquals("updated", on(other, cas).get("result"));
+    }
+
+    /**
+     * A multi-get through one node of documents whose primaries are on both
+     * nodes, and of one whose shard has no active primary: each item reports
+     * its own primary's numbers, and the item without a primary fails
+     * alone.
+     */
+    @SuppressWarnings("unchecked")
+    public void testAMultiGetSplitAcrossTheNodesAnswersEachItem() throws IOException {
+        List<String> indices = new ArrayList<>();
+        List<Map<String, Object>> written = new ArrayList<>();
+        for (int node = 0; node < NODES; node++) {
+            String index = "multi_mget_" + node;
+            createIndex(index, ",\"index.routing.allocation.require._name\":\"" + nodeNames.get(node) + "\"");
+            assertEquals(node, primaryNode(index));
+            // Written through the other node, once per node number, so the two
+            // documents stand at different versions.
+            Map<String, Object> last = null;
+            for (int i = 0; i <= node; i++) {
+                Request put = new Request("PUT", "/" + index + "/_doc/x");
+                put.setJsonEntity("{\"n\":" + i + "}");
+                last = on(1 - node, put);
+            }
+            written.add(last);
+            indices.add(index);
+        }
+        String unassigned = "multi_mget_unassigned";
+        Request create = new Request("PUT", "/" + unassigned);
+        create.addParameter("wait_for_active_shards", "0");
+        create.setJsonEntity(
+            "{\"settings\":{\"index.infino.enabled\":true,\"number_of_shards\":1,\"number_of_replicas\":0,"
+                + "\"index.routing.allocation.require._name\":\"no_such_node\"}}"
+        );
+        client().performRequest(create);
+
+        for (int node = 0; node < NODES; node++) {
+            Request mget = new Request("POST", "/_mget");
+            mget.setJsonEntity(
+                "{\"docs\":[{\"_index\":\""
+                    + indices.get(0)
+                    + "\",\"_id\":\"x\"},{\"_index\":\""
+                    + unassigned
+                    + "\",\"_id\":\"x\"},{\"_index\":\""
+                    + indices.get(1)
+                    + "\",\"_id\":\"x\"}]}"
+            );
+            List<?> docs = (List<?>) on(node, mget).get("docs");
+            assertNumbers("node " + node + ", first index", written.get(0), (Map<String, Object>) docs.get(0));
+            assertNumbers("node " + node + ", second index", written.get(1), (Map<String, Object>) docs.get(2));
+            Map<String, Object> failed = (Map<String, Object>) docs.get(1);
+            assertNotNull("node " + node + ": the item without a primary fails: " + failed, failed.get("error"));
+        }
+    }
+
+    /** {@code got} reports the version, sequence number and primary term {@code written} was acknowledged with. */
+    private static void assertNumbers(String what, Map<String, Object> written, Map<String, Object> got) {
+        assertEquals(what + ": " + got, true, got.get("found"));
+        assertEquals(what + ": " + got, written.get("_version"), got.get("_version"));
+        assertEquals(what + ": " + got, written.get("_seq_no"), got.get("_seq_no"));
+        assertEquals(what + ": " + got, written.get("_primary_term"), got.get("_primary_term"));
+    }
+
+    /**
      * The same new id created from both nodes at once: one create succeeds,
      * the other is refused, and the index holds one document. Before, each
      * node looked the id up, found it absent, and appended it.
