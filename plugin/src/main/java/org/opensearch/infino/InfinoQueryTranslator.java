@@ -951,15 +951,40 @@ final class InfinoQueryTranslator {
             Column c = resolve(f);
             if (c != null && c.fts() && !text.contains(c.name())) {
                 text.add(c.name());
-            } else if (c == null && org.opensearch.common.regex.Regex.isSimpleMatchPattern(f)) {
-                for (Column each : cols.values()) {
-                    if (each.fts() && !text.contains(each.name()) && org.opensearch.common.regex.Regex.simpleMatch(f, fieldOf(each.name()))) {
-                        text.add(each.name());
+            } else if (c == null) {
+                for (String each : textColumnsMatching(f)) {
+                    if (!text.contains(each)) {
+                        text.add(each);
                     }
                 }
             }
         }
         return text.size();
+    }
+
+    /**
+     * The text columns a field pattern ({@code ti*}, {@code *}) names, each
+     * once: those whose field or alias it matches, as stock expands a
+     * pattern to the mapped fields. The id column is no field of the
+     * documents, and a field masked for the user is left out rather than
+     * matched by its clear values. Empty when {@code field} is no pattern.
+     */
+    private List<String> textColumnsMatching(String field) {
+        List<String> names = new ArrayList<>();
+        if (!org.opensearch.common.regex.Regex.isSimpleMatchPattern(field)) {
+            return names;
+        }
+        for (Map.Entry<String, Column> entry : cols.entrySet()) {
+            Column c = entry.getValue();
+            if (c.fts()
+                && !c.name().equals(OSID)
+                && (trusted || !c.masked())
+                && !names.contains(c.name())
+                && org.opensearch.common.regex.Regex.simpleMatch(field, fieldOf(entry.getKey()))) {
+                names.add(c.name());
+            }
+        }
+        return names;
     }
 
     /** How a query string's JSON names its default type, best_fields: the builder has no getter for it. */
@@ -2813,6 +2838,12 @@ final class InfinoQueryTranslator {
         for (String f : fields) {
             Column c = column(f);
             if (c == null) {
+                // A pattern searches the text fields it matches.
+                for (String each : textColumnsMatching(f)) {
+                    if (!indexed.contains(each)) {
+                        indexed.add(each);
+                    }
+                }
                 continue;
             }
             if (c.fts()) {

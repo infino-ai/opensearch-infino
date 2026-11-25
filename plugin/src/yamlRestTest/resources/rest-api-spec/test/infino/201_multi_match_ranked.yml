@@ -669,6 +669,46 @@
         index: mm_default
         body: {"size": 10, "query": {"bool": {"filter": {"multi_match": {"query": "disk error", "fields": ["title", "body"], "type": "cross_fields"}}}}}
   - match: { hits.total.value: 5 }
+  # A field pattern searches the text fields it matches, as stock expands it.
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "sort": [{"n": "asc"}], "query": {"multi_match": {"query": "fan", "fields": ["ti*", "bo*"]}}}
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d2 }
+  - match: { hits.hits.1._id: d5 }
+  - do:
+      search:
+        index: mm_luc
+        body: {"size": 10, "sort": [{"n": "asc"}], "query": {"query_string": {"query": "fan", "fields": ["ti*"]}}}
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d5 }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "sort": [{"n": "asc"}], "query": {"multi_match": {"query": "fan", "fields": ["ti*", "bo*"]}}}
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d2 }
+  - match: { hits.hits.1._id: d5 }
+  - do:
+      search:
+        index: mm_proxy
+        body: {"size": 10, "sort": [{"n": "asc"}], "query": {"query_string": {"query": "fan", "fields": ["ti*"]}}}
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d5 }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "sort": [{"n": "asc"}], "query": {"multi_match": {"query": "fan", "fields": ["ti*", "bo*"]}}}
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d2 }
+  - match: { hits.hits.1._id: d5 }
+  - do:
+      search:
+        index: mm_default
+        body: {"size": 10, "sort": [{"n": "asc"}], "query": {"query_string": {"query": "fan", "fields": ["ti*"]}}}
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d5 }
   # A delete_by_query pages the matches by _doc and scores nothing: served.
   - do:
       delete_by_query:

@@ -103,6 +103,31 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("\"os_logs_0\"", t.from());
     }
 
+    public void testAFieldPatternSearchesTheTextFieldsItMatches() {
+        // A pattern names the text fields it matches, as the fields themselves would.
+        List<org.opensearch.index.query.QueryBuilder[]> same = List.of(
+            new org.opensearch.index.query.QueryBuilder[] { QueryBuilders.multiMatchQuery("disk", "ti*"), QueryBuilders.multiMatchQuery("disk", "title") },
+            new org.opensearch.index.query.QueryBuilder[] { QueryBuilders.multiMatchQuery("disk", "*"), QueryBuilders.multiMatchQuery("disk", "message", "title") },
+            new org.opensearch.index.query.QueryBuilder[] {
+                QueryBuilders.multiMatchQuery("disk", "mess*", "title"),
+                QueryBuilders.multiMatchQuery("disk", "message", "title") },
+            new org.opensearch.index.query.QueryBuilder[] {
+                QueryBuilders.queryStringQuery("disk").field("ti*"),
+                QueryBuilders.queryStringQuery("disk").field("title") },
+            new org.opensearch.index.query.QueryBuilder[] {
+                QueryBuilders.simpleQueryStringQuery("disk").field("mess*"),
+                QueryBuilders.simpleQueryStringQuery("disk").field("message") }
+        );
+        for (org.opensearch.index.query.QueryBuilder[] pair : same) {
+            Translation pattern = translateWithTitle(pair[0]);
+            Translation named = translateWithTitle(pair[1]);
+            assertEquals(pair[0].toString(), named.where(), pattern.where());
+            assertEquals(pair[0].toString(), named.from(), pattern.from());
+        }
+        // A pattern matching no text field matches nothing, as stock's does.
+        assertEquals("1=0", translateWithTitle(QueryBuilders.multiMatchQuery("disk", "nomatch*")).where());
+    }
+
     public void testTextClauseBecomesTheSource() {
         Translation t = translate(QueryBuilders.matchQuery("message", "disk full"));
         assertEquals("1=1", t.where());
