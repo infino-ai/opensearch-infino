@@ -1534,9 +1534,11 @@ public final class InfinoNative {
      * why, and whether the table refuses what it carries ({@code permanent}),
      * so every later try is refused the same way. One not permanent failed
      * for a reason of the moment and a later try may take it. {@code status}
-     * is null for a refusal of the document, and 429 for a document the
-     * hosted service turned away for the account's request rate: it was not
-     * written, and the client sends it again.
+     * is null for a refusal of the document; else the write did not reach
+     * the document because the hosted service ended it, and the client sends
+     * it again: 429 when the service turned a call away for the account's
+     * request rate, so the document was not written, and 503 when it did not
+     * answer a call, which may have written it.
      */
     public record PreparedFailure(int batch, int index, String reason, boolean permanent, RestStatus status) {}
 

@@ -544,6 +544,56 @@ public class InfinoWriterTests extends OpenSearchTestCase {
     }
 
     /**
+     * An append the hosted service ended partway, by not answering a call
+     * (503) or turning one away for the account's request rate (429),
+     * answers only the documents it did not write with that status: the one
+     * an earlier call wrote is 201, so a client that sends the failed items
+     * again does not store it twice. The bulk's delete is not sent to the
+     * same service after it; it is answered with the same status, for the
+     * client to send again.
+     */
+    public void testAnAppendTheServiceEndedPartwayAnswersOnlyWhatItDidNotWrite() {
+        String unanswered = "the hosted service could not be reached or did not answer in time; try again later: unavailable: append: timeout";
+        for (RestStatus status : new RestStatus[] { RestStatus.SERVICE_UNAVAILABLE, RestStatus.TOO_MANY_REQUESTS }) {
+            String reason = status == RestStatus.SERVICE_UNAVAILABLE ? unanswered : RATE_LIMITED;
+            String append = "{\"ok\":1,\"failed\":[{\"b\":0,\"i\":1,\"reason\":\"" + reason + "\",\"permanent\":false,\"status\":"
+                + status.getStatus() + "}]}";
+            AtomicInteger deletes = new AtomicInteger();
+            InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+                case "infino_open_with", "infino_prepare_batch" -> new Memory(1);
+                case "infino_prepared_failed" -> nativeString("[]");
+                case "infino_sql", "infino_sql_latest" -> nativeString("[{\"osid\":\"old\"}]"); // the deleted id holds a row
+                case "infino_append_prepared" -> nativeString(append);
+                case "infino_delete_osids" -> {
+                    deletes.incrementAndGet();
+                    yield 0;
+                }
+                default -> null; // the latest hold and its release, and the frees
+            }));
+            try {
+                InfinoWriter writer = new InfinoWriter(() -> Runnable::run, 100, Long.MAX_VALUE);
+                List<InfinoWriter.Outcome> outcomes = List.of(
+                    generated(0, "g1"),
+                    generated(1, "g2"),
+                    new InfinoWriter.Outcome(2, new DeleteRequest("i", "old"), new InfinoWriter.Write("old", null, true), null)
+                );
+                AtomicReference<BulkResponse> answered = new AtomicReference<>();
+                AtomicReference<Exception> failed = new AtomicReference<>();
+                writer.submit("t", new InfinoWriter.Waiter(SHARD, "i", outcomes, new BulkItemResponse[3], System.nanoTime(), ActionListener.wrap(answered::set, failed::set)));
+                assertNull(String.valueOf(failed.get()), failed.get());
+                BulkItemResponse[] items = answered.get().getItems();
+                assertEquals(status + ": written by an earlier call", RestStatus.CREATED, items[0].status());
+                assertEquals(status, items[1].status());
+                assertTrue(items[1].getFailureMessage(), items[1].getFailureMessage().contains(status == RestStatus.SERVICE_UNAVAILABLE ? "did not answer" : "rate limit exceeded"));
+                assertEquals(status + ": the delete is answered with the append's status", status, items[2].status());
+                assertEquals(status + ": the delete is not sent", 0, deletes.get());
+            } finally {
+                InfinoNative.useLib(null);
+            }
+        }
+    }
+
+    /**
      * A delete the hosted service turned away for the account's request
      * rate is a 429, one it did not answer a 503, and any other failure a
      * 500, as each delete of the bulk is answered.

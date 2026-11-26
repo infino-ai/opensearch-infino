@@ -879,6 +879,21 @@ public final class InfinoWriter {
         // committed by now: when they fail, the appended writes are answered as
         // written and only the deletes as failed, so a client retries just those,
         // and a delete retried removes what it names.
+        RestStatus ended = endedBy(refused);
+        if (!tombstones.isEmpty() && ended != null) {
+            // The hosted service ended the append (a rate limit, or no answer): the
+            // deletes would meet the same service, so they are not sent, and are
+            // answered with the append's status for the client to send again.
+            boolean unanswered = ended == RestStatus.SERVICE_UNAVAILABLE;
+            RuntimeException notSent = new InfinoNative.InfinoException(
+                "[infino] delete of " + tombstones.size() + " ids from " + table + " was not sent: the hosted service "
+                    + (unanswered ? "did not answer the append before it" : "turned the append before it away for the account's request rate")
+                    + "; try again later",
+                ended,
+                unanswered
+            );
+            return new Applied(refused, written, Set.copyOf(tombstones), notSent);
+        }
         if (!tombstones.isEmpty()) {
             int rc = InfinoNative.deleteOsids(table, tombstones.toArray(new String[0]), tombstones.size());
             if (rc != 0) {
@@ -1019,7 +1034,8 @@ public final class InfinoWriter {
      * again; a document the hosted service turned away for the account's
      * request rate is a 429, as a stock shard answers a write it has no room
      * for, which a client sends again. The service wrote nothing of it, so
-     * the write sent again is stored once.
+     * the write sent again is stored once. A document whose call the service
+     * did not answer is a 503, which a client sends again too.
      */
     static BulkItemResponse.Failure notTaken(String index, String id, InfinoNative.PreparedFailure f) {
         if (f.status() == null) {
@@ -1027,8 +1043,22 @@ public final class InfinoWriter {
         }
         Exception cause = f.status() == RestStatus.TOO_MANY_REQUESTS
             ? new OpenSearchRejectedExecutionException("[infino] the hosted service limited the account's request rate; send the write again: " + f.reason())
-            : new InfinoNative.InfinoException("[infino] " + f.reason(), f.status());
+            : new InfinoNative.InfinoException("[infino] " + f.reason(), f.status(), f.status() == RestStatus.SERVICE_UNAVAILABLE);
         return new BulkItemResponse.Failure(index, id, cause, f.status());
+    }
+
+    /**
+     * The status under which the hosted service ended an append, when it
+     * did ({@link InfinoNative.PreparedFailure#status}): 429 or 503, the
+     * first a document of it carries; null when the append ran to its end.
+     */
+    static RestStatus endedBy(Map<String, InfinoNative.PreparedFailure> notTaken) {
+        for (InfinoNative.PreparedFailure f : notTaken.values()) {
+            if (f.status() != null) {
+                return f.status();
+            }
+        }
+        return null;
     }
 
     /**
