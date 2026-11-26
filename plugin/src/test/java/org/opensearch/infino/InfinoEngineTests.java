@@ -34,6 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongConsumer;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -391,6 +392,112 @@ public class InfinoEngineTests extends OpenSearchTestCase {
             } finally {
                 InfinoNative.useLib(null);
             }
+        }
+    }
+
+    /**
+     * In default mode a document the hosted service turned away for the
+     * account's request rate was not written, so it comes back with what the
+     * commit found under its id, and the next commit writes it without
+     * looking its row up again: one lookup across both commits. One whose
+     * call the service did not answer (503) may have landed, so it is looked
+     * up again. The commit says whether the service rate limited it, and
+     * until the pause that follows ends, a commit makes no call at all.
+     */
+    public void testADefaultModeRateLimitKeepsEachBaseAndPausesTheNextCall() {
+        String limited = "backend: append: server returned 429: rate limit exceeded";
+        String unanswered = "the hosted service could not be reached or did not answer in time; try again later: unavailable: append: timeout";
+        for (int status : new int[] { 429, 503 }) {
+            String reason = status == 429 ? limited : unanswered;
+            String each = "{\"ok\":0,\"failed\":["
+                + "{\"b\":0,\"i\":0,\"reason\":\"" + reason + "\",\"permanent\":false,\"status\":" + status + "},"
+                + "{\"b\":0,\"i\":1,\"reason\":\"" + reason + "\",\"permanent\":false,\"status\":" + status + "}]}";
+            AtomicInteger appends = new AtomicInteger();
+            AtomicInteger lookups = new AtomicInteger();
+            InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+                case "infino_open_with", "infino_prepare_batch_meta" -> new Memory(1);
+                case "infino_sql_latest" -> {
+                    lookups.incrementAndGet();
+                    yield string("[{\"osid\":\"old\"}]"); // "old" holds a row, "new" none
+                }
+                case "infino_append_prepared" -> string(appends.incrementAndGet() == 1 ? each : "{\"ok\":2,\"failed\":[]}");
+                case "infino_check_doc" -> throw new AssertionError("a document the service ended the write for was checked");
+                default -> null; // the latest hold and its release, and the frees
+            }));
+            try {
+                InfinoEngine.Batch batch = new InfinoEngine.Batch();
+                batch.add("new", InfinoEngine.Base.UNKNOWN, new InfinoEngine.Version(0, true, "{\"n\":0}", null, -1, null));
+                batch.add("old", InfinoEngine.Base.UNKNOWN, new InfinoEngine.Version(1, true, "{\"n\":1}", null, -1, null));
+
+                InfinoEngine.Written written = InfinoEngine.write("t", 1, batch, held -> {}, () -> {}, (id, v) -> null);
+                assertEquals(status == 429, written.rateLimited());
+                assertEquals(Set.of("new", "old"), written.retry().entries.keySet());
+                InfinoEngine.Base absent = status == 429 ? InfinoEngine.Base.ABSENT : InfinoEngine.Base.UNKNOWN;
+                InfinoEngine.Base present = status == 429 ? InfinoEngine.Base.PRESENT : InfinoEngine.Base.UNKNOWN;
+                assertEquals(absent, written.retry().entries.get("new").base);
+                assertEquals(present, written.retry().entries.get("old").base);
+                assertEquals(1, lookups.get());
+
+                InfinoEngine.Batch open = new InfinoEngine.Batch();
+                open.putBack(written.retry(), false);
+                InfinoEngine.Written again = InfinoEngine.write("t", 1, open, held -> {}, () -> {}, (id, v) -> null);
+                assertTrue(again.retry().isEmpty());
+                assertFalse(again.rateLimited());
+                assertEquals(2, appends.get());
+                assertEquals("a rate limited document is not looked up again", status == 429 ? 1 : 2, lookups.get());
+            } finally {
+                InfinoNative.useLib(null);
+            }
+        }
+    }
+
+    /**
+     * After a commit the hosted service rate limited, the next commit waits:
+     * the pause doubles for each commit turned away in a row, from a second
+     * up to its cap, and a random part of it is taken, between half and
+     * all. Until it ends a commit makes no call (the counted calls stay put);
+     * a commit the service takes clears it.
+     */
+    public void testARateLimitPausesTheNextCommitDoublingUpToItsCap() {
+        long min = InfinoEngine.RATE_LIMIT_PAUSE_MIN_NANOS;
+        long max = InfinoEngine.RATE_LIMIT_PAUSE_MAX_NANOS;
+        InfinoEngine.RateLimit whole = new InfinoEngine.RateLimit(pause -> pause);
+        assertFalse("no limit yet", whole.waits(0));
+        long now = 0;
+        long expected = min;
+        for (int turnedAway = 0; turnedAway < 8; turnedAway++) {
+            whole.after(true, now);
+            assertTrue(whole.waits(now));
+            assertTrue(whole.waits(now + expected - 1));
+            assertFalse(whole.waits(now + expected));
+            now += expected;
+            expected = Math.min(max, expected * 2);
+        }
+        assertEquals("capped", max, expected);
+        whole.after(false, now);
+        assertFalse("cleared by a commit the service takes", whole.waits(now));
+
+        // A commit loop as the engine's: it calls the service only when the pause allows.
+        InfinoEngine.RateLimit limit = new InfinoEngine.RateLimit(pause -> pause);
+        AtomicInteger calls = new AtomicInteger();
+        LongConsumer commitAt = at -> {
+            if (!limit.waits(at)) {
+                calls.incrementAndGet();
+                limit.after(true, at); // turned away again
+            }
+        };
+        commitAt.accept(0);
+        commitAt.accept(1);
+        commitAt.accept(min - 1);
+        assertEquals("no call before the pause ends", 1, calls.get());
+        commitAt.accept(min);
+        assertEquals("one call once it has", 2, calls.get());
+        // With the random part, the pause is at least half and at most all of it.
+        for (int i = 0; i < 100; i++) {
+            InfinoEngine.RateLimit random = new InfinoEngine.RateLimit();
+            random.after(true, 0);
+            assertTrue(random.waits(min / 2 - 1));
+            assertFalse(random.waits(min));
         }
     }
 
