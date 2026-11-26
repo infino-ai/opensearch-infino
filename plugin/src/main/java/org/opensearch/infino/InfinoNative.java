@@ -563,6 +563,13 @@ public final class InfinoNative {
      * changes a few times in a node's life at most.
      */
     public static void init() {
+        // A node that does not see the cluster's storage answers from none of it.
+        InfinoStorageIdentity.refuseIfUnshared();
+        connect();
+    }
+
+    /** {@link #init}, on a node whether or not it sees the cluster's storage: the storage check and a switch of it open through this. */
+    private static void connect() {
         Target target = wanted;
         if (conn != null && target.equals(opened)) {
             return;
@@ -627,8 +634,9 @@ public final class InfinoNative {
             return;
         }
         wanted = target;
+        InfinoStorageIdentity.storageChanged();
         if (conn != null) {
-            init();
+            connect();
         }
     }
 
@@ -677,7 +685,7 @@ public final class InfinoNative {
     static String checkStorage(TimeValue timeout) {
         lib();
         Target target = wanted;
-        if (MEMORY_URIS.contains(target.uri())) {
+        if (inMemory(target)) {
             return null;
         }
         StorageFailure failure = within(timeout, () -> probeStorage(target));
@@ -727,7 +735,7 @@ public final class InfinoNative {
      */
     private static StorageFailure probeStorage(Target target) {
         try {
-            init();
+            connect();
         } catch (InfinoException e) {
             String opening = "cannot open " + target.name() + ": ";
             String why = e.getMessage().startsWith(opening) ? e.getMessage().substring(opening.length()) : e.getMessage();
@@ -803,6 +811,11 @@ public final class InfinoNative {
             return "Check that the directory exists and that the user the node runs as may read and write it.";
         }
         return "Check the node's credentials for this storage and that they may list it.";
+    }
+
+    /** Whether {@code target} is a catalog in the node's own memory. */
+    static boolean inMemory(Target target) {
+        return !target.hosted() && MEMORY_URIS.contains(target.uri());
     }
 
     /** Whether {@code uri} names local storage: {@code file://}, or a path with no scheme. */
@@ -1331,7 +1344,8 @@ public final class InfinoNative {
             return cached;
         }
         String json = take(lib.infino_columns(conn, name));
-        if (json == null || json.isEmpty()) {
+        // A table that could not be read lists no columns here, as one that does not exist.
+        if (json == null || json.isEmpty() || json.startsWith("{\"error\"")) {
             return Collections.emptyMap();
         }
         Mapping mapping = MAPPINGS.get(name);
@@ -1392,6 +1406,24 @@ public final class InfinoNative {
         Map<String, Column> view = Collections.unmodifiableMap(out);
         COLUMNS.put(name, view);
         return view;
+    }
+
+    /**
+     * The names of table {@code name}'s columns, in the table's order, read
+     * from the table now; empty when it does not exist. A read that fails for
+     * any other reason throws, so the caller never takes it for a missing table.
+     */
+    static List<String> columnNames(String name) {
+        init();
+        String json = takeOrThrow(lib.infino_columns(conn, name), RestStatus.SERVICE_UNAVAILABLE);
+        if (json.isEmpty()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        for (Map<String, Object> c : rows(json)) {
+            out.add((String) c.get("name"));
+        }
+        return out;
     }
 
     /** Whether {@code key} names {@code column} by an alias rather than by the column's own name. */
@@ -1538,9 +1570,12 @@ public final class InfinoNative {
      * the document because the hosted service ended it, and the client sends
      * it again: 429 when the service turned a call away for the account's
      * request rate, so the document was not written, and 503 when it did not
-     * answer a call, which may have written it.
+     * answer a call, which may have written it. {@code staleSchema} marks a
+     * 503 for a document the hosted service refused for a column its batch
+     * was typed without: the service did not write it either, and a later
+     * try types it afresh.
      */
-    public record PreparedFailure(int batch, int index, String reason, boolean permanent, RestStatus status) {}
+    public record PreparedFailure(int batch, int index, String reason, boolean permanent, RestStatus status, boolean staleSchema) {}
 
     /** Outcome of appending prepared batches. */
     public record PreparedResult(int ok, List<PreparedFailure> failed) {}
@@ -1680,7 +1715,8 @@ public final class InfinoNative {
                     ((Number) f.get("i")).intValue(),
                     (String) f.get("reason"),
                     Boolean.TRUE.equals(f.get("permanent")),
-                    f.get("status") instanceof Number n ? RestStatus.fromCode(n.intValue()) : null
+                    f.get("status") instanceof Number n ? RestStatus.fromCode(n.intValue()) : null,
+                    Boolean.TRUE.equals(f.get("stale_schema"))
                 )
             );
         }

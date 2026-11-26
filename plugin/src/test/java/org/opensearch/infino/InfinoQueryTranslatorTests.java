@@ -676,6 +676,35 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("SELECT osid, source FROM \"os_logs_0\" WHERE \"level\" = 'error' LIMIT 10", unsortedHits(QueryBuilders.termQuery("level", "error"), columns()));
     }
 
+    /**
+     * A query_string atom on a keyword field reads the field's list column as
+     * the query DSL does: a document that gave the field several values holds
+     * them there, its own column null, so "has a value", a wildcard and a
+     * regexp each match it by any of its values.
+     */
+    public void testQueryStringAtomsReadAKeywordsListColumn() {
+        Map<String, Column> cols = columns();
+        cols.put("level[]", Column.list("level[]", "str"));
+        for (String q : List.of("level:*", "level:[* TO *]")) {
+            String where = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery(q), cols, TABLE, NOW).where();
+            assertEquals(q, "(\"level\" IS NOT NULL OR \"level[]\" IS NOT NULL)", where);
+        }
+        String wildcard = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("level:er*"), cols, TABLE, NOW).where();
+        assertTrue(wildcard, wildcard.contains("(\"level[]\" IS NULL AND \"level\" LIKE 'er%')"));
+        assertTrue(wildcard, wildcard.contains("WHERE list_rows.list_value LIKE 'er%'"));
+        String regexp = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("level:/er.*/"), cols, TABLE, NOW).where();
+        assertTrue(regexp, regexp.contains("(\"level[]\" IS NULL AND regexp_like(\"level\", '^(?:er.*)$'))"));
+        assertTrue(regexp, regexp.contains("WHERE regexp_like(list_rows.list_value, '^(?:er.*)$')"));
+        // On the default fields a pattern reaches a keyword field too, as a bare term does: a simple_query_string prefix.
+        String bare = InfinoQueryTranslator.translate(QueryBuilders.simpleQueryStringQuery("er*").field("level"), cols, TABLE, NOW).where();
+        assertTrue(bare, bare.contains("WHERE list_rows.list_value LIKE 'er%'"));
+        String bareRegexp = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("/er.*/").field("level"), cols, TABLE, NOW).where();
+        assertTrue(bareRegexp, bareRegexp.contains("WHERE regexp_like(list_rows.list_value, '^(?:er.*)$')"));
+        // Without a list column each reads the own column alone, as before.
+        assertEquals("\"level\" IS NOT NULL", translate(QueryBuilders.queryStringQuery("level:*")).where());
+        assertEquals("\"level\" LIKE 'er%'", translate(QueryBuilders.queryStringQuery("level:er*")).where());
+    }
+
     /** The unsorted statement for {@code qb} over {@code cols}, sorted on a field no row holds. */
     private static String unsortedHits(org.opensearch.index.query.QueryBuilder qb, Map<String, Column> cols) {
         InfinoSearch.Plan plan = new InfinoSearch.Plan(

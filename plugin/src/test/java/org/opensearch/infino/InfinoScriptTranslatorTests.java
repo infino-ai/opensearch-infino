@@ -82,6 +82,18 @@ public class InfinoScriptTranslatorTests extends OpenSearchTestCase {
         assertEquals("NULL", sql("doc['nope'].value").expr());
     }
 
+    public void testDocSizeAndEmptyCountAListColumnsValues() {
+        // A document that gave the field several values holds them in its list column, its own column null.
+        Map<String, Column> cols = Map.of("tags", new Column("tags", "str", false, false), "tags[]", Column.list("tags[]", "str"));
+        Script size = new Script(ScriptType.INLINE, "painless", "doc['tags'].size()", Map.of());
+        assertEquals(
+            "CASE WHEN \"tags[]\" IS NOT NULL THEN CAST(cardinality(\"tags[]\") AS BIGINT) WHEN \"tags\" IS NOT NULL THEN 1 ELSE 0 END",
+            InfinoScriptTranslator.translate(size, cols, null, NOW).expr()
+        );
+        Script empty = new Script(ScriptType.INLINE, "painless", "doc['tags'].empty", Map.of());
+        assertEquals("(\"tags\" IS NULL AND \"tags[]\" IS NULL)", InfinoScriptTranslator.translate(empty, cols, null, NOW).expr());
+    }
+
     public void testStatementsBecomeOneExpression() {
         Sql s = sql("def t = doc['price'].value * params.rate; return t > params.min;", Map.of("rate", 2, "min", 200));
         assertEquals("((\"price\" * 2) > 200)", s.expr());

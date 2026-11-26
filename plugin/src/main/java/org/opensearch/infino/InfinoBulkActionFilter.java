@@ -111,7 +111,8 @@ import java.util.function.Supplier;
  * as the stock bulk runs them before any shard; a document a pipeline fails
  * or drops is answered as stock answers it and not written.
  *
- * <p>An update is merged here into the document it targets. The writes then
+ * <p>An update is merged here into the document it targets, or its script
+ * run against it ({@link InfinoScriptedUpdate}). The writes then
  * go to the table's {@link InfinoWriter}, which batches them across requests
  * and answers the bulk once they are committed; a document the declared
  * columns cannot hold comes back from that append as its own item with the
@@ -448,10 +449,6 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                 continue;
             }
             UpdateRequest update = (UpdateRequest) item;
-            if (update.script() != null) {
-                items[slot] = failure(slot, update, index, new IllegalArgumentException("[infino] scripted updates are not served"), RestStatus.BAD_REQUEST);
-                continue;
-            }
             try {
                 String table = tables.ensureForDocument(md, update.id(), update.routing());
                 if (!InfinoEngine.mergesHere(table)) {
@@ -460,7 +457,13 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                     later.add(slot);
                     continue;
                 }
-                writes.add(mergedWrite(md, table, update));
+                Merged merged = mergedWrite(md, table, update);
+                if (merged.noop() != null) {
+                    // The script wrote nothing: answered now, as stock answers a no-op.
+                    items[slot] = new BulkItemResponse(slot, DocWriteRequest.OpType.UPDATE, merged.noop());
+                    continue;
+                }
+                writes.add(merged.write());
                 writeSlots.add(slot);
                 mergedSlots.add(slot);
                 written.put(key, true);
@@ -582,6 +585,13 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
     }
 
     /**
+     * What an update merged on its primary became: the write that goes to
+     * the shard, or, when its script writes nothing ({@code ctx.op} is
+     * {@code noop}), the answer to give instead.
+     */
+    private record Merged(DocWriteRequest<?> write, UpdateResponse noop) {}
+
+    /**
      * {@code update} as a write of the whole document, merged on the primary
      * that writes {@code table}. The document's sequence number is read
      * first, checked against the update's own condition when it has one,
@@ -594,9 +604,12 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
      * gives is a conflict when its sequence number has moved since (a write
      * deleted it meanwhile), and otherwise not yet mergeable
      * ({@link NotYetMergeable}): the table does not yet hold the write the
-     * shard counts.
+     * shard counts. An update with a script runs it against that source
+     * ({@link InfinoScriptedUpdate}): the document it makes is written as a
+     * merged one is, a delete it asks for is conditioned on the same number,
+     * and a no-op writes nothing.
      */
-    private static IndexRequest mergedWrite(IndexMetadata md, String table, UpdateRequest update) {
+    private static Merged mergedWrite(IndexMetadata md, String table, UpdateRequest update) {
         ShardId shardId = new ShardId(md.getIndex(), OperationRouting.generateShardId(md, update.id(), update.routing()));
         IndexShard shard = InfinoServices.indicesService().indexServiceSafe(md.getIndex()).getShard(shardId.id());
         GetResult got = shard.getService().getForUpdate(update.id(), update.ifSeqNo(), update.ifPrimaryTerm());
@@ -608,7 +621,22 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
             }
             throw new VersionConflictEngineException(shardId, update.id(), "[infino] the document changed while the update was merged into it");
         }
-        String merged = merge(base, update);
+        String merged;
+        if (update.script() == null) {
+            merged = merge(base, update);
+        } else {
+            InfinoScriptedUpdate.Change change = InfinoScriptedUpdate.run(shardId, update, base, got.getSeqNo(), got.getPrimaryTerm(), got.getVersion());
+            switch (change.op()) {
+                case NOOP:
+                    return new Merged(null, change.noop());
+                case DELETE:
+                    DeleteRequest delete = new DeleteRequest(md.getIndex().getName()).id(update.id()).routing(update.routing());
+                    delete.setIfSeqNo(got.getSeqNo()).setIfPrimaryTerm(got.getPrimaryTerm());
+                    return new Merged(delete, null);
+                default:
+                    merged = change.document();
+            }
+        }
         if (merged == null) {
             throw new DocumentMissingException(shardId, update.id());
         }
@@ -618,7 +646,7 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
         } else {
             write.create(true);
         }
-        return write;
+        return new Merged(write, null);
     }
 
     /**
@@ -1745,13 +1773,9 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
             } else if (item instanceof DeleteRequest delete) {
                 outcomes.add(new Outcome(slot, item, new Write(delete.id(), null, true), null));
             } else if (item instanceof UpdateRequest update) {
-                if (update.script() != null) {
-                    outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, new IllegalArgumentException("[infino] scripted updates are not served"), RestStatus.BAD_REQUEST)));
-                    continue;
-                }
-                // Merged when its batch is written, in the order the batch takes the
-                // writes: into the write before it in the batch, else the table as
-                // the appends before it left it (see InfinoWriter#apply).
+                // Merged (or its script run) when its batch is written, in the order the
+                // batch takes the writes: into the write before it in the batch, else the
+                // table as the appends before it left it (see InfinoWriter#apply).
                 outcomes.add(new Outcome(slot, item, Write.update(update), null));
             } else {
                 outcomes.add(new Outcome(slot, item, null, failure(slot, item, indexName, new IllegalArgumentException("[infino] unsupported write " + item.getClass().getSimpleName()), RestStatus.BAD_REQUEST)));

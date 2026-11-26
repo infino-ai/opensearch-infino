@@ -545,6 +545,37 @@ public class InfinoWriterTests extends OpenSearchTestCase {
     }
 
     /**
+     * A document refused for a column its batch was typed without is
+     * answered 503 for a later try, but the service answered that append:
+     * it ended nothing, so the bulk's deletes are still sent. Only a status
+     * the service ended the append with, a rate limit or no answer, holds
+     * them back.
+     */
+    public void testAStaleSchemaRefusalDoesNotEndTheAppend() {
+        InfinoNative.PreparedFailure stale = new InfinoNative.PreparedFailure(
+            0,
+            0,
+            "column `@timestamp` was added since the batch was typed",
+            false,
+            RestStatus.SERVICE_UNAVAILABLE,
+            true
+        );
+        InfinoNative.PreparedFailure limited = new InfinoNative.PreparedFailure(
+            0,
+            1,
+            RATE_LIMITED,
+            false,
+            RestStatus.TOO_MANY_REQUESTS,
+            false
+        );
+        assertNull(InfinoWriter.endedBy(Map.of("a", stale)));
+        Map<String, InfinoNative.PreparedFailure> both = new LinkedHashMap<>();
+        both.put("a", stale);
+        both.put("b", limited);
+        assertEquals(RestStatus.TOO_MANY_REQUESTS, InfinoWriter.endedBy(both));
+    }
+
+    /**
      * An append the hosted service ended partway, by not answering a call
      * (503) or turning one away for the account's request rate (429),
      * answers only the documents it did not write with that status: the one
