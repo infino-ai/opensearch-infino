@@ -563,6 +563,13 @@ public final class InfinoNative {
      * changes a few times in a node's life at most.
      */
     public static void init() {
+        // A node that does not see the cluster's storage answers from none of it.
+        InfinoStorageIdentity.refuseIfUnshared();
+        connect();
+    }
+
+    /** {@link #init}, on a node whether or not it sees the cluster's storage: the storage check and a switch of it open through this. */
+    private static void connect() {
         Target target = wanted;
         if (conn != null && target.equals(opened)) {
             return;
@@ -627,8 +634,9 @@ public final class InfinoNative {
             return;
         }
         wanted = target;
+        InfinoStorageIdentity.storageChanged();
         if (conn != null) {
-            init();
+            connect();
         }
     }
 
@@ -677,7 +685,7 @@ public final class InfinoNative {
     static String checkStorage(TimeValue timeout) {
         lib();
         Target target = wanted;
-        if (MEMORY_URIS.contains(target.uri())) {
+        if (inMemory(target)) {
             return null;
         }
         StorageFailure failure = within(timeout, () -> probeStorage(target));
@@ -727,7 +735,7 @@ public final class InfinoNative {
      */
     private static StorageFailure probeStorage(Target target) {
         try {
-            init();
+            connect();
         } catch (InfinoException e) {
             String opening = "cannot open " + target.name() + ": ";
             String why = e.getMessage().startsWith(opening) ? e.getMessage().substring(opening.length()) : e.getMessage();
@@ -803,6 +811,11 @@ public final class InfinoNative {
             return "Check that the directory exists and that the user the node runs as may read and write it.";
         }
         return "Check the node's credentials for this storage and that they may list it.";
+    }
+
+    /** Whether {@code target} is a catalog in the node's own memory. */
+    static boolean inMemory(Target target) {
+        return !target.hosted() && MEMORY_URIS.contains(target.uri());
     }
 
     /** Whether {@code uri} names local storage: {@code file://}, or a path with no scheme. */
@@ -1392,6 +1405,20 @@ public final class InfinoNative {
         Map<String, Column> view = Collections.unmodifiableMap(out);
         COLUMNS.put(name, view);
         return view;
+    }
+
+    /** The names of table {@code name}'s columns, in the table's order, read from the table now; empty when it does not exist. */
+    static List<String> columnNames(String name) {
+        init();
+        String json = take(lib.infino_columns(conn, name));
+        if (json == null || json.isEmpty()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        for (Map<String, Object> c : rows(json)) {
+            out.add((String) c.get("name"));
+        }
+        return out;
     }
 
     /** Whether {@code key} names {@code column} by an alias rather than by the column's own name. */

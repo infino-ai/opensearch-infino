@@ -12,6 +12,7 @@ import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.cluster.routing.allocation.decider.AllocationDecider;
 import org.opensearch.common.lifecycle.LifecycleComponent;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.IndexScopedSettings;
@@ -37,6 +38,7 @@ import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.plugins.ActionPlugin;
+import org.opensearch.plugins.ClusterPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchPlugin;
@@ -81,7 +83,7 @@ import java.util.function.Supplier;
  * index recreated on a fresh cluster with the same setting reattaches to the
  * rows its predecessor wrote.
  */
-public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, EnginePlugin {
+public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, EnginePlugin, ClusterPlugin {
 
     private static final Logger log = LogManager.getLogger(InfinoPlugin.class);
 
@@ -721,8 +723,15 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
             PLATFORM_DEFAULT_URL,
             CACHE_DIR,
             PLATFORM_READ_WINDOW,
-            SQL_MAX_RESULT_SIZE
+            SQL_MAX_RESULT_SIZE,
+            InfinoStorageIdentity.CLUSTER_STORAGE_ID
         );
+    }
+
+    /** A shard of an Infino-backed index goes only to a node that sees the cluster's storage (see {@link InfinoStorageIdentity}). */
+    @Override
+    public Collection<AllocationDecider> createAllocationDeciders(Settings settings, ClusterSettings clusterSettings) {
+        return List.of(new InfinoStorageDecider());
     }
 
     /** The plugin's own action: a caller's SQL over Infino-backed indices, authorized as a read of each (see {@link InfinoSql}). */
