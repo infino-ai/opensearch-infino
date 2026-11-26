@@ -1264,7 +1264,7 @@ public class InfinoEngine extends InternalEngine {
             }
             if (why != null) {
                 // A keyword value too long for one term fails as Lucene fails it on a stock index.
-                Exception refused = why.startsWith(InfinoWriter.IMMENSE_TERM)
+                Exception refused = InfinoWriter.tooLongForOneTerm(why)
                     ? new IllegalArgumentException(why)
                     : new MapperParsingException("[infino] " + why);
                 return new IndexResult(refused, index.version());

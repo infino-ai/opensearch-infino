@@ -1,9 +1,9 @@
 # A keyword value whose UTF-8 encoding is longer than the 32,766 bytes one
 # Lucene term holds (issue #295), on a Lucene index, in proxy mode and in
 # default mode. Stock refuses the document with Lucene's own reason, an
-# illegal_argument_exception, at write time: alone, in an array, through a
-# keyword multi-field (a text field's .keyword), in a bulk item and in an
-# update's merged document. A field whose ignore_above leaves the value out
+# illegal_argument_exception, at write time: alone, in an array, in a
+# keyword with doc values only, through a keyword multi-field (a text
+# field's .keyword), in a bulk item and in an update's merged document. A field whose ignore_above leaves the value out
 # (as the .keyword dynamic mapping adds does) keeps it in _source only, and
 # the document is stored. Nothing is acknowledged and then lost: each index
 # ends with the same documents.
@@ -18,6 +18,7 @@
           mappings:
             properties:
               w: { type: keyword }
+              v: { type: keyword, index: false }
               k: { type: keyword, ignore_above: 256 }
               t: { type: text, fields: { keyword: { type: keyword } } }
               d: { type: text, fields: { keyword: { type: keyword, ignore_above: 256 } } }
@@ -29,6 +30,7 @@
           mappings:
             properties:
               w: { type: keyword }
+              v: { type: keyword, index: false }
               k: { type: keyword, ignore_above: 256 }
               t: { type: text, fields: { keyword: { type: keyword } } }
               d: { type: text, fields: { keyword: { type: keyword, ignore_above: 256 } } }
@@ -40,6 +42,7 @@
           mappings:
             properties:
               w: { type: keyword }
+              v: { type: keyword, index: false }
               k: { type: keyword, ignore_above: 256 }
               t: { type: text, fields: { keyword: { type: keyword } } }
               d: { type: text, fields: { keyword: { type: keyword, ignore_above: 256 } } }
@@ -61,6 +64,11 @@
   - match: { error.type: illegal_argument_exception }
   - match: { error.reason: "/^Document contains at least one immense term in field=\"t.keyword\" /" }
   - set: { error.reason: reason_t }
+  - do:
+      catch: bad_request
+      index: { index: kt_luc, id: v1, body: { v: $big } }
+  - match: { error.type: illegal_argument_exception }
+  - match: { error.reason: 'DocValuesField "v" is too large, must be <= 32766' }
   # kt_luc
   - do:
       catch: bad_request
@@ -122,6 +130,11 @@
   - match: { error.reason: $reason_t }
   - do:
       catch: bad_request
+      index: { index: kt_px, id: v1, body: { v: $big } }
+  - match: { error.type: illegal_argument_exception }
+  - match: { error.reason: 'DocValuesField "v" is too large, must be <= 32766' }
+  - do:
+      catch: bad_request
       index: { index: kt_px, id: a1, body: { w: [ b, $big ] } }
   - match: { error.type: illegal_argument_exception }
   - match: { error.reason: $reason_w }
@@ -178,6 +191,11 @@
       index: { index: kt_def, id: t1, body: { t: $big } }
   - match: { error.type: illegal_argument_exception }
   - match: { error.reason: $reason_t }
+  - do:
+      catch: bad_request
+      index: { index: kt_def, id: v1, body: { v: $big } }
+  - match: { error.type: illegal_argument_exception }
+  - match: { error.reason: 'DocValuesField "v" is too large, must be <= 32766' }
   - do:
       catch: bad_request
       index: { index: kt_def, id: a1, body: { w: [ b, $big ] } }

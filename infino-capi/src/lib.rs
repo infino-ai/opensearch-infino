@@ -123,6 +123,10 @@ const MAX_TERM_BYTES: usize = 32766;
 const IMMENSE_TERM: &str = "Document contains at least one immense term in field=\"";
 /// How many leading bytes of an immense term Lucene's refusal shows.
 const IMMENSE_TERM_PREFIX_BYTES: usize = 30;
+/// How Lucene's refusal of a value too long for a keyword's doc values
+/// starts, for a keyword that has doc values but no index
+/// ([`too_long_for_one_term`]); answered as [`IMMENSE_TERM`] is.
+const DOC_VALUES_TOO_LARGE: &str = "DocValuesField \"";
 /// What the column holding a field's values is named after the field's own,
 /// for a document that gives the field more than one: `<path>[]`, a list of
 /// the field's own type, declared the first time a document needs it. The
@@ -1468,8 +1472,8 @@ struct MappedField {
     /// default format, which [`default_format_millis`] reads.
     date_formats: Option<Vec<DateFormat>>,
     /// For a `keyword` field, its `ignore_above`, if it sets one, and
-    /// whether it builds terms (it is indexed or has doc values).
-    keyword: Option<(Option<usize>, bool)>,
+    /// the terms it builds, if any ([`builds_terms`]).
+    keyword: Option<(Option<usize>, Option<Terms>)>,
     /// The field's `keyword` multi-fields that build terms of its values
     /// (the `.keyword` sub-field dynamic mapping gives a string, say). They
     /// have no column of their own, but OpenSearch indexes each value in
@@ -1498,13 +1502,24 @@ impl MappedField {
     }
 }
 
-/// A `keyword` multi-field that builds terms: its full path, which an
-/// immense-term refusal names, and its `ignore_above`, past which a value is
-/// left out of it.
+/// Where a `keyword` field's terms go, which decides the words Lucene
+/// refuses a value too long for one term in ([`too_long_for_one_term`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Terms {
+    /// The field is indexed (whether or not it also has doc values).
+    Postings,
+    /// The field has doc values but no index.
+    DocValues,
+}
+
+/// A `keyword` multi-field that builds terms: its full path, which a
+/// refusal names, its `ignore_above`, past which a value is left out of it,
+/// and where its terms go.
 #[derive(Clone, Debug, PartialEq)]
 struct TermView {
     field: String,
     ignore_above: Option<usize>,
+    terms: Terms,
 }
 
 /// The `keyword` multi-fields under `def` (its `fields`) that build terms,
@@ -1520,9 +1535,10 @@ fn keyword_multi_fields(def: &Map<String, Value>, path: &str) -> Vec<TermView> {
             if sub.get("type").and_then(Value::as_str) != Some("keyword") {
                 return None;
             }
-            builds_terms(sub).then(|| TermView {
+            builds_terms(sub).map(|terms| TermView {
                 field: format!("{path}.{name}"),
                 ignore_above: ignore_above(sub),
+                terms,
             })
         })
         .collect()
@@ -1533,12 +1549,16 @@ fn ignore_above(def: &Map<String, Value>) -> Option<usize> {
     def.get("ignore_above").and_then(Value::as_u64).map(|n| n as usize)
 }
 
-/// Whether a `keyword` mapping builds terms: it is indexed or has doc
-/// values, as it does unless it turns both off.
-fn builds_terms(def: &Map<String, Value>) -> bool {
+/// The terms a `keyword` mapping builds: postings when it is indexed, doc
+/// values when only those, none when it turns both off.
+fn builds_terms(def: &Map<String, Value>) -> Option<Terms> {
     let indexed = def.get("index").and_then(Value::as_bool) != Some(false);
     let doc_values = def.get("doc_values").and_then(Value::as_bool) != Some(false);
-    indexed || doc_values
+    match (indexed, doc_values) {
+        (true, _) => Some(Terms::Postings),
+        (false, true) => Some(Terms::DocValues),
+        (false, false) => None,
+    }
 }
 
 /// How a mapped field's values are kept beyond its column's type, as
@@ -1555,7 +1575,7 @@ enum Kept {
     /// keyword multi-fields (`multi`) index.
     Keyword {
         ignore_above: Option<usize>,
-        terms: bool,
+        terms: Option<Terms>,
         multi: Vec<TermView>,
     },
     /// A field of another type (a `text` field, say) whose keyword
@@ -2909,13 +2929,13 @@ fn keyword_values(flat: &mut Map<String, Value>, kept: &HashMap<String, Kept>) -
             if let Some((ignore_above, terms)) = own {
                 if skips(ignore_above) {
                     keeps = false;
-                } else if terms && text.len() > MAX_TERM_BYTES {
-                    return Err(immense_term(path, &text));
+                } else if let Some(terms) = terms.filter(|_| text.len() > MAX_TERM_BYTES) {
+                    return Err(too_long_for_one_term(path, &text, terms));
                 }
             }
             for view in multi {
                 if !skips(view.ignore_above) && text.len() > MAX_TERM_BYTES {
-                    return Err(immense_term(&view.field, &text));
+                    return Err(too_long_for_one_term(&view.field, &text, view.terms));
                 }
             }
             Ok(keeps)
@@ -2958,10 +2978,20 @@ fn each_value(items: &[Value], f: &mut impl FnMut(&Value) -> Result<(), String>)
 }
 
 /// The reason Lucene gives, word for word, for a document whose `field`
-/// would index `term` past [`MAX_TERM_BYTES`]: OpenSearch answers it as an
-/// `illegal_argument_exception`. It shows the term's first bytes as Java
-/// prints a byte array (signed). Lucene copies that many bytes whatever the
-/// term's length, and an immense term is always longer.
+/// would index `term` past [`MAX_TERM_BYTES`], which OpenSearch answers as
+/// an `illegal_argument_exception`: an immense term ([`immense_term`]) when
+/// the field is indexed, a doc value too large when it only has doc values.
+fn too_long_for_one_term(field: &str, term: &str, terms: Terms) -> String {
+    match terms {
+        Terms::Postings => immense_term(field, term),
+        Terms::DocValues => format!("{DOC_VALUES_TOO_LARGE}{field}\" is too large, must be <= {MAX_TERM_BYTES}"),
+    }
+}
+
+/// Lucene's refusal of an indexed `term` past [`MAX_TERM_BYTES`] in
+/// `field`. It shows the term's first bytes as Java prints a byte array
+/// (signed). Lucene copies that many bytes whatever the term's length, and
+/// an immense term is always longer.
 fn immense_term(field: &str, term: &str) -> String {
     let prefix: Vec<String> = term
         .as_bytes()
@@ -8213,9 +8243,9 @@ mod tests {
             Field::new("short[]", DataType::List(Arc::new(Field::new(LIST_ITEM, DataType::LargeUtf8, true))), true),
         ]);
         let kept: HashMap<String, Kept> = [
-            ("short".to_string(), Kept::Keyword { ignore_above: Some(5), terms: true , multi: vec![] }),
-            ("long".to_string(), Kept::Keyword { ignore_above: None, terms: true , multi: vec![] }),
-            ("stored".to_string(), Kept::Keyword { ignore_above: None, terms: false , multi: vec![] }),
+            ("short".to_string(), Kept::Keyword { ignore_above: Some(5), terms: Some(Terms::Postings), multi: vec![] }),
+            ("long".to_string(), Kept::Keyword { ignore_above: None, terms: Some(Terms::Postings), multi: vec![] }),
+            ("stored".to_string(), Kept::Keyword { ignore_above: None, terms: None, multi: vec![] }),
         ]
         .into_iter()
         .collect();
@@ -8282,6 +8312,7 @@ mod tests {
                 "t":{"type":"text","fields":{"keyword":{"type":"keyword"}}},
                 "dyn":{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}},
                 "off":{"type":"text","fields":{"raw":{"type":"keyword","index":false,"doc_values":false}}},
+                "dv":{"type":"text","fields":{"raw":{"type":"keyword","index":false}}},
                 "k":{"type":"keyword","ignore_above":10,"fields":{"raw":{"type":"keyword"}}},
                 "plain":{"type":"text"}
             }}"#,
@@ -8293,7 +8324,7 @@ mod tests {
             .filter_map(|f| f.kept().map(|k| (f.path.clone(), k)))
             .collect();
         let schema = Schema::new(
-            ["t", "dyn", "off", "k", "plain"]
+            ["t", "dyn", "off", "dv", "k", "plain"]
                 .into_iter()
                 .map(|name| Field::new(name, DataType::LargeUtf8, true))
                 .chain([Field::new(
@@ -8314,6 +8345,9 @@ mod tests {
             assert!(why.starts_with(&format!("{IMMENSE_TERM}t.keyword\"")), "{why}");
             assert!(why.ends_with("got 32767"), "{why}");
         }
+        // A multi-field with doc values but no index refuses it in Lucene's words for doc values.
+        let why = row(json!({ "dv": past })).unwrap_err();
+        assert_eq!(why, "DocValuesField \"dv.raw\" is too large, must be <= 32766");
         // Past the multi-field's ignore_above, or with no terms, the value is kept whole.
         for field in ["dyn", "off", "plain"] {
             let flat = row(json!({ field: past })).unwrap();
@@ -8330,8 +8364,8 @@ mod tests {
     /// Whether a `keyword` field builds terms follows its mapping: one that
     /// is neither indexed nor has doc values stores a value past a term's
     /// length in its row and its source; an indexed one, or one with only
-    /// doc values, refuses the document as an immense term, at the check
-    /// and at the write.
+    /// doc values, refuses the document in Lucene's words (an immense term,
+    /// or a doc value too large), at the check and at the write.
     #[test]
     fn a_keyword_builds_terms_unless_its_mapping_turns_off_index_and_doc_values() {
         let h = open_logs();
@@ -8355,17 +8389,12 @@ mod tests {
         let doc_values_only = format!(r#"{{"level":"info","doc_values_only":"{past}"}}"#);
 
         assert_eq!(check(h, &stored), "");
-        for (doc, field) in [(&indexed, "indexed"), (&doc_values_only, "doc_values_only")] {
-            let why = check(h, doc);
-            assert!(
-                why.contains(&format!("immense term in field=\"{field}\"")),
-                "{field}: {why}"
-            );
-            assert!(
-                why.contains("bytes can be at most 32766 in length; got 32767"),
-                "{field}: {why}"
-            );
-        }
+        let why = check(h, &indexed);
+        assert!(why.contains("immense term in field=\"indexed\""), "{why}");
+        assert!(why.contains("bytes can be at most 32766 in length; got 32767"), "{why}");
+        // Lucene refuses a value too long for doc values in words of its own.
+        let why = check(h, &doc_values_only);
+        assert_eq!(why, "DocValuesField \"doc_values_only\" is too large, must be <= 32766");
 
         let out = index(
             h,
@@ -8374,11 +8403,13 @@ mod tests {
         assert_eq!(out["ok"], 1, "{out}");
         let failed = out["failed"].as_array().unwrap();
         assert_eq!(failed.len(), 2, "{out}");
-        for (f, (i, field)) in failed.iter().zip([(1, "indexed"), (2, "doc_values_only")]) {
+        for (f, (i, refusal)) in failed.iter().zip([
+            (1, "immense term in field=\"indexed\""),
+            (2, "DocValuesField \"doc_values_only\" is too large"),
+        ]) {
             assert_eq!(f["i"], i, "{out}");
             let why = f["reason"].as_str().unwrap();
-            let term = format!("immense term in field=\"{field}\"");
-            assert!(why.contains(&term), "{out}");
+            assert!(why.contains(refusal), "{out}");
         }
 
         // The stored value is whole in the row and in the source.

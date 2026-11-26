@@ -995,10 +995,19 @@ public final class InfinoWriter {
     static final String NO_TIMESTAMP = "documents must contain a single-valued timestamp field";
 
     /**
-     * How the bridge's reason starts when a keyword value is too long for one term: Lucene's own
-     * refusal, word for word, which stock answers as an {@code illegal_argument_exception}.
+     * How the bridge's reasons start when a keyword value is too long for one term, in an indexed
+     * keyword or in one with doc values only: Lucene's own refusals, word for word, which stock
+     * answers as an {@code illegal_argument_exception}.
      */
-    static final String IMMENSE_TERM = "Document contains at least one immense term in field=";
+    private static final List<String> TOO_LONG_FOR_ONE_TERM = List.of(
+        "Document contains at least one immense term in field=",
+        "DocValuesField \""
+    );
+
+    /** Whether the bridge's reason is Lucene's refusal of a keyword value too long for one term. */
+    static boolean tooLongForOneTerm(String why) {
+        return TOO_LONG_FOR_ONE_TERM.stream().anyMatch(why::startsWith);
+    }
 
     /**
      * A document the bridge refused, answered as stock answers it: a data stream's document without
@@ -1009,7 +1018,7 @@ public final class InfinoWriter {
         if (why.startsWith(NO_TIMESTAMP)) {
             return new MapperParsingException("failed to parse", new IllegalArgumentException(why));
         }
-        if (why.startsWith(IMMENSE_TERM)) {
+        if (tooLongForOneTerm(why)) {
             return new IllegalArgumentException(why);
         }
         return new IllegalArgumentException("[infino] " + why);
