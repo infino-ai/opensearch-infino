@@ -60,7 +60,7 @@ use infino::arrow_array::{
     LargeStringArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
 };
-use infino::arrow_schema::{DataType, Field, Schema, TimeUnit};
+use infino::arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use infino::serde_json::{self, json, Map, Value};
 use infino::{
     connect_with, rows_to_batch, Analyzer, Bm25SearchOptions, BoolMode, ColumnIndex,
@@ -4269,7 +4269,7 @@ pub unsafe extern "C" fn infino_index_batch_buf(
         };
         let n = prepared.n;
         let adds_columns = prepared.adds_columns;
-        let mut recheck = Recheck::new(conn, name, vec![prepared.typed_by.clone()]);
+        let mut recheck = Recheck::new(conn, name, std::slice::from_ref(&prepared));
         let failed = match append_prepared(
             &table,
             &conn.gate(name),
@@ -4313,6 +4313,12 @@ pub struct Prepared {
     /// weighed against the document read afresh ([`Recheck`]). None over
     /// storage, where the table's handle converts against the live schema.
     typed_by: Option<TableSchema>,
+    /// The table handle's Arrow schema the rows were conformed against, on a
+    /// hosted connection: it is fixed when the handle opens, so it can lack
+    /// a column the document holds, and a field given several values is
+    /// then sent whole under its name rather than split into the column and
+    /// its list ([`Recheck`]). None over storage.
+    conformed_by: Option<SchemaRef>,
 }
 
 /// One row of a buffer handed to [`prepare`]: its id, source, routing value
@@ -4491,6 +4497,7 @@ unsafe fn prepare(
         failed,
         adds_columns,
         typed_by: conn.hosted.then_some(table_schema),
+        conformed_by: conn.hosted.then_some(schema),
     })
 }
 
@@ -4592,15 +4599,15 @@ struct NotTaken {
     /// The status the caller answers for it when it is not a refusal of the
     /// document ([`untried`]): 429 for a write the hosted service turned
     /// away for the account's request rate, 503 for one it did not answer
-    /// or one refused for a column its batch's schema document lacked
+    /// or one refused for a column its batch's schemas lacked
     /// ([`STALE_SCHEMA_STATUS`]); the client sends any of them again.
     status: Option<u16>,
     /// The column the hosted service named when it refused the document
     /// for that column's type ([`mismatched_column`]), which [`Recheck`]
     /// weighs; None for any other failure.
     mismatched: Option<String>,
-    /// Whether it was refused for a column its batch's schema document
-    /// lacked ([`Recheck`]): the service stored nothing of it, so a later
+    /// Whether it was refused for a column its batch's schemas lacked
+    /// ([`Recheck`]): the service stored nothing of it, so a later
     /// commit need not look its id up, as after a rate limit.
     stale_schema: bool,
 }
@@ -4706,22 +4713,27 @@ const STALE_SCHEMA_STATUS: u16 = SERVICE_UNAVAILABLE;
 /// document ([`Bridge::replace_schema`]). A value whose column the document
 /// lacks takes the type its JSON suggests, and the service refuses it for
 /// the column's type on every try typed by that document; OpenSearch has
-/// acknowledged the write by then, so dropping it as refused loses it.
+/// acknowledged the write by then, so dropping it as refused loses it. The
+/// rows were conformed before that against the table handle's Arrow schema
+/// (`conformed_by`), which is fixed when the handle opens: a field given
+/// several values whose column it lacks is sent whole, as a list, under the
+/// column's name, and refused the same way.
 ///
 /// Only a refusal the hosted service made for a column's type is weighed,
 /// by the column it names ([`mismatched_column`]). The document is read
 /// afresh once per append, on the first refusal that asks, and swapped in
 /// for the kept one ([`Bridge::replace_schema`]), which stays kept while
-/// the read runs and if it fails. A refusal is the batch's document's own
-/// when the column it names is newer than every one that document knew (an
-/// id above the highest it had minted), or when the schema cannot be read.
-/// When the column is newer, the table's handle is dropped too, so the next
-/// write opens one that knows it. Nothing else counts: a refusal naming a column
-/// the document already knew, or any change elsewhere in the schema (its
-/// version, its limits, another column added by the same write), leaves the
-/// refusal permanent, so a document refused for what it carries is retried
-/// at most once per column it carries that its batch's document lacked,
-/// and then ends refused.
+/// the read runs and if it fails. A refusal is the bridge's own when the
+/// column it names is newer than every one the batch's document knew (an
+/// id above the highest it had minted), when the table holds the column
+/// and the handle's schema the rows were conformed against lacked it, or
+/// when the schema cannot be read. In the first two, the table's handle is
+/// dropped too, so the next write opens one that knows the column. Nothing
+/// else counts: a refusal naming a column both knew, or any change
+/// elsewhere in the schema (its version, its limits, another column added
+/// by the same write), leaves the refusal permanent, so a document refused
+/// for what it carries is retried at most once per column it carries that
+/// its batch's schemas lacked, and then ends refused.
 struct Recheck<'a> {
     /// The connection and table to read the schema of; None over storage,
     /// where batches are typed by the live schema, and in tests that
@@ -4729,19 +4741,22 @@ struct Recheck<'a> {
     conn: Option<(&'a Bridge, &'a str)>,
     /// The document each batch was typed by, by batch.
     typed_by: Vec<Option<TableSchema>>,
+    /// The handle's schema each batch was conformed against, by batch.
+    conformed_by: Vec<Option<SchemaRef>>,
     /// The document as read afresh, once read: or why it could not be.
     fresh: Option<Result<TableSchema, String>>,
-    /// Whether the table's handle was dropped for a column added since a
-    /// batch was typed, which is done once per append.
+    /// Whether the table's handle was dropped for a column a batch's
+    /// schemas lacked, which is done once per append.
     handle_dropped: bool,
 }
 
 impl<'a> Recheck<'a> {
-    /// A recheck of `name` on `conn` for batches typed by `typed_by`.
-    fn new(conn: &'a Bridge, name: &'a str, typed_by: Vec<Option<TableSchema>>) -> Self {
+    /// A recheck of `name` on `conn` for `batches`.
+    fn new(conn: &'a Bridge, name: &'a str, batches: &[Prepared]) -> Self {
         Recheck {
             conn: conn.hosted.then_some((conn, name)),
-            typed_by,
+            typed_by: batches.iter().map(|p| p.typed_by.clone()).collect(),
+            conformed_by: batches.iter().map(|p| p.conformed_by.clone()).collect(),
             fresh: None,
             handle_dropped: false,
         }
@@ -4753,35 +4768,43 @@ impl<'a> Recheck<'a> {
         Recheck {
             conn: None,
             typed_by: Vec::new(),
+            conformed_by: Vec::new(),
             fresh: None,
             handle_dropped: false,
         }
     }
 
     /// Why a refusal of batch `b` for `column`'s type may be the bridge's
-    /// own: the column was added since the batch's document was read, or
-    /// the schema cannot be read again. None when the batch's document knew
-    /// the column, or over storage.
+    /// own: the column was added since the batch's document was read, the
+    /// handle's schema the rows were conformed against lacked it, or the
+    /// schema cannot be read again. None when both knew the column, or over
+    /// storage.
     fn stale(&mut self, b: usize, column: &str) -> Option<String> {
         let (conn, name) = self.conn?;
         let typed = self.typed_by.get(b)?.as_ref()?;
+        let conformed = self.conformed_by.get(b).and_then(Option::as_ref);
         let fresh = self.fresh.get_or_insert_with(|| {
             conn.replace_schema(name, || conn.conn.schema(name))
                 .map_err(|e| short_reason(&e))
         });
-        match fresh {
-            Ok(now) if !added_since(typed, now, column) => None,
-            Ok(_) => {
-                if !self.handle_dropped {
-                    conn.forget_handle(name);
-                    self.handle_dropped = true;
-                }
-                Some(format!(
-                    "column `{column}` was added since the batch was typed"
-                ))
+        let why = match fresh {
+            Err(e) => return Some(format!("the table's schema could not be read again: {e}")),
+            Ok(now) if added_since(typed, now, column) => {
+                format!("column `{column}` was added since the batch was typed")
             }
-            Err(e) => Some(format!("the table's schema could not be read again: {e}")),
+            Ok(now)
+                if conformed.is_some_and(|s| s.field_with_name(column).is_err())
+                    && now.user_schema().field_with_name(column).is_ok() =>
+            {
+                format!("the table's handle did not know column `{column}` when the batch was prepared")
+            }
+            Ok(_) => return None,
+        };
+        if !self.handle_dropped {
+            conn.forget_handle(name);
+            self.handle_dropped = true;
         }
+        Some(why)
     }
 
     /// Say that a write refused for a column's type was not split: the
@@ -4802,7 +4825,7 @@ impl<'a> Recheck<'a> {
     }
 
     /// `failed`, with each document the hosted service refused for a
-    /// column's type that its batch's document lacked ([`Recheck::stale`])
+    /// column's type that its batch's schemas lacked ([`Recheck::stale`])
     /// reported for a later try under [`STALE_SCHEMA_STATUS`] instead of as
     /// permanent. Any other failure is left as it is: one turned away with
     /// a status of its own (a rate limit), one the bridge refused itself
@@ -5266,7 +5289,7 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
 /// `permanent` says every later try is refused the same way ([`NotTaken`]),
 /// `status` is 429 for a document the hosted service turned away for the
 /// account's request rate and 503 for one it did not answer ([`untried`])
-/// or refused for a column its batch's schema document lacked, else null,
+/// or refused for a column its batch's schemas lacked, else null,
 /// and `stale_schema` says the last, whose document the service did not
 /// store ([`Recheck`]); or `{"error":..}` when nothing ran (the handles are
 /// released either way).
@@ -5328,11 +5351,7 @@ pub unsafe extern "C" fn infino_append_prepared(
                 .collect()
         };
         let adds_columns = owned.iter().any(|p| p.adds_columns);
-        let mut recheck = Recheck::new(
-            conn,
-            name,
-            owned.iter().map(|p| p.typed_by.clone()).collect(),
-        );
+        let mut recheck = Recheck::new(conn, name, &owned);
         let failed = match append_prepared(
             &table,
             &conn.gate(name),
@@ -5350,7 +5369,7 @@ pub unsafe extern "C" fn infino_append_prepared(
         // A write adds its columns only when it lands, so one that landed
         // nothing changed nothing, and asks the service nothing more; nor is
         // a service that stopped answering asked for the schema. A document
-        // refused for a column its batch's document lacked had the schema
+        // refused for a column its batch's schemas lacked had the schema
         // read again already ([`Recheck`]).
         let unanswered = failed.iter().any(|f| f.status == Some(SERVICE_UNAVAILABLE));
         if adds_columns && ok > 0 && !unanswered {
@@ -11415,6 +11434,57 @@ mod tests {
         assert_eq!(s.landed, ["a"]);
         assert_eq!(s.document_reads, 1, "one read of the schema per append");
         drop(s);
+        close(h);
+    }
+
+    /// The column of numbers a [`typed_doc_with_ratios`] table holds, with
+    /// its list beside it for documents that give several values.
+    const RATIOS: &str = "ratios";
+
+    /// [`typed_doc`] without a date, with a [`RATIOS`] column of doubles and
+    /// its list column.
+    fn typed_doc_with_ratios() -> TableSchema {
+        let conn = connect_with(MEMORY_SCHEME, ConnectOptions::new()).unwrap();
+        let list = DataType::List(Arc::new(Field::new(LIST_ITEM, DataType::Float64, true)));
+        let fields = vec![
+            Field::new(OSID, DataType::LargeUtf8, false),
+            Field::new(SOURCE, DataType::LargeUtf8, true),
+            Field::new("level", DataType::LargeUtf8, true),
+            Field::new(RATIOS, DataType::Float64, true),
+            Field::new(format!("{RATIOS}{LIST_SUFFIX}"), list, true),
+        ];
+        conn.create_table("logs", Arc::new(Schema::new(fields)), IndexSpec::new())
+            .unwrap();
+        conn.schema("logs").unwrap()
+    }
+
+    /// A table handle's Arrow schema is fixed when it opens, while the kept
+    /// schema document is read again after a write that adds a column. A
+    /// field given several values whose column the handle lacks is not split
+    /// into the column and its list: it goes whole, as a list, under the
+    /// column's name, and the service refuses it for the column's type,
+    /// though the document knew the column. That refusal is the bridge's: the
+    /// documents are reported for a later try and the handle is dropped, so
+    /// the later try splits the field and lands.
+    #[test]
+    fn a_list_the_handle_could_not_split_is_tried_again_with_a_handle_that_can() {
+        let state = Arc::new(Mutex::new(Typed {
+            doc: Some(typed_doc(false)),
+            ..Typed::default()
+        }));
+        let h = typed_bridge(&state);
+        let bridge = unsafe { &*h };
+        bridge.table("logs").unwrap();
+        state.lock().unwrap().doc = Some(typed_doc_with_ratios());
+        bridge.reread_schema("logs");
+        let doc = json!({ "level": "info", RATIOS: [1.5, 2.5] }).to_string();
+        let out = append_replacing(h, prepared(h, &[("a", &doc)]), &[]);
+        assert_all_for_a_later_try(&out, 1);
+        let reason = out["failed"][0]["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("handle did not know column `ratios`"), "{reason}");
+        let out = append_replacing(h, prepared(h, &[("a", &doc)]), &[]);
+        assert_eq!(out["ok"], 1, "{out}");
+        assert_eq!(state.lock().unwrap().landed, ["a"]);
         close(h);
     }
 
