@@ -43,6 +43,8 @@
         refresh: true
         body: { script: { lang: painless, source: "ctx._source.remove('gone'); ctx._source.owner = ['name': params.name, 'team': 'x']", params: { name: ann } } }
   - match: { result: updated }
+  # From the write's answer: a default-mode get does not yet report the number an update took.
+  - set: { _seq_no: before_noop }
   - do: { get: { index: su_luc, id: "1" } }
   - is_false: _source.gone
   - match: { _source.owner: { name: ann, team: x } }
@@ -52,8 +54,6 @@
   - match: { hits.total.value: 0 }
 
   # A compare-and-set lease: ctx.op = "noop" writes nothing and answers noop.
-  - do: { get: { index: su_luc, id: "1" } }
-  - set: { _seq_no: before_noop }
   - do:
       update:
         index: su_luc
@@ -61,9 +61,9 @@
         refresh: true
         body: { script: { lang: painless, source: "if (ctx._source.n == params.expected) { ctx._source.n = params.next } else { ctx.op = 'noop' }", params: { expected: 99, next: 2 } } }
   - match: { result: noop }
+  - match: { _seq_no: $before_noop }
   - do: { get: { index: su_luc, id: "1" } }
   - match: { _source.n: 1 }
-  - match: { _seq_no: $before_noop }
   - do:
       update:
         index: su_luc
@@ -86,11 +86,12 @@
         refresh: true
         body: { script: { id: su_luc_add, params: { by: 3 } } }
   - match: { result: updated }
+  # if_seq_no below names the number this write took, from its answer.
+  - set: { _seq_no: seq, _primary_term: term }
   - do: { get: { index: su_luc, id: "1" } }
   - match: { _source.n: 5 }
 
   # if_seq_no: the update runs against the number it names, and conflicts once that has moved.
-  - set: { _seq_no: seq, _primary_term: term }
   - do:
       update:
         index: su_luc
@@ -236,6 +237,8 @@
         refresh: true
         body: { script: { lang: painless, source: "ctx._source.remove('gone'); ctx._source.owner = ['name': params.name, 'team': 'x']", params: { name: ann } } }
   - match: { result: updated }
+  # From the write's answer: a default-mode get does not yet report the number an update took.
+  - set: { _seq_no: before_noop }
   - do: { get: { index: su_def, id: "1" } }
   - is_false: _source.gone
   - match: { _source.owner: { name: ann, team: x } }
@@ -245,8 +248,6 @@
   - match: { hits.total.value: 0 }
 
   # A compare-and-set lease: ctx.op = "noop" writes nothing and answers noop.
-  - do: { get: { index: su_def, id: "1" } }
-  - set: { _seq_no: before_noop }
   - do:
       update:
         index: su_def
@@ -254,9 +255,9 @@
         refresh: true
         body: { script: { lang: painless, source: "if (ctx._source.n == params.expected) { ctx._source.n = params.next } else { ctx.op = 'noop' }", params: { expected: 99, next: 2 } } }
   - match: { result: noop }
+  - match: { _seq_no: $before_noop }
   - do: { get: { index: su_def, id: "1" } }
   - match: { _source.n: 1 }
-  - match: { _seq_no: $before_noop }
   - do:
       update:
         index: su_def
@@ -279,11 +280,12 @@
         refresh: true
         body: { script: { id: su_def_add, params: { by: 3 } } }
   - match: { result: updated }
+  # if_seq_no below names the number this write took, from its answer.
+  - set: { _seq_no: seq, _primary_term: term }
   - do: { get: { index: su_def, id: "1" } }
   - match: { _source.n: 5 }
 
   # if_seq_no: the update runs against the number it names, and conflicts once that has moved.
-  - set: { _seq_no: seq, _primary_term: term }
   - do:
       update:
         index: su_def
@@ -429,6 +431,8 @@
         refresh: true
         body: { script: { lang: painless, source: "ctx._source.remove('gone'); ctx._source.owner = ['name': params.name, 'team': 'x']", params: { name: ann } } }
   - match: { result: updated }
+  # From the write's answer: a default-mode get does not yet report the number an update took.
+  - set: { _seq_no: before_noop }
   - do: { get: { index: su_prx, id: "1" } }
   - is_false: _source.gone
   - match: { _source.owner: { name: ann, team: x } }
@@ -438,8 +442,6 @@
   - match: { hits.total.value: 0 }
 
   # A compare-and-set lease: ctx.op = "noop" writes nothing and answers noop.
-  - do: { get: { index: su_prx, id: "1" } }
-  - set: { _seq_no: before_noop }
   - do:
       update:
         index: su_prx
@@ -447,9 +449,9 @@
         refresh: true
         body: { script: { lang: painless, source: "if (ctx._source.n == params.expected) { ctx._source.n = params.next } else { ctx.op = 'noop' }", params: { expected: 99, next: 2 } } }
   - match: { result: noop }
+  - match: { _seq_no: $before_noop }
   - do: { get: { index: su_prx, id: "1" } }
   - match: { _source.n: 1 }
-  - match: { _seq_no: $before_noop }
   - do:
       update:
         index: su_prx
@@ -472,11 +474,12 @@
         refresh: true
         body: { script: { id: su_prx_add, params: { by: 3 } } }
   - match: { result: updated }
+  # if_seq_no below names the number this write took, from its answer.
+  - set: { _seq_no: seq, _primary_term: term }
   - do: { get: { index: su_prx, id: "1" } }
   - match: { _source.n: 5 }
 
   # if_seq_no: the update runs against the number it names, and conflicts once that has moved.
-  - set: { _seq_no: seq, _primary_term: term }
   - do:
       update:
         index: su_prx
