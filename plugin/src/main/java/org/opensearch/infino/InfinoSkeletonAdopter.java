@@ -145,8 +145,8 @@ final class InfinoSkeletonAdopter {
     /** Rows of each kind a walk names in its log, beyond which it only counts them. */
     static final int NAMED_ROWS = 10;
 
-    /** The shards whose skeleton is being rebuilt on this node, so a second start does not run beside the first. */
-    private static final Set<ShardId> RUNNING = ConcurrentHashMap.newKeySet();
+    /** The walks running on this node: a second start of a copy does not run beside the first, and a new copy waits for an earlier one's ({@link Walks}). */
+    private static final Walks RUNNING = new Walks();
 
     private InfinoSkeletonAdopter() {}
 
@@ -172,8 +172,25 @@ final class InfinoSkeletonAdopter {
     private static void start(IndexShard shard, String table, long restart, long failingSince) {
         ThreadPool threadPool = InfinoServices.threadPool();
         ShardId shardId = shard.shardId();
-        if (threadPool == null || !RUNNING.add(shardId)) {
+        if (threadPool == null || shard.state() == IndexShardState.CLOSED) {
             return;
+        }
+        switch (RUNNING.begin(shardId, shard)) {
+            case RUNNING -> {
+                return;
+            }
+            case LATER -> {
+                // The walk of an earlier copy of the shard on this node (one that
+                // closed, and started again from its store, say) has not ended yet:
+                // this copy starts once it has, rather than not at all.
+                threadPool.schedule(
+                    () -> start(shard, table, restart, failingSince),
+                    TimeValue.timeValueMillis(PAUSE_POLL_MILLIS),
+                    ThreadPool.Names.GENERIC
+                );
+                return;
+            }
+            case NOW -> {}
         }
         threadPool.generic().execute(() -> {
             boolean again = false;
@@ -198,7 +215,7 @@ final class InfinoSkeletonAdopter {
                 }
                 log.error("[infino] the skeleton of {} could not be rebuilt from table {}{}", shardId, table, then, e);
             } finally {
-                RUNNING.remove(shardId);
+                RUNNING.end(shardId, shard);
             }
             if (again) {
                 long failing = since;
@@ -331,6 +348,39 @@ final class InfinoSkeletonAdopter {
         final Named leftOut = new Named();
         /** Rows no write of this shard can name: no id, or an id that routes to another shard. */
         final Named unreachable = new Named();
+    }
+
+    /**
+     * The walks of the table running on this node, one per shard, each with
+     * the copy of the shard it walks for. A copy that closes and starts again
+     * (from its own store, say) is a new copy of the same shard, whose walk
+     * may begin before the earlier copy's walk has noticed the close and
+     * ended: it must wait for that walk, not be taken for it.
+     */
+    static final class Walks {
+
+        /** Whether a walk may begin ({@link #begin}). */
+        enum Begin {
+            /** No walk of the shard runs: this one runs, until {@link #end}. */
+            NOW,
+            /** This copy's walk runs already. */
+            RUNNING,
+            /** An earlier copy's walk of the shard runs still: try again later. */
+            LATER
+        }
+
+        private final Map<ShardId, Object> running = new ConcurrentHashMap<>();
+
+        /** Whether the walk of {@code shard} for {@code copy} may begin now. */
+        Begin begin(ShardId shard, Object copy) {
+            Object walking = running.putIfAbsent(shard, copy);
+            return walking == null ? Begin.NOW : walking == copy ? Begin.RUNNING : Begin.LATER;
+        }
+
+        /** The walk of {@code shard} for {@code copy} has ended. */
+        void end(ShardId shard, Object copy) {
+            running.remove(shard, copy);
+        }
     }
 
     /**
