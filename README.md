@@ -117,8 +117,8 @@ bin/opensearch-plugin install -b file:///path/infino-engine.zip
 
 | Where | How | |
 |---|---|---|
-| In memory | nothing to set | Lost on restart; for trying things out. |
-| On local disk | `-Dinfino.uri=file:///abs/path` | The node that owns the path serves the tables. |
+| In memory | nothing to set | Lost on restart; for trying things out. A single-node cluster only. |
+| On local disk | `-Dinfino.uri=file:///abs/path` | A single-node cluster, or a directory every node mounts (the same share on every node). A directory on each node's own disk is two storages, not one. |
 | In your bucket | `-Dinfino.uri=s3://bucket/prefix` or `gs://bucket/prefix` | Every node pointed at it serves the same tables. The node uses the machine's own identity: an EC2 instance role for S3, with the bucket in `us-east-1`, or the GCE service account (or the node user's gcloud application-default credentials) for GCS. Keys in environment variables are not read, and `az://` is not supported by the plugin yet. |
 | On an Infino account | `infino.platform.url` in `opensearch.yml`, the key in the keystore | The hosted service runs the engine and manages the tables. See [Hosted account](#hosted-account-and-stateless-nodes). |
 
@@ -127,6 +127,14 @@ When both a URI and an account are set, the account is used. A key belongs to on
 In Docker on EC2, the container reaches the instance role only when the instance's metadata hop limit is 2 (`aws ec2 modify-instance-metadata-options --http-put-response-hop-limit 2`). With the default of 1 the node finds no credentials.
 
 When the node starts, it checks once that it can use its storage, and waits at most 30 seconds, a hosted account included. For a local directory it writes a small file there and deletes it. For `s3://` it first asks the instance metadata service for a token, waiting 2 seconds, so a node with no credentials (the hop limit of 1 above) says so at once. For any storage it then lists the tables. If the check fails, the node logs one `ERROR` that names the storage, the reason and what to check. The node stops only when the failure will not pass on its own: the key or the credentials were refused, or the directory may not be written. On a timeout, a server error or a dropped connection it keeps starting, and each index tries the storage again when it is used. If a hosted open is still running when the 30 seconds are up, an index first waits for that open to return, which can take as long as the client's read timeout, and then tries again. The check does not yet catch a bucket or container that does not exist, or object-store credentials that may read but not write.
+
+**Every node must see the same storage.** Every copy of a shard reads the same table, and every node reads tables for the requests it receives, so a node that sees other storage would answer with no documents and a 200. The plugin cannot tell from a path: `file:///data/infino` on two machines is two disks. So the storage holds a token: the first node to use a `file://` or bucket storage writes a small marker table (`os_-storage`) with a random token, and the cluster records that token as the persistent cluster setting `infino.storage.id`. A hosted account's token is its URL and database, which every node naming the account shares; memory's names the node, as it lives in one node's process. A node whose storage has another token gets no shard of an Infino-backed index, answers 503 to the requests it would answer from its storage, and logs one `ERROR`:
+
+```
+[infino] this node does not see the cluster's Infino storage: expected token 3f2a..., node has 9c41... at file:///data/infino. Every node must see the same storage: ...
+```
+
+`GET _cluster/allocation/explain` gives the same reason for each copy left unassigned. The copy stays unassigned rather than answering short: an index whose only copy could go to such a node is red. To fix it, point every node at one storage (a bucket, a hosted account, or one directory every node mounts) and restart the nodes that differ. If the cluster moved to other storage on purpose, clear the recorded token with `PUT _cluster/settings {"persistent":{"infino.storage.id":null}}`: the cluster then records the token most data nodes report. Switching a node to a hosted account through the [account route](#hosted-account-and-stateless-nodes) records that account's token for the cluster, so the other nodes need the same account.
 
 **4. Start the node.** Every index is Infino-backed unless its settings say `index.infino.enabled: false`. To make the default off, set `infino.index.default_enabled: false` on the node. Give an index one shard and no replicas: the engine scales reads itself.
 
