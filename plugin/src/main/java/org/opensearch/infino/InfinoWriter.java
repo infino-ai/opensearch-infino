@@ -130,9 +130,18 @@ public final class InfinoWriter {
      * fields (null when the bridge reads the source alone; see
      * {@link InfinoMappedValues}).
      */
-    record Write(String id, String source, boolean lookup, boolean create, UpdateRequest update, List<String> ignored, String values) {
+    record Write(
+        String id,
+        String source,
+        boolean lookup,
+        boolean create,
+        UpdateRequest update,
+        List<String> ignored,
+        String values,
+        RuntimeException compileFailure
+    ) {
         Write(String id, String source, boolean lookup, boolean create, UpdateRequest update, List<String> ignored) {
-            this(id, source, lookup, create, update, ignored, null);
+            this(id, source, lookup, create, update, ignored, null, null);
         }
 
         Write(String id, String source, boolean lookup, boolean create, List<String> ignored) {
@@ -149,7 +158,7 @@ public final class InfinoWriter {
 
         /** This write with the values the mapper read from its source. */
         Write withValues(String values) {
-            return new Write(id, source, lookup, create, update, ignored, values);
+            return new Write(id, source, lookup, create, update, ignored, values, compileFailure);
         }
 
         /** The source as it crosses to the bridge: with the mapper's values when it has them. */
@@ -161,10 +170,13 @@ public final class InfinoWriter {
          * An update. Its document is merged into the one it replaces when its
          * batch is written, on the one thread that writes the table, so it
          * merges into every write taken before it: earlier in its own bulk,
-         * earlier in its batch, or in an append that has committed since.
+         * earlier in its batch, or in an append that has committed since. Its
+         * script is compiled here, as the update is staged, so the table's
+         * lock is not held for the compile ({@link InfinoScriptedUpdate#compileAhead});
+         * what a compile threw is kept as {@code compileFailure}.
          */
         static Write update(UpdateRequest update) {
-            return new Write(update.id(), null, true, false, update, List.of());
+            return new Write(update.id(), null, true, false, update, List.of(), null, InfinoScriptedUpdate.compileAhead(update));
         }
 
         /** Whether this write removes its id's document. */
@@ -202,11 +214,12 @@ public final class InfinoWriter {
      * or for an update a missing document or a merged one the columns refuse.
      * An update whose script deleted its document is {@code deleted}; one
      * whose script wrote nothing carries the {@code noop} answer instead,
-     * and took no sequence number.
+     * and took no sequence number. An update that wrote a document carries
+     * it as {@code document}, for an answer that asks for its source.
      */
-    private record Written(long seq, boolean existed, Exception rejection, boolean deleted, UpdateResponse noop) {
+    private record Written(long seq, boolean existed, Exception rejection, boolean deleted, UpdateResponse noop, String document) {
         Written(long seq, boolean existed, Exception rejection) {
-            this(seq, existed, rejection, false, null);
+            this(seq, existed, rejection, false, null, null);
         }
     }
 
@@ -793,6 +806,10 @@ public final class InfinoWriter {
                                 } else {
                                     InfinoScriptedUpdate.Change change = null;
                                     try {
+                                        // A script that did not compile as the update was staged fails where stock compiles it.
+                                        if (w.compileFailure() != null && InfinoScriptedUpdate.compiles(w.update(), base != null && !base.isEmpty())) {
+                                            throw w.compileFailure();
+                                        }
                                         change = InfinoScriptedUpdate.run(shardId, w.update(), base, current == null ? SequenceNumbers.UNASSIGNED_SEQ_NO : current, PRIMARY_TERM, VERSION);
                                     } catch (RuntimeException e) {
                                         // The script failed, or found no document and nothing to upsert: this update alone fails, as stock fails it.
@@ -800,7 +817,7 @@ public final class InfinoWriter {
                                     }
                                     if (change != null && change.op() == InfinoScriptedUpdate.Op.NOOP) {
                                         // The script writes nothing: the document stays as the writes before it left it.
-                                        written.put(o, new Written(SequenceNumbers.UNASSIGNED_SEQ_NO, current != null, null, false, change.noop()));
+                                        written.put(o, new Written(SequenceNumbers.UNASSIGNED_SEQ_NO, current != null, null, false, change.noop(), null));
                                         continue;
                                     }
                                     deletes = change != null && change.op() == InfinoScriptedUpdate.Op.DELETE;
@@ -861,7 +878,7 @@ public final class InfinoWriter {
                         }
                         String document = merged.containsKey(o) ? merged.get(o) : w.source();
                         long seq = batch.nextSeq++;
-                        written.put(o, new Written(seq, current != null, null, deletes, null));
+                        written.put(o, new Written(seq, current != null, null, deletes, null, merged.get(o)));
                         standing.put(w.id(), document == null ? null : seq);
                         documents.put(w.id(), document);
                         if (last.put(w.id(), o) != null) {
@@ -1270,19 +1287,18 @@ public final class InfinoWriter {
                 continue;
             }
             DocWriteResponse r;
-            if (done.deleted()) {
-                r = new UpdateResponse(w.shardId(), write.id(), done.seq(), PRIMARY_TERM, VERSION, DocWriteResponse.Result.DELETED);
+            if (o.item() instanceof UpdateRequest update && !write.deletes()) {
+                DocWriteResponse.Result result = done.deleted() ? DocWriteResponse.Result.DELETED
+                    : done.existed() ? DocWriteResponse.Result.UPDATED
+                    : DocWriteResponse.Result.CREATED;
+                UpdateResponse updated = new UpdateResponse(w.shardId(), write.id(), done.seq(), PRIMARY_TERM, VERSION, result);
+                // As stock: the document written, when the update asks for its source; none for one its script deleted.
+                updated.setGetResult(
+                    InfinoScriptedUpdate.writtenGetResult(update, w.indexName(), done.seq(), PRIMARY_TERM, VERSION, done.deleted() ? null : done.document())
+                );
+                r = updated;
             } else if (write.deletes()) {
                 r = new DeleteResponse(w.shardId(), write.id(), done.seq(), PRIMARY_TERM, VERSION, done.existed());
-            } else if (o.item() instanceof UpdateRequest) {
-                r = new UpdateResponse(
-                    w.shardId(),
-                    write.id(),
-                    done.seq(),
-                    PRIMARY_TERM,
-                    VERSION,
-                    done.existed() ? DocWriteResponse.Result.UPDATED : DocWriteResponse.Result.CREATED
-                );
             } else {
                 r = new IndexResponse(w.shardId(), write.id(), done.seq(), PRIMARY_TERM, VERSION, !done.existed());
             }

@@ -1,0 +1,238 @@
+# An update that asks for its source (_source) is answered with the
+# document it wrote under get, as stock answers: a scripted counter reads
+# its new value back. A script that does not compile fails only where
+# stock runs it. Each request runs on a Lucene twin too, so the answers are
+# stock's.
+setup:
+  - do:
+      indices.create:
+        index: us_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long }, tags: { type: keyword } } }
+  - do:
+      index: { index: us_luc, id: "c", refresh: true, body: { n: 1, tags: [ a ] } }
+  - do:
+      indices.create:
+        index: us_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long }, tags: { type: keyword } } }
+  - do:
+      index: { index: us_def, id: "c", refresh: true, body: { n: 1, tags: [ a ] } }
+  - do:
+      indices.create:
+        index: us_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { n: { type: long }, tags: { type: keyword } } }
+  - do:
+      index: { index: us_prx, id: "c", refresh: true, body: { n: 1, tags: [ a ] } }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: us_luc,us_def,us_prx
+        ignore_unavailable: true
+
+---
+"An update that asks for its source gets the document it wrote":
+  - do:
+      update:
+        index: us_luc
+        id: "c"
+        body: { script: { lang: painless, source: "ctx._source.n += 1" }, _source: true }
+  - match: { result: updated }
+  - match: { get.found: true }
+  - match: { get._source.n: 2 }
+  - match: { get._source.tags: [ a ] }
+  - do:
+      update:
+        index: us_luc
+        id: "c"
+        body: { script: { lang: painless, source: "ctx._source.n += 1" }, _source: [ n ] }
+  - match: { get._source: { n: 3 } }
+  - do:
+      update:
+        index: us_luc
+        id: "c"
+        body: { doc: { tags: [ b ] }, _source: true }
+  - match: { get._source: { n: 3, tags: [ b ] } }
+  - do:
+      update:
+        index: us_luc
+        id: "u"
+        body: { script: { lang: painless, source: "ctx._source.n = 10" }, upsert: { n: 0 }, scripted_upsert: true, _source: true }
+  - match: { result: created }
+  - match: { get._source.n: 10 }
+  - do:
+      update:
+        index: us_luc
+        id: "c"
+        body: { script: { lang: painless, source: "ctx._source.n += 1" } }
+  - match: { result: updated }
+  - is_false: get
+  - do:
+      update:
+        index: us_luc
+        id: "u"
+        body: { script: { lang: painless, source: "ctx.op = 'delete'" }, _source: true }
+  - match: { result: deleted }
+  - match: { get.found: true }
+  - is_false: get._source
+  - do:
+      update:
+        index: us_def
+        id: "c"
+        body: { script: { lang: painless, source: "ctx._source.n += 1" }, _source: true }
+  - match: { result: updated }
+  - match: { get.found: true }
+  - match: { get._source.n: 2 }
+  - match: { get._source.tags: [ a ] }
+  - do:
+      update:
+        index: us_def
+        id: "c"
+        body: { script: { lang: painless, source: "ctx._source.n += 1" }, _source: [ n ] }
+  - match: { get._source: { n: 3 } }
+  - do:
+      update:
+        index: us_def
+        id: "c"
+        body: { doc: { tags: [ b ] }, _source: true }
+  - match: { get._source: { n: 3, tags: [ b ] } }
+  - do:
+      update:
+        index: us_def
+        id: "u"
+        body: { script: { lang: painless, source: "ctx._source.n = 10" }, upsert: { n: 0 }, scripted_upsert: true, _source: true }
+  - match: { result: created }
+  - match: { get._source.n: 10 }
+  - do:
+      update:
+        index: us_def
+        id: "c"
+        body: { script: { lang: painless, source: "ctx._source.n += 1" } }
+  - match: { result: updated }
+  - is_false: get
+  - do:
+      update:
+        index: us_def
+        id: "u"
+        body: { script: { lang: painless, source: "ctx.op = 'delete'" }, _source: true }
+  - match: { result: deleted }
+  - match: { get.found: true }
+  - is_false: get._source
+  - do:
+      update:
+        index: us_prx
+        id: "c"
+        body: { script: { lang: painless, source: "ctx._source.n += 1" }, _source: true }
+  - match: { result: updated }
+  - match: { get.found: true }
+  - match: { get._source.n: 2 }
+  - match: { get._source.tags: [ a ] }
+  - do:
+      update:
+        index: us_prx
+        id: "c"
+        body: { script: { lang: painless, source: "ctx._source.n += 1" }, _source: [ n ] }
+  - match: { get._source: { n: 3 } }
+  - do:
+      update:
+        index: us_prx
+        id: "c"
+        body: { doc: { tags: [ b ] }, _source: true }
+  - match: { get._source: { n: 3, tags: [ b ] } }
+  - do:
+      update:
+        index: us_prx
+        id: "u"
+        body: { script: { lang: painless, source: "ctx._source.n = 10" }, upsert: { n: 0 }, scripted_upsert: true, _source: true }
+  - match: { result: created }
+  - match: { get._source.n: 10 }
+  - do:
+      update:
+        index: us_prx
+        id: "c"
+        body: { script: { lang: painless, source: "ctx._source.n += 1" } }
+  - match: { result: updated }
+  - is_false: get
+  - do:
+      update:
+        index: us_prx
+        id: "u"
+        body: { script: { lang: painless, source: "ctx.op = 'delete'" }, _source: true }
+  - match: { result: deleted }
+  - match: { get.found: true }
+  - is_false: get._source
+
+---
+"A script that does not compile fails only where stock runs it":
+  - do:
+      catch: bad_request
+      update:
+        index: us_luc
+        id: "c"
+        body: { script: { lang: painless, source: "ctx._source.n +=" } }
+  - match: { error.root_cause.0.type: script_exception }
+  - do:
+      update:
+        index: us_luc
+        id: "m"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.n +=" }, upsert: { n: 5 } }
+  - match: { result: created }
+  - do: { get: { index: us_luc, id: "m" } }
+  - match: { _source.n: 5 }
+  - do:
+      catch: missing
+      update:
+        index: us_luc
+        id: "none"
+        body: { script: { lang: painless, source: "ctx._source.n +=" } }
+  - do:
+      catch: bad_request
+      update:
+        index: us_def
+        id: "c"
+        body: { script: { lang: painless, source: "ctx._source.n +=" } }
+  - match: { error.root_cause.0.type: script_exception }
+  - do:
+      update:
+        index: us_def
+        id: "m"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.n +=" }, upsert: { n: 5 } }
+  - match: { result: created }
+  - do: { get: { index: us_def, id: "m" } }
+  - match: { _source.n: 5 }
+  - do:
+      catch: missing
+      update:
+        index: us_def
+        id: "none"
+        body: { script: { lang: painless, source: "ctx._source.n +=" } }
+  - do:
+      catch: bad_request
+      update:
+        index: us_prx
+        id: "c"
+        body: { script: { lang: painless, source: "ctx._source.n +=" } }
+  - match: { error.root_cause.0.type: script_exception }
+  - do:
+      update:
+        index: us_prx
+        id: "m"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.n +=" }, upsert: { n: 5 } }
+  - match: { result: created }
+  - do: { get: { index: us_prx, id: "m" } }
+  - match: { _source.n: 5 }
+  - do:
+      catch: missing
+      update:
+        index: us_prx
+        id: "none"
+        body: { script: { lang: painless, source: "ctx._source.n +=" } }

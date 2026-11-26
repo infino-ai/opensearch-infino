@@ -497,7 +497,7 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                         } else if (got[i].isFailed() && retries((UpdateRequest) requests.get(slot), got[i].getFailure().getCause(), retriesLeft)) {
                             later.add(slot);
                         } else {
-                            items[slot] = asUpdate(got[i], slot);
+                            items[slot] = asUpdate(got[i], slot, (UpdateRequest) requests.get(slot), writes.requests().get(i));
                         }
                     }
                     afterRound(bulk, concrete, items, later, notHere, clusters, proceed, deadline, retriesLeft, start, listener);
@@ -986,14 +986,21 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
         }
     }
 
-    /** A routed write's response as the update it was in the client's bulk. */
-    private static BulkItemResponse asUpdate(BulkItemResponse r, int slot) {
+    /**
+     * A routed write's response as the update it was in the client's bulk,
+     * {@code request}: with the document {@code written} wrote under
+     * {@code get} when the update asks for its source, as stock answers
+     * ({@link InfinoScriptedUpdate#writtenGetResult}).
+     */
+    private static BulkItemResponse asUpdate(BulkItemResponse r, int slot, UpdateRequest request, DocWriteRequest<?> written) {
         if (r.isFailed()) {
             return new BulkItemResponse(slot, DocWriteRequest.OpType.UPDATE, r.getFailure());
         }
         DocWriteResponse w = r.getResponse();
         UpdateResponse update = new UpdateResponse(w.getShardInfo(), w.getShardId(), w.getId(), w.getSeqNo(), w.getPrimaryTerm(), w.getVersion(), w.getResult());
         update.setForcedRefresh(w.forcedRefresh());
+        String document = written instanceof IndexRequest index ? sourceAsJson(index.source(), index.getContentType()) : null;
+        update.setGetResult(InfinoScriptedUpdate.writtenGetResult(request, w.getIndex(), w.getSeqNo(), w.getPrimaryTerm(), w.getVersion(), document));
         return new BulkItemResponse(slot, DocWriteRequest.OpType.UPDATE, update);
     }
 
