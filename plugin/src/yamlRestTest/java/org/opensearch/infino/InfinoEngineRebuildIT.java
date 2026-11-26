@@ -7,11 +7,18 @@ package org.opensearch.infino;
 import org.opensearch.client.ResponseException;
 
 import java.io.IOException;
+import java.nio.channels.Channels;
+import java.nio.channels.SeekableByteChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * A default-mode index as the registry recreates it on a fresh cluster:
@@ -45,12 +52,14 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     /** The cluster setting that holds skeleton rebuilds. */
     private static final String PAUSED = "infino.skeleton_rebuild.paused";
     /** The table of the untouched-rows test's indices, and its rows. */
-    private static final String KEPT_TABLE = "emr5_rows";
+    private static final String KEPT_TABLE = "emr8_rows";
     private static final int KEPT_ROWS = 200;
     /** The table of the final-pipeline test's indices, its rows, and the pipeline. */
-    private static final String PIPELINE_TABLE = "emr7_rows";
+    private static final String PIPELINE_TABLE = "emr9_rows";
     private static final int PIPELINE_ROWS = 50;
-    private static final String FINAL_PIPELINE = "emr7_final";
+    private static final String FINAL_PIPELINE = "emr9_final";
+    /** The system property naming the test node's log. */
+    private static final String SERVER_LOG = "tests.infino.server_log";
     /** The mark a rebuild's creates open their source with, which a client's write may not carry. */
     private static final String MARK = "/*infino:skeleton*/";
 
@@ -180,49 +189,54 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
      */
     @SuppressWarnings("unchecked")
     public void testARebuildLeavesTheTableAsItIs() throws Exception {
-        createIndex("emr5_old", false, KEPT_TABLE, 1);
+        createIndex("emr8_old", false, KEPT_TABLE, 1);
         StringBuilder bulk = new StringBuilder();
         for (int i = 0; i < KEPT_ROWS; i++) {
-            bulk.append("{\"index\":{\"_index\":\"emr5_old\",\"_id\":\"k").append(i).append("\"}}\n");
+            bulk.append("{\"index\":{\"_index\":\"emr8_old\",\"_id\":\"k").append(i).append("\"}}\n");
             bulk.append("{\"n\":").append(i).append("}\n");
         }
         assertEquals(false, call("POST", "/_bulk?refresh=true", bulk.toString()).get("errors"));
-        Map<String, Object> before = rowIds("emr5_old");
+        Map<String, Object> before = rowIds("emr8_old");
         assertEquals(KEPT_ROWS, before.size());
-        call("DELETE", "/emr5_old", null);
+        call("DELETE", "/emr8_old", null);
 
-        createIndex("emr5", true, KEPT_TABLE, 1);
+        createIndex("emr8", true, KEPT_TABLE, 1);
         // The shard's own document count, which a search of a skeleton being rebuilt does not wait for.
         assertBusy(() -> {
-            Map<String, Object> index = (Map<String, Object>) callList("GET", "/_cat/indices/emr5?format=json&h=docs.count", null).get(0);
+            Map<String, Object> index = (Map<String, Object>) callList("GET", "/_cat/indices/emr8?format=json&h=docs.count", null).get(0);
             assertEquals(String.valueOf(KEPT_ROWS), index.get("docs.count"));
         }, REBUILD_SECONDS, TimeUnit.SECONDS);
-        assertEquals("every row keeps its engine id through the rebuild", before, rowIds("emr5"));
+        assertEquals("every row keeps its engine id through the rebuild", before, rowIds("emr8"));
 
         // Fail the primary and allocate it again from its own store, as a node
         // killed and started again does. The rebuild's creates are in its
         // translog and not in a Lucene commit yet, so the start replays them;
         // then, as it becomes primary, it writes the table the operations of its
         // history the table may not hold, the rebuild's creates among them.
-        assertEquals("every create waits in the translog for the replay", KEPT_ROWS, uncommittedOperations("emr5"));
-        failPrimary("emr5");
-        assertEquals("and through the replay of its translog and its history", before, rowIds("emr5"));
+        assertEquals("every create waits in the translog for the replay", KEPT_ROWS, uncommittedOperations("emr8"));
+        long logMark = Files.size(serverLog());
+        failPrimary("emr8");
+        assertEquals("and through the replay of its translog and its history", before, rowIds("emr8"));
 
         // Closing flushes: the reopened index replays nothing and writes the
         // table from its history alone.
-        call("POST", "/emr5/_close", null);
-        call("POST", "/emr5/_open?wait_for_active_shards=1", null);
-        call("GET", "/_cluster/health/emr5?wait_for_status=green&timeout=60s", null);
-        assertEquals("and through the index's reopening", before, rowIds("emr5"));
-        assertEquals(KEPT_ROWS, ((Number) call("GET", "/emr5/_count", null).get("count")).intValue());
+        call("POST", "/emr8/_close", null);
+        call("POST", "/emr8/_open?wait_for_active_shards=1", null);
+        call("GET", "/_cluster/health/emr8?wait_for_status=green&timeout=60s", null);
+        assertEquals("and through the index's reopening", before, rowIds("emr8"));
+        assertEquals(KEPT_ROWS, ((Number) call("GET", "/emr8/_count", null).get("count")).intValue());
+        // The rows stay as they are either way, since the table refuses a
+        // source that opens with the mark; what the replay and the history
+        // skip is sending them: none is refused, and the history writes none.
+        assertNoRebuiltRowSentFromHistory(logMark, KEPT_TABLE);
 
         ResponseException forged = expectThrows(
             ResponseException.class,
-            () -> call("PUT", "/emr5/_doc/forged?refresh=true", "{" + MARK + "\"n\":1}")
+            () -> call("PUT", "/emr8/_doc/forged?refresh=true", "{" + MARK + "\"n\":1}")
         );
         assertEquals(400, forged.getResponse().getStatusLine().getStatusCode());
-        assertEquals(KEPT_ROWS, rowIds("emr5").size());
-        call("DELETE", "/emr5", null);
+        assertEquals(KEPT_ROWS, rowIds("emr8").size());
+        call("DELETE", "/emr8", null);
     }
 
     /**
@@ -236,29 +250,57 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     public void testARebuildRunsNoFinalPipeline() throws Exception {
         call("PUT", "/_ingest/pipeline/" + FINAL_PIPELINE, "{\"processors\":[{\"append\":{\"field\":\"seen\",\"value\":[\"final\"]}}]}");
         String withPipeline = ",\"index.final_pipeline\":\"" + FINAL_PIPELINE + "\"";
-        createIndex("emr7_old", false, PIPELINE_TABLE, 1, withPipeline);
+        createIndex("emr9_old", false, PIPELINE_TABLE, 1, withPipeline);
         StringBuilder bulk = new StringBuilder();
         for (int i = 0; i < PIPELINE_ROWS; i++) {
-            bulk.append("{\"index\":{\"_index\":\"emr7_old\",\"_id\":\"p").append(i).append("\"}}\n");
+            bulk.append("{\"index\":{\"_index\":\"emr9_old\",\"_id\":\"p").append(i).append("\"}}\n");
             bulk.append("{\"n\":").append(i).append("}\n");
         }
         assertEquals(false, call("POST", "/_bulk?refresh=true", bulk.toString()).get("errors"));
-        Map<String, Object> before = rowIds("emr7_old");
+        Map<String, Object> before = rowIds("emr9_old");
         assertEquals(PIPELINE_ROWS, before.size());
-        assertEquals(List.of("final"), ((Map<String, Object>) call("GET", "/emr7_old/_doc/p0", null).get("_source")).get("seen"));
-        call("DELETE", "/emr7_old", null);
+        assertEquals(List.of("final"), ((Map<String, Object>) call("GET", "/emr9_old/_doc/p0", null).get("_source")).get("seen"));
+        call("DELETE", "/emr9_old", null);
 
-        createIndex("emr7", true, PIPELINE_TABLE, 1, withPipeline);
+        createIndex("emr9", true, PIPELINE_TABLE, 1, withPipeline);
         assertBusy(() -> {
-            Map<String, Object> index = (Map<String, Object>) callList("GET", "/_cat/indices/emr7?format=json&h=docs.count", null).get(0);
+            Map<String, Object> index = (Map<String, Object>) callList("GET", "/_cat/indices/emr9?format=json&h=docs.count", null).get(0);
             assertEquals(String.valueOf(PIPELINE_ROWS), index.get("docs.count"));
         }, REBUILD_SECONDS, TimeUnit.SECONDS);
-        assertEquals("every row keeps its engine id through the rebuild", before, rowIds("emr7"));
-        assertEquals("the pipeline ran once", List.of("final"), ((Map<String, Object>) call("GET", "/emr7/_doc/p0", null).get("_source")).get("seen"));
-        failPrimary("emr7");
-        assertEquals("and through the replay of its translog and its history", before, rowIds("emr7"));
-        call("DELETE", "/emr7", null);
+        assertEquals("every row keeps its engine id through the rebuild", before, rowIds("emr9"));
+        assertEquals("the pipeline ran once", List.of("final"), ((Map<String, Object>) call("GET", "/emr9/_doc/p0", null).get("_source")).get("seen"));
+        failPrimary("emr9");
+        assertEquals("and through the replay of its translog and its history", before, rowIds("emr9"));
+        call("DELETE", "/emr9", null);
         call("DELETE", "/_ingest/pipeline/" + FINAL_PIPELINE, null);
+    }
+
+    /**
+     * The test node's log says, since byte {@code from}, that no operation of
+     * a shard's history was written to {@code table} on a restart or a
+     * reopening, and that the table refused none: a rebuild's creates are
+     * left out of both, since the table holds their rows.
+     */
+    private void assertNoRebuiltRowSentFromHistory(long from, String table) throws IOException {
+        String since;
+        try (SeekableByteChannel log = Files.newByteChannel(serverLog())) {
+            log.position(from);
+            since = new String(Channels.newInputStream(log).readAllBytes(), StandardCharsets.UTF_8);
+        }
+        Matcher written = Pattern.compile("wrote (\\d+) operations of its history from \\d+ to \\d+ into " + table + "\\b").matcher(since);
+        while (written.find()) {
+            assertEquals("operations of the history written to " + table + ": " + written.group(), "0", written.group(1));
+        }
+        for (String line : since.split("\n")) {
+            assertFalse("the table refused a replayed row: " + line, line.contains("table " + table + " refuses document"));
+        }
+    }
+
+    /** The test node's log, as the build names it. */
+    private static Path serverLog() {
+        String log = System.getProperty(SERVER_LOG);
+        assertNotNull(SERVER_LOG + " names the test node's log", log);
+        return Path.of(log);
     }
 
     /** The operations of {@code index}'s primary that its translog holds and no Lucene commit does yet. */

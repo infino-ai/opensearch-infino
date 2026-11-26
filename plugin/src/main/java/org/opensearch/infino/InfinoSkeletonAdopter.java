@@ -87,9 +87,9 @@ import java.util.function.Supplier;
  * to the table once more, as a replace with the same content.
  * Each is a create, so a client's write of the same id wins; a row a client
  * deleted while its create was in flight is deleted again through the
- * shard, so the skeleton and the translog end where the table is. Until a
- * shard's skeleton is whole, its engine looks ids up in the table
- * ({@link InfinoEngine#skeletonComplete}).
+ * shard, so the skeleton and the translog end where the table is. While a
+ * shard's skeleton may lack a row, its engine looks ids up in the table
+ * ({@link InfinoEngine#looksUpIds}).
  *
  * <p>While {@link #PAUSED} is set, a rebuild waits before it reads the
  * table: the index's searches miss the rows written before the rebuild, and
@@ -104,10 +104,20 @@ import java.util.function.Supplier;
  * node starts again. Any other failure, or one that passes but goes on for
  * {@link #GIVE_UP_MILLIS} with no request going through, stops the rebuild
  * with an error; the shard closing (the index deleted, the node stopping)
- * stops it quietly. A create the shard refuses (a conflict aside, which is
- * a client's write that got there first) is logged and counted, and leaves
- * the skeleton incomplete, so the engine goes on looking ids up in the
- * table rather than taking the refused row's id as new.
+ * stops it quietly.
+ *
+ * <p>A row the rebuild cannot create a document for (a create the shard
+ * refuses, a conflict aside, which is a client's write that got there first;
+ * a row with no source, or one that is no JSON object) is left out: it is
+ * counted and logged, with the first few by id and why. The rebuild still
+ * ends once it has walked the whole table ({@link InfinoEngine#rebuildWalked}),
+ * but the skeleton stays incomplete, so the shard's writes go on looking ids
+ * up in the table and a client's write of a left-out id replaces its row
+ * rather than adding a second one. Each time the shard's primary starts
+ * again, it walks the table again, and only a walk that leaves nothing out
+ * makes the skeleton complete ({@link InfinoEngine#skeletonComplete}). A row
+ * that routes to another shard and keeps no routing value, or that has no
+ * id, is logged too: no write of this shard can name it.
  */
 final class InfinoSkeletonAdopter {
 
@@ -148,6 +158,8 @@ final class InfinoSkeletonAdopter {
     private static final int PAGE_ROWS = 10_000;
     /** The count's alias in the row-count statement. */
     private static final String COUNT_ALIAS = "n";
+    /** Rows of each kind a walk names in its log, beyond which it only counts them. */
+    static final int NAMED_ROWS = 10;
 
     /**
      * Hold every skeleton rebuild that has not begun reading its table until
@@ -237,6 +249,7 @@ final class InfinoSkeletonAdopter {
             docs = searcher.getIndexReader().numDocs();
         }
         if (docs >= rows) {
+            InfinoEngine.rebuildWalked(shardId);
             InfinoEngine.skeletonComplete(shardId);
             return;
         }
@@ -245,9 +258,10 @@ final class InfinoSkeletonAdopter {
         // had one has no column for it.
         boolean routed = retrier.call("reading its columns", () -> columnsOf(table)).containsKey(InfinoQueryTranslator.ROUTING);
         long created = 0;
-        long unroutable = 0;
-        long refused = 0;
-        String firstRefusal = null;
+        // Rows of this shard the skeleton has no document for, which a write of this shard may name.
+        Named leftOut = new Named();
+        // Rows no write of this shard can name: no id, or an id that routes to another shard.
+        Named unreachable = new Named();
         String after = null;
         while (true) {
             String sql = pageSql(table, after, routed);
@@ -258,6 +272,7 @@ final class InfinoSkeletonAdopter {
                     Object id = row.get(InfinoQueryTranslator.OSID);
                     Object source = row.get(InfinoQueryTranslator.SOURCE);
                     if (id == null) {
+                        unreachable.add("a row", "has no id");
                         continue;
                     }
                     after = id.toString();
@@ -266,40 +281,61 @@ final class InfinoSkeletonAdopter {
                     if (OperationRouting.generateShardId(md, after, routing) != shardId.id()) {
                         // Written with a routing value before the table kept them: there
                         // is no routing that brings it back to this shard.
-                        unroutable++;
+                        unreachable.add(after, "routes to another shard by its id and keeps no routing value");
                         continue;
                     }
-                    if (source != null && searcher.count(new TermQuery(new Term(IdFieldMapper.NAME, Uid.encodeId(after)))) == 0) {
+                    if (searcher.count(new TermQuery(new Term(IdFieldMapper.NAME, Uid.encodeId(after)))) > 0) {
+                        continue;
+                    }
+                    if (source == null) {
+                        leftOut.add(after, "has no source");
+                    } else {
                         missing.put(after, new Row(source.toString(), routing));
                     }
                 }
             }
             if (!missing.isEmpty()) {
-                Created out = createMissing(shardId, table, missing, retrier, InfinoSkeletonAdopter::run, ids -> InfinoNative.existingOsidsLatest(table, ids));
-                created += out.created();
-                refused += out.refused();
-                firstRefusal = firstRefusal == null ? out.firstRefusal() : firstRefusal;
+                created += createMissing(
+                    shardId,
+                    table,
+                    missing,
+                    leftOut,
+                    retrier,
+                    InfinoSkeletonAdopter::run,
+                    ids -> InfinoNative.existingOsidsLatest(table, ids)
+                );
             }
             if (page.size() < PAGE_ROWS) {
                 break;
             }
         }
-        if (refused > 0) {
-            // Taken as whole, the skeleton would let a client's write of a refused
-            // row's id be appended as a new row beside the table's.
+        // The whole table is walked. A row left out keeps the skeleton
+        // incomplete: taken as whole, it would let a client's write of a
+        // left-out row's id be appended as a new row beside the table's.
+        InfinoEngine.rebuildWalked(shardId);
+        if (leftOut.count > 0) {
             log.error(
-                "[infino] the skeleton of {} misses {} rows of table {} that it could not create (the first: {}); it stays incomplete, so "
-                    + "its engine goes on looking ids up in the table, and the index's searches miss those rows",
+                "[infino] the skeleton of {} has no document for {} rows of table {}: {}. The index's searches miss those rows; the "
+                    + "shard's writes go on looking ids up in the table, so a write of one of those ids replaces its row. Fix the cause "
+                    + "(or delete those ids): each time the shard's primary starts again (close and open the index, or restart the node) "
+                    + "it walks the table again, and a walk that leaves nothing out ends the lookups",
                 shardId,
-                refused,
+                leftOut.count,
                 table,
-                firstRefusal
+                leftOut
             );
         } else {
             InfinoEngine.skeletonComplete(shardId);
         }
-        if (unroutable > 0) {
-            log.warn("[infino] {} rows of table {} route to another shard of {} by their id and keep no routing value; they are left out of its skeleton", unroutable, table, shardId);
+        if (unreachable.count > 0) {
+            log.warn(
+                "[infino] the skeleton of {} has no document for {} rows of table {} that no write of this shard can name, which the "
+                    + "index's searches miss: {}",
+                shardId,
+                unreachable.count,
+                table,
+                unreachable
+            );
         }
         log.info(
             "[infino] rebuilt the skeleton of {}: created {} documents from table {}, trying {} failed requests again",
@@ -344,11 +380,26 @@ final class InfinoSkeletonAdopter {
     record Row(String source, String routing) {}
 
     /**
-     * What {@link #createMissing} did: the documents created (or found
-     * created by an earlier send of the same create), and the rows left out
-     * of the skeleton, with the first one's reason.
+     * Rows counted, the first {@link #NAMED_ROWS} by id and why: what a walk
+     * left out, for its log.
      */
-    record Created(long created, long refused, String firstRefusal) {}
+    static final class Named {
+        long count;
+        final List<String> named = new ArrayList<>();
+
+        void add(String id, String why) {
+            count++;
+            if (named.size() < NAMED_ROWS) {
+                named.add(id + " (" + why + ")");
+            }
+        }
+
+        @Override
+        public String toString() {
+            long more = count - named.size();
+            return String.join(", ", named) + (more > 0 ? ", and " + more + " more" : "");
+        }
+    }
 
     /**
      * The table's columns. The bridge answers none when it cannot read
@@ -399,26 +450,24 @@ final class InfinoSkeletonAdopter {
      * client's write got there first, or, when it was sent before, this very
      * create did and its answer was lost, so it is checked against the table
      * as a created one is. Any other refusal leaves the row out of the
-     * skeleton, counted.
+     * skeleton, in {@code leftOut}. Returns the documents created (or found
+     * created by an earlier send of the same create).
      */
-    static Created createMissing(
+    static long createMissing(
         ShardId shardId,
         String table,
         Map<String, Row> missing,
+        Named leftOut,
         Retrier retrier,
         Function<BulkRequest, BulkResponse> bulk,
         Function<List<String>, Set<String>> kept
     ) {
         Map<String, IndexRequest> creates = new LinkedHashMap<>();
         Map<String, String> sources = new LinkedHashMap<>();
-        long refused = 0;
-        String firstRefusal = null;
         for (Map.Entry<String, Row> row : missing.entrySet()) {
             String source = marked(row.getValue().source());
             if (source == null) {
-                log.warn("[infino] the row of {} in table {} holds no JSON object; it is left out of the skeleton of {}", row.getKey(), table, shardId);
-                refused++;
-                firstRefusal = firstRefusal == null ? row.getKey() + ": no JSON object" : firstRefusal;
+                leftOut.add(row.getKey(), "holds no JSON object");
                 continue;
             }
             sources.put(row.getKey(), source);
@@ -445,13 +494,12 @@ final class InfinoSkeletonAdopter {
             if (failure == null || (failure.getStatus() == RestStatus.CONFLICT && sends.getOrDefault(id, 0) > 1)) {
                 created.add(id);
             } else if (failure.getStatus() != RestStatus.CONFLICT) {
-                refused++;
-                firstRefusal = firstRefusal == null ? id + ": " + failure.getMessage() : firstRefusal;
+                leftOut.add(id, "refused: " + failure.getMessage());
                 log.debug("[infino] the skeleton document of {} in {} was refused", id, shardId, failure.getCause());
             }
         }
         if (created.isEmpty()) {
-            return new Created(0, refused, firstRefusal);
+            return 0;
         }
         // As of the table's latest commit: a row another node deleted within the
         // engine's staleness window would otherwise read as kept, and its
@@ -477,7 +525,7 @@ final class InfinoSkeletonAdopter {
                 );
             }
         }
-        return new Created(created.size(), refused, firstRefusal);
+        return created.size();
     }
 
     /**

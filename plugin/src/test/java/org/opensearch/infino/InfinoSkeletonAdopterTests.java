@@ -83,6 +83,8 @@ public class InfinoSkeletonAdopterTests extends OpenSearchTestCase {
     /** How long a test's run of failures lasts, under its give-up time. */
     private static final long SHORT_FAILING_MILLIS = 2 * 60_000L;
 
+    /** Rows left out past those a walk's log names. */
+    private static final int MORE_ROWS = 3;
     private static final ShardId SHARD = new ShardId(new Index("logs", "uuid"), 0);
     private static final String ID = "a1";
     private static final String SENT = "{\"message\": \"disk full\", \"status\": 503, \"latency_ms\": 11.3, \"v\": [0.866, 0.0, 0.2887]}";
@@ -384,13 +386,14 @@ public class InfinoSkeletonAdopterTests extends OpenSearchTestCase {
         // The deletes of the rows the table lost meanwhile.
         bulks.answer(Map.of("gone", 200));
         List<List<String>> asked = new ArrayList<>();
-        InfinoSkeletonAdopter.Created out = InfinoSkeletonAdopter.createMissing(SHARD, "t", missing, new Fake().retrier, bulks, ids -> {
+        InfinoSkeletonAdopter.Named leftOut = new InfinoSkeletonAdopter.Named();
+        long created = InfinoSkeletonAdopter.createMissing(SHARD, "t", missing, leftOut, new Fake().retrier, bulks, ids -> {
             asked.add(List.copyOf(ids));
             return Set.of("ok", "busy");
         });
-        assertEquals("created, each once", 3, out.created());
-        assertEquals("the refused row and the one that is no JSON object", 2, out.refused());
-        assertNotNull(out.firstRefusal());
+        assertEquals("created, each once", 3, created);
+        assertEquals("the refused row and the one that is no JSON object", 2, leftOut.count);
+        assertTrue(leftOut.toString(), leftOut.toString().startsWith("notjson (holds no JSON object), refused (refused: "));
         assertEquals(List.of(List.of("ok", "busy", "refused", "client", "gone"), List.of("busy"), List.of("gone")), bulks.ids);
         assertTrue(bulks.sent.get(2).requests().stream().allMatch(r -> r instanceof DeleteRequest));
         assertEquals("a client's write that got there first is not checked against the table", List.of(List.of("ok", "busy", "gone")), asked);
@@ -407,14 +410,26 @@ public class InfinoSkeletonAdopterTests extends OpenSearchTestCase {
         bulks.answer(Map.of("a", 409, "b", 409));
         bulks.answer(Map.of("b", 200));
         List<List<String>> asked = new ArrayList<>();
-        InfinoSkeletonAdopter.Created out = InfinoSkeletonAdopter.createMissing(SHARD, "t", missing, new Fake().retrier, bulks, ids -> {
+        InfinoSkeletonAdopter.Named leftOut = new InfinoSkeletonAdopter.Named();
+        long created = InfinoSkeletonAdopter.createMissing(SHARD, "t", missing, leftOut, new Fake().retrier, bulks, ids -> {
             asked.add(List.copyOf(ids));
             return Set.of("a");
         });
-        assertEquals(2, out.created());
-        assertEquals(0, out.refused());
+        assertEquals(2, created);
+        assertEquals(0, leftOut.count);
         assertEquals("checked against the table, so a row deleted meanwhile leaves no document", List.of(List.of("a", "b")), asked);
         assertEquals(List.of("b"), bulks.ids.get(bulks.ids.size() - 1));
+    }
+
+    public void testALogOfRowsLeftOutNamesTheFirstAndCountsTheRest() {
+        InfinoSkeletonAdopter.Named rows = new InfinoSkeletonAdopter.Named();
+        assertEquals("", rows.toString());
+        for (int i = 0; i < InfinoSkeletonAdopter.NAMED_ROWS + MORE_ROWS; i++) {
+            rows.add("r" + i, "refused");
+        }
+        assertEquals(InfinoSkeletonAdopter.NAMED_ROWS + MORE_ROWS, rows.count);
+        assertTrue(rows.toString(), rows.toString().startsWith("r0 (refused), r1 (refused), "));
+        assertTrue(rows.toString(), rows.toString().endsWith("r" + (InfinoSkeletonAdopter.NAMED_ROWS - 1) + " (refused), and " + MORE_ROWS + " more"));
     }
 
     public void testItemsThatKeepFailingGiveUpRatherThanLoop() {

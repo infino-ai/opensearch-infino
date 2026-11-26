@@ -534,7 +534,17 @@ public class InfinoEngine extends InternalEngine {
      */
     private static final Map<ShardId, Copy> COPIES = new ConcurrentHashMap<>();
 
-    /** The shards of rebuilt indices whose skeleton holds every row of the table again (see {@link InfinoSkeletonAdopter}). */
+    /**
+     * The shards whose skeleton rebuild has walked the whole table on this
+     * node (see {@link InfinoSkeletonAdopter}), whatever rows it left out.
+     */
+    private static final Set<ShardId> REBUILD_WALKED = ConcurrentHashMap.newKeySet();
+
+    /**
+     * The shards whose skeleton rebuild has walked the whole table on this
+     * node and left no row out: the skeleton holds a document for every row
+     * of the table again, so ids need no lookup.
+     */
     private static final Set<ShardId> SKELETON_COMPLETE = ConcurrentHashMap.newKeySet();
 
     /** Record which copy of {@code shard} this node holds, as {@code routing} says. */
@@ -564,9 +574,24 @@ public class InfinoEngine extends InternalEngine {
         return copy != null && copy.primary() && TOOK_OVER.contains(shard);
     }
 
+    /**
+     * {@code shard}'s skeleton rebuild has walked the whole table, whatever
+     * it left out. Its writes go on looking ids up in the table until the
+     * skeleton is complete ({@link #looksUpIds}).
+     */
+    static void rebuildWalked(ShardId shard) {
+        REBUILD_WALKED.add(shard);
+        lookUpsChanged(shard);
+    }
+
     /** {@code shard}'s skeleton holds a document for every row of its table: ids need no lookup. */
     static void skeletonComplete(ShardId shard) {
         SKELETON_COMPLETE.add(shard);
+        lookUpsChanged(shard);
+    }
+
+    /** Let this node's engine of {@code shard} go of the latest connection if its writes no longer look ids up. */
+    private static void lookUpsChanged(ShardId shard) {
         for (InfinoEngine engine : BY_TABLE.values()) {
             if (engine.shardId.equals(shard)) {
                 engine.holdLatestWhileLookingUp(false);
@@ -578,6 +603,7 @@ public class InfinoEngine extends InternalEngine {
     static void forgetCopy(ShardId shard) {
         COPIES.remove(shard);
         TOOK_OVER.remove(shard);
+        REBUILD_WALKED.remove(shard);
         SKELETON_COMPLETE.remove(shard);
     }
 
@@ -587,9 +613,25 @@ public class InfinoEngine extends InternalEngine {
         return copy != null && copy.primary();
     }
 
-    /** Whether the skeleton can say which ids the table holds: not while a rebuilt index's skeleton is rebuilt. */
+    /**
+     * Whether the skeleton holds a document for every row its rebuild could
+     * create one for: not until a rebuilt index's rebuild has walked the
+     * table ({@link #rebuildWalked}). A row the rebuild left out has no
+     * document, and is no search's hit.
+     */
     private boolean skeletonKnowsIds() {
-        return !rebuilt || SKELETON_COMPLETE.contains(shardId);
+        return !rebuilt || REBUILD_WALKED.contains(shardId);
+    }
+
+    /**
+     * Whether this copy's writes look ids up in the table, because its
+     * skeleton may lack a document for a row the table holds: while a
+     * rebuilt index's skeleton is rebuilt, and after while the rebuild left
+     * rows out ({@link #skeletonComplete} not yet), so a client's write of a
+     * left-out id replaces its row rather than being taken as new.
+     */
+    private boolean looksUpIds() {
+        return !skeletonKnowsIds() || (rebuilt && !SKELETON_COMPLETE.contains(shardId));
     }
 
     /**
@@ -601,7 +643,7 @@ public class InfinoEngine extends InternalEngine {
      */
     private void holdLatestWhileLookingUp(boolean lookingUp) {
         synchronized (latestHoldLock) {
-            boolean wanted = (lookingUp || !skeletonKnowsIds() || (readsLatest && primaryCopy())) && !leaseRefreshStopped;
+            boolean wanted = (lookingUp || looksUpIds() || (readsLatest && primaryCopy())) && !leaseRefreshStopped;
             if (wanted == holdsLatest) {
                 return;
             }
@@ -924,7 +966,7 @@ public class InfinoEngine extends InternalEngine {
         if (pending != null) {
             return pending.source();
         }
-        if (!shardHoldsId && engine.skeletonKnowsIds()) {
+        if (!shardHoldsId && !engine.looksUpIds()) {
             return null;
         }
         if (engine.readsLatest) {
@@ -1321,7 +1363,7 @@ public class InfinoEngine extends InternalEngine {
                     }
                     // What the table holds for the id, when the batch has no write of it: a
                     // replay, or a write a rebuilt skeleton takes as new, may find a row there.
-                    Base base = recovery || (!skeletonKnowsIds() && result.isCreated())
+                    Base base = recovery || (looksUpIds() && result.isCreated())
                         ? Base.UNKNOWN
                         : result.isCreated() ? Base.ABSENT : Base.PRESENT;
                     batch.add(id, base, new Version(result.getSeqNo(), !recovery, source, index.routing(), stamp, ignored, mapped));
@@ -1378,7 +1420,7 @@ public class InfinoEngine extends InternalEngine {
                     }
                     return result;
                 }
-                if (skeletonKnowsIds() || !deleteTableOnly(id, result.getSeqNo())) {
+                if (!looksUpIds() || !deleteTableOnly(id, result.getSeqNo())) {
                     return result;
                 }
             }
