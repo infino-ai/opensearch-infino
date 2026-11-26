@@ -131,7 +131,7 @@
           - { script: { source: "ctx._source.took += 1" } }
   - match: { items.0.update.result: updated }
   - match: { items.1.update.status: 404 }
-  - match: { items.2.update.status: 400 }
+  - match: { items.2.update.result: updated }
   - do:
       search:
         index: em
@@ -146,8 +146,8 @@
           size: 0
           aggs:
             took: { sum: { field: took } }
-  # a 1.5, b now 4, d 0.5 (c was refused)
-  - match: { aggregations.took.value: 6.0 }
+  # a 1.5, b now 5 (4, then the script's +1), d 0.5 (c was refused)
+  - match: { aggregations.took.value: 7.0 }
 
   - do:
       delete:
