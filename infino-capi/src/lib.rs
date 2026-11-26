@@ -675,10 +675,15 @@ impl Bridge {
             .unwrap_or_default()
     }
 
-    /// Record what `mapping` indexes for `name`, replacing the earlier rule.
+    /// Record what `mapping` indexes for `name`, replacing the earlier rule
+    /// and keeping out what it left out ([`Indexed::keeping_left_out`]).
     fn index_rule(&self, name: &str, mapping: &Value) {
         if let Ok(mut all) = self.indexed.write() {
-            all.insert(name.to_string(), Arc::new(Indexed::of(mapping)));
+            let rule = match all.get(name) {
+                Some(earlier) => Indexed::of(mapping).keeping_left_out(earlier),
+                None => Indexed::of(mapping),
+            };
+            all.insert(name.to_string(), Arc::new(rule));
         }
     }
 
@@ -2169,23 +2174,63 @@ fn mapping_flag(value: Option<&Value>) -> Option<bool> {
 /// type one, and a later document with another shape there would be refused
 /// by the table after OpenSearch had acknowledged it.
 ///
-/// A path under a mapped field of any other type (a `geo_point` given as an
-/// object, a `flat_object`'s members) is that field's, and kept. So is a path
-/// no property maps where new fields are mapped (`dynamic` true, the
-/// default): the document's mapping update maps it before it is written.
-/// A table no mapping has been declared for indexes every path.
+/// A field whose type takes its value in several shapes and has no column
+/// of its own ([`WHOLE_TYPES`]: a `geo_point` as an object, a string or an
+/// array; a `geo_shape` as GeoJSON or WKT) is kept whole, as one string of
+/// its JSON, so every shape lands in the same column.
+///
+/// A path under a mapped field of any other type (a `flat_object`'s members,
+/// which its queries read) is that field's, and kept. So is a path no
+/// property maps where new fields are mapped (`dynamic` true, the default):
+/// the document's mapping update maps it before it is written. A table no
+/// mapping has been declared for indexes every path.
 #[derive(Debug, Default, PartialEq)]
 struct Indexed {
     /// `enabled: false`: nothing at or under this object is indexed.
     disabled: bool,
     /// This object's own `dynamic`, if it sets one ([`mapping_flag`]).
     dynamic: Option<bool>,
-    /// The object's properties by name: an object's own rule, or None for a
-    /// field of any other type, which keeps every path at or under it.
-    properties: HashMap<String, Option<Indexed>>,
-    /// Whether this object, or one under it, leaves anything out: when none
-    /// does, every path is indexed and no row is looked at.
-    leaves_out: bool,
+    /// The object's properties by name.
+    properties: HashMap<String, Property>,
+    /// Whether this object, or one under it, leaves anything out or keeps a
+    /// field whole: when none does, a row is flattened as it comes.
+    acts: bool,
+}
+
+/// One property of an object of a mapping ([`Indexed`]).
+#[derive(Debug, PartialEq)]
+enum Property {
+    /// A field of a type with a column, or none: every path at or under it
+    /// is its own, and kept.
+    Field,
+    /// A field kept whole, as the string of its value's JSON ([`WHOLE_TYPES`]).
+    Whole,
+    /// An object, with its own rule.
+    Object(Indexed),
+}
+
+/// The field types whose value comes in several shapes and that have no
+/// column of their own: each is kept whole, as one string ([`Indexed`]), so
+/// a later document's shape cannot fall beneath a column an earlier shape
+/// gave the path, which the engine would refuse at the commit.
+const WHOLE_TYPES: [&str; 2] = ["geo_point", "geo_shape"];
+
+/// How [`flatten`] reads the keys of one object: as they come, or by the
+/// mapping's rule for that object, with the `dynamic` in force there.
+#[derive(Clone, Copy)]
+enum Rule<'a> {
+    All,
+    In(&'a Indexed, bool),
+}
+
+/// What [`flatten`] does with one key ([`Indexed::step`]).
+enum Step<'a> {
+    /// Not indexed: left out of the row.
+    Drop,
+    /// Kept whole, as one string.
+    Whole,
+    /// Flattened by this rule.
+    Into(Rule<'a>),
 }
 
 impl Indexed {
@@ -2204,49 +2249,102 @@ impl Indexed {
                 let Some(field) = field.as_object() else {
                     continue;
                 };
-                let object = matches!(
-                    field.get("type").and_then(Value::as_str),
-                    None | Some("object") | Some("nested")
-                );
-                properties.insert(name.clone(), object.then(|| Self::object(field)));
+                let property = match field.get("type").and_then(Value::as_str) {
+                    None | Some("object") | Some("nested") => Property::Object(Self::object(field)),
+                    Some(ty) if WHOLE_TYPES.contains(&ty) => Property::Whole,
+                    Some(_) => Property::Field,
+                };
+                properties.insert(name.clone(), property);
             }
         }
-        let leaves_out = disabled
-            || dynamic == Some(false)
-            || properties.values().flatten().any(|child| child.leaves_out);
-        Indexed {
+        let mut rule = Indexed {
             disabled,
             dynamic,
             properties,
-            leaves_out,
+            acts: false,
+        };
+        rule.acts = rule.acting();
+        rule
+    }
+
+    /// Whether this object, or one under it, leaves anything out or keeps a
+    /// field whole.
+    fn acting(&self) -> bool {
+        self.disabled
+            || self.dynamic == Some(false)
+            || self.properties.values().any(|p| match p {
+                Property::Field => false,
+                Property::Whole => true,
+                Property::Object(child) => child.acts,
+            })
+    }
+
+    /// This rule, keeping out what `earlier` (the rule of the mapping this
+    /// one replaces) left out under `dynamic: false` and this one does not
+    /// map. A put-mapping that turns `dynamic` from false to true may land
+    /// while documents checked under the earlier rule wait for their commit;
+    /// their unmapped fields were never mapped, so the commit must not give
+    /// them columns either. A field this mapping maps is kept as it says.
+    fn keeping_left_out(mut self, earlier: &Indexed) -> Self {
+        self.keep_out_of(Some(earlier), true, true);
+        self
+    }
+
+    fn keep_out_of(&mut self, earlier: Option<&Indexed>, dynamic: bool, was: bool) {
+        let was = earlier.map_or(was, |e| !e.disabled && e.dynamic.unwrap_or(was));
+        let now = self.dynamic.unwrap_or(dynamic);
+        if now && !was {
+            self.dynamic = Some(false);
+        }
+        let now = self.dynamic.unwrap_or(dynamic);
+        for (name, property) in self.properties.iter_mut() {
+            if let Property::Object(child) = property {
+                let before = earlier.and_then(|e| match e.properties.get(name) {
+                    Some(Property::Object(object)) => Some(object),
+                    _ => None,
+                });
+                child.keep_out_of(before, now, was);
+            }
+        }
+        self.acts = self.acting();
+    }
+
+    /// The rule [`flatten`] reads a document by: as it comes when nothing is
+    /// left out or kept whole, else this one.
+    fn rule(&self) -> Rule<'_> {
+        if self.acts {
+            Rule::In(self, self.dynamic.unwrap_or(true))
+        } else {
+            Rule::All
         }
     }
 
-    /// Whether the flattened `path` ([`flatten`]) is indexed. A property
-    /// whose name holds a dot matches as one name, as a mapping may spell it.
-    fn indexes(&self, path: &str) -> bool {
+    /// What to do with `key` of this object, under the `dynamic` in force
+    /// here. A key holding a dot is read as the path it spells, and a
+    /// property whose name holds one matches as one name.
+    fn step(&self, key: &str, dynamic: bool) -> Step<'_> {
         let mut node = self;
-        // A new field is mapped unless an object above it says otherwise.
-        let mut dynamic = true;
-        let mut rest = path;
+        let mut dynamic = dynamic;
+        let mut rest = key;
         loop {
-            if node.disabled {
-                return false;
-            }
-            if let Some(d) = node.dynamic {
-                dynamic = d;
-            }
             let found = rest
                 .match_indices('.')
                 .map(|(at, _)| at)
                 .chain(iter::once(rest.len()))
                 .find_map(|end| node.properties.get(&rest[..end]).map(|p| (end, p)));
             match found {
-                None => return dynamic,
-                Some((_, None)) => return true,
-                // A value given where the mapping has an object: the object's own.
-                Some((end, Some(child))) if end == rest.len() => return !child.disabled,
-                Some((end, Some(child))) => {
+                None if dynamic => return Step::Into(Rule::All),
+                None => return Step::Drop,
+                Some((_, Property::Field)) => return Step::Into(Rule::All),
+                Some((end, Property::Whole)) if end == rest.len() => return Step::Whole,
+                // A path beneath a field kept whole is no value of its own.
+                Some((_, Property::Whole)) => return Step::Drop,
+                Some((_, Property::Object(child))) if child.disabled => return Step::Drop,
+                Some((end, Property::Object(child))) => {
+                    dynamic = child.dynamic.unwrap_or(dynamic);
+                    if end == rest.len() {
+                        return Step::Into(Rule::In(child, dynamic));
+                    }
                     node = child;
                     rest = &rest[end + 1..];
                 }
@@ -2254,12 +2352,38 @@ impl Indexed {
         }
     }
 
-    /// Leave out of `flat`, a document's flattened row, every path this
-    /// mapping does not index.
-    fn keep_indexed(&self, flat: &mut Map<String, Value>) {
-        if self.leaves_out {
-            flat.retain(|path, _| self.indexes(path));
-        }
+    /// Whether the flattened `path` is indexed at all.
+    #[cfg(test)]
+    fn indexes(&self, path: &str) -> bool {
+        !self.disabled && !matches!(self.step(path, self.dynamic.unwrap_or(true)), Step::Drop)
+    }
+}
+
+/// A table's columns by name, for the lookups a document makes of them:
+/// one per path, and one per dot prefix of a path no column holds.
+struct Columns<'a> {
+    schema: &'a Schema,
+    at: HashMap<&'a str, usize>,
+}
+
+impl<'a> Columns<'a> {
+    fn of(schema: &'a Schema) -> Self {
+        let at = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name().as_str(), i))
+            .collect();
+        Columns { schema, at }
+    }
+
+    /// The column named `name`, if the table holds one.
+    fn field(&self, name: &str) -> Option<&'a Field> {
+        self.at.get(name).map(|&i| self.schema.field(i))
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.at.contains_key(name)
     }
 }
 
@@ -2739,15 +2863,56 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
 /// member path, as OpenSearch indexes it: `a: [{b: 1}, {b: 2}]` becomes
 /// `a.b: [1, 2]`, so a declared `a.b` column takes the values rather than
 /// the objects; scalars beside the objects stay under the array's own path.
+#[cfg(test)]
 fn flatten(obj: &Map<String, Value>, prefix: &str, out: &mut Map<String, Value>) {
+    flatten_by(obj, prefix, Rule::All, out, &mut Vec::new());
+}
+
+/// [`flatten`] by a mapping's rule ([`Indexed`]): a key the mapping does not
+/// index is skipped before its path is built or its value looked into, and
+/// a field kept whole goes in as the string of its value's JSON, its path
+/// added to `whole`. A null, an empty array or an empty object kept whole
+/// holds no value, and goes in as nothing.
+fn flatten_by(
+    obj: &Map<String, Value>,
+    prefix: &str,
+    rule: Rule<'_>,
+    out: &mut Map<String, Value>,
+    whole: &mut Vec<String>,
+) {
     for (k, v) in obj {
+        let next = match rule {
+            Rule::All => Rule::All,
+            Rule::In(node, dynamic) => match node.step(k, dynamic) {
+                Step::Drop => continue,
+                Step::Whole => {
+                    let empty = match v {
+                        Value::Null => true,
+                        Value::Array(items) => items.is_empty(),
+                        Value::Object(inner) => inner.is_empty(),
+                        _ => false,
+                    };
+                    if !empty {
+                        let path = if prefix.is_empty() {
+                            k.clone()
+                        } else {
+                            format!("{prefix}.{k}")
+                        };
+                        whole.push(path.clone());
+                        out.insert(path, Value::String(v.to_string()));
+                    }
+                    continue;
+                }
+                Step::Into(next) => next,
+            },
+        };
         let path = if prefix.is_empty() {
             k.clone()
         } else {
             format!("{prefix}.{k}")
         };
         match v {
-            Value::Object(inner) if !inner.is_empty() => flatten(inner, &path, out),
+            Value::Object(inner) if !inner.is_empty() => flatten_by(inner, &path, next, out, whole),
             Value::Object(_) => {}
             Value::Array(items) if items.iter().any(Value::is_object) => {
                 let mut per_path: Vec<(String, Vec<Value>)> = Vec::new();
@@ -2756,7 +2921,7 @@ fn flatten(obj: &Map<String, Value>, prefix: &str, out: &mut Map<String, Value>)
                     match item {
                         Value::Object(inner) => {
                             let mut member = Map::new();
-                            flatten(inner, &path, &mut member);
+                            flatten_by(inner, &path, next, &mut member, whole);
                             for (member_path, member_value) in member {
                                 let values = match member_value {
                                     Value::Array(list) => list,
@@ -3103,7 +3268,7 @@ pub unsafe extern "C" fn infino_check_doc(
         out_string(
             match conform_doc(
                 source,
-                &schema,
+                &Columns::of(&schema),
                 &conn.kept(name),
                 &conn.engine_columns(name),
                 stamp.as_deref(),
@@ -3288,10 +3453,10 @@ fn is_at_or_under(path: &str, field: &str) -> bool {
 /// commit (it would become a second column beside the one there), so a
 /// document carrying it is refused when checked, not lost after OpenSearch
 /// acknowledged it.
-fn live_column_above<'a>(path: &'a str, schema: &Schema) -> Option<&'a str> {
+fn live_column_above<'a>(path: &'a str, columns: &Columns) -> Option<&'a str> {
     path.match_indices('.')
         .map(|(at, _)| &path[..at])
-        .find(|prefix| schema.field_with_name(prefix).is_ok())
+        .find(|prefix| columns.has(prefix))
 }
 
 /// Parse, flatten and conform one document to the declared columns. The
@@ -3312,7 +3477,7 @@ fn live_column_above<'a>(path: &'a str, schema: &Schema) -> Option<&'a str> {
 /// column as they are, where the document gives it a value.
 fn conform_doc(
     source: &str,
-    schema: &Schema,
+    columns: &Columns,
     kept: &HashMap<String, Kept>,
     engine: &[String],
     stamp: Option<&str>,
@@ -3325,8 +3490,22 @@ fn conform_doc(
         .as_object()
         .ok_or_else(|| "the document is not an object".to_string())?;
     let mut flat = Map::new();
-    flatten(obj, "", &mut flat);
-    indexed.keep_indexed(&mut flat);
+    if indexed.disabled {
+        // `enabled: false` at the root: the document is source only.
+    } else {
+        let mut whole = Vec::new();
+        flatten_by(obj, "", indexed.rule(), &mut flat, &mut whole);
+        // A field kept whole goes in as a string. A table written before
+        // keeps any column an earlier document typed otherwise at its path;
+        // the field is left out of that one rather than refused there.
+        for path in whole {
+            if columns.field(&path).is_some_and(|f| {
+                !matches!(f.data_type(), DataType::LargeUtf8 | DataType::Utf8 | DataType::Utf8View)
+            }) {
+                flat.remove(&path);
+            }
+        }
+    }
     // A declared field the mapper ignored keeps, of several values, those its
     // column takes (OpenSearch drops only the malformed ones); any other path
     // at or under an ignored field has no value OpenSearch indexed.
@@ -3338,7 +3517,7 @@ fn conform_doc(
             }
             let keeps_some = value.is_array()
                 && ignored.contains(&path.as_str())
-                && schema.field_with_name(path).is_ok();
+                && columns.has(path);
             if keeps_some {
                 partial.insert(path.clone());
             }
@@ -3380,7 +3559,7 @@ fn conform_doc(
     {
         if let Some(value) = flat.remove(reserved) {
             let own = format!("{OWN_COLUMN_PREFIX}{reserved}");
-            if schema.field_with_name(&own).is_ok() {
+            if columns.has(&own) {
                 if by_mapper.remove(reserved) {
                     by_mapper.insert(own.clone());
                 }
@@ -3401,7 +3580,7 @@ fn conform_doc(
     }
     let mut lists: Vec<(String, Value)> = Vec::new();
     for (path, value) in flat.iter_mut() {
-        let field = schema.field_with_name(path).ok();
+        let field = columns.field(path);
         // A field the mapping declares with a scalar or string column reads
         // through an array of arrays as OpenSearch does. Any other path (a
         // geo_point, a flat_object's member, a field not yet declared) is
@@ -3427,7 +3606,7 @@ fn conform_doc(
             // every commit ([`live_column_above`]): say so now, before the
             // write is acknowledged. A null there gives the engine nothing
             // to write, and it skips the path.
-            if let Some(column) = (!value.is_null()).then(|| live_column_above(path, schema)).flatten() {
+            if let Some(column) = (!value.is_null()).then(|| live_column_above(path, columns)).flatten() {
                 return Err(format!(
                     "field [{path}]: the table holds [{column}] as a column of its own, and no field can be added beneath it"
                 ));
@@ -4267,13 +4446,14 @@ pub unsafe extern "C" fn infino_index_batch(
         let indexed = conn.indexed(name);
         let engine = conn.engine_columns(name);
         let stamp = conn.stamp(name);
+        let columns = Columns::of(&schema);
 
         let mut failed: Vec<Value> = Vec::new();
         let mut rows: Vec<(usize, Map<String, Value>)> = Vec::with_capacity(n);
         for i in 0..n {
             let osid = unsafe { cstr(os_p[i]) }.unwrap_or("");
             let source = unsafe { cstr(sr_p[i]) }.unwrap_or("{}");
-            let mut flat = match conform_doc(source, &schema, &kept, &engine, stamp.as_deref(), &[], &indexed)
+            let mut flat = match conform_doc(source, &columns, &kept, &engine, stamp.as_deref(), &[], &indexed)
             {
                 Ok(flat) => flat,
                 Err(why) => {
@@ -4488,6 +4668,8 @@ unsafe fn prepare(
                 if matches!(item.data_type(), DataType::Utf8 | DataType::LargeUtf8))
         });
 
+    let columns = Columns::of(&schema);
+
     // Each row's id, source, routing value and ignored fields as borrowed
     // slices of the buffer, with its stamp and operation.
     let mut rows_in: Vec<RowIn> = Vec::with_capacity(n);
@@ -4526,7 +4708,7 @@ unsafe fn prepare(
                 seq,
                 op,
             } = row;
-            conform_doc(src, &schema, &kept, &engine, stamp.as_deref(), ignored, &indexed).map(|mut flat| {
+            conform_doc(src, &columns, &kept, &engine, stamp.as_deref(), ignored, &indexed).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 flat.insert(SOURCE.into(), Value::String(mapped_values(src).0.to_string()));
                 if keeps_ignored && !ignored.is_empty() {
@@ -8661,7 +8843,7 @@ mod tests {
             Field::new("m", DataType::Int64, true),
         ]);
         let row = |doc: &str, ignored: &[&str]| {
-            conform_doc(doc, &schema, &HashMap::new(), &[], None, ignored, &Indexed::default())
+            conform_doc(doc, &Columns::of(&schema), &HashMap::new(), &[], None, ignored, &Indexed::default())
         };
         let flat = row(r#"{"n":[1,"x",3],"m":"y"}"#, &["n", "m"]).unwrap();
         assert_eq!(flat.get("n[]"), Some(&json!([1, 3])), "{flat:?}");
@@ -8694,7 +8876,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let row = |doc: &str, ignored: &[&str]| conform_doc(doc, &schema, &kept, &[], None, ignored, &Indexed::default());
+        let row = |doc: &str, ignored: &[&str]| conform_doc(doc, &Columns::of(&schema), &kept, &[], None, ignored, &Indexed::default());
         let flat = row(r#"{"ip":["10.0.0.1","garbage","::1"]}"#, &["ip"]).unwrap();
         assert_eq!(flat.get("ip[]"), Some(&json!(["10.0.0.1", "::1"])), "{flat:?}");
         let flat = row(r#"{"b":[1,300,-128]}"#, &["b"]).unwrap();
@@ -8732,7 +8914,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let row = |doc: String| conform_doc(&doc, &schema, &kept, &[], None, &[], &Indexed::default());
+        let row = |doc: String| conform_doc(&doc, &Columns::of(&schema), &kept, &[], None, &[], &Indexed::default());
         let flat = row(r#"{"short":"abcdefgh"}"#.to_string()).unwrap();
         assert_eq!(flat.get("short"), Some(&Value::Null), "{flat:?}");
         let flat = row(r#"{"short":"abc"}"#.to_string()).unwrap();
@@ -9392,7 +9574,7 @@ mod tests {
                     .iter()
                     .map(|(id, src)| {
                         let mut flat =
-                            conform_doc(src, &schema, &conn.kept("bench"), &[], None, &[], &Indexed::default()).unwrap();
+                            conform_doc(src, &Columns::of(&schema), &conn.kept("bench"), &[], None, &[], &Indexed::default()).unwrap();
                         flat.insert(OSID.into(), Value::String(id.clone()));
                         flat.insert(SOURCE.into(), Value::String(src.clone()));
                         flat
@@ -11619,7 +11801,7 @@ mod tests {
 
         let schema = Schema::new(vec![Field::new("message", DataType::LargeUtf8, true)]);
         let kept = HashMap::new();
-        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], Some("@timestamp"), &[], &Indexed::default());
+        let check = |doc: &str| conform_doc(doc, &Columns::of(&schema), &kept, &[], Some("@timestamp"), &[], &Indexed::default());
         assert!(check(r#"{"@timestamp": "2023-01-01T00:00:01Z"}"#).is_ok());
         assert!(check(r#"{"@timestamp": ["2023-01-01T00:00:01Z", null]}"#).is_ok());
         for doc in [
@@ -11629,7 +11811,7 @@ mod tests {
         ] {
             assert_eq!(check(doc), Err(no_timestamp("@timestamp")), "{doc}");
         }
-        assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, &[], None, &[], &Indexed::default()).is_ok());
+        assert!(conform_doc(r#"{"message": "m"}"#, &Columns::of(&schema), &kept, &[], None, &[], &Indexed::default()).is_ok());
     }
 
     /// A write the hosted service could not take is not split into halves:
@@ -12310,7 +12492,7 @@ mod tests {
             ),
         ]);
         let source = r#"{"status": 200.7, "t": "25/Nov/2026:09:30:00 +0100", "t3": "1795595400", "gone": null}"#;
-        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], None, &[], &Indexed::default());
+        let check = |doc: &str| conform_doc(doc, &Columns::of(&schema), &kept, &[], None, &[], &Indexed::default());
         let refused = check(source).unwrap_err();
         assert!(
             refused.contains("fractional") || refused.contains("failed to parse date"),
@@ -12353,7 +12535,7 @@ mod tests {
             "t".to_string(),
             Kept::Date(DateFormat::parse_all("dd/MMM/yyyy:HH:mm:ss Z")),
         )]);
-        let row = |doc: String, ignored: &[&str]| conform_doc(&doc, &schema, &kept, &[], None, ignored, &Indexed::default());
+        let row = |doc: String, ignored: &[&str]| conform_doc(&doc, &Columns::of(&schema), &kept, &[], None, ignored, &Indexed::default());
 
         let source = r#"{"n": [1, 2.5, "x"], "t": ["25/Nov/2026:09:30:00 +0100", "never"]}"#;
         let values = r#"{"n": [1, 2], "t": [1795595400000]}"#;
@@ -12381,7 +12563,7 @@ mod tests {
             "body": {"type": "object", "enabled": false, "properties": {"a": {"type": "long"}}},
             "meta": {"properties": {"raw": {"enabled": false}, "n": {"type": "long"}}}
         }}));
-        assert!(disabled.leaves_out);
+        assert!(disabled.acts);
         for path in ["body", "body.a", "body.a.b", "meta.raw", "meta.raw.x"] {
             assert!(!disabled.indexes(path), "{path}");
         }
@@ -12400,13 +12582,15 @@ mod tests {
         let loose = Indexed::of(&json!({"_doc": {"dynamic": "false", "properties": {
             "tag": {"type": "keyword"},
             "loc": {"type": "geo_point"},
+            "fo": {"type": "flat_object"},
             "open": {"dynamic": true, "properties": {"k": {"type": "keyword"}}},
             "deep": {"properties": {"k": {"type": "keyword"}}}
         }}}));
-        for path in ["data", "data.a", "deep.free", "deep.free.x"] {
+        // A geo_point is kept whole, so nothing beneath it is a path of its own.
+        for path in ["data", "data.a", "deep.free", "deep.free.x", "loc.lat"] {
             assert!(!loose.indexes(path), "{path}");
         }
-        for path in ["tag", "loc.lat", "loc", "open.new", "open.new.x", "deep.k"] {
+        for path in ["tag", "loc", "fo.a", "open.new", "open.new.x", "deep.k"] {
             assert!(loose.indexes(path), "{path}");
         }
 
@@ -12418,8 +12602,8 @@ mod tests {
         // A mapping that leaves nothing out looks at no row; a strict one
         // refuses a new field before it is written, so it reads as indexed.
         let plain = Indexed::of(&json!({"dynamic": "strict", "properties": {"n": {"type": "long"}}}));
-        assert!(!plain.leaves_out);
-        assert!(!Indexed::default().leaves_out && Indexed::default().indexes("x.y"));
+        assert!(!plain.acts);
+        assert!(!Indexed::default().acts && Indexed::default().indexes("x.y"));
         // The template-aware settings: a field no template maps is left out
         // under `false_allow_templates`, and refused before it is written
         // under `strict_allow_templates`.
@@ -12427,7 +12611,7 @@ mod tests {
             "tag": {"type": "keyword"},
             "strict": {"dynamic": "strict_allow_templates", "properties": {}}
         }}));
-        assert!(templated.leaves_out);
+        assert!(templated.acts);
         assert!(templated.indexes("tag") && !templated.indexes("free"));
         assert!(templated.indexes("strict.new"));
         assert_eq!(mapping_flag(Some(&json!("runtime"))), None);
@@ -12597,5 +12781,114 @@ mod tests {
         assert!(rows[0]["data"].is_null(), "{rows}");
         assert_eq!(rows[1]["data"], "text", "{rows}");
         close(h);
+    }
+
+    /// A `geo_point` (or `geo_shape`) is kept whole, as one string of its
+    /// JSON: every shape it takes (an object, a string, an array of numbers,
+    /// several points, GeoJSON or WKT) lands in the same column, so two
+    /// documents checked before either commits cannot give the path columns
+    /// that refuse each other. On a table an earlier write gave another
+    /// column type at the path, the value is kept in the source only (#294).
+    #[test]
+    fn a_geo_field_is_kept_whole_so_every_shape_lands_in_one_column() {
+        let h = open_storage();
+        let bridge = bridge_ref(h).unwrap();
+        let mapping = r#"{"properties":{"tag":{"type":"keyword"},"loc":{"type":"geo_point"},
+            "area":{"type":"geo_shape"}}}"#;
+        let out = ensure(h, mapping);
+        assert!(out.contains("\"created\":true"), "{out}");
+        let docs = [
+            ("a", r#"{"tag":"a","loc":[1.5,2.5],"area":"POINT (1 2)"}"#),
+            ("b", r#"{"tag":"b","loc":{"lat":1,"lon":2},"area":{"type":"point","coordinates":[1,2]}}"#),
+            ("c", r#"{"tag":"c","loc":"40,-70","area":{"type":"linestring","coordinates":[[1,2],[3,4]]}}"#),
+            ("d", r#"{"tag":"d","loc":[[1,2],{"lat":3,"lon":4}]}"#),
+            ("e", r#"{"tag":"e","loc":null,"area":[]}"#),
+        ];
+        // Each is checked before any commits, as a bulk's documents are.
+        for (id, doc) in docs {
+            assert_eq!(check(h, doc), "", "{id}");
+        }
+        for (id, doc) in docs {
+            assert_eq!(index(h, &[(id, doc)])["ok"], 1, "{id}");
+            assert_eq!(get(h, id), doc, "{id}");
+        }
+        let schema = bridge.conn.open_table("logs").unwrap().schema();
+        for column in ["loc", "area"] {
+            let f = schema.field_with_name(column).unwrap();
+            assert!(matches!(f.data_type(), DataType::LargeUtf8 | DataType::Utf8 | DataType::Utf8View), "{f:?}");
+        }
+        assert!(schema.fields().iter().all(|f| !f.name().starts_with("loc.")), "{schema:?}");
+        let rows = sql(h, "SELECT osid, loc FROM logs ORDER BY osid");
+        assert_eq!(rows[1]["loc"], r#"{"lat":1,"lon":2}"#, "{rows}");
+        assert!(rows[4]["loc"].is_null(), "{rows}");
+        close(h);
+
+        // Written before: `loc` typed as a list of numbers by an earlier document.
+        let h = open_storage();
+        assert!(ensure(h, r#"{"properties":{"tag":{"type":"keyword"}}}"#).contains("\"created\":true"));
+        assert_eq!(index(h, &[("old", r#"{"tag":"o","loc":[1.5,2.5]}"#)])["ok"], 1);
+        assert!(ensure(h, mapping).contains("\"created\":false"));
+        let doc = r#"{"tag":"n","loc":{"lat":1,"lon":2}}"#;
+        assert_eq!(check(h, doc), "");
+        assert_eq!(index(h, &[("new", doc)])["ok"], 1);
+        assert_eq!(get(h, "new"), doc);
+        close(h);
+    }
+
+    /// A put-mapping that turns `dynamic` from false to true may land while
+    /// documents checked under `dynamic: false` wait for their commit. Their
+    /// unmapped fields were never mapped, so the commit gives them no column
+    /// either; a field the new mapping maps is kept (#294).
+    #[test]
+    fn a_field_left_out_stays_out_when_dynamic_turns_true_until_it_is_mapped() {
+        let h = open_storage();
+        let bridge = bridge_ref(h).unwrap();
+        let loose = r#"{"dynamic":false,"properties":{"tag":{"type":"keyword"}}}"#;
+        assert!(ensure(h, loose).contains("\"created\":true"));
+        let waiting = r#"{"tag":"a","note":{"x":1}}"#;
+        assert_eq!(check(h, waiting), "");
+        // The flip lands before the commit.
+        assert!(ensure(h, r#"{"dynamic":true,"properties":{"tag":{"type":"keyword"}}}"#).contains("\"created\":false"));
+        assert_eq!(index(h, &[("a", waiting)])["ok"], 1);
+        let schema = || bridge.conn.open_table("logs").unwrap().schema();
+        assert!(schema().fields().iter().all(|f| !f.name().starts_with("note")), "{:?}", schema());
+        // Once the mapping maps the field, a later document fills its column.
+        let mapped = r#"{"dynamic":true,"properties":{"tag":{"type":"keyword"},"note":{"type":"keyword"}}}"#;
+        assert!(ensure(h, mapped).contains("\"created\":false"));
+        assert_eq!(index(h, &[("b", r#"{"tag":"b","note":"mapped"}"#)])["ok"], 1);
+        let rows = sql(h, "SELECT osid, note FROM logs ORDER BY osid");
+        assert!(rows[0]["note"].is_null(), "{rows}");
+        assert_eq!(rows[1]["note"], "mapped", "{rows}");
+        assert_eq!(get(h, "a"), waiting);
+        close(h);
+    }
+
+    /// The mapping's rule is applied while the document is flattened: a key
+    /// it does not index is skipped before its path is built, a dotted key
+    /// is read as the path it spells, and a path beneath a field kept whole
+    /// is no value of its own (#294).
+    #[test]
+    fn flattening_by_the_rule_skips_what_the_mapping_does_not_index() {
+        let rule = Indexed::of(&json!({"dynamic": false, "properties": {
+            "tag": {"type": "keyword"},
+            "body": {"type": "object", "enabled": false},
+            "loc": {"type": "geo_point"},
+            "fo": {"type": "flat_object"},
+            "meta": {"properties": {"n": {"type": "long"}}}
+        }}));
+        let doc = json!({
+            "tag": "t", "body": {"a": {"b": [1, 2]}}, "body.c": 3, "free": {"x": 1},
+            "loc": {"lat": 1, "lon": 2}, "loc.lat": 9, "fo": {"a": {"b": 1}},
+            "meta": {"n": 1, "other": 2}, "meta.n2": 3,
+            "items": [{"tag": "x"}]
+        });
+        let mut flat = Map::new();
+        let mut whole = Vec::new();
+        flatten_by(doc.as_object().unwrap(), "", rule.rule(), &mut flat, &mut whole);
+        let mut paths: Vec<&str> = flat.keys().map(String::as_str).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["fo.a.b", "loc", "meta.n", "tag"], "{flat:?}");
+        assert_eq!(whole, ["loc"]);
+        assert_eq!(flat["loc"], r#"{"lat":1,"lon":2}"#);
     }
 }
