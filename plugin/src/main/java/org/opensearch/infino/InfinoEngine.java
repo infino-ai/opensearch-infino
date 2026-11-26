@@ -15,6 +15,7 @@ import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.common.Randomness;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
@@ -53,7 +54,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
@@ -454,7 +454,7 @@ public class InfinoEngine extends InternalEngine {
         private long notBefore = 0;
 
         RateLimit() {
-            this(pause -> pause / 2 + ThreadLocalRandom.current().nextLong(pause / 2 + 1));
+            this(pause -> pause / 2 + Randomness.get().nextLong(pause / 2 + 1));
         }
 
         RateLimit(LongUnaryOperator jitter) {
