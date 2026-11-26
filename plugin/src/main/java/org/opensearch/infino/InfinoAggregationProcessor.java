@@ -19,6 +19,8 @@ import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.core.common.breaker.CircuitBreaker;
+import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.index.Index;
@@ -42,6 +44,7 @@ import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.InternalOrder;
+import org.opensearch.search.aggregations.MultiBucketConsumerService;
 import org.opensearch.search.aggregations.bucket.BucketUtils;
 import org.opensearch.search.aggregations.bucket.composite.CompositeAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.composite.CompositeValuesSourceBuilder;
@@ -1726,6 +1729,8 @@ public class InfinoAggregationProcessor {
         final String orderTemplate;
         final DateKey date;
         final HistKey hist;
+        /** The rows this level buckets at all, as a condition its statement adds to the WHERE; null for every row (see {@link #hardBoundsWhere}). */
+        final String within;
 
         private Grouped(
             AggregationBuilder b,
@@ -1739,7 +1744,8 @@ public class InfinoAggregationProcessor {
             long minDocCount,
             String orderTemplate,
             DateKey date,
-            HistKey hist
+            HistKey hist,
+            String within
         ) {
             super(b, leaves, child);
             this.source = source;
@@ -1751,6 +1757,7 @@ public class InfinoAggregationProcessor {
             this.orderTemplate = orderTemplate;
             this.date = date;
             this.hist = hist;
+            this.within = within;
             // A level's top hits are a window over the documents partitioned by its key,
             // which a document with several values would stand in once per value.
             if (source.multi() && !leaves.hits().isEmpty()) {
@@ -1790,7 +1797,7 @@ public class InfinoAggregationProcessor {
                 throw new Unsupported("aggregation [" + t.getName() + "] has an order the table cannot sort by: " + t.order());
             }
             long minDocCount = shardOfMany ? Math.min(t.shardMinDocCount(), t.minDocCount()) : t.minDocCount();
-            return new Grouped(t, leaves, child, c, c.expr(), kind, true, shardSize(t), minDocCount, order, null, null);
+            return new Grouped(t, leaves, child, c, c.expr(), kind, true, shardSize(t), minDocCount, order, null, null, null);
         }
 
         /**
@@ -1839,7 +1846,7 @@ public class InfinoAggregationProcessor {
                 bounds = new LongBounds(min == null ? null : prepared.round(min), max == null ? null : prepared.round(max));
             }
             DateKey date = new DateKey(format, expr.rounding(), bounds, dh.keyed(), dh.offset());
-            return new Grouped(dh, leaves, child, c, expr.keyExpr(), KeyKind.DATE, false, Integer.MAX_VALUE, dh.minDocCount(), "{key} ASC", date, null);
+            return new Grouped(dh, leaves, child, c, expr.keyExpr(), KeyKind.DATE, false, Integer.MAX_VALUE, dh.minDocCount(), "{key} ASC", date, null, null);
         }
 
         static Grouped histogram(HistogramAggregationBuilder h, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child, long now) {
@@ -1851,40 +1858,74 @@ public class InfinoAggregationProcessor {
             if (h.order() != null && !InternalOrder.isKeyOrder(h.order())) {
                 throw new Unsupported("aggregation [" + h.getName() + "] has an order other than by key");
             }
-            DoubleBounds hard = histBounds(h, Histogram.HARD_BOUNDS_FIELD.getPreferredName());
+            // The builder keeps hard bounds without a getter: read back once from its own JSON form.
+            Map<String, Object> body = bodyOf(h, HistogramAggregationBuilder.NAME);
+            DoubleBounds hard = histBounds(body, Histogram.HARD_BOUNDS_FIELD.getPreferredName());
+            String within = null;
             if (hard != null) {
-                checkInside(hard, histBounds(h, Histogram.EXTENDED_BOUNDS_FIELD.getPreferredName()));
-                // As stock: a bucket is kept when its start, before the offset is added back,
-                // is inside the bounds. Outside them the key is null, which no bucket has.
-                String start = histStart(c, h.interval(), h.offset());
-                List<String> inside = new ArrayList<>();
-                if (hard.getMin() != null) {
-                    inside.add(start + " >= " + hard.getMin());
-                }
-                if (hard.getMax() != null) {
-                    inside.add(start + " <= " + hard.getMax());
-                }
-                if (!inside.isEmpty()) {
-                    keyExpr = "CASE WHEN " + String.join(" AND ", inside) + " THEN " + keyExpr + " END";
-                }
+                checkInside(hard, histBounds(body, Histogram.EXTENDED_BOUNDS_FIELD.getPreferredName()));
+                within = hardBoundsWhere(c, h.interval(), h.offset(), hard);
             }
             String order = h.order() != null && InternalOrder.isKeyDesc(h.order()) ? "{key} DESC" : "{key} ASC";
-            // As stock: a date's key prints in the field's format (or the request's), in UTC,
-            // and a number's only in a format the request gives.
-            DocValueFormat format = c.isTimestamp() ? dateFormat(h.format(), c, ZoneOffset.UTC)
-                : h.format() == null ? DocValueFormat.RAW
-                : new DocValueFormat.Decimal(h.format());
-            HistKey hist = new HistKey(h.interval(), h.offset(), h.keyed(), format, h.minBound(), h.maxBound());
-            return new Grouped(h, leaves, child, c, keyExpr, KeyKind.DOUBLE, false, Integer.MAX_VALUE, h.minDocCount(), order, null, hist);
+            HistKey hist = new HistKey(h.interval(), h.offset(), h.keyed(), histFormat(h, c, cols, table), h.minBound(), h.maxBound());
+            return new Grouped(h, leaves, child, c, keyExpr, KeyKind.DOUBLE, false, Integer.MAX_VALUE, h.minDocCount(), order, null, hist, within);
+        }
+
+        /**
+         * The format a histogram's keys print in, as stock picks it from what
+         * the values are read from. A date field's, with or without a value
+         * script, is the field's format (or the request's), in UTC. A number
+         * field's, or a script's with no field (stock reads a script's values
+         * as numbers, a date's as its epoch milliseconds), prints only in a
+         * format the request gives.
+         */
+        static DocValueFormat histFormat(HistogramAggregationBuilder h, Source c, Map<String, Column> cols, String table) {
+            Source field = c;
+            if (h.script() != null) {
+                Column column = h.field() == null ? null : InfinoSearch.columnFor(cols, h.field());
+                field = column == null ? null : Source.of(column, cols, table);
+            }
+            if (field != null && field.isTimestamp()) {
+                return dateFormat(h.format(), field, ZoneOffset.UTC);
+            }
+            return h.format() == null ? DocValueFormat.RAW : new DocValueFormat.Decimal(h.format());
+        }
+
+        /**
+         * The rows a histogram's hard bounds keep, as a condition for the
+         * level's WHERE: as stock, a row is bucketed when its bucket's start,
+         * before the offset is added back, is inside them. The rows outside are
+         * then not grouped at all, so the cost follows the bounds rather than
+         * the table. Over a plain column (a field each document gives one
+         * value) a range of the column itself, wider by a bucket on each side
+         * so that rounding cannot cut a row the bounds keep, comes first: the
+         * engine can skip the files that hold no value inside it.
+         */
+        static String hardBoundsWhere(Source c, double interval, double offset, DoubleBounds hard) {
+            String start = histStart(c, interval, offset);
+            boolean plain = c.column() != null && !c.multi();
+            List<String> inside = new ArrayList<>();
+            if (hard.getMin() != null) {
+                if (plain) {
+                    inside.add(c.expr() + " >= " + Explicit.bound(c, Math.floor(hard.getMin() + offset - interval)));
+                }
+                inside.add(start + " >= " + hard.getMin());
+            }
+            if (hard.getMax() != null) {
+                if (plain) {
+                    inside.add(c.expr() + " < " + Explicit.bound(c, Math.ceil(hard.getMax() + offset + interval)));
+                }
+                inside.add(start + " <= " + hard.getMax());
+            }
+            return inside.isEmpty() ? null : "(" + String.join(" AND ", inside) + ")";
         }
 
         /**
          * The histogram's bounds named {@code field} ({@code hard_bounds} or
-         * {@code extended_bounds}), or null. The builder keeps hard bounds
-         * without a getter, so both are read back from its own JSON form.
+         * {@code extended_bounds}) in its {@code body} ({@link #bodyOf}), or null.
          */
-        private static DoubleBounds histBounds(HistogramAggregationBuilder h, String field) {
-            Object bounds = bodyOf(h, HistogramAggregationBuilder.NAME).get(field);
+        private static DoubleBounds histBounds(Map<String, Object> body, String field) {
+            Object bounds = body.get(field);
             if (!(bounds instanceof Map<?, ?> m)) {
                 return null;
             }
@@ -3716,17 +3757,16 @@ public class InfinoAggregationProcessor {
                 rows = rangeCountedHistogram(level, from, where);
             }
             if (rows == null) {
-                String sql;
                 if (level.terms) {
                     String partition = i == 0 ? "" : "PARTITION BY " + parents + " ";
                     // keyed_total: the rows with a value under this parent, so what the
                     // window drops is counted exactly, without the field-less rows.
-                    sql = "SELECT * FROM (SELECT t.*, ROW_NUMBER() OVER (" + partition + "ORDER BY " + level.order("k" + i) + ") AS rn, SUM(doc_count) OVER ("
+                    String sql = "SELECT * FROM (SELECT t.*, ROW_NUMBER() OVER (" + partition + "ORDER BY " + level.order("k" + i) + ") AS rn, SUM(doc_count) OVER ("
                         + partition.trim() + ") AS keyed_total FROM (" + inner + ") t) WHERE rn <= " + level.size + " ORDER BY " + (i == 0 ? "rn" : parents + ", rn");
+                    rows = InfinoNative.sqlRows(sql);
                 } else {
-                    sql = "SELECT * FROM (" + inner + ") t ORDER BY " + String.join(", ", aliases);
+                    rows = boundedByMaxBuckets(inner, aliases, InfinoSearch.maxBuckets());
                 }
-                rows = InfinoNative.sqlRows(sql);
             }
             rowsByLevel.add(rows);
             kept = new ArrayList<>();
@@ -3754,6 +3794,35 @@ public class InfinoAggregationProcessor {
             prefetchSignificant(chain, kept, rowsByLevel.get(chain.size() - 1), leafChild, from, where);
         }
         return fold(chain, 0, List.of(), rowsByLevel, hitsByLevel, total, leafChild, from, where);
+    }
+
+    /**
+     * The groups of a histogram or date_histogram level ({@code inner}, keyed
+     * by {@code aliases}), in key order, read only up to one past
+     * {@code maxBuckets} ({@code search.max_buckets}), so no more groups than
+     * the limit reach the heap. A group missing a key (rows without the
+     * field, or under a parent's missing key) is no bucket, so it is left
+     * out. Past the limit the level fails with stock's own error, raised by
+     * stock's bucket counter, as stock's reduce raises it: for every bucket
+     * of the level at once, so the groups are counted in the engine first,
+     * one count and no rows.
+     */
+    static List<Map<String, Object>> boundedByMaxBuckets(String inner, List<String> aliases, int maxBuckets) {
+        List<String> present = new ArrayList<>();
+        for (String alias : aliases) {
+            present.add(alias + " IS NOT NULL");
+        }
+        String buckets = "FROM (" + inner + ") t WHERE " + String.join(" AND ", present);
+        List<Map<String, Object>> rows = InfinoNative.sqlRows(
+            "SELECT * " + buckets + " ORDER BY " + String.join(", ", aliases) + " LIMIT " + ((long) maxBuckets + 1)
+        );
+        if (rows.size() > maxBuckets) {
+            long groups = asLong(InfinoNative.sqlRows("SELECT COUNT(*) AS n " + buckets).get(0).get("n"));
+            new MultiBucketConsumerService.MultiBucketConsumer(maxBuckets, new NoopCircuitBreaker(CircuitBreaker.REQUEST)).accept(
+                (int) Math.min(Integer.MAX_VALUE, Math.max(groups, rows.size()))
+            );
+        }
+        return rows;
     }
 
     /**
@@ -4252,7 +4321,8 @@ public class InfinoAggregationProcessor {
     /**
      * The bare GROUP BY of level {@code i} of {@code chain}: the level's keys
      * and every parent's, the row count and the level's metrics, over
-     * {@code from WHERE where} narrowed by {@code restriction}, without rows
+     * {@code from WHERE where} narrowed by {@code restriction} and the rows
+     * the level buckets ({@link Grouped#within}), without rows
      * missing the level's key when {@code present}, and with the level's
      * minimum count as a HAVING. A key over a field some document gives
      * several values is read per value ({@link #groupStatement}).
@@ -4270,8 +4340,9 @@ public class InfinoAggregationProcessor {
         }
         String metrics = level.metrics.isEmpty() ? "" : metricColumns(level.metrics);
         String keep = present ? " AND " + presence(level.keyExpr, level.source) : "";
+        String within = level.within == null ? "" : " AND " + level.within;
         String having = level.minDocCount > 1 ? " HAVING COUNT(*) >= " + level.minDocCount : "";
-        return groupStatement(keyCols, metrics, from, where + restriction + keep, multi, having);
+        return groupStatement(keyCols, metrics, from, where + restriction + keep + within, multi, having);
     }
 
     /**
