@@ -58,8 +58,11 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     private static final String PIPELINE_TABLE = "emr9_rows";
     private static final int PIPELINE_ROWS = 50;
     private static final String FINAL_PIPELINE = "emr9_final";
-    /** The system property naming the test node's log. */
-    private static final String SERVER_LOG = "tests.infino.server_log";
+    /**
+     * The system property naming the test node's log: the build sets it,
+     * since the test security manager lets a test read the one file it names.
+     */
+    private static final String SERVER_LOG = "tests.config";
     /** The mark a rebuild's creates open their source with, which a client's write may not carry. */
     private static final String MARK = "/*infino:skeleton*/";
 

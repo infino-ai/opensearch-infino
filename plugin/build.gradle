@@ -400,7 +400,9 @@ tasks.named('yamlRestTest').configure {
     // Only the plugin's own suites: the stock ones copied beside them run in the core tasks.
     systemProperty 'tests.rest.suite', 'infino'
     // The test node's log, for a test that checks what the node did not write to a table.
-    systemProperty 'tests.infino.server_log', "${layout.buildDirectory.get().asFile.absolutePath}/testclusters/yamlRestTest-0/logs/yamlRestTest.log"
+    // tests.config names the one file beyond its own the test security manager lets a
+    // test read, and no test of this suite reads a config file of its own.
+    systemProperty 'tests.config', "${layout.buildDirectory.get().asFile.absolutePath}/testclusters/yamlRestTest-0/logs/yamlRestTest.log"
     systemProperty 'tests.rest.denylist', "${knnSuite}/*"
     filter {
         excludeTestsMatching coreTests
