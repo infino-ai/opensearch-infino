@@ -342,9 +342,9 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
 
     /**
      * A primary that fails while its rebuild is held, and starts again from
-     * its own store, as a node killed and started again does: it knows from
-     * the rebuild's lease, which it took before the shard first started and
-     * kept on disk, that its skeleton is still being rebuilt. So its searches
+     * its own store: it knows from the rebuild's lease, which it took before
+     * the shard first started and kept on disk, that its skeleton is still
+     * being rebuilt. So its searches
      * that return hits still answer 503, a write of an id its skeleton lacks
      * replaces the table's row rather than adding a second one, and once
      * released it finishes the rebuild.
