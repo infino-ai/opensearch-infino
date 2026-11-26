@@ -1263,7 +1263,11 @@ public class InfinoEngine extends InternalEngine {
                 return new IndexResult(e, index.version());
             }
             if (why != null) {
-                return new IndexResult(new MapperParsingException("[infino] " + why), index.version());
+                // A keyword value too long for one term fails as Lucene fails it on a stock index.
+                Exception refused = why.startsWith(InfinoWriter.IMMENSE_TERM)
+                    ? new IllegalArgumentException(why)
+                    : new MapperParsingException("[infino] " + why);
+                return new IndexResult(refused, index.version());
             }
         }
         // Lucene keeps the document's identity only: the metadata fields the

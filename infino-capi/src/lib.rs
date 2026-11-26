@@ -117,6 +117,12 @@ const MULTI_VALUE_SEPARATOR: &str = " ";
 /// The longest UTF-8 encoding a `keyword` value may have, as Lucene bounds
 /// one term.
 const MAX_TERM_BYTES: usize = 32766;
+/// How Lucene's refusal of a value too long for one term starts
+/// ([`immense_term`]); the plugin answers a reason that starts so as
+/// OpenSearch answers it, an `illegal_argument_exception`.
+const IMMENSE_TERM: &str = "Document contains at least one immense term in field=\"";
+/// How many leading bytes of an immense term Lucene's refusal shows.
+const IMMENSE_TERM_PREFIX_BYTES: usize = 30;
 /// What the column holding a field's values is named after the field's own,
 /// for a document that gives the field more than one: `<path>[]`, a list of
 /// the field's own type, declared the first time a document needs it. The
@@ -1464,6 +1470,11 @@ struct MappedField {
     /// For a `keyword` field, its `ignore_above`, if it sets one, and
     /// whether it builds terms (it is indexed or has doc values).
     keyword: Option<(Option<usize>, bool)>,
+    /// The field's `keyword` multi-fields that build terms of its values
+    /// (the `.keyword` sub-field dynamic mapping gives a string, say). They
+    /// have no column of their own, but OpenSearch indexes each value in
+    /// them too, so a value too long for one term refuses the document.
+    multi: Vec<TermView>,
     /// What OpenSearch accepts of an `ip` or narrow integer field beyond what
     /// its column takes.
     valid: Option<Valid>,
@@ -1475,9 +1486,59 @@ impl MappedField {
         self.precision
             .map(Kept::Precision)
             .or_else(|| self.date_formats.clone().map(Kept::Date))
-            .or_else(|| self.keyword.map(|(ignore_above, terms)| Kept::Keyword { ignore_above, terms }))
+            .or_else(|| {
+                self.keyword.map(|(ignore_above, terms)| Kept::Keyword {
+                    ignore_above,
+                    terms,
+                    multi: self.multi.clone(),
+                })
+            })
             .or_else(|| self.valid.map(Kept::Valid))
+            .or_else(|| (!self.multi.is_empty()).then(|| Kept::MultiFields(self.multi.clone())))
     }
+}
+
+/// A `keyword` multi-field that builds terms: its full path, which an
+/// immense-term refusal names, and its `ignore_above`, past which a value is
+/// left out of it.
+#[derive(Clone, Debug, PartialEq)]
+struct TermView {
+    field: String,
+    ignore_above: Option<usize>,
+}
+
+/// The `keyword` multi-fields under `def` (its `fields`) that build terms,
+/// each named `<path>.<name>`.
+fn keyword_multi_fields(def: &Map<String, Value>, path: &str) -> Vec<TermView> {
+    let Some(fields) = def.get("fields").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .filter_map(|(name, sub)| {
+            let sub = sub.as_object()?;
+            if sub.get("type").and_then(Value::as_str) != Some("keyword") {
+                return None;
+            }
+            builds_terms(sub).then(|| TermView {
+                field: format!("{path}.{name}"),
+                ignore_above: ignore_above(sub),
+            })
+        })
+        .collect()
+}
+
+/// A `keyword` mapping's `ignore_above`, if it sets one.
+fn ignore_above(def: &Map<String, Value>) -> Option<usize> {
+    def.get("ignore_above").and_then(Value::as_u64).map(|n| n as usize)
+}
+
+/// Whether a `keyword` mapping builds terms: it is indexed or has doc
+/// values, as it does unless it turns both off.
+fn builds_terms(def: &Map<String, Value>) -> bool {
+    let indexed = def.get("index").and_then(Value::as_bool) != Some(false);
+    let doc_values = def.get("doc_values").and_then(Value::as_bool) != Some(false);
+    indexed || doc_values
 }
 
 /// How a mapped field's values are kept beyond its column's type, as
@@ -1490,8 +1551,17 @@ enum Kept {
     Date(Vec<DateFormat>),
     /// A `keyword` value, indexed only up to `ignore_above` characters
     /// (UTF-16 units, as OpenSearch counts them) and, when the field builds
-    /// terms (`terms`), refused past [`MAX_TERM_BYTES`].
-    Keyword { ignore_above: Option<usize>, terms: bool },
+    /// terms (`terms`), refused past [`MAX_TERM_BYTES`]; as is one its
+    /// keyword multi-fields (`multi`) index.
+    Keyword {
+        ignore_above: Option<usize>,
+        terms: bool,
+        multi: Vec<TermView>,
+    },
+    /// A field of another type (a `text` field, say) whose keyword
+    /// multi-fields index its values: a value one of them indexes is refused
+    /// past [`MAX_TERM_BYTES`]. The field's own column keeps every value.
+    MultiFields(Vec<TermView>),
     /// An `ip` or narrow integer value, which its column takes beyond what
     /// OpenSearch accepts.
     Valid(Valid),
@@ -1882,6 +1952,7 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             .then(|| def.get("format").and_then(Value::as_str))
             .flatten()
             .map(DateFormat::parse_all);
+        let multi = keyword_multi_fields(def, &path);
         out.push(MappedField {
             path,
             data_type,
@@ -1891,11 +1962,8 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             range: ranged && indexed,
             precision: ty.and_then(|ty| Precision::of(ty, def)),
             date_formats,
-            keyword: (ty == Some("keyword")).then(|| {
-                let ignore_above = def.get("ignore_above").and_then(Value::as_u64).map(|n| n as usize);
-                let doc_values = def.get("doc_values").and_then(Value::as_bool).unwrap_or(true);
-                (ignore_above, indexed || doc_values)
-            }),
+            keyword: (ty == Some("keyword")).then(|| (ignore_above(def), builds_terms(def))),
+            multi,
             valid: ty.and_then(Valid::of),
         });
     }
@@ -2810,33 +2878,52 @@ fn ignored_paths(paths: &str) -> Vec<&str> {
 /// The values of the `keyword` fields `kept` names as OpenSearch indexes
 /// them: a value longer than its field's `ignore_above` is left out (the
 /// source keeps it), and one whose UTF-8 encoding is longer than a term may
-/// be refuses the document, as Lucene refuses it.
+/// be refuses the document, as Lucene refuses it ([`immense_term`]). A
+/// field's keyword multi-fields ([`TermView`]) index its values too, each up
+/// to its own `ignore_above`, so a value one of them takes past a term's
+/// length refuses the document as well; the field's own column keeps it.
 fn keyword_values(flat: &mut Map<String, Value>, kept: &HashMap<String, Kept>) -> Result<(), String> {
     for (path, value) in flat.iter_mut() {
-        let Some(Kept::Keyword { ignore_above, terms }) = kept.get(path) else {
-            continue;
+        let (own, multi) = match kept.get(path) {
+            Some(Kept::Keyword {
+                ignore_above,
+                terms,
+                multi,
+            }) => (Some((*ignore_above, *terms)), multi.as_slice()),
+            Some(Kept::MultiFields(multi)) => (None, multi.as_slice()),
+            _ => continue,
         };
+        // Whether the field's own column keeps `v`; an error when the field
+        // or one of its multi-fields would index it as an immense term. The
+        // field is indexed first, then its multi-fields, as the mapper
+        // indexes them, so the refusal names the first that refuses.
         let indexed = |v: &Value| -> Result<bool, String> {
             // A number or boolean is indexed as its text.
-            let s = match v {
-                Value::String(s) => s.as_str(),
-                Value::Number(_) | Value::Bool(_) => {
-                    return Ok(!ignore_above.is_some_and(|n| v.to_string().len() > n));
-                }
+            let text = match v {
+                Value::String(s) => s.clone(),
+                Value::Number(_) | Value::Bool(_) => v.to_string(),
                 _ => return Ok(true),
             };
-            if ignore_above.is_some_and(|n| s.encode_utf16().count() > n) {
-                return Ok(false);
+            let skips = |ignore_above: Option<usize>| ignore_above.is_some_and(|n| text.encode_utf16().count() > n);
+            let mut keeps = true;
+            if let Some((ignore_above, terms)) = own {
+                if skips(ignore_above) {
+                    keeps = false;
+                } else if terms && text.len() > MAX_TERM_BYTES {
+                    return Err(immense_term(path, &text));
+                }
             }
-            if *terms && s.len() > MAX_TERM_BYTES {
-                return Err(format!(
-                    "Document contains at least one immense term in field=\"{path}\" (whose UTF8 encoding is longer than the max length {MAX_TERM_BYTES}), all of which were skipped. bytes can be at most {MAX_TERM_BYTES} in length; got {}",
-                    s.len()
-                ));
+            for view in multi {
+                if !skips(view.ignore_above) && text.len() > MAX_TERM_BYTES {
+                    return Err(immense_term(&view.field, &text));
+                }
             }
-            Ok(true)
+            Ok(keeps)
         };
         match value {
+            // Only a keyword field's own values are left out; a field of
+            // another type keeps its values as they are.
+            Value::Array(items) if own.is_none() => each_value(items, &mut |v| indexed(v).map(|_| ()))?,
             Value::Array(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 array_values(std::mem::take(items), &mut values);
@@ -2854,6 +2941,39 @@ fn keyword_values(flat: &mut Map<String, Value>, kept: &HashMap<String, Kept>) -
         }
     }
     Ok(())
+}
+
+/// Call `f` on each value of a multi-valued field, in order, reading
+/// through an array inside the array as [`array_values`] does, without
+/// taking the values out.
+fn each_value(items: &[Value], f: &mut impl FnMut(&Value) -> Result<(), String>) -> Result<(), String> {
+    for item in items {
+        match item {
+            Value::Array(inner) => each_value(inner, f)?,
+            Value::Null => {}
+            other => f(other)?,
+        }
+    }
+    Ok(())
+}
+
+/// The reason Lucene gives, word for word, for a document whose `field`
+/// would index `term` past [`MAX_TERM_BYTES`]: OpenSearch answers it as an
+/// `illegal_argument_exception`. It shows the term's first bytes as Java
+/// prints a byte array (signed). Lucene copies that many bytes whatever the
+/// term's length, and an immense term is always longer.
+fn immense_term(field: &str, term: &str) -> String {
+    let prefix: Vec<String> = term
+        .as_bytes()
+        .iter()
+        .take(IMMENSE_TERM_PREFIX_BYTES)
+        .map(|b| (*b as i8).to_string())
+        .collect();
+    format!(
+        "{IMMENSE_TERM}{field}\" (whose UTF8 encoding is longer than the max length {MAX_TERM_BYTES}), all of which were skipped.  Please correct the analyzer to not produce such terms.  The prefix of the first immense term is: '[{}]...', original message: bytes can be at most {MAX_TERM_BYTES} in length; got {}",
+        prefix.join(", "),
+        term.len()
+    )
 }
 
 /// Whether the flattened `path` is the field `field` or a path under it (a
@@ -8093,9 +8213,9 @@ mod tests {
             Field::new("short[]", DataType::List(Arc::new(Field::new(LIST_ITEM, DataType::LargeUtf8, true))), true),
         ]);
         let kept: HashMap<String, Kept> = [
-            ("short".to_string(), Kept::Keyword { ignore_above: Some(5), terms: true }),
-            ("long".to_string(), Kept::Keyword { ignore_above: None, terms: true }),
-            ("stored".to_string(), Kept::Keyword { ignore_above: None, terms: false }),
+            ("short".to_string(), Kept::Keyword { ignore_above: Some(5), terms: true , multi: vec![] }),
+            ("long".to_string(), Kept::Keyword { ignore_above: None, terms: true , multi: vec![] }),
+            ("stored".to_string(), Kept::Keyword { ignore_above: None, terms: false , multi: vec![] }),
         ]
         .into_iter()
         .collect();
@@ -8127,6 +8247,84 @@ mod tests {
         // Past its ignore_above, a value of any length is left out, as OpenSearch leaves it.
         let flat = row(format!(r#"{{"short":"{past}"}}"#)).unwrap();
         assert_eq!(flat.get("short"), Some(&Value::Null), "{flat:?}");
+    }
+
+    /// The refusal of a value past a term's length is Lucene's, word for
+    /// word: the field, the limit, the term's first 30 bytes as Java prints
+    /// a byte array (signed), and the length.
+    #[test]
+    fn an_immense_term_is_refused_in_lucene_s_words() {
+        let past = "x".repeat(MAX_TERM_BYTES + 1);
+        let xs = vec!["120"; IMMENSE_TERM_PREFIX_BYTES].join(", ");
+        assert_eq!(
+            immense_term("w", &past),
+            format!(
+                "Document contains at least one immense term in field=\"w\" (whose UTF8 encoding is longer than the max length 32766), all of which were skipped.  Please correct the analyzer to not produce such terms.  The prefix of the first immense term is: '[{xs}]...', original message: bytes can be at most 32766 in length; got 32767"
+            )
+        );
+        // A byte past 127 prints negative, as a Java byte does.
+        let accented = "é".repeat(MAX_TERM_BYTES);
+        let why = immense_term("w", &accented);
+        assert!(why.contains("'[-61, -87, -61, -87,"), "{why}");
+        assert!(why.ends_with(&format!("got {}", accented.len())), "{why}");
+    }
+
+    /// A field's `keyword` multi-fields index its values too: a value one of
+    /// them takes past a term's length refuses the document, naming the
+    /// multi-field, alone or in an array, whatever the field's own type. A
+    /// multi-field's `ignore_above` (the 256 dynamic mapping sets on
+    /// `.keyword`) leaves the value out of it, and one that builds no terms
+    /// never refuses; the field's own column keeps the value either way.
+    #[test]
+    fn a_keyword_multi_field_refuses_a_value_past_one_term() {
+        let mapping: Value = serde_json::from_str(
+            r#"{"properties":{
+                "t":{"type":"text","fields":{"keyword":{"type":"keyword"}}},
+                "dyn":{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}},
+                "off":{"type":"text","fields":{"raw":{"type":"keyword","index":false,"doc_values":false}}},
+                "k":{"type":"keyword","ignore_above":10,"fields":{"raw":{"type":"keyword"}}},
+                "plain":{"type":"text"}
+            }}"#,
+        )
+        .unwrap();
+        let mapped = mapped_fields(&mapping);
+        let kept: HashMap<String, Kept> = mapped
+            .iter()
+            .filter_map(|f| f.kept().map(|k| (f.path.clone(), k)))
+            .collect();
+        let schema = Schema::new(
+            ["t", "dyn", "off", "k", "plain"]
+                .into_iter()
+                .map(|name| Field::new(name, DataType::LargeUtf8, true))
+                .chain([Field::new(
+                    "t[]",
+                    DataType::List(Arc::new(Field::new(LIST_ITEM, DataType::LargeUtf8, true))),
+                    true,
+                )])
+                .collect::<Vec<_>>(),
+        );
+        let row = |doc: Value| conform_doc(&doc.to_string(), &schema, &kept, &[], None, &[]);
+        let at = "x".repeat(MAX_TERM_BYTES);
+        let past = format!("{at}x");
+
+        let flat = row(json!({ "t": at })).unwrap();
+        assert_eq!(flat.get("t"), Some(&json!(at)), "{flat:?}");
+        for refused in [json!(past), json!(["short", past])] {
+            let why = row(json!({ "t": refused })).unwrap_err();
+            assert!(why.starts_with(&format!("{IMMENSE_TERM}t.keyword\"")), "{why}");
+            assert!(why.ends_with("got 32767"), "{why}");
+        }
+        // Past the multi-field's ignore_above, or with no terms, the value is kept whole.
+        for field in ["dyn", "off", "plain"] {
+            let flat = row(json!({ field: past })).unwrap();
+            assert_eq!(flat.get(field), Some(&json!(past)), "{field}: {flat:?}");
+        }
+        // A keyword field's value past its own ignore_above is left out of
+        // its column, but its multi-field without one still indexes it.
+        let flat = row(json!({ "k": "abcdefghijkl" })).unwrap();
+        assert_eq!(flat.get("k"), Some(&Value::Null), "{flat:?}");
+        let why = row(json!({ "k": past })).unwrap_err();
+        assert!(why.starts_with(&format!("{IMMENSE_TERM}k.raw\"")), "{why}");
     }
 
     /// Whether a `keyword` field builds terms follows its mapping: one that
