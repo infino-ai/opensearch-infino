@@ -41,6 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr, CString};
 use std::fs;
 use std::io::{self, ErrorKind};
+use std::iter;
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -572,6 +573,10 @@ pub struct Bridge {
     /// The columns each table's engine writes, from the mapping it was last
     /// declared from ([`ENGINE_COLUMNS`]).
     engine: RwLock<HashMap<String, Arc<Vec<String>>>>,
+    /// What each table's mapping indexes of a document ([`Indexed`]), from
+    /// the mapping it was last declared from: a path it does not index is
+    /// left out of the row and kept in the source only.
+    indexed: RwLock<HashMap<String, Arc<Indexed>>>,
     /// The tables an index is attached to rather than owns: tables that
     /// existed before the index, declared through `infino_attach_table`.
     /// Such a table is read as it is and never changed: it holds none of
@@ -657,6 +662,23 @@ impl Bridge {
     fn engine_rule(&self, name: &str, columns: Vec<String>) {
         if let Ok(mut all) = self.engine.write() {
             all.insert(name.to_string(), Arc::new(columns));
+        }
+    }
+
+    /// What the mapping of `name` indexes of a document ([`Indexed`]);
+    /// every path for a table no mapping has declared.
+    fn indexed(&self, name: &str) -> Arc<Indexed> {
+        self.indexed
+            .read()
+            .ok()
+            .and_then(|all| all.get(name).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Record what `mapping` indexes for `name`, replacing the earlier rule.
+    fn index_rule(&self, name: &str, mapping: &Value) {
+        if let Ok(mut all) = self.indexed.write() {
+            all.insert(name.to_string(), Arc::new(Indexed::of(mapping)));
         }
     }
 
@@ -1186,6 +1208,7 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
         kept: RwLock::new(HashMap::new()),
         stamps: RwLock::new(HashMap::new()),
         engine: RwLock::new(HashMap::new()),
+        indexed: RwLock::new(HashMap::new()),
         attached: RwLock::new(HashMap::new()),
         gates: Mutex::new(HashMap::new()),
         latest_from,
@@ -2055,6 +2078,11 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
                 )
             }
             Some("object") | Some("nested") | None => {
+                // An object with `enabled: false` indexes nothing under it, so
+                // nothing under it is a column ([`Indexed`]).
+                if mapping_flag(def.get("enabled")) == Some(false) {
+                    continue;
+                }
                 if let Some(p) = def.get("properties").and_then(|p| p.as_object()) {
                     walk_properties(p, &path, out);
                 }
@@ -2085,10 +2113,151 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
 
 fn mapped_fields(mapping: &Value) -> Vec<MappedField> {
     let mut out = Vec::new();
+    if mapping_flag(root_of(mapping).and_then(|root| root.get("enabled"))) == Some(false) {
+        return out;
+    }
     if let Some(props) = properties_of(mapping) {
         walk_properties(props, "", &mut out);
     }
     out
+}
+
+/// The root object of a mapping, past the `mappings` and `_doc` wrappers it
+/// may come in: the object that holds its `properties`, and its own
+/// `dynamic` and `enabled`.
+fn root_of(mapping: &Value) -> Option<&Map<String, Value>> {
+    let m = mapping.as_object()?;
+    if m.contains_key("properties") {
+        return Some(m);
+    }
+    if let Some(doc) = m.get("_doc") {
+        return root_of(doc);
+    }
+    if let Some(mappings) = m.get("mappings") {
+        return root_of(mappings);
+    }
+    Some(m)
+}
+
+/// A mapping's boolean setting, `enabled` or `dynamic`, as OpenSearch reads
+/// it: a boolean, or its string. `dynamic: strict` maps no new field either,
+/// but a document that brings one is refused before it is written, so for
+/// what reaches the table it reads as `true`. None when the setting is
+/// absent or no such value.
+fn mapping_flag(value: Option<&Value>) -> Option<bool> {
+    match value? {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => match s.as_str() {
+            "true" | "strict" | "runtime" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// What a mapping indexes of a document, object by object. A path it does
+/// not index is kept in the source only, as OpenSearch keeps it: every path
+/// under an object with `enabled: false`, every path of a mapping with
+/// `enabled: false` at its root, and a path no property maps under an object
+/// with `dynamic: false` (set on it, or on the nearest object above it that
+/// sets one). OpenSearch takes any value there, of a different shape in each
+/// document, so such a path gets no column: the first document's value would
+/// type one, and a later document with another shape there would be refused
+/// by the table after OpenSearch had acknowledged it.
+///
+/// A path under a mapped field of any other type (a `geo_point` given as an
+/// object, a `flat_object`'s members) is that field's, and kept. So is a path
+/// no property maps where new fields are mapped (`dynamic` true, the
+/// default): the document's mapping update maps it before it is written.
+/// A table no mapping has been declared for indexes every path.
+#[derive(Debug, Default, PartialEq)]
+struct Indexed {
+    /// `enabled: false`: nothing at or under this object is indexed.
+    disabled: bool,
+    /// This object's own `dynamic`, if it sets one ([`mapping_flag`]).
+    dynamic: Option<bool>,
+    /// The object's properties by name: an object's own rule, or None for a
+    /// field of any other type, which keeps every path at or under it.
+    properties: HashMap<String, Option<Indexed>>,
+    /// Whether this object, or one under it, leaves anything out: when none
+    /// does, every path is indexed and no row is looked at.
+    leaves_out: bool,
+}
+
+impl Indexed {
+    /// What `mapping` indexes, from its root object ([`root_of`]).
+    fn of(mapping: &Value) -> Self {
+        root_of(mapping).map(Self::object).unwrap_or_default()
+    }
+
+    /// The rule of one object of the mapping, or of its root.
+    fn object(def: &Map<String, Value>) -> Self {
+        let disabled = mapping_flag(def.get("enabled")) == Some(false);
+        let dynamic = mapping_flag(def.get("dynamic"));
+        let mut properties = HashMap::new();
+        if let Some(props) = def.get("properties").and_then(Value::as_object) {
+            for (name, field) in props {
+                let Some(field) = field.as_object() else {
+                    continue;
+                };
+                let object = matches!(
+                    field.get("type").and_then(Value::as_str),
+                    None | Some("object") | Some("nested")
+                );
+                properties.insert(name.clone(), object.then(|| Self::object(field)));
+            }
+        }
+        let leaves_out = disabled
+            || dynamic == Some(false)
+            || properties.values().flatten().any(|child| child.leaves_out);
+        Indexed {
+            disabled,
+            dynamic,
+            properties,
+            leaves_out,
+        }
+    }
+
+    /// Whether the flattened `path` ([`flatten`]) is indexed. A property
+    /// whose name holds a dot matches as one name, as a mapping may spell it.
+    fn indexes(&self, path: &str) -> bool {
+        let mut node = self;
+        // A new field is mapped unless an object above it says otherwise.
+        let mut dynamic = true;
+        let mut rest = path;
+        loop {
+            if node.disabled {
+                return false;
+            }
+            if let Some(d) = node.dynamic {
+                dynamic = d;
+            }
+            let found = rest
+                .match_indices('.')
+                .map(|(at, _)| at)
+                .chain(iter::once(rest.len()))
+                .find_map(|end| node.properties.get(&rest[..end]).map(|p| (end, p)));
+            match found {
+                None => return dynamic,
+                Some((_, None)) => return true,
+                // A value given where the mapping has an object: the object's own.
+                Some((end, Some(child))) if end == rest.len() => return !child.disabled,
+                Some((end, Some(child))) => {
+                    node = child;
+                    rest = &rest[end + 1..];
+                }
+            }
+        }
+    }
+
+    /// Leave out of `flat`, a document's flattened row, every path this
+    /// mapping does not index.
+    fn keep_indexed(&self, flat: &mut Map<String, Value>) {
+        if self.leaves_out {
+            flat.retain(|path, _| self.indexes(path));
+        }
+    }
 }
 
 /// Create the table from the mapping, or bring an existing table's schema up
@@ -2138,6 +2307,7 @@ fn declare_table(
         bridge.keep_rules(name, &mapped);
         bridge.engine_rule(name, engine_columns);
         bridge.stamp_rule(name, mapping);
+        bridge.index_rule(name, mapping);
         if !attached {
             bridge.attach_rule(name, None);
         }
@@ -2935,6 +3105,7 @@ pub unsafe extern "C" fn infino_check_doc(
                 &conn.engine_columns(name),
                 stamp.as_deref(),
                 &ignored,
+                &conn.indexed(name),
             ) {
                 Ok(_) => String::new(),
                 Err(why) => why,
@@ -3108,6 +3279,18 @@ fn is_at_or_under(path: &str, field: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
+/// The column of `schema` that the flattened `path`, one `schema` has no
+/// column for, would nest under: `body` for `body.a` once a document has
+/// given `body` a value of its own. The engine refuses such a path in every
+/// commit (it would become a second column beside the one there), so a
+/// document carrying it is refused when checked, not lost after OpenSearch
+/// acknowledged it.
+fn live_column_above<'a>(path: &'a str, schema: &Schema) -> Option<&'a str> {
+    path.match_indices('.')
+        .map(|(at, _)| &path[..at])
+        .find(|prefix| schema.field_with_name(prefix).is_ok())
+}
+
 /// Parse, flatten and conform one document to the declared columns. The
 /// row it returns is what the engine is given. A declared field the document
 /// gives several values goes to its list column ([`LIST_SUFFIX`]), each
@@ -3131,6 +3314,7 @@ fn conform_doc(
     engine: &[String],
     stamp: Option<&str>,
     ignored: &[&str],
+    indexed: &Indexed,
 ) -> Result<Map<String, Value>, String> {
     let (source, mapped) = mapped_values(source);
     let doc: Value = serde_json::from_str(source).map_err(|e| format!("malformed JSON: {e}"))?;
@@ -3139,6 +3323,7 @@ fn conform_doc(
         .ok_or_else(|| "the document is not an object".to_string())?;
     let mut flat = Map::new();
     flatten(obj, "", &mut flat);
+    indexed.keep_indexed(&mut flat);
     // A declared field the mapper ignored keeps, of several values, those its
     // column takes (OpenSearch drops only the malformed ones); any other path
     // at or under an ignored field has no value OpenSearch indexed.
@@ -3235,6 +3420,14 @@ fn conform_doc(
             ));
         }
         let Some(field) = field else {
+            // A new path under a column the table already holds is refused by
+            // every commit ([`live_column_above`]): say so now, before the
+            // write is acknowledged.
+            if let Some(column) = live_column_above(path, schema) {
+                return Err(format!(
+                    "field [{path}]: the table holds [{column}] as a column of its own, and no field can be added beneath it"
+                ));
+            }
             continue;
         };
         let dt = field.data_type();
@@ -4067,6 +4260,7 @@ pub unsafe extern "C" fn infino_index_batch(
         };
         let schema = table.schema();
         let kept = conn.kept(name);
+        let indexed = conn.indexed(name);
         let engine = conn.engine_columns(name);
         let stamp = conn.stamp(name);
 
@@ -4075,7 +4269,7 @@ pub unsafe extern "C" fn infino_index_batch(
         for i in 0..n {
             let osid = unsafe { cstr(os_p[i]) }.unwrap_or("");
             let source = unsafe { cstr(sr_p[i]) }.unwrap_or("{}");
-            let mut flat = match conform_doc(source, &schema, &kept, &engine, stamp.as_deref(), &[])
+            let mut flat = match conform_doc(source, &schema, &kept, &engine, stamp.as_deref(), &[], &indexed)
             {
                 Ok(flat) => flat,
                 Err(why) => {
@@ -4277,6 +4471,7 @@ unsafe fn prepare(
         .map_err(|e| engine_error_value(&e))?;
     let schema = table.schema();
     let kept = conn.kept(name);
+    let indexed = conn.indexed(name);
     let engine = conn.engine_columns(name);
     let stamp = conn.stamp(name);
     // A table whose ignored column holds something else (a document's own
@@ -4327,7 +4522,7 @@ unsafe fn prepare(
                 seq,
                 op,
             } = row;
-            conform_doc(src, &schema, &kept, &engine, stamp.as_deref(), ignored).map(|mut flat| {
+            conform_doc(src, &schema, &kept, &engine, stamp.as_deref(), ignored, &indexed).map(|mut flat| {
                 flat.insert(OSID.into(), Value::String((*id).to_string()));
                 flat.insert(SOURCE.into(), Value::String(mapped_values(src).0.to_string()));
                 if keeps_ignored && !ignored.is_empty() {
@@ -8462,7 +8657,7 @@ mod tests {
             Field::new("m", DataType::Int64, true),
         ]);
         let row = |doc: &str, ignored: &[&str]| {
-            conform_doc(doc, &schema, &HashMap::new(), &[], None, ignored)
+            conform_doc(doc, &schema, &HashMap::new(), &[], None, ignored, &Indexed::default())
         };
         let flat = row(r#"{"n":[1,"x",3],"m":"y"}"#, &["n", "m"]).unwrap();
         assert_eq!(flat.get("n[]"), Some(&json!([1, 3])), "{flat:?}");
@@ -8495,7 +8690,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let row = |doc: &str, ignored: &[&str]| conform_doc(doc, &schema, &kept, &[], None, ignored);
+        let row = |doc: &str, ignored: &[&str]| conform_doc(doc, &schema, &kept, &[], None, ignored, &Indexed::default());
         let flat = row(r#"{"ip":["10.0.0.1","garbage","::1"]}"#, &["ip"]).unwrap();
         assert_eq!(flat.get("ip[]"), Some(&json!(["10.0.0.1", "::1"])), "{flat:?}");
         let flat = row(r#"{"b":[1,300,-128]}"#, &["b"]).unwrap();
@@ -8533,7 +8728,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let row = |doc: String| conform_doc(&doc, &schema, &kept, &[], None, &[]);
+        let row = |doc: String| conform_doc(&doc, &schema, &kept, &[], None, &[], &Indexed::default());
         let flat = row(r#"{"short":"abcdefgh"}"#.to_string()).unwrap();
         assert_eq!(flat.get("short"), Some(&Value::Null), "{flat:?}");
         let flat = row(r#"{"short":"abc"}"#.to_string()).unwrap();
@@ -9193,7 +9388,7 @@ mod tests {
                     .iter()
                     .map(|(id, src)| {
                         let mut flat =
-                            conform_doc(src, &schema, &conn.kept("bench"), &[], None, &[]).unwrap();
+                            conform_doc(src, &schema, &conn.kept("bench"), &[], None, &[], &Indexed::default()).unwrap();
                         flat.insert(OSID.into(), Value::String(id.clone()));
                         flat.insert(SOURCE.into(), Value::String(src.clone()));
                         flat
@@ -11420,7 +11615,7 @@ mod tests {
 
         let schema = Schema::new(vec![Field::new("message", DataType::LargeUtf8, true)]);
         let kept = HashMap::new();
-        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], Some("@timestamp"), &[]);
+        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], Some("@timestamp"), &[], &Indexed::default());
         assert!(check(r#"{"@timestamp": "2023-01-01T00:00:01Z"}"#).is_ok());
         assert!(check(r#"{"@timestamp": ["2023-01-01T00:00:01Z", null]}"#).is_ok());
         for doc in [
@@ -11430,7 +11625,7 @@ mod tests {
         ] {
             assert_eq!(check(doc), Err(no_timestamp("@timestamp")), "{doc}");
         }
-        assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, &[], None, &[]).is_ok());
+        assert!(conform_doc(r#"{"message": "m"}"#, &schema, &kept, &[], None, &[], &Indexed::default()).is_ok());
     }
 
     /// A write the hosted service could not take is not split into halves:
@@ -12111,7 +12306,7 @@ mod tests {
             ),
         ]);
         let source = r#"{"status": 200.7, "t": "25/Nov/2026:09:30:00 +0100", "t3": "1795595400", "gone": null}"#;
-        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], None, &[]);
+        let check = |doc: &str| conform_doc(doc, &schema, &kept, &[], None, &[], &Indexed::default());
         let refused = check(source).unwrap_err();
         assert!(
             refused.contains("fractional") || refused.contains("failed to parse date"),
@@ -12154,7 +12349,7 @@ mod tests {
             "t".to_string(),
             Kept::Date(DateFormat::parse_all("dd/MMM/yyyy:HH:mm:ss Z")),
         )]);
-        let row = |doc: String, ignored: &[&str]| conform_doc(&doc, &schema, &kept, &[], None, ignored);
+        let row = |doc: String, ignored: &[&str]| conform_doc(&doc, &schema, &kept, &[], None, ignored, &Indexed::default());
 
         let source = r#"{"n": [1, 2.5, "x"], "t": ["25/Nov/2026:09:30:00 +0100", "never"]}"#;
         let values = r#"{"n": [1, 2], "t": [1795595400000]}"#;
@@ -12168,5 +12363,128 @@ mod tests {
         // At a field not ignored, fewer values than the source gives stand in for none.
         let fewer = format!(r#"{{"n": [1, 2.5]}}{MAPPED_VALUES}{{"n": [1]}}"#);
         assert!(row(fewer, &[]).is_err());
+    }
+
+    /// What a mapping indexes ([`Indexed`]): nothing at or under an object
+    /// with `enabled: false`, nothing at all under a root that says so, and
+    /// no field a property does not map under `dynamic: false`, where the
+    /// nearest object that sets `dynamic` decides. A path under a mapped
+    /// field of any other type is that field's (#294).
+    #[test]
+    fn a_mapping_indexes_neither_a_disabled_object_nor_an_unmapped_field_under_dynamic_false() {
+        let disabled = Indexed::of(&json!({"properties": {
+            "tag": {"type": "keyword"},
+            "body": {"type": "object", "enabled": false, "properties": {"a": {"type": "long"}}},
+            "meta": {"properties": {"raw": {"enabled": false}, "n": {"type": "long"}}}
+        }}));
+        assert!(disabled.leaves_out);
+        for path in ["body", "body.a", "body.a.b", "meta.raw", "meta.raw.x"] {
+            assert!(!disabled.indexes(path), "{path}");
+        }
+        // A new field elsewhere is mapped by its document's mapping update.
+        for path in ["tag", "meta.n", "meta.other", "other", "other.x"] {
+            assert!(disabled.indexes(path), "{path}");
+        }
+        // Nothing under the disabled object is a column either.
+        let fields = mapped_fields(&json!({"properties": {
+            "body": {"type": "object", "enabled": false, "properties": {"a": {"type": "long"}}},
+            "n": {"type": "long"}
+        }}));
+        assert_eq!(fields.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["n"]);
+
+        // As OpenSearch hands a mapping over: wrapped, its flags as strings.
+        let loose = Indexed::of(&json!({"_doc": {"dynamic": "false", "properties": {
+            "tag": {"type": "keyword"},
+            "loc": {"type": "geo_point"},
+            "open": {"dynamic": true, "properties": {"k": {"type": "keyword"}}},
+            "deep": {"properties": {"k": {"type": "keyword"}}}
+        }}}));
+        for path in ["data", "data.a", "deep.free", "deep.free.x"] {
+            assert!(!loose.indexes(path), "{path}");
+        }
+        for path in ["tag", "loc.lat", "loc", "open.new", "open.new.x", "deep.k"] {
+            assert!(loose.indexes(path), "{path}");
+        }
+
+        // `enabled: false` at the root: the whole document is source only.
+        let root = Indexed::of(&json!({"mappings": {"enabled": false}}));
+        assert!(!root.indexes("anything") && !root.indexes("a.b"));
+        assert!(mapped_fields(&json!({"enabled": false, "properties": {"n": {"type": "long"}}})).is_empty());
+
+        // A mapping that leaves nothing out looks at no row; a strict one
+        // refuses a new field before it is written, so it reads as indexed.
+        let plain = Indexed::of(&json!({"dynamic": "strict", "properties": {"n": {"type": "long"}}}));
+        assert!(!plain.leaves_out);
+        assert!(!Indexed::default().leaves_out && Indexed::default().indexes("x.y"));
+        // A property spelled with a dot matches as one name.
+        let dotted = Indexed::of(&json!({"dynamic": false, "properties": {"a.b": {"type": "long"}}}));
+        assert!(dotted.indexes("a.b") && !dotted.indexes("a.c"));
+    }
+
+    /// A field the mapping does not index takes a value of any shape in each
+    /// document: an object, a string, an array (of arrays too), a number.
+    /// Each is written in its own commit, none is refused, the table holds
+    /// no column for the field, and the source keeps it whole. A table that
+    /// already holds a column for such a field, typed by an earlier
+    /// document, keeps it and its old values; a later document leaves it
+    /// null rather than being refused for a value it cannot take (#294).
+    #[test]
+    fn a_field_the_mapping_does_not_index_takes_any_shape_and_gets_no_column() {
+        let h = open_storage();
+        let bridge = bridge_ref(h).unwrap();
+        // Written before the rule: a document typed `body.a` as a number.
+        let out = ensure(h, r#"{"properties":{"tag":{"type":"keyword"}}}"#);
+        assert!(out.contains("\"created\":true"), "{out}");
+        assert_eq!(index(h, &[("old", r#"{"tag":"o","body":{"a":1}}"#)])["ok"], 1);
+        let schema = || bridge.conn.open_table("logs").unwrap().schema();
+        assert!(schema().field_with_name("body.a").is_ok());
+
+        let mapping = r#"{"dynamic":"false","properties":{"tag":{"type":"keyword"},
+            "body":{"type":"object","enabled":false}}}"#;
+        let out = ensure(h, mapping);
+        assert!(out.contains("\"created\":false"), "{out}");
+        let docs = [
+            ("d0", r#"{"tag":"a","body":{"a":"now a string"},"data":{"x":1}}"#),
+            ("d1", r#"{"tag":"b","body":"text","data":"text"}"#),
+            ("d2", r#"{"tag":"c","body":[1,"x",{"a":"y"}],"data":[[1,2],[3]]}"#),
+            ("d3", r#"{"tag":"d","body":7,"data":{"x":{"y":[true]}}}"#),
+        ];
+        for (id, doc) in docs {
+            assert_eq!(check(h, doc), "", "{id}");
+            let out = index(h, &[(id, doc)]);
+            assert_eq!(out["ok"], 1, "{id}: {out}");
+        }
+        let schema = schema();
+        for column in ["body", "data", "data.x", "body.a[]", "data[]"] {
+            assert!(schema.field_with_name(column).is_err(), "{column}: {schema:?}");
+        }
+        for (id, doc) in docs {
+            assert_eq!(get(h, id), doc, "{id}");
+        }
+        let rows = sql(h, r#"SELECT osid, "body.a", tag FROM logs ORDER BY osid"#);
+        assert_eq!(rows.as_array().map(Vec::len), Some(5), "{rows}");
+        assert_eq!(rows[4]["osid"], "old", "{rows}");
+        assert_eq!(rows[4]["body.a"], 1, "{rows}");
+        assert!(rows[0]["body.a"].is_null(), "{rows}");
+        assert_eq!(rows[2]["tag"], "c", "{rows}");
+        close(h);
+    }
+
+    /// A new path beneath a column the table already holds is refused by
+    /// every commit, so the check refuses it too: a write is answered with
+    /// the reason before it is acknowledged, rather than lost at the commit.
+    #[test]
+    fn a_path_beneath_a_live_column_is_refused_when_checked() {
+        let h = open_storage();
+        let out = ensure(h, r#"{"properties":{"tag":{"type":"keyword"}}}"#);
+        assert!(out.contains("\"created\":true"), "{out}");
+        assert_eq!(index(h, &[("a", r#"{"tag":"a","loc":"40,-70"}"#)])["ok"], 1);
+        let doc = r#"{"tag":"b","loc":{"lat":40,"lon":-70}}"#;
+        let why = check(h, doc);
+        assert!(why.contains("[loc.lat]") && why.contains("[loc]"), "{why}");
+        assert_ne!(index(h, &[("b", doc)])["ok"], 1);
+        // A path beside the column, or the column itself, is no conflict.
+        assert_eq!(check(h, r#"{"tag":"c","loc":"1,2","locale":{"x":1}}"#), "");
+        close(h);
     }
 }

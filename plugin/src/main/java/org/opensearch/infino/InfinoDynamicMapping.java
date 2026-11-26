@@ -73,8 +73,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * index and round, and none once its fields are mapped.
  *
  * <p>A field the table already holds as a column the mapping does not name
- * (written before this rule, or under {@code dynamic: false}) is left as it
- * is: a column's text index is fixed when the column is added, so mapping
+ * (written before this rule, or under {@code dynamic: false} by a release
+ * that still gave such a field a column) is left as it is: a column's text index is fixed when the column is added, so mapping
  * it as text now would only make the table refuse the mapping.
  */
 final class InfinoDynamicMapping {

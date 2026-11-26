@@ -1,0 +1,536 @@
+# A field the mapping does not index is kept in _source only: an object
+# with enabled: false, a field left unmapped under dynamic: false, and every
+# field of a mapping that sets enabled: false at its root. Its value may take
+# a different shape in each document (an object, a string, an array), and
+# every document is stored and returned whole, as stock stores it. Each case
+# runs the same documents, one bulk each so each lands in its own commit,
+# into a Lucene twin, a proxy-mode index and a default-mode index.
+---
+"An object with enabled: false takes a value of any shape in each document and keeps it in _source":
+  - do:
+      indices.create:
+        index: uf_obj_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"properties": {"tag": {"type": "keyword"}, "msg": {"type": "text"}, "body": {"type": "object", "enabled": false}, "meta": {"properties": {"raw": {"type": "object", "enabled": false}, "n": {"type": "long"}}}}}
+  - do:
+      indices.create:
+        index: uf_obj_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"properties": {"tag": {"type": "keyword"}, "msg": {"type": "text"}, "body": {"type": "object", "enabled": false}, "meta": {"properties": {"raw": {"type": "object", "enabled": false}, "n": {"type": "long"}}}}}
+  - do:
+      indices.create:
+        index: uf_obj_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"properties": {"tag": {"type": "keyword"}, "msg": {"type": "text"}, "body": {"type": "object", "enabled": false}, "meta": {"properties": {"raw": {"type": "object", "enabled": false}, "n": {"type": "long"}}}}}
+  # luc
+  - do: { index: { index: uf_obj_luc, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "body": {"a": 1}, "meta": {"raw": 7, "n": 0}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_obj_luc, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "body": "text", "meta": {"raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "n": 1}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_obj_luc, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "body": [1, "x", {"a": "y"}], "meta": {"raw": [1, "x", {"a": "y"}], "n": 2}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_obj_luc, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "body": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "meta": {"raw": "text", "n": 3}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_obj_luc, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "body": 7, "meta": {"raw": {"a": 1}, "n": 4}} } }
+  - match: { result: created }
+  - do: { count: { index: uf_obj_luc } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_obj_luc, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "body": {"a": 1}, "meta": {"raw": 7, "n": 0}} }
+  - do: { get: { index: uf_obj_luc, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "body": "text", "meta": {"raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "n": 1}} }
+  - do: { get: { index: uf_obj_luc, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "body": [1, "x", {"a": "y"}], "meta": {"raw": [1, "x", {"a": "y"}], "n": 2}} }
+  - do: { get: { index: uf_obj_luc, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "body": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "meta": {"raw": "text", "n": 3}} }
+  - do: { get: { index: uf_obj_luc, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "body": 7, "meta": {"raw": {"a": 1}, "n": 4}} }
+  - do: { search: { index: uf_obj_luc, body: { query: { match: { msg: hello } } } } }
+  - match: { hits.total.value: 5 }
+  - do: { search: { index: uf_obj_luc, body: { query: { term: { tag: t1 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "body": "text", "meta": {"raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "n": 1}} }
+  # px
+  - do: { index: { index: uf_obj_px, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "body": {"a": 1}, "meta": {"raw": 7, "n": 0}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_obj_px, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "body": "text", "meta": {"raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "n": 1}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_obj_px, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "body": [1, "x", {"a": "y"}], "meta": {"raw": [1, "x", {"a": "y"}], "n": 2}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_obj_px, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "body": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "meta": {"raw": "text", "n": 3}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_obj_px, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "body": 7, "meta": {"raw": {"a": 1}, "n": 4}} } }
+  - match: { result: created }
+  - do: { count: { index: uf_obj_px } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_obj_px, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "body": {"a": 1}, "meta": {"raw": 7, "n": 0}} }
+  - do: { get: { index: uf_obj_px, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "body": "text", "meta": {"raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "n": 1}} }
+  - do: { get: { index: uf_obj_px, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "body": [1, "x", {"a": "y"}], "meta": {"raw": [1, "x", {"a": "y"}], "n": 2}} }
+  - do: { get: { index: uf_obj_px, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "body": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "meta": {"raw": "text", "n": 3}} }
+  - do: { get: { index: uf_obj_px, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "body": 7, "meta": {"raw": {"a": 1}, "n": 4}} }
+  - do: { search: { index: uf_obj_px, body: { query: { match: { msg: hello } } } } }
+  - match: { hits.total.value: 5 }
+  - do: { search: { index: uf_obj_px, body: { query: { term: { tag: t1 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "body": "text", "meta": {"raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "n": 1}} }
+  # def
+  - do: { index: { index: uf_obj_def, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "body": {"a": 1}, "meta": {"raw": 7, "n": 0}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_obj_def, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "body": "text", "meta": {"raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "n": 1}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_obj_def, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "body": [1, "x", {"a": "y"}], "meta": {"raw": [1, "x", {"a": "y"}], "n": 2}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_obj_def, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "body": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "meta": {"raw": "text", "n": 3}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_obj_def, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "body": 7, "meta": {"raw": {"a": 1}, "n": 4}} } }
+  - match: { result: created }
+  - do: { count: { index: uf_obj_def } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_obj_def, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "body": {"a": 1}, "meta": {"raw": 7, "n": 0}} }
+  - do: { get: { index: uf_obj_def, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "body": "text", "meta": {"raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "n": 1}} }
+  - do: { get: { index: uf_obj_def, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "body": [1, "x", {"a": "y"}], "meta": {"raw": [1, "x", {"a": "y"}], "n": 2}} }
+  - do: { get: { index: uf_obj_def, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "body": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "meta": {"raw": "text", "n": 3}} }
+  - do: { get: { index: uf_obj_def, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "body": 7, "meta": {"raw": {"a": 1}, "n": 4}} }
+  - do: { search: { index: uf_obj_def, body: { query: { match: { msg: hello } } } } }
+  - match: { hits.total.value: 5 }
+  - do: { search: { index: uf_obj_def, body: { query: { term: { tag: t1 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "body": "text", "meta": {"raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "n": 1}} }
+---
+"A field left unmapped under dynamic: false takes a value of any shape in each document and keeps it in _source":
+  - do:
+      indices.create:
+        index: uf_dyn_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"dynamic": false, "properties": {"tag": {"type": "keyword"}, "msg": {"type": "text"}}}
+  - do:
+      indices.create:
+        index: uf_dyn_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"dynamic": false, "properties": {"tag": {"type": "keyword"}, "msg": {"type": "text"}}}
+  - do:
+      indices.create:
+        index: uf_dyn_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"dynamic": false, "properties": {"tag": {"type": "keyword"}, "msg": {"type": "text"}}}
+  # luc
+  - do: { index: { index: uf_dyn_luc, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "data": {"a": 1}, "data2": 7} } }
+  - match: { result: created }
+  - do: { index: { index: uf_dyn_luc, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "data": "text", "data2": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_dyn_luc, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "data": [1, "x", {"a": "y"}], "data2": [1, "x", {"a": "y"}]} } }
+  - match: { result: created }
+  - do: { index: { index: uf_dyn_luc, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "data": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "data2": "text"} } }
+  - match: { result: created }
+  - do: { index: { index: uf_dyn_luc, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "data": 7, "data2": {"a": 1}} } }
+  - match: { result: created }
+  - do: { count: { index: uf_dyn_luc } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_dyn_luc, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "data": {"a": 1}, "data2": 7} }
+  - do: { get: { index: uf_dyn_luc, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "data": "text", "data2": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} }
+  - do: { get: { index: uf_dyn_luc, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "data": [1, "x", {"a": "y"}], "data2": [1, "x", {"a": "y"}]} }
+  - do: { get: { index: uf_dyn_luc, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "data": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "data2": "text"} }
+  - do: { get: { index: uf_dyn_luc, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "data": 7, "data2": {"a": 1}} }
+  - do: { search: { index: uf_dyn_luc, body: { query: { match: { msg: hello } } } } }
+  - match: { hits.total.value: 5 }
+  - do: { search: { index: uf_dyn_luc, body: { query: { term: { tag: t1 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "data": "text", "data2": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} }
+  - do: { search: { index: uf_dyn_luc, body: { query: { exists: { field: data } } } } }
+  - match: { hits.total.value: 0 }
+  # px
+  - do: { index: { index: uf_dyn_px, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "data": {"a": 1}, "data2": 7} } }
+  - match: { result: created }
+  - do: { index: { index: uf_dyn_px, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "data": "text", "data2": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_dyn_px, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "data": [1, "x", {"a": "y"}], "data2": [1, "x", {"a": "y"}]} } }
+  - match: { result: created }
+  - do: { index: { index: uf_dyn_px, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "data": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "data2": "text"} } }
+  - match: { result: created }
+  - do: { index: { index: uf_dyn_px, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "data": 7, "data2": {"a": 1}} } }
+  - match: { result: created }
+  - do: { count: { index: uf_dyn_px } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_dyn_px, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "data": {"a": 1}, "data2": 7} }
+  - do: { get: { index: uf_dyn_px, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "data": "text", "data2": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} }
+  - do: { get: { index: uf_dyn_px, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "data": [1, "x", {"a": "y"}], "data2": [1, "x", {"a": "y"}]} }
+  - do: { get: { index: uf_dyn_px, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "data": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "data2": "text"} }
+  - do: { get: { index: uf_dyn_px, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "data": 7, "data2": {"a": 1}} }
+  - do: { search: { index: uf_dyn_px, body: { query: { match: { msg: hello } } } } }
+  - match: { hits.total.value: 5 }
+  - do: { search: { index: uf_dyn_px, body: { query: { term: { tag: t1 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "data": "text", "data2": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} }
+  - do: { search: { index: uf_dyn_px, body: { query: { exists: { field: data } } } } }
+  - match: { hits.total.value: 0 }
+  # def
+  - do: { index: { index: uf_dyn_def, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "data": {"a": 1}, "data2": 7} } }
+  - match: { result: created }
+  - do: { index: { index: uf_dyn_def, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "data": "text", "data2": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_dyn_def, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "data": [1, "x", {"a": "y"}], "data2": [1, "x", {"a": "y"}]} } }
+  - match: { result: created }
+  - do: { index: { index: uf_dyn_def, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "data": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "data2": "text"} } }
+  - match: { result: created }
+  - do: { index: { index: uf_dyn_def, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "data": 7, "data2": {"a": 1}} } }
+  - match: { result: created }
+  - do: { count: { index: uf_dyn_def } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_dyn_def, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "data": {"a": 1}, "data2": 7} }
+  - do: { get: { index: uf_dyn_def, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "data": "text", "data2": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} }
+  - do: { get: { index: uf_dyn_def, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "data": [1, "x", {"a": "y"}], "data2": [1, "x", {"a": "y"}]} }
+  - do: { get: { index: uf_dyn_def, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "data": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}, "data2": "text"} }
+  - do: { get: { index: uf_dyn_def, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "data": 7, "data2": {"a": 1}} }
+  - do: { search: { index: uf_dyn_def, body: { query: { match: { msg: hello } } } } }
+  - match: { hits.total.value: 5 }
+  - do: { search: { index: uf_dyn_def, body: { query: { term: { tag: t1 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "data": "text", "data2": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} }
+  - do: { search: { index: uf_dyn_def, body: { query: { exists: { field: data } } } } }
+  - match: { hits.total.value: 0 }
+---
+"A mapping with enabled: false at its root keeps every document whole in _source":
+  - do:
+      indices.create:
+        index: uf_root_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"enabled": false}
+  - do:
+      indices.create:
+        index: uf_root_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"enabled": false}
+  - do:
+      indices.create:
+        index: uf_root_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"enabled": false}
+  # luc
+  - do: { index: { index: uf_root_luc, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "body": {"a": 1}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_root_luc, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "body": "text"} } }
+  - match: { result: created }
+  - do: { index: { index: uf_root_luc, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "body": [1, "x", {"a": "y"}]} } }
+  - match: { result: created }
+  - do: { index: { index: uf_root_luc, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "body": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_root_luc, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "body": 7} } }
+  - match: { result: created }
+  - do: { count: { index: uf_root_luc } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_root_luc, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "body": {"a": 1}} }
+  - do: { get: { index: uf_root_luc, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "body": "text"} }
+  - do: { get: { index: uf_root_luc, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "body": [1, "x", {"a": "y"}]} }
+  - do: { get: { index: uf_root_luc, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "body": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} }
+  - do: { get: { index: uf_root_luc, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "body": 7} }
+  - do: { search: { index: uf_root_luc, body: { query: { match_all: {} }, sort: [ _doc ] } } }
+  - match: { hits.total.value: 5 }
+  # px
+  - do: { index: { index: uf_root_px, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "body": {"a": 1}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_root_px, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "body": "text"} } }
+  - match: { result: created }
+  - do: { index: { index: uf_root_px, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "body": [1, "x", {"a": "y"}]} } }
+  - match: { result: created }
+  - do: { index: { index: uf_root_px, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "body": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_root_px, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "body": 7} } }
+  - match: { result: created }
+  - do: { count: { index: uf_root_px } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_root_px, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "body": {"a": 1}} }
+  - do: { get: { index: uf_root_px, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "body": "text"} }
+  - do: { get: { index: uf_root_px, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "body": [1, "x", {"a": "y"}]} }
+  - do: { get: { index: uf_root_px, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "body": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} }
+  - do: { get: { index: uf_root_px, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "body": 7} }
+  - do: { search: { index: uf_root_px, body: { query: { match_all: {} }, sort: [ _doc ] } } }
+  - match: { hits.total.value: 5 }
+  # def
+  - do: { index: { index: uf_root_def, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "body": {"a": 1}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_root_def, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "body": "text"} } }
+  - match: { result: created }
+  - do: { index: { index: uf_root_def, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "body": [1, "x", {"a": "y"}]} } }
+  - match: { result: created }
+  - do: { index: { index: uf_root_def, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "body": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_root_def, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "body": 7} } }
+  - match: { result: created }
+  - do: { count: { index: uf_root_def } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_root_def, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "body": {"a": 1}} }
+  - do: { get: { index: uf_root_def, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "body": "text"} }
+  - do: { get: { index: uf_root_def, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "body": [1, "x", {"a": "y"}]} }
+  - do: { get: { index: uf_root_def, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "body": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} }
+  - do: { get: { index: uf_root_def, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "body": 7} }
+  - do: { search: { index: uf_root_def, body: { query: { match_all: {} }, sort: [ _doc ] } } }
+  - match: { hits.total.value: 5 }
+---
+"A dynamic template that maps an object with enabled: false keeps its later shapes in _source":
+  - do:
+      indices.create:
+        index: uf_tpl_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"dynamic_templates": [{"blobs": {"match": "blob*", "match_mapping_type": "object", "mapping": {"type": "object", "enabled": false}}}], "properties": {"tag": {"type": "keyword"}, "msg": {"type": "text"}}}
+  - do:
+      indices.create:
+        index: uf_tpl_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"dynamic_templates": [{"blobs": {"match": "blob*", "match_mapping_type": "object", "mapping": {"type": "object", "enabled": false}}}], "properties": {"tag": {"type": "keyword"}, "msg": {"type": "text"}}}
+  - do:
+      indices.create:
+        index: uf_tpl_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"dynamic_templates": [{"blobs": {"match": "blob*", "match_mapping_type": "object", "mapping": {"type": "object", "enabled": false}}}], "properties": {"tag": {"type": "keyword"}, "msg": {"type": "text"}}}
+  # luc
+  - do: { index: { index: uf_tpl_luc, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "blob": {"a": 1}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_tpl_luc, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "blob": "text"} } }
+  - match: { result: created }
+  - do: { index: { index: uf_tpl_luc, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "blob": [1, "x", {"a": "y"}]} } }
+  - match: { result: created }
+  - do: { index: { index: uf_tpl_luc, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "blob": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_tpl_luc, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "blob": 7} } }
+  - match: { result: created }
+  - do: { count: { index: uf_tpl_luc } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_tpl_luc, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "blob": {"a": 1}} }
+  - do: { get: { index: uf_tpl_luc, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "blob": "text"} }
+  - do: { get: { index: uf_tpl_luc, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "blob": [1, "x", {"a": "y"}]} }
+  - do: { get: { index: uf_tpl_luc, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "blob": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} }
+  - do: { get: { index: uf_tpl_luc, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "blob": 7} }
+  - do: { search: { index: uf_tpl_luc, body: { query: { match: { msg: hello } } } } }
+  - match: { hits.total.value: 5 }
+  - do: { search: { index: uf_tpl_luc, body: { query: { term: { tag: t1 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "blob": "text"} }
+  # px
+  - do: { index: { index: uf_tpl_px, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "blob": {"a": 1}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_tpl_px, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "blob": "text"} } }
+  - match: { result: created }
+  - do: { index: { index: uf_tpl_px, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "blob": [1, "x", {"a": "y"}]} } }
+  - match: { result: created }
+  - do: { index: { index: uf_tpl_px, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "blob": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_tpl_px, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "blob": 7} } }
+  - match: { result: created }
+  - do: { count: { index: uf_tpl_px } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_tpl_px, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "blob": {"a": 1}} }
+  - do: { get: { index: uf_tpl_px, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "blob": "text"} }
+  - do: { get: { index: uf_tpl_px, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "blob": [1, "x", {"a": "y"}]} }
+  - do: { get: { index: uf_tpl_px, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "blob": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} }
+  - do: { get: { index: uf_tpl_px, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "blob": 7} }
+  - do: { search: { index: uf_tpl_px, body: { query: { match: { msg: hello } } } } }
+  - match: { hits.total.value: 5 }
+  - do: { search: { index: uf_tpl_px, body: { query: { term: { tag: t1 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "blob": "text"} }
+  # def
+  - do: { index: { index: uf_tpl_def, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "blob": {"a": 1}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_tpl_def, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "blob": "text"} } }
+  - match: { result: created }
+  - do: { index: { index: uf_tpl_def, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "blob": [1, "x", {"a": "y"}]} } }
+  - match: { result: created }
+  - do: { index: { index: uf_tpl_def, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "blob": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_tpl_def, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "blob": 7} } }
+  - match: { result: created }
+  - do: { count: { index: uf_tpl_def } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_tpl_def, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "blob": {"a": 1}} }
+  - do: { get: { index: uf_tpl_def, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "blob": "text"} }
+  - do: { get: { index: uf_tpl_def, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "blob": [1, "x", {"a": "y"}]} }
+  - do: { get: { index: uf_tpl_def, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "blob": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}} }
+  - do: { get: { index: uf_tpl_def, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "blob": 7} }
+  - do: { search: { index: uf_tpl_def, body: { query: { match: { msg: hello } } } } }
+  - match: { hits.total.value: 5 }
+  - do: { search: { index: uf_tpl_def, body: { query: { term: { tag: t1 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "blob": "text"} }
+---
+"An object with enabled: false under a mapped object, and under a dynamic: false object, keeps its shapes in _source":
+  - do:
+      indices.create:
+        index: uf_deep_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"properties": {"tag": {"type": "keyword"}, "msg": {"type": "text"}, "outer": {"properties": {"n": {"type": "long"}, "raw": {"type": "object", "enabled": false}}}, "loose": {"type": "object", "dynamic": false, "properties": {"k": {"type": "keyword"}}}}}
+  - do:
+      indices.create:
+        index: uf_deep_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"properties": {"tag": {"type": "keyword"}, "msg": {"type": "text"}, "outer": {"properties": {"n": {"type": "long"}, "raw": {"type": "object", "enabled": false}}}, "loose": {"type": "object", "dynamic": false, "properties": {"k": {"type": "keyword"}}}}}
+  - do:
+      indices.create:
+        index: uf_deep_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: {"properties": {"tag": {"type": "keyword"}, "msg": {"type": "text"}, "outer": {"properties": {"n": {"type": "long"}, "raw": {"type": "object", "enabled": false}}}, "loose": {"type": "object", "dynamic": false, "properties": {"k": {"type": "keyword"}}}}}
+  # luc
+  - do: { index: { index: uf_deep_luc, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "outer": {"n": 0, "raw": {"a": 1}}, "loose": {"k": "t0", "free": 7}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_deep_luc, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "outer": {"n": 1, "raw": "text"}, "loose": {"k": "t1", "free": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_deep_luc, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "outer": {"n": 2, "raw": [1, "x", {"a": "y"}]}, "loose": {"k": "t2", "free": [1, "x", {"a": "y"}]}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_deep_luc, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "outer": {"n": 3, "raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}, "loose": {"k": "t3", "free": "text"}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_deep_luc, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "outer": {"n": 4, "raw": 7}, "loose": {"k": "t4", "free": {"a": 1}}} } }
+  - match: { result: created }
+  - do: { count: { index: uf_deep_luc } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_deep_luc, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "outer": {"n": 0, "raw": {"a": 1}}, "loose": {"k": "t0", "free": 7}} }
+  - do: { get: { index: uf_deep_luc, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "outer": {"n": 1, "raw": "text"}, "loose": {"k": "t1", "free": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}} }
+  - do: { get: { index: uf_deep_luc, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "outer": {"n": 2, "raw": [1, "x", {"a": "y"}]}, "loose": {"k": "t2", "free": [1, "x", {"a": "y"}]}} }
+  - do: { get: { index: uf_deep_luc, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "outer": {"n": 3, "raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}, "loose": {"k": "t3", "free": "text"}} }
+  - do: { get: { index: uf_deep_luc, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "outer": {"n": 4, "raw": 7}, "loose": {"k": "t4", "free": {"a": 1}}} }
+  - do: { search: { index: uf_deep_luc, body: { query: { match: { msg: hello } } } } }
+  - match: { hits.total.value: 5 }
+  - do: { search: { index: uf_deep_luc, body: { query: { term: { tag: t1 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "outer": {"n": 1, "raw": "text"}, "loose": {"k": "t1", "free": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}} }
+  # px
+  - do: { index: { index: uf_deep_px, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "outer": {"n": 0, "raw": {"a": 1}}, "loose": {"k": "t0", "free": 7}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_deep_px, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "outer": {"n": 1, "raw": "text"}, "loose": {"k": "t1", "free": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_deep_px, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "outer": {"n": 2, "raw": [1, "x", {"a": "y"}]}, "loose": {"k": "t2", "free": [1, "x", {"a": "y"}]}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_deep_px, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "outer": {"n": 3, "raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}, "loose": {"k": "t3", "free": "text"}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_deep_px, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "outer": {"n": 4, "raw": 7}, "loose": {"k": "t4", "free": {"a": 1}}} } }
+  - match: { result: created }
+  - do: { count: { index: uf_deep_px } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_deep_px, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "outer": {"n": 0, "raw": {"a": 1}}, "loose": {"k": "t0", "free": 7}} }
+  - do: { get: { index: uf_deep_px, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "outer": {"n": 1, "raw": "text"}, "loose": {"k": "t1", "free": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}} }
+  - do: { get: { index: uf_deep_px, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "outer": {"n": 2, "raw": [1, "x", {"a": "y"}]}, "loose": {"k": "t2", "free": [1, "x", {"a": "y"}]}} }
+  - do: { get: { index: uf_deep_px, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "outer": {"n": 3, "raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}, "loose": {"k": "t3", "free": "text"}} }
+  - do: { get: { index: uf_deep_px, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "outer": {"n": 4, "raw": 7}, "loose": {"k": "t4", "free": {"a": 1}}} }
+  - do: { search: { index: uf_deep_px, body: { query: { match: { msg: hello } } } } }
+  - match: { hits.total.value: 5 }
+  - do: { search: { index: uf_deep_px, body: { query: { term: { tag: t1 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "outer": {"n": 1, "raw": "text"}, "loose": {"k": "t1", "free": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}} }
+  # def
+  - do: { index: { index: uf_deep_def, id: d0, refresh: true, body: {"tag": "t0", "msg": "hello number 0", "outer": {"n": 0, "raw": {"a": 1}}, "loose": {"k": "t0", "free": 7}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_deep_def, id: d1, refresh: true, body: {"tag": "t1", "msg": "hello number 1", "outer": {"n": 1, "raw": "text"}, "loose": {"k": "t1", "free": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_deep_def, id: d2, refresh: true, body: {"tag": "t2", "msg": "hello number 2", "outer": {"n": 2, "raw": [1, "x", {"a": "y"}]}, "loose": {"k": "t2", "free": [1, "x", {"a": "y"}]}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_deep_def, id: d3, refresh: true, body: {"tag": "t3", "msg": "hello number 3", "outer": {"n": 3, "raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}, "loose": {"k": "t3", "free": "text"}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_deep_def, id: d4, refresh: true, body: {"tag": "t4", "msg": "hello number 4", "outer": {"n": 4, "raw": 7}, "loose": {"k": "t4", "free": {"a": 1}}} } }
+  - match: { result: created }
+  - do: { count: { index: uf_deep_def } }
+  - match: { count: 5 }
+  - do: { get: { index: uf_deep_def, id: d0 } }
+  - match: { _source: {"tag": "t0", "msg": "hello number 0", "outer": {"n": 0, "raw": {"a": 1}}, "loose": {"k": "t0", "free": 7}} }
+  - do: { get: { index: uf_deep_def, id: d1 } }
+  - match: { _source: {"tag": "t1", "msg": "hello number 1", "outer": {"n": 1, "raw": "text"}, "loose": {"k": "t1", "free": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}} }
+  - do: { get: { index: uf_deep_def, id: d2 } }
+  - match: { _source: {"tag": "t2", "msg": "hello number 2", "outer": {"n": 2, "raw": [1, "x", {"a": "y"}]}, "loose": {"k": "t2", "free": [1, "x", {"a": "y"}]}} }
+  - do: { get: { index: uf_deep_def, id: d3 } }
+  - match: { _source: {"tag": "t3", "msg": "hello number 3", "outer": {"n": 3, "raw": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}, "loose": {"k": "t3", "free": "text"}} }
+  - do: { get: { index: uf_deep_def, id: d4 } }
+  - match: { _source: {"tag": "t4", "msg": "hello number 4", "outer": {"n": 4, "raw": 7}, "loose": {"k": "t4", "free": {"a": 1}}} }
+  - do: { search: { index: uf_deep_def, body: { query: { match: { msg: hello } } } } }
+  - match: { hits.total.value: 5 }
+  - do: { search: { index: uf_deep_def, body: { query: { term: { tag: t1 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "outer": {"n": 1, "raw": "text"}, "loose": {"k": "t1", "free": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}} }
