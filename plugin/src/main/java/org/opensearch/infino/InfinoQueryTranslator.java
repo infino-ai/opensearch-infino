@@ -1261,7 +1261,10 @@ final class InfinoQueryTranslator {
      * its values in the columns under it, so it exists where any of them
      * holds one, as Lucene expands {@code exists} on an object over its
      * sub-fields; a pattern ({@code *}) names every column it matches. The
-     * reserved columns are never a document's field.
+     * reserved columns are never a document's field. A field with a column
+     * of its own exists where a column under it holds a value too: a table
+     * written before a {@code geo_point} was kept whole holds the points
+     * given as objects in {@code loc.lat} and {@code loc.lon}.
      */
     private String exists(String field) {
         String meta = metadataExists(field);
@@ -1270,16 +1273,19 @@ final class InfinoQueryTranslator {
         }
         // Whether a field has a value tells nothing of a masked one's: its hash is shown.
         Column c = resolve(field);
+        List<String> present = new ArrayList<>();
         if (c != null) {
+            present.add(quoteIdent(c.name()) + " IS NOT NULL");
             Column values = listOf(cols, c);
-            String own = quoteIdent(c.name()) + " IS NOT NULL";
-            return values == null ? own : "(" + own + " OR " + quoteIdent(values.name()) + " IS NOT NULL)";
+            if (values != null) {
+                present.add(quoteIdent(values.name()) + " IS NOT NULL");
+            }
+        } else {
+            refuseColumnless(field);
         }
-        refuseColumnless(field);
         String under = field + ".";
         // OpenSearch's own field-pattern matcher, named in full: this class's Regex is a query node.
-        boolean pattern = org.opensearch.common.regex.Regex.isSimpleMatchPattern(field);
-        List<String> present = new ArrayList<>();
+        boolean pattern = c == null && org.opensearch.common.regex.Regex.isSimpleMatchPattern(field);
         for (Column sub : cols.values()) {
             String name = sub.name();
             if (name.equals(OSID) || name.equals(SOURCE) || name.equals(SEQ) || name.equals(IGNORED)) {
@@ -1290,7 +1296,10 @@ final class InfinoQueryTranslator {
                 present.add(quoteIdent(name) + " IS NOT NULL");
             }
         }
-        return present.isEmpty() ? NONE : "(" + String.join(" OR ", present) + ")";
+        if (present.isEmpty()) {
+            return NONE;
+        }
+        return c != null && present.size() == 1 ? present.get(0) : "(" + String.join(" OR ", present) + ")";
     }
 
     /**

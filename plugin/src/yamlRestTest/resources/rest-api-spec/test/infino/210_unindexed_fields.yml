@@ -4,7 +4,7 @@
 # a different shape in each document (an object, a string, an array), and
 # every document is stored and returned whole, as stock stores it. A
 # geo_point, which takes several shapes too, is kept whole in one column so
-# every shape lands. Each case
+# every shape lands, and so are an xy_point and a geo_shape. Each case
 # runs the same documents, one bulk each so each lands in its own commit,
 # into a Lucene twin, a proxy-mode index and a default-mode index.
 ---
@@ -669,3 +669,92 @@
   - do: { search: { index: uf_geo_def, body: { query: { term: { tag: c } } } } }
   - match: { hits.total.value: 1 }
   - match: { hits.hits.0._id: g2 }
+---
+"An xy_point, a geo_shape and a geo_point under source take each of their shapes, one commit each, and exist where given":
+  - do:
+      indices.create:
+        index: uf_xy_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { tag: { type: keyword }, pos: { type: xy_point }, area: { type: geo_shape }, source: { properties: { geo: { properties: { location: { type: geo_point } } } } } } }
+  - do:
+      indices.create:
+        index: uf_xy_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { tag: { type: keyword }, pos: { type: xy_point }, area: { type: geo_shape }, source: { properties: { geo: { properties: { location: { type: geo_point } } } } } } }
+  - do:
+      indices.create:
+        index: uf_xy_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { tag: { type: keyword }, pos: { type: xy_point }, area: { type: geo_shape }, source: { properties: { geo: { properties: { location: { type: geo_point } } } } } } }
+  - do: { index: { index: uf_xy_luc, id: x0, refresh: true, body: {"tag": "a", "pos": "1,2", "area": "POINT (1 2)", "source": {"geo": {"location": "40,-70"}}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_xy_luc, id: x1, refresh: true, body: {"tag": "b", "pos": {"x": 1, "y": 2}, "area": {"type": "point", "coordinates": [1, 2]}, "source": {"geo": {"location": {"lat": 1, "lon": 2}}}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_xy_luc, id: x2, refresh: true, body: {"tag": "c", "pos": [1, 2]} } }
+  - match: { result: created }
+  - do: { count: { index: uf_xy_luc } }
+  - match: { count: 3 }
+  - do: { get: { index: uf_xy_luc, id: x0 } }
+  - match: { _source: {"tag": "a", "pos": "1,2", "area": "POINT (1 2)", "source": {"geo": {"location": "40,-70"}}} }
+  - do: { get: { index: uf_xy_luc, id: x1 } }
+  - match: { _source: {"tag": "b", "pos": {"x": 1, "y": 2}, "area": {"type": "point", "coordinates": [1, 2]}, "source": {"geo": {"location": {"lat": 1, "lon": 2}}}} }
+  - do: { get: { index: uf_xy_luc, id: x2 } }
+  - match: { _source: {"tag": "c", "pos": [1, 2]} }
+  - do: { count: { index: uf_xy_luc, body: { query: { exists: { field: pos } } } } }
+  - match: { count: 3 }
+  - do: { count: { index: uf_xy_luc, body: { query: { exists: { field: area } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: uf_xy_luc, body: { query: { exists: { field: source.geo.location } } } } }
+  - match: { count: 2 }
+  - do: { search: { index: uf_xy_luc, body: { query: { term: { tag: c } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: x2 }
+  - do: { index: { index: uf_xy_px, id: x0, refresh: true, body: {"tag": "a", "pos": "1,2", "area": "POINT (1 2)", "source": {"geo": {"location": "40,-70"}}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_xy_px, id: x1, refresh: true, body: {"tag": "b", "pos": {"x": 1, "y": 2}, "area": {"type": "point", "coordinates": [1, 2]}, "source": {"geo": {"location": {"lat": 1, "lon": 2}}}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_xy_px, id: x2, refresh: true, body: {"tag": "c", "pos": [1, 2]} } }
+  - match: { result: created }
+  - do: { count: { index: uf_xy_px } }
+  - match: { count: 3 }
+  - do: { get: { index: uf_xy_px, id: x0 } }
+  - match: { _source: {"tag": "a", "pos": "1,2", "area": "POINT (1 2)", "source": {"geo": {"location": "40,-70"}}} }
+  - do: { get: { index: uf_xy_px, id: x1 } }
+  - match: { _source: {"tag": "b", "pos": {"x": 1, "y": 2}, "area": {"type": "point", "coordinates": [1, 2]}, "source": {"geo": {"location": {"lat": 1, "lon": 2}}}} }
+  - do: { get: { index: uf_xy_px, id: x2 } }
+  - match: { _source: {"tag": "c", "pos": [1, 2]} }
+  - do: { count: { index: uf_xy_px, body: { query: { exists: { field: pos } } } } }
+  - match: { count: 3 }
+  - do: { count: { index: uf_xy_px, body: { query: { exists: { field: area } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: uf_xy_px, body: { query: { exists: { field: source.geo.location } } } } }
+  - match: { count: 2 }
+  - do: { search: { index: uf_xy_px, body: { query: { term: { tag: c } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: x2 }
+  - do: { index: { index: uf_xy_def, id: x0, refresh: true, body: {"tag": "a", "pos": "1,2", "area": "POINT (1 2)", "source": {"geo": {"location": "40,-70"}}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_xy_def, id: x1, refresh: true, body: {"tag": "b", "pos": {"x": 1, "y": 2}, "area": {"type": "point", "coordinates": [1, 2]}, "source": {"geo": {"location": {"lat": 1, "lon": 2}}}} } }
+  - match: { result: created }
+  - do: { index: { index: uf_xy_def, id: x2, refresh: true, body: {"tag": "c", "pos": [1, 2]} } }
+  - match: { result: created }
+  - do: { count: { index: uf_xy_def } }
+  - match: { count: 3 }
+  - do: { get: { index: uf_xy_def, id: x0 } }
+  - match: { _source: {"tag": "a", "pos": "1,2", "area": "POINT (1 2)", "source": {"geo": {"location": "40,-70"}}} }
+  - do: { get: { index: uf_xy_def, id: x1 } }
+  - match: { _source: {"tag": "b", "pos": {"x": 1, "y": 2}, "area": {"type": "point", "coordinates": [1, 2]}, "source": {"geo": {"location": {"lat": 1, "lon": 2}}}} }
+  - do: { get: { index: uf_xy_def, id: x2 } }
+  - match: { _source: {"tag": "c", "pos": [1, 2]} }
+  - do: { count: { index: uf_xy_def, body: { query: { exists: { field: pos } } } } }
+  - match: { count: 3 }
+  - do: { count: { index: uf_xy_def, body: { query: { exists: { field: area } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: uf_xy_def, body: { query: { exists: { field: source.geo.location } } } } }
+  - match: { count: 2 }
+  - do: { search: { index: uf_xy_def, body: { query: { term: { tag: c } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: x2 }
