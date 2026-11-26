@@ -85,6 +85,24 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("1=0", translate(QueryBuilders.existsQuery("missing")).where());
     }
 
+    /**
+     * A field with a column of its own exists where a column under it holds a value too: a
+     * table written before a geo_point was kept whole holds the points given as objects in the
+     * columns under it, and the points written since in the field's own column.
+     */
+    public void testExistsOnAFieldWithAColumnCountsTheColumnsUnderIt() {
+        Map<String, Column> cols = columns();
+        cols.put("loc", new Column("loc", "str", false, false));
+        cols.put("loc.lat", new Column("loc.lat", "f64", false, false));
+        cols.put("loc.lon", new Column("loc.lon", "f64", false, false));
+        assertEquals(
+            "(\"loc\" IS NOT NULL OR \"loc.lat\" IS NOT NULL OR \"loc.lon\" IS NOT NULL)",
+            InfinoQueryTranslator.translate(QueryBuilders.existsQuery("loc"), cols, TABLE, NOW).where()
+        );
+        // A field with no column under it reads its own alone.
+        assertEquals("\"level\" IS NOT NULL", InfinoQueryTranslator.translate(QueryBuilders.existsQuery("level"), cols, TABLE, NOW).where());
+    }
+
     public void testDateRangeUsesDateMath() {
         Translation t = translate(QueryBuilders.rangeQuery("@timestamp").gte("now-15m").lte("now"));
         assertEquals("(\"@timestamp\" >= '2026-10-24T11:45:00Z' AND \"@timestamp\" <= '2026-10-24T12:00:00Z')", t.where());

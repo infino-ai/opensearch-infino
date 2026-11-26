@@ -1101,7 +1101,7 @@
         index: er
 
 ---
-"Default mode: an array of arrays in a field without a column is refused when it is written":
+"Default mode: an array of arrays in a flat_object is refused when it is written, and several points of a geo_point land":
   - do:
       indices.create:
         index: aa
@@ -1118,10 +1118,11 @@
               where: { type: geo_point }
               attrs: { type: flat_object }
 
-  # A geo_point given several points and a flat_object holding an array of
-  # arrays have no column to read the inner arrays through, so each is
-  # refused as its own bulk item; an array of arrays in a long field is read
-  # through, as OpenSearch reads it, and lands.
+  # A flat_object holding an array of arrays has no column to read the inner
+  # arrays through, so it is refused as its own bulk item. A geo_point is
+  # kept whole, as one string, so several points land as stock takes them;
+  # an array of arrays in a long field is read through, as OpenSearch reads
+  # it, and lands.
   - do:
       bulk:
         refresh: true
@@ -1136,13 +1137,13 @@
           - { status: [ [ 4, 5 ], [ 6 ] ] }
   - match: { errors: true }
   - match: { items.0.index.status: 201 }
-  - match: { items.1.index.status: 400 }
+  - match: { items.1.index.status: 201 }
   - match: { items.2.index.status: 400 }
   - match: { items.3.index.status: 201 }
 
-  # The committed write gave where and attrs.tags the list columns the table
-  # types from their values, which hold no array of arrays either: the same
-  # refusals hold in a later request.
+  # The committed write gave attrs.tags the list column the table types from
+  # its values, which holds no array of arrays either: the same refusal
+  # holds in a later request. Several points still land.
   - do:
       bulk:
         refresh: true
@@ -1152,7 +1153,7 @@
           - index: { _index: aa, _id: nested2 }
           - { status: 6, attrs: { tags: [ [ x ], [ y ] ] } }
   - match: { errors: true }
-  - match: { items.0.index.status: 400 }
+  - match: { items.0.index.status: 201 }
   - match: { items.1.index.status: 400 }
 
   - do:
@@ -1161,9 +1162,12 @@
         body:
           track_total_hits: true
           sort: [ { status: asc } ]
-  - match: { hits.total.value: 2 }
+  - match: { hits.total.value: 4 }
   - match: { hits.hits.0._id: a }
-  - match: { hits.hits.1._id: b }
+  - match: { hits.hits.1._id: points }
+  - match: { hits.hits.1._source.where: [ [ 1.0, 2.0 ], [ 3.0, 4.0 ] ] }
+  - match: { hits.hits.2._id: b }
+  - match: { hits.hits.3._id: points2 }
 
   - do:
       indices.delete:
@@ -1267,7 +1271,7 @@
         index: lm
 
 ---
-"Default mode: a geo_shape whose coordinates are an array of arrays is refused when it is written":
+"Default mode: a geo_shape whose coordinates are an array of arrays lands, kept whole":
   - do:
       indices.create:
         index: gs
@@ -1283,10 +1287,8 @@
               status: { type: long }
               shape: { type: geo_shape }
 
-  # A geo_shape has no column; a point's coordinates are one array and are
-  # taken, but a line's or a polygon's are an array of arrays, which the
-  # table cannot hold, so each is refused as its own bulk item rather than
-  # acknowledged and then dropped.
+  # A geo_shape has no column of its own: it is kept whole, as one string of
+  # its JSON, so a point, a line and a polygon all land, as stock takes them.
   - do:
       bulk:
         refresh: true
@@ -1297,29 +1299,30 @@
           - { status: 2, shape: { type: linestring, coordinates: [ [ 1.0, 2.0 ], [ 3.0, 4.0 ] ] } }
           - index: { _index: gs, _id: polygon }
           - { status: 3, shape: { type: polygon, coordinates: [ [ [ 0.0, 0.0 ], [ 1.0, 0.0 ], [ 1.0, 1.0 ], [ 0.0, 0.0 ] ] ] } }
-  - match: { errors: true }
+  - match: { errors: false }
   - match: { items.0.index.status: 201 }
-  - match: { items.1.index.status: 400 }
-  - match: { items.2.index.status: 400 }
+  - match: { items.1.index.status: 201 }
+  - match: { items.2.index.status: 201 }
 
-  # The committed point gave shape.coordinates a list column; a line in a
-  # later request is still refused.
+  # A line in a later request lands beside them in the same column.
   - do:
       bulk:
         refresh: true
         body:
           - index: { _index: gs, _id: line2 }
           - { status: 4, shape: { type: linestring, coordinates: [ [ 1.0, 2.0 ], [ 3.0, 4.0 ] ] } }
-  - match: { errors: true }
-  - match: { items.0.index.status: 400 }
+  - match: { errors: false }
+  - match: { items.0.index.status: 201 }
 
   - do:
       search:
         index: gs
         body:
           track_total_hits: true
-  - match: { hits.total.value: 1 }
-  - match: { hits.hits.0._id: point }
+          sort: [ { status: asc } ]
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.2._id: polygon }
+  - match: { hits.hits.2._source.shape.type: polygon }
 
   - do:
       indices.delete:
