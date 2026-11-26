@@ -257,6 +257,10 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         }
         assertFalse("the refused row has no document", ids.contains(REFUSED_ID));
         assertEquals("searches answer, and writes still look ids up", Set.of(LEFT_OUT_LEASE), rebuildLeases("emr5"));
+        // A get of an id the table does not hold says so, rather than 503 for
+        // as long as a row is left out.
+        ResponseException missing = expectThrows(ResponseException.class, () -> call("GET", "/emr5/_doc/no-such-id", null));
+        assertEquals(404, missing.getResponse().getStatusLine().getStatusCode());
 
         // The skeleton has no document for the id, but the write finds the
         // table's row and replaces it: the table still holds one row per id.
