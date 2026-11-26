@@ -34,6 +34,7 @@
 mod attached;
 mod read_sql;
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -127,6 +128,12 @@ const IMMENSE_TERM_PREFIX_BYTES: usize = 30;
 /// starts, for a keyword that has doc values but no index
 /// ([`too_long_for_one_term`]); answered as [`IMMENSE_TERM`] is.
 const DOC_VALUES_TOO_LARGE: &str = "DocValuesField \"";
+/// The built-in normalizer that lowercases a keyword's values, the one
+/// normalizer applied before a value's term length is checked.
+const LOWERCASE_NORMALIZER: &str = "lowercase";
+/// 'İ' (U+0130), whose lowercase Java and Rust read differently
+/// ([`lowercase`]).
+const DOTTED_CAPITAL_I: char = '\u{130}';
 /// What the column holding a field's values is named after the field's own,
 /// for a document that gives the field more than one: `<path>[]`, a list of
 /// the field's own type, declared the first time a document needs it. The
@@ -1471,9 +1478,8 @@ struct MappedField {
     /// The formats a date field's mapping declares, in order; `None` for the
     /// default format, which [`default_format_millis`] reads.
     date_formats: Option<Vec<DateFormat>>,
-    /// For a `keyword` field, its `ignore_above`, if it sets one, and
-    /// the terms it builds, if any ([`builds_terms`]).
-    keyword: Option<(Option<usize>, Option<Terms>)>,
+    /// For a `keyword` field, how it indexes a value.
+    keyword: Option<KeywordIndexing>,
     /// The field's `keyword` multi-fields that build terms of its values
     /// (the `.keyword` sub-field dynamic mapping gives a string, say). They
     /// have no column of their own, but OpenSearch indexes each value in
@@ -1491,9 +1497,8 @@ impl MappedField {
             .map(Kept::Precision)
             .or_else(|| self.date_formats.clone().map(Kept::Date))
             .or_else(|| {
-                self.keyword.map(|(ignore_above, terms)| Kept::Keyword {
-                    ignore_above,
-                    terms,
+                self.keyword.map(|indexing| Kept::Keyword {
+                    indexing,
                     multi: self.multi.clone(),
                 })
             })
@@ -1512,14 +1517,87 @@ enum Terms {
     DocValues,
 }
 
+/// How a `keyword` mapping indexes a value, as OpenSearch's keyword mapper
+/// does: not at all past `ignore_above` (counted in UTF-16 units, on the
+/// value as written), else into its terms ([`Terms`]), if it builds any,
+/// where one term holds at most [`MAX_TERM_BYTES`]. Under the built-in
+/// `lowercase` normalizer the term is the value lowercased ([`lowercase`]);
+/// another normalizer (a custom one from the index's analysis settings) is
+/// not applied, so its terms are taken to be the values as written.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct KeywordIndexing {
+    ignore_above: Option<usize>,
+    terms: Option<Terms>,
+    lowercase: bool,
+}
+
+impl KeywordIndexing {
+    /// How the `keyword` mapping `def` indexes a value.
+    fn of(def: &Map<String, Value>) -> Self {
+        let indexed = def.get("index").and_then(Value::as_bool) != Some(false);
+        let doc_values = def.get("doc_values").and_then(Value::as_bool) != Some(false);
+        Self {
+            ignore_above: def.get("ignore_above").and_then(Value::as_u64).map(|n| n as usize),
+            terms: match (indexed, doc_values) {
+                (true, _) => Some(Terms::Postings),
+                (false, true) => Some(Terms::DocValues),
+                (false, false) => None,
+            },
+            lowercase: def.get("normalizer").and_then(Value::as_str) == Some(LOWERCASE_NORMALIZER),
+        }
+    }
+
+    /// Whether `text` is past `ignore_above`, so not indexed. A string has
+    /// no more UTF-16 units than UTF-8 bytes, so one no longer in bytes is
+    /// not counted.
+    fn skips(&self, text: &str) -> bool {
+        self.ignore_above
+            .is_some_and(|n| text.len() > n && text.encode_utf16().count() > n)
+    }
+
+    /// Lucene's refusal when the term `text` gives `field` is longer than
+    /// one term may be; `None` when it fits, or the field builds no terms.
+    /// Lowercasing a character at most adds half to its UTF-8 encoding (two
+    /// bytes to three), so a value of at most half a term's length fits
+    /// whatever its case, and is not lowercased to tell.
+    fn refusal(&self, field: &str, text: &str) -> Option<String> {
+        let terms = self.terms?;
+        let fits = if self.lowercase { MAX_TERM_BYTES / 2 } else { MAX_TERM_BYTES };
+        if text.len() <= fits {
+            return None;
+        }
+        let term = if self.lowercase {
+            Cow::Owned(lowercase(text))
+        } else {
+            Cow::Borrowed(text)
+        };
+        (term.len() > MAX_TERM_BYTES).then(|| too_long_for_one_term(field, &term, terms))
+    }
+}
+
+/// `text` as Lucene's `lowercase` filter (behind the built-in `lowercase`
+/// normalizer) lowercases it: each character by Java's
+/// `Character.toLowerCase`, the one-to-one Unicode mapping. Rust's
+/// `char::to_lowercase` is the full mapping, which differs from it only
+/// for 'İ' (U+0130), whose one-to-one lowercase is a plain 'i'.
+fn lowercase(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == DOTTED_CAPITAL_I {
+            out.push('i');
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
 /// A `keyword` multi-field that builds terms: its full path, which a
-/// refusal names, its `ignore_above`, past which a value is left out of it,
-/// and where its terms go.
+/// refusal names, and how it indexes a value.
 #[derive(Clone, Debug, PartialEq)]
 struct TermView {
     field: String,
-    ignore_above: Option<usize>,
-    terms: Terms,
+    indexing: KeywordIndexing,
 }
 
 /// The `keyword` multi-fields under `def` (its `fields`) that build terms,
@@ -1535,30 +1613,13 @@ fn keyword_multi_fields(def: &Map<String, Value>, path: &str) -> Vec<TermView> {
             if sub.get("type").and_then(Value::as_str) != Some("keyword") {
                 return None;
             }
-            builds_terms(sub).map(|terms| TermView {
+            let indexing = KeywordIndexing::of(sub);
+            indexing.terms.is_some().then(|| TermView {
                 field: format!("{path}.{name}"),
-                ignore_above: ignore_above(sub),
-                terms,
+                indexing,
             })
         })
         .collect()
-}
-
-/// A `keyword` mapping's `ignore_above`, if it sets one.
-fn ignore_above(def: &Map<String, Value>) -> Option<usize> {
-    def.get("ignore_above").and_then(Value::as_u64).map(|n| n as usize)
-}
-
-/// The terms a `keyword` mapping builds: postings when it is indexed, doc
-/// values when only those, none when it turns both off.
-fn builds_terms(def: &Map<String, Value>) -> Option<Terms> {
-    let indexed = def.get("index").and_then(Value::as_bool) != Some(false);
-    let doc_values = def.get("doc_values").and_then(Value::as_bool) != Some(false);
-    match (indexed, doc_values) {
-        (true, _) => Some(Terms::Postings),
-        (false, true) => Some(Terms::DocValues),
-        (false, false) => None,
-    }
 }
 
 /// How a mapped field's values are kept beyond its column's type, as
@@ -1569,13 +1630,11 @@ enum Kept {
     Precision(Precision),
     /// A date read by the formats its mapping declares, in order.
     Date(Vec<DateFormat>),
-    /// A `keyword` value, indexed only up to `ignore_above` characters
-    /// (UTF-16 units, as OpenSearch counts them) and, when the field builds
-    /// terms (`terms`), refused past [`MAX_TERM_BYTES`]; as is one its
-    /// keyword multi-fields (`multi`) index.
+    /// A `keyword` value, left out of its column past `ignore_above` and
+    /// refused when its term is too long ([`KeywordIndexing`]); as is one
+    /// its keyword multi-fields (`multi`) index.
     Keyword {
-        ignore_above: Option<usize>,
-        terms: Option<Terms>,
+        indexing: KeywordIndexing,
         multi: Vec<TermView>,
     },
     /// A field of another type (a `text` field, say) whose keyword
@@ -1982,7 +2041,7 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             range: ranged && indexed,
             precision: ty.and_then(|ty| Precision::of(ty, def)),
             date_formats,
-            keyword: (ty == Some("keyword")).then(|| (ignore_above(def), builds_terms(def))),
+            keyword: (ty == Some("keyword")).then(|| KeywordIndexing::of(def)),
             multi,
             valid: ty.and_then(Valid::of),
         });
@@ -2905,37 +2964,34 @@ fn ignored_paths(paths: &str) -> Vec<&str> {
 fn keyword_values(flat: &mut Map<String, Value>, kept: &HashMap<String, Kept>) -> Result<(), String> {
     for (path, value) in flat.iter_mut() {
         let (own, multi) = match kept.get(path) {
-            Some(Kept::Keyword {
-                ignore_above,
-                terms,
-                multi,
-            }) => (Some((*ignore_above, *terms)), multi.as_slice()),
+            Some(Kept::Keyword { indexing, multi }) => (Some(indexing), multi.as_slice()),
             Some(Kept::MultiFields(multi)) => (None, multi.as_slice()),
             _ => continue,
         };
         // Whether the field's own column keeps `v`; an error when the field
-        // or one of its multi-fields would index it as an immense term. The
+        // or one of its multi-fields would index it as too long a term. The
         // field is indexed first, then its multi-fields, as the mapper
         // indexes them, so the refusal names the first that refuses.
         let indexed = |v: &Value| -> Result<bool, String> {
             // A number or boolean is indexed as its text.
             let text = match v {
-                Value::String(s) => s.clone(),
-                Value::Number(_) | Value::Bool(_) => v.to_string(),
+                Value::String(s) => Cow::Borrowed(s.as_str()),
+                Value::Number(_) | Value::Bool(_) => Cow::Owned(v.to_string()),
                 _ => return Ok(true),
             };
-            let skips = |ignore_above: Option<usize>| ignore_above.is_some_and(|n| text.encode_utf16().count() > n);
             let mut keeps = true;
-            if let Some((ignore_above, terms)) = own {
-                if skips(ignore_above) {
+            if let Some(own) = own {
+                if own.skips(&text) {
                     keeps = false;
-                } else if let Some(terms) = terms.filter(|_| text.len() > MAX_TERM_BYTES) {
-                    return Err(too_long_for_one_term(path, &text, terms));
+                } else if let Some(why) = own.refusal(path, &text) {
+                    return Err(why);
                 }
             }
             for view in multi {
-                if !skips(view.ignore_above) && text.len() > MAX_TERM_BYTES {
-                    return Err(too_long_for_one_term(&view.field, &text, view.terms));
+                if !view.indexing.skips(&text) {
+                    if let Some(why) = view.indexing.refusal(&view.field, &text) {
+                        return Err(why);
+                    }
                 }
             }
             Ok(keeps)
@@ -8236,6 +8292,14 @@ mod tests {
     /// whose UTF-8 encoding is past a term's length refuses the document.
     #[test]
     fn keyword_values_follow_ignore_above_and_the_term_length() {
+        let keyword = |ignore_above, terms| Kept::Keyword {
+            indexing: KeywordIndexing {
+                ignore_above,
+                terms,
+                lowercase: false,
+            },
+            multi: vec![],
+        };
         let schema = Schema::new(vec![
             Field::new("short", DataType::LargeUtf8, true),
             Field::new("long", DataType::LargeUtf8, true),
@@ -8243,9 +8307,9 @@ mod tests {
             Field::new("short[]", DataType::List(Arc::new(Field::new(LIST_ITEM, DataType::LargeUtf8, true))), true),
         ]);
         let kept: HashMap<String, Kept> = [
-            ("short".to_string(), Kept::Keyword { ignore_above: Some(5), terms: Some(Terms::Postings), multi: vec![] }),
-            ("long".to_string(), Kept::Keyword { ignore_above: None, terms: Some(Terms::Postings), multi: vec![] }),
-            ("stored".to_string(), Kept::Keyword { ignore_above: None, terms: None, multi: vec![] }),
+            ("short".to_string(), keyword(Some(5), Some(Terms::Postings))),
+            ("long".to_string(), keyword(None, Some(Terms::Postings))),
+            ("stored".to_string(), keyword(None, None)),
         ]
         .into_iter()
         .collect();
@@ -8359,6 +8423,86 @@ mod tests {
         assert_eq!(flat.get("k"), Some(&Value::Null), "{flat:?}");
         let why = row(json!({ "k": past })).unwrap_err();
         assert!(why.starts_with(&format!("{IMMENSE_TERM}k.raw\"")), "{why}");
+    }
+
+    /// The row of `doc` for a table declared from `mapping`, every column a
+    /// string, with the rules the mapping gives its fields.
+    fn keyword_row(mapping: &str, doc: Value) -> Result<Map<String, Value>, String> {
+        let mapped = mapped_fields(&serde_json::from_str(mapping).unwrap());
+        let kept: HashMap<String, Kept> = mapped
+            .iter()
+            .filter_map(|f| f.kept().map(|k| (f.path.clone(), k)))
+            .collect();
+        let schema = Schema::new(
+            mapped
+                .iter()
+                .map(|f| Field::new(f.path.as_str(), DataType::LargeUtf8, true))
+                .collect::<Vec<_>>(),
+        );
+        conform_doc(&doc.to_string(), &schema, &kept, &[], None, &[])
+    }
+
+    /// A value is measured in UTF-8 bytes against a term's length and in
+    /// UTF-16 units against `ignore_above`, as OpenSearch measures it: 16,384
+    /// two-byte characters are one byte past a term, and a character
+    /// outside the Basic Multilingual Plane is two units (a surrogate pair).
+    /// A keyword multi-field under an object is named by its full path.
+    #[test]
+    fn a_keyword_value_is_measured_as_opensearch_measures_it() {
+        let mapping = r#"{"properties":{
+            "w":{"type":"keyword"},
+            "s":{"type":"keyword","ignore_above":3},
+            "a":{"properties":{"t":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}}
+        }}"#;
+        let accented = "é".repeat(MAX_TERM_BYTES / 2 + 1);
+        let why = keyword_row(mapping, json!({ "w": accented })).unwrap_err();
+        assert!(why.starts_with(&format!("{IMMENSE_TERM}w\"")), "{why}");
+        assert!(why.contains("'[-61, -87, -61, -87,"), "{why}");
+        assert!(why.ends_with("got 32768"), "{why}");
+        let accented = "é".repeat(MAX_TERM_BYTES / 2);
+        assert!(keyword_row(mapping, json!({ "w": accented })).is_ok());
+
+        // One emoji is two UTF-16 units and kept under ignore_above 3; two are four, and left out.
+        let flat = keyword_row(mapping, json!({ "s": "😀" })).unwrap();
+        assert_eq!(flat.get("s"), Some(&json!("😀")), "{flat:?}");
+        let flat = keyword_row(mapping, json!({ "s": "😀😀" })).unwrap();
+        assert_eq!(flat.get("s"), Some(&Value::Null), "{flat:?}");
+        // Three ASCII characters are three units, and kept.
+        let flat = keyword_row(mapping, json!({ "s": "abc" })).unwrap();
+        assert_eq!(flat.get("s"), Some(&json!("abc")), "{flat:?}");
+
+        let past = "x".repeat(MAX_TERM_BYTES + 1);
+        let why = keyword_row(mapping, json!({ "a": { "t": past } })).unwrap_err();
+        assert!(why.starts_with(&format!("{IMMENSE_TERM}a.t.keyword\"")), "{why}");
+    }
+
+    /// Under the built-in `lowercase` normalizer, the term whose length is
+    /// checked is the value lowercased, and the refusal shows its bytes, as
+    /// stock checks and shows it: 'Ⱥ' is two bytes and its lowercase 'ⱥ'
+    /// three, the Kelvin sign three bytes and its lowercase 'k' one. 'İ'
+    /// lowercases to a plain 'i', as Java's `Character.toLowerCase` takes it.
+    #[test]
+    fn a_lowercase_normalizer_checks_the_lowercased_term() {
+        let mapping = r#"{"properties":{
+            "n":{"type":"keyword","normalizer":"lowercase"},
+            "t":{"type":"text","fields":{"keyword":{"type":"keyword","normalizer":"lowercase"}}},
+            "custom":{"type":"keyword","normalizer":"my_normalizer"}
+        }}"#;
+        let grows = "Ⱥ".repeat(12_000);
+        assert!(grows.len() <= MAX_TERM_BYTES);
+        for (field, named) in [("n", "n"), ("t", "t.keyword")] {
+            let why = keyword_row(mapping, json!({ field: grows })).unwrap_err();
+            assert!(why.starts_with(&format!("{IMMENSE_TERM}{named}\"")), "{why}");
+            assert!(why.contains("'[-30, -79, -91, -30, -79, -91,"), "{why}");
+            assert!(why.ends_with("got 36000"), "{why}");
+        }
+        let shrinks = "\u{212A}".repeat(11_000);
+        assert!(shrinks.len() > MAX_TERM_BYTES);
+        let flat = keyword_row(mapping, json!({ "n": shrinks })).unwrap();
+        assert_eq!(flat.get("n"), Some(&json!(shrinks)), "the column keeps the value as written");
+        assert_eq!(lowercase("İK"), "ik");
+        // Another normalizer is not applied: the value as written is the term.
+        assert!(keyword_row(mapping, json!({ "custom": grows })).is_ok());
     }
 
     /// Whether a `keyword` field builds terms follows its mapping: one that

@@ -1010,6 +1010,15 @@ public final class InfinoWriter {
     }
 
     /**
+     * A document the table's columns refused at a shard's write (default mode), answered as stock
+     * answers it: a keyword value too long for one term fails with Lucene's reason as it stands, any
+     * other refusal as a document the mapper could not parse.
+     */
+    static Exception refusedAtWrite(String why) {
+        return tooLongForOneTerm(why) ? new IllegalArgumentException(why) : new MapperParsingException("[infino] " + why);
+    }
+
+    /**
      * A document the bridge refused, answered as stock answers it: a data stream's document without
      * one timestamp fails the parse, and a keyword value too long for one term fails with Lucene's
      * reason as it stands.

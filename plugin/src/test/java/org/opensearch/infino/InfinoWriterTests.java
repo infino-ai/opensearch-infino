@@ -17,6 +17,7 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.engine.DocumentMissingException;
 import org.opensearch.index.engine.VersionConflictEngineException;
+import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.threadpool.TestThreadPool;
@@ -431,5 +432,35 @@ public class InfinoWriterTests extends OpenSearchTestCase {
         m.write(0, bytes, 0, bytes.length);
         m.setByte(bytes.length, (byte) 0);
         return m;
+    }
+
+    /** Lucene's refusal of a keyword value past one term, as the bridge gives it. */
+    private static final String IMMENSE =
+        "Document contains at least one immense term in field=\"w\" (whose UTF8 encoding is longer than the max length 32766), all of which were skipped.";
+    /** Lucene's refusal of a value past one term in a keyword with doc values only. */
+    private static final String DOC_VALUES = "DocValuesField \"v\" is too large, must be <= 32766";
+
+    /**
+     * A keyword value too long for one term fails as stock fails it, an illegal argument with Lucene's
+     * reason as it stands, in both modes; any other refusal keeps its own answer.
+     */
+    public void testAValueTooLongForOneTermIsRefusedWithLucenesReasonInBothModes() {
+        for (String why : List.of(IMMENSE, DOC_VALUES)) {
+            assertTrue(why, InfinoWriter.tooLongForOneTerm(why));
+            for (Exception e : List.of(InfinoWriter.refused(why), InfinoWriter.refusedAtWrite(why))) {
+                assertEquals(IllegalArgumentException.class, e.getClass());
+                assertEquals(why, e.getMessage());
+                assertEquals(RestStatus.BAD_REQUEST, ExceptionsHelper.status(e));
+            }
+        }
+        String other = "field [n]: not a number";
+        assertFalse(InfinoWriter.tooLongForOneTerm(other));
+        assertEquals("[infino] " + other, InfinoWriter.refused(other).getMessage());
+        assertEquals(IllegalArgumentException.class, InfinoWriter.refused(other).getClass());
+        Exception atWrite = InfinoWriter.refusedAtWrite(other);
+        assertEquals(MapperParsingException.class, atWrite.getClass());
+        assertEquals("[infino] " + other, atWrite.getMessage());
+        // A reason that only mentions the words further in is not Lucene's refusal.
+        assertFalse(InfinoWriter.tooLongForOneTerm("field [w]: " + IMMENSE));
     }
 }
