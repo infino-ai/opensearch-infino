@@ -21,8 +21,8 @@ import java.util.concurrent.TimeUnit;
  * each write anew before the engine sees it (its derived source), which
  * drops the mark a rebuild's creates carry: the primary knows them by their
  * content instead, and puts the mark back, so the table keeps every row as
- * it was through the rebuild, a replay of the primary's translog, and its
- * history. The table is read through SQL as a user who cannot see the vector
+ * it was through the rebuild and through the history the primary writes to
+ * the table when it starts again from its store. The table is read through SQL as a user who cannot see the vector
  * field, whose view of the index leaves it out.
  */
 public class InfinoRebuildKnnIT extends InfinoRestTestCase {
@@ -75,11 +75,9 @@ public class InfinoRebuildKnnIT extends InfinoRestTestCase {
         }, REBUILD_SECONDS, TimeUnit.SECONDS);
         assertEquals("every row keeps its engine id through the rebuild", before, rowIds("kemr"));
 
-        // The primary started again from its own store replays the rebuild's
-        // creates from its translog, then writes the table its history.
-        Map<String, Object> indices = (Map<String, Object>) call("GET", "/kemr/_stats/translog", null).get("indices");
-        Map<String, Object> translog = (Map<String, Object>) ((Map<String, Object>) ((Map<String, Object>) indices.get("kemr")).get("primaries")).get("translog");
-        assertEquals("every create waits in the translog for the replay", ROWS, ((Number) translog.get("uncommitted_operations")).intValue());
+        // The primary starts again from its own store. The cancel closes the
+        // shard cleanly, which flushes, so the start replays nothing from its
+        // translog; as it becomes primary it writes the table its history.
         List<Object> shard = callList("GET", "/_cat/shards/kemr?format=json&h=node", null);
         String node = ((Map<String, Object>) shard.get(0)).get("node").toString();
         call(

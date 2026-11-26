@@ -211,15 +211,15 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         }, REBUILD_SECONDS, TimeUnit.SECONDS);
         assertEquals("every row keeps its engine id through the rebuild", before, rowIds("emr8"));
 
-        // Fail the primary and allocate it again from its own store, as a node
-        // killed and started again does. The rebuild's creates are in its
-        // translog and not in a Lucene commit yet, so the start replays them;
-        // then, as it becomes primary, it writes the table the operations of its
-        // history the table may not hold, the rebuild's creates among them.
-        assertEquals("every create waits in the translog for the replay", KEPT_ROWS, uncommittedOperations("emr8"));
+        // Fail the primary and allocate it again from its own store. The cancel
+        // closes the shard cleanly, which flushes, so the start replays nothing
+        // from its translog; as it becomes primary, it writes the table the
+        // operations of its history the table may not hold, the rebuild's
+        // creates among them. (A replay after a node is killed is not covered
+        // here: a REST test cannot kill the node.)
         long logMark = Files.size(serverLog());
         failPrimary("emr8");
-        assertEquals("and through the replay of its translog and its history", before, rowIds("emr8"));
+        assertEquals("and through its history", before, rowIds("emr8"));
 
         // Closing flushes: the reopened index replays nothing and writes the
         // table from its history alone.
@@ -229,8 +229,8 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         assertEquals("and through the index's reopening", before, rowIds("emr8"));
         assertEquals(KEPT_ROWS, ((Number) call("GET", "/emr8/_count", null).get("count")).intValue());
         // The rows stay as they are either way, since the table refuses a
-        // source that opens with the mark; what the replay and the history
-        // skip is sending them: none is refused, and the history writes none.
+        // source that opens with the mark; what the history skips is sending
+        // them: it writes none, and the table refuses none.
         assertNoRebuiltRowSentFromHistory(logMark, KEPT_TABLE);
 
         ResponseException forged = expectThrows(
@@ -273,7 +273,7 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         assertEquals("every row keeps its engine id through the rebuild", before, rowIds("emr9"));
         assertEquals("the pipeline ran once", List.of("final"), ((Map<String, Object>) call("GET", "/emr9/_doc/p0", null).get("_source")).get("seen"));
         failPrimary("emr9");
-        assertEquals("and through the replay of its translog and its history", before, rowIds("emr9"));
+        assertEquals("and through its history", before, rowIds("emr9"));
         call("DELETE", "/emr9", null);
         call("DELETE", "/_ingest/pipeline/" + FINAL_PIPELINE, null);
     }
@@ -282,7 +282,7 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
      * The test node's log says, since byte {@code from}, that no operation of
      * a shard's history was written to {@code table} on a restart or a
      * reopening, and that the table refused none: a rebuild's creates are
-     * left out of both, since the table holds their rows.
+     * left out, since the table holds their rows.
      */
     private void assertNoRebuiltRowSentFromHistory(long from, String table) throws IOException {
         String since;
@@ -304,14 +304,6 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
         String log = System.getProperty(SERVER_LOG);
         assertNotNull(SERVER_LOG + " names the test node's log", log);
         return Path.of(log);
-    }
-
-    /** The operations of {@code index}'s primary that its translog holds and no Lucene commit does yet. */
-    @SuppressWarnings("unchecked")
-    private int uncommittedOperations(String index) throws IOException {
-        Map<String, Object> indices = (Map<String, Object>) call("GET", "/" + index + "/_stats/translog", null).get("indices");
-        Map<String, Object> primaries = (Map<String, Object>) ((Map<String, Object>) indices.get(index)).get("primaries");
-        return ((Number) ((Map<String, Object>) primaries.get("translog")).get("uncommitted_operations")).intValue();
     }
 
     /** Fail {@code index}'s one primary and wait until it is allocated again from its own store. */
