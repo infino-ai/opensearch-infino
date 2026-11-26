@@ -208,7 +208,7 @@ public final class InfinoWriter {
      * write became, and the ids whose delete failed after the append had
      * committed, with why (empty and null when every delete landed).
      */
-    private record Applied(Map<String, String> refused, Map<Outcome, Written> written, Set<String> undeleted, Exception deleteFailure) {}
+    private record Applied(Map<String, InfinoNative.PreparedFailure> refused, Map<Outcome, Written> written, Set<String> undeleted, Exception deleteFailure) {}
 
     /** Whether an outcome carries a row to append: its prepared batch holds these, in the bulk's order. */
     private static boolean carriesRow(Outcome o) {
@@ -424,8 +424,14 @@ public final class InfinoWriter {
                 }
             }
         } catch (InfinoNative.InfinoException e) {
-            // With its status: a 503 when the hosted service could not be reached or did not answer in time.
-            waiter.listener().onFailure(e);
+            // With its status: a 503 when the hosted service could not be reached or did not answer in
+            // time, a 429 when it limited the account's request rate, each on the items a client retries.
+            RestStatus retry = e.retryStatus();
+            if (retry == null) {
+                waiter.listener().onFailure(e);
+            } else {
+                failWrites(waiter, e, retry);
+            }
             return;
         }
         List<String> ids = new ArrayList<>();
@@ -618,8 +624,13 @@ public final class InfinoWriter {
                 }
             } catch (Exception e) {
                 log.warn("[infino] append of {} bulks to {} failed", staged.size(), table, e);
+                RestStatus retry = e instanceof InfinoNative.InfinoException ie ? ie.retryStatus() : null;
                 for (Staged s : staged) {
-                    s.waiter().listener().onFailure(e);
+                    if (retry == null) {
+                        s.waiter().listener().onFailure(e);
+                    } else {
+                        failWrites(s.waiter(), e, retry);
+                    }
                 }
             }
             List<List<Staged>> more = new ArrayList<>();
@@ -860,7 +871,7 @@ public final class InfinoWriter {
             // A read after the write must see the table, not a prefetched copy.
             InfinoNative.forgetSources(table, last.keySet());
         }
-        Map<String, String> refused = appended.refused();
+        Map<String, InfinoNative.PreparedFailure> refused = appended.refused();
         if (latest && appended.committed()) {
             readsCaughtUp(batch, latestSet);
         }
@@ -868,10 +879,25 @@ public final class InfinoWriter {
         // committed by now: when they fail, the appended writes are answered as
         // written and only the deletes as failed, so a client retries just those,
         // and a delete retried removes what it names.
+        RestStatus ended = endedBy(refused);
+        if (!tombstones.isEmpty() && ended != null) {
+            // The hosted service ended the append (a rate limit, or no answer): the
+            // deletes would meet the same service, so they are not sent, and are
+            // answered with the append's status for the client to send again.
+            boolean unanswered = ended == RestStatus.SERVICE_UNAVAILABLE;
+            RuntimeException notSent = new InfinoNative.InfinoException(
+                "[infino] delete of " + tombstones.size() + " ids from " + table + " was not sent: the hosted service "
+                    + (unanswered ? "did not answer the append before it" : "turned the append before it away for the account's request rate")
+                    + "; try again later",
+                ended,
+                unanswered
+            );
+            return new Applied(refused, written, Set.copyOf(tombstones), notSent);
+        }
         if (!tombstones.isEmpty()) {
             int rc = InfinoNative.deleteOsids(table, tombstones.toArray(new String[0]), tombstones.size());
             if (rc != 0) {
-                IllegalStateException failed = new IllegalStateException("[infino] delete of " + tombstones.size() + " ids from " + table + " returned " + rc);
+                RuntimeException failed = InfinoNative.deleteFailed(table, tombstones.size(), rc);
                 log.warn("[infino] the batch's writes to {} committed, its deletes did not", table, failed);
                 return new Applied(refused, written, Set.copyOf(tombstones), failed);
             }
@@ -959,8 +985,8 @@ public final class InfinoWriter {
         InfinoNative.releaseLatest();
     }
 
-    /** What an append did: the documents the bridge refused, by id, and whether it committed any row. */
-    private record Appended(Map<String, String> refused, boolean committed) {}
+    /** What an append did: the documents the bridge did not take, by id, and whether it committed any row. */
+    private record Appended(Map<String, InfinoNative.PreparedFailure> refused, boolean committed) {}
 
     /** The copy of the batch's index that writes its table, as this node's cluster state names it; null when unknown. */
     private static String writerAllocation(List<Staged> staged) {
@@ -1033,6 +1059,60 @@ public final class InfinoWriter {
         return new IllegalArgumentException("[infino] " + why);
     }
 
+    /**
+     * The failure of a write the bridge did not take: a refusal of its
+     * document is a 400 ({@link #refused}), which a client does not send
+     * again; a document the hosted service turned away for the account's
+     * request rate is a 429, as a stock shard answers a write it has no room
+     * for, which a client sends again. The service wrote nothing of it, so
+     * the write sent again is stored once. A document whose call the service
+     * did not answer is a 503, which a client sends again too.
+     */
+    static BulkItemResponse.Failure notTaken(String index, String id, InfinoNative.PreparedFailure f) {
+        if (f.status() == null) {
+            return new BulkItemResponse.Failure(index, id, refused(f.reason()), RestStatus.BAD_REQUEST);
+        }
+        Exception cause = f.status() == RestStatus.TOO_MANY_REQUESTS
+            ? new OpenSearchRejectedExecutionException("[infino] the hosted service limited the account's request rate; send the write again: " + f.reason())
+            : new InfinoNative.InfinoException("[infino] " + f.reason(), f.status(), f.status() == RestStatus.SERVICE_UNAVAILABLE);
+        return new BulkItemResponse.Failure(index, id, cause, f.status());
+    }
+
+    /**
+     * The status under which the hosted service ended an append, when it
+     * did ({@link InfinoNative.PreparedFailure#status}): 429 or 503, the
+     * first a document of it carries; null when the append ran to its end.
+     */
+    static RestStatus endedBy(Map<String, InfinoNative.PreparedFailure> notTaken) {
+        for (InfinoNative.PreparedFailure f : notTaken.values()) {
+            if (f.status() != null) {
+                return f.status();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Answer {@code w} with each of its writes failed by {@code e} under
+     * {@code status} and each item answered up front as it was: the append
+     * that carried them met a hosted service that did not answer or limited
+     * the account's request rate ({@link InfinoNative.InfinoException#retryStatus}).
+     * A client sends such items again, as it does a stock shard's writes it
+     * had no room for; failing the bulk whole would also lose the answers of
+     * the items refused up front, which it must not send again.
+     */
+    static void failWrites(Waiter w, Exception e, RestStatus status) {
+        for (Outcome o : w.outcomes()) {
+            if (o.answered() != null) {
+                w.items()[o.slot()] = o.answered();
+                continue;
+            }
+            String id = o.write() == null ? o.item().id() : o.write().id();
+            w.items()[o.slot()] = new BulkItemResponse(o.slot(), o.item().opType(), new BulkItemResponse.Failure(w.indexName(), id, e, status));
+        }
+        w.listener().onResponse(new BulkResponse(w.items(), (System.nanoTime() - w.startNanos()) / 1_000_000L));
+    }
+
     /** The prepared batches as one commit, each row under the sequence number its write was given; a refused document is reported under its id. */
     private static Appended appendPrepared(String table, List<Staged> staged, Map<Outcome, Written> written, List<String> replaced) {
         List<Pointer> handles = new ArrayList<>();
@@ -1045,7 +1125,7 @@ public final class InfinoWriter {
                 docs += s.preparedIds().size();
             }
         }
-        Map<String, String> refused = new HashMap<>();
+        Map<String, InfinoNative.PreparedFailure> refused = new HashMap<>();
         if (handles.isEmpty()) {
             return new Appended(refused, false);
         }
@@ -1062,7 +1142,7 @@ public final class InfinoWriter {
         InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, handles, replaced, seqs);
         long millis = (System.nanoTime() - start) / 1_000_000L;
         for (InfinoNative.PreparedFailure f : result.failed()) {
-            refused.put(withRows.get(f.batch()).preparedIds().get(f.index()), f.reason());
+            refused.put(withRows.get(f.batch()).preparedIds().get(f.index()), f);
         }
         log.debug("[infino] appended {} of {} documents to {} in {} ms ({} bulks)", result.ok(), docs, table, millis, handles.size());
         return new Appended(refused, result.ok() > 0);
@@ -1103,7 +1183,7 @@ public final class InfinoWriter {
                 seqs.add(written.get(o).seq());
             }
         }
-        Map<String, String> refused = new HashMap<>();
+        Map<String, InfinoNative.PreparedFailure> refused = new HashMap<>();
         if (ids.isEmpty()) {
             return new Appended(refused, false);
         }
@@ -1111,7 +1191,7 @@ public final class InfinoWriter {
         long[] numbers = seqs.stream().mapToLong(Long::longValue).toArray();
         InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced, numbers);
         for (InfinoNative.PreparedFailure f : result.failed()) {
-            refused.put(ids.get(f.index()), f.reason());
+            refused.put(ids.get(f.index()), f);
         }
         log.debug("[infino] appended {} of {} documents to {} (folded: an id appeared twice in the batch, or a write met a conflict)", result.ok(), ids.size(), table);
         return new Appended(refused, result.ok() > 0);
@@ -1138,20 +1218,17 @@ public final class InfinoWriter {
                 continue;
             }
             if (write.deletes() && applied.undeleted().contains(write.id())) {
+                // A 429 or 503 when the hosted service turned the delete away or did not answer, else a 500.
                 w.items()[o.slot()] = new BulkItemResponse(
                     o.slot(),
                     o.item().opType(),
-                    new BulkItemResponse.Failure(w.indexName(), write.id(), applied.deleteFailure(), RestStatus.INTERNAL_SERVER_ERROR)
+                    new BulkItemResponse.Failure(w.indexName(), write.id(), applied.deleteFailure(), ExceptionsHelper.status(applied.deleteFailure()))
                 );
                 continue;
             }
-            String why = applied.refused().get(write.id());
-            if (why != null) {
-                w.items()[o.slot()] = new BulkItemResponse(
-                    o.slot(),
-                    o.item().opType(),
-                    new BulkItemResponse.Failure(w.indexName(), write.id(), refused(why), RestStatus.BAD_REQUEST)
-                );
+            InfinoNative.PreparedFailure notTaken = applied.refused().get(write.id());
+            if (notTaken != null) {
+                w.items()[o.slot()] = new BulkItemResponse(o.slot(), o.item().opType(), notTaken(w.indexName(), write.id(), notTaken));
                 continue;
             }
             DocWriteResponse r;

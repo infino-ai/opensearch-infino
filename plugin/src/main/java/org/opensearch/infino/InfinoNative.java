@@ -502,6 +502,20 @@ public final class InfinoNative {
             return unavailable;
         }
 
+        /**
+         * The status that tells a client to send the call again, or null
+         * when this is no such error: 503 when the hosted service could not
+         * be reached or did not answer ({@link #unavailable}), whatever
+         * status it gave, and 429 when it turned the call away for the
+         * account's request rate. A call turned away wrote nothing.
+         */
+        public RestStatus retryStatus() {
+            if (unavailable) {
+                return RestStatus.SERVICE_UNAVAILABLE;
+            }
+            return status == RestStatus.TOO_MANY_REQUESTS ? status : null;
+        }
+
         @Override
         public RestStatus status() {
             return status;
@@ -1519,9 +1533,14 @@ public final class InfinoNative {
      * One refused document of a prepared batch: which batch, which document,
      * why, and whether the table refuses what it carries ({@code permanent}),
      * so every later try is refused the same way. One not permanent failed
-     * for a reason of the moment and a later try may take it.
+     * for a reason of the moment and a later try may take it. {@code status}
+     * is null for a refusal of the document; else the write did not reach
+     * the document because the hosted service ended it, and the client sends
+     * it again: 429 when the service turned a call away for the account's
+     * request rate, so the document was not written, and 503 when it did not
+     * answer a call, which may have written it.
      */
-    public record PreparedFailure(int batch, int index, String reason, boolean permanent) {}
+    public record PreparedFailure(int batch, int index, String reason, boolean permanent, RestStatus status) {}
 
     /** Outcome of appending prepared batches. */
     public record PreparedResult(int ok, List<PreparedFailure> failed) {}
@@ -1660,7 +1679,8 @@ public final class InfinoNative {
                     ((Number) f.get("b")).intValue(),
                     ((Number) f.get("i")).intValue(),
                     (String) f.get("reason"),
-                    Boolean.TRUE.equals(f.get("permanent"))
+                    Boolean.TRUE.equals(f.get("permanent")),
+                    f.get("status") instanceof Number n ? RestStatus.fromCode(n.intValue()) : null
                 )
             );
         }
@@ -1716,7 +1736,37 @@ public final class InfinoNative {
         return new BatchResult(((Number) out.get("ok")).intValue(), failed);
     }
 
-    /** Tombstone every row with one of these ids, in one mutation. */
+    /** What {@link #deleteOsids} returns for a delete the hosted service turned away for the account's request rate. */
+    static final int DELETE_RATE_LIMITED = -3;
+    /** What {@link #deleteOsids} returns for a delete the hosted service could not be reached for, or did not answer. */
+    static final int DELETE_UNAVAILABLE = -4;
+
+    /**
+     * Why a delete of {@code ids} ids from {@code table} failed with the code
+     * {@code rc} from {@link #deleteOsids}: a 429 or a 503 the client sends
+     * again when the hosted service turned it away or did not answer, else
+     * an internal error.
+     */
+    public static RuntimeException deleteFailed(String table, int ids, int rc) {
+        String what = "[infino] delete of " + ids + " ids from " + table;
+        return switch (rc) {
+            case DELETE_RATE_LIMITED -> new InfinoException(
+                what + " was turned away for the account's request rate; try again later",
+                RestStatus.TOO_MANY_REQUESTS
+            );
+            case DELETE_UNAVAILABLE -> new InfinoException(
+                what + ": the hosted service could not be reached or did not answer in time; try again later",
+                RestStatus.SERVICE_UNAVAILABLE,
+                true
+            );
+            default -> new IllegalStateException(what + " returned " + rc);
+        };
+    }
+
+    /**
+     * Tombstone every row with one of these ids, in one mutation. 0 when it
+     * did, else a negative code ({@link #deleteFailed} says what it means).
+     */
     public static int deleteOsids(String name, String[] osids, int n) {
         init();
         InfinoRequestCache.changed(name);
