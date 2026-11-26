@@ -28,7 +28,6 @@ import org.opensearch.index.engine.EngineCreationFailureException;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.FlushFailedEngineException;
 import org.opensearch.index.engine.InternalEngine;
-import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.ParseContext.Document;
 import org.opensearch.index.mapper.SourceFieldMapper;
@@ -1263,7 +1262,7 @@ public class InfinoEngine extends InternalEngine {
                 return new IndexResult(e, index.version());
             }
             if (why != null) {
-                return new IndexResult(new MapperParsingException("[infino] " + why), index.version());
+                return new IndexResult(InfinoWriter.refusedAtWrite(why), index.version());
             }
         }
         // Lucene keeps the document's identity only: the metadata fields the

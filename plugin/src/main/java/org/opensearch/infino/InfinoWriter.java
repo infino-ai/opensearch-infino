@@ -994,10 +994,41 @@ public final class InfinoWriter {
     /** How the bridge's reason starts when a data stream's document lacks one timestamp. */
     static final String NO_TIMESTAMP = "documents must contain a single-valued timestamp field";
 
-    /** A document the bridge refused, answered as stock answers it: a data stream's document without one timestamp fails the parse. */
+    /**
+     * How the bridge's reasons start when a keyword value is too long for one term, in an indexed
+     * keyword or in one with doc values only: Lucene's own refusals, word for word, which stock
+     * answers as an {@code illegal_argument_exception}.
+     */
+    private static final List<String> TOO_LONG_FOR_ONE_TERM = List.of(
+        "Document contains at least one immense term in field=",
+        "DocValuesField \""
+    );
+
+    /** Whether the bridge's reason is Lucene's refusal of a keyword value too long for one term. */
+    static boolean tooLongForOneTerm(String why) {
+        return TOO_LONG_FOR_ONE_TERM.stream().anyMatch(why::startsWith);
+    }
+
+    /**
+     * A document the table's columns refused at a shard's write (default mode), answered as stock
+     * answers it: a keyword value too long for one term fails with Lucene's reason as it stands, any
+     * other refusal as a document the mapper could not parse.
+     */
+    static Exception refusedAtWrite(String why) {
+        return tooLongForOneTerm(why) ? new IllegalArgumentException(why) : new MapperParsingException("[infino] " + why);
+    }
+
+    /**
+     * A document the bridge refused, answered as stock answers it: a data stream's document without
+     * one timestamp fails the parse, and a keyword value too long for one term fails with Lucene's
+     * reason as it stands.
+     */
     static Exception refused(String why) {
         if (why.startsWith(NO_TIMESTAMP)) {
             return new MapperParsingException("failed to parse", new IllegalArgumentException(why));
+        }
+        if (tooLongForOneTerm(why)) {
+            return new IllegalArgumentException(why);
         }
         return new IllegalArgumentException("[infino] " + why);
     }

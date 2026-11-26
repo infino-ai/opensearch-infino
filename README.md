@@ -268,6 +268,8 @@ A `nested` query (Dashboards' `has_reference` on saved objects' `references` is 
 
 In proxy mode, a batch's writes and deletes are two mutations, with the deletes after the append. If a node stops between them, the batch is not acknowledged; the client's retry applies both again, and both are idempotent. If a delete fails after its append committed, only the delete items fail (500).
 
+**A value too long for one term.** In both modes, a document whose `keyword` value, or a value a `keyword` multi-field indexes, is longer than one Lucene term (32,766 bytes in UTF-8) is refused with stock's 400 and reason. One difference: when two fields of a document are too long, the reason names the first by field name, while stock names the first in the order the document gives them.
+
 ## Build and test
 
 ```bash
