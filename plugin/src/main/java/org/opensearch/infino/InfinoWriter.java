@@ -200,8 +200,15 @@ public final class InfinoWriter {
      * it was given, whether a document stood under its id just before it, and
      * what kept it out of the write (null when it was written): a conflict,
      * or for an update a missing document or a merged one the columns refuse.
+     * An update whose script deleted its document is {@code deleted}; one
+     * whose script wrote nothing carries the {@code noop} answer instead,
+     * and took no sequence number.
      */
-    private record Written(long seq, boolean existed, Exception rejection) {}
+    private record Written(long seq, boolean existed, Exception rejection, boolean deleted, UpdateResponse noop) {
+        Written(long seq, boolean existed, Exception rejection) {
+            this(seq, existed, rejection, false, null);
+        }
+    }
 
     /**
      * What a flush did: the ids the engine refused with the reason, what each
@@ -688,6 +695,8 @@ public final class InfinoWriter {
                     lookups.add(o.write().id());
                 }
                 conditioned |= InfinoDocumentVersion.seqConditioned(o.item());
+                // A script's no-op answers with the document's sequence number, as stock does.
+                conditioned |= o.write().update() != null && o.write().update().script() != null;
             }
         }
         Set<String> existed;
@@ -768,6 +777,8 @@ public final class InfinoWriter {
                             ? standing.get(w.id())
                             : existed.contains(w.id()) ? stored.getOrDefault(w.id(), InfinoDocumentVersion.UNTRACKED_SEQ_NO) : null;
                         Exception rejection = rejection(shardId, o, current);
+                        // Whether this is an update whose script deleted its document.
+                        boolean deletes = false;
                         if (rejection == null && w.update() != null) {
                             // The base is the write before it in this batch, else the table,
                             // which holds every append of its id before this one: no running
@@ -776,10 +787,28 @@ public final class InfinoWriter {
                                 String base = documents.containsKey(w.id()) ? documents.get(w.id()) : current == null ? null
                                     : latest ? InfinoNative.getSourceLatest(table, w.id())
                                     : InfinoNative.getSourceFresh(table, w.id());
-                                String document = InfinoBulkActionFilter.merge(base, w.update());
-                                if (document == null) {
-                                    rejection = new DocumentMissingException(shardId, w.id());
+                                String document = null;
+                                if (w.update().script() == null) {
+                                    document = InfinoBulkActionFilter.merge(base, w.update());
                                 } else {
+                                    InfinoScriptedUpdate.Change change = null;
+                                    try {
+                                        change = InfinoScriptedUpdate.run(shardId, w.update(), base, current == null ? SequenceNumbers.UNASSIGNED_SEQ_NO : current, PRIMARY_TERM, VERSION);
+                                    } catch (RuntimeException e) {
+                                        // The script failed, or found no document and nothing to upsert: this update alone fails, as stock fails it.
+                                        rejection = e;
+                                    }
+                                    if (change != null && change.op() == InfinoScriptedUpdate.Op.NOOP) {
+                                        // The script writes nothing: the document stays as the writes before it left it.
+                                        written.put(o, new Written(SequenceNumbers.UNASSIGNED_SEQ_NO, current != null, null, false, change.noop()));
+                                        continue;
+                                    }
+                                    deletes = change != null && change.op() == InfinoScriptedUpdate.Op.DELETE;
+                                    document = change == null ? null : change.document();
+                                }
+                                if (rejection == null && !deletes && document == null) {
+                                    rejection = new DocumentMissingException(shardId, w.id());
+                                } else if (rejection == null && !deletes) {
                                     MapperService mappers = ignoring.computeIfAbsent(
                                         shardId,
                                         id -> Optional.ofNullable(InfinoIgnored.ignoring(id.getIndex()))
@@ -832,7 +861,7 @@ public final class InfinoWriter {
                         }
                         String document = merged.containsKey(o) ? merged.get(o) : w.source();
                         long seq = batch.nextSeq++;
-                        written.put(o, new Written(seq, current != null, null));
+                        written.put(o, new Written(seq, current != null, null, deletes, null));
                         standing.put(w.id(), document == null ? null : seq);
                         documents.put(w.id(), document);
                         if (last.put(w.id(), o) != null) {
@@ -856,7 +885,7 @@ public final class InfinoWriter {
             if (!existed.contains(w.id())) {
                 continue; // a new id: its row is appended, and there is nothing to replace
             }
-            if (w.deletes()) {
+            if (w.deletes() || written.get(o).deleted()) {
                 tombstones.add(w.id());
             } else {
                 replaced.add(w.id());
@@ -1220,7 +1249,13 @@ public final class InfinoWriter {
                 );
                 continue;
             }
-            if (write.deletes() && applied.undeleted().contains(write.id())) {
+            if (done.noop() != null) {
+                // An update whose script wrote nothing: stock's no-op answer.
+                w.items()[o.slot()] = new BulkItemResponse(o.slot(), o.item().opType(), done.noop());
+                continue;
+            }
+            boolean deletes = write.deletes() || done.deleted();
+            if (deletes && applied.undeleted().contains(write.id())) {
                 // A 429 or 503 when the hosted service turned the delete away or did not answer, else a 500.
                 w.items()[o.slot()] = new BulkItemResponse(
                     o.slot(),
@@ -1235,7 +1270,9 @@ public final class InfinoWriter {
                 continue;
             }
             DocWriteResponse r;
-            if (write.deletes()) {
+            if (done.deleted()) {
+                r = new UpdateResponse(w.shardId(), write.id(), done.seq(), PRIMARY_TERM, VERSION, DocWriteResponse.Result.DELETED);
+            } else if (write.deletes()) {
                 r = new DeleteResponse(w.shardId(), write.id(), done.seq(), PRIMARY_TERM, VERSION, done.existed());
             } else if (o.item() instanceof UpdateRequest) {
                 r = new UpdateResponse(
