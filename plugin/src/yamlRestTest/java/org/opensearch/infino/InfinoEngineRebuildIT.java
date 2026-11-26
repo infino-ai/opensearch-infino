@@ -59,6 +59,13 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
     private static final int SHARDED_ROWS = 16;
     private static final int SHARDED_SHARDS = 2;
     private static final String SHARDED_ROUTING = "one";
+    /** The table of the restart-from-store test's index, its rows, and the id written mid-rebuild. */
+    private static final String RESTARTED_TABLE = "emr10_rows";
+    private static final int RESTARTED_ROWS = 20;
+    private static final String RESTARTED_ID = "t0";
+    /** The leases a shard holds while its skeleton is rebuilt, and once a rebuild left rows out. */
+    private static final String REBUILD_LEASE = "infino_skeleton_rebuild";
+    private static final String LEFT_OUT_LEASE = "infino_skeleton_left_out";
     /** The header a 503 of a rebuilding index says how long to wait in, and the seconds it says. */
     private static final String RETRY_AFTER = "Retry-After";
     private static final String RETRY_AFTER_SECONDS = "5";
@@ -221,7 +228,11 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
      * refuses its source) is left out, and logged: the rebuild still ends
      * once it has walked the table, so the index answers searches again,
      * with every other row a hit, rather than answering 503 until the node
-     * starts again.
+     * starts again. The shard's writes go on looking ids up in the table, so
+     * a client's write of the left-out id replaces its row rather than
+     * adding a second one. The next start of the primary walks the table
+     * again; with that id written since, it leaves nothing out, and the
+     * writes stop looking ids up.
      */
     @SuppressWarnings("unchecked")
     public void testARebuildThatLeavesARowOutStillEnds() throws Exception {
@@ -245,6 +256,21 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
             ids.add(((Map<String, Object>) h).get("_id"));
         }
         assertFalse("the refused row has no document", ids.contains(REFUSED_ID));
+        assertEquals("searches answer, and writes still look ids up", Set.of(LEFT_OUT_LEASE), rebuildLeases("emr5"));
+
+        // The skeleton has no document for the id, but the write finds the
+        // table's row and replaces it: the table still holds one row per id.
+        call("PUT", "/emr5/_doc/" + REFUSED_ID + "?refresh=true", "{\"n\":0}");
+        assertEquals(REFUSED_ROWS, ((Number) call("GET", "/emr5/_count", null).get("count")).intValue());
+
+        // The primary starts again from its store and walks the table again:
+        // nothing is left out now, so the shard no longer holds the lease.
+        call("POST", "/emr5/_close", null);
+        call("POST", "/emr5/_open?wait_for_active_shards=1", null);
+        call("GET", "/_cluster/health/emr5?wait_for_status=green&timeout=60s", null);
+        assertBusy(() -> assertEquals(Set.of(), rebuildLeases("emr5")), REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertEquals(REFUSED_ROWS, hitsOnceRebuilt("emr5", REFUSED_ROWS + 1).size());
+        assertEquals(REFUSED_ROWS, ((Number) call("GET", "/emr5/_count", null).get("count")).intValue());
         call("DELETE", "/emr5", null);
     }
 
@@ -296,11 +322,98 @@ public class InfinoEngineRebuildIT extends InfinoRestTestCase {
             assertRebuilding("POST", "/emr7/_search", "{\"size\":" + (SHARDED_ROWS + 1) + "}");
             assertRebuilding("POST", "/emr7/_search?allow_partial_search_results=true", "{\"size\":" + (SHARDED_ROWS + 1) + "}");
             assertEquals(SHARDED_ROWS, ((Number) call("GET", "/emr7/_count", null).get("count")).intValue());
+            // Sent to each shard alone, the rebuilding one answers 503 and the
+            // other, whose table is empty and which is not rebuilt, answers.
+            int rebuilding = shardOf("emr7", SHARDED_ROUTING);
+            assertRebuilding("POST", "/emr7/_search?preference=_shards:" + rebuilding, "{\"size\":" + (SHARDED_ROWS + 1) + "}");
+            Map<String, Object> other = call("POST", "/emr7/_search?preference=_shards:" + (1 - rebuilding), "{\"size\":" + (SHARDED_ROWS + 1) + "}");
+            assertEquals(0, ((List<?>) ((Map<String, Object>) other.get("hits")).get("hits")).size());
+            assertEquals(1, ((Number) ((Map<String, Object>) other.get("_shards")).get("successful")).intValue());
         } finally {
             call("PUT", "/_cluster/settings", "{\"persistent\":{\"" + PAUSED + "\":null}}");
         }
         assertBusy(() -> assertEquals(SHARDED_ROWS, hitsOnceRebuilt("emr7", SHARDED_ROWS + 1).size()), REBUILD_SECONDS, TimeUnit.SECONDS);
         call("DELETE", "/emr7", null);
+    }
+
+    /**
+     * A primary that fails while its rebuild is held, and starts again from
+     * its own store, as a node killed and started again does: it knows from
+     * the rebuild's lease, which it took before the shard first started and
+     * kept on disk, that its skeleton is still being rebuilt. So its searches
+     * that return hits still answer 503, a write of an id its skeleton lacks
+     * replaces the table's row rather than adding a second one, and once
+     * released it finishes the rebuild.
+     */
+    @SuppressWarnings("unchecked")
+    public void testAPrimaryStartingAgainFromItsStoreMidRebuildFinishesIt() throws Exception {
+        createIndex("emr10_old", false, RESTARTED_TABLE, 1);
+        StringBuilder rows = new StringBuilder();
+        for (int i = 0; i < RESTARTED_ROWS; i++) {
+            rows.append("{\"index\":{\"_index\":\"emr10_old\",\"_id\":\"t").append(i).append("\"}}\n");
+            rows.append("{\"n\":").append(i).append("}\n");
+        }
+        assertEquals(false, call("POST", "/_bulk?refresh=true", rows.toString()).get("errors"));
+        call("DELETE", "/emr10_old", null);
+
+        call("PUT", "/_cluster/settings", "{\"persistent\":{\"" + PAUSED + "\":true}}");
+        try {
+            createIndex("emr10", false, RESTARTED_TABLE, 1);
+            call("GET", "/_cluster/health/emr10?wait_for_status=green&timeout=60s", null);
+            assertRebuilding("POST", "/emr10/_search", "{\"size\":" + (RESTARTED_ROWS + 1) + "}");
+            failPrimary("emr10");
+            assertEquals(Set.of(REBUILD_LEASE), rebuildLeases("emr10"));
+            assertRebuilding("POST", "/emr10/_search", "{\"size\":" + (RESTARTED_ROWS + 1) + "}");
+            call("PUT", "/emr10/_doc/" + RESTARTED_ID + "?refresh=true", "{\"n\":" + REWRITTEN_VALUE + "}");
+            assertEquals("the write replaces the row", RESTARTED_ROWS, ((Number) call("GET", "/emr10/_count", null).get("count")).intValue());
+        } finally {
+            call("PUT", "/_cluster/settings", "{\"persistent\":{\"" + PAUSED + "\":null}}");
+        }
+        assertBusy(() -> assertEquals(RESTARTED_ROWS, hitsOnceRebuilt("emr10", RESTARTED_ROWS + 1).size()), REBUILD_SECONDS, TimeUnit.SECONDS);
+        assertEquals(Set.of(), rebuildLeases("emr10"));
+        assertEquals(RESTARTED_ROWS, ((Number) call("GET", "/emr10/_count", null).get("count")).intValue());
+        assertEquals(REWRITTEN_VALUE, ((Map<String, Object>) call("GET", "/emr10/_doc/" + RESTARTED_ID, null).get("_source")).get("n"));
+        call("DELETE", "/emr10", null);
+    }
+
+    /** Fail {@code index}'s one primary and wait until it is allocated again from its own store. */
+    @SuppressWarnings("unchecked")
+    private void failPrimary(String index) throws IOException {
+        List<Object> shard = callList("GET", "/_cat/shards/" + index + "?format=json&h=node", null);
+        String node = ((Map<String, Object>) shard.get(0)).get("node").toString();
+        call(
+            "POST",
+            "/_cluster/reroute",
+            "{\"commands\":[{\"cancel\":{\"index\":\"" + index + "\",\"shard\":0,\"node\":\"" + node + "\",\"allow_primary\":true}}]}"
+        );
+        call("GET", "/_cluster/health/" + index + "?wait_for_status=green&timeout=60s", null);
+    }
+
+    /** The rebuild's leases ({@link #REBUILD_LEASE}, {@link #LEFT_OUT_LEASE}) {@code index}'s one primary holds. */
+    @SuppressWarnings("unchecked")
+    private Set<String> rebuildLeases(String index) throws IOException {
+        Map<String, Object> indices = (Map<String, Object>) call("GET", "/" + index + "/_stats?level=shards", null).get("indices");
+        Map<String, Object> shards = (Map<String, Object>) ((Map<String, Object>) indices.get(index)).get("shards");
+        Set<String> held = new HashSet<>();
+        for (Object copy : (List<?>) shards.get("0")) {
+            Map<String, Object> c = (Map<String, Object>) copy;
+            if (Boolean.TRUE.equals(((Map<String, Object>) c.get("routing")).get("primary"))) {
+                for (Object lease : (List<?>) ((Map<String, Object>) c.get("retention_leases")).get("leases")) {
+                    String id = ((Map<String, Object>) lease).get("id").toString();
+                    if (id.equals(REBUILD_LEASE) || id.equals(LEFT_OUT_LEASE)) {
+                        held.add(id);
+                    }
+                }
+            }
+        }
+        return held;
+    }
+
+    /** The shard of {@code index} a document written with {@code routing} goes to. */
+    @SuppressWarnings("unchecked")
+    private int shardOf(String index, String routing) throws IOException {
+        List<?> groups = (List<?>) call("GET", "/" + index + "/_search_shards?routing=" + routing, null).get("shards");
+        return ((Number) ((Map<String, Object>) ((List<?>) groups.get(0)).get(0)).get("shard")).intValue();
     }
 
     /**

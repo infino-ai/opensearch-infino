@@ -8,6 +8,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.TermQuery;
+import org.opensearch.ExceptionsHelper;
+import org.opensearch.OpenSearchException;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
@@ -23,6 +26,7 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentType;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.gateway.WriteStateException;
@@ -53,13 +57,13 @@ import java.util.concurrent.ConcurrentHashMap;
  * out the rows written before the rebuild.
  *
  * <p>The rebuild is under way while the shard holds the rebuild's retention
- * lease ({@link InfinoEngine#REBUILD_LEASE}), which the primary adds before
- * it reads the table and which every copy is given: a replica refuses those
+ * lease ({@link InfinoEngine#REBUILD_LEASE}), which the primary takes before
+ * the shard starts and which every copy is given: a replica refuses those
  * searches too, and a replica that takes over as primary, or a primary that
  * starts again from its own store, finishes the rebuild. The rebuild is done
- * once it has walked the whole table, whatever rows it had to leave out
- * (which it logs, with how many and why), and it then refreshes every copy
- * so their searches see its last documents, with refresh off as with it on.
+ * once it has walked the whole table, whatever rows it had to leave out, and
+ * it then refreshes every copy so their searches see its last documents,
+ * with refresh off as with it on.
  *
  * <p>When the shard's primary starts (or a replica takes over as primary),
  * the shard's table is read a page at a time in id order, and every row the
@@ -71,9 +75,28 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@link #SKELETON_ONLY}).
  * Each is a create, so a client's write of the same id wins; a row a client
  * deleted while its create was in flight is deleted again through the
- * shard, so the skeleton and the translog end where the table is. Until a
- * shard's skeleton is whole, its engine looks ids up in the table
- * ({@link InfinoEngine#skeletonComplete}).
+ * shard, so the skeleton and the translog end where the table is. While a
+ * shard's skeleton may lack a row, its engine looks ids up in the table
+ * ({@link InfinoEngine#looksUpIds}).
+ *
+ * <p>A row the rebuild cannot create a document for (a source the mapping
+ * now refuses, a row with no source) is left out: it is counted and logged,
+ * and it no longer keeps searches back. The shard then holds the left-out
+ * lease ({@link InfinoEngine#LEFT_OUT_LEASE}), which every copy is given, so
+ * its writes go on looking ids up in the table and a client's write of a
+ * left-out id replaces its row rather than adding a second one. Each time
+ * the shard's primary starts again, it walks the table again, holding no
+ * search back, and only a walk that leaves nothing out removes that lease.
+ * A row that routes to another shard and keeps no routing value, or that has
+ * no id, is logged too: no write of this shard can name it.
+ *
+ * <p>A walk that fails for a reason that may pass (see
+ * {@link #retryable(Throwable)}) starts again after a wait that grows to
+ * {@link #MAX_RESTART_MILLIS}, until it has failed for {@link #GIVE_UP_MILLIS}
+ * with no walk ending; any other failure stops it at once. A rebuild that
+ * stops logs an error, and the shard's searches that return hits answer 503
+ * until the shard starts again (the index closed and opened, or the node
+ * restarted).
  *
  * <p>While {@link #PAUSED} is set, a rebuild waits before it reads the
  * table: the shard holds the rebuild's lease, its searches that return hits
@@ -108,31 +131,45 @@ final class InfinoSkeletonAdopter {
     private static final long FIRST_RESTART_MILLIS = 1_000;
     /** The longest wait before a failed rebuild starts again. */
     private static final long MAX_RESTART_MILLIS = 60_000;
+    /**
+     * How long a rebuild may go on failing, each time for a reason that may
+     * pass, with no walk of the table ending, before it stops with an error:
+     * a table that cannot be read for this long is down or refusing, not
+     * busy, and a rebuild left trying would hold a generic thread with no end.
+     */
+    static final long GIVE_UP_MILLIS = 30 * 60_000L;
     /** Pages read between two log lines of a rebuild's progress. */
     private static final int PROGRESS_PAGES = 10;
     /** How many times a finished rebuild tries to refresh the shard's copies. */
     private static final int REFRESH_TRIES = 3;
-    /** Rows left out that a rebuild names in its log, beyond which it only counts them. */
-    private static final int NAMED_LEFT_OUT = 10;
+    /** Rows of each kind a walk names in its log, beyond which it only counts them. */
+    static final int NAMED_ROWS = 10;
 
     /** The shards whose skeleton is being rebuilt on this node, so a second start does not run beside the first. */
     private static final Set<ShardId> RUNNING = ConcurrentHashMap.newKeySet();
 
     private InfinoSkeletonAdopter() {}
 
-    /** Rebuild {@code shard}'s skeleton from {@code table} on the generic pool, unless it is being rebuilt already. */
+    /**
+     * Rebuild {@code shard}'s skeleton from {@code table} on the generic pool,
+     * or walk the table again when the shard's rebuild left rows out, unless
+     * a walk of it runs already.
+     */
     static void start(IndexShard shard, String table) {
-        start(shard, table, FIRST_RESTART_MILLIS);
+        start(shard, table, FIRST_RESTART_MILLIS, -1);
     }
 
     /**
      * {@link #start}, waiting {@code restart} before starting again if the
-     * rebuild fails: until it is done the shard refuses searches that return
-     * hits, so a rebuild that fails is not left there. It stops once the
-     * shard closes or is no longer the primary here (a copy that takes over
-     * finishes the rebuild).
+     * walk fails for a reason that may pass ({@link #retryable(Throwable)})
+     * and it has failed for less than {@link #GIVE_UP_MILLIS} since
+     * {@code failingSince} (in the thread pool's relative milliseconds, or -1
+     * for no failure yet): until a rebuild is done the shard refuses searches
+     * that return hits, so one that fails for a moment is not left there. Any
+     * other failure stops it, as does the shard closing or this copy no
+     * longer being the primary (a copy that takes over walks the table again).
      */
-    private static void start(IndexShard shard, String table, long restart) {
+    private static void start(IndexShard shard, String table, long restart, long failingSince) {
         ThreadPool threadPool = InfinoServices.threadPool();
         ShardId shardId = shard.shardId();
         if (threadPool == null || !RUNNING.add(shardId)) {
@@ -140,23 +177,33 @@ final class InfinoSkeletonAdopter {
         }
         threadPool.generic().execute(() -> {
             boolean again = false;
+            long since = failingSince;
             try {
                 adopt(shard, table);
             } catch (Exception e) {
-                again = shard.state() != IndexShardState.CLOSED && shard.isPrimaryMode();
-                log.error(
-                    "[infino] the skeleton of {} could not be rebuilt from table {}{}",
-                    shardId,
-                    table,
-                    again ? "; its searches that return hits answer 503 until it is, and it starts again in " + restart + "ms" : "",
-                    e
-                );
+                boolean primaryHere = shard.state() != IndexShardState.CLOSED && shard.isPrimaryMode();
+                long now = threadPool.relativeTimeInMillis();
+                since = since < 0 ? now : since;
+                again = primaryHere && retryable(e) && now - since < GIVE_UP_MILLIS;
+                String then;
+                if (again) {
+                    then = "; it starts again in " + restart + "ms";
+                } else if (primaryHere && InfinoEngine.rebuilding(shardId)) {
+                    then = "; it stops, and the shard's searches that return hits answer 503 until the shard starts again (close and open the "
+                        + "index, or restart the node)";
+                } else if (primaryHere) {
+                    then = "; it stops, and the shard's writes go on looking ids up in the table until a walk leaves no row out";
+                } else {
+                    then = "";
+                }
+                log.error("[infino] the skeleton of {} could not be rebuilt from table {}{}", shardId, table, then, e);
             } finally {
                 RUNNING.remove(shardId);
             }
             if (again) {
+                long failing = since;
                 threadPool.schedule(
-                    () -> start(shard, table, Math.min(restart * 2, MAX_RESTART_MILLIS)),
+                    () -> start(shard, table, Math.min(restart * 2, MAX_RESTART_MILLIS), failing),
                     TimeValue.timeValueMillis(restart),
                     ThreadPool.Names.GENERIC
                 );
@@ -166,12 +213,21 @@ final class InfinoSkeletonAdopter {
 
     private static void adopt(IndexShard shard, String table) throws IOException {
         ShardId shardId = shard.shardId();
-        if (!holdLease(shard) || !waitWhilePaused(shard)) {
+        // A walk again over a skeleton whose rebuild left rows out holds no
+        // search back: the skeleton has every other row.
+        boolean rebuild = InfinoEngine.rebuilding(shardId);
+        if ((rebuild && !holdLease(shard, InfinoEngine.REBUILD_LEASE, InfinoEngine.REBUILD_LEASE_SOURCE)) || !waitWhilePaused(shard)) {
             return;
         }
         IndexMetadata md = shard.indexSettings().getIndexMetadata();
         long rows = tableRows(table);
-        log.info("[infino] rebuilding the skeleton of {} from the {} rows of table {}", shardId, rows, table);
+        log.info(
+            "[infino] {} the skeleton of {} from the {} rows of table {}",
+            rebuild ? "rebuilding" : "walking again, for the rows its rebuild left out,",
+            shardId,
+            rows,
+            table
+        );
         // A row written with a routing value keeps it; a table that never
         // had one has no column for it.
         boolean routed = InfinoNative.columns(table).containsKey(InfinoQueryTranslator.ROUTING);
@@ -186,7 +242,7 @@ final class InfinoSkeletonAdopter {
                     Object id = row.get(InfinoQueryTranslator.OSID);
                     Object source = row.get(InfinoQueryTranslator.SOURCE);
                     if (id == null) {
-                        tally.noId++;
+                        tally.unreachable.add("a row", "has no id");
                         continue;
                     }
                     after = id.toString();
@@ -195,14 +251,14 @@ final class InfinoSkeletonAdopter {
                     if (OperationRouting.generateShardId(md, after, routing) != shardId.id()) {
                         // Written with a routing value before the table kept them: there
                         // is no routing that brings it back to this shard.
-                        tally.leftOut("routes to another shard by its id and keeps no routing value", after);
+                        tally.unreachable.add(after, "routes to another shard by its id and keeps no routing value");
                         continue;
                     }
                     if (searcher.count(new TermQuery(new Term(IdFieldMapper.NAME, Uid.encodeId(after)))) > 0) {
                         continue;
                     }
                     if (source == null) {
-                        tally.leftOut("has no source", after);
+                        tally.leftOut.add(after, "has no source");
                     } else {
                         missing.put(after, new Row(source.toString(), routing));
                     }
@@ -218,49 +274,98 @@ final class InfinoSkeletonAdopter {
                 log.info("[infino] rebuilding the skeleton of {}: walked {} of about {} rows, created {} documents", shardId, tally.walked, rows, tally.created);
             }
         }
-        // The whole table is walked: the rebuild is done, whatever it left out.
-        InfinoEngine.skeletonComplete(shardId);
-        releaseLease(shard);
-        refreshCopies(shardId);
-        if (tally.leftOut > 0 || tally.noId > 0) {
-            log.warn(
-                "[infino] the skeleton of {} leaves out {} rows of table {}, which its searches' hits miss: {}{}",
-                shardId,
-                tally.leftOut + tally.noId,
-                table,
-                tally.named,
-                tally.noId > 0 ? "; " + tally.noId + " rows have no id" : ""
-            );
-        }
-        log.info("[infino] rebuilt the skeleton of {}: walked {} rows of table {}, created {} documents", shardId, tally.walked, table, tally.created);
+        finish(shard, table, rebuild, tally);
     }
 
-    /** What a rebuild walked, created and left out (and some of what it left out, by id and why). */
+    /**
+     * The whole table is walked: the rebuild is done, whatever it left out,
+     * so the shard's searches answer. A row left out keeps the shard's writes
+     * looking ids up in the table: the left-out lease is taken before the
+     * rebuild's is let go, so no write in between takes such an id as new. A
+     * walk that leaves nothing out ends that. A copy that is no longer the
+     * primary leaves both leases to the one that is, which walks again.
+     */
+    private static void finish(IndexShard shard, String table, boolean rebuild, Tally tally) {
+        ShardId shardId = shard.shardId();
+        boolean primary = tally.leftOut.count > 0
+            ? holdLease(shard, InfinoEngine.LEFT_OUT_LEASE, InfinoEngine.LEFT_OUT_LEASE_SOURCE)
+            : releaseLease(shard, InfinoEngine.LEFT_OUT_LEASE);
+        if (!primary) {
+            return;
+        }
+        InfinoEngine.rebuildWalked(shardId);
+        if (rebuild) {
+            releaseLease(shard, InfinoEngine.REBUILD_LEASE);
+            refreshCopies(shardId);
+        }
+        if (tally.leftOut.count > 0) {
+            log.error(
+                "[infino] the skeleton of {} has no document for {} rows of table {}: {}. Searches answer, and their hits miss those rows; "
+                    + "the shard's writes go on looking ids up in the table, so a write of one of those ids replaces its row. Fix the "
+                    + "cause (or delete those ids): each time the shard's primary starts again (close and open the index, or restart the "
+                    + "node) it walks the table again, and a walk that leaves nothing out ends the lookups",
+                shardId,
+                tally.leftOut.count,
+                table,
+                tally.leftOut
+            );
+        }
+        if (tally.unreachable.count > 0) {
+            log.warn(
+                "[infino] the skeleton of {} has no document for {} rows of table {} that no write of this shard can name, which its "
+                    + "searches' hits miss: {}",
+                shardId,
+                tally.unreachable.count,
+                table,
+                tally.unreachable
+            );
+        }
+        log.info("[infino] walked {} rows of table {} for the skeleton of {}, created {} documents", tally.walked, table, shardId, tally.created);
+    }
+
+    /** What a walk of the table walked, created and left out. */
     private static final class Tally {
         long walked;
         long created;
-        long noId;
-        long leftOut;
+        /** Rows of this shard the skeleton has no document for, which a write of this shard may name. */
+        final Named leftOut = new Named();
+        /** Rows no write of this shard can name: no id, or an id that routes to another shard. */
+        final Named unreachable = new Named();
+    }
+
+    /**
+     * Rows counted, the first {@link #NAMED_ROWS} by id and why: what a walk
+     * left out, for its log.
+     */
+    static final class Named {
+        long count;
         final List<String> named = new ArrayList<>();
 
-        void leftOut(String why, String id) {
-            leftOut++;
-            if (named.size() < NAMED_LEFT_OUT) {
+        void add(String id, String why) {
+            count++;
+            if (named.size() < NAMED_ROWS) {
                 named.add(id + " (" + why + ")");
             }
+        }
+
+        @Override
+        public String toString() {
+            long more = count - named.size();
+            return String.join(", ", named) + (more > 0 ? ", and " + more + " more" : "");
         }
     }
 
     /**
-     * Add the rebuild's lease ({@link InfinoEngine#REBUILD_LEASE}) unless the
-     * shard holds it already (a rebuild resumed), keep it on disk, and wait
-     * until the shard's copies hold it too: from then on a copy that takes
-     * over, or this one starting again from its store, finishes the rebuild.
-     * False when this copy is no longer the primary: the one that is
-     * finishes it.
+     * Add the lease {@code id} (the rebuild's, {@link InfinoEngine#REBUILD_LEASE},
+     * or the left-out one, {@link InfinoEngine#LEFT_OUT_LEASE}) unless the
+     * shard holds it already (a rebuild resumed, or one its primary took
+     * before the shard started), keep it on disk, and wait until the shard's
+     * copies hold it too: from then on a copy that takes over, or this one
+     * starting again from its store, knows of it. False when this copy is no
+     * longer the primary: the one that is walks the table again.
      */
-    private static boolean holdLease(IndexShard shard) {
-        if (shard.getRetentionLeases().contains(InfinoEngine.REBUILD_LEASE)) {
+    private static boolean holdLease(IndexShard shard, String id, String source) {
+        if (shard.getRetentionLeases().contains(id)) {
             return true;
         }
         PlainActionFuture<ReplicationResponse> synced = PlainActionFuture.newFuture();
@@ -268,10 +373,10 @@ final class InfinoSkeletonAdopter {
             if (!shard.isPrimaryMode()) {
                 return false;
             }
-            shard.addRetentionLease(InfinoEngine.REBUILD_LEASE, InfinoEngine.REBUILD_LEASE_RETAINING, InfinoEngine.REBUILD_LEASE_SOURCE, synced);
+            shard.addRetentionLease(id, InfinoEngine.REBUILD_LEASE_RETAINING, source, synced);
         } catch (AssertionError e) {
             // The shard moved off this node, or a copy took over, between the check and the add.
-            log.info("[infino] the skeleton rebuild of {} stops here: this copy is no longer its primary", shard.shardId());
+            log.info("[infino] the skeleton walk of {} stops here: this copy is no longer its primary", shard.shardId());
             return false;
         }
         synced.actionGet();
@@ -284,24 +389,26 @@ final class InfinoSkeletonAdopter {
     }
 
     /**
-     * Remove the rebuild's lease and wait until the shard's copies no longer
-     * hold it. A copy that no longer is the primary (its shard moved, or a
-     * replica took over) leaves it: the new primary finishes the rebuild.
+     * Remove the lease {@code id} and wait until the shard's copies no longer
+     * hold it. False when this copy is no longer the primary (its shard
+     * moved, or a replica took over): it leaves the lease to the new primary,
+     * which walks the table again.
      */
-    private static void releaseLease(IndexShard shard) {
+    private static boolean releaseLease(IndexShard shard, String id) {
         PlainActionFuture<ReplicationResponse> synced = PlainActionFuture.newFuture();
         try {
             if (!shard.isPrimaryMode()) {
-                return;
+                return false;
             }
-            shard.removeRetentionLease(InfinoEngine.REBUILD_LEASE, synced);
+            shard.removeRetentionLease(id, synced);
         } catch (RetentionLeaseNotFoundException e) {
-            return;
+            return true;
         } catch (AssertionError e) {
-            log.info("[infino] the skeleton of {} is rebuilt; the copy that took over as primary releases its lease", shard.shardId());
-            return;
+            log.info("[infino] the skeleton walk of {} ends; the copy that took over as primary releases its lease", shard.shardId());
+            return false;
         }
         synced.actionGet();
+        return true;
     }
 
     /**
@@ -401,11 +508,11 @@ final class InfinoSkeletonAdopter {
      * Create a skeleton document for each id, as a skeleton-only write; then
      * delete through the shard any whose row the table lost meanwhile.
      * Returns the documents created. A create that failed for a reason that
-     * may pass (a full write pool, a shard not ready: 429 or a server error)
-     * fails the rebuild once the rest are done, so it starts again and
-     * creates it then. A create refused for any other reason but a client's
-     * write of the same id winning (the mapping refusing the row's source,
-     * say) leaves its row out, in {@code tally}.
+     * may pass (a full write pool, a shard not ready: see
+     * {@link #retryable(RestStatus)}) fails the walk once the rest are done,
+     * so it starts again and creates it then. A create refused for any other
+     * reason but a client's write of the same id winning (the mapping
+     * refusing the row's source, say) leaves its row out, in {@code tally}.
      */
     private static long createMissing(String index, String table, Map<String, Row> missing, Tally tally) {
         BulkRequest creates = new BulkRequest();
@@ -422,24 +529,53 @@ final class InfinoSkeletonAdopter {
         for (BulkItemResponse item : run(creates, true).getItems()) {
             if (!item.isFailed()) {
                 created.add(item.getId());
-            } else if (mayPass(item.getFailure().getStatus())) {
+            } else if (retryable(item.getFailure().getStatus())) {
                 passing = item.getFailure();
             } else if (item.getFailure().getStatus() != RestStatus.CONFLICT) {
-                tally.leftOut("refused: " + item.getFailureMessage(), item.getId());
+                tally.leftOut.add(item.getId(), "refused: " + item.getFailureMessage());
             }
         }
         if (!created.isEmpty()) {
             deleteLost(index, table, missing, created);
         }
         if (passing != null) {
-            throw new IllegalStateException("[infino] a skeleton create failed for a reason that may pass", passing.getCause());
+            throw new OpenSearchStatusException("[infino] a skeleton create failed for a reason that may pass", passing.getStatus(), passing.getCause());
         }
         return created.size();
     }
 
-    /** Whether a create that failed with {@code status} may go through when sent again: a rate limit, or a server error. */
-    private static boolean mayPass(RestStatus status) {
-        return status == RestStatus.TOO_MANY_REQUESTS || status.getStatus() >= RestStatus.INTERNAL_SERVER_ERROR.getStatus();
+    /**
+     * Whether a request answered {@code status} may go through when tried
+     * again: a rate limit or a full thread pool (429), or a service, a shard
+     * or a gateway not ready or not answering (502, 503, 504). Any other
+     * status, a 500 among them, says the request failed, and trying it again
+     * would fail it again.
+     */
+    static boolean retryable(RestStatus status) {
+        return status == RestStatus.TOO_MANY_REQUESTS
+            || status == RestStatus.BAD_GATEWAY
+            || status == RestStatus.SERVICE_UNAVAILABLE
+            || status == RestStatus.GATEWAY_TIMEOUT;
+    }
+
+    /**
+     * Whether {@code e} may pass when its request is tried again. A bridge
+     * error passes when the bridge marks it as the hosted service not reached
+     * or not answering ({@link InfinoNative.InfinoException#unavailable}: a
+     * transport failure, or a 502, 503 or 504), or when its status is one
+     * that passes ({@link #retryable(RestStatus)}), as the service's 429 is;
+     * one without a status reads as a 500 and does not. A failure of the
+     * cluster passes when it is a full thread pool or carries a status that
+     * passes. Anything else is a fault of the request or of the rebuild,
+     * which a retry would only repeat.
+     */
+    static boolean retryable(Throwable e) {
+        Throwable cause = ExceptionsHelper.unwrapCause(e);
+        if (cause instanceof InfinoNative.InfinoException infino) {
+            return infino.unavailable() || retryable(infino.status());
+        }
+        return cause instanceof OpenSearchRejectedExecutionException
+            || (cause instanceof OpenSearchException && retryable(ExceptionsHelper.status(cause)));
     }
 
     /** Delete through the shard the documents just {@code created} whose rows the table no longer holds. */

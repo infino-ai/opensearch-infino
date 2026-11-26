@@ -23,6 +23,7 @@ import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.gateway.WriteStateException;
 import org.opensearch.index.engine.DocumentIndexWriter;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineCreationFailureException;
@@ -35,8 +36,10 @@ import org.opensearch.index.mapper.ParseContext.Document;
 import org.opensearch.index.mapper.SourceFieldMapper;
 import org.opensearch.index.seqno.ReplicationTracker;
 import org.opensearch.index.seqno.RetentionLease;
+import org.opensearch.index.seqno.RetentionLeases;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.shard.RefreshListeners;
+import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
@@ -145,16 +148,24 @@ import java.util.function.Predicate;
  * were lost) starts with an empty skeleton; {@link InfinoSkeletonAdopter}
  * creates a document for each row, through the write path, with writes that
  * leave the table alone, under a retention lease every copy is given
- * ({@link #REBUILD_LEASE}). Until it is done the skeleton cannot say which
- * ids exist: a write the skeleton takes as new is looked up in the table,
- * and a delete the skeleton does not find deletes the table's row and
- * reports it found; a replica that takes over meanwhile does the same, and
- * finishes the rebuild. A row written with a routing value keeps it, so the
- * rebuilt document is routed as it was. Until then a search of the shard
- * that returns hits answers 503 on every copy ({@link #answersSearches}):
- * its hits name skeleton documents, so its page would leave out rows its
- * total counts. A count or an aggregation reads the table alone, which
- * holds every row, and is answered.
+ * ({@link #REBUILD_LEASE}), which the primary takes before the shard starts.
+ * Until the rebuild has walked the whole table, a search of the shard that
+ * returns hits answers 503 on every copy ({@link #answersSearches}): its hits
+ * name skeleton documents, so its page would leave out rows its total
+ * counts. A count or an aggregation reads the table alone, which holds every
+ * row, and is answered. A row written with a routing value keeps it, so the
+ * rebuilt document is routed as it was.
+ *
+ * <p>While the skeleton may lack a document for a row of the table, it
+ * cannot say which ids exist, so the shard's writes look ids up in the table
+ * ({@link #looksUpIds}): a write the skeleton takes as new is looked up in
+ * the table, and a delete the skeleton does not find deletes the table's row
+ * and reports it found; a replica that takes over does the same. That holds
+ * during the rebuild, and after it while any row was left out (a source the
+ * mapping now refuses, say), under a second lease every copy is given
+ * ({@link #LEFT_OUT_LEASE}): a client's write of a left-out id then replaces
+ * its row rather than adding a second one. Only a later walk of the table
+ * that leaves nothing out ends it.
  *
  * <p>The table holds a retention lease on the shard's history from the first
  * operation it may not hold, which the primary moves forward as commits
@@ -244,9 +255,21 @@ public class InfinoEngine extends InternalEngine {
     /** What the rebuild's lease names as the one holding it. */
     static final String REBUILD_LEASE_SOURCE = "infino skeleton rebuild";
     /**
-     * Where the rebuild's lease holds the shard's history from: past every
-     * operation, so it keeps none. A shard keeps its history from the lowest
-     * of its leases, and the rebuild's lease only marks the rebuild.
+     * The retention lease a shard holds once its rebuild has walked the whole
+     * table but left rows out (see {@link InfinoSkeletonAdopter}): searches
+     * answer, but the skeleton still lacks a document for those rows, so the
+     * shard's writes go on looking ids up in the table ({@link #looksUpIds}).
+     * Every copy is given it, as it is the rebuild's lease, so a copy that
+     * takes over keeps looking them up; a later walk that leaves nothing out
+     * removes it.
+     */
+    static final String LEFT_OUT_LEASE = "infino_skeleton_left_out";
+    /** What the left-out lease names as the one holding it. */
+    static final String LEFT_OUT_LEASE_SOURCE = "infino skeleton rows left out";
+    /**
+     * Where the rebuild's lease and the left-out lease hold the shard's
+     * history from: past every operation, so they keep none. A shard keeps
+     * its history from the lowest of its leases, and these only mark a state.
      */
     static final long REBUILD_LEASE_RETAINING = Long.MAX_VALUE;
     /** How many times a primary starting empty counts its table's rows before its start fails. */
@@ -459,8 +482,8 @@ public class InfinoEngine extends InternalEngine {
      * Whether this copy is a primary whose skeleton started empty over a
      * table holding rows (see the class comment): an index the registry
      * recreated, or a primary allocated empty over a table that kept its
-     * rows. Its rebuild is under way from the start, before the rebuild's
-     * lease is added ({@link #rebuilding()}).
+     * rows. Its rebuild is under way from the start: it takes the rebuild's
+     * lease before the shard starts ({@link #leaseRebuildBeforeStart}).
      */
     private final boolean rebuilt;
     /**
@@ -589,8 +612,11 @@ public class InfinoEngine extends InternalEngine {
      */
     private static final Map<ShardId, Copy> COPIES = new ConcurrentHashMap<>();
 
-    /** The shards of rebuilt indices whose skeleton holds every row of the table again (see {@link InfinoSkeletonAdopter}). */
-    private static final Set<ShardId> SKELETON_COMPLETE = ConcurrentHashMap.newKeySet();
+    /**
+     * The shards whose skeleton rebuild has walked the whole table on this
+     * node (see {@link InfinoSkeletonAdopter}), whatever rows it left out.
+     */
+    private static final Set<ShardId> REBUILD_WALKED = ConcurrentHashMap.newKeySet();
 
     /** Record which copy of {@code shard} this node holds, as {@code routing} says. */
     static void copyOf(ShardId shard, ShardRouting routing) {
@@ -625,9 +651,13 @@ public class InfinoEngine extends InternalEngine {
         return copy != null && copy.primary() && TOOK_OVER.contains(shard);
     }
 
-    /** {@code shard}'s skeleton holds a document for every row of its table: ids need no lookup. */
-    static void skeletonComplete(ShardId shard) {
-        SKELETON_COMPLETE.add(shard);
+    /**
+     * {@code shard}'s skeleton rebuild has walked the whole table: its
+     * searches answer. Its writes stop looking ids up in the table unless
+     * the shard holds the left-out lease ({@link #looksUpIds}).
+     */
+    static void rebuildWalked(ShardId shard) {
+        REBUILD_WALKED.add(shard);
         for (InfinoEngine engine : BY_TABLE.values()) {
             if (engine.shardId.equals(shard)) {
                 engine.holdLatestWhileLookingUp(false);
@@ -639,7 +669,7 @@ public class InfinoEngine extends InternalEngine {
     static void forgetCopy(ShardId shard) {
         COPIES.remove(shard);
         TOOK_OVER.remove(shard);
-        SKELETON_COMPLETE.remove(shard);
+        REBUILD_WALKED.remove(shard);
     }
 
     /**
@@ -686,24 +716,60 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /**
+     * Whether the rebuild of this node's copy of {@code shard} walked the
+     * whole table but left rows out, so its writes still look ids up in the
+     * table ({@link #LEFT_OUT_LEASE}): its next primary walks the table again.
+     */
+    static boolean leavesRowsOut(ShardId shard) {
+        InfinoEngine engine = engineOf(shard);
+        return engine != null && engine.holdsLease(LEFT_OUT_LEASE);
+    }
+
+    /**
      * Whether this copy's skeleton is being rebuilt: the shard holds the
      * rebuild's lease ({@link #REBUILD_LEASE}), which every copy is given,
      * or this is a primary that started empty over a table holding rows and
-     * its rebuild has not finished ({@link #skeletonComplete}) though it has
-     * not added the lease yet.
+     * its rebuild has not walked the table ({@link #rebuildWalked}), though
+     * it holds no lease (its tracker would not take one).
      */
     private boolean rebuilding() {
-        boolean under = (rebuilt && !SKELETON_COMPLETE.contains(shardId)) || holdsRebuildLease();
+        boolean under = (rebuilt && !REBUILD_WALKED.contains(shardId)) || holdsLease(REBUILD_LEASE);
         if (under) {
             sawRebuild = true;
         }
         return under;
     }
 
-    /** Whether this copy holds the rebuild's lease, as it was last given the shard's leases. */
-    private boolean holdsRebuildLease() {
-        return config().getGlobalCheckpointSupplier() instanceof ReplicationTracker tracker
-            && tracker.getRetentionLeases().contains(REBUILD_LEASE);
+    /** Whether this copy holds the lease {@code id}, as it was last given the shard's leases. */
+    private boolean holdsLease(String id) {
+        return config().getGlobalCheckpointSupplier() instanceof ReplicationTracker tracker && tracker.getRetentionLeases().contains(id);
+    }
+
+    /**
+     * Give this copy the rebuild's lease ({@link #REBUILD_LEASE}) and keep it
+     * on disk, while the primary is still recovering, before the shard
+     * starts: a crash before the rebuild could add it would otherwise leave
+     * a copy that starts again from this store, or a replica that recovers
+     * from this one and takes over, not knowing a rebuild is due, answering
+     * short pages and adding a second row for each id it is sent. Until the
+     * shard starts, its tracker takes leases as a replica's does; it keeps
+     * them once the primary takes charge of them, and a replica recovering
+     * from this copy is given them.
+     */
+    private void leaseRebuildBeforeStart(ShardPath path) throws WriteStateException {
+        if (!(config().getGlobalCheckpointSupplier() instanceof ReplicationTracker tracker) || tracker.isPrimaryMode()) {
+            return;
+        }
+        RetentionLeases held = tracker.getRetentionLeases();
+        if (held.contains(REBUILD_LEASE)) {
+            return;
+        }
+        List<RetentionLease> leases = new ArrayList<>(held.leases());
+        leases.add(new RetentionLease(REBUILD_LEASE, REBUILD_LEASE_RETAINING, config().getThreadPool().absoluteTimeInMillis(), REBUILD_LEASE_SOURCE));
+        tracker.updateRetentionLeasesOnReplica(new RetentionLeases(held.primaryTerm(), held.version() + 1, leases));
+        if (path != null) {
+            tracker.persistRetentionLeases(path.getShardStatePath());
+        }
     }
 
     /**
@@ -777,9 +843,24 @@ public class InfinoEngine extends InternalEngine {
         return copy != null && copy.primary();
     }
 
-    /** Whether the skeleton can say which ids the table holds: not while it is rebuilt ({@link #rebuilding()}). */
+    /**
+     * Whether the skeleton holds a document for every row its rebuild could
+     * create one for: not while it is rebuilt ({@link #rebuilding()}). A row
+     * the rebuild left out has no document, and is no search's hit.
+     */
     private boolean skeletonKnowsIds() {
         return !rebuilding();
+    }
+
+    /**
+     * Whether this copy's writes look ids up in the table, because its
+     * skeleton may lack a document for a row the table holds: while it is
+     * rebuilt, and after while the rebuild left rows out
+     * ({@link #LEFT_OUT_LEASE}), so a client's write of a left-out id
+     * replaces its row rather than being taken as new.
+     */
+    private boolean looksUpIds() {
+        return !skeletonKnowsIds() || holdsLease(LEFT_OUT_LEASE);
     }
 
     /**
@@ -791,7 +872,7 @@ public class InfinoEngine extends InternalEngine {
      */
     private void holdLatestWhileLookingUp(boolean lookingUp) {
         synchronized (latestHoldLock) {
-            boolean wanted = (lookingUp || !skeletonKnowsIds() || (readsLatest && primaryCopy())) && !leaseRefreshStopped;
+            boolean wanted = (lookingUp || looksUpIds() || (readsLatest && primaryCopy())) && !leaseRefreshStopped;
             if (wanted == holdsLatest) {
                 return;
             }
@@ -822,9 +903,13 @@ public class InfinoEngine extends InternalEngine {
             // has a skeleton that knows none of them: an index the registry
             // recreated, or a primary allocated empty after every copy was lost.
             // A primary starting from its own store, or a replica, learns of a
-            // rebuild under way from the rebuild's lease (see rebuilding()).
+            // rebuild under way from the rebuild's lease (see rebuilding()), which
+            // this primary takes now, before the shard starts.
             Copy starting = COPIES.get(shardId);
             this.rebuilt = starting != null && starting.emptyStore() && holdsRows(table);
+            if (rebuilt) {
+                leaseRebuildBeforeStart(config.getStore().shardPath());
+            }
         } catch (Throwable t) {
             // A bridge that cannot load or a table that cannot be declared fails
             // this shard; as an Error it would take the node down.
@@ -1126,7 +1211,7 @@ public class InfinoEngine extends InternalEngine {
         if (pending != null) {
             return pending.source();
         }
-        if (!shardHoldsId && engine.skeletonKnowsIds()) {
+        if (!shardHoldsId && !engine.looksUpIds()) {
             return null;
         }
         if (engine.readsLatest) {
@@ -1483,7 +1568,7 @@ public class InfinoEngine extends InternalEngine {
                     return result;
                 }
                 // Read before the batch lock: it reads the shard's leases, under their own lock.
-                boolean knowsIds = skeletonKnowsIds();
+                boolean lookUp = looksUpIds();
                 synchronized (batchLock) {
                     boolean recovery = index.origin().isRecovery();
                     // A row a reader may not hold the id of yet carries the sequence number that
@@ -1508,7 +1593,7 @@ public class InfinoEngine extends InternalEngine {
                     }
                     // What the table holds for the id, when the batch has no write of it: a
                     // replay, or a write a rebuilt skeleton takes as new, may find a row there.
-                    Base base = recovery || (!knowsIds && result.isCreated())
+                    Base base = recovery || (lookUp && result.isCreated())
                         ? Base.UNKNOWN
                         : result.isCreated() ? Base.ABSENT : Base.PRESENT;
                     batch.add(id, base, new Version(result.getSeqNo(), !recovery, source, index.routing(), stamp, ignored, mapped));
@@ -1565,7 +1650,7 @@ public class InfinoEngine extends InternalEngine {
                     }
                     return result;
                 }
-                if (skeletonKnowsIds() || !deleteTableOnly(id, result.getSeqNo())) {
+                if (!looksUpIds() || !deleteTableOnly(id, result.getSeqNo())) {
                     return result;
                 }
             }
@@ -1821,7 +1906,8 @@ public class InfinoEngine extends InternalEngine {
      * renewed within {@code index.soft_deletes.retention_lease.period}, and
      * {@link #holdHistoryThrough} renews only when it moves, so an idle
      * shard, or one whose commits fail, would lose the history it holds.
-     * The rebuild's lease ({@link #REBUILD_LEASE}) is renewed with it.
+     * The rebuild's and the left-out leases ({@link #REBUILD_LEASE},
+     * {@link #LEFT_OUT_LEASE}) are renewed with it.
      */
     private void refreshTableLease() {
         try {
@@ -1831,9 +1917,13 @@ public class InfinoEngine extends InternalEngine {
                     if (held != null) {
                         tracker.renewRetentionLease(TABLE_LEASE, held.retainingSequenceNumber(), TABLE_LEASE_SOURCE);
                     }
-                    // A rebuild held for longer than the lease period keeps its lease.
+                    // A rebuild held for longer than the lease period keeps its lease, and
+                    // a shard whose rebuild left rows out keeps looking ids up.
                     if (tracker.isPrimaryMode() && tracker.getRetentionLeases().contains(REBUILD_LEASE)) {
                         tracker.renewRetentionLease(REBUILD_LEASE, REBUILD_LEASE_RETAINING, REBUILD_LEASE_SOURCE);
+                    }
+                    if (tracker.isPrimaryMode() && tracker.getRetentionLeases().contains(LEFT_OUT_LEASE)) {
+                        tracker.renewRetentionLease(LEFT_OUT_LEASE, REBUILD_LEASE_RETAINING, LEFT_OUT_LEASE_SOURCE);
                     }
                 } finally {
                     leaseLock.readLock().unlock();

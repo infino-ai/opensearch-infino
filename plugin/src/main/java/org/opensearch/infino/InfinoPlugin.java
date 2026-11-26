@@ -560,11 +560,12 @@ public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, 
      * (an index the registry recreated, or a primary allocated empty), or
      * one that holds the lease of a rebuild a copy before it began (a
      * replica that took over, or a primary starting again from its store);
-     * see {@link InfinoSkeletonAdopter}.
+     * or walk the table again for one whose rebuild left rows out (see
+     * {@link InfinoEngine#leavesRowsOut}); see {@link InfinoSkeletonAdopter}.
      */
     private static void adoptIfRebuilt(IndexShard shard) {
         Settings settings = shard.indexSettings().getSettings();
-        if (!inDefaultMode(settings) || !InfinoEngine.rebuilding(shard.shardId())) {
+        if (!inDefaultMode(settings) || !(InfinoEngine.rebuilding(shard.shardId()) || InfinoEngine.leavesRowsOut(shard.shardId()))) {
             return;
         }
         try {
