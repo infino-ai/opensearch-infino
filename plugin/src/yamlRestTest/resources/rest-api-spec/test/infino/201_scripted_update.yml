@@ -1,0 +1,579 @@
+---
+"Scripted _update on a Lucene twin":
+  # The same requests and the same expected answers on all three indices, so
+  # a scripted update on an Infino-backed index answers as on a Lucene one.
+  - do:
+      indices.create:
+        index: su_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { tags: { type: keyword }, n: { type: long }, gone: { type: keyword }, count: { type: long }, owner: { properties: { name: { type: keyword }, team: { type: keyword } } } } }
+  - do:
+      index: { index: su_luc, id: "1", refresh: true, body: { tags: [ a ], n: 1, gone: x, owner: { name: bob } } }
+
+  # A tag added from params, then another removed: tag searches see both changes.
+  - do:
+      update:
+        index: su_luc
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.tags.add(params.tag)", params: { tag: b } } }
+  - match: { result: updated }
+  - do: { get: { index: su_luc, id: "1" } }
+  - match: { _source.tags: [ a, b ] }
+  - do: { search: { index: su_luc, body: { query: { term: { tags: b } } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      update:
+        index: su_luc
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.tags.removeIf(t -> t == params.tag)", params: { tag: a } } }
+  - match: { result: updated }
+  - do: { get: { index: su_luc, id: "1" } }
+  - match: { _source.tags: [ b ] }
+  - do: { search: { index: su_luc, body: { query: { term: { tags: a } } } } }
+  - match: { hits.total.value: 0 }
+
+  # A field removed and an object set in one script.
+  - do:
+      update:
+        index: su_luc
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.remove('gone'); ctx._source.owner = ['name': params.name, 'team': 'x']", params: { name: ann } } }
+  - match: { result: updated }
+  - do: { get: { index: su_luc, id: "1" } }
+  - is_false: _source.gone
+  - match: { _source.owner: { name: ann, team: x } }
+  - do: { search: { index: su_luc, body: { query: { term: { owner.name: ann } } } } }
+  - match: { hits.total.value: 1 }
+  - do: { search: { index: su_luc, body: { query: { exists: { field: gone } } } } }
+  - match: { hits.total.value: 0 }
+
+  # A compare-and-set lease: ctx.op = "noop" writes nothing and answers noop.
+  - do: { get: { index: su_luc, id: "1" } }
+  - set: { _seq_no: before_noop }
+  - do:
+      update:
+        index: su_luc
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "if (ctx._source.n == params.expected) { ctx._source.n = params.next } else { ctx.op = 'noop' }", params: { expected: 99, next: 2 } } }
+  - match: { result: noop }
+  - do: { get: { index: su_luc, id: "1" } }
+  - match: { _source.n: 1 }
+  - match: { _seq_no: $before_noop }
+  - do:
+      update:
+        index: su_luc
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "if (ctx._source.n == params.expected) { ctx._source.n = params.next } else { ctx.op = 'noop' }", params: { expected: 1, next: 2 } } }
+  - match: { result: updated }
+  - do: { get: { index: su_luc, id: "1" } }
+  - match: { _source.n: 2 }
+
+  # A stored script.
+  - do:
+      put_script:
+        id: su_luc_add
+        body: { script: { lang: painless, source: "ctx._source.n += params.by" } }
+  - do:
+      update:
+        index: su_luc
+        id: "1"
+        refresh: true
+        body: { script: { id: su_luc_add, params: { by: 3 } } }
+  - match: { result: updated }
+  - do: { get: { index: su_luc, id: "1" } }
+  - match: { _source.n: 5 }
+
+  # if_seq_no: the update runs against the number it names, and conflicts once that has moved.
+  - set: { _seq_no: seq, _primary_term: term }
+  - do:
+      update:
+        index: su_luc
+        id: "1"
+        if_seq_no: $seq
+        if_primary_term: $term
+        body: { script: { lang: painless, source: "ctx._source.n += 1" } }
+  - match: { result: updated }
+  - do:
+      catch: conflict
+      update:
+        index: su_luc
+        id: "1"
+        if_seq_no: $seq
+        if_primary_term: $term
+        body: { script: { lang: painless, source: "ctx._source.n += 1" } }
+  - do: { get: { index: su_luc, id: "1" } }
+  - match: { _source.n: 6 }
+
+  # A script that fails is a bad request, and writes nothing.
+  - do:
+      catch: bad_request
+      update:
+        index: su_luc
+        id: "1"
+        body: { script: { lang: painless, source: "ctx._source.missing.length()" } }
+  - match: { error.type: illegal_argument_exception }
+  - match: { error.reason: "failed to execute script" }
+  - do: { get: { index: su_luc, id: "1" } }
+  - match: { _source.n: 6 }
+
+  # ctx.op = "delete" deletes.
+  - do:
+      update:
+        index: su_luc
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx.op = 'delete'" } }
+  - match: { result: deleted }
+  - do:
+      catch: missing
+      get: { index: su_luc, id: "1" }
+
+  # A missing document without an upsert is missing; with one, the upsert is written as it is.
+  - do:
+      catch: missing
+      update:
+        index: su_luc
+        id: u1
+        body: { script: { lang: painless, source: "ctx._source.count += 1" } }
+  - do:
+      update:
+        index: su_luc
+        id: u1
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.count += 1" }, upsert: { count: 1 } }
+  - match: { result: created }
+  - do: { get: { index: su_luc, id: u1 } }
+  - match: { _source.count: 1 }
+  - do:
+      update:
+        index: su_luc
+        id: u1
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.count += 1" }, upsert: { count: 1 } }
+  - match: { result: updated }
+  - do: { get: { index: su_luc, id: u1 } }
+  - match: { _source.count: 2 }
+
+  # scripted_upsert: the script makes the new document from the upsert.
+  - do:
+      update:
+        index: su_luc
+        id: s1
+        refresh: true
+        body: { scripted_upsert: true, script: { lang: painless, source: "if (ctx._source.count == null) { ctx._source.count = 0 } ctx._source.count += params.by", params: { by: 5 } }, upsert: {} }
+  - match: { result: created }
+  - do: { get: { index: su_luc, id: s1 } }
+  - match: { _source.count: 5 }
+
+  # Scripted updates in a bulk, one id three times: each runs against the one before it.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - update: { _index: su_luc, _id: s1 }
+          - { script: { lang: painless, source: "ctx._source.count += 1" } }
+          - update: { _index: su_luc, _id: s1 }
+          - { script: { lang: painless, source: "ctx.op = 'noop'" } }
+          - update: { _index: su_luc, _id: s1 }
+          - { script: { lang: painless, source: "ctx._source.count += 1" } }
+  - match: { errors: false }
+  - match: { items.0.update.result: updated }
+  - match: { items.1.update.result: noop }
+  - match: { items.2.update.result: updated }
+  - do: { get: { index: su_luc, id: s1 } }
+  - match: { _source.count: 7 }
+  - do: { search: { index: su_luc, body: { query: { range: { count: { gte: 7 } } } } } }
+  - match: { hits.total.value: 1 }
+
+---
+"Scripted _update on a default-mode index":
+  # The same requests and the same expected answers on all three indices, so
+  # a scripted update on an Infino-backed index answers as on a Lucene one.
+  - do:
+      indices.create:
+        index: su_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { tags: { type: keyword }, n: { type: long }, gone: { type: keyword }, count: { type: long }, owner: { properties: { name: { type: keyword }, team: { type: keyword } } } } }
+  - do:
+      index: { index: su_def, id: "1", refresh: true, body: { tags: [ a ], n: 1, gone: x, owner: { name: bob } } }
+
+  # A tag added from params, then another removed: tag searches see both changes.
+  - do:
+      update:
+        index: su_def
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.tags.add(params.tag)", params: { tag: b } } }
+  - match: { result: updated }
+  - do: { get: { index: su_def, id: "1" } }
+  - match: { _source.tags: [ a, b ] }
+  - do: { search: { index: su_def, body: { query: { term: { tags: b } } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      update:
+        index: su_def
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.tags.removeIf(t -> t == params.tag)", params: { tag: a } } }
+  - match: { result: updated }
+  - do: { get: { index: su_def, id: "1" } }
+  - match: { _source.tags: [ b ] }
+  - do: { search: { index: su_def, body: { query: { term: { tags: a } } } } }
+  - match: { hits.total.value: 0 }
+
+  # A field removed and an object set in one script.
+  - do:
+      update:
+        index: su_def
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.remove('gone'); ctx._source.owner = ['name': params.name, 'team': 'x']", params: { name: ann } } }
+  - match: { result: updated }
+  - do: { get: { index: su_def, id: "1" } }
+  - is_false: _source.gone
+  - match: { _source.owner: { name: ann, team: x } }
+  - do: { search: { index: su_def, body: { query: { term: { owner.name: ann } } } } }
+  - match: { hits.total.value: 1 }
+  - do: { search: { index: su_def, body: { query: { exists: { field: gone } } } } }
+  - match: { hits.total.value: 0 }
+
+  # A compare-and-set lease: ctx.op = "noop" writes nothing and answers noop.
+  - do: { get: { index: su_def, id: "1" } }
+  - set: { _seq_no: before_noop }
+  - do:
+      update:
+        index: su_def
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "if (ctx._source.n == params.expected) { ctx._source.n = params.next } else { ctx.op = 'noop' }", params: { expected: 99, next: 2 } } }
+  - match: { result: noop }
+  - do: { get: { index: su_def, id: "1" } }
+  - match: { _source.n: 1 }
+  - match: { _seq_no: $before_noop }
+  - do:
+      update:
+        index: su_def
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "if (ctx._source.n == params.expected) { ctx._source.n = params.next } else { ctx.op = 'noop' }", params: { expected: 1, next: 2 } } }
+  - match: { result: updated }
+  - do: { get: { index: su_def, id: "1" } }
+  - match: { _source.n: 2 }
+
+  # A stored script.
+  - do:
+      put_script:
+        id: su_def_add
+        body: { script: { lang: painless, source: "ctx._source.n += params.by" } }
+  - do:
+      update:
+        index: su_def
+        id: "1"
+        refresh: true
+        body: { script: { id: su_def_add, params: { by: 3 } } }
+  - match: { result: updated }
+  - do: { get: { index: su_def, id: "1" } }
+  - match: { _source.n: 5 }
+
+  # if_seq_no: the update runs against the number it names, and conflicts once that has moved.
+  - set: { _seq_no: seq, _primary_term: term }
+  - do:
+      update:
+        index: su_def
+        id: "1"
+        if_seq_no: $seq
+        if_primary_term: $term
+        body: { script: { lang: painless, source: "ctx._source.n += 1" } }
+  - match: { result: updated }
+  - do:
+      catch: conflict
+      update:
+        index: su_def
+        id: "1"
+        if_seq_no: $seq
+        if_primary_term: $term
+        body: { script: { lang: painless, source: "ctx._source.n += 1" } }
+  - do: { get: { index: su_def, id: "1" } }
+  - match: { _source.n: 6 }
+
+  # A script that fails is a bad request, and writes nothing.
+  - do:
+      catch: bad_request
+      update:
+        index: su_def
+        id: "1"
+        body: { script: { lang: painless, source: "ctx._source.missing.length()" } }
+  - match: { error.type: illegal_argument_exception }
+  - match: { error.reason: "failed to execute script" }
+  - do: { get: { index: su_def, id: "1" } }
+  - match: { _source.n: 6 }
+
+  # ctx.op = "delete" deletes.
+  - do:
+      update:
+        index: su_def
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx.op = 'delete'" } }
+  - match: { result: deleted }
+  - do:
+      catch: missing
+      get: { index: su_def, id: "1" }
+
+  # A missing document without an upsert is missing; with one, the upsert is written as it is.
+  - do:
+      catch: missing
+      update:
+        index: su_def
+        id: u1
+        body: { script: { lang: painless, source: "ctx._source.count += 1" } }
+  - do:
+      update:
+        index: su_def
+        id: u1
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.count += 1" }, upsert: { count: 1 } }
+  - match: { result: created }
+  - do: { get: { index: su_def, id: u1 } }
+  - match: { _source.count: 1 }
+  - do:
+      update:
+        index: su_def
+        id: u1
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.count += 1" }, upsert: { count: 1 } }
+  - match: { result: updated }
+  - do: { get: { index: su_def, id: u1 } }
+  - match: { _source.count: 2 }
+
+  # scripted_upsert: the script makes the new document from the upsert.
+  - do:
+      update:
+        index: su_def
+        id: s1
+        refresh: true
+        body: { scripted_upsert: true, script: { lang: painless, source: "if (ctx._source.count == null) { ctx._source.count = 0 } ctx._source.count += params.by", params: { by: 5 } }, upsert: {} }
+  - match: { result: created }
+  - do: { get: { index: su_def, id: s1 } }
+  - match: { _source.count: 5 }
+
+  # Scripted updates in a bulk, one id three times: each runs against the one before it.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - update: { _index: su_def, _id: s1 }
+          - { script: { lang: painless, source: "ctx._source.count += 1" } }
+          - update: { _index: su_def, _id: s1 }
+          - { script: { lang: painless, source: "ctx.op = 'noop'" } }
+          - update: { _index: su_def, _id: s1 }
+          - { script: { lang: painless, source: "ctx._source.count += 1" } }
+  - match: { errors: false }
+  - match: { items.0.update.result: updated }
+  - match: { items.1.update.result: noop }
+  - match: { items.2.update.result: updated }
+  - do: { get: { index: su_def, id: s1 } }
+  - match: { _source.count: 7 }
+  - do: { search: { index: su_def, body: { query: { range: { count: { gte: 7 } } } } } }
+  - match: { hits.total.value: 1 }
+
+---
+"Scripted _update on a proxy-mode index":
+  # The same requests and the same expected answers on all three indices, so
+  # a scripted update on an Infino-backed index answers as on a Lucene one.
+  - do:
+      indices.create:
+        index: su_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { tags: { type: keyword }, n: { type: long }, gone: { type: keyword }, count: { type: long }, owner: { properties: { name: { type: keyword }, team: { type: keyword } } } } }
+  - do:
+      index: { index: su_prx, id: "1", refresh: true, body: { tags: [ a ], n: 1, gone: x, owner: { name: bob } } }
+
+  # A tag added from params, then another removed: tag searches see both changes.
+  - do:
+      update:
+        index: su_prx
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.tags.add(params.tag)", params: { tag: b } } }
+  - match: { result: updated }
+  - do: { get: { index: su_prx, id: "1" } }
+  - match: { _source.tags: [ a, b ] }
+  - do: { search: { index: su_prx, body: { query: { term: { tags: b } } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      update:
+        index: su_prx
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.tags.removeIf(t -> t == params.tag)", params: { tag: a } } }
+  - match: { result: updated }
+  - do: { get: { index: su_prx, id: "1" } }
+  - match: { _source.tags: [ b ] }
+  - do: { search: { index: su_prx, body: { query: { term: { tags: a } } } } }
+  - match: { hits.total.value: 0 }
+
+  # A field removed and an object set in one script.
+  - do:
+      update:
+        index: su_prx
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.remove('gone'); ctx._source.owner = ['name': params.name, 'team': 'x']", params: { name: ann } } }
+  - match: { result: updated }
+  - do: { get: { index: su_prx, id: "1" } }
+  - is_false: _source.gone
+  - match: { _source.owner: { name: ann, team: x } }
+  - do: { search: { index: su_prx, body: { query: { term: { owner.name: ann } } } } }
+  - match: { hits.total.value: 1 }
+  - do: { search: { index: su_prx, body: { query: { exists: { field: gone } } } } }
+  - match: { hits.total.value: 0 }
+
+  # A compare-and-set lease: ctx.op = "noop" writes nothing and answers noop.
+  - do: { get: { index: su_prx, id: "1" } }
+  - set: { _seq_no: before_noop }
+  - do:
+      update:
+        index: su_prx
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "if (ctx._source.n == params.expected) { ctx._source.n = params.next } else { ctx.op = 'noop' }", params: { expected: 99, next: 2 } } }
+  - match: { result: noop }
+  - do: { get: { index: su_prx, id: "1" } }
+  - match: { _source.n: 1 }
+  - match: { _seq_no: $before_noop }
+  - do:
+      update:
+        index: su_prx
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "if (ctx._source.n == params.expected) { ctx._source.n = params.next } else { ctx.op = 'noop' }", params: { expected: 1, next: 2 } } }
+  - match: { result: updated }
+  - do: { get: { index: su_prx, id: "1" } }
+  - match: { _source.n: 2 }
+
+  # A stored script.
+  - do:
+      put_script:
+        id: su_prx_add
+        body: { script: { lang: painless, source: "ctx._source.n += params.by" } }
+  - do:
+      update:
+        index: su_prx
+        id: "1"
+        refresh: true
+        body: { script: { id: su_prx_add, params: { by: 3 } } }
+  - match: { result: updated }
+  - do: { get: { index: su_prx, id: "1" } }
+  - match: { _source.n: 5 }
+
+  # if_seq_no: the update runs against the number it names, and conflicts once that has moved.
+  - set: { _seq_no: seq, _primary_term: term }
+  - do:
+      update:
+        index: su_prx
+        id: "1"
+        if_seq_no: $seq
+        if_primary_term: $term
+        body: { script: { lang: painless, source: "ctx._source.n += 1" } }
+  - match: { result: updated }
+  - do:
+      catch: conflict
+      update:
+        index: su_prx
+        id: "1"
+        if_seq_no: $seq
+        if_primary_term: $term
+        body: { script: { lang: painless, source: "ctx._source.n += 1" } }
+  - do: { get: { index: su_prx, id: "1" } }
+  - match: { _source.n: 6 }
+
+  # A script that fails is a bad request, and writes nothing.
+  - do:
+      catch: bad_request
+      update:
+        index: su_prx
+        id: "1"
+        body: { script: { lang: painless, source: "ctx._source.missing.length()" } }
+  - match: { error.type: illegal_argument_exception }
+  - match: { error.reason: "failed to execute script" }
+  - do: { get: { index: su_prx, id: "1" } }
+  - match: { _source.n: 6 }
+
+  # ctx.op = "delete" deletes.
+  - do:
+      update:
+        index: su_prx
+        id: "1"
+        refresh: true
+        body: { script: { lang: painless, source: "ctx.op = 'delete'" } }
+  - match: { result: deleted }
+  - do:
+      catch: missing
+      get: { index: su_prx, id: "1" }
+
+  # A missing document without an upsert is missing; with one, the upsert is written as it is.
+  - do:
+      catch: missing
+      update:
+        index: su_prx
+        id: u1
+        body: { script: { lang: painless, source: "ctx._source.count += 1" } }
+  - do:
+      update:
+        index: su_prx
+        id: u1
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.count += 1" }, upsert: { count: 1 } }
+  - match: { result: created }
+  - do: { get: { index: su_prx, id: u1 } }
+  - match: { _source.count: 1 }
+  - do:
+      update:
+        index: su_prx
+        id: u1
+        refresh: true
+        body: { script: { lang: painless, source: "ctx._source.count += 1" }, upsert: { count: 1 } }
+  - match: { result: updated }
+  - do: { get: { index: su_prx, id: u1 } }
+  - match: { _source.count: 2 }
+
+  # scripted_upsert: the script makes the new document from the upsert.
+  - do:
+      update:
+        index: su_prx
+        id: s1
+        refresh: true
+        body: { scripted_upsert: true, script: { lang: painless, source: "if (ctx._source.count == null) { ctx._source.count = 0 } ctx._source.count += params.by", params: { by: 5 } }, upsert: {} }
+  - match: { result: created }
+  - do: { get: { index: su_prx, id: s1 } }
+  - match: { _source.count: 5 }
+
+  # Scripted updates in a bulk, one id three times: each runs against the one before it.
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - update: { _index: su_prx, _id: s1 }
+          - { script: { lang: painless, source: "ctx._source.count += 1" } }
+          - update: { _index: su_prx, _id: s1 }
+          - { script: { lang: painless, source: "ctx.op = 'noop'" } }
+          - update: { _index: su_prx, _id: s1 }
+          - { script: { lang: painless, source: "ctx._source.count += 1" } }
+  - match: { errors: false }
+  - match: { items.0.update.result: updated }
+  - match: { items.1.update.result: noop }
+  - match: { items.2.update.result: updated }
+  - do: { get: { index: su_prx, id: s1 } }
+  - match: { _source.count: 7 }
+  - do: { search: { index: su_prx, body: { query: { range: { count: { gte: 7 } } } } } }
+  - match: { hits.total.value: 1 }
+
