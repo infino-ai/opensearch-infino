@@ -909,6 +909,17 @@ impl Bridge {
         });
     }
 
+    /// Drop `name`'s kept handle and keep its schema document: the handle
+    /// was opened before a column the document now holds was added
+    /// ([`Recheck`]), and the next write opens one that knows it.
+    fn forget_handle(&self, name: &str) {
+        self.forgetting(name, || {
+            if let Ok(mut tables) = self.tables.write() {
+                tables.remove(name);
+            }
+        });
+    }
+
     /// Read `name`'s schema document again after a write that added a
     /// column to it: the engine adds one during an append as well as during
     /// a declaration (a geo_point's first values, a flat_object's members, a
@@ -3534,14 +3545,25 @@ const HOSTED_TYPE_MISMATCH: Shape = (
     "; apply the schema with the column's type changed to store it",
 );
 
-/// Whether the engine refused a write for a value whose type is not its
-/// column's, typed by the local engine or in the text of the hosted
-/// service's 400. A batch typed by a kept schema document that lacks a
-/// column added since carries that column's values in the type their JSON
-/// suggests, which is refused this way ([`Recheck`]).
-fn type_mismatch(e: &InfinoError) -> bool {
-    matches!(e, InfinoError::Schema(SchemaError::TypeMismatch { .. }))
-        || hosted_schema_refusal(e).is_some_and(|reason| says(reason, HOSTED_TYPE_MISMATCH))
+/// What ends the column's name in a [`HOSTED_TYPE_MISMATCH`] refusal, which
+/// the engine words "column `<name>` is `<type>` but the batch carries ...".
+const HOSTED_MISMATCH_NAME_ENDS: &str = "` is `";
+
+/// The column the hosted service names when it refused a write for a value
+/// whose type is not that column's, in the text of its 400
+/// ([`HOSTED_TYPE_MISMATCH`]); None for any other error. A batch typed by a
+/// kept schema document that lacks a column added since carries that
+/// column's values in the type their JSON suggests, which the service
+/// refuses this way, naming the column ([`Recheck`]). A refusal the bridge
+/// makes itself, converting rows against a schema document
+/// ([`rows_to_batch`]), is not one: it names a column that document holds,
+/// so reading the schema again cannot show it was added since.
+fn mismatched_column(e: &InfinoError) -> Option<&str> {
+    let reason = hosted_schema_refusal(e).filter(|r| says(r, HOSTED_TYPE_MISMATCH))?;
+    let named = reason.strip_prefix(HOSTED_TYPE_MISMATCH.0)?;
+    named
+        .split_once(HOSTED_MISMATCH_NAME_ENDS)
+        .map(|(column, _)| column)
 }
 
 /// Whether `reason` has the shape `(starts, ends)`.
@@ -3571,9 +3593,11 @@ fn hosted_schema_refusal(e: &InfinoError) -> Option<&str> {
 
 /// Write rows with `write`, isolating the ones the engine refuses: a refused
 /// write is split in halves until each refused document stands alone and is
-/// reported with the engine's reason, and as `permanent` when the engine
-/// refused what it carries ([`refuses_content`]), while every accepted half
-/// is one write. A write the hosted service could not take
+/// reported with the engine's reason, as `permanent` when the engine
+/// refused what it carries ([`refuses_content`]), and with the column the
+/// hosted service named when it refused a value for that column's type
+/// (`mismatched`, [`mismatched_column`]), while every accepted half is one
+/// write. A write the hosted service could not take
 /// ([`ends_the_write`]: it did not answer, or turned the call away for the
 /// account's request rate) says nothing of the rows, and every half would
 /// meet the same service: it ends the call with that error, so a stalled or
@@ -3600,6 +3624,7 @@ fn write_checked(
                 "i": rows[0].0,
                 "reason": short_reason(&e),
                 "permanent": refuses_content(&e),
+                "mismatched": mismatched_column(&e),
             }));
         }
         Err(_) => {
@@ -3773,8 +3798,16 @@ fn replace_rows_checked(
         return replace_each(&[a, b], failed);
     }
     let permanent = rows.len() == 1 && refuses_content(&e);
+    // The column a refusal of the document alone names, as for an append
+    // ([`write_checked`]).
+    let mismatched = mismatched_column(&e).filter(|_| permanent);
     for (i, _) in rows {
-        failed.push(json!({"i": i, "reason": reason, "permanent": permanent}));
+        failed.push(json!({
+            "i": i,
+            "reason": reason,
+            "permanent": permanent,
+            "mismatched": mismatched,
+        }));
     }
     Ok(())
 }
@@ -4236,7 +4269,6 @@ pub unsafe extern "C" fn infino_index_batch_buf(
         };
         let n = prepared.n;
         let adds_columns = prepared.adds_columns;
-        let early: HashSet<(usize, usize)> = prepared.failed.iter().map(|(i, _)| (0, *i)).collect();
         let mut recheck = Recheck::new(conn, name, vec![prepared.typed_by.clone()]);
         let failed = match append_prepared(
             &table,
@@ -4250,13 +4282,8 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             Ok(failed) => failed,
             Err(e) => return engine_err_json(&e),
         };
-        let failed = recheck.retry_stale_refusals(failed, &early);
-        let failed: Vec<Value> = failed
-            .into_iter()
-            .map(|(_, i, reason, permanent, status)| {
-                json!({ "i": i, "reason": reason, "permanent": permanent, "status": status })
-            })
-            .collect();
+        let failed = recheck.retry_stale_refusals(failed);
+        let failed: Vec<Value> = failed.iter().map(|f| f.to_json(false)).collect();
         let ok = n - failed.len();
         if adds_columns && ok > 0 {
             conn.reread_schema(name);
@@ -4549,15 +4576,70 @@ fn osids_of(batch: &RecordBatch) -> Vec<String> {
     ids
 }
 
-/// A document an append did not take: (batch index, document index, reason,
-/// permanent, status). It is permanent when the table refuses what the
-/// document carries, so every later try is refused the same way; otherwise
-/// it failed for a reason of the moment and a later try may take it. The
-/// status is the one the caller answers for it when it is not a refusal of
-/// the document ([`untried`]): 429 for a write the hosted service turned
-/// away for the account's request rate, 503 for one it did not answer; the
-/// client sends either again.
-type NotTaken = (usize, usize, String, bool, Option<u16>);
+/// A document an append did not take.
+#[derive(Debug)]
+struct NotTaken {
+    /// The index of its prepared batch.
+    batch: usize,
+    /// Its index in that batch.
+    index: usize,
+    /// Why it was not taken.
+    reason: String,
+    /// Whether the table refuses what the document carries, so every later
+    /// try is refused the same way; otherwise it failed for a reason of the
+    /// moment and a later try may take it.
+    permanent: bool,
+    /// The status the caller answers for it when it is not a refusal of the
+    /// document ([`untried`]): 429 for a write the hosted service turned
+    /// away for the account's request rate, 503 for one it did not answer
+    /// or one refused for a column its batch's schema document lacked
+    /// ([`STALE_SCHEMA_STATUS`]); the client sends any of them again.
+    status: Option<u16>,
+    /// The column the hosted service named when it refused the document
+    /// for that column's type ([`mismatched_column`]), which [`Recheck`]
+    /// weighs; None for any other failure.
+    mismatched: Option<String>,
+    /// Whether it was refused for a column its batch's schema document
+    /// lacked ([`Recheck`]): the service stored nothing of it, so a later
+    /// commit need not look its id up, as after a rate limit.
+    stale_schema: bool,
+}
+
+impl NotTaken {
+    /// A document of batch `batch`, at `index` in it, not taken for `reason`.
+    fn new(
+        batch: usize,
+        index: usize,
+        reason: String,
+        permanent: bool,
+        status: Option<u16>,
+    ) -> Self {
+        NotTaken {
+            batch,
+            index,
+            reason,
+            permanent,
+            status,
+            mismatched: None,
+            stale_schema: false,
+        }
+    }
+
+    /// The document as the plugin reads it, with its batch when `batched`.
+    fn to_json(&self, batched: bool) -> Value {
+        let mut out = json!({
+            "i": self.index,
+            "reason": self.reason,
+            "permanent": self.permanent,
+            "status": self.status,
+            "stale_schema": self.stale_schema,
+        });
+        if batched {
+            out["b"] = json!(self.batch);
+        }
+        out
+    }
+}
 
 /// Stamp each document of a prepared batch with its sequence number,
 /// `seqs[i]` for document `i` of the batch: in the row it falls back to, and
@@ -4594,15 +4676,16 @@ fn stamp_seqs(p: &mut Prepared, seqs: &[i64]) -> Result<(), String> {
 }
 
 /// `result`, noting in `mismatch` the reason of a refusal for a column's
-/// type ([`type_mismatch`]), which the caller weighs against the table's
-/// schema read afresh before splitting the write ([`Recheck`]).
+/// type and the column it names ([`mismatched_column`]), which the caller
+/// weighs against the table's schema read afresh before splitting the
+/// write ([`Recheck`]).
 fn noting_mismatch<T>(
     result: Result<T, InfinoError>,
-    mismatch: &mut Option<String>,
+    mismatch: &mut Option<(String, String)>,
 ) -> Result<T, InfinoError> {
     if let Err(e) = &result {
-        if type_mismatch(e) {
-            *mismatch = Some(short_reason(e));
+        if let Some(column) = mismatched_column(e) {
+            *mismatch = Some((short_reason(e), column.to_string()));
         }
     }
     result
@@ -4612,7 +4695,8 @@ fn noting_mismatch<T>(
 /// it for a column's type while its batch was typed by a schema document
 /// that lags the table ([`Recheck`]): the client sends it again, as for a
 /// service that did not answer, and the retry types it afresh. The service
-/// stored nothing of it.
+/// stored nothing of it, which the document's `stale_schema` says
+/// ([`NotTaken`]).
 const STALE_SCHEMA_STATUS: u16 = SERVICE_UNAVAILABLE;
 
 /// Whether the refusals a hosted append met may be the bridge's own. Each
@@ -4624,14 +4708,20 @@ const STALE_SCHEMA_STATUS: u16 = SERVICE_UNAVAILABLE;
 /// the column's type on every try typed by that document; OpenSearch has
 /// acknowledged the write by then, so dropping it as refused loses it.
 ///
-/// The kept handle and document are dropped and the document read afresh,
-/// once per append, on the first refusal that asks. A batch is stale when
-/// the table now holds a column newer than every one its document knew
-/// (an id above the highest it had minted), or when the document cannot be
-/// read. Nothing else counts: a change elsewhere in the document (its
-/// version, its limits, a dropped column) leaves a refusal of the rows
-/// permanent, so a document refused for what it carries is retried at most
-/// once per column added, and then ends refused.
+/// Only a refusal the hosted service made for a column's type is weighed,
+/// by the column it names ([`mismatched_column`]). The document is read
+/// afresh once per append, on the first refusal that asks, and swapped in
+/// for the kept one ([`Bridge::replace_schema`]), which stays kept while
+/// the read runs and if it fails. A refusal is the batch's document's own
+/// when the column it names is newer than every one that document knew (an
+/// id above the highest it had minted), or when the schema cannot be read.
+/// When the column is newer, the table's handle is dropped too, so the next
+/// write opens one that knows it. Nothing else counts: a refusal naming a column
+/// the document already knew, or any change elsewhere in the schema (its
+/// version, its limits, another column added by the same write), leaves the
+/// refusal permanent, so a document refused for what it carries is retried
+/// at most once per column it carries that its batch's document lacked,
+/// and then ends refused.
 struct Recheck<'a> {
     /// The connection and table to read the schema of; None over storage,
     /// where batches are typed by the live schema, and in tests that
@@ -4641,6 +4731,9 @@ struct Recheck<'a> {
     typed_by: Vec<Option<TableSchema>>,
     /// The document as read afresh, once read: or why it could not be.
     fresh: Option<Result<TableSchema, String>>,
+    /// Whether the table's handle was dropped for a column added since a
+    /// batch was typed, which is done once per append.
+    handle_dropped: bool,
 }
 
 impl<'a> Recheck<'a> {
@@ -4650,6 +4743,7 @@ impl<'a> Recheck<'a> {
             conn: conn.hosted.then_some((conn, name)),
             typed_by,
             fresh: None,
+            handle_dropped: false,
         }
     }
 
@@ -4660,22 +4754,32 @@ impl<'a> Recheck<'a> {
             conn: None,
             typed_by: Vec::new(),
             fresh: None,
+            handle_dropped: false,
         }
     }
 
-    /// Why batch `b` may have been typed by a document that lags the table,
-    /// or None when it was typed by one that knows every column the table
-    /// holds (or over storage).
-    fn stale(&mut self, b: usize) -> Option<String> {
+    /// Why a refusal of batch `b` for `column`'s type may be the bridge's
+    /// own: the column was added since the batch's document was read, or
+    /// the schema cannot be read again. None when the batch's document knew
+    /// the column, or over storage.
+    fn stale(&mut self, b: usize, column: &str) -> Option<String> {
         let (conn, name) = self.conn?;
         let typed = self.typed_by.get(b)?.as_ref()?;
         let fresh = self.fresh.get_or_insert_with(|| {
-            conn.forget(name);
-            conn.table_schema(name).map_err(|e| short_reason(&e))
+            conn.replace_schema(name, || conn.conn.schema(name))
+                .map_err(|e| short_reason(&e))
         });
         match fresh {
-            Ok(now) if !newer_columns(typed, now) => None,
-            Ok(_) => Some("the table gained columns since the batch was typed".to_string()),
+            Ok(now) if !added_since(typed, now, column) => None,
+            Ok(_) => {
+                if !self.handle_dropped {
+                    conn.forget_handle(name);
+                    self.handle_dropped = true;
+                }
+                Some(format!(
+                    "column `{column}` was added since the batch was typed"
+                ))
+            }
             Err(e) => Some(format!("the table's schema could not be read again: {e}")),
         }
     }
@@ -4691,50 +4795,43 @@ impl<'a> Recheck<'a> {
         }
     }
 
-    /// Why any of `batches` may have been typed by a document that lags the
-    /// table ([`Recheck::stale`]).
-    fn any_stale(&mut self, batches: impl Iterator<Item = usize>) -> Option<String> {
-        batches.into_iter().find_map(|b| self.stale(b))
+    /// Why a refusal for `column`'s type of a write carrying `batches` may
+    /// be the bridge's own ([`Recheck::stale`]).
+    fn any_stale(&mut self, batches: impl Iterator<Item = usize>, column: &str) -> Option<String> {
+        batches.into_iter().find_map(|b| self.stale(b, column))
     }
 
-    /// `failed`, with each document refused for a column's type whose batch
-    /// is stale ([`Recheck::stale`]) reported for a later try under
-    /// [`STALE_SCHEMA_STATUS`] instead of as permanent. A document turned
-    /// away with a status of its own (a rate limit) is left as it is, as is
-    /// one refused before the append (`early`, by its conversion), which the
-    /// service never saw.
-    fn retry_stale_refusals(
-        &mut self,
-        failed: Vec<NotTaken>,
-        early: &HashSet<(usize, usize)>,
-    ) -> Vec<NotTaken> {
-        let by_service = |(b, i, _, permanent, status): &NotTaken| {
-            *permanent && status.is_none() && !early.contains(&(*b, *i))
-        };
-        if self.conn.is_none() || !failed.iter().any(by_service) {
+    /// `failed`, with each document the hosted service refused for a
+    /// column's type that its batch's document lacked ([`Recheck::stale`])
+    /// reported for a later try under [`STALE_SCHEMA_STATUS`] instead of as
+    /// permanent. Any other failure is left as it is: one turned away with
+    /// a status of its own (a rate limit), one the bridge refused itself
+    /// (by its conversion), and one the service refused for anything but a
+    /// column's type.
+    fn retry_stale_refusals(&mut self, failed: Vec<NotTaken>) -> Vec<NotTaken> {
+        let weighed = |f: &NotTaken| f.permanent && f.status.is_none() && f.mismatched.is_some();
+        if self.conn.is_none() || !failed.iter().any(weighed) {
             return failed;
         }
         let mut retried = 0usize;
         let failed: Vec<NotTaken> = failed
             .into_iter()
-            .map(|f| {
-                if !by_service(&f) {
+            .map(|mut f| {
+                if !weighed(&f) {
                     return f;
                 }
-                let (b, i, reason, permanent, status) = f;
-                match self.stale(b) {
-                    None => (b, i, reason, permanent, status),
-                    Some(why) => {
-                        retried += 1;
-                        (
-                            b,
-                            i,
-                            format!("{reason} ({why}; a later try types it again)"),
-                            false,
-                            Some(STALE_SCHEMA_STATUS),
-                        )
-                    }
+                let why = f
+                    .mismatched
+                    .as_deref()
+                    .and_then(|column| self.stale(f.batch, column));
+                if let Some(why) = why {
+                    retried += 1;
+                    f.reason = format!("{} ({why}; a later try types it again)", f.reason);
+                    f.permanent = false;
+                    f.status = Some(STALE_SCHEMA_STATUS);
+                    f.stale_schema = true;
                 }
+                f
             })
             .collect();
         if let (true, Some((_, name))) = (retried > 0, self.conn) {
@@ -4746,11 +4843,11 @@ impl<'a> Recheck<'a> {
     }
 }
 
-/// Whether `now` holds a column newer than every one `typed` knew: an id
-/// above the highest `typed` holds, live or dropped. Ids are minted in
-/// order and never reused, so such a column was added after `typed` was
-/// read.
-fn newer_columns(typed: &TableSchema, now: &TableSchema) -> bool {
+/// Whether `now` holds `column` under an id above every one `typed` knew,
+/// live or dropped. Ids are minted in order and never reused, so such a
+/// column was added after `typed` was read; a column `typed` already knew
+/// is one its rows were typed by.
+fn added_since(typed: &TableSchema, now: &TableSchema, column: &str) -> bool {
     let known = typed
         .fields()
         .iter()
@@ -4758,7 +4855,9 @@ fn newer_columns(typed: &TableSchema, now: &TableSchema) -> bool {
         .chain(typed.tombstoned().iter().map(|id| id.0))
         .max()
         .unwrap_or(0);
-    now.fields().iter().any(|f| f.id.0 > known)
+    now.fields()
+        .iter()
+        .any(|f| f.name == column && f.id.0 > known)
 }
 
 /// Whether a write landed. One the hosted service ended ([`ends_the_write`]:
@@ -4818,12 +4917,18 @@ fn append_prepared(
     for (b, p) in prepared.iter_mut().enumerate() {
         // Refused by the columns before conversion, as every try would be.
         for (i, why) in &p.failed {
-            failed.push((b, *i, why.clone(), true, None));
+            failed.push(NotTaken::new(b, *i, why.clone(), true, None));
         }
         if let Some(seqs) = seqs.get(b) {
             if let Err(why) = stamp_seqs(p, seqs) {
                 for i in &p.index_of {
-                    failed.push((b, *i, format!("sequence number: {why}"), false, None));
+                    failed.push(NotTaken::new(
+                        b,
+                        *i,
+                        format!("sequence number: {why}"),
+                        false,
+                        None,
+                    ));
                 }
                 p.batch = None;
                 p.values.clear();
@@ -4838,7 +4943,7 @@ fn append_prepared(
             for (b, p) in prepared.iter().enumerate() {
                 if p.batch.is_some() {
                     for i in &p.index_of {
-                        failed.push((b, *i, why.clone(), false, None));
+                        failed.push(NotTaken::new(b, *i, why.clone(), false, None));
                     }
                 }
             }
@@ -4854,7 +4959,7 @@ fn append_prepared(
     let mut stop: Option<InfinoError> = None;
     // The reason the joined write was refused for a column's type, if it
     // was ([`type_mismatch`]).
-    let mut mismatch: Option<String> = None;
+    let mut mismatch: Option<(String, String)> = None;
     if let Some(batch) = &joined {
         if replaced.is_empty() {
             let _pass = gate.append();
@@ -4900,7 +5005,7 @@ fn append_prepared(
                     for (b, p) in prepared.iter().enumerate() {
                         if p.batch.is_some() {
                             for i in &p.index_of {
-                                failed.push((b, *i, why.clone(), false, None));
+                                failed.push(NotTaken::new(b, *i, why.clone(), false, None));
                             }
                         }
                     }
@@ -4919,13 +5024,13 @@ fn append_prepared(
     // read again first: when the table gained columns since the batch was
     // typed, or cannot be read, every document not written is reported for
     // a later try, which types it afresh, with no further call.
-    if let (Some(refusal), None) = (&mismatch, &stop) {
+    if let (Some((refusal, column)), None) = (&mismatch, &stop) {
         let converted = prepared
             .iter()
             .enumerate()
             .filter(|(_, p)| p.batch.is_some())
             .map(|(b, _)| b);
-        if let Some(why) = recheck.any_stale(converted) {
+        if let Some(why) = recheck.any_stale(converted, column) {
             let reason = format!("{refusal} ({why}; a later try types it again)");
             let before = failed.len();
             for (b, p) in prepared.iter().enumerate() {
@@ -4939,13 +5044,16 @@ fn append_prepared(
                             fresh_landed
                         };
                     if !wrote {
-                        failed.push((
-                            b,
-                            p.index_of[j],
-                            reason.clone(),
-                            false,
-                            Some(STALE_SCHEMA_STATUS),
-                        ));
+                        failed.push(NotTaken {
+                            stale_schema: true,
+                            ..NotTaken::new(
+                                b,
+                                p.index_of[j],
+                                reason.clone(),
+                                false,
+                                Some(STALE_SCHEMA_STATUS),
+                            )
+                        });
                     }
                 }
             }
@@ -5009,13 +5117,16 @@ fn append_prepared(
         }
         for r in refused {
             let i = r["i"].as_u64().unwrap_or(0) as usize;
-            failed.push((
-                b,
-                i,
-                r["reason"].as_str().unwrap_or("refused").to_string(),
-                r["permanent"].as_bool().unwrap_or(false),
-                r["status"].as_u64().and_then(|s| u16::try_from(s).ok()),
-            ));
+            failed.push(NotTaken {
+                mismatched: r["mismatched"].as_str().map(str::to_string),
+                ..NotTaken::new(
+                    b,
+                    i,
+                    r["reason"].as_str().unwrap_or("refused").to_string(),
+                    r["permanent"].as_bool().unwrap_or(false),
+                    r["status"].as_u64().and_then(|s| u16::try_from(s).ok()),
+                )
+            });
         }
     }
     Ok(failed)
@@ -5150,13 +5261,15 @@ pub unsafe extern "C" fn infino_prepare_batch_meta(
 /// in the same mutation. `seqs` (null for none) holds `seqs_count` sequence
 /// numbers, one per document of every batch, batch after batch in order: the
 /// number each document is written under. Returns
-/// `{"ok":n,"failed":[{"b":batch,"i":doc,"reason":..,"permanent":..,"status":..}]}`,
+/// `{"ok":n,"failed":[{"b":batch,"i":doc,"reason":..,"permanent":..,"status":..,"stale_schema":..}]}`,
 /// where `b` indexes `prepared`, `i` the documents of that batch,
-/// `permanent` says every later try is refused the same way ([`NotTaken`])
-/// and `status` is 429 for a document the hosted service turned away for the
-/// account's request rate and 503 for one it did not answer ([`untried`]),
-/// else null; or `{"error":..}` when nothing ran (the handles are released
-/// either way).
+/// `permanent` says every later try is refused the same way ([`NotTaken`]),
+/// `status` is 429 for a document the hosted service turned away for the
+/// account's request rate and 503 for one it did not answer ([`untried`])
+/// or refused for a column its batch's schema document lacked, else null,
+/// and `stale_schema` says the last, whose document the service did not
+/// store ([`Recheck`]); or `{"error":..}` when nothing ran (the handles are
+/// released either way).
 #[no_mangle]
 pub unsafe extern "C" fn infino_append_prepared(
     h: *mut Bridge,
@@ -5215,12 +5328,11 @@ pub unsafe extern "C" fn infino_append_prepared(
                 .collect()
         };
         let adds_columns = owned.iter().any(|p| p.adds_columns);
-        let early: HashSet<(usize, usize)> = owned
-            .iter()
-            .enumerate()
-            .flat_map(|(b, p)| p.failed.iter().map(move |(i, _)| (b, *i)))
-            .collect();
-        let mut recheck = Recheck::new(conn, name, owned.iter().map(|p| p.typed_by.clone()).collect());
+        let mut recheck = Recheck::new(
+            conn,
+            name,
+            owned.iter().map(|p| p.typed_by.clone()).collect(),
+        );
         let failed = match append_prepared(
             &table,
             &conn.gate(name),
@@ -5233,21 +5345,18 @@ pub unsafe extern "C" fn infino_append_prepared(
             Ok(failed) => failed,
             Err(e) => return engine_err_json(&e),
         };
-        let failed = recheck.retry_stale_refusals(failed, &early);
+        let failed = recheck.retry_stale_refusals(failed);
         let ok = n.saturating_sub(failed.len());
         // A write adds its columns only when it lands, so one that landed
         // nothing changed nothing, and asks the service nothing more; nor is
-        // a service that stopped answering asked for the schema.
-        let unanswered = failed.iter().any(|f| f.4 == Some(SERVICE_UNAVAILABLE));
+        // a service that stopped answering asked for the schema. A document
+        // refused for a column its batch's document lacked had the schema
+        // read again already ([`Recheck`]).
+        let unanswered = failed.iter().any(|f| f.status == Some(SERVICE_UNAVAILABLE));
         if adds_columns && ok > 0 && !unanswered {
             conn.reread_schema(name);
         }
-        let failed: Vec<Value> = failed
-            .into_iter()
-            .map(|(b, i, reason, permanent, status)| {
-                json!({ "b": b, "i": i, "reason": reason, "permanent": permanent, "status": status })
-            })
-            .collect();
+        let failed: Vec<Value> = failed.iter().map(|f| f.to_json(true)).collect();
         out_json(json!({ "ok": ok, "failed": failed }))
     }))
     .unwrap_or(ptr::null_mut())
@@ -11120,7 +11229,8 @@ mod tests {
     }
 
     /// The documents a stale-schema refusal is reported for: every one of
-    /// `out`, for a later try under [`STALE_SCHEMA_STATUS`], not permanent.
+    /// `out`, for a later try under [`STALE_SCHEMA_STATUS`], not permanent,
+    /// and marked as not stored.
     fn assert_all_for_a_later_try(out: &Value, n: usize) {
         let failed = out["failed"].as_array().unwrap();
         assert_eq!(out["ok"], 0, "{out}");
@@ -11128,6 +11238,7 @@ mod tests {
         for f in failed {
             assert_eq!(f["permanent"], false, "{f}");
             assert_eq!(f["status"], STALE_SCHEMA_STATUS, "{f}");
+            assert_eq!(f["stale_schema"], true, "{f}");
             let reason = f["reason"].as_str().unwrap_or_default();
             assert!(reason.contains("a later try types it again"), "{reason}");
         }
@@ -11141,7 +11252,10 @@ mod tests {
     /// table gained a column (or its schema cannot be read) every document
     /// is reported for a later try, with no call per document: one refused
     /// append and one read of the schema, whatever the batch's size. The
-    /// later try types the documents afresh and lands them.
+    /// schema read is kept, so the later try types the documents by it with
+    /// no read of its own and lands them. A read that fails keeps the old
+    /// document, so a busy service costs one more refused try, whose read
+    /// then passes, before the documents land.
     #[test]
     fn a_batch_typed_by_a_stale_document_is_tried_again_whole_without_a_split() {
         const DOCS: usize = 8;
@@ -11175,11 +11289,26 @@ mod tests {
                 assert_eq!(s.document_reads, 1, "busy = {busy}: one read of the schema");
                 assert!(s.landed.is_empty(), "{:?}", s.landed);
             }
-            state.lock().unwrap().schema_busy = false;
-            let p = prepared(h, &rows);
-            let out = append_replacing(h, p, &[]);
+            {
+                let mut s = state.lock().unwrap();
+                s.schema_busy = false;
+                s.appends = 0;
+                s.document_reads = 0;
+            }
+            if busy {
+                let out = append_replacing(h, prepared(h, &rows), &[]);
+                assert_all_for_a_later_try(&out, DOCS);
+                let mut s = state.lock().unwrap();
+                assert_eq!((s.appends, s.document_reads), (1, 1), "the read passes now");
+                s.appends = 0;
+                s.document_reads = 0;
+            }
+            let out = append_replacing(h, prepared(h, &rows), &[]);
             assert_eq!(out["ok"], DOCS, "busy = {busy}: {out}");
-            assert_eq!(state.lock().unwrap().landed.len(), DOCS);
+            let s = state.lock().unwrap();
+            assert_eq!(s.landed.len(), DOCS);
+            assert_eq!(s.document_reads, 0, "busy = {busy}: typed by the kept read");
+            drop(s);
             close(h);
         }
     }
@@ -11252,6 +11381,62 @@ mod tests {
         assert_eq!(out["failed"][0]["permanent"], true, "{out}");
         assert_eq!(state.lock().unwrap().landed, ["a"]);
         close(h);
+    }
+
+    /// A refusal is weighed by the column it names, not by whether the
+    /// table gained any column: a document refused for the type of a column
+    /// its batch's document already knew stays refused for good, though
+    /// another column was added since the batch was typed. Otherwise, on a
+    /// table whose writes keep adding paths, it would be put back for a
+    /// later try on every commit and never end.
+    #[test]
+    fn a_refusal_naming_a_known_column_stays_permanent_while_another_is_added() {
+        let state = Arc::new(Mutex::new(Typed {
+            doc: Some(typed_doc(false)),
+            ..Typed::default()
+        }));
+        let h = typed_bridge(&state);
+        let bridge = unsafe { &*h };
+        bridge.table_schema("logs").unwrap();
+        // A column is added behind the bridge; this batch does not carry it.
+        state.lock().unwrap().doc = Some(typed_doc(true));
+        let plain = json!({ "level": "info" }).to_string();
+        let p = prepared(h, &[(REFUSED_ID, &plain), ("a", &plain)]);
+        state.lock().unwrap().document_reads = 0;
+        let out = append_replacing(h, p, &[]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let failed = out["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1, "{out}");
+        assert_eq!(failed[0]["i"], 0, "{out}");
+        assert_eq!(failed[0]["permanent"], true, "{out}");
+        assert_eq!(failed[0]["stale_schema"], false, "{out}");
+        assert_eq!(failed[0]["status"], Value::Null, "{out}");
+        let s = state.lock().unwrap();
+        assert_eq!(s.landed, ["a"]);
+        assert_eq!(s.document_reads, 1, "one read of the schema per append");
+        drop(s);
+        close(h);
+    }
+
+    /// Only the hosted service's refusal of a value for its column's type
+    /// names a column to weigh; the same refusal made by the bridge while
+    /// converting rows, or any other refusal, names none.
+    #[test]
+    fn only_the_hosted_type_mismatch_names_a_column() {
+        let mismatch = SchemaError::TypeMismatch {
+            column: STAMP.into(),
+            frozen: DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            offered: DataType::Int64,
+        };
+        let hosted = InfinoError::Backend(format!(
+            "append: server returned 400: append error: schema: {mismatch}"
+        ));
+        assert_eq!(mismatched_column(&hosted), Some(STAMP));
+        assert_eq!(mismatched_column(&InfinoError::Schema(mismatch)), None);
+        let cap = InfinoError::Backend(
+            "append: server returned 400: append error: schema: adding [x] exceeds 10; raise `max_fields` in the schema or fix the producer".into(),
+        );
+        assert_eq!(mismatched_column(&cap), None);
     }
 
     /// A whole write (a replace, a delete, a schema change) waits for the
