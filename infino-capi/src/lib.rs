@@ -1124,6 +1124,9 @@ fn open(uri: &str, api_key: Option<&str>, cache_dir: Option<&str>) -> Result<Bri
             Duration::from_millis(staleness),
         ));
     }
+    if hosted {
+        options = within(options, REQUEST_TIMEOUT_MS.load(Ordering::SeqCst));
+    }
     let conn = connect_with(uri, options)?;
     let latest_from = (!hosted && !uri.starts_with(MEMORY_SCHEME)).then(|| LatestFrom {
         uri: uri.to_string(),
@@ -1171,6 +1174,34 @@ static READ_STALENESS_MS: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
 pub extern "C" fn infino_set_read_staleness_ms(ms: u64) {
     READ_STALENESS_MS.store(ms, Ordering::SeqCst);
+}
+
+/// How long one request to the hosted service may take, in milliseconds
+/// ([`infino_set_request_timeout_ms`]); 0 for the engine's default.
+static REQUEST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Give each request of the hosted connections opened from here on `ms`
+/// milliseconds to be answered rather than the engine's default (0 restores
+/// it). A request not answered in that time fails as
+/// [`InfinoError::Unavailable`], and the connection it held is let go.
+///
+/// The time bounds every request of the connection, a write as much as a
+/// read. A write that runs out of it may still land on the service, which
+/// is why the default is long: set a short one on a node whose searches
+/// must not wait, and whose writes are few or none.
+#[no_mangle]
+pub extern "C" fn infino_set_request_timeout_ms(ms: u64) {
+    REQUEST_TIMEOUT_MS.store(ms, Ordering::SeqCst);
+}
+
+/// `options` with each request given `ms` milliseconds; unchanged for 0,
+/// which leaves the engine's default.
+fn within(options: ConnectOptions, ms: u64) -> ConnectOptions {
+    if ms == 0 {
+        options
+    } else {
+        options.with_request_timeout(Duration::from_millis(ms))
+    }
 }
 
 #[no_mangle]
@@ -5185,7 +5216,9 @@ pub unsafe extern "C" fn infino_sql(h: *mut Bridge, sql: *const c_char) -> *mut 
         };
         match conn.query_viewed(sql) {
             Ok(b) => out_string(batches_to_json(&b)),
-            Err(e) => err_json(&e.to_string()),
+            // A statement the hosted service did not answer in time is a
+            // 503 for the search that sent it, not a failure of its own.
+            Err(e) => engine_err_json(&e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -5415,7 +5448,8 @@ fn sql_error_value(e: &InfinoError) -> Value {
         InfinoError::OverBudget(_) => Some(STATUS_TOO_MANY_REQUESTS),
         _ => None,
     };
-    let mut v = error_value(&e.to_string());
+    // A statement the hosted service did not answer in time: a 503.
+    let mut v = engine_error_value(e);
     if let Some(status) = status {
         v["status"] = json!(status);
     }
@@ -5479,7 +5513,7 @@ pub unsafe extern "C" fn infino_bm25(
         ) {
             Ok(b) if conn.is_attached(name) => out_string(attached::hits_json(&b, true)),
             Ok(b) => out_string(batches_to_json(&b)),
-            Err(e) => err_json(&e.to_string()),
+            Err(e) => engine_err_json(&e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -5528,7 +5562,7 @@ pub unsafe extern "C" fn infino_sorted(
         match table.sorted_search(column, descending != 0, k.max(0) as usize, Some(projection)) {
             // The engine fixes every row's `score` at zero; a sorted hit has none.
             Ok(b) => out_string(batches_to_json(&without_column(&b, "score"))),
-            Err(e) => err_json(&e.to_string()),
+            Err(e) => engine_err_json(&e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -5577,7 +5611,7 @@ pub unsafe extern "C" fn infino_count(
         };
         match table.count(column, query, mode) {
             Ok(n) => out_string(n.to_string()),
-            Err(e) => err_json(&e.to_string()),
+            Err(e) => engine_err_json(&e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -5648,7 +5682,7 @@ pub unsafe extern "C" fn infino_count_where(
         }
         match table.count_where(&exprs) {
             Ok(counts) => out_string(json!(counts).to_string()),
-            Err(e) => err_json(&e.to_string()),
+            Err(e) => engine_err_json(&e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -5678,7 +5712,7 @@ fn count_where_by_sql(conn: &Bridge, name: &str, predicates: &[String]) -> *mut 
         // only the table's view gives.
         let batches = match conn.query_viewed(&sql) {
             Ok(b) => b,
-            Err(e) => return err_json(&e.to_string()),
+            Err(e) => return engine_err_json(&e),
         };
         let count = batches
             .iter()
@@ -5922,7 +5956,7 @@ pub unsafe extern "C" fn infino_token_match(
         match table.token_match(column, query, BoolMode::Or, Some(id)) {
             Ok(b) if attached => out_string(attached::hits_json(&b, false)),
             Ok(b) => out_string(batches_to_json(&b)),
-            Err(e) => err_json(&e.to_string()),
+            Err(e) => engine_err_json(&e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -5958,7 +5992,7 @@ pub unsafe extern "C" fn infino_knn(
         match table.vector_search(column, &emb, k.max(0) as usize, None, Some(&projection)) {
             Ok(b) if conn.is_attached(name) => out_string(attached::hits_json(&b, true)),
             Ok(b) => out_string(batches_to_json(&b)),
-            Err(e) => err_json(&e.to_string()),
+            Err(e) => engine_err_json(&e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -6006,7 +6040,7 @@ pub unsafe extern "C" fn infino_hybrid(
         ) {
             Ok(b) if conn.is_attached(name) => out_string(attached::hits_json(&b, true)),
             Ok(b) => out_string(batches_to_json(&b)),
-            Err(e) => err_json(&e.to_string()),
+            Err(e) => engine_err_json(&e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -9934,6 +9968,36 @@ mod tests {
             body += stream.read(&mut buf).ok().filter(|&n| n > 0)?;
         }
         head.split_whitespace().nth(1).map(str::to_string)
+    }
+
+    /// A request the hosted service takes and never answers ends when the
+    /// connection's request timeout does, as a service that could not be
+    /// reached, rather than holding its caller for the engine's default.
+    #[test]
+    fn a_request_the_service_never_answers_ends_at_the_request_timeout() {
+        const TIMEOUT_MS: u64 = 300;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}/db", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            // Each request is read whole and its connection kept open, unanswered.
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let _ = read_request(&mut stream);
+                held.push(stream);
+            }
+        });
+        let options = within(ConnectOptions::new().with_api_key(FAKE_KEY), TIMEOUT_MS);
+        let conn = connect_with(&uri, options).unwrap();
+        let asked = Instant::now();
+        let out = conn.query_sql("SELECT 1");
+        let waited = asked.elapsed();
+        assert!(matches!(out, Err(InfinoError::Unavailable(_))), "{out:?}");
+        assert!(waited >= Duration::from_millis(TIMEOUT_MS), "{waited:?}");
+        // Far under the engine's default of minutes; the margin is for retries.
+        assert!(waited < Duration::from_secs(30), "{waited:?}");
     }
 
     /// A whole write (a replace, a delete, a schema change) waits for the

@@ -159,6 +159,9 @@ public interface InfinoLib extends Library {
     /** For tests: open the connections from here on under a read staleness window of {@code ms} milliseconds (0 for the engine's default). */
     void infino_set_read_staleness_ms(long ms);
 
+    /** Give each request of the hosted connections opened from here on {@code ms} milliseconds to be answered (0 for the engine's default). */
+    void infino_set_request_timeout_ms(long ms);
+
     /** The indices a caller's read-only statement reads, as {@code {"indices": [..]}}, or an error with its status. */
     Pointer infino_sql_indices(String sql);
 
