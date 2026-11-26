@@ -1,0 +1,639 @@
+---
+"match_phrase_prefix matches as on a Lucene twin, in default and proxy mode":
+  # The same documents in a Lucene twin, a default-mode and a proxy-mode index.
+  - do:
+      indices.create:
+        index: mpp_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: integer }
+              title: { type: text, fields: { keyword: { type: keyword } } }
+              kw: { type: keyword }
+  - do:
+      indices.create:
+        index: mpp_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: integer }
+              title: { type: text, fields: { keyword: { type: keyword } } }
+              kw: { type: keyword }
+  - do:
+      indices.create:
+        index: mpp_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: integer }
+              title: { type: text, fields: { keyword: { type: keyword } } }
+              kw: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: mpp_luc
+        body:
+          - index: { _id: "1" }
+          - { n: 1, title: "logs-web dashboard", kw: "logs-web" }
+          - index: { _id: "2" }
+          - { n: 2, title: "Logstash pipeline", kw: "Logstash" }
+          - index: { _id: "3" }
+          - { n: 3, title: "my dashboard of logs", kw: "my" }
+          - index: { _id: "4" }
+          - { n: 4, title: "my dash 🦊 board", kw: "fox" }
+          - index: { _id: "5" }
+          - { n: 5, title: [ "my dash", "board games" ], kw: "games" }
+          - index: { _id: "6" }
+          - { n: 6, title: "Dashboard for my logs", kw: "for" }
+          - index: { _id: "7" }
+          - { n: 7, title: "my_dashboard", kw: "my_dashboard" }
+          - index: { _id: "8" }
+          - { n: 8, title: "a dash board here", kw: "here" }
+  - do:
+      bulk:
+        refresh: true
+        index: mpp_def
+        body:
+          - index: { _id: "1" }
+          - { n: 1, title: "logs-web dashboard", kw: "logs-web" }
+          - index: { _id: "2" }
+          - { n: 2, title: "Logstash pipeline", kw: "Logstash" }
+          - index: { _id: "3" }
+          - { n: 3, title: "my dashboard of logs", kw: "my" }
+          - index: { _id: "4" }
+          - { n: 4, title: "my dash 🦊 board", kw: "fox" }
+          - index: { _id: "5" }
+          - { n: 5, title: [ "my dash", "board games" ], kw: "games" }
+          - index: { _id: "6" }
+          - { n: 6, title: "Dashboard for my logs", kw: "for" }
+          - index: { _id: "7" }
+          - { n: 7, title: "my_dashboard", kw: "my_dashboard" }
+          - index: { _id: "8" }
+          - { n: 8, title: "a dash board here", kw: "here" }
+  - do:
+      bulk:
+        refresh: true
+        index: mpp_prx
+        body:
+          - index: { _id: "1" }
+          - { n: 1, title: "logs-web dashboard", kw: "logs-web" }
+          - index: { _id: "2" }
+          - { n: 2, title: "Logstash pipeline", kw: "Logstash" }
+          - index: { _id: "3" }
+          - { n: 3, title: "my dashboard of logs", kw: "my" }
+          - index: { _id: "4" }
+          - { n: 4, title: "my dash 🦊 board", kw: "fox" }
+          - index: { _id: "5" }
+          - { n: 5, title: [ "my dash", "board games" ], kw: "games" }
+          - index: { _id: "6" }
+          - { n: 6, title: "Dashboard for my logs", kw: "for" }
+          - index: { _id: "7" }
+          - { n: 7, title: "my_dashboard", kw: "my_dashboard" }
+          - index: { _id: "8" }
+          - { n: 8, title: "a dash board here", kw: "here" }
+  # match_phrase_prefix of one word matches a word starting with it, as on a Lucene twin
+  # Stock analyzes the query: a trailing dash, as Dashboards leaves of logs-*, makes no word.
+  - do:
+      search:
+        index: mpp_luc
+        body: { query: { match_phrase_prefix: { title: "logs" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      count:
+        index: mpp_luc
+        body: { query: { match_phrase_prefix: { title: "logs" } } }
+  - match: { count: 4 }
+  - do:
+      search:
+        index: mpp_def
+        body: { query: { match_phrase_prefix: { title: "logs" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      count:
+        index: mpp_def
+        body: { query: { match_phrase_prefix: { title: "logs" } } }
+  - match: { count: 4 }
+  - do:
+      search:
+        index: mpp_prx
+        body: { query: { match_phrase_prefix: { title: "logs" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      count:
+        index: mpp_prx
+        body: { query: { match_phrase_prefix: { title: "logs" } } }
+  - match: { count: 4 }
+  # match_phrase_prefix of one word with punctuation, as Dashboards sends for an index pattern
+  - do:
+      search:
+        index: mpp_luc
+        body: { query: { match_phrase_prefix: { title: { query: "logs-" } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      count:
+        index: mpp_luc
+        body: { query: { match_phrase_prefix: { title: { query: "logs-" } } } }
+  - match: { count: 4 }
+  - do:
+      search:
+        index: mpp_def
+        body: { query: { match_phrase_prefix: { title: { query: "logs-" } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      count:
+        index: mpp_def
+        body: { query: { match_phrase_prefix: { title: { query: "logs-" } } } }
+  - match: { count: 4 }
+  - do:
+      search:
+        index: mpp_prx
+        body: { query: { match_phrase_prefix: { title: { query: "logs-" } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      count:
+        index: mpp_prx
+        body: { query: { match_phrase_prefix: { title: { query: "logs-" } } } }
+  - match: { count: 4 }
+  # match_phrase_prefix of several words: the words adjacent and in order, the last a prefix
+  # Not my_dashboard (one word to the analyzer), not my logs, and in either value of an array.
+  - do:
+      search:
+        index: mpp_luc
+        body: { query: { match_phrase_prefix: { title: "my dash" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "5" }
+  - do:
+      count:
+        index: mpp_luc
+        body: { query: { match_phrase_prefix: { title: "my dash" } } }
+  - match: { count: 3 }
+  - do:
+      search:
+        index: mpp_def
+        body: { query: { match_phrase_prefix: { title: "my dash" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "5" }
+  - do:
+      count:
+        index: mpp_def
+        body: { query: { match_phrase_prefix: { title: "my dash" } } }
+  - match: { count: 3 }
+  - do:
+      search:
+        index: mpp_prx
+        body: { query: { match_phrase_prefix: { title: "my dash" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "5" }
+  - do:
+      count:
+        index: mpp_prx
+        body: { query: { match_phrase_prefix: { title: "my dash" } } }
+  - match: { count: 3 }
+  # match_phrase_prefix never spans an emoji or two values of an array
+  # An emoji is a word to the standard tokenizer; the values of an array lie apart.
+  - do:
+      search:
+        index: mpp_luc
+        body: { query: { match_phrase_prefix: { title: "dash bo" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "8" }
+  - do:
+      count:
+        index: mpp_luc
+        body: { query: { match_phrase_prefix: { title: "dash bo" } } }
+  - match: { count: 1 }
+  - do:
+      search:
+        index: mpp_def
+        body: { query: { match_phrase_prefix: { title: "dash bo" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "8" }
+  - do:
+      count:
+        index: mpp_def
+        body: { query: { match_phrase_prefix: { title: "dash bo" } } }
+  - match: { count: 1 }
+  - do:
+      search:
+        index: mpp_prx
+        body: { query: { match_phrase_prefix: { title: "dash bo" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "8" }
+  - do:
+      count:
+        index: mpp_prx
+        body: { query: { match_phrase_prefix: { title: "dash bo" } } }
+  - match: { count: 1 }
+  # match_phrase_prefix with no word matches nothing, or everything under zero_terms_query all
+  - do:
+      search:
+        index: mpp_luc
+        body: { query: { match_phrase_prefix: { title: { query: "--", zero_terms_query: all } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 8 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "4" }
+  - match: { hits.hits.4._id: "5" }
+  - match: { hits.hits.5._id: "6" }
+  - match: { hits.hits.6._id: "7" }
+  - match: { hits.hits.7._id: "8" }
+  - do:
+      count:
+        index: mpp_luc
+        body: { query: { match_phrase_prefix: { title: { query: "--", zero_terms_query: all } } } }
+  - match: { count: 8 }
+  - do:
+      search:
+        index: mpp_def
+        body: { query: { match_phrase_prefix: { title: { query: "--", zero_terms_query: all } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 8 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "4" }
+  - match: { hits.hits.4._id: "5" }
+  - match: { hits.hits.5._id: "6" }
+  - match: { hits.hits.6._id: "7" }
+  - match: { hits.hits.7._id: "8" }
+  - do:
+      count:
+        index: mpp_def
+        body: { query: { match_phrase_prefix: { title: { query: "--", zero_terms_query: all } } } }
+  - match: { count: 8 }
+  - do:
+      search:
+        index: mpp_prx
+        body: { query: { match_phrase_prefix: { title: { query: "--", zero_terms_query: all } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 8 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "4" }
+  - match: { hits.hits.4._id: "5" }
+  - match: { hits.hits.5._id: "6" }
+  - match: { hits.hits.6._id: "7" }
+  - match: { hits.hits.7._id: "8" }
+  - do:
+      count:
+        index: mpp_prx
+        body: { query: { match_phrase_prefix: { title: { query: "--", zero_terms_query: all } } } }
+  - match: { count: 8 }
+  # match_phrase_prefix on an unmapped field matches nothing
+  - do:
+      search:
+        index: mpp_luc
+        body: { query: { match_phrase_prefix: { nope: "logs" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 0 }
+  - do:
+      count:
+        index: mpp_luc
+        body: { query: { match_phrase_prefix: { nope: "logs" } } }
+  - match: { count: 0 }
+  - do:
+      search:
+        index: mpp_def
+        body: { query: { match_phrase_prefix: { nope: "logs" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 0 }
+  - do:
+      count:
+        index: mpp_def
+        body: { query: { match_phrase_prefix: { nope: "logs" } } }
+  - match: { count: 0 }
+  - do:
+      search:
+        index: mpp_prx
+        body: { query: { match_phrase_prefix: { nope: "logs" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 0 }
+  - do:
+      count:
+        index: mpp_prx
+        body: { query: { match_phrase_prefix: { nope: "logs" } } }
+  - match: { count: 0 }
+  # match_phrase_prefix inside a bool should beside a simple_query_string, as Dashboards' saved-object search sends it
+  - do:
+      search:
+        index: mpp_luc
+        body: { query: { bool: { should: [ { simple_query_string: { query: "logs*", fields: [ title ], default_operator: OR } }, { match_phrase_prefix: { title: "logs" } } ], minimum_should_match: 1 } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      count:
+        index: mpp_luc
+        body: { query: { bool: { should: [ { simple_query_string: { query: "logs*", fields: [ title ], default_operator: OR } }, { match_phrase_prefix: { title: "logs" } } ], minimum_should_match: 1 } } }
+  - match: { count: 4 }
+  - do:
+      search:
+        index: mpp_def
+        body: { query: { bool: { should: [ { simple_query_string: { query: "logs*", fields: [ title ], default_operator: OR } }, { match_phrase_prefix: { title: "logs" } } ], minimum_should_match: 1 } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      count:
+        index: mpp_def
+        body: { query: { bool: { should: [ { simple_query_string: { query: "logs*", fields: [ title ], default_operator: OR } }, { match_phrase_prefix: { title: "logs" } } ], minimum_should_match: 1 } } }
+  - match: { count: 4 }
+  - do:
+      search:
+        index: mpp_prx
+        body: { query: { bool: { should: [ { simple_query_string: { query: "logs*", fields: [ title ], default_operator: OR } }, { match_phrase_prefix: { title: "logs" } } ], minimum_should_match: 1 } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      count:
+        index: mpp_prx
+        body: { query: { bool: { should: [ { simple_query_string: { query: "logs*", fields: [ title ], default_operator: OR } }, { match_phrase_prefix: { title: "logs" } } ], minimum_should_match: 1 } } }
+  - match: { count: 4 }
+  # match_phrase_prefix of several words inside a bool should beside a simple_query_string
+  - do:
+      search:
+        index: mpp_luc
+        body: { query: { bool: { should: [ { simple_query_string: { query: "my dash*", fields: [ title ], default_operator: AND } }, { match_phrase_prefix: { title: "my dash" } } ], minimum_should_match: 1 } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      count:
+        index: mpp_luc
+        body: { query: { bool: { should: [ { simple_query_string: { query: "my dash*", fields: [ title ], default_operator: AND } }, { match_phrase_prefix: { title: "my dash" } } ], minimum_should_match: 1 } } }
+  - match: { count: 4 }
+  - do:
+      search:
+        index: mpp_def
+        body: { query: { bool: { should: [ { simple_query_string: { query: "my dash*", fields: [ title ], default_operator: AND } }, { match_phrase_prefix: { title: "my dash" } } ], minimum_should_match: 1 } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      count:
+        index: mpp_def
+        body: { query: { bool: { should: [ { simple_query_string: { query: "my dash*", fields: [ title ], default_operator: AND } }, { match_phrase_prefix: { title: "my dash" } } ], minimum_should_match: 1 } } }
+  - match: { count: 4 }
+  - do:
+      search:
+        index: mpp_prx
+        body: { query: { bool: { should: [ { simple_query_string: { query: "my dash*", fields: [ title ], default_operator: AND } }, { match_phrase_prefix: { title: "my dash" } } ], minimum_should_match: 1 } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      count:
+        index: mpp_prx
+        body: { query: { bool: { should: [ { simple_query_string: { query: "my dash*", fields: [ title ], default_operator: AND } }, { match_phrase_prefix: { title: "my dash" } } ], minimum_should_match: 1 } } }
+  - match: { count: 4 }
+  # match_phrase_prefix in a filter and under must_not
+  - do:
+      search:
+        index: mpp_luc
+        body: { query: { bool: { filter: [ { match_phrase_prefix: { title: "das" } } ], must_not: [ { match_phrase_prefix: { title: "my das" } } ] } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "6" }
+  - match: { hits.hits.2._id: "8" }
+  - do:
+      count:
+        index: mpp_luc
+        body: { query: { bool: { filter: [ { match_phrase_prefix: { title: "das" } } ], must_not: [ { match_phrase_prefix: { title: "my das" } } ] } } }
+  - match: { count: 3 }
+  - do:
+      search:
+        index: mpp_def
+        body: { query: { bool: { filter: [ { match_phrase_prefix: { title: "das" } } ], must_not: [ { match_phrase_prefix: { title: "my das" } } ] } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "6" }
+  - match: { hits.hits.2._id: "8" }
+  - do:
+      count:
+        index: mpp_def
+        body: { query: { bool: { filter: [ { match_phrase_prefix: { title: "das" } } ], must_not: [ { match_phrase_prefix: { title: "my das" } } ] } } }
+  - match: { count: 3 }
+  - do:
+      search:
+        index: mpp_prx
+        body: { query: { bool: { filter: [ { match_phrase_prefix: { title: "das" } } ], must_not: [ { match_phrase_prefix: { title: "my das" } } ] } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "6" }
+  - match: { hits.hits.2._id: "8" }
+  - do:
+      count:
+        index: mpp_prx
+        body: { query: { bool: { filter: [ { match_phrase_prefix: { title: "das" } } ], must_not: [ { match_phrase_prefix: { title: "my das" } } ] } } }
+  - match: { count: 3 }
+
+---
+"match_phrase_prefix is refused where stock refuses it or the table would read it otherwise":
+  # The same documents in a Lucene twin, a default-mode and a proxy-mode index.
+  - do:
+      indices.create:
+        index: mppr_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: integer }
+              title: { type: text, fields: { keyword: { type: keyword } } }
+              kw: { type: keyword }
+  - do:
+      indices.create:
+        index: mppr_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: integer }
+              title: { type: text, fields: { keyword: { type: keyword } } }
+              kw: { type: keyword }
+  - do:
+      indices.create:
+        index: mppr_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: integer }
+              title: { type: text, fields: { keyword: { type: keyword } } }
+              kw: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: mppr_luc
+        body:
+          - index: { _id: "1" }
+          - { n: 1, title: "logs-web dashboard", kw: "logs-web" }
+          - index: { _id: "2" }
+          - { n: 2, title: "Logstash pipeline", kw: "Logstash" }
+          - index: { _id: "3" }
+          - { n: 3, title: "my dashboard of logs", kw: "my" }
+          - index: { _id: "4" }
+          - { n: 4, title: "my dash 🦊 board", kw: "fox" }
+          - index: { _id: "5" }
+          - { n: 5, title: [ "my dash", "board games" ], kw: "games" }
+          - index: { _id: "6" }
+          - { n: 6, title: "Dashboard for my logs", kw: "for" }
+          - index: { _id: "7" }
+          - { n: 7, title: "my_dashboard", kw: "my_dashboard" }
+          - index: { _id: "8" }
+          - { n: 8, title: "a dash board here", kw: "here" }
+  - do:
+      bulk:
+        refresh: true
+        index: mppr_def
+        body:
+          - index: { _id: "1" }
+          - { n: 1, title: "logs-web dashboard", kw: "logs-web" }
+          - index: { _id: "2" }
+          - { n: 2, title: "Logstash pipeline", kw: "Logstash" }
+          - index: { _id: "3" }
+          - { n: 3, title: "my dashboard of logs", kw: "my" }
+          - index: { _id: "4" }
+          - { n: 4, title: "my dash 🦊 board", kw: "fox" }
+          - index: { _id: "5" }
+          - { n: 5, title: [ "my dash", "board games" ], kw: "games" }
+          - index: { _id: "6" }
+          - { n: 6, title: "Dashboard for my logs", kw: "for" }
+          - index: { _id: "7" }
+          - { n: 7, title: "my_dashboard", kw: "my_dashboard" }
+          - index: { _id: "8" }
+          - { n: 8, title: "a dash board here", kw: "here" }
+  - do:
+      bulk:
+        refresh: true
+        index: mppr_prx
+        body:
+          - index: { _id: "1" }
+          - { n: 1, title: "logs-web dashboard", kw: "logs-web" }
+          - index: { _id: "2" }
+          - { n: 2, title: "Logstash pipeline", kw: "Logstash" }
+          - index: { _id: "3" }
+          - { n: 3, title: "my dashboard of logs", kw: "my" }
+          - index: { _id: "4" }
+          - { n: 4, title: "my dash 🦊 board", kw: "fox" }
+          - index: { _id: "5" }
+          - { n: 5, title: [ "my dash", "board games" ], kw: "games" }
+          - index: { _id: "6" }
+          - { n: 6, title: "Dashboard for my logs", kw: "for" }
+          - index: { _id: "7" }
+          - { n: 7, title: "my_dashboard", kw: "my_dashboard" }
+          - index: { _id: "8" }
+          - { n: 8, title: "a dash board here", kw: "here" }
+  # match_phrase_prefix on a keyword field is refused, as Lucene refuses it
+  # Stock builds a phrase prefix on text fields only.
+  - do:
+      catch: /Can only use phrase prefix queries on text fields - not on \[kw\]/
+      search:
+        index: mppr_luc
+        body: { query: { match_phrase_prefix: { kw: "logs" } } }
+  - do:
+      catch: /Can only use phrase prefix queries on text fields - not on \[kw\]/
+      search:
+        index: mppr_def
+        body: { query: { match_phrase_prefix: { kw: "logs" } } }
+  - do:
+      catch: /Can only use phrase prefix queries on text fields - not on \[kw\]/
+      search:
+        index: mppr_prx
+        body: { query: { match_phrase_prefix: { kw: "logs" } } }
+  # match_phrase_prefix on a keyword field inside a bool should is refused, as Lucene refuses it
+  # A keyword multi-field is no text field either.
+  - do:
+      catch: /Can only use phrase prefix queries on text fields - not on \[title.keyword\]/
+      search:
+        index: mppr_luc
+        body: { query: { bool: { should: [ { simple_query_string: { query: "logs*", fields: [ title ] } }, { match_phrase_prefix: { title.keyword: "logs" } } ] } } }
+  - do:
+      catch: /Can only use phrase prefix queries on text fields - not on \[title.keyword\]/
+      search:
+        index: mppr_def
+        body: { query: { bool: { should: [ { simple_query_string: { query: "logs*", fields: [ title ] } }, { match_phrase_prefix: { title.keyword: "logs" } } ] } } }
+  - do:
+      catch: /Can only use phrase prefix queries on text fields - not on \[title.keyword\]/
+      search:
+        index: mppr_prx
+        body: { query: { bool: { should: [ { simple_query_string: { query: "logs*", fields: [ title ] } }, { match_phrase_prefix: { title.keyword: "logs" } } ] } } }
+  # match_phrase_prefix with slop over several words is refused, never read without it
+  # The token index finds words adjacent only.
+  - do:
+      search:
+        index: mppr_luc
+        body: { query: { match_phrase_prefix: { title: { query: "my board", slop: 2 } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - do:
+      catch: /match_phrase_prefix with slop over several words is not served/
+      search:
+        index: mppr_def
+        body: { query: { match_phrase_prefix: { title: { query: "my board", slop: 2 } } } }
+  - do:
+      catch: /match_phrase_prefix with slop over several words is not served/
+      search:
+        index: mppr_prx
+        body: { query: { match_phrase_prefix: { title: { query: "my board", slop: 2 } } } }
+  # match_phrase_prefix with an analyzer other than the standard one is refused
+  # The table reads every query's words with the standard analyzer.
+  - do:
+      search:
+        index: mppr_luc
+        body: { query: { match_phrase_prefix: { title: { query: "logs", analyzer: whitespace } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.3._id: "6" }
+  - do:
+      catch: /match_phrase_prefix with analyzer \[whitespace\] is not served/
+      search:
+        index: mppr_def
+        body: { query: { match_phrase_prefix: { title: { query: "logs", analyzer: whitespace } } } }
+  - do:
+      catch: /match_phrase_prefix with analyzer \[whitespace\] is not served/
+      search:
+        index: mppr_prx
+        body: { query: { match_phrase_prefix: { title: { query: "logs", analyzer: whitespace } } } }

@@ -11,6 +11,7 @@ import org.opensearch.index.query.Operator;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.QueryShardException;
 import org.opensearch.index.query.QueryStringQueryBuilder;
+import org.opensearch.index.search.MatchQuery.ZeroTermsQuery;
 import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.infino.InfinoQueryTranslator.Translation;
 import org.opensearch.test.OpenSearchTestCase;
@@ -2354,6 +2355,91 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         // _source cannot be searched, as stock says.
         QueryShardException source = expectThrows(QueryShardException.class, () -> translate(QueryBuilders.existsQuery("_source")));
         assertEquals("The _source field is not searchable", source.getMessage());
+    }
+
+    /**
+     * A match_phrase_prefix on a text column: one word is the prefix of a word; several are the
+     * leading words as a phrase and the whole run as a pattern, the last word open.
+     */
+    public void testMatchPhrasePrefixOnATextColumn() {
+        // One word, as a prefix query on the column; the standard tokenizer drops the punctuation.
+        assertEquals("regexp_like(\"message\", '\\bdis', 'i')", translate(QueryBuilders.matchPhrasePrefixQuery("message", "dis")).where());
+        assertEquals("regexp_like(\"message\", '\\blogs', 'i')", translate(QueryBuilders.matchPhrasePrefixQuery("message", "logs-")).where());
+        // Slop over one word changes nothing, as in stock.
+        assertEquals("regexp_like(\"message\", '\\bDis', 'i')", translate(QueryBuilders.matchPhrasePrefixQuery("message", "Dis").slop(2)).where());
+        Translation t = translate(QueryBuilders.matchPhrasePrefixQuery("message", "disk fu"));
+        assertEquals(
+            "(osid IN (SELECT osid FROM token_match('os_logs_0', 'message', '\"disk\"', 'and')) AND regexp_like(\"message\", '\\bdisk[^\\w\\p{Extended_Pictographic}]+fu', 'i'))",
+            t.where()
+        );
+        // It is never the clause the hits rank by: stock scores the words the last one expands to.
+        assertNull(t.principal());
+        assertTrue(t.scoring().unrankable());
+        t = translate(QueryBuilders.matchPhrasePrefixQuery("message", "node 3 dis"));
+        assertEquals(
+            "(osid IN (SELECT osid FROM token_match('os_logs_0', 'message', '\"node 3\"', 'and')) AND regexp_like(\"message\", "
+                + "'\\bnode[^\\w\\p{Extended_Pictographic}]+3[^\\w\\p{Extended_Pictographic}]+dis', 'i'))",
+            t.where()
+        );
+        // No word: zero_terms_query decides, none by default.
+        assertEquals("1=0", translate(QueryBuilders.matchPhrasePrefixQuery("message", "-- !")).where());
+        assertEquals(
+            "1=1",
+            translate(QueryBuilders.matchPhrasePrefixQuery("message", "").zeroTermsQuery(ZeroTermsQuery.ALL)).where()
+        );
+        // An unmapped field matches nothing; the standard analyzer named is the one read anyway.
+        assertEquals("1=0", translate(QueryBuilders.matchPhrasePrefixQuery("nope", "dis")).where());
+        assertEquals("regexp_like(\"message\", '\\bdis', 'i')", translate(QueryBuilders.matchPhrasePrefixQuery("message", "dis").analyzer("standard")).where());
+        // Inside a bool should beside a simple_query_string, as Dashboards' saved-object search sends it.
+        t = translate(
+            QueryBuilders.boolQuery()
+                .should(QueryBuilders.simpleQueryStringQuery("disk*").field("message"))
+                .should(QueryBuilders.matchPhrasePrefixQuery("message", "disk"))
+        );
+        assertNotNull(t);
+        assertTrue(t.where(), t.where().contains("regexp_like(\"message\", '\\bdisk', 'i')"));
+    }
+
+    /** Over several words, the run is a pattern on each of a field's values, so the words never span two of them. */
+    public void testMatchPhrasePrefixReadsEachValueOfAList() {
+        Map<String, Column> cols = columns();
+        cols.put("message[]", Column.list("message[]", "str"));
+        String where = InfinoQueryTranslator.translate(QueryBuilders.matchPhrasePrefixQuery("message", "disk fu"), cols, TABLE, NOW).where();
+        assertTrue(where, where.startsWith("(osid IN (SELECT osid FROM token_match('os_logs_0', 'message', '\"disk\"', 'and')) AND ((\"message[]\" IS NULL AND regexp_like(\"message\", "));
+        assertTrue(where, where.contains("unnest("));
+        // One word cannot span two values joined by a space.
+        assertEquals(
+            "regexp_like(\"message\", '\\bdis', 'i')",
+            InfinoQueryTranslator.translate(QueryBuilders.matchPhrasePrefixQuery("message", "dis"), cols, TABLE, NOW).where()
+        );
+    }
+
+    /** What stock refuses (a field that is not a text one) or the table would read otherwise is refused, never answered. */
+    public void testMatchPhrasePrefixRefusals() {
+        for (String field : new String[] { "level", "message.keyword", "status" }) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.matchPhrasePrefixQuery(field, "err")));
+            assertEquals("Can only use phrase prefix queries on text fields - not on [" + field + "]", e.getMessage());
+        }
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.matchPhrasePrefixQuery("message", "disk fu").slop(1))
+        );
+        assertEquals("[infino] match_phrase_prefix with slop over several words is not served: the token index finds the words adjacent only", e.getMessage());
+        e = expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.matchPhrasePrefixQuery("message", "disk").analyzer("whitespace")));
+        assertEquals(
+            "[infino] match_phrase_prefix with analyzer [whitespace] is not served: the table reads the query's words with the standard analyzer",
+            e.getMessage()
+        );
+        e = expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.matchPhrasePrefixQuery("message", "caf\u00e9")));
+        assertEquals(
+            "[infino] match_phrase_prefix on [message] is not served for the word [caf\u00e9]: only words of ASCII letters and digits are read as stock reads them",
+            e.getMessage()
+        );
+        // Inside a bool it is refused as well, not left out.
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> translate(QueryBuilders.boolQuery().should(QueryBuilders.matchPhrasePrefixQuery("level", "e")).should(QueryBuilders.termQuery("level", "x")))
+        );
     }
 
     /** A multi_match whose last term is a prefix is refused, as match_bool_prefix is, never answered as a plain match. */
