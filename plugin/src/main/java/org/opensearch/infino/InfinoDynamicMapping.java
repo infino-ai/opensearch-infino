@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
@@ -23,6 +24,7 @@ import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.MediaType;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
@@ -82,8 +84,11 @@ final class InfinoDynamicMapping {
 
     private static final Logger log = LogManager.getLogger(InfinoDynamicMapping.class);
     /**
-     * How many rounds a document's update may go in: a document whose fields are
-     * still new after that is left to the table, as before this rule.
+     * How many rounds a document's update may go in. A document that would
+     * still add a field after that is refused, never written with a field the
+     * mapping does not hold yet: the table would give that field a column of
+     * its own typing, which the mapping, once it holds the field, could not
+     * be applied over.
      */
     private static final int MAX_ROUNDS = 3;
     /** The id a document is parsed under when the bulk has not given it one yet: the mapping does not depend on it. */
@@ -163,6 +168,13 @@ final class InfinoDynamicMapping {
      * refused then, as stock refuses the later document. An index in
      * {@code single} sends one document's update per round, so a refused
      * update is answered to its own document.
+     *
+     * <p>Every document whose update went is parsed again in the next round,
+     * against the mapping this node then holds. The wait for an update ends
+     * at the first newer mapping this node applies ({@link #awaitMappings}),
+     * which may be another bulk's: this node may not hold this update yet, so
+     * a document parsed again that still adds a field sends its update again,
+     * which the cluster manager takes as a no-op once it holds it.
      */
     private static void round(
         List<Doc> docs,
@@ -184,6 +196,9 @@ final class InfinoDynamicMapping {
         Map<String, Unmapped> unmapped = new HashMap<>();
         List<Doc> waiting = new ArrayList<>();
         for (Doc doc : docs) {
+            if (answered[doc.slot()] != null) {
+                continue; // refused in an earlier round
+            }
             IndexMetadata md = state.metadata().index(doc.index());
             IndexService service = md == null ? null : indices.indexService(md.getIndex());
             if (service == null) {
@@ -204,7 +219,15 @@ final class InfinoDynamicMapping {
                 }
                 continue;
             }
-            if (update == null || rounds.getOrDefault(doc, 0) >= MAX_ROUNDS) {
+            if (update == null) {
+                continue;
+            }
+            if (rounds.getOrDefault(doc, 0) >= MAX_ROUNDS) {
+                if (doc.answers()) {
+                    answered[doc.slot()] = failure(bulk, doc, stillUnmapped(doc.index()));
+                } else {
+                    log.debug("[infino] the update of {} in {} still adds a field after {} rounds", doc.id(), doc.index(), MAX_ROUNDS);
+                }
                 continue;
             }
             Mapping merged = byIndex.get(doc.index());
@@ -229,10 +252,8 @@ final class InfinoDynamicMapping {
         }
         AtomicInteger pending = new AtomicInteger(byIndex.size());
         Map<String, Long> sent = new HashMap<>();
-        for (Map.Entry<String, List<Doc>> e : contributors.entrySet()) {
-            if (e.getValue().size() > 1) {
-                waiting.addAll(e.getValue());
-            }
+        for (List<Doc> from : contributors.values()) {
+            waiting.addAll(from);
         }
         Runnable sentAll = () -> awaitMappings(
             sent,
@@ -260,6 +281,8 @@ final class InfinoDynamicMapping {
                         log.debug("[infino] mapping update for {} refused, retried per document: {}", index, failure.getMessage());
                         single.add(index);
                     } else {
+                        // Its own update was refused: nothing to parse it again for.
+                        waiting.removeAll(from);
                         for (Doc doc : from) {
                             if (doc.answers()) {
                                 answered[doc.slot()] = failure(bulk, doc, failure);
@@ -577,6 +600,18 @@ final class InfinoDynamicMapping {
             out.put(e.getKey(), md != null && md.getIndexUUID().equals(e.getValue().getIndexUUID()) ? md : e.getValue());
         }
         return out;
+    }
+
+    /**
+     * Why a document that still adds a field after {@link #MAX_ROUNDS} is
+     * refused: the mapping kept moving under it. A retry finds the fields
+     * mapped, so it is answered as a rejection the client retries.
+     */
+    static OpenSearchStatusException stillUnmapped(String index) {
+        return new OpenSearchStatusException(
+            "[infino] the mapping of [" + index + "] kept changing while this document's new fields were mapped; retry the document",
+            RestStatus.TOO_MANY_REQUESTS
+        );
     }
 
     private static BulkItemResponse failure(BulkRequest bulk, Doc doc, Exception cause) {
