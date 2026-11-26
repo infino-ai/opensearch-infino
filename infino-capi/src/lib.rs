@@ -2551,7 +2551,12 @@ pub unsafe extern "C" fn infino_columns(h: *mut Bridge, name: *const c_char) -> 
                 }
                 out_json(Value::Array(cols))
             }
-            Err(_) => out_string(String::new()),
+            // No such table: no columns. Any other failure (a read the
+            // storage turned away, a service that did not answer) is an
+            // error, so a caller that must tell a missing table from an
+            // unreadable one can.
+            Err(InfinoError::NotFound(_)) => out_string(String::new()),
+            Err(e) => engine_err_json(&e),
         }
     }))
     .unwrap_or(ptr::null_mut())
@@ -6602,6 +6607,48 @@ mod tests {
         let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_string();
         unsafe { infino_free_string(p) };
         s
+    }
+
+    /// A table that does not exist has no columns; one that exists but cannot
+    /// be read (its directory made unreadable) is an error, never taken for a
+    /// missing table.
+    #[test]
+    fn the_columns_of_a_missing_table_are_none_and_a_failed_read_is_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "infino-capi-test-unreadable-{}-{}",
+            std::process::id(),
+            OPENED_LOGS.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let uri = c(&format!("file://{}", dir.display()));
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        assert!(!h.is_null());
+        let missing = take(unsafe { infino_columns(h, c("absent").as_ptr()) });
+        assert_eq!(missing, "", "a table that does not exist has no columns");
+        let out = ensure(h, MAPPING);
+        assert!(out.contains("\"created\":true"), "{out}");
+        close(h);
+        let mut locked = Vec::new();
+        for table in std::fs::read_dir(&dir).unwrap() {
+            let table = table.unwrap().path();
+            if table.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("logs-")) {
+                std::fs::set_permissions(&table, std::fs::Permissions::from_mode(0)).unwrap();
+                locked.push(table);
+            }
+        }
+        assert!(!locked.is_empty(), "the table's directory");
+        // A user the permissions do not bind (root) reads it anyway: nothing fails to read.
+        let unreadable = std::fs::read_dir(&locked[0]).is_err();
+        let h = unsafe { infino_open(uri.as_ptr()) };
+        assert!(!h.is_null());
+        let failed = take(unsafe { infino_columns(h, c("logs").as_ptr()) });
+        close(h);
+        for table in &locked {
+            std::fs::set_permissions(table, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        if unreadable {
+            assert!(failed.starts_with("{\"error\""), "{failed}");
+        }
     }
 
     /// A fresh catalog on local disk: `memory://` tables have no durable
