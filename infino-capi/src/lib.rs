@@ -112,7 +112,8 @@ const OWN_COLUMN_PREFIX: &str = ".";
 /// field: a document's field of the same name gets a column of its own.
 const ENGINE_COLUMNS: &str = "_engine_columns";
 /// Separator used when a multi-valued string field lands in a scalar string
-/// column: the values are joined so a text index sees every token. The
+/// column: the values are joined so a text index sees every token. A
+/// `keyword` field's values are never joined ([`LIST_SUFFIX`]). The
 /// original array is still in `source`.
 const MULTI_VALUE_SEPARATOR: &str = " ";
 /// The longest UTF-8 encoding a `keyword` value may have, as Lucene bounds
@@ -141,8 +142,9 @@ const DOTTED_CAPITAL_I: char = '\u{130}';
 /// What the column holding a field's values is named after the field's own,
 /// for a document that gives the field more than one: `<path>[]`, a list of
 /// the field's own type, declared the first time a document needs it. The
-/// field's own column is null for that document, except a string field's,
-/// which keeps the values joined so its text index sees every token.
+/// field's own column is null for that document, except a string field's
+/// other than a `keyword` one, which keeps the values joined so its text
+/// index sees every token.
 const LIST_SUFFIX: &str = "[]";
 /// The name Arrow gives a list column's element.
 const LIST_ITEM: &str = "item";
@@ -3272,11 +3274,21 @@ fn conform_doc(
                         .map_err(why)?
                 };
                 if conformed.len() > 1 {
-                    // A string field keeps its values joined, for its text index.
-                    let own = if matches!(
-                        dt,
-                        DataType::LargeUtf8 | DataType::Utf8 | DataType::Utf8View
-                    ) {
+                    // A string field keeps its values joined, for its text
+                    // index. A keyword field does not: its index takes each
+                    // value as one term, so the joined values would be one
+                    // term, which the engine refuses at commit once it is
+                    // past a term's length, after OpenSearch acknowledged
+                    // the document. Each value is checked against that
+                    // length on its own ([`keyword_values`]), and every
+                    // query reads a document's values from its list column.
+                    let keyword = matches!(rule, Some(Kept::Keyword { .. }));
+                    let own = if !keyword
+                        && matches!(
+                            dt,
+                            DataType::LargeUtf8 | DataType::Utf8 | DataType::Utf8View
+                        )
+                    {
                         Value::String(
                             conformed
                                 .iter()
@@ -9627,8 +9639,9 @@ mod tests {
 
     /// A field a document gives several values keeps them in its list column,
     /// declared the first time on either append path with the field's own
-    /// type, the field's own column null for that document (a string's keeps
-    /// them joined, for its text index); one value in an array is that value.
+    /// type, the field's own column null for that document (a text field's
+    /// keeps them joined, for its text index; a keyword's does not); one
+    /// value in an array is that value.
     #[test]
     fn several_values_go_to_the_field_s_list_column() {
         let h = open_logs();
@@ -9641,7 +9654,8 @@ mod tests {
             &[
                 (
                     "m1",
-                    r#"{"n":[1,2,2],"d":["2026-10-01T00:00:00Z","2026-10-02T00:00:00Z"],"kw":["a","b"]}"#,
+                    r#"{"n":[1,2,2],"d":["2026-10-01T00:00:00Z","2026-10-02T00:00:00Z"],"kw":["a","b"],
+                        "message":["disk full","again"]}"#,
                 ),
                 (
                     "m2",
@@ -9675,13 +9689,14 @@ mod tests {
         let rows = sql(
             h,
             r#"SELECT osid, n, array_to_string("n[]", ',') AS ns, cardinality("d[]") AS dates, kw,
-                array_to_string("kw[]", ',') AS kws, "items.price", array_to_string("items.price[]", ',') AS prices
+                array_to_string("kw[]", ',') AS kws, message, "items.price", array_to_string("items.price[]", ',') AS prices
                 FROM logs ORDER BY osid"#,
         );
         assert_eq!(rows[0]["n"], Value::Null, "{rows}");
         assert_eq!(rows[0]["ns"], "1,2,2", "{rows}");
         assert_eq!(rows[0]["dates"], 2, "{rows}");
-        assert_eq!(rows[0]["kw"], "a b", "{rows}");
+        assert_eq!(rows[0]["kw"], Value::Null, "{rows}");
+        assert_eq!(rows[0]["message"], "disk full again", "{rows}");
         assert_eq!(rows[0]["kws"], "a,b", "{rows}");
         assert_eq!(rows[1]["n"], 3, "{rows}");
         assert_eq!(rows[1]["ns"], Value::Null, "{rows}");
@@ -9691,6 +9706,62 @@ mod tests {
         assert_eq!(rows[2]["prices"], "5.5,7", "{rows}");
         let hits = sql(h, r#"SELECT osid FROM logs WHERE array_has("n[]", 2)"#);
         assert_eq!(hits, json!([{ "osid": "m1" }]), "{hits}");
+        close(h);
+    }
+
+    /// How many short values the keyword array below holds, and the bytes of
+    /// each: joined by spaces they are 79,359 bytes, more than twice what one
+    /// term holds, while each is far shorter.
+    const MANY_VALUES: usize = 320;
+    const SHORT_VALUE_BYTES: usize = 247;
+
+    /// A keyword field a document gives many short values keeps each in its
+    /// list column, on both append paths, and the document is stored. Its
+    /// own column is null: the values joined would be one term to its
+    /// keyword index, past a term's length, which the engine refuses at
+    /// commit after OpenSearch acknowledged the document. So is a document
+    /// rewritten with one value more each time, as a scripted update adds
+    /// one, before and after its values joined pass a term's length.
+    #[test]
+    fn a_keyword_field_s_many_short_values_are_each_stored() {
+        let h = open_logs();
+        let value = |i: usize| format!("{i:03}{}", "v".repeat(SHORT_VALUE_BYTES - 3));
+        let doc = |n: usize| json!({ "level": (0..n).map(value).collect::<Vec<_>>() }).to_string();
+        let joined = (0..MANY_VALUES).map(value).collect::<Vec<_>>().join(MULTI_VALUE_SEPARATOR);
+        assert!(joined.len() > MAX_TERM_BYTES, "premise: {}", joined.len());
+        assert_eq!(check(h, &doc(MANY_VALUES)), "");
+        // The direct append (proxy mode's) and the prepared one (default mode's).
+        let out = index(h, &[("a1", &doc(MANY_VALUES))]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let p = prepared(h, &[("a2", &doc(MANY_VALUES))]);
+        let out = append_replacing(h, p, &[]);
+        assert_eq!(out["ok"], 1, "{out}");
+        // The fewest values that, joined, are past a term's length.
+        let past = MAX_TERM_BYTES / (SHORT_VALUE_BYTES + MULTI_VALUE_SEPARATOR.len()) + 1;
+        let (first, last) = (past - 2, past + 2);
+        for n in first..=last {
+            let p = prepared(h, &[("g", &doc(n))]);
+            let replaced: &[&str] = if n == first { &[] } else { &["g"] };
+            let out = append_replacing(h, p, replaced);
+            assert_eq!(out["ok"], 1, "{n} values: {out}");
+        }
+        // The last value the rewritten document gained: each document holds
+        // it once, in its list column, and the rewritten one only as last written.
+        let rows = sql(
+            h,
+            &format!(
+                r#"SELECT osid, level, cardinality("level[]") AS n FROM logs
+                    WHERE array_has("level[]", '{}') ORDER BY osid"#,
+                value(last - 1)
+            ),
+        );
+        let rows = rows.as_array().expect("rows");
+        let ids: Vec<&str> = rows.iter().filter_map(|r| r["osid"].as_str()).collect();
+        assert_eq!(ids, ["a1", "a2", "g"], "{rows:?}");
+        for (row, n) in rows.iter().zip([MANY_VALUES, MANY_VALUES, last]) {
+            assert_eq!(row["level"], Value::Null, "{rows:?}");
+            assert_eq!(row["n"], n, "{rows:?}");
+        }
         close(h);
     }
 
