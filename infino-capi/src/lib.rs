@@ -4891,6 +4891,13 @@ pub unsafe extern "C" fn infino_index_batch(
     .unwrap_or(ptr::null_mut())
 }
 
+/// Whether the hosted service left a document of a write unanswered (503,
+/// [`untried`]): then it is not asked for the schema after the write, which
+/// would wait on a service that just did not answer.
+fn unanswered(failed: &[NotTaken]) -> bool {
+    failed.iter().any(|f| f.status == Some(SERVICE_UNAVAILABLE))
+}
+
 /// Index many documents from one buffer, in one append. The buffer holds
 /// `id0 source0 id1 source1 ...` as UTF-8; `id_ends[i]` is where row i's id
 /// ends (its source starts there) and `src_ends[i]` where its source ends,
@@ -4952,11 +4959,13 @@ pub unsafe extern "C" fn infino_index_batch_buf(
             Err(e) => return engine_err_json(&e),
         };
         let failed = recheck.retry_stale_refusals(failed);
-        let failed: Vec<Value> = failed.iter().map(|f| f.to_json(false)).collect();
         let ok = n - failed.len();
-        if adds_columns && ok > 0 {
+        // As in [`infino_append_prepared`]: a service that stopped answering
+        // is not asked for the schema too.
+        if adds_columns && ok > 0 && !unanswered(&failed) {
             conn.reread_schema(name);
         }
+        let failed: Vec<Value> = failed.iter().map(|f| f.to_json(false)).collect();
         out_json(json!({ "ok": ok, "failed": failed }))
     }))
     .unwrap_or(ptr::null_mut())
@@ -6043,8 +6052,7 @@ pub unsafe extern "C" fn infino_append_prepared(
         // a service that stopped answering asked for the schema. A document
         // refused for a column its batch's schemas lacked had the schema
         // read again already ([`Recheck`]).
-        let unanswered = failed.iter().any(|f| f.status == Some(SERVICE_UNAVAILABLE));
-        if adds_columns && ok > 0 && !unanswered {
+        if adds_columns && ok > 0 && !unanswered(&failed) {
             conn.reread_schema(name);
         }
         let failed: Vec<Value> = failed.iter().map(|f| f.to_json(true)).collect();
@@ -13315,6 +13323,16 @@ mod tests {
     fn logs_service(
         write: impl Fn(&str) -> Option<(u16, Vec<u8>)> + Send + 'static,
     ) -> *mut Bridge {
+        logs_service_counting_schema_reads(write).0
+    }
+
+    /// [`logs_service`], with how many times the bridge has read the table's
+    /// schema document from it.
+    fn logs_service_counting_schema_reads(
+        write: impl Fn(&str) -> Option<(u16, Vec<u8>)> + Send + 'static,
+    ) -> (*mut Bridge, Arc<AtomicUsize>) {
+        let schema_reads = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::clone(&schema_reads);
         let local = open_logs();
         let bridge = unsafe { &*local };
         let document = bridge.conn.schema("logs").unwrap().to_json().to_string();
@@ -13338,6 +13356,7 @@ mod tests {
                     Some((200, "application/json", b"[]".to_vec()))
                 } else if request.contains("/v1/schema/") {
                     if String::from_utf8_lossy(&body).contains("\"document\"") {
+                        reads.fetch_add(1, Ordering::SeqCst);
                         Some((200, "application/json", document.clone().into_bytes()))
                     } else {
                         Some((200, "application/vnd.apache.arrow.stream", ipc.clone()))
@@ -13359,7 +13378,7 @@ mod tests {
         let key = c("ik_test");
         let h = unsafe { infino_open_with(uri.as_ptr(), key.as_ptr(), ptr::null()) };
         assert!(!h.is_null(), "the open lists the tables");
-        h
+        (h, schema_reads)
     }
 
     /// A prepared batch of `ids` for `logs`, each document `{"level":"info"}`.
@@ -13728,6 +13747,70 @@ mod tests {
         assert_unanswered(out["failed"].as_array().unwrap(), 2..4);
         assert_eq!(appends.load(Ordering::SeqCst), 4, "{out}");
         unsafe { infino_close(h) };
+    }
+
+    /// An append from one buffer whose documents add a column reads the
+    /// schema document again once the service has answered it, but not
+    /// when the service left part of it unanswered: a service that just did
+    /// not answer is not asked for the schema too, as with a prepared append.
+    #[test]
+    fn an_append_from_a_buffer_left_unanswered_does_not_read_the_schema_again() {
+        let name = c("logs");
+        let ids = ["a", "b", "c", "d"];
+        // "un" is a path the mapping does not declare, so the append adds its column.
+        let doc = br#"{"level":"info","un":7}"#;
+        let mut buf = Vec::new();
+        let mut id_ends = Vec::new();
+        let mut src_ends = Vec::new();
+        for id in ids {
+            buf.extend_from_slice(id.as_bytes());
+            id_ends.push(buf.len() as u32);
+            buf.extend_from_slice(doc);
+            src_ends.push(buf.len() as u32);
+        }
+        // The joined batch is refused for its content and goes in halves; the
+        // first half lands and the second is answered with `last`.
+        let schema_reads_during = |last: u16| -> (Value, usize) {
+            let answers: &'static [u16] = if last == SERVICE_UNAVAILABLE {
+                &[STATUS_BAD_REQUEST, STATUS_BAD_REQUEST, 200, SERVICE_UNAVAILABLE]
+            } else {
+                &[STATUS_BAD_REQUEST, STATUS_BAD_REQUEST, 200, 200]
+            };
+            let appends = Arc::new(AtomicUsize::new(0));
+            let (h, reads) = logs_service_counting_schema_reads(move |request| {
+                if !request.contains("/v1/append/") {
+                    return None;
+                }
+                let n = appends.fetch_add(1, Ordering::SeqCst);
+                Some((answers[n], b"append error: failing".to_vec()))
+            });
+            let before = reads.load(Ordering::SeqCst);
+            let out = take(unsafe {
+                infino_index_batch_buf(
+                    h,
+                    name.as_ptr(),
+                    buf.as_ptr(),
+                    buf.len(),
+                    id_ends.as_ptr(),
+                    src_ends.as_ptr(),
+                    ids.len() as c_int,
+                )
+            });
+            let during = reads.load(Ordering::SeqCst) - before;
+            unsafe { infino_close(h) };
+            (serde_json::from_str(&out).unwrap(), during)
+        };
+
+        let (answered, reads_answered) = schema_reads_during(200);
+        assert_eq!(answered["ok"], 4, "{answered}");
+        let (unanswered, reads_unanswered) = schema_reads_during(SERVICE_UNAVAILABLE);
+        assert_eq!(unanswered["ok"], 2, "{unanswered}");
+        assert_unanswered(unanswered["failed"].as_array().unwrap(), 2..4);
+        assert_eq!(
+            reads_unanswered + 1,
+            reads_answered,
+            "only the answered append reads the schema again"
+        );
     }
 
     /// A delete the hosted service turns away for the account's request rate,
