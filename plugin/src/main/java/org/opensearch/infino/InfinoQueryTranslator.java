@@ -239,17 +239,22 @@ final class InfinoQueryTranslator {
      * columns that read a value whole (keyword, number, date): {@code text}
      * the clause on the text column, {@code values} the predicates of the
      * others, and {@code match} the predicate the query translated to, any
-     * of them. Stock scores such a clause as a {@code dis_max} of its
-     * fields: the text field's BM25, and on another field the boost (1)
-     * where the value matches, as a term query there scores. So the hits
-     * rank by the text's BM25 with a value match as a bonus
-     * ({@link #valueRanking}), combined by the query's tie_breaker:
-     * {@code best} (0) takes the greater, otherwise (1) the sum.
+     * of them; {@code columns} the columns of {@code values}, in order.
+     * Stock scores such a clause as a {@code dis_max} of its fields: the
+     * text field's BM25, and on another field the boost (1) where the value
+     * matches, as a term query there scores. So the hits rank by the text's
+     * BM25 with a value match as a bonus ({@link #valueRanking}), combined
+     * by the query's tie_breaker: {@code best} (0) takes the greater,
+     * otherwise (1) the sum, each value field that matches adding its own.
      */
-    record ValueRanking(TextClause text, List<String> values, String match, boolean best) {
-        /** The bonus a hit takes where one of {@link #values} matches it. */
-        Bonus bonus() {
-            return new Bonus("CASE WHEN (" + String.join(" OR ", values) + ") THEN " + scoreLiteral(VALUE_MATCH_SCORE) + " ELSE 0.0 END", List.of(VALUE_MATCH_SCORE));
+    record ValueRanking(TextClause text, List<String> values, List<Column> columns, String match, boolean best) {
+        /** What a hit adds where {@link #values} match it: 1 where any does under {@code best}, else 1 for each. */
+        List<Bonus> bonuses() {
+            List<Bonus> out = new ArrayList<>();
+            for (List<String> each : best ? List.of(values) : values.stream().map(List::of).toList()) {
+                out.add(new Bonus("CASE WHEN (" + String.join(" OR ", each) + ") THEN " + scoreLiteral(VALUE_MATCH_SCORE) + " ELSE 0.0 END", List.of(VALUE_MATCH_SCORE)));
+            }
+            return List.copyOf(out);
         }
     }
 
@@ -748,7 +753,7 @@ final class InfinoQueryTranslator {
         if (valueRanking != null) {
             if (principal == null && across == null && !unscored[0] && texts.isEmpty() && bonuses.isEmpty()) {
                 // The text column's BM25 and a value match, combined as stock's dis_max combines its fields.
-                return new Scoring(valueRanking.text(), offset[0], List.of(valueRanking.bonus()), false, false, false, null, valueRanking.best());
+                return new Scoring(valueRanking.text(), offset[0], valueRanking.bonuses(), false, false, false, null, valueRanking.best());
             }
             // Beside another scoring clause the hits no longer score by this one alone.
             unscored[0] = true;
@@ -941,7 +946,11 @@ final class InfinoQueryTranslator {
         if (v == null || alone.principal != null || !v.match().equals(match)) {
             return null;
         }
-        return new ValueRanking(v.text(), v.values(), v.match(), tieBreaker == 0f);
+        // A boolean field, or a keyword field with use_similarity, scores a match by BM25 in stock, not by 1.
+        if (v.columns().stream().anyMatch(Column::scoresTermsByBm25)) {
+            return null;
+        }
+        return new ValueRanking(v.text(), v.values(), v.columns(), v.match(), tieBreaker == 0f);
     }
 
     /** Whether every field of a query weighs 1 (no {@code field^boost}). */
@@ -2809,6 +2818,7 @@ final class InfinoQueryTranslator {
         onFields = null;
         List<String> indexed = new ArrayList<>();
         List<String> exact = new ArrayList<>();
+        List<Column> exactColumns = new ArrayList<>();
         for (String f : fields) {
             Column c = column(f);
             if (c == null) {
@@ -2820,6 +2830,7 @@ final class InfinoQueryTranslator {
                 String p = exactValue(f, c, value);
                 if (p != null) {
                     exact.add(p);
+                    exactColumns.add(c);
                 }
             }
         }
@@ -2845,7 +2856,7 @@ final class InfinoQueryTranslator {
         String p = or.size() == 1 ? or.get(0) : "(" + String.join(" OR ", or) + ")";
         if (indexed.size() == 1 && !exact.isEmpty() && positive && filtering == 0 && !composed) {
             // One text column beside value columns: it may rank, the values a bonus (see valueRanking).
-            onFields = new ValueRanking(new TextClause(indexed.get(0), query, mode), List.copyOf(exact), p, true);
+            onFields = new ValueRanking(new TextClause(indexed.get(0), query, mode), List.copyOf(exact), List.copyOf(exactColumns), p, true);
         }
         return p;
     }

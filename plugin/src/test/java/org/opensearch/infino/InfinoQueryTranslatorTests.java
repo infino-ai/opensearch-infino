@@ -1646,10 +1646,28 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             String sql = InfinoSearch.scoredStatement(unsortedPlan(t, columns()), "osid", t.where(), 10, false);
             assertTrue(sql, sql.contains("GREATEST(infino_bm25, infino_bonus) AS score"));
         }
-        // most_fields sums its fields.
+        // most_fields sums its fields: each value field that matches adds its own 1, as stock sums them.
         InfinoQueryTranslator.Scoring most = translate(QueryBuilders.multiMatchQuery("disk").type(MultiMatchQueryBuilder.Type.MOST_FIELDS)).scoring();
         assertEquals(disk, most.text());
         assertFalse(most.best());
+        assertEquals(
+            List.of("CASE WHEN (\"level\" = 'disk') THEN 1.0 ELSE 0.0 END", "CASE WHEN (\"host.name\" = 'disk') THEN 1.0 ELSE 0.0 END"),
+            most.bonuses().stream().map(InfinoQueryTranslator.Bonus::expr).toList()
+        );
+        // A boolean field scores a match by BM25 in stock, not by 1: left unranked.
+        Map<String, Column> withFlag = columns();
+        withFlag.put("ok", new Column("ok", "bool", false, false));
+        assertTrue(
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("true"), withFlag, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches)
+                .scoring()
+                .unrankable()
+        );
+        // So does a keyword field with use_similarity.
+        Map<String, Column> similar = columns();
+        similar.put("host.name", similar.get("host.name").scoredBySimilarity());
+        assertTrue(
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("disk"), similar, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).scoring().unrankable()
+        );
         Translation mostTranslation = translate(QueryBuilders.multiMatchQuery("disk").type(MultiMatchQueryBuilder.Type.MOST_FIELDS));
         String summed = InfinoSearch.scoredStatement(unsortedPlan(mostTranslation, columns()), "osid", mostTranslation.where(), 10, false);
         assertTrue(summed, summed.contains("infino_bm25 + infino_bonus AS score"));
