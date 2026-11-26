@@ -557,6 +557,7 @@ public class InfinoEngineTests extends OpenSearchTestCase {
             assertFalse(status.name(), InfinoEngine.unanswered(new InfinoNative.InfinoException("refused", status)));
         }
         assertTrue(InfinoEngine.unanswered(new IllegalStateException("wrapped", new InfinoNative.InfinoException("x", RestStatus.SERVICE_UNAVAILABLE, true))));
+        assertTrue("a 429 for the account's request rate", InfinoEngine.unanswered(new InfinoNative.InfinoException("rate", RestStatus.TOO_MANY_REQUESTS)));
         assertFalse(InfinoEngine.unanswered(new IllegalStateException("the bridge could not prepare a batch")));
     }
 
@@ -682,6 +683,102 @@ public class InfinoEngineTests extends OpenSearchTestCase {
         assertEquals(0, replay.unansweredLeft);
         assertTrue("it waited on its own thread", replay.parks > 0);
         assertTrue("held at the bound: " + replay.most, replay.most <= BOUND + 1);
+    }
+
+    /**
+     * A document an append did not take tells the client to send it again
+     * when the hosted service turned it away for the rate (429) or could not
+     * serve it (502, 503, 504); a refusal of the document does not.
+     */
+    public void testADocumentTurnedAwayForNowHasARetryStatus() {
+        assertEquals(RestStatus.TOO_MANY_REQUESTS, InfinoEngine.retryStatus(failure(RATE_LIMITED, false)));
+        assertEquals(RestStatus.SERVICE_UNAVAILABLE, InfinoEngine.retryStatus(failure("append: server returned 504: gateway timeout", false)));
+        assertNull(InfinoEngine.retryStatus(failure("append: server returned 400: update error: bad value", false)));
+        assertNull("refused for what it carries", InfinoEngine.retryStatus(failure(RATE_LIMITED, true)));
+        assertNull(InfinoEngine.retryStatus(failure("the table refused it", false)));
+    }
+
+    /**
+     * A replay whose appends the hosted service turns away document by
+     * document for the account's request rate (every document a 429, none
+     * written) waits at the bound as it waits out an outage, and goes on once
+     * appends land, rather than stopping: the commit counts as one the
+     * service did not take ({@link InfinoEngine#noteCommit}), not as a table
+     * that refuses the writes.
+     */
+    public void testAReplayWhoseAppendsAre429PerDocumentWaitsAndGoesOn() {
+        AtomicInteger appends = new AtomicInteger();
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> switch (method.getName()) {
+            case "infino_open_with", "infino_prepare_batch_meta" -> new Memory(1);
+            case "infino_append_prepared" -> appends.incrementAndGet() <= UNANSWERED_COMMITS
+                ? string(
+                    "{\"ok\":0,\"failed\":[{\"b\":0,\"i\":0,\"reason\":\"" + RATE_LIMITED_JSON + "\",\"permanent\":false},"
+                        + "{\"b\":0,\"i\":1,\"reason\":\"" + RATE_LIMITED_JSON + "\",\"permanent\":false}]}"
+                )
+                : string("{\"ok\":2,\"failed\":[]}");
+            default -> null;
+        }));
+        try {
+            AtomicLong clock = new AtomicLong();
+            AtomicInteger parks = new AtomicInteger();
+            InfinoEngine.Stalls stalls = new InfinoEngine.Stalls(clock::get, nanos -> {
+                parks.incrementAndGet();
+                clock.addAndGet(nanos);
+            });
+            AtomicLong waiting = new AtomicLong();
+            InfinoEngine.Replay replay = new InfinoEngine.Replay() {
+                @Override
+                public String name() {
+                    return "replaying a test history";
+                }
+
+                @Override
+                public String backlog() {
+                    return InfinoEngine.pastBound(waiting.get(), 0) ? waiting.get() + " writes" : null;
+                }
+
+                @Override
+                public void commit() {
+                    // Two documents stand for the batch a commit carries.
+                    InfinoEngine.Batch sent = new InfinoEngine.Batch();
+                    sent.add("a", InfinoEngine.Base.ABSENT, write(0, "{}"));
+                    sent.add("b", InfinoEngine.Base.ABSENT, write(1, "{}"));
+                    InfinoEngine.Written w = InfinoEngine.write("t", 1, sent, held -> {}, () -> {}, (id, v) -> null);
+                    InfinoEngine.noteCommit(stalls, sent, w.retry(), w.unavailable());
+                    if (w.retry().isEmpty()) {
+                        waiting.addAndGet(-Math.min(waiting.get(), BATCH_DOCS));
+                    }
+                }
+
+                @Override
+                public boolean closing() {
+                    return false;
+                }
+            };
+            long most = 0;
+            for (long op = 0; op < 3 * BOUND; op++) {
+                most = Math.max(most, waiting.incrementAndGet());
+                stalls.hold(replay);
+                if (waiting.get() >= BATCH_DOCS && stalls.fullBatchMayCommit(InfinoEngine.pastBound(waiting.get(), 0))) {
+                    replay.commit();
+                }
+            }
+            assertTrue("every turned-away commit, then those that landed: " + appends.get(), appends.get() > UNANSWERED_COMMITS);
+            assertTrue("it waited on its own thread", parks.get() > 0);
+            assertTrue("held at the bound: " + most, most <= BOUND + 1);
+        } finally {
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /** The reason a document turned away for the account's request rate carries. */
+    private static final String RATE_LIMITED = "append: server returned 429: {\"error\":\"rate limit exceeded\"}";
+    /** {@link #RATE_LIMITED} inside a JSON string. */
+    private static final String RATE_LIMITED_JSON = RATE_LIMITED.replace("\"", "\\\"");
+
+    /** A document an append did not take, with {@code reason}. */
+    private static InfinoNative.PreparedFailure failure(String reason, boolean permanent) {
+        return new InfinoNative.PreparedFailure(0, 0, reason, permanent);
     }
 
     /** A replay waiting for the hosted service stops once the engine closes. */

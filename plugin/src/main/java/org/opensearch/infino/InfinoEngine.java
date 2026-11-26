@@ -196,6 +196,8 @@ public class InfinoEngine extends InternalEngine {
     private static final long STALL_BACKOFF_MAX_NANOS = TimeUnit.SECONDS.toNanos(30);
     /** The longest reason a stalled commit is remembered by. */
     private static final int STALL_REASON_MAX = 512;
+    /** What precedes the status of a hosted service's refusal in an error's text: {@code server returned 429: ...}. */
+    private static final String SERVICE_STATUS_MARKER = "server returned ";
     /** The longest a held replay sleeps before it looks again whether the engine is closing. */
     private static final long HOLD_POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
     /** Locks over ids that order each id's skeleton write with its record in the batch. */
@@ -1841,14 +1843,7 @@ public class InfinoEngine extends InternalEngine {
                     }
                 }
             }
-            if (unavailable != null) {
-                // The whole batch came back: the hosted service did not answer (see #write).
-                stalls.noteStall(true, "the hosted service did not answer: " + unavailable);
-            } else if (tookNone(b, retry)) {
-                stalls.noteStall(false, "the table took none of the " + b.entries.size() + " ids it was sent");
-            } else {
-                stalls.noteProgress();
-            }
+            noteCommit(stalls, b, retry, unavailable);
             // Every write through `through` is in the table now, but for those
             // to retry and those a later take carries, which wait in the batch.
             long covered = through;
@@ -1863,6 +1858,46 @@ public class InfinoEngine extends InternalEngine {
             holdHistoryThrough(covered);
             return retry.isEmpty();
         }
+    }
+
+    /**
+     * Note what a commit of {@code sent} did in {@code stalls}: a stall when
+     * it took none of its writes ({@link #tookNone}), unanswered when the
+     * hosted service did not take it ({@code unavailable}, the reason
+     * {@link #write} gives, else null), and progress when it took any.
+     */
+    static void noteCommit(Stalls stalls, Batch sent, Batch retry, String unavailable) {
+        if (!tookNone(sent, retry)) {
+            stalls.noteProgress();
+        } else if (unavailable != null) {
+            stalls.noteStall(true, "the hosted service did not take it: " + unavailable);
+        } else {
+            stalls.noteStall(false, "the table took none of the " + sent.entries.size() + " ids it was sent");
+        }
+    }
+
+    /**
+     * The status a document an append did not take was turned away with,
+     * when it tells the client to send it again: 429 when the hosted service
+     * turned it away for the account's request rate, 503 when the service or
+     * a gateway could not serve it (502, 503, 504). Null for a refusal of
+     * the document itself. Read off the reason here; #301 carries it on the
+     * failure itself ({@code PreparedFailure.status}).
+     */
+    static RestStatus retryStatus(InfinoNative.PreparedFailure f) {
+        if (f.permanent() || f.reason() == null) {
+            return null;
+        }
+        int at = f.reason().indexOf(SERVICE_STATUS_MARKER);
+        if (at < 0 || f.reason().length() < at + SERVICE_STATUS_MARKER.length() + 3) {
+            return null;
+        }
+        String code = f.reason().substring(at + SERVICE_STATUS_MARKER.length(), at + SERVICE_STATUS_MARKER.length() + 3);
+        return switch (code) {
+            case "429" -> RestStatus.TOO_MANY_REQUESTS;
+            case "502", "503", "504" -> RestStatus.SERVICE_UNAVAILABLE;
+            default -> null;
+        };
     }
 
     /**
@@ -1881,13 +1916,14 @@ public class InfinoEngine extends InternalEngine {
      * Whether a commit's failure is the hosted service not answering: the
      * bridge marks it {@link InfinoNative.InfinoException#unavailable}, for
      * a refused or broken connection, a request past its deadline, or a 502,
-     * 503 or 504, whatever status it carries. It is the mark {@link #write}
-     * keeps a batch on. An outage passes on its own, so a replay waits it out
-     * rather than stopping (see {@link Stalls#hold}).
+     * 503 or 504, whatever status it carries; or the service turned the
+     * call away for the account's request rate (429). Both pass on their own,
+     * so a replay waits them out rather than stopping (see {@link Stalls#hold}).
      */
     static boolean unanswered(Throwable e) {
         for (Throwable t = e; t != null; t = t.getCause()) {
-            if (t instanceof InfinoNative.InfinoException ie && ie.unavailable()) {
+            // The same test InfinoException.retryStatus() makes in #301: the mark, or a 429.
+            if (t instanceof InfinoNative.InfinoException ie && (ie.unavailable() || ie.status() == RestStatus.TOO_MANY_REQUESTS)) {
                 return true;
             }
         }
@@ -2228,6 +2264,12 @@ public class InfinoEngine extends InternalEngine {
                 // The batch carries each row's sequence number from prepare, so the append names none.
                 InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced, null);
                 retry = notTaken(table, result.failed(), ids, written, withMapped);
+                // Every document it did not take was turned away for the moment (a 429 for the
+                // account's request rate, say): the service did not take the commit, as when it
+                // does not answer, so a replay waits it out rather than stopping.
+                if (!result.failed().isEmpty() && result.failed().stream().allMatch(f -> retryStatus(f) != null)) {
+                    unavailable = "it turned every document away for now: " + result.failed().get(0).reason();
+                }
             }
         } catch (InfinoNative.InfinoException e) {
             if (!e.unavailable()) {
