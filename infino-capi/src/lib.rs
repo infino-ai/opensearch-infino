@@ -118,6 +118,10 @@ const MULTI_VALUE_SEPARATOR: &str = " ";
 /// The longest UTF-8 encoding a `keyword` value may have, as Lucene bounds
 /// one term.
 const MAX_TERM_BYTES: usize = 32766;
+/// The most UTF-8 bytes one UTF-16 unit encodes: a character in the Basic
+/// Multilingual Plane is one unit in at most three bytes, one outside it two
+/// units in four. A string has at least a third as many units as bytes.
+const MAX_UTF8_BYTES_PER_UTF16_UNIT: usize = 3;
 /// How Lucene's refusal of a value too long for one term starts
 /// ([`immense_term`]); the plugin answers a reason that starts so as
 /// OpenSearch answers it, an `illegal_argument_exception`.
@@ -1547,12 +1551,9 @@ impl KeywordIndexing {
         }
     }
 
-    /// Whether `text` is past `ignore_above`, so not indexed. A string has
-    /// no more UTF-16 units than UTF-8 bytes, so one no longer in bytes is
-    /// not counted.
+    /// Whether `text` is past `ignore_above`, so not indexed.
     fn skips(&self, text: &str) -> bool {
-        self.ignore_above
-            .is_some_and(|n| text.len() > n && text.encode_utf16().count() > n)
+        self.ignore_above.is_some_and(|n| more_utf16_units_than(text, n))
     }
 
     /// Lucene's refusal when the term `text` gives `field` is longer than
@@ -1573,6 +1574,21 @@ impl KeywordIndexing {
         };
         (term.len() > MAX_TERM_BYTES).then(|| too_long_for_one_term(field, &term, terms))
     }
+}
+
+/// Whether `text` is more than `n` UTF-16 units long, as OpenSearch counts
+/// a keyword value against `ignore_above`, without counting every unit of a
+/// long value. A string has no more units than UTF-8 bytes, and at least a
+/// third as many ([`MAX_UTF8_BYTES_PER_UTF16_UNIT`]), so its byte length
+/// settles most values; otherwise at most `n + 1` units are read.
+fn more_utf16_units_than(text: &str, n: usize) -> bool {
+    if text.len() <= n {
+        return false;
+    }
+    if text.len() > n.saturating_mul(MAX_UTF8_BYTES_PER_UTF16_UNIT) {
+        return true;
+    }
+    text.encode_utf16().nth(n).is_some()
 }
 
 /// `text` as Lucene's `lowercase` filter (behind the built-in `lowercase`
@@ -2973,23 +2989,27 @@ fn keyword_values(flat: &mut Map<String, Value>, kept: &HashMap<String, Kept>) -
         // field is indexed first, then its multi-fields, as the mapper
         // indexes them, so the refusal names the first that refuses.
         let indexed = |v: &Value| -> Result<bool, String> {
-            // A number or boolean is indexed as its text.
             let text = match v {
-                Value::String(s) => Cow::Borrowed(s.as_str()),
-                Value::Number(_) | Value::Bool(_) => Cow::Owned(v.to_string()),
+                Value::String(s) => s.as_str(),
+                // A number or boolean is indexed as its text, far shorter
+                // than one term, so only the field's own `ignore_above` can
+                // leave it out, and it is spelled out only to check that.
+                Value::Number(_) | Value::Bool(_) => {
+                    return Ok(!own.is_some_and(|own| own.ignore_above.is_some() && own.skips(&v.to_string())));
+                }
                 _ => return Ok(true),
             };
             let mut keeps = true;
             if let Some(own) = own {
-                if own.skips(&text) {
+                if own.skips(text) {
                     keeps = false;
-                } else if let Some(why) = own.refusal(path, &text) {
+                } else if let Some(why) = own.refusal(path, text) {
                     return Err(why);
                 }
             }
             for view in multi {
-                if !view.indexing.skips(&text) {
-                    if let Some(why) = view.indexing.refusal(&view.field, &text) {
+                if !view.indexing.skips(text) {
+                    if let Some(why) = view.indexing.refusal(&view.field, text) {
                         return Err(why);
                     }
                 }
@@ -8474,6 +8494,46 @@ mod tests {
         let past = "x".repeat(MAX_TERM_BYTES + 1);
         let why = keyword_row(mapping, json!({ "a": { "t": past } })).unwrap_err();
         assert!(why.starts_with(&format!("{IMMENSE_TERM}a.t.keyword\"")), "{why}");
+    }
+
+    /// A value is past `ignore_above` when it is more than that many UTF-16
+    /// units long, whatever its byte length: checked at the limit `n` and
+    /// around the byte lengths `n` and `3n` the check reads first, for
+    /// characters of one, two, three and four UTF-8 bytes (one, one, one and
+    /// two units), against counting every unit.
+    #[test]
+    fn more_utf16_units_than_counts_units_at_the_boundaries() {
+        const LIMIT: usize = 12;
+        let counted = |text: &str, n: usize| text.encode_utf16().count() > n;
+        for c in ['a', 'é', '€', '😀'] {
+            let units = c.len_utf16();
+            for chars in 0..=(MAX_UTF8_BYTES_PER_UTF16_UNIT * LIMIT + 2) {
+                let text = c.to_string().repeat(chars);
+                assert_eq!(
+                    more_utf16_units_than(&text, LIMIT),
+                    chars * units > LIMIT,
+                    "{chars} x {c:?} ({} bytes)",
+                    text.len()
+                );
+                assert_eq!(more_utf16_units_than(&text, LIMIT), counted(&text, LIMIT));
+            }
+        }
+        // Mixed widths around the byte bounds: 12 three-byte characters are
+        // 36 bytes (3n) and 12 units, not past; one more ASCII character makes
+        // 37 bytes, past 3n, so past without counting.
+        let at = "€".repeat(LIMIT);
+        assert_eq!(at.len(), MAX_UTF8_BYTES_PER_UTF16_UNIT * LIMIT);
+        assert!(!more_utf16_units_than(&at, LIMIT));
+        assert!(more_utf16_units_than(&format!("{at}a"), LIMIT));
+        // Ten ASCII characters and one emoji: 12 units in 14 bytes, not past.
+        let emoji = format!("{}😀", "a".repeat(LIMIT - 2));
+        assert!(!more_utf16_units_than(&emoji, LIMIT));
+        assert!(more_utf16_units_than(&format!("{emoji}a"), LIMIT));
+        // A limit of zero leaves out any non-empty value, and an enormous
+        // limit does not overflow.
+        assert!(!more_utf16_units_than("", 0));
+        assert!(more_utf16_units_than("a", 0));
+        assert!(!more_utf16_units_than("abc", usize::MAX));
     }
 
     /// Under the built-in `lowercase` normalizer, the term whose length is
