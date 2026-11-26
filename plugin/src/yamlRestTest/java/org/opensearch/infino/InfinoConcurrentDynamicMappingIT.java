@@ -41,6 +41,8 @@ public class InfinoConcurrentDynamicMappingIT extends InfinoRestTestCase {
     private static final int NAMES = 10;
     /** Below this draw a field's value is a string, below {@link #NUMBER_BELOW} a number, else an object. */
     private static final double STRING_BELOW = 0.6;
+    /** In the array test, below this draw a field's value is an array instead. */
+    private static final double ARRAY_BELOW = 0.4;
     /** See {@link #STRING_BELOW}. */
     private static final double NUMBER_BELOW = 0.8;
     /** The share of documents that carry the sparse string field. */
@@ -52,11 +54,24 @@ public class InfinoConcurrentDynamicMappingIT extends InfinoRestTestCase {
 
     public void testConcurrentFirstWritesLeaveTheIndexHealthy() throws Exception {
         for (int trial = 0; trial < TRIALS; trial++) {
-            assertHealthyAfterConcurrentFirstWrites("dyn_race_" + trial, trial);
+            assertHealthyAfterConcurrentFirstWrites("dyn_race_" + trial, trial, false);
         }
     }
 
-    private void assertHealthyAfterConcurrentFirstWrites(String index, int trial) throws Exception {
+    /**
+     * As {@link #testConcurrentFirstWritesLeaveTheIndexHealthy}, where some
+     * new fields' first values are arrays of strings or of numbers: each is
+     * written once the mapping declares it, as one value per document with its
+     * values listed beside it, never as a list column of the table's own
+     * typing that the mapping could not then be applied over.
+     */
+    public void testConcurrentNewArrayFieldsLeaveTheIndexHealthy() throws Exception {
+        for (int trial = 0; trial < TRIALS; trial++) {
+            assertHealthyAfterConcurrentFirstWrites("dyn_arrays_" + trial, trial, true);
+        }
+    }
+
+    private void assertHealthyAfterConcurrentFirstWrites(String index, int trial, boolean arrays) throws Exception {
         call(
             "PUT",
             "/" + index,
@@ -82,7 +97,14 @@ public class InfinoConcurrentDynamicMappingIT extends InfinoRestTestCase {
                             bulk.append('_').append(d).append("\"}}\n");
                             bulk.append("{\"x\":{\"h").append(random.nextInt(GROUPS)).append("\":{\"k").append(random.nextInt(NAMES)).append("\":");
                             double kind = random.nextDouble();
-                            if (kind < STRING_BELOW) {
+                            if (arrays && kind < ARRAY_BELOW) {
+                                // An array of strings below half the share, else of numbers.
+                                if (kind < ARRAY_BELOW / 2) {
+                                    bulk.append("[\"silk ").append(random.nextInt(VALUES)).append("\",\"wool\"]");
+                                } else {
+                                    bulk.append('[').append(random.nextInt(VALUES)).append(",999]");
+                                }
+                            } else if (kind < STRING_BELOW) {
                                 bulk.append("\"silk scarf ").append(random.nextInt(VALUES)).append('"');
                             } else if (kind < NUMBER_BELOW) {
                                 bulk.append(random.nextInt(VALUES));
