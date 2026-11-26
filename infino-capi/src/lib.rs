@@ -2140,16 +2140,19 @@ fn root_of(mapping: &Value) -> Option<&Map<String, Value>> {
 }
 
 /// A mapping's boolean setting, `enabled` or `dynamic`, as OpenSearch reads
-/// it: a boolean, or its string. `dynamic: strict` maps no new field either,
-/// but a document that brings one is refused before it is written, so for
-/// what reaches the table it reads as `true`. None when the setting is
+/// it: a boolean, or its string. `dynamic: strict` (and
+/// `strict_allow_templates`) maps no new field either, but a document that
+/// brings one is refused before it is written, so for what reaches the
+/// table it reads as `true`. `false_allow_templates` reads as `false`: a new
+/// field a dynamic template matches is mapped by the document's mapping
+/// update, and any other is left out of the index. None when the setting is
 /// absent or no such value.
 fn mapping_flag(value: Option<&Value>) -> Option<bool> {
     match value? {
         Value::Bool(b) => Some(*b),
         Value::String(s) => match s.as_str() {
-            "true" | "strict" | "runtime" => Some(true),
-            "false" => Some(false),
+            "true" | "strict" | "strict_allow_templates" => Some(true),
+            "false" | "false_allow_templates" => Some(false),
             _ => None,
         },
         _ => None,
@@ -3422,8 +3425,9 @@ fn conform_doc(
         let Some(field) = field else {
             // A new path under a column the table already holds is refused by
             // every commit ([`live_column_above`]): say so now, before the
-            // write is acknowledged.
-            if let Some(column) = live_column_above(path, schema) {
+            // write is acknowledged. A null there gives the engine nothing
+            // to write, and it skips the path.
+            if let Some(column) = (!value.is_null()).then(|| live_column_above(path, schema)).flatten() {
                 return Err(format!(
                     "field [{path}]: the table holds [{column}] as a column of its own, and no field can be added beneath it"
                 ));
@@ -12416,6 +12420,17 @@ mod tests {
         let plain = Indexed::of(&json!({"dynamic": "strict", "properties": {"n": {"type": "long"}}}));
         assert!(!plain.leaves_out);
         assert!(!Indexed::default().leaves_out && Indexed::default().indexes("x.y"));
+        // The template-aware settings: a field no template maps is left out
+        // under `false_allow_templates`, and refused before it is written
+        // under `strict_allow_templates`.
+        let templated = Indexed::of(&json!({"dynamic": "false_allow_templates", "properties": {
+            "tag": {"type": "keyword"},
+            "strict": {"dynamic": "strict_allow_templates", "properties": {}}
+        }}));
+        assert!(templated.leaves_out);
+        assert!(templated.indexes("tag") && !templated.indexes("free"));
+        assert!(templated.indexes("strict.new"));
+        assert_eq!(mapping_flag(Some(&json!("runtime"))), None);
         // A property spelled with a dot matches as one name.
         let dotted = Indexed::of(&json!({"dynamic": false, "properties": {"a.b": {"type": "long"}}}));
         assert!(dotted.indexes("a.b") && !dotted.indexes("a.c"));
@@ -12485,6 +12500,102 @@ mod tests {
         assert_ne!(index(h, &[("b", doc)])["ok"], 1);
         // A path beside the column, or the column itself, is no conflict.
         assert_eq!(check(h, r#"{"tag":"c","loc":"1,2","locale":{"x":1}}"#), "");
+        // Nor is a null beneath it, which the engine skips.
+        let null = r#"{"tag":"d","loc":{"lat":null}}"#;
+        assert_eq!(check(h, null), "");
+        assert_eq!(index(h, &[("d", null)])["ok"], 1);
+        close(h);
+    }
+
+    /// A put-mapping that names a field `dynamic: false` left out declares
+    /// it again: the rule is rebuilt from the new mapping, the field gets
+    /// its column, and the documents written after it fill that column. One
+    /// written before keeps its value in the source only, as stock indexes
+    /// only what it mapped (#294).
+    #[test]
+    fn a_put_mapping_gives_a_left_out_field_its_column() {
+        let h = open_storage();
+        let bridge = bridge_ref(h).unwrap();
+        let out = ensure(h, r#"{"dynamic":false,"properties":{"tag":{"type":"keyword"}}}"#);
+        assert!(out.contains("\"created\":true"), "{out}");
+        let before = r#"{"tag":"a","note":"left out"}"#;
+        assert_eq!(index(h, &[("n1", before)])["ok"], 1);
+        let schema = || bridge.conn.open_table("logs").unwrap().schema();
+        assert!(schema().field_with_name("note").is_err());
+
+        let out = ensure(
+            h,
+            r#"{"dynamic":false,"properties":{"tag":{"type":"keyword"},"note":{"type":"keyword"}}}"#,
+        );
+        assert!(out.contains("\"created\":false"), "{out}");
+        assert!(schema().field_with_name("note").is_ok());
+        assert_eq!(index(h, &[("n2", r#"{"tag":"b","note":"mapped"}"#)])["ok"], 1);
+        let rows = sql(h, "SELECT osid, note FROM logs ORDER BY osid");
+        assert!(rows[0]["note"].is_null(), "{rows}");
+        assert_eq!(rows[1]["note"], "mapped", "{rows}");
+        assert_eq!(get(h, "n1"), before);
+        close(h);
+    }
+
+    /// Of an array of objects, the members the mapping maps keep their
+    /// values, and the ones `dynamic: false` leaves out take any shape in
+    /// each element and each document, with no column (#294).
+    #[test]
+    fn an_array_of_objects_keeps_only_its_mapped_members() {
+        let h = open_storage();
+        let bridge = bridge_ref(h).unwrap();
+        let out = ensure(
+            h,
+            r#"{"dynamic":"false","properties":{"items":{"properties":{"name":{"type":"keyword"}}}}}"#,
+        );
+        assert!(out.contains("\"created\":true"), "{out}");
+        let docs = [
+            ("a", r#"{"items":[{"name":"x","extra":1},{"name":"y","extra":"s"}]}"#),
+            ("b", r#"{"items":[{"name":"z","extra":{"deep":[1]}},{"extra":[[1],[2]]}]}"#),
+            ("c", r#"{"items":{"name":"w","extra":[{"k":true}]}}"#),
+        ];
+        for (id, doc) in docs {
+            assert_eq!(check(h, doc), "", "{id}");
+            assert_eq!(index(h, &[(id, doc)])["ok"], 1, "{id}");
+        }
+        let schema = bridge.conn.open_table("logs").unwrap().schema();
+        assert!(
+            schema.fields().iter().all(|f| !f.name().starts_with("items.extra")),
+            "{schema:?}"
+        );
+        for (id, doc) in docs {
+            assert_eq!(get(h, id), doc, "{id}");
+        }
+        let rows = sql(h, r#"SELECT osid, "items.name" FROM logs ORDER BY osid"#);
+        assert_eq!(rows[1]["items.name"], "z", "{rows}");
+        assert_eq!(rows[2]["items.name"], "w", "{rows}");
+        close(h);
+    }
+
+    /// A table written before the rule may hold a scalar column at a path
+    /// the mapping does not index (`data`, typed from a string). A later
+    /// document with an object there is not refused for nesting under that
+    /// column: its paths are left out of the row before any column is
+    /// looked at (#294).
+    #[test]
+    fn an_old_scalar_column_does_not_refuse_an_object_beneath_it_once_unindexed() {
+        let h = open_storage();
+        let bridge = bridge_ref(h).unwrap();
+        let out = ensure(h, r#"{"properties":{"tag":{"type":"keyword"}}}"#);
+        assert!(out.contains("\"created\":true"), "{out}");
+        assert_eq!(index(h, &[("old", r#"{"tag":"o","data":"text"}"#)])["ok"], 1);
+        let out = ensure(h, r#"{"dynamic":false,"properties":{"tag":{"type":"keyword"}}}"#);
+        assert!(out.contains("\"created\":false"), "{out}");
+        let doc = r#"{"tag":"n","data":{"x":1}}"#;
+        assert_eq!(check(h, doc), "");
+        assert_eq!(index(h, &[("new", doc)])["ok"], 1);
+        assert_eq!(get(h, "new"), doc);
+        let schema = bridge.conn.open_table("logs").unwrap().schema();
+        assert!(schema.field_with_name("data").is_ok());
+        assert!(schema.field_with_name("data.x").is_err());
+        let rows = sql(h, "SELECT osid, data FROM logs ORDER BY osid");
+        assert!(rows[0]["data"].is_null(), "{rows}");
+        assert_eq!(rows[1]["data"], "text", "{rows}");
         close(h);
     }
 }

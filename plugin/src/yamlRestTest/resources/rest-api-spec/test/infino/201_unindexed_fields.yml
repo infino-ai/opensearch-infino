@@ -534,3 +534,53 @@
   - match: { hits.total.value: 1 }
   - match: { hits.hits.0._id: d1 }
   - match: { hits.hits.0._source: {"tag": "t1", "msg": "hello number 1", "outer": {"n": 1, "raw": "text"}, "loose": {"k": "t1", "free": {"a": {"b": [true, null]}, "c": [[1, 2], [3]]}}} }
+---
+"A put-mapping that names a field dynamic: false left out maps it for the documents written after it":
+  - do:
+      indices.create:
+        index: uf_put_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: false, properties: { tag: { type: keyword } } }
+  - do:
+      indices.create:
+        index: uf_put_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: false, properties: { tag: { type: keyword } } }
+  - do:
+      indices.create:
+        index: uf_put_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: false, properties: { tag: { type: keyword } } }
+  - do: { index: { index: uf_put_luc, id: n1, refresh: true, body: {"tag": "a", "note": "left out"} } }
+  - do: { indices.put_mapping: { index: uf_put_luc, body: { properties: { note: { type: keyword } } } } }
+  - do: { index: { index: uf_put_luc, id: n2, refresh: true, body: {"tag": "b", "note": "mapped"} } }
+  - do: { search: { index: uf_put_luc, body: { query: { term: { note: mapped } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: n2 }
+  - do: { search: { index: uf_put_luc, body: { query: { term: { note: left out } } } } }
+  - match: { hits.total.value: 0 }
+  - do: { get: { index: uf_put_luc, id: n1 } }
+  - match: { _source.note: left out }
+  - do: { index: { index: uf_put_px, id: n1, refresh: true, body: {"tag": "a", "note": "left out"} } }
+  - do: { indices.put_mapping: { index: uf_put_px, body: { properties: { note: { type: keyword } } } } }
+  - do: { index: { index: uf_put_px, id: n2, refresh: true, body: {"tag": "b", "note": "mapped"} } }
+  - do: { search: { index: uf_put_px, body: { query: { term: { note: mapped } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: n2 }
+  - do: { search: { index: uf_put_px, body: { query: { term: { note: left out } } } } }
+  - match: { hits.total.value: 0 }
+  - do: { get: { index: uf_put_px, id: n1 } }
+  - match: { _source.note: left out }
+  - do: { index: { index: uf_put_def, id: n1, refresh: true, body: {"tag": "a", "note": "left out"} } }
+  - do: { indices.put_mapping: { index: uf_put_def, body: { properties: { note: { type: keyword } } } } }
+  - do: { index: { index: uf_put_def, id: n2, refresh: true, body: {"tag": "b", "note": "mapped"} } }
+  - do: { search: { index: uf_put_def, body: { query: { term: { note: mapped } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: n2 }
+  - do: { search: { index: uf_put_def, body: { query: { term: { note: left out } } } } }
+  - match: { hits.total.value: 0 }
+  - do: { get: { index: uf_put_def, id: n1 } }
+  - match: { _source.note: left out }
