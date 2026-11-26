@@ -17,6 +17,7 @@ import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.allocation.AllocationService;
+import org.opensearch.cluster.routing.allocation.RoutingAllocation;
 import org.opensearch.cluster.routing.allocation.allocator.BalancedShardsAllocator;
 import org.opensearch.cluster.routing.allocation.decider.AllocationDeciders;
 import org.opensearch.cluster.routing.allocation.decider.Decision;
@@ -26,6 +27,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.infino.InfinoStorageIdentity.Seen;
 import org.opensearch.test.gateway.TestGatewayAllocator;
 
+import java.util.Arrays;
 import java.util.List;
 
 /** Where a shard of an Infino-backed index may go: only to a node that sees the cluster's storage. */
@@ -101,9 +103,32 @@ public class InfinoStorageDeciderTests extends OpenSearchAllocationTestCase {
 
         InfinoStorageIdentity.assumeReported(replica.currentNodeId(), OWN_DISK);
         InfinoStorageDecider decider = new InfinoStorageDecider();
-        assertEquals(
-            Decision.Type.NO,
-            decider.canRemain(replica, state.getRoutingNodes().node(replica.currentNodeId()), newRoutingAllocation(deciders(), state)).type()
+        RoutingAllocation routing = newRoutingAllocation(deciders(), state);
+        // A reroute asks every shard: its refusal carries no reason, which is built only for an explanation.
+        routing.debugDecision(false);
+        assertSame(Decision.NO, decider.canRemain(replica, state.getRoutingNodes().node(replica.currentNodeId()), routing));
+        routing.debugDecision(true);
+        Decision explained = decider.canRemain(replica, state.getRoutingNodes().node(replica.currentNodeId()), routing);
+        assertEquals(Decision.Type.NO, explained.type());
+        assertTrue(explained.getExplanation(), explained.getExplanation().contains("file:///data/infino"));
+    }
+
+    /** Whether a node is refused is what the reason says, without building it. */
+    public void testARefusalIsDecidedWithoutItsReason() {
+        for (String cluster : List.of(TOKEN, "")) {
+            for (Seen seen : Arrays.asList(SHARED, OWN_DISK, null)) {
+                for (boolean remain : new boolean[] { false, true }) {
+                    assertEquals(
+                        cluster + " " + seen + " " + remain,
+                        InfinoStorageDecider.refusal(cluster, seen, remain) != null,
+                        InfinoStorageDecider.refuses(cluster, seen, remain)
+                    );
+                }
+            }
+        }
+        assertTrue(
+            "a node not yet upgraded never reports",
+            InfinoStorageDecider.refusal(TOKEN, null, false).contains("a plugin version without this check")
         );
     }
 

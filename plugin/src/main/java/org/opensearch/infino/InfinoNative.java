@@ -1344,7 +1344,8 @@ public final class InfinoNative {
             return cached;
         }
         String json = take(lib.infino_columns(conn, name));
-        if (json == null || json.isEmpty()) {
+        // A table that could not be read lists no columns here, as one that does not exist.
+        if (json == null || json.isEmpty() || json.startsWith("{\"error\"")) {
             return Collections.emptyMap();
         }
         Mapping mapping = MAPPINGS.get(name);
@@ -1407,11 +1408,15 @@ public final class InfinoNative {
         return view;
     }
 
-    /** The names of table {@code name}'s columns, in the table's order, read from the table now; empty when it does not exist. */
+    /**
+     * The names of table {@code name}'s columns, in the table's order, read
+     * from the table now; empty when it does not exist. A read that fails for
+     * any other reason throws, so the caller never takes it for a missing table.
+     */
     static List<String> columnNames(String name) {
         init();
-        String json = take(lib.infino_columns(conn, name));
-        if (json == null || json.isEmpty()) {
+        String json = takeOrThrow(lib.infino_columns(conn, name), RestStatus.SERVICE_UNAVAILABLE);
+        if (json.isEmpty()) {
             return List.of();
         }
         List<String> out = new ArrayList<>();

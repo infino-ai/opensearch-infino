@@ -46,10 +46,20 @@ final class InfinoStorageDecider extends AllocationDecider {
             return allocation.decision(Decision.YES, NAME, "not an Infino-backed index");
         }
         String cluster = InfinoStorageIdentity.CLUSTER_STORAGE_ID.get(allocation.metadata().settings());
-        String refusal = refusal(cluster, InfinoStorageIdentity.reported(node.nodeId()), remain);
-        return refusal == null
-            ? allocation.decision(Decision.YES, NAME, "this node sees the cluster's Infino storage")
-            : allocation.decision(Decision.NO, NAME, "%s", refusal);
+        InfinoStorageIdentity.Seen seen = InfinoStorageIdentity.reported(node.nodeId());
+        if (!refuses(cluster, seen, remain)) {
+            return allocation.decision(Decision.YES, NAME, "this node sees the cluster's Infino storage");
+        }
+        // The reason is built only for an explanation: a reroute asks every shard of every node.
+        return allocation.debugDecision() ? allocation.decision(Decision.NO, NAME, "%s", refusal(cluster, seen, remain)) : Decision.NO;
+    }
+
+    /** Whether {@link #refusal} has a reason, without building it. */
+    static boolean refuses(String cluster, InfinoStorageIdentity.Seen seen, boolean remain) {
+        if (seen == null || cluster.isEmpty()) {
+            return !remain;
+        }
+        return InfinoStorageIdentity.mismatched(cluster, seen);
     }
 
     /**
@@ -59,10 +69,16 @@ final class InfinoStorageDecider extends AllocationDecider {
      */
     static String refusal(String cluster, InfinoStorageIdentity.Seen seen, boolean remain) {
         if (seen == null) {
-            return remain ? null : "this node has not reported which Infino storage it sees yet; it does once it has read its storage (see its log)";
+            return remain
+                ? null
+                : "this node has not reported which Infino storage it sees yet; it does once it has read its storage (see its log),"
+                    + " unless it runs a plugin version without this check, as a node not yet upgraded in a rolling upgrade does";
         }
         if (cluster.isEmpty()) {
-            return remain ? null : "the cluster has not recorded its Infino storage yet";
+            return remain
+                ? null
+                : "the cluster has not recorded its Infino storage yet; it does once more than half of the data nodes, or every one,"
+                    + " has reported the storage it sees (see their logs)";
         }
         return InfinoStorageIdentity.mismatched(cluster, seen) ? InfinoStorageIdentity.notShared(cluster, seen) : null;
     }

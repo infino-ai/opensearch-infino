@@ -67,6 +67,15 @@ public class InfinoUnsharedStorageIT extends InfinoRestTestCase {
         String index = "storage_check";
         call("PUT", "/" + index, "{\"settings\":{\"number_of_shards\":1,\"number_of_replicas\":1}}");
         int primary = awaitPrimary(index);
+        if (SHARED) {
+            // Every copy started before the write, so the replica takes part in
+            // the write's refresh: what is checked here is which storage a copy
+            // reads, not how fresh a copy that finishes recovering mid-write is.
+            Request started = new Request("GET", "/_cluster/health/" + index);
+            started.addParameter("wait_for_status", "green");
+            started.addParameter("timeout", ALLOCATION_SECONDS + "s");
+            assertEquals("every copy started: ", false, on(primary, started).get("timed_out"));
+        }
         StringBuilder bulk = new StringBuilder();
         for (int i = 0; i < DOCS; i++) {
             bulk.append("{\"index\":{\"_id\":\"d").append(i).append("\"}}\n{\"n\":").append(i).append("}\n");

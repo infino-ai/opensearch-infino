@@ -34,6 +34,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -50,20 +51,26 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <ul>
  * <li>a node's own storage ({@code file://}, {@code s3://}, {@code gs://},
- * {@code az://}) holds a marker table, {@link #MARKER_TABLE}, created by the
- * first node that finds none, with a random token;</li>
- * <li>a hosted account is shared by construction: its token is the service
- * URL and the database, which every node naming the same account names;</li>
+ * {@code az://}) and a hosted account's database each hold a marker table,
+ * {@link #MARKER_TABLE}, created by the first node that finds none, with a
+ * random token: two accounts whose databases share a name hold two
+ * markers;</li>
  * <li>{@code memory://} lives in one node's process, so it is that node's
  * alone: its token names the node, and only a single-node cluster can use it.</li>
  * </ul>
  *
- * <p>Each node reports its token to the elected cluster manager. The first
- * data node to report fixes the cluster's token, kept as the persistent
- * cluster setting {@link #CLUSTER_STORAGE_ID}, so it survives a full
- * restart; a later report never overwrites it, except from a node whose
- * storage an administrator switched through the account route. A node whose
- * token differs (or that has not reported yet) gets no shard of an Infino
+ * <p>Each node reports its token to the elected cluster manager, which keeps
+ * the cluster's token as the persistent cluster setting
+ * {@link #CLUSTER_STORAGE_ID}, so it survives a full restart. No one node's
+ * report decides it ({@link #chosen}): with none kept, the manager takes the
+ * token more than half of all data nodes report, or once every data node has
+ * reported, the one most of them report, so the node whose storage answers
+ * first (memory, a local directory) does not choose for a cluster on a
+ * bucket; once kept, it is replaced only when every data node reports the
+ * same other token and an administrator switched at least one of them
+ * through the account route, so switching one node moves no shard of the
+ * others. A node whose token differs (or that has not reported yet) gets no
+ * shard of an Infino
  * index ({@link InfinoStorageDecider}), refuses every table operation it
  * would otherwise answer from the wrong storage ({@link #refuseIfUnshared}),
  * and logs one ERROR saying what to fix. A copy that would answer with no
@@ -76,9 +83,9 @@ final class InfinoStorageIdentity {
 
     /**
      * The token of the storage the cluster's Infino indices live on, set by
-     * the cluster manager from the first data node's report. Cleared by an
-     * administrator whose cluster moved to other storage on purpose; the
-     * manager then takes the token most data nodes report.
+     * the cluster manager from the data nodes' reports ({@link #chosen}).
+     * Cleared by an administrator whose cluster moved to other storage on
+     * purpose; the manager then takes it from the data nodes' reports again.
      */
     static final Setting<String> CLUSTER_STORAGE_ID = Setting.simpleString(
         "infino.storage.id",
@@ -106,8 +113,7 @@ final class InfinoStorageIdentity {
     static final String REPORT_ACTION = "internal:infino/storage/report";
     /** How long a node waits before it reads its token, or reports it, again after a failure. */
     static final TimeValue RETRY_DELAY = TimeValue.timeValueSeconds(10);
-    /** How a token of a hosted account, and of a node's memory, starts: never a marker's column name. */
-    private static final String HOSTED = "hosted ";
+    /** How a token of a node's memory starts: never a marker's column name. */
     private static final String MEMORY = "memory ";
 
     /** What a node reports: its storage's token, and where that storage is, with any password hidden. */
@@ -136,6 +142,8 @@ final class InfinoStorageIdentity {
 
     /** Each node's report, by node id, as the elected manager holds them. */
     private static final Map<String, Seen> REPORTED = new ConcurrentHashMap<>();
+    /** The nodes whose last report came after an administrator switched their storage through the account route. */
+    private static final Set<String> ADOPTING = ConcurrentHashMap.newKeySet();
 
     private InfinoStorageIdentity() {}
 
@@ -166,20 +174,24 @@ final class InfinoStorageIdentity {
         }
         if (state.nodes().isLocalNodeElectedClusterManager()) {
             REPORTED.keySet().removeIf(id -> state.nodes().get(id) == null);
-            if (expected.isEmpty() && !REPORTED.isEmpty()) {
-                record(null);
+            ADOPTING.removeIf(id -> state.nodes().get(id) == null);
+            // A node that left can be the one whose report was missing.
+            if (!REPORTED.isEmpty() && chosen(expected, REPORTED, ADOPTING, state.nodes()) != null) {
+                record();
             }
         } else if (!REPORTED.isEmpty()) {
             // Another node manages the cluster now; what this one held may be stale by the time it is elected again.
             REPORTED.clear();
+            ADOPTING.clear();
         }
     }
 
     /**
      * The node's storage was switched while it runs (the account route): read
-     * its token again and have the cluster take it, as the administrator
-     * pointed the cluster's storage there. A no-op before the node's services
-     * run, when the switch is the node's own configuration at boot.
+     * its token again and ask the cluster to take it, as the administrator
+     * pointed the cluster's storage there. The cluster takes it once every
+     * data node reports it ({@link #chosen}). A no-op before the node's
+     * services run, when the switch is the node's own configuration at boot.
      */
     static void storageChanged() {
         if (InfinoServices.clusterService() == null) {
@@ -196,14 +208,25 @@ final class InfinoStorageIdentity {
      * Refuse a table operation on a node that does not see the cluster's
      * storage: answered from this node's storage, it would find no documents
      * or the wrong ones, with a 200. Passes while either token is unknown, and
-     * while a switched storage waits for the cluster to take its token.
+     * on the cluster's only node while its switched storage waits for the
+     * manager to take its token, which it will. A node switched in a cluster
+     * of several is refused until every data node sees its storage. The
+     * caller is told only that the storage is not shared: where each storage
+     * is goes to the node's log and the allocation explanation, which need
+     * an administrator.
      */
     static void refuseIfUnshared() {
         Seen seen = own;
         String cluster = expected;
-        if (seen != null && !adopting && mismatched(cluster, seen)) {
-            throw new InfinoNative.InfinoException(notShared(cluster, seen), RestStatus.SERVICE_UNAVAILABLE);
+        if (seen != null && mismatched(cluster, seen) && !(adopting && soleNode())) {
+            throw new InfinoNative.InfinoException(NOT_SHARED_TO_CALLER, RestStatus.SERVICE_UNAVAILABLE);
         }
+    }
+
+    /** Whether this node is the cluster's only node, so its storage is the cluster's whatever it is. */
+    private static boolean soleNode() {
+        ClusterService clusters = InfinoServices.clusterService();
+        return clusters != null && clusters.state().nodes().getSize() == 1;
     }
 
     /** Whether the cluster has a token and {@code seen} is a different one. */
@@ -249,19 +272,27 @@ final class InfinoStorageIdentity {
         }
     }
 
-    /** The token of the storage {@code target} names, as node {@code nodeId} sees it; the marker is created when there is none. */
+    /**
+     * The token of the storage {@code target} names, as node {@code nodeId}
+     * sees it; the marker is created when there is none. A hosted account's
+     * database holds a marker too: its URL and database name do not tell two
+     * accounts apart, as a database is named after the cluster by default.
+     */
     static Seen read(InfinoNative.Target target, String nodeId) {
         String where = InfinoNative.scrubbed(target, target.name());
         if (InfinoNative.inMemory(target)) {
             return new Seen(MEMORY + nodeId, where + " (in the memory of node " + nodeId + ")");
         }
-        if (target.hosted()) {
-            return new Seen(HOSTED + InfinoNative.scrubbed(target, target.uri()), where);
-        }
         return new Seen(markerToken(), where);
     }
 
-    /** The token in the marker of the storage the node's connection is open to; the marker is created, with a random token, when there is none. */
+    /**
+     * The token in the marker of the storage the node's connection is open
+     * to; the marker is created, with a random token, when there is none. A
+     * read that fails for another reason than a missing marker throws, and
+     * the read is tried again later ({@link #readSoon}): taken for a missing
+     * marker, it would add a column to the marker on every such failure.
+     */
     static String markerToken() {
         String token = tokenOf(InfinoNative.columnNames(MARKER_TABLE));
         if (token == null) {
@@ -342,24 +373,41 @@ final class InfinoStorageIdentity {
     /** On the elected manager: node {@code nodeId} sees {@code seen}; {@code adopt} when an administrator switched its storage. */
     static void received(String nodeId, Seen seen, boolean adopt) {
         Seen before = REPORTED.put(nodeId, seen);
+        if (adopt) {
+            ADOPTING.add(nodeId);
+        } else {
+            ADOPTING.remove(nodeId);
+        }
         ClusterService clusters = InfinoServices.clusterService();
         if (clusters == null) {
             return;
         }
-        String cluster = CLUSTER_STORAGE_ID.get(clusters.state().metadata().settings());
-        if (adopt || cluster.isEmpty()) {
-            record(adopt ? seen.token() : null);
-        } else if (!seen.equals(before)) {
+        ClusterState state = clusters.state();
+        String cluster = CLUSTER_STORAGE_ID.get(state.metadata().settings());
+        if (chosen(cluster, REPORTED, ADOPTING, state.nodes()) != null) {
+            record();
+            return;
+        }
+        if (adopt && mismatched(cluster, seen)) {
+            log.warn(
+                "[infino] node {} was switched to other storage, but the cluster keeps token {} while other data nodes still see it;"
+                    + " until every data node is switched, node {} gets no shard of an Infino index and refuses Infino requests",
+                nodeId,
+                cluster,
+                nodeId
+            );
+        }
+        if (!seen.equals(before)) {
             reroute(clusters, "infino storage reported by node " + nodeId);
         }
     }
 
     /**
-     * On the elected manager: keep {@code token} as the cluster's, replacing
-     * whatever it was; or with null, when the cluster has none, the token most
-     * data nodes reported. The decisions are taken again once it is kept.
+     * On the elected manager: keep the token {@link #chosen} takes from the
+     * reports as the cluster's, if it takes one. The decisions are taken
+     * again once it is kept.
      */
-    private static void record(String token) {
+    private static void record() {
         ClusterService clusters = InfinoServices.clusterService();
         if (clusters == null) {
             return;
@@ -368,8 +416,8 @@ final class InfinoStorageIdentity {
             @Override
             public ClusterState execute(ClusterState current) {
                 String now = CLUSTER_STORAGE_ID.get(current.metadata().settings());
-                String chosen = token != null ? token : now.isEmpty() ? chosen(REPORTED, current.nodes()) : null;
-                if (chosen == null || chosen.equals(now)) {
+                String chosen = chosen(now, REPORTED, ADOPTING, current.nodes());
+                if (chosen == null) {
                     return current;
                 }
                 Settings persistent = Settings.builder()
@@ -393,23 +441,56 @@ final class InfinoStorageIdentity {
         });
     }
 
-    /** The token most of the data nodes in {@code nodes} reported, of {@code reports}; null when none of them has. Ties go to the smaller token. */
-    static String chosen(Map<String, Seen> reports, DiscoveryNodes nodes) {
+    /**
+     * The token the cluster keeps in place of {@code now} (empty for none),
+     * from the {@code reports} of the data nodes in {@code nodes}; null to
+     * keep {@code now}. Only data nodes count, and each counts out of all
+     * the data nodes in the cluster, reported or not:
+     *
+     * <ul>
+     * <li>with no token kept, the one more than half of the data nodes
+     * report; short of that, once every data node has reported, the one most
+     * of them report, a tie going to the smaller token. The reports that
+     * arrive first never choose it: a node on memory or a local directory
+     * answers before one reading a bucket;</li>
+     * <li>with one kept, another that every data node reports, when at least
+     * one of them was switched to it through the account route
+     * ({@code adopting}): one node's switch never moves the others' shards,
+     * and a cluster restarted on other storage by mistake is refused rather
+     * than served empty;</li>
+     * <li>a node's memory is its own, so it is the cluster's storage only
+     * when that node is the whole cluster.</li>
+     * </ul>
+     */
+    static String chosen(String now, Map<String, Seen> reports, Set<String> adopting, DiscoveryNodes nodes) {
+        Map<String, DiscoveryNode> data = nodes.getDataNodes();
         Map<String, Integer> votes = new HashMap<>();
-        for (Map.Entry<String, Seen> e : reports.entrySet()) {
-            DiscoveryNode node = nodes.get(e.getKey());
-            if (node != null && node.isDataNode()) {
-                votes.merge(e.getValue().token(), 1, Integer::sum);
+        int reported = 0;
+        boolean switched = false;
+        for (String id : data.keySet()) {
+            Seen seen = reports.get(id);
+            if (seen != null) {
+                reported++;
+                votes.merge(seen.token(), 1, Integer::sum);
+                switched |= adopting.contains(id);
             }
         }
-        String best = null;
+        String most = null;
         for (Map.Entry<String, Integer> e : votes.entrySet()) {
-            int than = best == null ? -1 : votes.get(best);
-            if (e.getValue() > than || (e.getValue() == than && e.getKey().compareTo(best) < 0)) {
-                best = e.getKey();
+            String token = e.getKey();
+            if (token.equals(now) || (token.startsWith(MEMORY) && nodes.getSize() > 1)) {
+                continue;
+            }
+            int count = e.getValue();
+            if (now.isEmpty() ? count * 2 > data.size() : count == data.size() && switched) {
+                return token;
+            }
+            int than = most == null ? -1 : votes.get(most);
+            if (count > than || (count == than && token.compareTo(most) < 0)) {
+                most = token;
             }
         }
-        return best;
+        return now.isEmpty() && reported == data.size() ? most : null;
     }
 
     private static void reroute(ClusterService clusters, String reason) {
@@ -425,6 +506,7 @@ final class InfinoStorageIdentity {
     /** For tests: forget every report and this node's own token. */
     static void reset() {
         REPORTED.clear();
+        ADOPTING.clear();
         own = null;
         expected = "";
         reportedTo = null;
@@ -468,7 +550,16 @@ final class InfinoStorageIdentity {
         );
     }
 
-    /** Why a node seeing {@code seen} is refused by a cluster whose token is {@code cluster}. */
+    /**
+     * What a caller of a node that does not see the cluster's storage is
+     * told: that it does not, and where an administrator reads why. Where
+     * each storage is (a bucket, a path, a database) is not the caller's to
+     * know.
+     */
+    static final String NOT_SHARED_TO_CALLER = "[infino] this node does not see the cluster's Infino storage;"
+        + " an administrator finds why in the node's log and in _cluster/allocation/explain";
+
+    /** Why a node seeing {@code seen} is refused by a cluster whose token is {@code cluster}: for the log and the allocation explanation. */
     static String notShared(String cluster, Seen seen) {
         return "[infino] this node does not see the cluster's Infino storage: expected token "
             + cluster
