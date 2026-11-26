@@ -78,7 +78,7 @@ The plugin has two parts: a Java plugin (`plugin/`) and a native bridge (`infino
 
 The document id is a column too, with a term index.
 
-A field the mapping does not index gets no column and is kept in `_source` only, as stock keeps it: anything under an object with `"enabled": false` (or every field, when the mapping sets that at its root), and a field the mapping does not name under `"dynamic": false`. Its value may take a different shape in each document. A `geo_point` or `geo_shape`, whose value also comes in several shapes, is kept whole as one string column, so every shape is taken. A table written before this release may already hold a column for such a field; it keeps that column and the values in it, and later documents leave it empty.
+A field the mapping does not index gets no column and is kept in `_source` only, as stock keeps it: anything under an object with `"enabled": false` (or every field, when the mapping sets that at its root), and a field the mapping does not name under `"dynamic": false`. Its value may take a different shape in each document. A field whose value also comes in several shapes (`geo_point`, `geo_shape`, `xy_point`, `xy_shape`, `join`, `completion`, `percolator`) is kept whole as one string column, so every shape is taken; a shape or a percolator query is kept as a short marker of its shape, as only `exists` reads it. A table written before this release may already hold a column for such a field; it keeps that column and the values in it, and later documents leave it empty.
 
 A document that the declared columns cannot hold is refused as its own bulk item, with the reason.
 
