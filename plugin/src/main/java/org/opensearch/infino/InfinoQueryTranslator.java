@@ -76,6 +76,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -3947,20 +3948,44 @@ final class InfinoQueryTranslator {
     }
 
     /**
+     * The keyword columns, as {@code table} NUL {@code column}, found to have
+     * more than {@link #MAX_PATTERN_VALUES} distinct values: counting such a
+     * column's terms costs far more than the pattern it would spare (over a
+     * second for millions of values), and a column rarely leaves that class.
+     * One that does is only matched row by row, still correctly. Cleared past
+     * {@link #MANY_VALUES_MAX} entries.
+     */
+    private static final Set<String> MANY_VALUES = ConcurrentHashMap.newKeySet();
+    /** The most columns {@link #MANY_VALUES} remembers before it starts over. */
+    private static final int MANY_VALUES_MAX = 10_000;
+
+    /**
      * Each keyword column's distinct values in {@code table}, read once per
      * query from its term index ({@link InfinoNative#valueCountsTop}): null
-     * for a column without one, or with more than {@link #MAX_PATTERN_VALUES}.
+     * for a column without one, or with more than {@link #MAX_PATTERN_VALUES}
+     * (remembered in {@link #MANY_VALUES}, so not counted again).
      */
     private static Function<String, List<String>> termIndexValues(String table) {
         Map<String, Optional<List<String>>> read = new HashMap<>();
         return column -> read.computeIfAbsent(column, name -> {
+            String key = table + "\u0000" + name;
+            if (MANY_VALUES.contains(key)) {
+                return Optional.empty();
+            }
             Map<String, Object> top;
             try {
                 top = InfinoNative.valueCountsTop(table, name, MAX_PATTERN_VALUES);
             } catch (RuntimeException e) {
                 return Optional.empty();
             }
-            if (top == null || !(top.get("groups") instanceof Number groups) || groups.longValue() > MAX_PATTERN_VALUES || !(top.get("rows") instanceof List<?> rows)) {
+            if (top != null && top.get("groups") instanceof Number groups && groups.longValue() > MAX_PATTERN_VALUES) {
+                if (MANY_VALUES.size() >= MANY_VALUES_MAX) {
+                    MANY_VALUES.clear();
+                }
+                MANY_VALUES.add(key);
+                return Optional.empty();
+            }
+            if (top == null || !(top.get("rows") instanceof List<?> rows)) {
                 return Optional.empty();
             }
             List<String> values = new ArrayList<>();
