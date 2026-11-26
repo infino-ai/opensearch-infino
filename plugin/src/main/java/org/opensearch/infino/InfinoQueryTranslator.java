@@ -263,7 +263,7 @@ final class InfinoQueryTranslator {
     private static final double VALUE_MATCH_SCORE = 1.0;
 
     /** The most distinct values of a keyword column a pattern is matched against; past it, row by row. */
-    static final int MAX_PATTERN_VALUES = 10_000;
+    static final int MAX_PATTERN_VALUES = 50_000;
 
     /** The most values a pattern may match on a keyword column and still be searched as an IN list; past it, row by row. */
     static final int MAX_PATTERN_MATCHES = 1_000;
