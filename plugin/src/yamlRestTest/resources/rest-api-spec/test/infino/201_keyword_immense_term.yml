@@ -51,18 +51,19 @@
   - match: { result: created }
   - do: { get: { index: kt_luc, id: k1 } }
   - set: { _source.k: big }
-  # Stock's reasons, which the Infino indices must give word for word.
+  # Stock's reasons, which the Infino indices must give word for word. (A regex here
+  # ignores white space, so . stands for each space.)
   - do:
       catch: bad_request
       index: { index: kt_luc, id: w1, body: { w: $big } }
   - match: { error.type: illegal_argument_exception }
-  - match: { error.reason: "/^Document contains at least one immense term in field=\"w\" .* got 32767$/" }
+  - match: { error.reason: '/^Document.contains.at.least.one.immense.term.in.field="w".*got.32767$/' }
   - set: { error.reason: reason_w }
   - do:
       catch: bad_request
       index: { index: kt_luc, id: t1, body: { t: $big } }
   - match: { error.type: illegal_argument_exception }
-  - match: { error.reason: "/^Document contains at least one immense term in field=\"t.keyword\" /" }
+  - match: { error.reason: '/^Document.contains.at.least.one.immense.term.in.field="t[.]keyword".*got.32767$/' }
   - set: { error.reason: reason_t }
   - do:
       catch: bad_request
