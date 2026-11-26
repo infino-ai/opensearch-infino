@@ -1570,9 +1570,12 @@ public final class InfinoNative {
      * the document because the hosted service ended it, and the client sends
      * it again: 429 when the service turned a call away for the account's
      * request rate, so the document was not written, and 503 when it did not
-     * answer a call, which may have written it.
+     * answer a call, which may have written it. {@code staleSchema} marks a
+     * 503 for a document the hosted service refused for a column its batch
+     * was typed without: the service did not write it either, and a later
+     * try types it afresh.
      */
-    public record PreparedFailure(int batch, int index, String reason, boolean permanent, RestStatus status) {}
+    public record PreparedFailure(int batch, int index, String reason, boolean permanent, RestStatus status, boolean staleSchema) {}
 
     /** Outcome of appending prepared batches. */
     public record PreparedResult(int ok, List<PreparedFailure> failed) {}
@@ -1712,7 +1715,8 @@ public final class InfinoNative {
                     ((Number) f.get("i")).intValue(),
                     (String) f.get("reason"),
                     Boolean.TRUE.equals(f.get("permanent")),
-                    f.get("status") instanceof Number n ? RestStatus.fromCode(n.intValue()) : null
+                    f.get("status") instanceof Number n ? RestStatus.fromCode(n.intValue()) : null,
+                    Boolean.TRUE.equals(f.get("stale_schema"))
                 )
             );
         }

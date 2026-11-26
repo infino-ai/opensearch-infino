@@ -1111,10 +1111,13 @@ public final class InfinoWriter {
      * The status under which the hosted service ended an append, when it
      * did ({@link InfinoNative.PreparedFailure#status}): 429 or 503, the
      * first a document of it carries; null when the append ran to its end.
+     * A document refused for a column its batch was typed without carries a
+     * 503 for a later try ({@link InfinoNative.PreparedFailure#staleSchema}),
+     * but the service answered that append, so it ended nothing.
      */
     static RestStatus endedBy(Map<String, InfinoNative.PreparedFailure> notTaken) {
         for (InfinoNative.PreparedFailure f : notTaken.values()) {
-            if (f.status() != null) {
+            if (f.status() != null && !f.staleSchema()) {
                 return f.status();
             }
         }

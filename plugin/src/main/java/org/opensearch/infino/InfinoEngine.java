@@ -1980,11 +1980,12 @@ public class InfinoEngine extends InternalEngine {
      * <p>A document the write did not reach because the hosted service ended
      * it carries a status ({@link InfinoNative.PreparedFailure#status}) and is
      * not checked: the service refused nothing it carries. Turned away for
-     * the account's request rate (429), it was not written, so the table
-     * holds under its id what this commit found ({@code replaced} names the
-     * ids that hold a row), and the next commit writes it without looking it
-     * up. Any other is looked up, since a call the service did not answer
-     * may have written it. The documents put back are logged in one line.
+     * the account's request rate (429), or refused for a column its batch was
+     * typed without ({@link InfinoNative.PreparedFailure#staleSchema}), it was
+     * not written, so the table holds under its id what this commit found
+     * ({@code replaced} names the ids that hold a row), and the next commit
+     * writes it without looking it up. Any other is looked up, since a call
+     * the service did not answer may have written it. The documents put back are logged in one line.
      */
     private static Batch notTaken(
         String table,
@@ -2043,9 +2044,9 @@ public class InfinoEngine extends InternalEngine {
                 );
                 continue;
             }
-            if (f.status() == RestStatus.TOO_MANY_REQUESTS) {
+            if (f.status() == RestStatus.TOO_MANY_REQUESTS || f.staleSchema()) {
                 retry.add(id, replaced.contains(id) ? Base.PRESENT : Base.ABSENT, v);
-                limited++;
+                limited += f.staleSchema() ? 0 : 1;
             } else {
                 retry.add(id, Base.UNKNOWN, v);
             }
