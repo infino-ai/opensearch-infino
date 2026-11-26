@@ -5,6 +5,10 @@
 # finds it by a term on any one of its values, counts each value in a terms
 # aggregation, and never takes the values joined for one term. Nothing is
 # acknowledged and then lost: each index ends with the same documents.
+#
+# Such a document's own column is null, its values in its list column, so
+# every reader takes them from there: a query_string "has a value", wildcard
+# and regexp atom, and a script's doc['f'].size() and .empty, as stock does.
 
 ---
 "A keyword array of values that each fit one term is stored and found by each value":
@@ -171,3 +175,117 @@
   - match: { aggregations.t.sum_other_doc_count: 0 }
   - do: { get: { index: kwa_def, id: k1 } }
   - match: { _source.tags.1: $b }
+
+---
+"query_string atoms and a script read every value of a keyword array":
+  - do:
+      indices.create:
+        index: kwq_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tags: { type: keyword }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: kwq_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tags: { type: keyword }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: kwq_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tags: { type: keyword }
+              n: { type: long }
+  # kwq_luc
+  - do: { bulk: { index: kwq_luc, refresh: true, body: [ {"index": {"_id": "q1"}}, {"n": 1, "tags": [ "red", "green" ]}, {"index": {"_id": "q2"}}, {"n": 2, "tags": "red"}, {"index": {"_id": "q3"}}, {"n": 3} ] } }
+  - match: { errors: false }
+  - do: { search: { index: kwq_luc, body: { query: { query_string: { query: "tags:*" } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: kwq_luc, body: { query: { query_string: { query: "tags:[* TO *]" } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: kwq_luc, body: { query: { query_string: { query: "tags:gr*" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q1 }
+  - do: { search: { index: kwq_luc, body: { query: { query_string: { query: "tags:/gr.*/" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q1 }
+  - do: { search: { index: kwq_luc, body: { query: { simple_query_string: { query: "gr*", fields: [ tags ] } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q1 }
+  - do: { search: { index: kwq_luc, body: { query: { script: { script: "doc['tags'].size() > 0" } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: kwq_luc, body: { query: { script: { script: "doc['tags'].size() > 1" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q1 }
+  - do: { search: { index: kwq_luc, body: { query: { script: { script: "doc['tags'].empty" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q3 }
+  - do: { search: { index: kwq_luc, body: { sort: [ { n: asc } ], script_fields: { sz: { script: "doc['tags'].size()" } } } } }
+  - match: { hits.hits.0.fields.sz.0: 2 }
+  - match: { hits.hits.1.fields.sz.0: 1 }
+  - match: { hits.hits.2.fields.sz.0: 0 }
+  # kwq_px
+  - do: { bulk: { index: kwq_px, refresh: true, body: [ {"index": {"_id": "q1"}}, {"n": 1, "tags": [ "red", "green" ]}, {"index": {"_id": "q2"}}, {"n": 2, "tags": "red"}, {"index": {"_id": "q3"}}, {"n": 3} ] } }
+  - match: { errors: false }
+  - do: { search: { index: kwq_px, body: { query: { query_string: { query: "tags:*" } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: kwq_px, body: { query: { query_string: { query: "tags:[* TO *]" } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: kwq_px, body: { query: { query_string: { query: "tags:gr*" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q1 }
+  - do: { search: { index: kwq_px, body: { query: { query_string: { query: "tags:/gr.*/" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q1 }
+  - do: { search: { index: kwq_px, body: { query: { simple_query_string: { query: "gr*", fields: [ tags ] } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q1 }
+  - do: { search: { index: kwq_px, body: { query: { script: { script: "doc['tags'].size() > 0" } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: kwq_px, body: { query: { script: { script: "doc['tags'].size() > 1" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q1 }
+  - do: { search: { index: kwq_px, body: { query: { script: { script: "doc['tags'].empty" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q3 }
+  - do: { search: { index: kwq_px, body: { sort: [ { n: asc } ], script_fields: { sz: { script: "doc['tags'].size()" } } } } }
+  - match: { hits.hits.0.fields.sz.0: 2 }
+  - match: { hits.hits.1.fields.sz.0: 1 }
+  - match: { hits.hits.2.fields.sz.0: 0 }
+  # kwq_def
+  - do: { bulk: { index: kwq_def, refresh: true, body: [ {"index": {"_id": "q1"}}, {"n": 1, "tags": [ "red", "green" ]}, {"index": {"_id": "q2"}}, {"n": 2, "tags": "red"}, {"index": {"_id": "q3"}}, {"n": 3} ] } }
+  - match: { errors: false }
+  - do: { search: { index: kwq_def, body: { query: { query_string: { query: "tags:*" } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: kwq_def, body: { query: { query_string: { query: "tags:[* TO *]" } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: kwq_def, body: { query: { query_string: { query: "tags:gr*" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q1 }
+  - do: { search: { index: kwq_def, body: { query: { query_string: { query: "tags:/gr.*/" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q1 }
+  - do: { search: { index: kwq_def, body: { query: { simple_query_string: { query: "gr*", fields: [ tags ] } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q1 }
+  - do: { search: { index: kwq_def, body: { query: { script: { script: "doc['tags'].size() > 0" } } } } }
+  - match: { hits.total.value: 2 }
+  - do: { search: { index: kwq_def, body: { query: { script: { script: "doc['tags'].size() > 1" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q1 }
+  - do: { search: { index: kwq_def, body: { query: { script: { script: "doc['tags'].empty" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: q3 }
+  - do: { search: { index: kwq_def, body: { sort: [ { n: asc } ], script_fields: { sz: { script: "doc['tags'].size()" } } } } }
+  - match: { hits.hits.0.fields.sz.0: 2 }
+  - match: { hits.hits.1.fields.sz.0: 1 }
+  - match: { hits.hits.2.fields.sz.0: 0 }
