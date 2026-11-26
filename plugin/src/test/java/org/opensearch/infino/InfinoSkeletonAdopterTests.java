@@ -438,7 +438,7 @@ public class InfinoSkeletonAdopterTests extends OpenSearchTestCase {
         Function<BulkRequest, BulkResponse> busy = bulk -> response(bulk, Map.of("a", 429));
         expectThrows(
             InfinoSkeletonAdopter.GaveUp.class,
-            () -> InfinoSkeletonAdopter.createMissing(SHARD, "t", missing, fake.retrier, busy, ids -> Set.copyOf(ids))
+            () -> InfinoSkeletonAdopter.createMissing(SHARD, "t", missing, new InfinoSkeletonAdopter.Named(), fake.retrier, busy, ids -> Set.copyOf(ids))
         );
     }
 
