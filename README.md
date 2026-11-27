@@ -72,7 +72,7 @@ The plugin has two parts: a Java plugin (`plugin/`) and a native bridge (`infino
 |---|---|
 | `date` | a timestamp column, with a range index unless the mapping says `"index": false` |
 | numeric types | a numeric column, with a range index unless the mapping says `"index": false` |
-| `text` | a string column with its own BM25 index |
+| `text` | a string column with its own BM25 index, which splits text into words as the standard analyzer does, whatever analyzer the field names. A text field whose analyzer splits text with a pattern tokenizer (`pattern`, `simple_pattern`, `simple_pattern_split`, or the `pattern` analyzer) would miss what stock finds, so it is refused with a 400: when the index is created (OpenSearch 3.7 and later; the request's mapping or a template's), and in a mapping update that adds one |
 | `keyword` | a string column compared by exact value, with a term index that keeps each value whole (the engine's `keyword` analyzer), which counts its values for a terms aggregation. On a hosted account the column takes the default analyzer instead, and a terms aggregation counts with a statement, until the hosted service accepts the keyword analyzer ([#274](https://github.com/infino-ai/opensearch-infino/issues/274)) |
 | `knn_vector` | a vector column, searched by the space type the mapping names |
 

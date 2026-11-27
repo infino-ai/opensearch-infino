@@ -40,7 +40,6 @@ import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.ClusterPlugin;
 import org.opensearch.plugins.EnginePlugin;
-import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.SearchPlugin;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
@@ -83,7 +82,7 @@ import java.util.function.Supplier;
  * index recreated on a fresh cluster with the same setting reattaches to the
  * rows its predecessor wrote.
  */
-public class InfinoPlugin extends Plugin implements ActionPlugin, SearchPlugin, EnginePlugin, ClusterPlugin {
+public class InfinoPlugin extends InfinoPluginBase implements ActionPlugin, SearchPlugin, EnginePlugin, ClusterPlugin {
 
     private static final Logger log = LogManager.getLogger(InfinoPlugin.class);
 

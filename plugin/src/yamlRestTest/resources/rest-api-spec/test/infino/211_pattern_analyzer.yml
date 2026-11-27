@@ -1,0 +1,205 @@
+# A text field analyzed with a pattern tokenizer. Stock splits
+# www.Example.com at each non-word character into www, example and com, so a
+# match on example finds it. The table indexes text with the standard
+# analyzer only, which keeps www.example.com as one word, so the same match
+# found nothing, with no error. An Infino-backed index whose text field would
+# be analyzed that way is refused instead, in both modes: at creation (the
+# request's mapping or a template's), and in a mapping update that adds such
+# a field. A Lucene twin shows what stock answers.
+---
+"Stock matches each token of a field with the pattern tokenizer, set directly or through copy_to":
+  - do:
+      indices.create:
+        index: pat_luc
+        body:
+          settings:
+            index.infino.enabled: false
+            number_of_shards: 1
+            number_of_replicas: 0
+            analysis: { analyzer: { wordSplit: { type: custom, tokenizer: pattern, filter: [ lowercase ] } } }
+          mappings:
+            properties:
+              direct: { type: text, norms: false, analyzer: wordSplit }
+              host: { type: keyword, copy_to: tokens }
+              tokens: { type: text, analyzer: wordSplit }
+  - do: { index: { index: pat_luc, id: "1", refresh: true, body: { direct: www.Example.com, host: www.Example.com } } }
+  - do:
+      indices.analyze:
+        index: pat_luc
+        body: { analyzer: wordSplit, text: www.Example.com }
+  - length: { tokens: 3 }
+  - match: { tokens.0.token: www }
+  - match: { tokens.1.token: example }
+  - match: { tokens.2.token: com }
+  - do: { search: { index: pat_luc, body: { query: { match: { direct: example } } } } }
+  - match: { hits.total.value: 1 }
+  - do: { search: { index: pat_luc, body: { query: { match_phrase: { direct: www.example.com } } } } }
+  - match: { hits.total.value: 1 }
+  - do: { search: { index: pat_luc, body: { query: { match: { tokens: example } } } } }
+  - match: { hits.total.value: 1 }
+
+---
+"Creating an Infino-backed index with a field that has the pattern tokenizer is refused in both modes":
+  - do:
+      catch: /field\s\[direct\]\suses\sanalyzer\s\[wordSplit\],\swhich\ssplits\stext\swith\sa\spattern\stokenizer/
+      indices.create:
+        index: pat_px
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: proxy
+            number_of_shards: 1
+            number_of_replicas: 0
+            analysis: { analyzer: { wordSplit: { type: custom, tokenizer: pattern, filter: [ lowercase ] } } }
+          mappings: { properties: { direct: { type: text, norms: false, analyzer: wordSplit } } }
+  - do:
+      catch: /field\s\[direct\]\suses\sanalyzer\s\[wordSplit\],\swhich\ssplits\stext\swith\sa\spattern\stokenizer/
+      indices.create:
+        index: pat_def
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+            analysis: { analyzer: { wordSplit: { type: custom, tokenizer: pattern, filter: [ lowercase ] } } }
+          mappings: { properties: { direct: { type: text, norms: false, analyzer: wordSplit } } }
+  # A copy_to target, a custom pattern, the built-in pattern analyzer, and the
+  # index's default analyzer are refused the same way.
+  - do:
+      catch: /field\s\[tokens\]\suses\sanalyzer\s\[wordSplit\]/
+      indices.create:
+        index: pat_copy_def
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+            analysis: { analyzer: { wordSplit: { type: custom, tokenizer: pattern, filter: [ lowercase ] } } }
+          mappings: { properties: { host: { type: keyword, copy_to: tokens }, tokens: { type: text, analyzer: wordSplit } } }
+  - do:
+      catch: /field\s\[direct\]\suses\sanalyzer\s\[dots\]/
+      indices.create:
+        index: pat_custom_px
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: proxy
+            number_of_shards: 1
+            number_of_replicas: 0
+            analysis:
+              tokenizer: { dot: { type: pattern, pattern: "[.]" } }
+              analyzer: { dots: { type: custom, tokenizer: dot, filter: [ lowercase ] } }
+          mappings: { properties: { direct: { type: text, analyzer: dots } } }
+  - do:
+      catch: /field\s\[direct\]\suses\sanalyzer\s\[pattern\]/
+      indices.create:
+        index: pat_builtin_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { direct: { type: text, analyzer: pattern } } }
+  - do:
+      catch: /default\sanalyzer\s\[index\.analysis\.analyzer\.default\]\ssplits\stext\swith\sa\spattern\stokenizer/
+      indices.create:
+        index: pat_default_px
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: proxy
+            number_of_shards: 1
+            number_of_replicas: 0
+            analysis: { analyzer: { default: { type: pattern } } }
+          mappings: { properties: { direct: { type: text } } }
+  - do: { indices.exists: { index: pat_px } }
+  - is_false: ''
+  - do: { indices.exists: { index: pat_def } }
+  - is_false: ''
+
+---
+"A template's field with the pattern tokenizer is refused when an index is created from it":
+  - do:
+      indices.put_index_template:
+        name: pat-template
+        body:
+          index_patterns: [ "pat-tpl-*" ]
+          priority: 200
+          template:
+            settings:
+              index.infino.enabled: true
+              number_of_shards: 1
+              number_of_replicas: 0
+              analysis: { analyzer: { wordSplit: { type: custom, tokenizer: pattern, filter: [ lowercase ] } } }
+            mappings: { properties: { direct: { type: text, analyzer: wordSplit } } }
+  - do:
+      catch: /field\s\[direct\]\suses\sanalyzer\s\[wordSplit\]/
+      indices.create:
+        index: pat-tpl-def
+        body: { settings: { index.infino.mode: default } }
+  - do:
+      catch: /field\s\[direct\]\suses\sanalyzer\s\[wordSplit\]/
+      indices.create:
+        index: pat-tpl-px
+        body: { settings: { index.infino.mode: proxy } }
+  # The first write to a missing index creates it from the template, and is refused the same way.
+  - do:
+      catch: /field\s\[direct\]\suses\sanalyzer\s\[wordSplit\]/
+      index:
+        index: pat-tpl-auto
+        body: { direct: www.Example.com }
+  - do: { indices.exists: { index: pat-tpl-def } }
+  - is_false: ''
+  - do: { indices.exists: { index: pat-tpl-auto } }
+  - is_false: ''
+
+---
+"A mapping update that adds a field with the pattern tokenizer is refused in both modes":
+  - do:
+      indices.create:
+        index: pat_upd_px
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: proxy
+            number_of_shards: 1
+            number_of_replicas: 0
+            analysis: { analyzer: { wordSplit: { type: custom, tokenizer: pattern, filter: [ lowercase ] } } }
+          mappings: { properties: { plain: { type: text } } }
+  - do:
+      indices.create:
+        index: pat_upd_def
+        body:
+          settings:
+            index.infino.enabled: true
+            index.infino.mode: default
+            number_of_shards: 1
+            number_of_replicas: 0
+            analysis: { analyzer: { wordSplit: { type: custom, tokenizer: pattern, filter: [ lowercase ] } } }
+          mappings: { properties: { plain: { type: text } } }
+  - do:
+      catch: bad_request
+      indices.put_mapping:
+        index: pat_upd_px
+        body: { properties: { direct: { type: text, analyzer: wordSplit } } }
+  - match: { error.reason: "/field\\s\\[direct\\]\\suses\\sanalyzer\\s\\[wordSplit\\]/" }
+  - do:
+      catch: bad_request
+      indices.put_mapping:
+        index: pat_upd_def
+        body: { properties: { direct: { type: text, analyzer: wordSplit } } }
+  - match: { error.reason: "/field\\s\\[direct\\]\\suses\\sanalyzer\\s\\[wordSplit\\]/" }
+  - do:
+      catch: bad_request
+      indices.put_mapping:
+        index: pat_upd_def
+        body: { dynamic_templates: [ { tokens: { match: "*_tokens", mapping: { type: text, analyzer: wordSplit } } } ] }
+  - match: { error.reason: "/dynamic\\stemplate\\s\\[tokens\\]\\suses\\sanalyzer\\s\\[wordSplit\\]/" }
+  # A field the table can analyze is still added, and the field never refused stays unmapped.
+  - do:
+      indices.put_mapping:
+        index: pat_upd_def
+        body: { properties: { words: { type: text, analyzer: whitespace } } }
+  - is_true: acknowledged
+  - do: { indices.get_mapping: { index: pat_upd_def } }
+  - match: { pat_upd_def.mappings.properties.words.type: text }
+  - is_false: pat_upd_def.mappings.properties.direct

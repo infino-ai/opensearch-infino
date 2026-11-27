@@ -68,6 +68,9 @@ sourceSets.main.java.srcDirs += versionMajor >= 3 ? 'src/main/client3' : 'src/ma
 // metadata and mark the call without it for removal; earlier releases make
 // only that call.
 sourceSets.main.java.srcDirs += versionMajor > 3 || (versionMajor == 3 && versionMinor >= 4) ? 'src/main/filter34' : 'src/main/filter33'
+// The plugin's base: 3.7 and later let a plugin check an index's mapping,
+// templates applied, as the index is created; earlier releases do not.
+sourceSets.main.java.srcDirs += versionMajor > 3 || (versionMajor == 3 && versionMinor >= 7) ? 'src/main/validator37' : 'src/main/validator36'
 
 configurations {
     securityPlugin
