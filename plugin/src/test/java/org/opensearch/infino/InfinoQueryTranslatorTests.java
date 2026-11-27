@@ -1875,6 +1875,28 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A date word reads in the query string's time_zone only where stock's
+     * parser reads it as a range there: on the one field its default_field
+     * names, unquoted. Over several fields (no fields named) stock reads it
+     * through the date field's term query, in UTC, time_zone or not.
+     */
+    public void testADateWordReadsInTheTimeZoneOnlyOnItsDefaultField() {
+        String zoned = translate(QueryBuilders.queryStringQuery("2026-10-25").defaultField("@timestamp").timeZone("+05:30")).where();
+        assertEquals("(\"@timestamp\" >= '2026-10-24T18:30:00Z' AND \"@timestamp\" <= '2026-10-25T18:29:59.999Z')", zoned);
+        String utc = "(\"@timestamp\" >= '2026-10-25T00:00:00Z' AND \"@timestamp\" <= '2026-10-25T23:59:59.999Z')";
+        assertEquals(utc, translate(QueryBuilders.queryStringQuery("2026-10-25").defaultField("@timestamp")).where());
+        assertEquals(utc, translate(QueryBuilders.queryStringQuery("\"2026-10-25\"").defaultField("@timestamp").timeZone("+05:30")).where());
+        for (org.opensearch.index.query.QueryBuilder qb : List.of(
+            QueryBuilders.queryStringQuery("2026-10-25").timeZone("+05:30"),
+            QueryBuilders.queryStringQuery("2026-10-25").field("@timestamp").field("level").timeZone("+05:30"),
+            QueryBuilders.queryStringQuery("2026-10-25").defaultField("@time*").timeZone("+05:30")
+        )) {
+            String where = translate(qb).where();
+            assertTrue(qb + " " + where, where.contains(utc));
+        }
+    }
+
     public void testQueryStringClausesReadAsLuceneReadsThem() {
         // Terms on the default fields go to the engine as one query with Lucene's occurrences as sigils.
         assertEquals("token_match('os_logs_0', 'message', '+disk +cache', 'or')", translate(QueryBuilders.queryStringQuery("disk AND cache").defaultField("message")).from());

@@ -119,7 +119,7 @@ setup:
 teardown:
   - do:
       indices.delete:
-        index: dfs_luc,dfs_prx,dfs_def,dfr_luc,dfr_prx,dfr_def,dfm_luc,dfm_prx,dfm_def,dft_luc,dft_prx,dft_def
+        index: dfs_luc,dfs_prx,dfs_def,dfr_luc,dfr_prx,dfr_def,dfm_luc,dfm_prx,dfm_def,dft_luc,dft_prx,dft_def,dfz_luc,dfz_prx,dfz_def
         ignore_unavailable: true
 
 ---
@@ -1616,3 +1616,146 @@ teardown:
   - match: { hits.hits.0._id: "1" }
   - match: { hits.hits.1._id: "2" }
   - match: { hits.hits.2._id: "3" }
+
+---
+"A date word reads in the query's time_zone on its one default_field, and in UTC over every field":
+  # Stock's query string parser reads a word on its one default_field, a
+  # date field, as a range in the query's time_zone: 2026-10-25 at +05:30
+  # runs from 18:30 UTC the day before (documents 1 and 2). Over every
+  # field it reads the word through the date field's term query, in UTC,
+  # time_zone or not (documents 2 and 3); so does a quoted word.
+  - do:
+      indices.create:
+        index: dfz_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, ts: { type: date } } }
+  - do:
+      indices.create:
+        index: dfz_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, ts: { type: date } } }
+  - do:
+      indices.create:
+        index: dfz_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, ts: { type: date } } }
+  - do:
+      bulk:
+        refresh: true
+        index: dfz_luc
+        body:
+          - index: { _id: "1" }
+          - { "message": "one", "ts": "2026-10-24T20:00:00Z" }
+          - index: { _id: "2" }
+          - { "message": "two", "ts": "2026-10-25T10:00:00Z" }
+          - index: { _id: "3" }
+          - { "message": "three", "ts": "2026-10-25T20:00:00Z" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfz_prx
+        body:
+          - index: { _id: "1" }
+          - { "message": "one", "ts": "2026-10-24T20:00:00Z" }
+          - index: { _id: "2" }
+          - { "message": "two", "ts": "2026-10-25T10:00:00Z" }
+          - index: { _id: "3" }
+          - { "message": "three", "ts": "2026-10-25T20:00:00Z" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfz_def
+        body:
+          - index: { _id: "1" }
+          - { "message": "one", "ts": "2026-10-24T20:00:00Z" }
+          - index: { _id: "2" }
+          - { "message": "two", "ts": "2026-10-25T10:00:00Z" }
+          - index: { _id: "3" }
+          - { "message": "three", "ts": "2026-10-25T20:00:00Z" }
+  - do:
+      search:
+        index: dfz_luc
+        body: { query: { query_string: { query: "2026-10-25", default_field: ts, time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfz_luc
+        body: { query: { query_string: { query: "2026-10-25", default_field: ts } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_luc
+        body: { query: { query_string: { query: "2026-10-25", time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_luc
+        body: { query: { query_string: { query: "\"2026-10-25\"", default_field: ts, time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_prx
+        body: { query: { query_string: { query: "2026-10-25", default_field: ts, time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfz_prx
+        body: { query: { query_string: { query: "2026-10-25", default_field: ts } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_prx
+        body: { query: { query_string: { query: "2026-10-25", time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_prx
+        body: { query: { query_string: { query: "\"2026-10-25\"", default_field: ts, time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_def
+        body: { query: { query_string: { query: "2026-10-25", default_field: ts, time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfz_def
+        body: { query: { query_string: { query: "2026-10-25", default_field: ts } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_def
+        body: { query: { query_string: { query: "2026-10-25", time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_def
+        body: { query: { query_string: { query: "\"2026-10-25\"", default_field: ts, time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }

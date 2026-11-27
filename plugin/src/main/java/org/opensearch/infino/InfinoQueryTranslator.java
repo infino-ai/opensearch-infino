@@ -513,6 +513,14 @@ final class InfinoQueryTranslator {
      */
     private boolean lenient;
     /**
+     * The time zone a query string's word on a date field is read in, where
+     * stock reads it there: the query's {@code default_field} names that one
+     * field (stock's parser then reads the word as a range in the query's
+     * {@code time_zone}). Null otherwise: over several fields, or a pattern,
+     * stock reads the word through the field's term query, in UTC.
+     */
+    private ZoneId wordZone;
+    /**
      * Whether a text clause in filter context is a predicate rather than the
      * principal: so when another text clause scores the hits, which must
      * then be the ranked one, read with the filter's restriction on its rows.
@@ -1701,11 +1709,21 @@ final class InfinoQueryTranslator {
                 // Stock refuses the pair, with this message.
                 throw new IllegalArgumentException("cannot use [fields] parameter in conjunction with [default_field]");
             }
-            return queryString(qs.queryString(), qs.defaultField(), new ArrayList<>(qs.fields().keySet()), qs.defaultOperator(), qs.minimumShouldMatch(), false, qs.lenient(), positive);
+            return queryString(
+                qs.queryString(),
+                qs.defaultField(),
+                new ArrayList<>(qs.fields().keySet()),
+                qs.defaultOperator(),
+                qs.minimumShouldMatch(),
+                false,
+                qs.lenient(),
+                positive,
+                qs.timeZone()
+            );
         }
         if (qb instanceof SimpleQueryStringBuilder sqs) {
             Boolean asked = LENIENT_SET.matcher(sqs.toString()).find() ? sqs.lenient() : null;
-            return queryString(sqs.value(), null, new ArrayList<>(sqs.fields().keySet()), sqs.defaultOperator(), sqs.minimumShouldMatch(), true, asked, positive);
+            return queryString(sqs.value(), null, new ArrayList<>(sqs.fields().keySet()), sqs.defaultOperator(), sqs.minimumShouldMatch(), true, asked, positive, null);
         }
         if (qb instanceof BoolQueryBuilder b) {
             return bool(b, positive);
@@ -2801,7 +2819,8 @@ final class InfinoQueryTranslator {
             if (c.fts()) {
                 indexed.add(c.name());
             } else if (exactToo) {
-                String p = exactValue(f, c, value);
+                // A phrase is read through the field's term query, in UTC, as stock reads it.
+                String p = exactValue(f, c, value, asPhrase ? null : wordZone);
                 if (p != null) {
                     exact.add(p);
                     exactColumns.add(c);
@@ -2897,7 +2916,8 @@ final class InfinoQueryTranslator {
      * cannot tell that list's clauses as stock counts them, it is refused
      * (see {@link #refuseUncountedClauses}). {@code simple} is a
      * simple_query_string, which has no default field of its own.
-     * {@code asked} is the query's {@code lenient}, null when it sets none.
+     * {@code asked} is the query's {@code lenient}, null when it sets none;
+     * {@code zone} its {@code time_zone}, null when it sets none.
      */
     private String queryString(
         String query,
@@ -2907,7 +2927,8 @@ final class InfinoQueryTranslator {
         String minimumShouldMatch,
         boolean simple,
         Boolean asked,
-        boolean positive
+        boolean positive,
+        ZoneId zone
     ) {
         String q = query == null ? "" : query.trim();
         if (q.isEmpty() || "*".equals(q) || "*:*".equals(q)) {
@@ -2915,11 +2936,15 @@ final class InfinoQueryTranslator {
         }
         List<String> named = namedFields(fields, defaultField);
         boolean was = lenient;
+        ZoneId wasZone = wordZone;
         lenient = lenient(asked, named, !simple && IndexSettings.QUERY_STRING_LENIENT_SETTING.get(indexSettings()));
+        // OpenSearch's own field-pattern matcher, named in full: this class's Regex is a query node.
+        wordZone = defaultField != null && !org.opensearch.common.regex.Regex.isSimpleMatchPattern(defaultField) ? zone : null;
         try {
             return queryString(q, named, defaultField == null && fields.isEmpty(), op, minimumShouldMatch, simple, positive);
         } finally {
             lenient = was;
+            wordZone = wasZone;
         }
     }
 
@@ -3257,17 +3282,18 @@ final class InfinoQueryTranslator {
      * field holding the whole value, an ip field the address, a number field
      * the number, a boolean field {@code true} or {@code false}, and a date
      * field the date, which covers every instant it names
-     * ({@code 2026-10-24} is the whole day), read in the field's format.
-     * A value the field's type cannot read ({@code timeout} on a number
-     * field) is null when the query is {@link #lenient}, so the field adds
-     * nothing, and otherwise refused, as stock fails the request.
+     * ({@code 2026-10-24} is the whole day), read in the field's format and
+     * in {@code zone} (UTC when null). A value the field's type cannot read
+     * ({@code timeout} on a number field) is null when the query is
+     * {@link #lenient}, so the field adds nothing, and otherwise refused, as
+     * stock fails the request.
      */
-    private String exactValue(String field, Column c, String value) {
+    private String exactValue(String field, Column c, String value, ZoneId zone) {
         Column t = c.element();
         if (readable(t, value)) {
             if (t.isTimestamp()) {
-                String from = dateLiteral(value, t.dateFormat(), false, null);
-                String to = dateLiteral(value, t.dateFormat(), true, null);
+                String from = dateLiteral(value, t.dateFormat(), false, zone);
+                String to = dateLiteral(value, t.dateFormat(), true, zone);
                 return anyValue(c, v -> "(" + v + " >= " + from + " AND " + v + " <= " + to + ")");
             }
             return equality(field, value);
