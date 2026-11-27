@@ -130,37 +130,6 @@ public class InfinoDefaultFieldSearchTests extends OpenSearchTestCase {
     }
 
     /**
-     * A wildcard or regular expression naming no field matches a keyword
-     * field's whole value, read from the column's term index where it has
-     * one: the same hits as matching every row.
-     */
-    public void testAPatternOnAKeywordFieldFindsItsValues() {
-        long now = System.currentTimeMillis();
-        for (QueryBuilder qb : List.of(QueryBuilders.queryStringQuery("dis*"), QueryBuilders.queryStringQuery("/d[a-z]+k/"), QueryBuilders.queryStringQuery("w?rn"))) {
-            List<String> hits = new ArrayList<>();
-            for (Map<String, Object> row : InfinoNative.sqlRows(InfinoSearch.hitStatement(plan(qb), MESSAGES.length + 1, false))) {
-                hits.add(row.get(InfinoQueryTranslator.OSID).toString());
-            }
-            hits.sort(Comparator.comparingInt(Integer::parseInt));
-            List<String> want = new ArrayList<>();
-            for (int i = 0; i < MESSAGES.length; i++) {
-                String level = LEVELS[i];
-                boolean keyword = qb.toString().contains("dis*") ? level.startsWith("dis") : qb.toString().contains("w?rn") ? level.matches("w.rn") : level.matches("d[a-z]+k");
-                boolean text = java.util.Arrays.stream(MESSAGES[i].split(" ")).anyMatch(w -> qb.toString().contains("w?rn") ? w.matches("w.rn") : w.startsWith("dis") || w.matches("d[a-z]+k"));
-                if (keyword || text) {
-                    want.add(Integer.toString(i));
-                }
-            }
-            assertEquals(qb.toString(), want, hits);
-            String where = InfinoQueryTranslator.translate(qb, InfinoNative.columns(TABLE), TABLE, now).where();
-            if (InfinoNative.valueCountsTop(TABLE, "level", 10) != null) {
-                // Read from the term index: the values matched, searched by equality.
-                assertFalse(where, where.contains("\"level\" LIKE") || where.contains("regexp_like(\"level\""));
-            }
-        }
-    }
-
-    /**
      * The text hits score the same whether a keyword value matches or not:
      * a write adding a matching keyword value adds its document, scored by
      * the keyword match, and leaves every text hit scored by its BM25.

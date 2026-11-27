@@ -1527,15 +1527,14 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
      * pattern: refused, or skipped when lenient.
      */
     public void testAPatternOnAKeywordFieldMatchesItsValue() {
-        assertEquals("(\"host.name\" >= 'n' AND \"host.name\" < 'o' AND \"host.name\" LIKE 'n%')", translate(QueryBuilders.queryStringQuery("n*").field("host.name")).where());
+        assertEquals("\"host.name\" LIKE 'n%'", translate(QueryBuilders.queryStringQuery("n*").field("host.name")).where());
         assertEquals(
             translate(QueryBuilders.queryStringQuery("host.name:n*")).where(),
             translate(QueryBuilders.queryStringQuery("n*").field("host.name")).where()
         );
-        assertEquals("(\"host.name\" >= 'n' AND \"host.name\" < 'o' AND regexp_like(\"host.name\", '^(?:n.*)$'))", translate(QueryBuilders.queryStringQuery("/n.*/").field("host.name")).where());
+        assertEquals("regexp_like(\"host.name\", '^(?:n.*)$')", translate(QueryBuilders.queryStringQuery("/n.*/").field("host.name")).where());
         assertEquals(
-            "((\"level\" >= 'n' AND \"level\" < 'o' AND \"level\" LIKE 'n%') OR regexp_like(\"message\", '\\bn[^\\s]*', 'i') "
-                + "OR (\"host.name\" >= 'n' AND \"host.name\" < 'o' AND \"host.name\" LIKE 'n%'))",
+            "(\"level\" LIKE 'n%' OR regexp_like(\"message\", '\\bn[^\\s]*', 'i') OR \"host.name\" LIKE 'n%')",
             translate(QueryBuilders.queryStringQuery("n*")).where()
         );
         IllegalArgumentException number = expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("5*").field("status")));
@@ -1739,11 +1738,10 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
     }
 
     /**
-     * The read that asks whether a keyword field matches is made among the
-     * rows the query may return: a filter or must clause around the query
-     * narrows it. Patterns alone are read too: where no row matches them on
-     * a keyword field, the query reads the text columns alone, which costs
-     * less than matching the pattern on every keyword column.
+     * The read that asks whether a keyword field matches is made only where
+     * it could change the answer, and among the rows the query may return:
+     * patterns alone score every match the same either way, so are not read;
+     * a filter or must clause around the query narrows the read.
      */
     public void testTheKeywordReadIsMadeWhereItMatters() {
         List<String> reads = new java.util.ArrayList<>();
@@ -1754,20 +1752,9 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         for (String patterns : List.of("/pay-[0-9]+/", "pay*", "pay* OR /n.*/")) {
             reads.clear();
             String where = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery(patterns), columns(), TABLE, NOW, none).where();
-            assertEquals(patterns, 1, reads.size());
-            assertFalse(where, where.contains("\"level\""));
+            assertEquals(patterns, 0, reads.size());
+            assertTrue(where, where.contains("\"level\""));
         }
-        // Beside a time filter the read asks only within it.
-        reads.clear();
-        InfinoQueryTranslator.translate(
-            QueryBuilders.boolQuery().must(QueryBuilders.queryStringQuery("/pay-[0-9]+/")).filter(QueryBuilders.rangeQuery("@timestamp").gte("2026-10-24T00:00:00Z")),
-            columns(),
-            TABLE,
-            NOW,
-            none
-        );
-        assertEquals(1, reads.size());
-        assertTrue(reads.get(0), reads.get(0).contains("regexp_like(\"level\"") && reads.get(0).contains("AND (\"@timestamp\" >= '2026-10-24T00:00:00Z')"));
         // Discover's shape with Lucene syntax: a query string and a time filter.
         reads.clear();
         Translation discover = InfinoQueryTranslator.translate(
@@ -1801,52 +1788,6 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals(1, reads.size());
         assertTrue(reads.get(0), reads.get(0).contains("AND \"host.name\" = 'n1'") && reads.get(0).contains("AND \"status\" = 500"));
         assertFalse(reads.get(0), reads.get(0).contains("text_match"));
-    }
-
-    /**
-     * A wildcard or regular expression on a keyword column is matched against
-     * the column's distinct values where the table knows them (its term
-     * index), as stock matches its term dictionary: the values it matches
-     * are searched by equality, and a column none matches adds nothing, so
-     * neither the query nor the keyword read matches the pattern row by row.
-     */
-    public void testAPatternOnAKeywordColumnIsMatchedAgainstItsValues() {
-        Map<String, List<String>> known = Map.of("level", List.of("info", "error"), "host.name", List.of("pay-1", "pay-22", "web-1"));
-        java.util.function.Function<String, List<String>> values = known::get;
-        List<String> reads = new java.util.ArrayList<>();
-        java.util.function.Function<String, List<Map<String, Object>>> rows = sql -> {
-            reads.add(sql);
-            return List.of(Map.of("infino_hit", 1));
-        };
-        String regex = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("/pay-[0-9]+/"), columns(), TABLE, NOW, rows, values).where();
-        assertTrue(regex, regex.contains(" OR \"host.name\" IN ('pay-1', 'pay-22'))") && !regex.contains("level"));
-        assertEquals(1, reads.size());
-        assertEquals("SELECT 1 AS infino_hit FROM \"os_logs_0\" WHERE \"host.name\" IN ('pay-1', 'pay-22') LIMIT 1", reads.get(0));
-        assertEquals(
-            "\"host.name\" = 'web-1'",
-            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("w*").field("host.name"), columns(), TABLE, NOW, rows, values).where()
-        );
-        assertEquals(
-            "\"host.name\" IN ('pay-1', 'pay-22')",
-            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("host.name:pay*"), columns(), TABLE, NOW, rows, values).where()
-        );
-        // No value matches: the keyword columns add nothing, and nothing is read.
-        reads.clear();
-        Translation none = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("/zz[0-9]+/"), columns(), TABLE, NOW, rows, values);
-        assertEquals(0, reads.size());
-        assertFalse(none.where(), none.where().contains("level") || none.where().contains("host.name"));
-        // A column whose values are not known is matched row by row, as before.
-        String unknown = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("/pay-[0-9]+/"), columns(), TABLE, NOW, rows, c -> null).where();
-        assertTrue(unknown, unknown.contains("regexp_like(\"level\", '^(?:pay-[0-9]+)$')"));
-        // Row by row, the pattern's literal start first keeps the values in its range: cheap per row, and files outside it are skipped.
-        assertTrue(unknown, unknown.contains("(\"level\" >= 'pay-' AND \"level\" < 'pay.' AND regexp_like(\"level\", '^(?:pay-[0-9]+)$'))"));
-        assertEquals("pay-", InfinoQueryTranslator.regexPrefix("pay-[0-9]+"));
-        assertEquals("ab", InfinoQueryTranslator.regexPrefix("abc?d"));
-        assertNull(InfinoQueryTranslator.regexPrefix("a*b"));
-        assertNull(InfinoQueryTranslator.regexPrefix("pay|web"));
-        assertNull(InfinoQueryTranslator.regexPrefix(".*error"));
-        assertEquals("pay", InfinoQueryTranslator.wildcardPrefix("pay*"));
-        assertNull(InfinoQueryTranslator.wildcardPrefix("*pay"));
     }
 
     public void testARunIsOneTermWhenAsked() {
@@ -1960,9 +1901,9 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         // Wildcards and regular expressions: a term of a text column, the whole value of an exact one.
         assertEquals("regexp_like(\"message\", '\\bdis[^\\s]*', 'i')", translate(QueryBuilders.queryStringQuery("message:dis*")).where());
         assertEquals("regexp_like(\"message\", '\\bdis[^\\s]*', 'i')", translate(QueryBuilders.queryStringQuery("dis*").defaultField("message")).where());
-        assertEquals("(\"host.name\" >= 'n' AND \"host.name\" < 'o' AND \"host.name\" LIKE 'n%')", translate(QueryBuilders.queryStringQuery("host.name:n*")).where());
+        assertEquals("\"host.name\" LIKE 'n%'", translate(QueryBuilders.queryStringQuery("host.name:n*")).where());
         assertEquals("regexp_like(\"message\", '\\b(?:d.sk)\\b', 'i')", translate(QueryBuilders.queryStringQuery("message:/d.sk/")).where());
-        assertEquals("(\"level\" >= 'err' AND \"level\" < 'ers' AND regexp_like(\"level\", '^(?:err.*)$'))", translate(QueryBuilders.queryStringQuery("level:/err.*/")).where());
+        assertEquals("regexp_like(\"level\", '^(?:err.*)$')", translate(QueryBuilders.queryStringQuery("level:/err.*/")).where());
         // Boosts change nothing; fuzziness and proximity are refused with the clause named; so is a bad string.
         assertEquals("token_match('os_logs_0', 'message', '+disk +cache', 'or')", translate(QueryBuilders.queryStringQuery("disk^2 AND cache").defaultField("message")).from());
         assertTrue(expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.queryStringQuery("disk~1"))).getMessage().contains("fuzziness"));

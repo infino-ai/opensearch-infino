@@ -74,16 +74,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.function.ToIntFunction;
 import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 /**
  * Translates an OpenSearch query-DSL builder tree into the SQL the Infino
@@ -261,12 +258,6 @@ final class InfinoQueryTranslator {
 
     /** What a term query on a field other than a text one scores in stock: its boost, 1 (a constant-score query). */
     private static final double VALUE_MATCH_SCORE = 1.0;
-
-    /** The most distinct values of a keyword column a pattern is matched against; past it, row by row. */
-    static final int MAX_PATTERN_VALUES = 50_000;
-
-    /** The most values a pattern may match on a keyword column and still be searched as an IN list; past it, row by row. */
-    static final int MAX_PATTERN_MATCHES = 1_000;
 
     /**
      * A query string's BM25 over several text columns, as stock scores it:
@@ -544,13 +535,6 @@ final class InfinoQueryTranslator {
      * ({@link #enclosingConstraints}).
      */
     private final List<Enclosing> enclosing = new ArrayList<>();
-    /**
-     * A keyword column's distinct values, by column name, when the table can
-     * list them cheaply (its term index, at most {@link #MAX_PATTERN_VALUES});
-     * null otherwise. A pattern on such a column is matched against them, as
-     * stock matches its term dictionary, rather than row by row.
-     */
-    private Function<String, List<String>> knownValues = c -> null;
 
     /** A bool enclosing the clause being translated, and its clause that holds it. */
     private record Enclosing(BoolQueryBuilder bool, QueryBuilder child) {}
@@ -585,33 +569,14 @@ final class InfinoQueryTranslator {
 
     /** Translate, or {@code null} when the query is not answerable over the table's columns. */
     static Translation translate(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis) {
-        return translate(qb, cols, table, nowMillis, InfinoNative::sqlRows, termIndexValues(table));
+        return translate(qb, cols, table, nowMillis, InfinoNative::sqlRows);
     }
 
-    /**
-     * {@link #translate(QueryBuilder, Map, String, long)}, reading the table's rows through {@code rows}; no keyword
-     * column's values are known, so a pattern on one is matched row by row.
-     */
+    /** {@link #translate(QueryBuilder, Map, String, long)}, reading the table's rows through {@code rows}. */
     static Translation translate(QueryBuilder qb, Map<String, Column> cols, String table, long nowMillis, Function<String, List<Map<String, Object>>> rows) {
-        return translate(qb, cols, table, nowMillis, rows, c -> null);
-    }
-
-    /**
-     * {@link #translate(QueryBuilder, Map, String, long, Function)}, a keyword column's distinct values read through
-     * {@code values} ({@link #knownValues}).
-     */
-    static Translation translate(
-        QueryBuilder qb,
-        Map<String, Column> cols,
-        String table,
-        long nowMillis,
-        Function<String, List<Map<String, Object>>> rows,
-        Function<String, List<String>> values
-    ) {
         // The query is read more than once (what scores it, how it ranks): each read of the table is made once.
         Map<String, List<Map<String, Object>>> read = new HashMap<>();
         InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, false, false, sql -> read.computeIfAbsent(sql, rows));
-        t.knownValues = values;
         t.filterTextIsPredicate = t.scoresText(qb);
         String where = t.predicate(qb, true);
         if (where == null) {
@@ -660,7 +625,6 @@ final class InfinoQueryTranslator {
     private InfinoQueryTranslator alone() {
         InfinoQueryTranslator t = new InfinoQueryTranslator(cols, table, nowMillis, trusted, columnValuesOnly, rows);
         t.enclosing.addAll(enclosing);
-        t.knownValues = knownValues;
         return t;
     }
 
@@ -3057,11 +3021,14 @@ final class InfinoQueryTranslator {
                 text.add(f);
             }
         }
+        List<Node> leaves = defaultFieldLeaves(parsed, new ArrayList<>());
+        if (leaves.stream().noneMatch(l -> l instanceof Term)) {
+            // Patterns alone: stock scores each match the same, and over the text
+            // columns alone they rank no better, so the read could change nothing.
+            return targets;
+        }
         List<String> or = new ArrayList<>();
-        // Patterns alone rank no better without the value fields, but the read still pays:
-        // where no row matches them, the query reads the text columns alone, which costs
-        // less than matching the pattern on every value column.
-        for (Node leaf : defaultFieldLeaves(parsed, new ArrayList<>())) {
+        for (Node leaf : leaves) {
             String p = node(leaf, values, false, q, op);
             if (p == null) {
                 // A clause the table cannot take on those columns is refused as the query is read.
@@ -3707,7 +3674,7 @@ final class InfinoQueryTranslator {
                 return anyOf(
                     targets,
                     c -> termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*")),
-                    c -> valuesMatching(c, wildcardPattern(w.pattern()), wildcardPrefix(w.pattern()), () -> like(c, wildcardToLike(w.pattern()))),
+                    c -> like(c, wildcardToLike(w.pattern())),
                     "the wildcard [" + w.pattern() + "]"
                 );
             }
@@ -3719,14 +3686,14 @@ final class InfinoQueryTranslator {
                 return termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*"));
             }
             // Any of the field's values, its list column's too, as a wildcard query reads them.
-            return c.element().isString() ? valuesMatching(c, wildcardPattern(w.pattern()), wildcardPrefix(w.pattern()), () -> like(c, wildcardToLike(w.pattern()))) : null;
+            return like(c, wildcardToLike(w.pattern()));
         }
         if (n instanceof Regex r) {
             if (r.field() == null) {
                 return anyOf(
                     targets,
                     c -> termPattern(c, "(?:" + r.pattern() + ")", false),
-                    c -> valuesMatching(c, regexPattern(r.pattern()), regexPrefix(r.pattern()), () -> wholeValueMatches(c, r.pattern())),
+                    c -> wholeValueMatches(c, r.pattern()),
                     "the regular expression [/" + r.pattern() + "/]"
                 );
             }
@@ -3737,9 +3704,7 @@ final class InfinoQueryTranslator {
             if (c.fts()) {
                 return termPattern(c, "(?:" + r.pattern() + ")", false);
             }
-            return c.element().isString()
-                ? valuesMatching(c, regexPattern(r.pattern()), regexPrefix(r.pattern()), () -> wholeValueMatches(c, r.pattern()))
-                : null;
+            return c.element().isString() ? wholeValueMatches(c, r.pattern()) : null;
         }
         if (n instanceof Range r) {
             if (r.field() == null) {
@@ -3832,178 +3797,12 @@ final class InfinoQueryTranslator {
             if (p == null) {
                 return null;
             }
-            if (!NONE.equals(p)) {
-                or.add(p);
-            }
+            or.add(p);
         }
         if (or.isEmpty()) {
             return NONE;
         }
         return or.size() == 1 ? or.get(0) : "(" + String.join(" OR ", or) + ")";
-    }
-
-    /**
-     * The rows of a keyword column {@code c} whose value {@code matches}, as
-     * stock reads a pattern there: against the column's distinct values
-     * ({@link #knownValues}), the ones it matches searched by equality, and
-     * none matching nothing, so the column adds no work. {@code byRow} is
-     * the predicate matching each row's value instead, for a column whose
-     * values are not known (one with too many to list), a list column, or a
-     * pattern matching more than {@link #MAX_PATTERN_MATCHES} of them. Row
-     * by row, a pattern that starts with literal text ({@code prefix}, null
-     * for none) first keeps the values in that text's range, which costs
-     * far less per row than the pattern and lets the table skip the files
-     * whose values all fall outside it.
-     */
-    private String valuesMatching(Column c, Pattern matches, String prefix, Supplier<String> byRow) {
-        if (c.isList() || listOf(cols, c) != null) {
-            return byRow.get();
-        }
-        Supplier<String> ranged = () -> {
-            String p = byRow.get();
-            String upper = prefix == null ? null : prefixUpperBound(prefix);
-            if (p == null || upper == null) {
-                return p;
-            }
-            String v = quoteIdent(c.name());
-            return "(" + v + " >= " + literal(prefix) + " AND " + v + " < " + literal(upper) + " AND " + p + ")";
-        };
-        List<String> values = matches == null ? null : knownValues.apply(c.name());
-        if (values == null) {
-            return ranged.get();
-        }
-        List<String> hit = new ArrayList<>();
-        for (String v : values) {
-            if (v != null && matches.matcher(v).matches()) {
-                hit.add(literal(v));
-                if (hit.size() > MAX_PATTERN_MATCHES) {
-                    return ranged.get();
-                }
-            }
-        }
-        if (hit.isEmpty()) {
-            return NONE;
-        }
-        return quoteIdent(c.name()) + (hit.size() == 1 ? " = " + hit.get(0) : " IN (" + String.join(", ", hit) + ")");
-    }
-
-    /**
-     * The least string greater than every string starting with
-     * {@code prefix}: its last character one higher. Null when that is not a
-     * plain ASCII step (a non-ASCII or the last printable character), so no
-     * range is drawn.
-     */
-    private static String prefixUpperBound(String prefix) {
-        char last = prefix.charAt(prefix.length() - 1);
-        if (last < ' ' || last >= '~') {
-            return null;
-        }
-        for (int i = 0; i < prefix.length(); i++) {
-            if (prefix.charAt(i) > '~') {
-                return null;
-            }
-        }
-        return prefix.substring(0, prefix.length() - 1) + (char) (last + 1);
-    }
-
-    /** The literal text a Lucene wildcard starts with, before its first {@code *} or {@code ?}; null for none. */
-    static String wildcardPrefix(String wildcard) {
-        int end = 0;
-        while (end < wildcard.length() && wildcard.charAt(end) != '*' && wildcard.charAt(end) != '?' && wildcard.charAt(end) != '\\') {
-            end++;
-        }
-        return end == 0 ? null : wildcard.substring(0, end);
-    }
-
-    /**
-     * The literal text every match of a regular expression starts with: its
-     * leading letters, digits and plain punctuation, less the last one when a
-     * quantifier follows it (which may repeat or drop it); null for none, or
-     * for an expression with an alternative ({@code |}), whose branches may
-     * start apart.
-     */
-    static String regexPrefix(String regex) {
-        if (regex.indexOf('|') >= 0) {
-            return null;
-        }
-        int end = 0;
-        while (end < regex.length() && (Character.isLetterOrDigit(regex.charAt(end)) || "-_:/ ,=;'%!".indexOf(regex.charAt(end)) >= 0)) {
-            end++;
-        }
-        if (end < regex.length() && "?*{".indexOf(regex.charAt(end)) >= 0) {
-            end--;
-        }
-        return end <= 0 ? null : regex.substring(0, end);
-    }
-
-    /** A Lucene wildcard as a whole-value Java pattern: {@code *} any run, {@code ?} one character, the rest literal. */
-    private static Pattern wildcardPattern(String wildcard) {
-        StringBuilder out = new StringBuilder();
-        for (int i = 0; i < wildcard.length(); i++) {
-            char ch = wildcard.charAt(i);
-            out.append(ch == '*' ? ".*" : ch == '?' ? "." : Pattern.quote(String.valueOf(ch)));
-        }
-        return Pattern.compile(out.toString(), Pattern.DOTALL);
-    }
-
-    /** A regular expression as a whole-value Java pattern, as the row-by-row predicate anchors it; null when Java cannot read it. */
-    private static Pattern regexPattern(String regex) {
-        try {
-            return Pattern.compile("(?:" + regex + ")");
-        } catch (PatternSyntaxException e) {
-            return null;
-        }
-    }
-
-    /**
-     * The keyword columns, as {@code table} NUL {@code column}, found to have
-     * more than {@link #MAX_PATTERN_VALUES} distinct values: counting such a
-     * column's terms costs far more than the pattern it would spare (over a
-     * second for millions of values), and a column rarely leaves that class.
-     * One that does is only matched row by row, still correctly. Cleared past
-     * {@link #MANY_VALUES_MAX} entries.
-     */
-    private static final Set<String> MANY_VALUES = ConcurrentHashMap.newKeySet();
-    /** The most columns {@link #MANY_VALUES} remembers before it starts over. */
-    private static final int MANY_VALUES_MAX = 10_000;
-
-    /**
-     * Each keyword column's distinct values in {@code table}, read once per
-     * query from its term index ({@link InfinoNative#valueCountsTop}): null
-     * for a column without one, or with more than {@link #MAX_PATTERN_VALUES}
-     * (remembered in {@link #MANY_VALUES}, so not counted again).
-     */
-    private static Function<String, List<String>> termIndexValues(String table) {
-        Map<String, Optional<List<String>>> read = new HashMap<>();
-        return column -> read.computeIfAbsent(column, name -> {
-            String key = table + "\u0000" + name;
-            if (MANY_VALUES.contains(key)) {
-                return Optional.empty();
-            }
-            Map<String, Object> top;
-            try {
-                top = InfinoNative.valueCountsTop(table, name, MAX_PATTERN_VALUES);
-            } catch (RuntimeException e) {
-                return Optional.empty();
-            }
-            if (top != null && top.get("groups") instanceof Number groups && groups.longValue() > MAX_PATTERN_VALUES) {
-                if (MANY_VALUES.size() >= MANY_VALUES_MAX) {
-                    MANY_VALUES.clear();
-                }
-                MANY_VALUES.add(key);
-                return Optional.empty();
-            }
-            if (top == null || !(top.get("rows") instanceof List<?> rows)) {
-                return Optional.empty();
-            }
-            List<String> values = new ArrayList<>();
-            for (Object row : rows) {
-                if (row instanceof Map<?, ?> m && m.get(name) != null) {
-                    values.add(m.get(name).toString());
-                }
-            }
-            return Optional.of(values);
-        }).orElse(null);
     }
 
     /**
