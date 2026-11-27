@@ -245,6 +245,8 @@ final class InfinoQueryTranslator {
      * BM25 with a value match as a bonus ({@link #valueRanking}), combined
      * by the query's tie_breaker: {@code best} (0) takes the greater,
      * otherwise (1) the sum, each value field that matches adding its own.
+     * TODO(engine): one multi-column search with per-column scoring, see
+     * {@link #liveTargets}.
      */
     record ValueRanking(TextClause text, List<String> values, List<Column> columns, String match, boolean best) {
         /** What a hit adds where {@link #values} match it: 1 where any does under {@code best}, else 1 for each. */
@@ -3037,6 +3039,13 @@ final class InfinoQueryTranslator {
      * refused here as it is where the query is read, unless the query is
      * lenient. One read of the table asks for any row the clauses match
      * there (a value, a pattern); the table as a search reads it.
+     *
+     * <p>TODO(engine): one multi-column search with per-column scoring
+     * (BM25 on text columns, a constant on keyword, number and date
+     * columns, combined by dis_max and tie_breaker) would replace this read
+     * and {@link ValueRanking}. The read and the search are two reads of the
+     * table, so a row written between them that matches only on a keyword
+     * field can be left out of the hits.
      */
     private List<String> liveTargets(Node parsed, List<String> targets, String q, Operator op) {
         List<String> values = new ArrayList<>();
