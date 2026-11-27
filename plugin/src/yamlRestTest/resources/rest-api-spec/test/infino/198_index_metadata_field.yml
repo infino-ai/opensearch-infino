@@ -805,3 +805,108 @@
   - do:
       catch: /\[infino\] aggregation \[t\] has a script beside \[_index\]/
       search: { index: ixf_refused_def, body: { size: 0, aggregations: { t: { terms: { field: _index, script: { source: "_value" } } } } } }
+
+---
+"_index among a text query's fields, Lucene twin":
+  - do:
+      indices.create:
+        index: ixfl_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { msg: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixfl_luc
+        body:
+          - index: { _id: "1" }
+          - { msg: slow request }
+          - index: { _id: "2" }
+          - { msg: slow disk }
+          - index: { _id: "3" }
+          - { msg: fast request }
+  - do:
+      count: { index: ixfl_luc, body: { query: { multi_match: { query: slow, fields: [ msg, _index ] } } } }
+  - match: { count: 2 }
+  - do:
+      count: { index: ixfl_luc, body: { query: { multi_match: { query: ixfl_luc, fields: [ msg, _index ] } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfl_luc, body: { query: { simple_query_string: { query: slow, fields: [ _index, msg ] } } } }
+  - match: { count: 2 }
+  - do:
+      count: { index: ixfl_luc, body: { query: { query_string: { query: ixfl_luc, default_field: _index } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfl_luc, body: { query: { query_string: { query: other_index, default_field: _index } } } }
+  - match: { count: 0 }
+
+---
+"_index among a text query's fields, default mode":
+  - do:
+      indices.create:
+        index: ixfl_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { msg: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixfl_def
+        body:
+          - index: { _id: "1" }
+          - { msg: slow request }
+          - index: { _id: "2" }
+          - { msg: slow disk }
+          - index: { _id: "3" }
+          - { msg: fast request }
+  - do:
+      count: { index: ixfl_def, body: { query: { multi_match: { query: slow, fields: [ msg, _index ] } } } }
+  - match: { count: 2 }
+  - do:
+      count: { index: ixfl_def, body: { query: { multi_match: { query: ixfl_def, fields: [ msg, _index ] } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfl_def, body: { query: { simple_query_string: { query: slow, fields: [ _index, msg ] } } } }
+  - match: { count: 2 }
+  - do:
+      count: { index: ixfl_def, body: { query: { query_string: { query: ixfl_def, default_field: _index } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfl_def, body: { query: { query_string: { query: other_index, default_field: _index } } } }
+  - match: { count: 0 }
+
+---
+"_index among a text query's fields, proxy mode":
+  - do:
+      indices.create:
+        index: ixfl_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { msg: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixfl_prx
+        body:
+          - index: { _id: "1" }
+          - { msg: slow request }
+          - index: { _id: "2" }
+          - { msg: slow disk }
+          - index: { _id: "3" }
+          - { msg: fast request }
+  - do:
+      count: { index: ixfl_prx, body: { query: { multi_match: { query: slow, fields: [ msg, _index ] } } } }
+  - match: { count: 2 }
+  - do:
+      count: { index: ixfl_prx, body: { query: { multi_match: { query: ixfl_prx, fields: [ msg, _index ] } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfl_prx, body: { query: { simple_query_string: { query: slow, fields: [ _index, msg ] } } } }
+  - match: { count: 2 }
+  - do:
+      count: { index: ixfl_prx, body: { query: { query_string: { query: ixfl_prx, default_field: _index } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfl_prx, body: { query: { query_string: { query: other_index, default_field: _index } } } }
+  - match: { count: 0 }

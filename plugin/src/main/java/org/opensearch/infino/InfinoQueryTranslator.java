@@ -2623,6 +2623,13 @@ final class InfinoQueryTranslator {
         List<String> indexed = new ArrayList<>();
         List<String> exact = new ArrayList<>();
         for (String f : fields) {
+            if (InfinoIndexField.NAME.equals(f)) {
+                // As stock reads _index among a query's fields: one keyword value, the index's name.
+                if (exactToo && !composed) {
+                    exact.add(indexMatches(value, false));
+                }
+                continue;
+            }
             Column c = column(f);
             if (c == null) {
                 continue;
@@ -2897,7 +2904,7 @@ final class InfinoQueryTranslator {
             return false;
         }
         for (String f : fields) {
-            Column c = column(f);
+            Column c = InfinoIndexField.NAME.equals(f) ? null : column(f);
             if (c == null || !c.fts()) {
                 return false;
             }
@@ -2909,6 +2916,9 @@ final class InfinoQueryTranslator {
     private boolean textTerm(Term t, List<String> targets) {
         if (t.field() == null) {
             return textTargets(targets);
+        }
+        if (InfinoIndexField.NAME.equals(t.field())) {
+            return false;
         }
         Column c = column(t.field());
         return c != null && c.fts();
@@ -2924,6 +2934,9 @@ final class InfinoQueryTranslator {
             return true;
         }
         for (String f : targets) {
+            if (InfinoIndexField.NAME.equals(f)) {
+                continue; // one keyword value, never text
+            }
             Column c = column(f);
             if (c == null || c.fts()) {
                 return true;
