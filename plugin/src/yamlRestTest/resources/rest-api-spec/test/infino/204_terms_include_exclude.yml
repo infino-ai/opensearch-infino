@@ -1,0 +1,434 @@
+# A terms aggregation's include and exclude, on a stock index, in proxy mode
+# and in default mode, each answered with stock's buckets, counts and
+# sum_other_doc_count. Exact values (an array) are the key in or not in the
+# set, read as the field reads them: a keyword's text, an ip's address however
+# it is written, a number's value, a boolean's truth. A string is a Lucene
+# regular expression over the whole value, as Dashboards' filter bar sends for
+# its value suggestions. A key left out takes no bucket and is no part of
+# sum_other_doc_count. The forms the table cannot read exactly are refused.
+
+---
+"Terms include and exclude keep stock's buckets in both modes":
+  - do:
+      indices.create:
+        index: tie_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              service: { type: keyword }
+              tags: { type: keyword }
+              region: { type: keyword }
+              addr: { type: ip }
+              n: { type: long }
+              d: { type: double }
+              b: { type: boolean }
+  - do:
+      indices.create:
+        index: tie_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              service: { type: keyword }
+              tags: { type: keyword }
+              region: { type: keyword }
+              addr: { type: ip }
+              n: { type: long }
+              d: { type: double }
+              b: { type: boolean }
+  - do:
+      indices.create:
+        index: tie_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              service: { type: keyword }
+              tags: { type: keyword }
+              region: { type: keyword }
+              addr: { type: ip }
+              n: { type: long }
+              d: { type: double }
+              b: { type: boolean }
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: tie_luc, _id: "1" }
+          - { service: api, tags: [ x, y ], region: eu, addr: "0.0.0.0", n: 1, d: 1.5, b: true }
+          - index: { _index: tie_luc, _id: "2" }
+          - { service: apigw, tags: [ x ], region: eu, addr: "::ffff:0.0.0.0", n: 2, d: 2.5, b: false }
+          - index: { _index: tie_luc, _id: "3" }
+          - { service: auth, tags: [ y, z ], region: us, addr: "10.0.0.1", n: 3, d: 1.5, b: true }
+          - index: { _index: tie_luc, _id: "4" }
+          - { service: a, tags: [ a ], region: us, addr: "10.0.0.1", n: 1, d: 3.5, b: true }
+          - index: { _index: tie_luc, _id: "5" }
+          - { service: api, tags: [ z ], region: us, addr: "::1", n: 2, d: 2.5, b: false }
+          - index: { _index: tie_luc, _id: "6" }
+          - { service: web, region: eu, addr: "10.0.0.1", n: 3 }
+          - index: { _index: tie_px, _id: "1" }
+          - { service: api, tags: [ x, y ], region: eu, addr: "0.0.0.0", n: 1, d: 1.5, b: true }
+          - index: { _index: tie_px, _id: "2" }
+          - { service: apigw, tags: [ x ], region: eu, addr: "::ffff:0.0.0.0", n: 2, d: 2.5, b: false }
+          - index: { _index: tie_px, _id: "3" }
+          - { service: auth, tags: [ y, z ], region: us, addr: "10.0.0.1", n: 3, d: 1.5, b: true }
+          - index: { _index: tie_px, _id: "4" }
+          - { service: a, tags: [ a ], region: us, addr: "10.0.0.1", n: 1, d: 3.5, b: true }
+          - index: { _index: tie_px, _id: "5" }
+          - { service: api, tags: [ z ], region: us, addr: "::1", n: 2, d: 2.5, b: false }
+          - index: { _index: tie_px, _id: "6" }
+          - { service: web, region: eu, addr: "10.0.0.1", n: 3 }
+          - index: { _index: tie_def, _id: "1" }
+          - { service: api, tags: [ x, y ], region: eu, addr: "0.0.0.0", n: 1, d: 1.5, b: true }
+          - index: { _index: tie_def, _id: "2" }
+          - { service: apigw, tags: [ x ], region: eu, addr: "::ffff:0.0.0.0", n: 2, d: 2.5, b: false }
+          - index: { _index: tie_def, _id: "3" }
+          - { service: auth, tags: [ y, z ], region: us, addr: "10.0.0.1", n: 3, d: 1.5, b: true }
+          - index: { _index: tie_def, _id: "4" }
+          - { service: a, tags: [ a ], region: us, addr: "10.0.0.1", n: 1, d: 3.5, b: true }
+          - index: { _index: tie_def, _id: "5" }
+          - { service: api, tags: [ z ], region: us, addr: "::1", n: 2, d: 2.5, b: false }
+          - index: { _index: tie_def, _id: "6" }
+          - { service: web, region: eu, addr: "10.0.0.1", n: 3 }
+
+  # Dashboards' value suggestions for a filter on service, typing ap: a regular expression.
+  - do:
+      search:
+        index: tie_luc
+        body: { size: 0, timeout: "1000ms", terminate_after: 100000, query: { bool: { filter: [] } }, aggs: { suggestions: { terms: { field: service, include: "ap.*", execution_hint: map, shard_size: 10 } } } }
+  - length: { aggregations.suggestions.buckets: 2 }
+  - match: { aggregations.suggestions.buckets.0.key: api }
+  - match: { aggregations.suggestions.buckets.0.doc_count: 2 }
+  - match: { aggregations.suggestions.buckets.1.key: apigw }
+  - match: { aggregations.suggestions.buckets.1.doc_count: 1 }
+  - match: { aggregations.suggestions.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie_px
+        body: { size: 0, timeout: "1000ms", terminate_after: 100000, query: { bool: { filter: [] } }, aggs: { suggestions: { terms: { field: service, include: "ap.*", execution_hint: map, shard_size: 10 } } } }
+  - length: { aggregations.suggestions.buckets: 2 }
+  - match: { aggregations.suggestions.buckets.0.key: api }
+  - match: { aggregations.suggestions.buckets.0.doc_count: 2 }
+  - match: { aggregations.suggestions.buckets.1.key: apigw }
+  - match: { aggregations.suggestions.buckets.1.doc_count: 1 }
+  - match: { aggregations.suggestions.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie_def
+        body: { size: 0, timeout: "1000ms", terminate_after: 100000, query: { bool: { filter: [] } }, aggs: { suggestions: { terms: { field: service, include: "ap.*", execution_hint: map, shard_size: 10 } } } }
+  - length: { aggregations.suggestions.buckets: 2 }
+  - match: { aggregations.suggestions.buckets.0.key: api }
+  - match: { aggregations.suggestions.buckets.0.doc_count: 2 }
+  - match: { aggregations.suggestions.buckets.1.key: apigw }
+  - match: { aggregations.suggestions.buckets.1.doc_count: 1 }
+  - match: { aggregations.suggestions.sum_other_doc_count: 0 }
+
+  # With an empty search box Dashboards sends .*: every key, cut to size, the rest counted as other.
+  - do:
+      search:
+        index: tie_luc
+        body: { size: 0, aggs: { s: { terms: { field: service, include: ".*", size: 2 } } } }
+  - length: { aggregations.s.buckets: 2 }
+  - match: { aggregations.s.buckets.0.key: api }
+  - match: { aggregations.s.buckets.1.key: a }
+  - match: { aggregations.s.sum_other_doc_count: 3 }
+  - do:
+      search:
+        index: tie_px
+        body: { size: 0, aggs: { s: { terms: { field: service, include: ".*", size: 2 } } } }
+  - length: { aggregations.s.buckets: 2 }
+  - match: { aggregations.s.buckets.0.key: api }
+  - match: { aggregations.s.buckets.1.key: a }
+  - match: { aggregations.s.sum_other_doc_count: 3 }
+  - do:
+      search:
+        index: tie_def
+        body: { size: 0, aggs: { s: { terms: { field: service, include: ".*", size: 2 } } } }
+  - length: { aggregations.s.buckets: 2 }
+  - match: { aggregations.s.buckets.0.key: api }
+  - match: { aggregations.s.buckets.1.key: a }
+  - match: { aggregations.s.sum_other_doc_count: 3 }
+
+  # An exact keyword left out is no part of sum_other_doc_count.
+  - do:
+      search:
+        index: tie_luc
+        body: { size: 0, aggs: { s: { terms: { field: service, exclude: [ a ], size: 2 } } } }
+  - length: { aggregations.s.buckets: 2 }
+  - match: { aggregations.s.buckets.0.key: api }
+  - match: { aggregations.s.buckets.0.doc_count: 2 }
+  - match: { aggregations.s.buckets.1.key: apigw }
+  - match: { aggregations.s.sum_other_doc_count: 2 }
+  - do:
+      search:
+        index: tie_px
+        body: { size: 0, aggs: { s: { terms: { field: service, exclude: [ a ], size: 2 } } } }
+  - length: { aggregations.s.buckets: 2 }
+  - match: { aggregations.s.buckets.0.key: api }
+  - match: { aggregations.s.buckets.0.doc_count: 2 }
+  - match: { aggregations.s.buckets.1.key: apigw }
+  - match: { aggregations.s.sum_other_doc_count: 2 }
+  - do:
+      search:
+        index: tie_def
+        body: { size: 0, aggs: { s: { terms: { field: service, exclude: [ a ], size: 2 } } } }
+  - length: { aggregations.s.buckets: 2 }
+  - match: { aggregations.s.buckets.0.key: api }
+  - match: { aggregations.s.buckets.0.doc_count: 2 }
+  - match: { aggregations.s.buckets.1.key: apigw }
+  - match: { aggregations.s.sum_other_doc_count: 2 }
+
+  # A regular expression include and exclude together.
+  - do:
+      search:
+        index: tie_luc
+        body: { size: 0, aggs: { s: { terms: { field: service, include: "a.*", exclude: "api|w.*" } } } }
+  - length: { aggregations.s.buckets: 3 }
+  - match: { aggregations.s.buckets.0.key: a }
+  - match: { aggregations.s.buckets.1.key: apigw }
+  - match: { aggregations.s.buckets.2.key: auth }
+  - match: { aggregations.s.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie_px
+        body: { size: 0, aggs: { s: { terms: { field: service, include: "a.*", exclude: "api|w.*" } } } }
+  - length: { aggregations.s.buckets: 3 }
+  - match: { aggregations.s.buckets.0.key: a }
+  - match: { aggregations.s.buckets.1.key: apigw }
+  - match: { aggregations.s.buckets.2.key: auth }
+  - match: { aggregations.s.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie_def
+        body: { size: 0, aggs: { s: { terms: { field: service, include: "a.*", exclude: "api|w.*" } } } }
+  - length: { aggregations.s.buckets: 3 }
+  - match: { aggregations.s.buckets.0.key: a }
+  - match: { aggregations.s.buckets.1.key: apigw }
+  - match: { aggregations.s.buckets.2.key: auth }
+  - match: { aggregations.s.sum_other_doc_count: 0 }
+
+  # A field documents give several values: each value is kept or left out on its own.
+  - do:
+      search:
+        index: tie_luc
+        body: { size: 0, aggs: { t: { terms: { field: tags, include: [ x, z ], size: 1 } } } }
+  - length: { aggregations.t.buckets: 1 }
+  - match: { aggregations.t.buckets.0.key: x }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.sum_other_doc_count: 2 }
+  - do:
+      search:
+        index: tie_px
+        body: { size: 0, aggs: { t: { terms: { field: tags, include: [ x, z ], size: 1 } } } }
+  - length: { aggregations.t.buckets: 1 }
+  - match: { aggregations.t.buckets.0.key: x }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.sum_other_doc_count: 2 }
+  - do:
+      search:
+        index: tie_def
+        body: { size: 0, aggs: { t: { terms: { field: tags, include: [ x, z ], size: 1 } } } }
+  - length: { aggregations.t.buckets: 1 }
+  - match: { aggregations.t.buckets.0.key: x }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.sum_other_doc_count: 2 }
+
+  # An ip address left out in any of its writings: 0.0.0.0 is also ::ffff:0.0.0.0.
+  - do:
+      search:
+        index: tie_luc
+        body: { size: 0, aggs: { a: { terms: { field: addr, exclude: [ "0.0.0.0" ], size: 1 } } } }
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "10.0.0.1" }
+  - match: { aggregations.a.buckets.0.doc_count: 3 }
+  - match: { aggregations.a.sum_other_doc_count: 1 }
+  - do:
+      search:
+        index: tie_px
+        body: { size: 0, aggs: { a: { terms: { field: addr, exclude: [ "0.0.0.0" ], size: 1 } } } }
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "10.0.0.1" }
+  - match: { aggregations.a.buckets.0.doc_count: 3 }
+  - match: { aggregations.a.sum_other_doc_count: 1 }
+  - do:
+      search:
+        index: tie_def
+        body: { size: 0, aggs: { a: { terms: { field: addr, exclude: [ "0.0.0.0" ], size: 1 } } } }
+  - length: { aggregations.a.buckets: 1 }
+  - match: { aggregations.a.buckets.0.key: "10.0.0.1" }
+  - match: { aggregations.a.buckets.0.doc_count: 3 }
+  - match: { aggregations.a.sum_other_doc_count: 1 }
+
+  # A long's values, read as numbers: 2.5 is 2.
+  - do:
+      search:
+        index: tie_luc
+        body: { size: 0, aggs: { n: { terms: { field: n, include: [ 1, 3, 2.5 ], exclude: [ "2.5" ] } } } }
+  - length: { aggregations.n.buckets: 2 }
+  - match: { aggregations.n.buckets.0.key: 1 }
+  - match: { aggregations.n.buckets.0.doc_count: 2 }
+  - match: { aggregations.n.buckets.1.key: 3 }
+  - match: { aggregations.n.buckets.1.doc_count: 2 }
+  - match: { aggregations.n.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie_px
+        body: { size: 0, aggs: { n: { terms: { field: n, include: [ 1, 3, 2.5 ], exclude: [ "2.5" ] } } } }
+  - length: { aggregations.n.buckets: 2 }
+  - match: { aggregations.n.buckets.0.key: 1 }
+  - match: { aggregations.n.buckets.0.doc_count: 2 }
+  - match: { aggregations.n.buckets.1.key: 3 }
+  - match: { aggregations.n.buckets.1.doc_count: 2 }
+  - match: { aggregations.n.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie_def
+        body: { size: 0, aggs: { n: { terms: { field: n, include: [ 1, 3, 2.5 ], exclude: [ "2.5" ] } } } }
+  - length: { aggregations.n.buckets: 2 }
+  - match: { aggregations.n.buckets.0.key: 1 }
+  - match: { aggregations.n.buckets.0.doc_count: 2 }
+  - match: { aggregations.n.buckets.1.key: 3 }
+  - match: { aggregations.n.buckets.1.doc_count: 2 }
+  - match: { aggregations.n.sum_other_doc_count: 0 }
+
+  # A double's values.
+  - do:
+      search:
+        index: tie_luc
+        body: { size: 0, aggs: { d: { terms: { field: d, exclude: [ 1.5 ] } } } }
+  - length: { aggregations.d.buckets: 2 }
+  - match: { aggregations.d.buckets.0.key: 2.5 }
+  - match: { aggregations.d.buckets.0.doc_count: 2 }
+  - match: { aggregations.d.buckets.1.key: 3.5 }
+  - match: { aggregations.d.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie_px
+        body: { size: 0, aggs: { d: { terms: { field: d, exclude: [ 1.5 ] } } } }
+  - length: { aggregations.d.buckets: 2 }
+  - match: { aggregations.d.buckets.0.key: 2.5 }
+  - match: { aggregations.d.buckets.0.doc_count: 2 }
+  - match: { aggregations.d.buckets.1.key: 3.5 }
+  - match: { aggregations.d.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie_def
+        body: { size: 0, aggs: { d: { terms: { field: d, exclude: [ 1.5 ] } } } }
+  - length: { aggregations.d.buckets: 2 }
+  - match: { aggregations.d.buckets.0.key: 2.5 }
+  - match: { aggregations.d.buckets.0.doc_count: 2 }
+  - match: { aggregations.d.buckets.1.key: 3.5 }
+  - match: { aggregations.d.sum_other_doc_count: 0 }
+
+  # A boolean's values.
+  - do:
+      search:
+        index: tie_luc
+        body: { size: 0, aggs: { b: { terms: { field: b, include: [ "true" ] } } } }
+  - length: { aggregations.b.buckets: 1 }
+  - match: { aggregations.b.buckets.0.key: 1 }
+  - match: { aggregations.b.buckets.0.key_as_string: "true" }
+  - match: { aggregations.b.buckets.0.doc_count: 3 }
+  - do:
+      search:
+        index: tie_px
+        body: { size: 0, aggs: { b: { terms: { field: b, include: [ "true" ] } } } }
+  - length: { aggregations.b.buckets: 1 }
+  - match: { aggregations.b.buckets.0.key: 1 }
+  - match: { aggregations.b.buckets.0.key_as_string: "true" }
+  - match: { aggregations.b.buckets.0.doc_count: 3 }
+  - do:
+      search:
+        index: tie_def
+        body: { size: 0, aggs: { b: { terms: { field: b, include: [ "true" ] } } } }
+  - length: { aggregations.b.buckets: 1 }
+  - match: { aggregations.b.buckets.0.key: 1 }
+  - match: { aggregations.b.buckets.0.key_as_string: "true" }
+  - match: { aggregations.b.buckets.0.doc_count: 3 }
+
+  # Under a parent bucket.
+  - do:
+      search:
+        index: tie_luc
+        body: { size: 0, aggs: { r: { terms: { field: region }, aggs: { s: { terms: { field: service, include: "ap.*" } } } } } }
+  - length: { aggregations.r.buckets: 2 }
+  - match: { aggregations.r.buckets.0.key: eu }
+  - length: { aggregations.r.buckets.0.s.buckets: 2 }
+  - match: { aggregations.r.buckets.0.s.buckets.0.key: api }
+  - match: { aggregations.r.buckets.0.s.buckets.1.key: apigw }
+  - match: { aggregations.r.buckets.0.s.sum_other_doc_count: 0 }
+  - match: { aggregations.r.buckets.1.key: us }
+  - length: { aggregations.r.buckets.1.s.buckets: 1 }
+  - match: { aggregations.r.buckets.1.s.buckets.0.key: api }
+  - match: { aggregations.r.buckets.1.s.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie_px
+        body: { size: 0, aggs: { r: { terms: { field: region }, aggs: { s: { terms: { field: service, include: "ap.*" } } } } } }
+  - length: { aggregations.r.buckets: 2 }
+  - match: { aggregations.r.buckets.0.key: eu }
+  - length: { aggregations.r.buckets.0.s.buckets: 2 }
+  - match: { aggregations.r.buckets.0.s.buckets.0.key: api }
+  - match: { aggregations.r.buckets.0.s.buckets.1.key: apigw }
+  - match: { aggregations.r.buckets.0.s.sum_other_doc_count: 0 }
+  - match: { aggregations.r.buckets.1.key: us }
+  - length: { aggregations.r.buckets.1.s.buckets: 1 }
+  - match: { aggregations.r.buckets.1.s.buckets.0.key: api }
+  - match: { aggregations.r.buckets.1.s.sum_other_doc_count: 0 }
+  - do:
+      search:
+        index: tie_def
+        body: { size: 0, aggs: { r: { terms: { field: region }, aggs: { s: { terms: { field: service, include: "ap.*" } } } } } }
+  - length: { aggregations.r.buckets: 2 }
+  - match: { aggregations.r.buckets.0.key: eu }
+  - length: { aggregations.r.buckets.0.s.buckets: 2 }
+  - match: { aggregations.r.buckets.0.s.buckets.0.key: api }
+  - match: { aggregations.r.buckets.0.s.buckets.1.key: apigw }
+  - match: { aggregations.r.buckets.0.s.sum_other_doc_count: 0 }
+  - match: { aggregations.r.buckets.1.key: us }
+  - length: { aggregations.r.buckets.1.s.buckets: 1 }
+  - match: { aggregations.r.buckets.1.s.buckets.0.key: api }
+  - match: { aggregations.r.buckets.1.s.sum_other_doc_count: 0 }
+
+  # A regular expression on an ip field is refused, as stock refuses it.
+  - do:
+      catch: request
+      search:
+        index: tie_luc
+        body: { size: 0, aggs: { a: { terms: { field: addr, exclude: "127.*" } } } }
+  - do:
+      catch: request
+      search:
+        index: tie_px
+        body: { size: 0, aggs: { a: { terms: { field: addr, exclude: "127.*" } } } }
+  - do:
+      catch: request
+      search:
+        index: tie_def
+        body: { size: 0, aggs: { a: { terms: { field: addr, exclude: "127.*" } } } }
+
+  # What the table cannot read exactly is refused by name, never approximated.
+  - do:
+      catch: /partition/
+      search:
+        index: tie_px
+        body: { size: 0, aggs: { s: { terms: { field: service, include: { partition: 0, num_partitions: 2 } } } } }
+  - do:
+      catch: /intersection/
+      search:
+        index: tie_px
+        body: { size: 0, aggs: { s: { terms: { field: service, include: "a.*&.*i" } } } }
+  - do:
+      catch: /partition/
+      search:
+        index: tie_def
+        body: { size: 0, aggs: { s: { terms: { field: service, include: { partition: 0, num_partitions: 2 } } } } }
+  - do:
+      catch: /intersection/
+      search:
+        index: tie_def
+        body: { size: 0, aggs: { s: { terms: { field: service, include: "a.*&.*i" } } } }
+  - do:
+      indices.delete:
+        index: tie_luc,tie_px,tie_def

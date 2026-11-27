@@ -1774,10 +1774,6 @@ public class InfinoAggregationProcessor {
             long now
         ) {
             Source c = sourceOf(t, cols, table, now);
-            if (t.includeExclude() != null) {
-                // Read as Lucene reads them (its regular expressions, its partitions), which the table does not.
-                throw new Unsupported("aggregation [" + t.getName() + "] has include/exclude, which is not served");
-            }
             if (t.size() > MAX_TERMS_SIZE) {
                 throw new Unsupported("aggregation [" + t.getName() + "] asks for " + t.size() + " buckets; at most " + MAX_TERMS_SIZE + " are served");
             }
@@ -1785,12 +1781,47 @@ public class InfinoAggregationProcessor {
             if (c.masked() && kind != KeyKind.STR && kind != KeyKind.BOOL) {
                 throw masked(t, c); // a numeric or date key would be the value itself
             }
+            String keyExpr = c.expr();
+            if (t.includeExclude() != null) {
+                // A key the include/exclude drops is no key: the level sees no
+                // value there, so it takes no bucket and counts as other to no
+                // one, as stock never collects the term.
+                if (c.masked()) {
+                    throw new Unsupported("aggregation [" + t.getName() + "] has include/exclude over " + c.label() + ", a field masked for this user, which is not served");
+                }
+                if (t.format() != null) {
+                    throw new Unsupported("aggregation [" + t.getName() + "] has include/exclude with a format, which is not served");
+                }
+                UnaryOperator<String> keep = InfinoIncludeExclude.keyTest(t.getName(), bodyOf(t, TermsAggregationBuilder.NAME), keyType(t, cols, kind));
+                if (c.multi()) {
+                    // The key is read per value, under the field's own name (groupStatement).
+                    keyExpr = "CASE WHEN " + keep.apply(c.expr()) + " THEN " + c.expr() + " END";
+                } else {
+                    c = c.where(keep.apply(c.expr()));
+                    keyExpr = c.expr();
+                }
+            }
             String order = orderClause(t.order(), leaves.metrics());
             if (order == null) {
                 throw new Unsupported("aggregation [" + t.getName() + "] has an order the table cannot sort by: " + t.order());
             }
             long minDocCount = shardOfMany ? Math.min(t.shardMinDocCount(), t.minDocCount()) : t.minDocCount();
-            return new Grouped(t, leaves, child, c, c.expr(), kind, true, shardSize(t), minDocCount, order, null, null);
+            return new Grouped(t, leaves, child, c, keyExpr, kind, true, shardSize(t), minDocCount, order, null, null);
+        }
+
+        /** How a terms level's include/exclude values are read against its key of {@code kind}: an ip field's as addresses. */
+        private static InfinoIncludeExclude.KeyType keyType(TermsAggregationBuilder t, Map<String, Column> cols, KeyKind kind) {
+            return switch (kind) {
+                case STR -> {
+                    Column col = t.field() == null || t.script() != null ? null : InfinoSearch.columnFor(cols, t.field());
+                    InfinoNative.FieldType type = col == null ? null : col.element().fieldType();
+                    yield type != null && type.isIp() ? InfinoIncludeExclude.KeyType.IP : InfinoIncludeExclude.KeyType.KEYWORD;
+                }
+                case BOOL -> InfinoIncludeExclude.KeyType.BOOLEAN;
+                case LONG -> InfinoIncludeExclude.KeyType.LONG;
+                case DOUBLE -> InfinoIncludeExclude.KeyType.DOUBLE;
+                case DATE -> InfinoIncludeExclude.KeyType.DATE;
+            };
         }
 
         /**
