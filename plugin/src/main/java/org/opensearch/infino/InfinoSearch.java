@@ -437,12 +437,7 @@ public final class InfinoSearch {
          * else its least.
          */
         static SortSpec ofValues(Column c, Column values, boolean greatest, boolean desc) {
-            String pick = (greatest ? "array_max(" : "array_min(") + InfinoQueryTranslator.quoteIdent(values.name()) + ")";
-            String expr = c.isList()
-                ? pick
-                : "CASE WHEN " + InfinoQueryTranslator.quoteIdent(values.name()) + " IS NULL THEN " + InfinoQueryTranslator.quoteIdent(c.name())
-                    + " ELSE " + pick + " END";
-            return new SortSpec(expr, c.name(), InfinoScriptTranslator.typeOf(c.element()), desc);
+            return new SortSpec(InfinoQueryTranslator.oneValue(c, values, greatest), c.name(), InfinoScriptTranslator.typeOf(c.element()), desc);
         }
 
         /**

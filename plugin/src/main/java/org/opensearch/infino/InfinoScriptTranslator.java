@@ -16,6 +16,7 @@ import java.util.Map;
 
 import static org.opensearch.infino.InfinoQueryTranslator.listOf;
 import static org.opensearch.infino.InfinoQueryTranslator.literal;
+import static org.opensearch.infino.InfinoQueryTranslator.oneValue;
 import static org.opensearch.infino.InfinoQueryTranslator.quoteIdent;
 
 /**
@@ -862,15 +863,20 @@ final class InfinoScriptTranslator {
     /** {@code doc['f']} itself, or one of its properties when {@code property} is given. */
     private Sql docField(String field, String property) {
         Column c = column(field);
+        // A document that gave the field several values holds them in its list
+        // column, its own column null.
+        Column list = c == null ? null : c.isList() ? c : listOf(cols, c);
         if (property == null || property.equals("value") || property.equals("getValue")) {
-            return c == null ? new Sql("NULL", SqlType.UNKNOWN) : Sql.of(c);
+            if (c == null) {
+                return new Sql("NULL", SqlType.UNKNOWN);
+            }
+            // As stock's: the first of the document's values in doc-values order, its least.
+            return list == null ? Sql.of(c) : new Sql(oneValue(c, list, false), typeOf(c.element()));
         }
         String col = c == null ? "NULL" : quoteIdent(c.name());
-        // A document that gave the field several values holds them in its list
-        // column, its own column null: they count, as stock counts each value.
-        // The count is cast to a signed integer, as the other arms are: a
-        // list's cardinality is unsigned, which a script field would answer as text.
-        Column list = c == null ? null : c.isList() ? c : listOf(cols, c);
+        // Every value counts, as stock counts each. The count is cast to a
+        // signed integer, as the other arms are: a list's cardinality is
+        // unsigned, which a script field would answer as text.
         String own = c == null || c.isList() ? "NULL" : col;
         String values = list == null ? null : quoteIdent(list.name());
         String size = values == null

@@ -8,7 +8,8 @@
 #
 # Such a document's own column is null, its values in its list column, so
 # every reader takes them from there: a query_string "has a value", wildcard
-# and regexp atom, and a script's doc['f'].size() and .empty, as stock does.
+# and regexp atom, and a script's doc['f'].size(), .empty and .value, as
+# stock does.
 
 ---
 "A keyword array of values that each fit one term is stored and found by each value":
@@ -289,3 +290,78 @@
   - match: { hits.hits.0.fields.sz.0: 2 }
   - match: { hits.hits.1.fields.sz.0: 1 }
   - match: { hits.hits.2.fields.sz.0: 0 }
+
+---
+"A script's doc['f'].value on an array is its least value, as stock's":
+  # Stock's doc values keep a document's values sorted, a keyword's by its
+  # UTF-8 bytes ("Zebra" before "apple"), a number's by value, and .value
+  # is the first of them.
+  - do:
+      indices.create:
+        index: kwv_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tags: { type: keyword }
+              nums: { type: long }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: kwv_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tags: { type: keyword }
+              nums: { type: long }
+              n: { type: long }
+  - do:
+      indices.create:
+        index: kwv_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              tags: { type: keyword }
+              nums: { type: long }
+              n: { type: long }
+  - do: { bulk: { index: kwv_luc, refresh: true, body: [ {"index": {"_id": "v1"}}, {"n": 1, "tags": [ "red", "green", "Zebra", "apple" ], "nums": [ 5, 2, 9 ]}, {"index": {"_id": "v2"}}, {"n": 2, "tags": "solo", "nums": 7} ] } }
+  - match: { errors: false }
+  - do: { search: { index: kwv_luc, body: { sort: [ { n: asc } ], script_fields: { t: { script: "doc['tags'].value" }, m: { script: "doc['nums'].value" } } } } }
+  - match: { hits.hits.0.fields.t.0: Zebra }
+  - match: { hits.hits.0.fields.m.0: 2 }
+  - match: { hits.hits.1.fields.t.0: solo }
+  - match: { hits.hits.1.fields.m.0: 7 }
+  - do: { search: { index: kwv_luc, body: { query: { script: { script: "doc['tags'].value == 'Zebra'" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: v1 }
+  - do: { search: { index: kwv_luc, body: { query: { script: { script: "doc['nums'].value < 5" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: v1 }
+  - do: { bulk: { index: kwv_px, refresh: true, body: [ {"index": {"_id": "v1"}}, {"n": 1, "tags": [ "red", "green", "Zebra", "apple" ], "nums": [ 5, 2, 9 ]}, {"index": {"_id": "v2"}}, {"n": 2, "tags": "solo", "nums": 7} ] } }
+  - match: { errors: false }
+  - do: { search: { index: kwv_px, body: { sort: [ { n: asc } ], script_fields: { t: { script: "doc['tags'].value" }, m: { script: "doc['nums'].value" } } } } }
+  - match: { hits.hits.0.fields.t.0: Zebra }
+  - match: { hits.hits.0.fields.m.0: 2 }
+  - match: { hits.hits.1.fields.t.0: solo }
+  - match: { hits.hits.1.fields.m.0: 7 }
+  - do: { search: { index: kwv_px, body: { query: { script: { script: "doc['tags'].value == 'Zebra'" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: v1 }
+  - do: { search: { index: kwv_px, body: { query: { script: { script: "doc['nums'].value < 5" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: v1 }
+  - do: { bulk: { index: kwv_def, refresh: true, body: [ {"index": {"_id": "v1"}}, {"n": 1, "tags": [ "red", "green", "Zebra", "apple" ], "nums": [ 5, 2, 9 ]}, {"index": {"_id": "v2"}}, {"n": 2, "tags": "solo", "nums": 7} ] } }
+  - match: { errors: false }
+  - do: { search: { index: kwv_def, body: { sort: [ { n: asc } ], script_fields: { t: { script: "doc['tags'].value" }, m: { script: "doc['nums'].value" } } } } }
+  - match: { hits.hits.0.fields.t.0: Zebra }
+  - match: { hits.hits.0.fields.m.0: 2 }
+  - match: { hits.hits.1.fields.t.0: solo }
+  - match: { hits.hits.1.fields.m.0: 7 }
+  - do: { search: { index: kwv_def, body: { query: { script: { script: "doc['tags'].value == 'Zebra'" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: v1 }
+  - do: { search: { index: kwv_def, body: { query: { script: { script: "doc['nums'].value < 5" } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: v1 }
