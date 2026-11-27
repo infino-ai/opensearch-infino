@@ -30,6 +30,7 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.IndexService;
+import org.opensearch.index.mapper.DocumentMapper;
 import org.opensearch.index.mapper.DocumentMapperForType;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.Mapping;
@@ -73,8 +74,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * index and round, and none once its fields are mapped.
  *
  * <p>A field the table already holds as a column the mapping does not name
- * (written before this rule, or under {@code dynamic: false}) is left as it
- * is: a column's text index is fixed when the column is added, so mapping
+ * (written before this rule, or under {@code dynamic: false} by a release
+ * that still gave such a field a column) is left as it is: a column's text index is fixed when the column is added, so mapping
  * it as text now would only make the table refuse the mapping.
  */
 final class InfinoDynamicMapping {
@@ -87,6 +88,10 @@ final class InfinoDynamicMapping {
     private static final int MAX_ROUNDS = 3;
     /** The id a document is parsed under when the bulk has not given it one yet: the mapping does not depend on it. */
     private static final String PLACEHOLDER_ID = "_infino_dynamic_mapping";
+    /** The {@code dynamic} setting that maps no new field, by its enum name. */
+    private static final String DYNAMIC_FALSE = "FALSE";
+    /** The {@code dynamic} setting that maps only a new field a dynamic template matches, by its enum name. */
+    private static final String DYNAMIC_FALSE_ALLOW_TEMPLATES = "FALSE_ALLOW_TEMPLATES";
 
     private InfinoDynamicMapping() {}
 
@@ -278,18 +283,12 @@ final class InfinoDynamicMapping {
      * parsed: the walk reads names, and its values must fit that mapping.
      */
     private static Mapping update(Doc doc, MapperService mappers, Unmapped held, boolean recheck) throws IOException {
-        if (doc.source() == null) {
+        if (doc.source() == null || indexesNothing(mappers)) {
             return null;
         }
         MediaType type = doc.type() == null ? MediaTypeRegistry.JSON : doc.type();
-        Scan scan = new Scan(mappers, held);
-        try (XContentParser parser = parser(doc.source(), type)) {
-            boolean added = parser.nextToken() != XContentParser.Token.START_OBJECT || scan.object(parser, "");
-            if (!added && !recheck) {
-                return null;
-            }
-        } catch (IOException | RuntimeException e) {
-            // Not a document the walk can read: the mapper reports it as stock does.
+        if (!recheck && !addsField(doc.source(), type, mappers, held)) {
+            return null;
         }
         BytesReference source = doc.source();
         if (!held.columns().isEmpty()) {
@@ -308,12 +307,38 @@ final class InfinoDynamicMapping {
     }
 
     /**
+     * Whether the walk over {@code source} finds a field the mapping does not
+     * hold and would map ({@link Scan}), so the document must be parsed. A
+     * document the walk cannot read is parsed, so the mapper reports it as
+     * stock does.
+     */
+    static boolean addsField(BytesReference source, MediaType type, MapperService mappers, Unmapped held) {
+        try (XContentParser parser = parser(source, type)) {
+            return parser.nextToken() != XContentParser.Token.START_OBJECT || new Scan(mappers, held).object(parser, "");
+        } catch (IOException | RuntimeException e) {
+            return true;
+        }
+    }
+
+    /**
+     * Whether the mapping sets {@code enabled: false} at its root: it maps no
+     * field of any document, so no document is parsed for one.
+     */
+    static boolean indexesNothing(MapperService mappers) {
+        DocumentMapper mapper = mappers.documentMapper();
+        return mapper != null && !mapper.root().isEnabled();
+    }
+
+    /**
      * The columns the table holds that the mapping does not name, and every
      * object path above them: a field there is left to the table as before.
      * The table's own columns hold no field: a field of the same name is
      * mapped as any new field is.
      */
-    private record Unmapped(Set<String> columns, Set<String> objects) {
+    record Unmapped(Set<String> columns, Set<String> objects) {
+        /** A table that holds no column the mapping does not name. */
+        static final Unmapped NONE = new Unmapped(Set.of(), Set.of());
+
         static Unmapped of(IndexMetadata md, MapperService mappers) {
             Set<String> columns = new HashSet<>();
             Set<String> objects = new HashSet<>();
@@ -342,7 +367,10 @@ final class InfinoDynamicMapping {
      * mapping: a value under a path no field or object maps, or an object no
      * object maps. A field's own value (an object or array it takes, a
      * geo point, a range) and an object that is not indexed are not looked
-     * into, and a null or an empty array adds nothing, as in stock.
+     * into, and a null or an empty array adds nothing, as in stock. Nor does
+     * a new field where the mapping maps none ({@link #mapsNew}): under
+     * {@code dynamic: false} it stays out of the mapping, so parsing the
+     * document for it would only be repeated on every bulk that carries it.
      */
     private static final class Scan {
         private final MapperService mappers;
@@ -381,7 +409,11 @@ final class InfinoDynamicMapping {
                     return false;
                 }
                 if (object == null && !held.objects().contains(path)) {
-                    return true;
+                    if (mapsNew(path)) {
+                        return true;
+                    }
+                    parser.skipChildren();
+                    return false;
                 }
                 return object(parser, path);
             }
@@ -396,7 +428,36 @@ final class InfinoDynamicMapping {
             if (held.columns().contains(path)) {
                 return false;
             }
-            return true;
+            return mapsNew(path);
+        }
+
+        /**
+         * Whether a field at {@code path}, which the mapping does not hold,
+         * would be mapped: the nearest object above it that sets
+         * {@code dynamic} says, else the root's, which maps a new field by
+         * default. {@code false} maps none, and {@code false_allow_templates}
+         * only one a dynamic template matches, so it is new when the mapping
+         * has any. Read by name, so a release without the template-aware
+         * values reads the same.
+         */
+        private boolean mapsNew(String path) {
+            ObjectMapper.Dynamic dynamic = null;
+            for (int dot = path.lastIndexOf('.'); dot > 0 && dynamic == null; dot = path.lastIndexOf('.', dot - 1)) {
+                ObjectMapper object = mappers.getObjectMapper(path.substring(0, dot));
+                dynamic = object == null ? null : object.dynamic();
+            }
+            DocumentMapper mapper = mappers.documentMapper();
+            if (dynamic == null && mapper != null) {
+                dynamic = mapper.root().dynamic();
+            }
+            if (dynamic == null) {
+                return true;
+            }
+            return switch (dynamic.name()) {
+                case DYNAMIC_FALSE -> false;
+                case DYNAMIC_FALSE_ALLOW_TEMPLATES -> mapper != null && mapper.root().dynamicTemplates().length > 0;
+                default -> true;
+            };
         }
     }
 
