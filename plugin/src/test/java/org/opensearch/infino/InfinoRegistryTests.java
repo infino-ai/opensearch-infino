@@ -30,6 +30,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -153,6 +155,8 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
         try {
             // No pool for the registry: nothing retries on its own, the read below drains.
             bind(clusterService, null, bridge);
+            // One row a write, so the drain writes twice and the election is lost between.
+            InfinoRegistry.rowsPerWrite(1);
             IndexMetadata a = index("first_row", "first-uuid", 1);
             IndexMetadata b = index("second_row", "second-uuid", 1);
             ClusterServiceUtils.setState(clusterService, withIndices(clusterService.state(), a, b));
@@ -173,6 +177,123 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
             assertEquals(1, bridge.appended.size());
             assertFalse(clusterService.state().nodes().isLocalNodeElectedClusterManager());
         } finally {
+            InfinoRegistry.rowsPerWrite(InfinoRegistry.MAX_ROWS_PER_WRITE);
+            unbind(clusterService, threadPool);
+        }
+    }
+
+    public void testADrainWritesEveryDueRowInOneCountAndOneAppend() throws Exception {
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        StubBridge bridge = new StubBridge();
+        try {
+            // No pool for the registry: nothing retries on its own, the read below drains.
+            bind(clusterService, null, bridge);
+            List<IndexMetadata> indices = new ArrayList<>();
+            for (int i = 0; i < 5; i++) {
+                indices.add(index("burst_" + i, "burst-uuid-" + i, 1));
+            }
+            ClusterServiceUtils.setState(clusterService, withIndices(clusterService.state(), indices.toArray(new IndexMetadata[0])));
+            bridge.failing = true;
+            for (IndexMetadata md : indices) {
+                InfinoRegistry.record(md);
+            }
+            assertTrue(bridge.appended.isEmpty());
+            bridge.failing = false;
+            int countsBefore = bridge.counts.get();
+            // Every row waits out its first delay, then one read drains them together.
+            Thread.sleep(InfinoRegistry.retryDelay(1).millis() + 100);
+            InfinoRegistry.rows();
+            assertEquals(5, bridge.appended.size());
+            assertEquals("one commit carries every row", 1, bridge.appends.get());
+            assertEquals("one count asks for every row", 1, bridge.counts.get() - countsBefore);
+        } finally {
+            for (int i = 0; i < 5; i++) {
+                InfinoRegistry.forget("burst_" + i);
+            }
+            unbind(clusterService, threadPool);
+        }
+    }
+
+    public void testMovesWithinTheDrainDelayAreWrittenByOneDrainInOneCommit() throws Exception {
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        StubBridge bridge = new StubBridge();
+        try {
+            // No pool for the registry's retries: only the drains asked for below write.
+            bind(clusterService, null, bridge);
+            IndexMetadata a = index("moved_a", "moved-a-uuid", 1);
+            IndexMetadata b = index("moved_b", "moved-b-uuid", 1);
+            ClusterServiceUtils.setState(clusterService, withIndices(clusterService.state(), a, b));
+            bridge.failing = true;
+            InfinoRegistry.record(a);
+            InfinoRegistry.record(b);
+            bridge.failing = false;
+            // Two moves in a row: one drain, after the delay.
+            InfinoRegistry.drainSoon(threadPool);
+            InfinoRegistry.drainSoon(threadPool);
+            assertTrue("a drain waits out its delay", bridge.appended.isEmpty());
+            assertBusy(() -> assertEquals(2, bridge.appended.size()), 10, TimeUnit.SECONDS);
+            assertEquals(1, bridge.appends.get());
+        } finally {
+            InfinoRegistry.forget("moved_a");
+            InfinoRegistry.forget("moved_b");
+            unbind(clusterService, threadPool);
+        }
+    }
+
+    public void testAWriteReplacesTheRowsHeldOnceAndDeletesThoseHeldTwiceFirst() {
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        StubBridge bridge = new StubBridge();
+        try {
+            bind(clusterService, null, bridge);
+            bridge.held.put("once", 1L);
+            bridge.held.put("twice", 2L);
+            Map<String, String> rows = new java.util.LinkedHashMap<>();
+            rows.put("once", "{\"name\":\"once\"}");
+            rows.put("twice", "{\"name\":\"twice\"}");
+            rows.put("new", "{\"name\":\"new\"}");
+            assertTrue(InfinoRegistry.write(rows).isEmpty());
+            assertEquals(List.of(List.of("twice")), bridge.deletedIds);
+            // The row held twice is gone, so its new row is appended rather than replacing.
+            assertEquals(List.of(List.of("once")), bridge.replacedIds);
+            assertEquals(1, bridge.appends.get());
+            assertEquals(3, bridge.appended.size());
+        } finally {
+            unbind(clusterService, threadPool);
+        }
+    }
+
+    public void testARowTheTableRefusesIsTriedAgainWhileTheRestAreRecorded() throws Exception {
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        StubBridge bridge = new StubBridge();
+        try {
+            bind(clusterService, null, bridge);
+            IndexMetadata taken = index("taken", "taken-uuid", 1);
+            IndexMetadata refused = index("refused", "refused-uuid", 1);
+            ClusterServiceUtils.setState(clusterService, withIndices(clusterService.state(), taken, refused));
+            bridge.failing = true;
+            InfinoRegistry.record(taken);
+            InfinoRegistry.record(refused);
+            bridge.failing = false;
+            bridge.refused.add("refused");
+            Thread.sleep(InfinoRegistry.retryDelay(1).millis() + 100);
+            InfinoRegistry.rows();
+            assertEquals(1, bridge.appends.get());
+            assertEquals(List.of("taken"), bridge.appended.stream().map(row -> InfinoNative.object(row).get("name")).toList());
+            // The refused row waits out its next delay, alone: the taken one is recorded.
+            bridge.refused.clear();
+            InfinoRegistry.rows();
+            assertEquals(1, bridge.appends.get());
+            Thread.sleep(InfinoRegistry.retryDelay(2).millis() + 100);
+            InfinoRegistry.rows();
+            assertEquals(2, bridge.appends.get());
+            assertEquals(List.of("taken", "refused"), bridge.appended.stream().map(row -> InfinoNative.object(row).get("name")).toList());
+        } finally {
+            InfinoRegistry.forget("taken");
+            InfinoRegistry.forget("refused");
             unbind(clusterService, threadPool);
         }
     }
@@ -298,7 +419,8 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
      * A bridge that answers the registry's calls, failing each write while
      * {@link #failing}, and keeps the source of every row it appends. Its
      * table is read only once a declaration of it has succeeded; each
-     * declaration fails while {@link #declareFailing}.
+     * declaration fails while {@link #declareFailing}. It counts as held the
+     * rows {@link #held} names, and refuses a row whose id {@link #refused} names.
      */
     private static final class StubBridge implements InvocationHandler {
         volatile boolean failing;
@@ -306,8 +428,20 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
         final AtomicInteger declarations = new AtomicInteger();
         private volatile boolean declared;
         volatile Runnable onAppend = () -> {};
+        /** The source of every row appended, in order. */
         final List<String> appended = new CopyOnWriteArrayList<>();
-        private volatile String prepared;
+        /** How many appends were made: one per commit. */
+        final AtomicInteger appends = new AtomicInteger();
+        /** How many counts of held rows were asked for. */
+        final AtomicInteger counts = new AtomicInteger();
+        /** The ids each append named as replaced. */
+        final List<List<String>> replacedIds = new CopyOnWriteArrayList<>();
+        /** The ids each delete named. */
+        final List<List<String>> deletedIds = new CopyOnWriteArrayList<>();
+        final Map<String, Long> held = new ConcurrentHashMap<>();
+        final Set<String> refused = ConcurrentHashMap.newKeySet();
+        private volatile List<String> preparedIds = List.of();
+        private volatile List<String> preparedSources = List.of();
 
         InfinoLib lib() {
             return (InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, this);
@@ -325,24 +459,68 @@ public class InfinoRegistryTests extends OpenSearchTestCase {
                     }
                     declared = true;
                     return string("{}");
-                case "infino_sql":
-                    // The registry counts a row's copies before every write.
+                case "infino_sql": {
+                    // The registry counts the rows it holds under the ids before every write.
                     if (declared == false) {
                         return string("{\"error\":\"table os_index not found\"}");
                     }
-                    return string(failing ? "{\"error\":\"the service is down\"}" : "[{\"held\":0}]");
+                    if (failing) {
+                        return string("{\"error\":\"the service is down\"}");
+                    }
+                    String sql = (String) args[1];
+                    if (sql.contains("count(*)") == false) {
+                        return string("[]");
+                    }
+                    counts.incrementAndGet();
+                    StringBuilder rows = new StringBuilder("[");
+                    for (Map.Entry<String, Long> row : held.entrySet()) {
+                        if (sql.contains("'" + row.getKey() + "'")) {
+                            rows.append(rows.length() > 1 ? "," : "")
+                                .append("{\"osid\":\"")
+                                .append(row.getKey())
+                                .append("\",\"held\":")
+                                .append(row.getValue())
+                                .append('}');
+                        }
+                    }
+                    return string(rows.append(']').toString());
+                }
                 case "infino_prepare_batch": {
                     byte[] buf = (byte[]) args[2];
-                    int idEnd = ((int[]) args[4])[0];
-                    int srcEnd = ((int[]) args[5])[0];
-                    prepared = new String(buf, idEnd, srcEnd - idEnd, StandardCharsets.UTF_8);
+                    int[] idEnds = (int[]) args[4];
+                    int[] srcEnds = (int[]) args[5];
+                    int n = (int) args[7];
+                    List<String> ids = new ArrayList<>();
+                    List<String> sources = new ArrayList<>();
+                    for (int i = 0; i < n; i++) {
+                        int start = i == 0 ? 0 : srcEnds[i - 1];
+                        ids.add(new String(buf, start, idEnds[i] - start, StandardCharsets.UTF_8));
+                        sources.add(new String(buf, idEnds[i], srcEnds[i] - idEnds[i], StandardCharsets.UTF_8));
+                    }
+                    preparedIds = ids;
+                    preparedSources = sources;
                     return new Memory(1);
                 }
-                case "infino_append_prepared":
-                    appended.add(prepared);
+                case "infino_append_prepared": {
+                    appends.incrementAndGet();
+                    String[] replaced = (String[]) args[4];
+                    replacedIds.add(replaced == null ? List.of() : List.of(replaced).subList(0, (int) args[5]));
+                    StringBuilder failed = new StringBuilder();
+                    for (int i = 0; i < preparedIds.size(); i++) {
+                        if (refused.contains(preparedIds.get(i))) {
+                            failed.append(failed.length() > 0 ? "," : "")
+                                .append("{\"b\":0,\"i\":")
+                                .append(i)
+                                .append(",\"reason\":\"refused\"}");
+                        } else {
+                            appended.add(preparedSources.get(i));
+                        }
+                    }
                     onAppend.run();
-                    return string("{\"ok\":1,\"failed\":[]}");
+                    return string("{\"ok\":" + (preparedIds.size() - refused.size()) + ",\"failed\":[" + failed + "]}");
+                }
                 case "infino_delete_osids":
+                    deletedIds.add(List.of((String[]) args[2]).subList(0, (int) args[3]));
                     return 0;
                 default:
                     return null; // the frees

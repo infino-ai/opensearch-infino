@@ -32,6 +32,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -111,11 +112,29 @@ final class InfinoRegistry {
     /** The longest wait between tries of a row that keeps failing. */
     static final TimeValue MAX_RETRY_DELAY = TimeValue.timeValueMinutes(1);
     /**
+     * How long a drain waits after the metadata moves, so the indices that
+     * move meanwhile are written with it, in one commit. A burst of index
+     * creates moves the metadata a few times per index (created, a shard
+     * started, a field mapped); drained at once, each move is a commit of its
+     * own. A read of the registry drains first, so it never waits for this.
+     */
+    static final TimeValue DRAIN_DELAY = TimeValue.timeValueSeconds(1);
+    /** Whether a drain is scheduled and has not started: one at a time, however often the metadata moves meanwhile. */
+    private static final AtomicBoolean drainScheduled = new AtomicBoolean();
+    /**
      * Failures in a row before one is logged as a warning: on the hosted
      * service the first tries after the registry table is created can miss
      * it for a moment, and the next try finds it.
      */
     private static final int WARN_AFTER_FAILURES = 3;
+    /**
+     * The most rows one registry write carries; a drain of more writes them in
+     * runs of this many. Bounds the id list of the count that comes first and
+     * of the replace.
+     */
+    static final int MAX_ROWS_PER_WRITE = 256;
+    /** The rows one write carries: {@link #MAX_ROWS_PER_WRITE}, lower in tests. */
+    private static volatile int rowsPerWrite = MAX_ROWS_PER_WRITE;
     /** Whether the registry table has been declared on the connection; set only once a declaration succeeds. */
     private static final AtomicBoolean declared = new AtomicBoolean();
     /** Whether a call that reads the registry back has waited out the read window since the table was declared. */
@@ -163,7 +182,18 @@ final class InfinoRegistry {
             }
         }
         if (any) {
-            threadPool.generic().execute(InfinoRegistry::drain);
+            drainSoon(threadPool);
+        }
+    }
+
+    /** Drain after {@link #DRAIN_DELAY}, on the generic pool, unless a drain is already scheduled. */
+    static void drainSoon(ThreadPool threadPool) {
+        if (drainScheduled.compareAndSet(false, true)) {
+            threadPool.schedule(() -> {
+                // Cleared first: what moves while this drain runs schedules the next.
+                drainScheduled.set(false);
+                drain();
+            }, DRAIN_DELAY, ThreadPool.Names.GENERIC);
         }
     }
 
@@ -176,16 +206,8 @@ final class InfinoRegistry {
      */
     private static synchronized void drain() {
         long now = System.nanoTime();
+        List<IndexMetadata> due = new ArrayList<>();
         for (String name : new ArrayList<>(pending.keySet())) {
-            if (!electedManager()) {
-                // The elected manager records every index from its own state; what
-                // this node queued while it was the manager may be older than that.
-                // Asked before each row, as the node can lose the election mid-drain.
-                pending.clear();
-                failures.clear();
-                retryAt.clear();
-                return;
-            }
             Long at = retryAt.get(name);
             if (at != null && at - now > 0) {
                 continue;
@@ -201,7 +223,19 @@ final class InfinoRegistry {
                 log.debug("[infino] index {} is gone; its registry row is not written", name);
                 continue;
             }
-            record(current);
+            due.add(current);
+        }
+        for (int from = 0; from < due.size(); from += rowsPerWrite) {
+            if (!electedManager()) {
+                // The elected manager records every index from its own state; what
+                // this node queued while it was the manager may be older than that.
+                // Asked before each write, as the node can lose the election mid-drain.
+                pending.clear();
+                failures.clear();
+                retryAt.clear();
+                return;
+            }
+            record(due.subList(from, Math.min(due.size(), from + rowsPerWrite)));
         }
     }
 
@@ -212,25 +246,69 @@ final class InfinoRegistry {
      * starts from the registry would otherwise come up without the index.
      */
     static void record(IndexMetadata md) {
-        String name = md.getIndex().getName();
+        record(List.of(md));
+    }
+
+    /**
+     * Write the rows of {@code indices} together, as {@link #record(IndexMetadata)}
+     * writes one: one count of the rows they hold and one commit for all of
+     * them, rather than one of each per index. Each table commit rewrites the
+     * table's newest manifest part whole, so a burst of index creates written
+     * one row at a time costs a commit, and a rewrite of that part, per index.
+     * A row the write refuses is tried again on its own schedule; the rest are
+     * recorded.
+     */
+    private static void record(List<IndexMetadata> indices) {
+        Map<String, String> rows = new LinkedHashMap<>();
+        Map<String, IndexMetadata> byName = new LinkedHashMap<>();
+        for (IndexMetadata md : indices) {
+            String name = md.getIndex().getName();
+            try {
+                rows.put(name, rowOf(md));
+                byName.put(name, md);
+            } catch (Exception e) {
+                failed(md, e);
+            }
+        }
+        if (rows.isEmpty()) {
+            return;
+        }
+        Map<String, String> refused;
         try {
-            write(name, rowOf(md));
+            refused = write(rows);
+        } catch (Exception e) {
+            for (IndexMetadata md : byName.values()) {
+                failed(md, e);
+            }
+            return;
+        }
+        for (IndexMetadata md : byName.values()) {
+            String name = md.getIndex().getName();
+            String reason = refused.get(name);
+            if (reason != null) {
+                failed(md, new IllegalStateException(reason));
+                continue;
+            }
             recorded.put(name, md.getVersion());
             failures.remove(name);
             retryAt.remove(name);
-        } catch (Exception e) {
-            int failed = failures.merge(name, 1, Integer::sum);
-            TimeValue delay = retryDelay(failed);
-            retryAt.put(name, System.nanoTime() + delay.nanos());
-            // Metadata queued since this write began is newer, and wins.
-            pending.putIfAbsent(name, md);
-            if (failed < WARN_AFTER_FAILURES) {
-                log.debug("[infino] index {} could not be recorded in the registry; trying again in {}", name, delay, e);
-            } else {
-                log.warn("[infino] index {} could not be recorded in the registry ({} tries); trying again in {}", name, failed, delay, e);
-            }
-            retryIn(name, delay);
         }
+    }
+
+    /** {@code md}'s row was not written: try it again after a delay that grows with each failure in a row. */
+    private static void failed(IndexMetadata md, Exception e) {
+        String name = md.getIndex().getName();
+        int failed = failures.merge(name, 1, Integer::sum);
+        TimeValue delay = retryDelay(failed);
+        retryAt.put(name, System.nanoTime() + delay.nanos());
+        // Metadata queued since this write began is newer, and wins.
+        pending.putIfAbsent(name, md);
+        if (failed < WARN_AFTER_FAILURES) {
+            log.debug("[infino] index {} could not be recorded in the registry; trying again in {}", name, delay, e);
+        } else {
+            log.warn("[infino] index {} could not be recorded in the registry ({} tries); trying again in {}", name, failed, delay, e);
+        }
+        retryIn(name, delay);
     }
 
     /**
@@ -297,31 +375,68 @@ final class InfinoRegistry {
      * replace of one refuses: those rows go, and one is appended.
      */
     static void write(String id, String source) {
-        declareToRead();
-        long held = heldRows(id);
-        if (held > 1) {
-            InfinoNative.deleteOsids(TABLE, new String[] { id }, 1);
-        }
-        List<String> replaced = held == 1 ? List.of(id) : List.of();
-        Pointer prepared = InfinoNative.prepare(TABLE, List.of(id), List.of(source));
-        // The registry's rows are the node's own bookkeeping: no client conditions a write on them.
-        InfinoNative.PreparedResult result = InfinoNative.appendPrepared(TABLE, List.of(prepared), replaced, null);
-        if (!result.failed().isEmpty()) {
-            throw new IllegalStateException(result.failed().get(0).reason());
+        String refused = write(Map.of(id, source)).get(id);
+        if (refused != null) {
+            throw new IllegalStateException(refused);
         }
     }
 
-    /** How many rows the registry holds under {@code name}. */
-    private static long heldRows(String name) {
+    /**
+     * Write every row of {@code rows} (source by id), as {@link #write(String, String)}
+     * writes one, in one count and one append: the rows that replace one
+     * already held and those that are new land together. Returns why the
+     * table refused each row it did not take, by id; a call that fails
+     * throws, and writes none of them.
+     */
+    static Map<String, String> write(Map<String, String> rows) {
+        declareToRead();
+        List<String> ids = new ArrayList<>(rows.keySet());
+        Map<String, Long> held = heldRows(ids);
+        String[] doubled = ids.stream().filter(id -> held.getOrDefault(id, 0L) > 1).toArray(String[]::new);
+        if (doubled.length > 0) {
+            InfinoNative.deleteOsids(TABLE, doubled, doubled.length);
+        }
+        List<String> replaced = ids.stream().filter(id -> held.getOrDefault(id, 0L) == 1).toList();
+        List<String> sources = ids.stream().map(rows::get).toList();
+        Pointer prepared = InfinoNative.prepare(TABLE, ids, sources);
+        // The registry's rows are the node's own bookkeeping: no client conditions a write on them.
+        InfinoNative.PreparedResult result = InfinoNative.appendPrepared(TABLE, List.of(prepared), replaced, null);
+        Map<String, String> refused = new LinkedHashMap<>();
+        for (InfinoNative.PreparedFailure failure : result.failed()) {
+            // One batch: each failure names its row by its place in it.
+            refused.putIfAbsent(ids.get(failure.index()), failure.reason());
+        }
+        return refused;
+    }
+
+    /** How many rows the registry holds under each of {@code ids}; an id it holds none under is left out. */
+    private static Map<String, Long> heldRows(List<String> ids) {
+        StringBuilder in = new StringBuilder();
+        for (String id : ids) {
+            if (in.length() > 0) {
+                in.append(", ");
+            }
+            in.append(InfinoQueryTranslator.literal(id));
+        }
         List<Map<String, Object>> counted = InfinoNative.sqlRows(
-            "SELECT count(*) AS held FROM "
+            "SELECT "
+                + InfinoQueryTranslator.OSID
+                + ", count(*) AS held FROM "
                 + InfinoQueryTranslator.quoteIdent(TABLE)
                 + " WHERE "
                 + InfinoQueryTranslator.OSID
-                + " = "
-                + InfinoQueryTranslator.literal(name)
+                + " IN ("
+                + in
+                + ") GROUP BY "
+                + InfinoQueryTranslator.OSID
         );
-        return counted.isEmpty() || !(counted.get(0).get("held") instanceof Number n) ? 0 : n.longValue();
+        Map<String, Long> held = new HashMap<>();
+        for (Map<String, Object> row : counted) {
+            if (row.get(InfinoQueryTranslator.OSID) instanceof String id && row.get("held") instanceof Number n) {
+                held.put(id, n.longValue());
+            }
+        }
+        return held;
     }
 
     /** The index is gone: so is its row. */
@@ -541,6 +656,11 @@ final class InfinoRegistry {
                 settled.set(true);
             }
         }
+    }
+
+    /** For tests: the most rows one write carries; {@link #MAX_ROWS_PER_WRITE} restores it. */
+    static void rowsPerWrite(int rows) {
+        rowsPerWrite = rows;
     }
 
     /** For tests: the next call declares the registry table again, as on a node that has just started. */
