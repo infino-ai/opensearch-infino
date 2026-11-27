@@ -245,8 +245,8 @@ final class InfinoQueryTranslator {
      * BM25 with a value match as a bonus ({@link #valueRanking}), combined
      * by the query's tie_breaker: {@code best} (0) takes the greater,
      * otherwise (1) the sum, each value field that matches adding its own.
-     * TODO(engine): one multi-column search with per-column scoring, see
-     * {@link #liveTargets}.
+     * TODO(engine): one multi-column search with per-column scoring
+     * (infino-ai/infino#1540), see {@link #liveTargets}.
      */
     record ValueRanking(TextClause text, List<String> values, List<Column> columns, String match, boolean best) {
         /** What a hit adds where {@link #values} match it: 1 where any does under {@code best}, else 1 for each. */
@@ -3041,7 +3041,7 @@ final class InfinoQueryTranslator {
      * there (a value, a pattern); the table as a search reads it.
      *
      * <p>TODO(engine): one multi-column search with per-column scoring
-     * (BM25 on text columns, a constant on keyword, number and date
+     * (infino-ai/infino#1540; BM25 on text columns, a constant on keyword, number and date
      * columns, combined by dis_max and tie_breaker) would replace this read
      * and {@link ValueRanking}. The read and the search are two reads of the
      * table, so a row written between them that matches only on a keyword
