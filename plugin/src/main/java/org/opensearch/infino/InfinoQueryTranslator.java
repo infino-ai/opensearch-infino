@@ -462,6 +462,8 @@ final class InfinoQueryTranslator {
     private final Map<NestedQueryBuilder, Map<String, Double>> nestedScores = new java.util.IdentityHashMap<>();
     /** Each BM25-scored term clause's score ({@link #bm25TermScore}), read once per clause. */
     private final Map<QueryBuilder, Double> termScores = new java.util.IdentityHashMap<>();
+    /** Whether each value given to a clause on {@code _index} matches the table's index, resolved once per value ({@link #onIndex}). */
+    private final Map<String, Boolean> indexMatched = new java.util.HashMap<>();
 
     private InfinoQueryTranslator(Map<String, Column> cols, String table, long nowMillis, boolean trusted) {
         this(cols, table, nowMillis, trusted, false);
@@ -1342,7 +1344,7 @@ final class InfinoQueryTranslator {
         }
         if (qb instanceof TermsQueryBuilder ts && InfinoIndexField.NAME.equals(ts.fieldName())) {
             for (Object value : termsOf(ts)) {
-                if (InfinoIndexField.matches(table, String.valueOf(value), false)) {
+                if (onIndex(String.valueOf(value), false)) {
                     return ALL;
                 }
             }
@@ -1366,7 +1368,12 @@ final class InfinoQueryTranslator {
 
     /** Every row when {@code value} on {@code _index} matches the table's index ({@link InfinoIndexField#matches}), else none. */
     private String indexMatches(Object value, boolean caseInsensitive) {
-        return InfinoIndexField.matches(table, String.valueOf(value), caseInsensitive) ? ALL : NONE;
+        return onIndex(String.valueOf(value), caseInsensitive) ? ALL : NONE;
+    }
+
+    /** {@link InfinoIndexField#matches} for this table, each value resolved against the cluster's indices once. */
+    private boolean onIndex(String value, boolean caseInsensitive) {
+        return indexMatched.computeIfAbsent((caseInsensitive ? "i:" : "s:") + value, k -> InfinoIndexField.matches(table, value, caseInsensitive));
     }
 
     /** The values a terms query names: its own, or a terms lookup's, which only a trusted query (a security rule) reads. */

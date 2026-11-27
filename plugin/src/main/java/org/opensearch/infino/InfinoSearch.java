@@ -2949,6 +2949,7 @@ public final class InfinoSearch {
                 read.add(index);
             }
         }
+        Set<Index> reads = new HashSet<>(read);
         List<AggregationBuilder> perIndexBuilders = new ArrayList<>();
         List<AggregationBuilder> overAll = new ArrayList<>();
         for (AggregationBuilder b : builders) {
@@ -2967,7 +2968,7 @@ public final class InfinoSearch {
         for (Index index : indices) {
             SearchSourceBuilder perIndex = after == null || after.get(index) == null ? source : withSearchAfter(source, after.get(index));
             Plan plan = plan(tableOf.apply(index), perIndex, now, accessOf.apply(index));
-            if (read.contains(index)) {
+            if (reads.contains(index)) {
                 readPlans.add(plan);
             }
             if (after != null && plan.ranksByScore()) {
@@ -2993,7 +2994,7 @@ public final class InfinoSearch {
                     sharedTotal && !countWithAggs ? page.total() : null
                 );
                 aggs.add(counted.aggregations());
-                if (read.contains(index)) {
+                if (reads.contains(index)) {
                     readTotal += counted.total();
                 }
                 if (countWithAggs) {
