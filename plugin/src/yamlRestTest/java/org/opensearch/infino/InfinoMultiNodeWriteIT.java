@@ -497,9 +497,9 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
 
         Request scripted = new Request("POST", "/" + index + "/_update/x");
         scripted.setJsonEntity("{\"script\":{\"source\":\"ctx._source.a += 1\"}}");
-        assertEquals(400, status(other, scripted));
+        assertEquals("updated", on(other, scripted).get("result"));
 
-        assertEquals("the upsert, then the update", Map.of("a", 1, "made", true), sourceAfterRefresh(index, "x"));
+        assertEquals("the upsert, the update, then the script", Map.of("a", 2, "made", true), sourceAfterRefresh(index, "x"));
         assertEquals("the doc as upserted", Map.of("b", 1), sourceAfterRefresh(index, "y"));
     }
 

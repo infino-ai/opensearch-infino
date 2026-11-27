@@ -63,7 +63,6 @@ search/50_multi_match/Cross fields do not return negative scores  # [bug] multi_
 
 # --- Aggregation results
 search.aggregation/10_histogram/Deprecated _time order  # [bug] date_histogram ignores order: a descending key order comes back ascending (https://github.com/infino-ai/opensearch-infino/issues/205)
-search.aggregation/10_histogram/Format test  # [bug] histogram buckets have no key_as_string (https://github.com/infino-ai/opensearch-infino/issues/205)
 search.aggregation/20_terms/Unmapped booleans  # [bug] terms on an unmapped field with value_type and missing returns a string key (https://github.com/infino-ai/opensearch-infino/issues/206)
 search.aggregation/20_terms/Unmapped dates  # [bug] terms on an unmapped field with value_type and missing returns a string key (https://github.com/infino-ai/opensearch-infino/issues/206)
 search.aggregation/20_terms/Unmapped doubles  # [bug] terms on an unmapped field with value_type and missing returns a string key (https://github.com/infino-ai/opensearch-infino/issues/206)

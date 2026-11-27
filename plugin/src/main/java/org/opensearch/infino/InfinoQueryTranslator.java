@@ -1261,7 +1261,10 @@ final class InfinoQueryTranslator {
      * its values in the columns under it, so it exists where any of them
      * holds one, as Lucene expands {@code exists} on an object over its
      * sub-fields; a pattern ({@code *}) names every column it matches. The
-     * reserved columns are never a document's field.
+     * reserved columns are never a document's field. A field with a column
+     * of its own exists where a column under it holds a value too: a table
+     * written before a {@code geo_point} was kept whole holds the points
+     * given as objects in {@code loc.lat} and {@code loc.lon}.
      */
     private String exists(String field) {
         String meta = metadataExists(field);
@@ -1270,16 +1273,19 @@ final class InfinoQueryTranslator {
         }
         // Whether a field has a value tells nothing of a masked one's: its hash is shown.
         Column c = resolve(field);
+        List<String> present = new ArrayList<>();
         if (c != null) {
+            present.add(quoteIdent(c.name()) + " IS NOT NULL");
             Column values = listOf(cols, c);
-            String own = quoteIdent(c.name()) + " IS NOT NULL";
-            return values == null ? own : "(" + own + " OR " + quoteIdent(values.name()) + " IS NOT NULL)";
+            if (values != null) {
+                present.add(quoteIdent(values.name()) + " IS NOT NULL");
+            }
+        } else {
+            refuseColumnless(field);
         }
-        refuseColumnless(field);
         String under = field + ".";
         // OpenSearch's own field-pattern matcher, named in full: this class's Regex is a query node.
-        boolean pattern = org.opensearch.common.regex.Regex.isSimpleMatchPattern(field);
-        List<String> present = new ArrayList<>();
+        boolean pattern = c == null && org.opensearch.common.regex.Regex.isSimpleMatchPattern(field);
         for (Column sub : cols.values()) {
             String name = sub.name();
             if (name.equals(OSID) || name.equals(SOURCE) || name.equals(SEQ) || name.equals(IGNORED)) {
@@ -1290,7 +1296,10 @@ final class InfinoQueryTranslator {
                 present.add(quoteIdent(name) + " IS NOT NULL");
             }
         }
-        return present.isEmpty() ? NONE : "(" + String.join(" OR ", present) + ")";
+        if (present.isEmpty()) {
+            return NONE;
+        }
+        return c != null && present.size() == 1 ? present.get(0) : "(" + String.join(" OR ", present) + ")";
     }
 
     /**
@@ -3116,7 +3125,10 @@ final class InfinoQueryTranslator {
         }
         if (n instanceof Wildcard w) {
             if (w.field() == null) {
-                return anyOf(targets, c -> termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*")));
+                return anyOf(
+                    targets,
+                    c -> c.fts() ? termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*")) : like(c, wildcardToLike(w.pattern()))
+                );
             }
             Column c = column(w.field());
             if (c == null) {
@@ -3125,11 +3137,12 @@ final class InfinoQueryTranslator {
             if (c.fts()) {
                 return termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*"));
             }
-            return c.isString() ? quoteIdent(c.name()) + " LIKE " + literal(wildcardToLike(w.pattern())) : null;
+            // Any of the field's values, its list column's too, as a wildcard query reads them.
+            return like(c, wildcardToLike(w.pattern()));
         }
         if (n instanceof Regex r) {
             if (r.field() == null) {
-                return anyOf(targets, c -> termPattern(c, "(?:" + r.pattern() + ")", false));
+                return anyOf(targets, c -> c.fts() ? termPattern(c, "(?:" + r.pattern() + ")", false) : wholeValueMatches(c, r.pattern()));
             }
             Column c = column(r.field());
             if (c == null) {
@@ -3138,8 +3151,7 @@ final class InfinoQueryTranslator {
             if (c.fts()) {
                 return termPattern(c, "(?:" + r.pattern() + ")", false);
             }
-            // A Lucene regexp is anchored to the whole value.
-            return c.isString() ? "regexp_like(" + quoteIdent(c.name()) + ", " + literal("^(?:" + r.pattern() + ")$") + ")" : null;
+            return c.element().isString() ? wholeValueMatches(c, r.pattern()) : null;
         }
         if (n instanceof Range r) {
             if (r.field() == null) {
@@ -3150,7 +3162,8 @@ final class InfinoQueryTranslator {
                 return NONE;
             }
             if (r.from() == null && r.to() == null) {
-                return quoteIdent(c.name()) + " IS NOT NULL";
+                // Any value at all, in the field's own column or its list column, as exists reads it.
+                return exists(r.field());
             }
             RangeQueryBuilder rb = new RangeQueryBuilder(r.field());
             if (r.from() != null) {
@@ -3199,12 +3212,17 @@ final class InfinoQueryTranslator {
         return out.toString();
     }
 
-    /** The predicate over the text columns named, any of them matching; none matches nothing. */
+    /**
+     * The predicate over the text and string columns named, any of them
+     * matching; none matches nothing. A keyword field is reached as a bare
+     * term reaches it ({@link #textOnFields}): a pattern on the default
+     * fields matches its values whole.
+     */
     private String anyOf(List<String> targets, Function<Column, String> perColumn) {
         List<String> or = new ArrayList<>();
         for (String f : targets) {
             Column c = column(f);
-            if (c != null && c.fts()) {
+            if (c != null && (c.fts() || c.element().isString())) {
                 String p = perColumn.apply(c);
                 if (p == null) {
                     return null;
@@ -3227,6 +3245,16 @@ final class InfinoQueryTranslator {
     private static String termPattern(Column c, String regex, boolean openEnd) {
         String bounded = "\\b" + regex + (openEnd ? "" : "\\b");
         return "regexp_like(" + quoteIdent(c.name()) + ", " + literal(bounded) + ", 'i')";
+    }
+
+    /**
+     * The rows where any value of a string column matches a Lucene regexp,
+     * which is anchored to the whole value; the field's list column's values
+     * too, as a regexp query reads them.
+     */
+    private String wholeValueMatches(Column c, String pattern) {
+        String anchored = literal("^(?:" + pattern + ")$");
+        return anyValue(c, v -> "regexp_like(" + v + ", " + anchored + ")");
     }
 
     /** A Lucene wildcard as a regular expression: {@code *} any run within a term, {@code ?} one character, the rest literal. */
