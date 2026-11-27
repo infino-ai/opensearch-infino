@@ -1044,15 +1044,25 @@ public class InfinoEngine extends InternalEngine {
                 out.put(id, new InfinoNative.Doc(v.source(), v.seq(), v.routing()));
             }
         }
-        if (committed.isEmpty()) {
-            return out;
+        out.putAll(committedDocs(table, committed, readsEveryCommit(table)));
+        return out;
+    }
+
+    /**
+     * The documents of {@code ids} as {@code table}'s commits hold them, by
+     * id, for a realtime read: through this node's own connection when it
+     * {@code readsEveryCommit}, else from the table's latest commit, holding
+     * that connection open for the realtime reads that follow. An id the
+     * table does not hold is absent.
+     */
+    static Map<String, InfinoNative.Doc> committedDocs(String table, Collection<String> ids, boolean readsEveryCommit) {
+        if (ids.isEmpty()) {
+            return new HashMap<>();
         }
-        boolean latest = readsEveryCommit(table) == false;
-        if (latest) {
+        if (readsEveryCommit == false) {
             holdLatestForRealtime(table);
         }
-        out.putAll(InfinoNative.docsOf(table, committed, latest));
-        return out;
+        return InfinoNative.docsOf(table, ids, readsEveryCommit == false);
     }
 
     /**

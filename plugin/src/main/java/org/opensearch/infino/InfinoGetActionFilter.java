@@ -49,6 +49,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -394,13 +395,46 @@ public class InfinoGetActionFilter implements ActionFilter {
      * committed counts when {@code realtime}, as a stock get reads the
      * translog, and otherwise only what the latest refresh made visible; in
      * proxy mode an acknowledged write is in the table, visible to searches,
-     * already. Null when it is missing or deleted.
+     * already, and a realtime read sees it from any node ({@link #proxyDocs}).
+     * Null when it is missing or deleted.
      */
     static InfinoNative.Doc docOf(IndexMetadata index, String table, String id, boolean realtime) {
         if (!InfinoPlugin.inDefaultMode(index.getSettings())) {
-            return InfinoNative.getDoc(table, id);
+            return realtime ? proxyDocs(index, table, List.of(id)).get(id) : InfinoNative.getDoc(table, id);
         }
         return realtime ? InfinoEngine.currentDoc(table, id) : InfinoEngine.refreshedDoc(table, id);
+    }
+
+    /**
+     * Proxy-mode documents of {@code ids} in {@code table}, by id, for a
+     * realtime get or multi-get: as of the writer's last commit. A node other
+     * than the one writing the table reads its latest commit, since its own
+     * view may trail that node's commits, and would miss a document written
+     * moments ago or report the sequence number of a write before the latest
+     * ({@link #proxyReadsEveryCommit}).
+     */
+    static Map<String, InfinoNative.Doc> proxyDocs(IndexMetadata index, String table, Collection<String> ids) {
+        return InfinoEngine.committedDocs(table, ids, proxyReadsEveryCommit(index, table));
+    }
+
+    /**
+     * Whether this node's own connection has read every commit to
+     * proxy-mode {@code index}'s {@code table}, so a realtime read may go
+     * through it: only on the node holding the index's active primary, which
+     * writes the table, once it has committed to it as that copy
+     * ({@link InfinoWriter#caughtUp}). Every other node may answer from the
+     * commit before the writer's last for up to the engine's staleness
+     * window, so its realtime reads read the table's latest commit.
+     */
+    static boolean proxyReadsEveryCommit(IndexMetadata index, String table) {
+        ClusterService clusters = InfinoServices.clusterService();
+        InfinoWriter writer = InfinoServices.writer();
+        if (clusters == null || writer == null) {
+            return false;
+        }
+        ClusterState state = clusters.state();
+        return Objects.equals(state.nodes().getLocalNodeId(), InfinoBulkActionFilter.writerNode(state, index.getIndex()))
+            && writer.caughtUp(table, InfinoBulkActionFilter.writerAllocation(state, index.getIndex()));
     }
 
     /** Refresh the shard behind {@code table} before a get that asks for it; proxy mode has nothing to refresh. */

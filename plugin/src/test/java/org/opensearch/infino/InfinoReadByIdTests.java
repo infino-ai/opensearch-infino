@@ -110,6 +110,27 @@ public class InfinoReadByIdTests extends OpenSearchTestCase {
         assertEquals(List.of("infino_get_docs_latest"), bridge.reads);
     }
 
+    /**
+     * A realtime get or multi-get in proxy mode on a node that has not read
+     * the writer's last commit (here no cluster names this node the writer)
+     * reads the table's latest commit: the node's own view may trail it, and
+     * miss a document written moments before. A get that is not realtime
+     * reads through the node's own connection.
+     */
+    public void testARealtimeProxyReadOffTheWriterReadsTheLatestCommit() {
+        IndexMetadata md = index(InfinoPlugin.MODE_PROXY);
+        FakeBridge bridge = new FakeBridge("{\"docs\":{\"1\":{\"source\":\"{}\",\"seq\":3}}}");
+        InfinoNative.useLib(bridge.lib());
+        assertEquals(new InfinoNative.Doc("{}", 3, null), InfinoGetActionFilter.docOf(md, "os_logs", "1", true));
+        assertEquals(Map.of("1", new InfinoNative.Doc("{}", 3, null)), InfinoGetActionFilter.proxyDocs(md, "os_logs", List.of("1")));
+        assertEquals(List.of("infino_get_docs_latest", "infino_get_docs_latest"), bridge.reads);
+
+        bridge = new FakeBridge(FAILED);
+        InfinoNative.useLib(bridge.lib());
+        expectThrows(InfinoNative.InfinoException.class, () -> InfinoGetActionFilter.docOf(md, "os_logs", "1", false));
+        assertEquals(List.of("infino_get_doc"), bridge.reads);
+    }
+
     /** A lookup the bridge fails, or answers with nothing at all, throws with 503 from both reads. */
     public void testAFailedLookupThrowsARetryableStatus() {
         for (String answer : new String[] { FAILED, null }) {

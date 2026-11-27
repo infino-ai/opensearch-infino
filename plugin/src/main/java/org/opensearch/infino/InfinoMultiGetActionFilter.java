@@ -290,6 +290,8 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                 }
             } else if (access.restrictsDocuments()) {
                 docsOf.put(table, InfinoGetActionFilter.restrictedDocs(table, e.getValue(), access));
+            } else if (mget.realtime()) {
+                docsOf.put(table, InfinoGetActionFilter.proxyDocs(indices.get(indexOfTable.get(table)), table, e.getValue()));
             } else {
                 docsOf.put(table, InfinoNative.docs(table, e.getValue(), null));
             }

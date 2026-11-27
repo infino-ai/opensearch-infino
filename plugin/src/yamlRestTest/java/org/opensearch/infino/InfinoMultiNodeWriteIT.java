@@ -57,6 +57,10 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
     private static final int CONFLICT = 409;
     /** The status of a get of a document the index does not hold. */
     private static final int NOT_FOUND = 404;
+    /** Documents a test creates and gets at once through the node that does not write their table. */
+    private static final int FRESH_GETS = 20;
+    /** Edits a test makes one after another, each conditioned on the get before it. */
+    private static final int CONDITIONED_SAVES = 10;
     /** Rounds of a write and a get of it on each node, in the get test. */
     private static final int GET_ROUNDS = 30;
     /** Settings that keep a write out of the table until a refresh: the table takes a write once the copies hold it durably, and the translog syncs only hourly. */
@@ -280,6 +284,42 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
             assertNumbers("node " + node + ", second index", written.get(1), (Map<String, Object>) docs.get(2));
             Map<String, Object> failed = (Map<String, Object>) docs.get(1);
             assertNotNull("node " + node + ": the item without a primary fails: " + failed, failed.get("error"));
+        }
+    }
+
+    /**
+     * In either mode, a realtime get and multi-get through the node that does
+     * not write the table find a document created moments before, with the
+     * numbers its write reported, and a write conditioned on what such a get
+     * reported is applied, edit after edit. In proxy mode that node's own view
+     * of the table may trail the writer's commits, so it reads the latest one.
+     */
+    @SuppressWarnings("unchecked")
+    public void testAGetThroughTheOtherNodeFindsADocumentCreatedMomentsBefore() throws IOException {
+        for (String mode : new String[] { "default", "proxy" }) {
+            String index = "multi_fresh_get_" + mode;
+            createIndex(index, ",\"index.infino.mode\":\"" + mode + "\"");
+            int writer = primaryNode(index);
+            int other = 1 - writer;
+            for (int i = 0; i < FRESH_GETS; i++) {
+                Request put = new Request("PUT", "/" + index + "/_doc/u" + i);
+                put.setJsonEntity("{\"n\":" + i + "}");
+                Map<String, Object> written = on(writer, put);
+                assertNumbers(mode + ", get of u" + i, written, on(other, new Request("GET", "/" + index + "/_doc/u" + i)));
+                Request mget = new Request("POST", "/" + index + "/_mget");
+                mget.setJsonEntity("{\"ids\":[\"u" + i + "\"]}");
+                assertNumbers(mode + ", mget of u" + i, written, (Map<String, Object>) ((List<?>) on(other, mget).get("docs")).get(0));
+            }
+            for (int i = 0; i < CONDITIONED_SAVES; i++) {
+                Map<String, Object> got = on(other, new Request("GET", "/" + index + "/_doc/u0"));
+                Request save = conditioned(
+                    new Request("PUT", "/" + index + "/_doc/u0"),
+                    ((Number) got.get("_seq_no")).longValue(),
+                    ((Number) got.get("_primary_term")).longValue()
+                );
+                save.setJsonEntity("{\"n\":" + (FRESH_GETS + i) + "}");
+                assertEquals(mode + ", save " + i, "updated", on(writer, save).get("result"));
+            }
         }
     }
 
