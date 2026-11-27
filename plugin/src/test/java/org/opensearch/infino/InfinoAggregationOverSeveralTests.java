@@ -19,6 +19,7 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Cardinality and percentiles over several tables read as one, as a search
@@ -130,6 +131,33 @@ public class InfinoAggregationOverSeveralTests extends OpenSearchTestCase {
         assertEquals("[infino] aggregation [c] on [user] over several indices that map it as different types is not served", e.getMessage());
         // A field of different kinds that the aggregations do not read is no reason to refuse.
         assertEquals(MEDIAN, median(WITH, USER_LONG), 1);
+    }
+
+    /**
+     * An index the search reads no row of (the security plugin's own) takes no
+     * part in an aggregation over several indices read as one: its columns
+     * would join the union's, so here its long {@code user} would meet the
+     * others' keyword one and refuse the cardinality.
+     */
+    public void testAnIndexReadOfNoRowTakesNoPartOverSeveral() {
+        Index a = new Index("over_several_a", "_na_");
+        Index b = new Index("over_several_b", "_na_");
+        Index unread = new Index("over_several_unread", "_na_");
+        Map<Index, String> tables = Map.of(a, WITH, b, WITHOUT, unread, USER_LONG);
+        SearchSourceBuilder source = new SearchSourceBuilder().size(0).aggregation(AggregationBuilders.cardinality("c").field("user"));
+        InfinoSearch.Searched searched = InfinoSearch.search(
+            List.of(a, b, unread),
+            tables::get,
+            index -> index.equals(unread) ? InfinoAccess.NO_ROWS : InfinoAccess.NONE,
+            source,
+            null,
+            null,
+            null,
+            null,
+            System.nanoTime()
+        );
+        InternalCardinality c = searched.response().getAggregations().get("c");
+        assertEquals(USERS, c.getValue());
     }
 
     public void testIntegersOfAnyWidthAreOneKind() {
