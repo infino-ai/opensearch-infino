@@ -103,6 +103,11 @@ public final class InfinoServices extends AbstractLifecycleComponent {
         // Which index each table backs, for the tables declared on the applier
         // thread too, where the state may not be read (see InfinoTables).
         clusterService.addListener(event -> InfinoPlugin.tables().observe(event.state().metadata()));
+        // Whether this node sees the cluster's storage: read, reported to the
+        // cluster manager, and checked before shards are allocated here (see
+        // InfinoStorageIdentity).
+        InfinoStorageIdentity.register(InfinoServices.transportService);
+        clusterService.addListener(InfinoStorageIdentity::onClusterChanged);
     }
 
     /** Whether the cluster would create an index a write names before it exists, as it decides for a stock bulk. */

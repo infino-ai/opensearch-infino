@@ -200,15 +200,22 @@ public final class InfinoWriter {
      * it was given, whether a document stood under its id just before it, and
      * what kept it out of the write (null when it was written): a conflict,
      * or for an update a missing document or a merged one the columns refuse.
+     * An update whose script deleted its document is {@code deleted}; one
+     * whose script wrote nothing carries the {@code noop} answer instead,
+     * and took no sequence number.
      */
-    private record Written(long seq, boolean existed, Exception rejection) {}
+    private record Written(long seq, boolean existed, Exception rejection, boolean deleted, UpdateResponse noop) {
+        Written(long seq, boolean existed, Exception rejection) {
+            this(seq, existed, rejection, false, null);
+        }
+    }
 
     /**
      * What a flush did: the ids the engine refused with the reason, what each
      * write became, and the ids whose delete failed after the append had
      * committed, with why (empty and null when every delete landed).
      */
-    private record Applied(Map<String, String> refused, Map<Outcome, Written> written, Set<String> undeleted, Exception deleteFailure) {}
+    private record Applied(Map<String, InfinoNative.PreparedFailure> refused, Map<Outcome, Written> written, Set<String> undeleted, Exception deleteFailure) {}
 
     /** Whether an outcome carries a row to append: its prepared batch holds these, in the bulk's order. */
     private static boolean carriesRow(Outcome o) {
@@ -407,19 +414,32 @@ public final class InfinoWriter {
      * commits, and the listener gets the whole bulk's response then.
      */
     void submit(String table, Waiter waiter) {
-        Pointer prepared = prepareRows(table, waiter);
-        if (prepared != null) {
-            boolean changed;
-            try {
-                changed = withMapperValues(waiter, prepared);
-            } catch (RuntimeException e) {
-                InfinoNative.freePrepared(prepared);
-                throw e;
+        Pointer prepared;
+        try {
+            prepared = prepareRows(table, waiter);
+            if (prepared != null) {
+                boolean changed;
+                try {
+                    changed = withMapperValues(waiter, prepared);
+                } catch (RuntimeException e) {
+                    InfinoNative.freePrepared(prepared);
+                    throw e;
+                }
+                if (changed) {
+                    InfinoNative.freePrepared(prepared);
+                    prepared = prepareRows(table, waiter);
+                }
             }
-            if (changed) {
-                InfinoNative.freePrepared(prepared);
-                prepared = prepareRows(table, waiter);
+        } catch (InfinoNative.InfinoException e) {
+            // With its status: a 503 when the hosted service could not be reached or did not answer in
+            // time, a 429 when it limited the account's request rate, each on the items a client retries.
+            RestStatus retry = e.retryStatus();
+            if (retry == null) {
+                waiter.listener().onFailure(e);
+            } else {
+                failWrites(waiter, e, retry);
             }
+            return;
         }
         List<String> ids = new ArrayList<>();
         long bytes = 0;
@@ -436,10 +456,6 @@ public final class InfinoWriter {
             } else if (o.write() != null && o.write().update() != null) {
                 updates++;
             }
-        }
-        if (!ids.isEmpty() && prepared == null) {
-            waiter.listener().onFailure(new IllegalStateException("[infino] the bridge could not prepare the batch for " + table));
-            return;
         }
         Staged staged = new Staged(waiter, prepared, ids, ids.size() + updates, bytes, named);
 
@@ -615,8 +631,13 @@ public final class InfinoWriter {
                 }
             } catch (Exception e) {
                 log.warn("[infino] append of {} bulks to {} failed", staged.size(), table, e);
+                RestStatus retry = e instanceof InfinoNative.InfinoException ie ? ie.retryStatus() : null;
                 for (Staged s : staged) {
-                    s.waiter().listener().onFailure(e);
+                    if (retry == null) {
+                        s.waiter().listener().onFailure(e);
+                    } else {
+                        failWrites(s.waiter(), e, retry);
+                    }
                 }
             }
             List<List<Staged>> more = new ArrayList<>();
@@ -674,6 +695,8 @@ public final class InfinoWriter {
                     lookups.add(o.write().id());
                 }
                 conditioned |= InfinoDocumentVersion.seqConditioned(o.item());
+                // A script's no-op answers with the document's sequence number, as stock does.
+                conditioned |= o.write().update() != null && o.write().update().script() != null;
             }
         }
         Set<String> existed;
@@ -754,6 +777,8 @@ public final class InfinoWriter {
                             ? standing.get(w.id())
                             : existed.contains(w.id()) ? stored.getOrDefault(w.id(), InfinoDocumentVersion.UNTRACKED_SEQ_NO) : null;
                         Exception rejection = rejection(shardId, o, current);
+                        // Whether this is an update whose script deleted its document.
+                        boolean deletes = false;
                         if (rejection == null && w.update() != null) {
                             // The base is the write before it in this batch, else the table,
                             // which holds every append of its id before this one: no running
@@ -762,10 +787,28 @@ public final class InfinoWriter {
                                 String base = documents.containsKey(w.id()) ? documents.get(w.id()) : current == null ? null
                                     : latest ? InfinoNative.getSourceLatest(table, w.id())
                                     : InfinoNative.getSourceFresh(table, w.id());
-                                String document = InfinoBulkActionFilter.merge(base, w.update());
-                                if (document == null) {
-                                    rejection = new DocumentMissingException(shardId, w.id());
+                                String document = null;
+                                if (w.update().script() == null) {
+                                    document = InfinoBulkActionFilter.merge(base, w.update());
                                 } else {
+                                    InfinoScriptedUpdate.Change change = null;
+                                    try {
+                                        change = InfinoScriptedUpdate.run(shardId, w.update(), base, current == null ? SequenceNumbers.UNASSIGNED_SEQ_NO : current, PRIMARY_TERM, VERSION);
+                                    } catch (RuntimeException e) {
+                                        // The script failed, or found no document and nothing to upsert: this update alone fails, as stock fails it.
+                                        rejection = e;
+                                    }
+                                    if (change != null && change.op() == InfinoScriptedUpdate.Op.NOOP) {
+                                        // The script writes nothing: the document stays as the writes before it left it.
+                                        written.put(o, new Written(SequenceNumbers.UNASSIGNED_SEQ_NO, current != null, null, false, change.noop()));
+                                        continue;
+                                    }
+                                    deletes = change != null && change.op() == InfinoScriptedUpdate.Op.DELETE;
+                                    document = change == null ? null : change.document();
+                                }
+                                if (rejection == null && !deletes && document == null) {
+                                    rejection = new DocumentMissingException(shardId, w.id());
+                                } else if (rejection == null && !deletes) {
                                     MapperService mappers = ignoring.computeIfAbsent(
                                         shardId,
                                         id -> Optional.ofNullable(InfinoIgnored.ignoring(id.getIndex()))
@@ -818,7 +861,7 @@ public final class InfinoWriter {
                         }
                         String document = merged.containsKey(o) ? merged.get(o) : w.source();
                         long seq = batch.nextSeq++;
-                        written.put(o, new Written(seq, current != null, null));
+                        written.put(o, new Written(seq, current != null, null, deletes, null));
                         standing.put(w.id(), document == null ? null : seq);
                         documents.put(w.id(), document);
                         if (last.put(w.id(), o) != null) {
@@ -842,7 +885,7 @@ public final class InfinoWriter {
             if (!existed.contains(w.id())) {
                 continue; // a new id: its row is appended, and there is nothing to replace
             }
-            if (w.deletes()) {
+            if (w.deletes() || written.get(o).deleted()) {
                 tombstones.add(w.id());
             } else {
                 replaced.add(w.id());
@@ -857,7 +900,7 @@ public final class InfinoWriter {
             // A read after the write must see the table, not a prefetched copy.
             InfinoNative.forgetSources(table, last.keySet());
         }
-        Map<String, String> refused = appended.refused();
+        Map<String, InfinoNative.PreparedFailure> refused = appended.refused();
         if (latest && appended.committed()) {
             readsCaughtUp(batch, latestSet);
         }
@@ -865,10 +908,25 @@ public final class InfinoWriter {
         // committed by now: when they fail, the appended writes are answered as
         // written and only the deletes as failed, so a client retries just those,
         // and a delete retried removes what it names.
+        RestStatus ended = endedBy(refused);
+        if (!tombstones.isEmpty() && ended != null) {
+            // The hosted service ended the append (a rate limit, or no answer): the
+            // deletes would meet the same service, so they are not sent, and are
+            // answered with the append's status for the client to send again.
+            boolean unanswered = ended == RestStatus.SERVICE_UNAVAILABLE;
+            RuntimeException notSent = new InfinoNative.InfinoException(
+                "[infino] delete of " + tombstones.size() + " ids from " + table + " was not sent: the hosted service "
+                    + (unanswered ? "did not answer the append before it" : "turned the append before it away for the account's request rate")
+                    + "; try again later",
+                ended,
+                unanswered
+            );
+            return new Applied(refused, written, Set.copyOf(tombstones), notSent);
+        }
         if (!tombstones.isEmpty()) {
             int rc = InfinoNative.deleteOsids(table, tombstones.toArray(new String[0]), tombstones.size());
             if (rc != 0) {
-                IllegalStateException failed = new IllegalStateException("[infino] delete of " + tombstones.size() + " ids from " + table + " returned " + rc);
+                RuntimeException failed = InfinoNative.deleteFailed(table, tombstones.size(), rc);
                 log.warn("[infino] the batch's writes to {} committed, its deletes did not", table, failed);
                 return new Applied(refused, written, Set.copyOf(tombstones), failed);
             }
@@ -956,8 +1014,8 @@ public final class InfinoWriter {
         InfinoNative.releaseLatest();
     }
 
-    /** What an append did: the documents the bridge refused, by id, and whether it committed any row. */
-    private record Appended(Map<String, String> refused, boolean committed) {}
+    /** What an append did: the documents the bridge did not take, by id, and whether it committed any row. */
+    private record Appended(Map<String, InfinoNative.PreparedFailure> refused, boolean committed) {}
 
     /** The copy of the batch's index that writes its table, as this node's cluster state names it; null when unknown. */
     private static String writerAllocation(List<Staged> staged) {
@@ -991,12 +1049,100 @@ public final class InfinoWriter {
     /** How the bridge's reason starts when a data stream's document lacks one timestamp. */
     static final String NO_TIMESTAMP = "documents must contain a single-valued timestamp field";
 
-    /** A document the bridge refused, answered as stock answers it: a data stream's document without one timestamp fails the parse. */
+    /**
+     * How the bridge's reasons start when a keyword value is too long for one term, in an indexed
+     * keyword or in one with doc values only: Lucene's own refusals, word for word, which stock
+     * answers as an {@code illegal_argument_exception}.
+     */
+    private static final List<String> TOO_LONG_FOR_ONE_TERM = List.of(
+        "Document contains at least one immense term in field=",
+        "DocValuesField \""
+    );
+
+    /** Whether the bridge's reason is Lucene's refusal of a keyword value too long for one term. */
+    static boolean tooLongForOneTerm(String why) {
+        return TOO_LONG_FOR_ONE_TERM.stream().anyMatch(why::startsWith);
+    }
+
+    /**
+     * A document the table's columns refused at a shard's write (default mode), answered as stock
+     * answers it: a keyword value too long for one term fails with Lucene's reason as it stands, any
+     * other refusal as a document the mapper could not parse.
+     */
+    static Exception refusedAtWrite(String why) {
+        return tooLongForOneTerm(why) ? new IllegalArgumentException(why) : new MapperParsingException("[infino] " + why);
+    }
+
+    /**
+     * A document the bridge refused, answered as stock answers it: a data stream's document without
+     * one timestamp fails the parse, and a keyword value too long for one term fails with Lucene's
+     * reason as it stands.
+     */
     static Exception refused(String why) {
         if (why.startsWith(NO_TIMESTAMP)) {
             return new MapperParsingException("failed to parse", new IllegalArgumentException(why));
         }
+        if (tooLongForOneTerm(why)) {
+            return new IllegalArgumentException(why);
+        }
         return new IllegalArgumentException("[infino] " + why);
+    }
+
+    /**
+     * The failure of a write the bridge did not take: a refusal of its
+     * document is a 400 ({@link #refused}), which a client does not send
+     * again; a document the hosted service turned away for the account's
+     * request rate is a 429, as a stock shard answers a write it has no room
+     * for, which a client sends again. The service wrote nothing of it, so
+     * the write sent again is stored once. A document whose call the service
+     * did not answer is a 503, which a client sends again too.
+     */
+    static BulkItemResponse.Failure notTaken(String index, String id, InfinoNative.PreparedFailure f) {
+        if (f.status() == null) {
+            return new BulkItemResponse.Failure(index, id, refused(f.reason()), RestStatus.BAD_REQUEST);
+        }
+        Exception cause = f.status() == RestStatus.TOO_MANY_REQUESTS
+            ? new OpenSearchRejectedExecutionException("[infino] the hosted service limited the account's request rate; send the write again: " + f.reason())
+            : new InfinoNative.InfinoException("[infino] " + f.reason(), f.status(), f.status() == RestStatus.SERVICE_UNAVAILABLE);
+        return new BulkItemResponse.Failure(index, id, cause, f.status());
+    }
+
+    /**
+     * The status under which the hosted service ended an append, when it
+     * did ({@link InfinoNative.PreparedFailure#status}): 429 or 503, the
+     * first a document of it carries; null when the append ran to its end.
+     * A document refused for a column its batch was typed without carries a
+     * 503 for a later try ({@link InfinoNative.PreparedFailure#staleSchema}),
+     * but the service answered that append, so it ended nothing.
+     */
+    static RestStatus endedBy(Map<String, InfinoNative.PreparedFailure> notTaken) {
+        for (InfinoNative.PreparedFailure f : notTaken.values()) {
+            if (f.status() != null && !f.staleSchema()) {
+                return f.status();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Answer {@code w} with each of its writes failed by {@code e} under
+     * {@code status} and each item answered up front as it was: the append
+     * that carried them met a hosted service that did not answer or limited
+     * the account's request rate ({@link InfinoNative.InfinoException#retryStatus}).
+     * A client sends such items again, as it does a stock shard's writes it
+     * had no room for; failing the bulk whole would also lose the answers of
+     * the items refused up front, which it must not send again.
+     */
+    static void failWrites(Waiter w, Exception e, RestStatus status) {
+        for (Outcome o : w.outcomes()) {
+            if (o.answered() != null) {
+                w.items()[o.slot()] = o.answered();
+                continue;
+            }
+            String id = o.write() == null ? o.item().id() : o.write().id();
+            w.items()[o.slot()] = new BulkItemResponse(o.slot(), o.item().opType(), new BulkItemResponse.Failure(w.indexName(), id, e, status));
+        }
+        w.listener().onResponse(new BulkResponse(w.items(), (System.nanoTime() - w.startNanos()) / 1_000_000L));
     }
 
     /** The prepared batches as one commit, each row under the sequence number its write was given; a refused document is reported under its id. */
@@ -1011,7 +1157,7 @@ public final class InfinoWriter {
                 docs += s.preparedIds().size();
             }
         }
-        Map<String, String> refused = new HashMap<>();
+        Map<String, InfinoNative.PreparedFailure> refused = new HashMap<>();
         if (handles.isEmpty()) {
             return new Appended(refused, false);
         }
@@ -1028,7 +1174,7 @@ public final class InfinoWriter {
         InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, handles, replaced, seqs);
         long millis = (System.nanoTime() - start) / 1_000_000L;
         for (InfinoNative.PreparedFailure f : result.failed()) {
-            refused.put(withRows.get(f.batch()).preparedIds().get(f.index()), f.reason());
+            refused.put(withRows.get(f.batch()).preparedIds().get(f.index()), f);
         }
         log.debug("[infino] appended {} of {} documents to {} in {} ms ({} bulks)", result.ok(), docs, table, millis, handles.size());
         return new Appended(refused, result.ok() > 0);
@@ -1069,18 +1215,15 @@ public final class InfinoWriter {
                 seqs.add(written.get(o).seq());
             }
         }
-        Map<String, String> refused = new HashMap<>();
+        Map<String, InfinoNative.PreparedFailure> refused = new HashMap<>();
         if (ids.isEmpty()) {
             return new Appended(refused, false);
         }
         Pointer prepared = InfinoNative.prepare(table, ids, sources, ignored);
-        if (prepared == null) {
-            throw new IllegalStateException("[infino] the bridge could not prepare the folded batch for " + table);
-        }
         long[] numbers = seqs.stream().mapToLong(Long::longValue).toArray();
         InfinoNative.PreparedResult result = InfinoNative.appendPrepared(table, List.of(prepared), replaced, numbers);
         for (InfinoNative.PreparedFailure f : result.failed()) {
-            refused.put(ids.get(f.index()), f.reason());
+            refused.put(ids.get(f.index()), f);
         }
         log.debug("[infino] appended {} of {} documents to {} (folded: an id appeared twice in the batch, or a write met a conflict)", result.ok(), ids.size(), table);
         return new Appended(refused, result.ok() > 0);
@@ -1106,25 +1249,30 @@ public final class InfinoWriter {
                 );
                 continue;
             }
-            if (write.deletes() && applied.undeleted().contains(write.id())) {
+            if (done.noop() != null) {
+                // An update whose script wrote nothing: stock's no-op answer.
+                w.items()[o.slot()] = new BulkItemResponse(o.slot(), o.item().opType(), done.noop());
+                continue;
+            }
+            boolean deletes = write.deletes() || done.deleted();
+            if (deletes && applied.undeleted().contains(write.id())) {
+                // A 429 or 503 when the hosted service turned the delete away or did not answer, else a 500.
                 w.items()[o.slot()] = new BulkItemResponse(
                     o.slot(),
                     o.item().opType(),
-                    new BulkItemResponse.Failure(w.indexName(), write.id(), applied.deleteFailure(), RestStatus.INTERNAL_SERVER_ERROR)
+                    new BulkItemResponse.Failure(w.indexName(), write.id(), applied.deleteFailure(), ExceptionsHelper.status(applied.deleteFailure()))
                 );
                 continue;
             }
-            String why = applied.refused().get(write.id());
-            if (why != null) {
-                w.items()[o.slot()] = new BulkItemResponse(
-                    o.slot(),
-                    o.item().opType(),
-                    new BulkItemResponse.Failure(w.indexName(), write.id(), refused(why), RestStatus.BAD_REQUEST)
-                );
+            InfinoNative.PreparedFailure notTaken = applied.refused().get(write.id());
+            if (notTaken != null) {
+                w.items()[o.slot()] = new BulkItemResponse(o.slot(), o.item().opType(), notTaken(w.indexName(), write.id(), notTaken));
                 continue;
             }
             DocWriteResponse r;
-            if (write.deletes()) {
+            if (done.deleted()) {
+                r = new UpdateResponse(w.shardId(), write.id(), done.seq(), PRIMARY_TERM, VERSION, DocWriteResponse.Result.DELETED);
+            } else if (write.deletes()) {
                 r = new DeleteResponse(w.shardId(), write.id(), done.seq(), PRIMARY_TERM, VERSION, done.existed());
             } else if (o.item() instanceof UpdateRequest) {
                 r = new UpdateResponse(

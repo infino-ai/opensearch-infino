@@ -304,9 +304,6 @@ final class InfinoRegistry {
         }
         List<String> replaced = held == 1 ? List.of(id) : List.of();
         Pointer prepared = InfinoNative.prepare(TABLE, List.of(id), List.of(source));
-        if (prepared == null) {
-            throw new IllegalStateException("the registry row could not be prepared");
-        }
         // The registry's rows are the node's own bookkeeping: no client conditions a write on them.
         InfinoNative.PreparedResult result = InfinoNative.appendPrepared(TABLE, List.of(prepared), replaced, null);
         if (!result.failed().isEmpty()) {
