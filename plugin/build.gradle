@@ -179,6 +179,15 @@ def yamlSuiteRunner = 'org.opensearch.infino.InfinoClientYamlTestSuiteIT'
 def multiNodeTask = 'multiNodeTest'
 def multiNodeTests = 'org.opensearch.infino.InfinoMultiNodeWriteIT'
 def multiNodeData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-multinode"
+// Every node must see the cluster's storage. The storage test runs on the
+// multi-node cluster above (one catalog both nodes share) and again on a
+// two-node cluster whose nodes each keep a catalog of their own, where a
+// copy on the node that sees the other catalog must stay unassigned. That
+// node cannot read the security plugin's index either, so that cluster
+// runs without the security plugin.
+def unsharedTask = 'unsharedStorageTest'
+def storageTests = 'org.opensearch.infino.InfinoUnsharedStorageIT'
+def unsharedData = "${layout.buildDirectory.get().asFile.absolutePath}/infino-catalog-unshared"
 
 // The test cluster runs the security plugin, enabled, with the demo node
 // certificates on the transport layer and plain HTTP with basic
@@ -352,6 +361,17 @@ testClusters.matching { it.name == multiNodeTask }.all {
     systemProperty 'infino.data', System.getProperty('infino.data', multiNodeData)
 }
 
+testClusters.maybeCreate(unsharedTask)
+testClusters.matching { it.name == unsharedTask }.all {
+    numberOfNodes = 2
+    plugin(tasks.named('bundlePlugin').flatMap { it.archiveFile })
+    setting 'plugins.security.disabled', 'true'
+    nodes.each { node ->
+        node.systemProperty 'infino.uri', "file://${unsharedData}/${node.name}"
+        node.systemProperty 'infino.data', "${unsharedData}/${node.name}"
+    }
+}
+
 // The stock suites' clusters, one per mode, each over its own catalog. The
 // lucene one is the same cluster without the plugin: a test failing there
 // fails for the cluster (the security plugin, the single node), not for Infino.
@@ -409,6 +429,7 @@ tasks.named('yamlRestTest').configure {
         excludeTestsMatching knnTests
         excludeTestsMatching replicaTests
         excludeTestsMatching multiNodeTests
+        excludeTestsMatching storageTests
     }
     def catalog = System.getProperty('infino.uri', defaultUri)
     def fixture = System.getProperty('infino.fixture', defaultFixture)
@@ -471,11 +492,27 @@ def multiNodeTest = tasks.register(multiNodeTask, RestIntegTestTask) {
     group = 'verification'
     testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
     classpath = sourceSets.yamlRestTest.runtimeClasspath
+    systemProperty 'tests.infino.storage.shared', 'true'
     filter {
         includeTestsMatching multiNodeTests
+        includeTestsMatching storageTests
     }
     doFirst {
         delete multiNodeData
+    }
+}
+
+def unsharedStorageTest = tasks.register(unsharedTask, RestIntegTestTask) {
+    description = 'Runs the storage test on a two-node cluster whose nodes each keep their own catalog.'
+    group = 'verification'
+    testClassesDirs = sourceSets.yamlRestTest.output.classesDirs
+    classpath = sourceSets.yamlRestTest.runtimeClasspath
+    systemProperty 'tests.infino.storage.shared', 'false'
+    filter {
+        includeTestsMatching storageTests
+    }
+    doFirst {
+        delete unsharedData
     }
 }
 tasks.named('check').configure {
@@ -483,4 +520,5 @@ tasks.named('check').configure {
     dependsOn engineReplicaTest
     dependsOn engineReplicaStaleReadTest
     dependsOn multiNodeTest
+    dependsOn unsharedStorageTest
 }

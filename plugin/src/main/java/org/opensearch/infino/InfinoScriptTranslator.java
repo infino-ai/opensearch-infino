@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
+import static org.opensearch.infino.InfinoQueryTranslator.listOf;
 import static org.opensearch.infino.InfinoQueryTranslator.literal;
 import static org.opensearch.infino.InfinoQueryTranslator.quoteIdent;
 
@@ -865,9 +866,20 @@ final class InfinoScriptTranslator {
             return c == null ? new Sql("NULL", SqlType.UNKNOWN) : Sql.of(c);
         }
         String col = c == null ? "NULL" : quoteIdent(c.name());
+        // A document that gave the field several values holds them in its list
+        // column, its own column null: they count, as stock counts each value.
+        // The count is cast to a signed integer, as the other arms are: a
+        // list's cardinality is unsigned, which a script field would answer as text.
+        Column list = c == null ? null : c.isList() ? c : listOf(cols, c);
+        String own = c == null || c.isList() ? "NULL" : col;
+        String values = list == null ? null : quoteIdent(list.name());
+        String size = values == null
+            ? "CASE WHEN " + col + " IS NULL THEN 0 ELSE 1 END"
+            : "CASE WHEN " + values + " IS NOT NULL THEN CAST(cardinality(" + values + ") AS BIGINT) WHEN " + own + " IS NOT NULL THEN 1 ELSE 0 END";
+        String empty = values == null ? "(" + col + " IS NULL)" : "(" + own + " IS NULL AND " + values + " IS NULL)";
         return switch (property) {
-            case "size", "length" -> new Sql("CASE WHEN " + col + " IS NULL THEN 0 ELSE 1 END", SqlType.INT);
-            case "empty", "isEmpty" -> new Sql("(" + col + " IS NULL)", SqlType.BOOL);
+            case "size", "length" -> new Sql(size, SqlType.INT);
+            case "empty", "isEmpty" -> new Sql(empty, SqlType.BOOL);
             default -> throw refuse("reads doc['" + field + "']." + property + ", which is not served; .value, .size() and .empty are");
         };
     }

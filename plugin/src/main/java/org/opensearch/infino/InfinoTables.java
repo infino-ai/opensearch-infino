@@ -71,6 +71,12 @@ public final class InfinoTables {
     /** Where a table's mapping declares the columns its engine writes, which the bridge keeps apart from the fields. */
     private static final String ENGINE_COLUMNS = "_engine_columns";
     private static final String TYPE = "type";
+    /**
+     * The root settings of a mapping that say what it indexes of a document
+     * ({@code dynamic: false}, {@code enabled: false}): the bridge keeps a
+     * field they leave out of the index in the source only, with no column.
+     */
+    private static final List<String> INDEXING_SETTINGS = List.of("dynamic", "enabled");
     private static final String KEYWORD = "keyword";
     private static final String LONG = "long";
     /**
@@ -382,18 +388,20 @@ public final class InfinoTables {
      * sequence number column every table has does. An edge index's table
      * declares its edge columns as the engine's graph walks read them,
      * whatever the mapping says of them: the tables as strings, the ids as
-     * the engine's id type.
+     * the engine's id type. The mapping's root {@code dynamic} and
+     * {@code enabled} go along ({@link #INDEXING_SETTINGS}).
      */
     @SuppressWarnings("unchecked")
-    private static String tableMapping(IndexMetadata md) {
+    static String tableMapping(IndexMetadata md) {
         MappingMetadata mapping = md.mapping();
         boolean stamped = InfinoPlugin.inDefaultMode(md.getSettings());
         boolean edges = InfinoPlugin.INFINO_EDGES.get(md.getSettings());
         if (!stamped && !edges) {
             return mapping == null ? "{}" : mapping.source().string();
         }
+        Map<String, Object> source = mapping == null ? Map.of() : mapping.sourceAsMap();
         Map<String, Object> properties = new LinkedHashMap<>();
-        Object declared = mapping == null ? null : mapping.sourceAsMap().get(PROPERTIES);
+        Object declared = source.get(PROPERTIES);
         if (declared instanceof Map<?, ?> m) {
             properties.putAll((Map<String, Object>) m);
         }
@@ -403,6 +411,12 @@ public final class InfinoTables {
         }
         Map<String, Object> table = new LinkedHashMap<>();
         table.put(PROPERTIES, properties);
+        for (String setting : INDEXING_SETTINGS) {
+            Object value = source.get(setting);
+            if (value != null) {
+                table.put(setting, value);
+            }
+        }
         if (stamped) {
             Map<String, Object> engine = new LinkedHashMap<>();
             engine.put(InfinoQueryTranslator.ROUTING, Map.of(TYPE, KEYWORD));
@@ -411,7 +425,7 @@ public final class InfinoTables {
             table.put(ENGINE_COLUMNS, engine);
         }
         // A data stream's timestamp field, which the bridge requires of each document.
-        Object stream = mapping == null ? null : mapping.sourceAsMap().get(DataStreamFieldMapper.NAME);
+        Object stream = source.get(DataStreamFieldMapper.NAME);
         if (stream != null) {
             table.put(DataStreamFieldMapper.NAME, stream);
         }
