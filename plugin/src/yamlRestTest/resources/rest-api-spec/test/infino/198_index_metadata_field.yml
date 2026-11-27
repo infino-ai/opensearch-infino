@@ -910,3 +910,183 @@
   - do:
       count: { index: ixfl_prx, body: { query: { query_string: { query: other_index, default_field: _index } } } }
   - match: { count: 0 }
+
+---
+"_index over indices of two shards each, Lucene twin":
+  - do:
+      indices.create:
+        index: ixs_a_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { service: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixs_a_luc
+        body:
+          - index: { _id: "1" }
+          - { service: api }
+          - index: { _id: "2" }
+          - { service: db }
+          - index: { _id: "3" }
+          - { service: web }
+          - index: { _id: "4" }
+          - { service: api }
+  - do:
+      indices.create:
+        index: ixs_b_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { service: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixs_b_luc
+        body:
+          - index: { _id: "1" }
+          - { service: api }
+          - index: { _id: "2" }
+          - { service: db }
+  - do:
+      search:
+        index: "ixs_a_luc,ixs_b_luc"
+        body: { size: 0, aggs: { t: { terms: { field: _index } }, n: { value_count: { field: _index } }, c: { cardinality: { field: _index } } } }
+  - match: { hits.total.value: 6 }
+  - length: { aggregations.t.buckets: 2 }
+  - match: { aggregations.t.buckets.0.key: ixs_a_luc }
+  - match: { aggregations.t.buckets.0.doc_count: 4 }
+  - match: { aggregations.t.buckets.1.key: ixs_b_luc }
+  - match: { aggregations.t.buckets.1.doc_count: 2 }
+  - match: { aggregations.n.value: 6 }
+  - match: { aggregations.c.value: 2 }
+  - do:
+      count: { index: "ixs_a_luc,ixs_b_luc", body: { query: { term: { _index: ixs_a_luc } } } }
+  - match: { count: 4 }
+  - do:
+      search:
+        index: "ixs_a_luc,ixs_b_luc"
+        body: { size: 0, query: { term: { service: api } }, aggs: { t: { terms: { field: _index } } } }
+  - match: { aggregations.t.buckets.0.key: ixs_a_luc }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.1.key: ixs_b_luc }
+  - match: { aggregations.t.buckets.1.doc_count: 1 }
+
+---
+"_index over indices of two shards each, default mode":
+  - do:
+      indices.create:
+        index: ixs_a_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { service: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixs_a_def
+        body:
+          - index: { _id: "1" }
+          - { service: api }
+          - index: { _id: "2" }
+          - { service: db }
+          - index: { _id: "3" }
+          - { service: web }
+          - index: { _id: "4" }
+          - { service: api }
+  - do:
+      indices.create:
+        index: ixs_b_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { service: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixs_b_def
+        body:
+          - index: { _id: "1" }
+          - { service: api }
+          - index: { _id: "2" }
+          - { service: db }
+  - do:
+      search:
+        index: "ixs_a_def,ixs_b_def"
+        body: { size: 0, aggs: { t: { terms: { field: _index } }, n: { value_count: { field: _index } }, c: { cardinality: { field: _index } } } }
+  - match: { hits.total.value: 6 }
+  - length: { aggregations.t.buckets: 2 }
+  - match: { aggregations.t.buckets.0.key: ixs_a_def }
+  - match: { aggregations.t.buckets.0.doc_count: 4 }
+  - match: { aggregations.t.buckets.1.key: ixs_b_def }
+  - match: { aggregations.t.buckets.1.doc_count: 2 }
+  - match: { aggregations.n.value: 6 }
+  - match: { aggregations.c.value: 2 }
+  - do:
+      count: { index: "ixs_a_def,ixs_b_def", body: { query: { term: { _index: ixs_a_def } } } }
+  - match: { count: 4 }
+  - do:
+      search:
+        index: "ixs_a_def,ixs_b_def"
+        body: { size: 0, query: { term: { service: api } }, aggs: { t: { terms: { field: _index } } } }
+  - match: { aggregations.t.buckets.0.key: ixs_a_def }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.1.key: ixs_b_def }
+  - match: { aggregations.t.buckets.1.doc_count: 1 }
+
+---
+"_index over indices of two shards each, proxy mode":
+  - do:
+      indices.create:
+        index: ixs_a_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { service: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixs_a_prx
+        body:
+          - index: { _id: "1" }
+          - { service: api }
+          - index: { _id: "2" }
+          - { service: db }
+          - index: { _id: "3" }
+          - { service: web }
+          - index: { _id: "4" }
+          - { service: api }
+  - do:
+      indices.create:
+        index: ixs_b_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { service: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ixs_b_prx
+        body:
+          - index: { _id: "1" }
+          - { service: api }
+          - index: { _id: "2" }
+          - { service: db }
+  - do:
+      search:
+        index: "ixs_a_prx,ixs_b_prx"
+        body: { size: 0, aggs: { t: { terms: { field: _index } }, n: { value_count: { field: _index } }, c: { cardinality: { field: _index } } } }
+  - match: { hits.total.value: 6 }
+  - length: { aggregations.t.buckets: 2 }
+  - match: { aggregations.t.buckets.0.key: ixs_a_prx }
+  - match: { aggregations.t.buckets.0.doc_count: 4 }
+  - match: { aggregations.t.buckets.1.key: ixs_b_prx }
+  - match: { aggregations.t.buckets.1.doc_count: 2 }
+  - match: { aggregations.n.value: 6 }
+  - match: { aggregations.c.value: 2 }
+  - do:
+      count: { index: "ixs_a_prx,ixs_b_prx", body: { query: { term: { _index: ixs_a_prx } } } }
+  - match: { count: 4 }
+  - do:
+      search:
+        index: "ixs_a_prx,ixs_b_prx"
+        body: { size: 0, query: { term: { service: api } }, aggs: { t: { terms: { field: _index } } } }
+  - match: { aggregations.t.buckets.0.key: ixs_a_prx }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.1.key: ixs_b_prx }
+  - match: { aggregations.t.buckets.1.doc_count: 1 }
