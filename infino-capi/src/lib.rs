@@ -32,6 +32,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod attached;
+mod range_field;
 mod read_sql;
 
 use std::borrow::Cow;
@@ -68,6 +69,7 @@ use infino::{
     ConnectOptions, Connection, Consistency, FieldPatch, FtsField, IndexSpec, InfinoError, Metric,
     MutationStats, OptimizeOptions, SchemaError, SchemaPatch, Supertable, TableSchema,
 };
+use range_field::RangeKind;
 use rayon::prelude::*;
 
 /// The OpenSearch `_id` of a row.
@@ -1588,6 +1590,10 @@ struct MappedField {
     /// What OpenSearch accepts of an `ip` or narrow integer field beyond what
     /// its column takes.
     valid: Option<Valid>,
+    /// One of the two hidden columns of a range field ([`range_field`]),
+    /// which a table made outside the plugin never holds: an attached index
+    /// keeps the field in `_source` only.
+    range_end: bool,
 }
 
 impl MappedField {
@@ -2085,6 +2091,26 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
         };
         let ty = def.get("type").and_then(|t| t.as_str());
         let indexed = def.get("index").and_then(|i| i.as_bool()) != Some(false);
+        if let Some(kind) = ty.and_then(|ty| RangeKind::of(ty, def)) {
+            // A range is kept as its two ends, each a column of its own.
+            for end in [range_field::FROM, range_field::TO] {
+                out.push(MappedField {
+                    path: range_field::column(&path, end),
+                    data_type: kind.data_type(),
+                    fts: false,
+                    exact: false,
+                    vector: None,
+                    range: indexed,
+                    precision: None,
+                    date_formats: None,
+                    keyword: None,
+                    multi: Vec::new(),
+                    valid: None,
+                    range_end: true,
+                });
+            }
+            continue;
+        }
         let ranged = matches!(
             ty,
             Some("date")
@@ -2161,6 +2187,7 @@ fn walk_properties(props: &Map<String, Value>, prefix: &str, out: &mut Vec<Mappe
             keyword: (ty == Some("keyword")).then(|| KeywordIndexing::of(def)),
             multi,
             valid: ty.and_then(Valid::of),
+            range_end: false,
         });
     }
 }
@@ -2255,6 +2282,9 @@ enum Property {
     Field,
     /// A field kept whole, as one string ([`WHOLE_TYPES`]).
     Whole(Whole),
+    /// A range field, kept as its two ends ([`range_field`]); none for an
+    /// `ip_range`, which is kept in `_source` only.
+    Range(Option<RangeKind>),
     /// An object, with its own rule.
     Object(Indexed),
 }
@@ -2325,6 +2355,8 @@ enum Step<'a> {
     Drop,
     /// Kept whole, as one string.
     Whole(Whole),
+    /// A range field's value, read into its two ends by [`conform_doc`].
+    Range(&'a RangeKind),
     /// Kept only at the paths the table already holds a column for
     /// ([`Dynamic::Held`]).
     Held,
@@ -2350,6 +2382,9 @@ impl Indexed {
                 };
                 let property = match field.get("type").and_then(Value::as_str) {
                     None | Some("object") | Some("nested") => Property::Object(Self::object(field)),
+                    Some(ty) if range_field::is_range_type(ty) => {
+                        Property::Range(RangeKind::of(ty, field))
+                    }
                     Some(ty) => match WHOLE_TYPES.iter().find(|(whole, _)| *whole == ty) {
                         Some((_, whole)) => Property::Whole(*whole),
                         None => Property::Field,
@@ -2375,7 +2410,7 @@ impl Indexed {
             || matches!(self.dynamic, Some(Dynamic::Dropped | Dynamic::Held))
             || self.properties.values().any(|p| match p {
                 Property::Field => false,
-                Property::Whole(_) => true,
+                Property::Whole(_) | Property::Range(_) => true,
                 Property::Object(child) => child.acts,
             })
     }
@@ -2451,6 +2486,11 @@ impl Indexed {
                 }
                 // A path beneath a field kept whole is no value of its own.
                 Some((_, Property::Whole(_))) => return Step::Drop,
+                Some((end, Property::Range(Some(kind)))) if end == rest.len() => {
+                    return Step::Range(kind)
+                }
+                // An `ip_range`, or a path beneath a range field: no column.
+                Some((_, Property::Range(_))) => return Step::Drop,
                 Some((_, Property::Object(child))) if child.disabled => return Step::Drop,
                 Some((end, Property::Object(child))) => {
                     dynamic = child.dynamic.unwrap_or(dynamic);
@@ -2697,9 +2737,11 @@ fn declare_table(
                         attached::SCORE
                     ));
                 }
+                // A range field's two ends are columns only the plugin makes:
+                // over another's table, the field is kept in `_source` only.
                 let missing: Vec<&str> = mapped
                     .iter()
-                    .filter(|f| schema.field_with_name(&f.path).is_err())
+                    .filter(|f| !f.range_end && schema.field_with_name(&f.path).is_err())
                     .map(|f| f.path.as_str())
                     .collect();
                 if !missing.is_empty() {
@@ -3025,6 +3067,9 @@ struct Flattening<'a> {
     columns: Option<&'a Columns>,
     /// The paths of the fields kept whole ([`Whole`]).
     whole: Vec<String>,
+    /// The paths of the range fields, each with its type: the row holds
+    /// each one's value as written until [`conform_doc`] reads it.
+    ranges: Vec<(String, RangeKind)>,
     /// The paths kept because a column holds them ([`Dynamic::Held`]).
     held: Vec<String>,
 }
@@ -3058,6 +3103,14 @@ fn flatten_by(
                         let path = path();
                         f.whole.push(path.clone());
                         out.insert(path, kept);
+                    }
+                    continue;
+                }
+                Step::Range(kind) => {
+                    if !holds_nothing(v) {
+                        let path = path();
+                        f.ranges.push((path.clone(), kind.clone()));
+                        out.insert(path, v.clone());
                     }
                     continue;
                 }
@@ -3773,6 +3826,28 @@ fn conform_doc(
                 Some(_) => {
                     flat.remove(path);
                 }
+            }
+        }
+        // A range field's value goes in as its two ends ([`range_field`]):
+        // one value each for one range, a list each, in the same order, for
+        // several. A field of an array of objects is seen once per object.
+        let mut read: HashSet<&str> = HashSet::new();
+        for (path, kind) in &f.ranges {
+            if !read.insert(path.as_str()) {
+                continue;
+            }
+            let Some(value) = flat.remove(path) else {
+                continue;
+            };
+            let ends = range_field::ranges(path, kind, &value)?;
+            let (from, to): (Vec<Value>, Vec<Value>) = ends.into_iter().unzip();
+            for (end, mut values) in [(range_field::FROM, from), (range_field::TO, to)] {
+                let value = match values.len() {
+                    0 => continue,
+                    1 => values.pop().unwrap_or(Value::Null),
+                    _ => Value::Array(values),
+                };
+                flat.insert(range_field::column(path, end), value);
             }
         }
     }
@@ -14224,6 +14299,60 @@ mod tests {
         assert_eq!(check(h, doc), "");
         assert_eq!(index(h, &[("new", doc)])["ok"], 1);
         assert_eq!(get(h, "new"), doc);
+        close(h);
+    }
+
+    /// A range field is kept as its two ends, both inclusive, in hidden
+    /// columns under its path: an exclusive bound as the next value inside
+    /// it, a bound left out as the least or greatest value, and several
+    /// ranges as the two columns' lists, in the same order, so the engine
+    /// reads them back pair by pair. An `ip_range` has no columns. A value
+    /// OpenSearch's mapper refuses is refused (#314).
+    #[test]
+    fn a_range_field_is_kept_as_its_two_ends() {
+        let h = open_storage();
+        let mapping = r#"{"properties":{"r":{"type":"long_range"},"d":{"type":"date_range"},"ip":{"type":"ip_range"},"o":{"properties":{"r":{"type":"integer_range"}}}}}"#;
+        assert!(ensure(h, mapping).contains("\"created\":true"));
+        let docs = [
+            ("a", r#"{"r":{"gte":1,"lt":5},"d":{"gte":"2016-01-01","lt":"2016-01-02"},"ip":"10.0.0.0/8"}"#),
+            ("b", r#"{"r":[{"gt":7},{"lte":-3}],"ip":{"gte":"10.0.0.1"}}"#),
+            ("c", r#"{"r":null,"o":[{"r":{"gte":2,"lte":3}},{"r":{"gte":9,"lte":9}}]}"#),
+        ];
+        assert_eq!(index(h, &docs)["ok"], 3);
+        assert_eq!(get(h, "a"), docs[0].1);
+        let names: Vec<String> = columns(h).as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap().to_string()).collect();
+        assert!(!names.iter().any(|n| n == "ip" || n.starts_with("ip.")), "{names:?}");
+        assert!(!names.iter().any(|n| n == "r" || n == "r.gte" || n == "r.gt"), "{names:?}");
+        let rows = sql(h, r#"SELECT osid, "r.from", "r.to" FROM logs ORDER BY osid"#);
+        assert_eq!((&rows[0]["r.from"], &rows[0]["r.to"]), (&json!(1), &json!(4)), "{rows}");
+        assert!(rows[1]["r.from"].is_null() && rows[2]["r.from"].is_null(), "{rows}");
+        let dates = sql(
+            h,
+            r#"SELECT osid FROM logs WHERE "d.from" = arrow_cast(1451606400000, 'Timestamp(Millisecond, Some("UTC"))') AND "d.to" = arrow_cast(1451692799999, 'Timestamp(Millisecond, Some("UTC"))')"#,
+        );
+        assert_eq!(dates, json!([{"osid": "a"}]));
+        // The lists pair up row by row when unnested side by side, as the plugin reads them.
+        let pairs = sql(
+            h,
+            r#"SELECT osid, unnest("r.from[]") AS l, unnest("r.to[]") AS u FROM logs WHERE "r.from[]" IS NOT NULL ORDER BY l"#,
+        );
+        assert_eq!(pairs, json!([{"osid": "b", "l": i64::MIN, "u": -3}, {"osid": "b", "l": 8, "u": i64::MAX}]));
+        let nested = sql(
+            h,
+            r#"SELECT osid, unnest("o.r.from[]") AS l, unnest("o.r.to[]") AS u FROM logs WHERE "o.r.from[]" IS NOT NULL ORDER BY l"#,
+        );
+        assert_eq!(nested, json!([{"osid": "c", "l": 2, "u": 3}, {"osid": "c", "l": 9, "u": 9}]));
+        // A value from each step between a range's ends, as a histogram reads one.
+        let steps = sql(
+            h,
+            r#"SELECT unnest(generate_series(0, CAST(CEIL((CAST("r.to" AS DOUBLE) - CAST("r.from" AS DOUBLE)) / 2.0) AS BIGINT))) AS i FROM logs WHERE "r.from" IS NOT NULL"#,
+        );
+        assert_eq!(steps, json!([{"i": 0}, {"i": 1}, {"i": 2}]));
+        assert!(check(h, r#"{"r":{"gt":5,"lt":6}}"#).ends_with("min value (6) is greater than max value (5)"));
+        assert_eq!(check(h, r#"{"r":{"from":1}}"#), "error parsing field [r], with unknown parameter [from]");
+        assert_eq!(check(h, r#"{"r":5}"#), "error parsing field [r], expected an object but got r");
+        assert!(check(h, r#"{"d":{"gte":"not a date"}}"#).contains("failed to parse date field"));
+        assert_eq!(check(h, r#"{"ip":"bad"}"#), "");
         close(h);
     }
 
