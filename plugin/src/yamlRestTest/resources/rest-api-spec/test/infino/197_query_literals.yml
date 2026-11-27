@@ -359,18 +359,16 @@ teardown:
   - match: { hits.total.value: 1 }
 
 ---
-"An IPv6 CIDR block is refused":
+"An IPv6 CIDR block in a term on an ip field matches the addresses it covers":
   - do:
       search: { index: lit_luc, body: { query: { term: { a: "2001:db8::/32" } } } }
   - match: { hits.total.value: 1 }
   - do:
-      catch: bad_request
       search: { index: lit_prx, body: { query: { term: { a: "2001:db8::/32" } } } }
-  - match: { error.root_cause.0.reason: "/.*a.term.with.the.IPv6.CIDR.block..2001:db8::.32..on..a..is.not.served.*/" }
+  - match: { hits.total.value: 1 }
   - do:
-      catch: bad_request
       search: { index: lit_def, body: { query: { term: { a: "2001:db8::/32" } } } }
-  - match: { error.root_cause.0.reason: "/.*a.term.with.the.IPv6.CIDR.block..2001:db8::.32..on..a..is.not.served.*/" }
+  - match: { hits.total.value: 1 }
 
 ---
 "A search option the table cannot serve is refused, naming it":
