@@ -57,11 +57,12 @@ public class InfinoUnsharedStorageIT extends InfinoRestTestCase {
 
     /**
      * An index of one shard and one replica: on separate directories the
-     * replica is never allocated, the node with no copy counts every document
-     * through the primary, and its get is refused rather than answered
-     * missing. Before, the replica was allocated to the other node, read that
-     * node's empty directory, and answered {@code _count?preference=_replica}
-     * with 0 and a 200.
+     * replica is never allocated, and the node with no copy counts every
+     * document through the primary and sends its get on to the primary's
+     * node, which answers it from the cluster's storage, as stock answers a
+     * get through a node holding no copy. Before, the replica was allocated
+     * to the other node, read that node's empty directory, and answered
+     * {@code _count?preference=_replica} with 0 and a 200.
      */
     public void testAReplicaReadsTheClustersStorageOrIsNotAllocated() throws Exception {
         String index = "storage_check";
@@ -135,10 +136,9 @@ public class InfinoUnsharedStorageIT extends InfinoRestTestCase {
             assertTrue(reason, reason.contains(NOT_SHARED) && reason.contains("file://"));
         }, ALLOCATION_SECONDS, TimeUnit.SECONDS);
         assertEquals("yellow", call("GET", "/_cluster/health/" + index, null).get("status"));
-        assertEquals(true, on(primary, new Request("GET", "/" + index + "/_doc/d1")).get("found"));
-        ResponseException refused = expectThrows(ResponseException.class, () -> on(other, new Request("GET", "/" + index + "/_doc/d1")));
-        assertEquals(UNAVAILABLE, refused.getResponse().getStatusLine().getStatusCode());
-        assertTrue(refused.getMessage(), refused.getMessage().contains(NOT_SHARED));
+        for (int node : new int[] { primary, other }) {
+            assertEquals("get through " + nodeNames.get(node), true, on(node, new Request("GET", "/" + index + "/_doc/d1")).get("found"));
+        }
     }
 
     /**
