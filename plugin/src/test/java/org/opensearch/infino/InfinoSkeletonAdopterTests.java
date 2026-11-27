@@ -361,6 +361,35 @@ public class InfinoSkeletonAdopterTests extends OpenSearchTestCase {
         assertEquals(InfinoSkeletonAdopter.Kind.CLIENT, InfinoSkeletonAdopter.kind(SHARD, replayed(ID, SENT)));
     }
 
+    /**
+     * A rebuild's create reaches the table neither when the primary applies
+     * it nor when the primary replays it from its translog after a restart.
+     * A client's write reaches it from the primary and from the primary's own
+     * replay, and from no other copy.
+     */
+    public void testARebuildsCreateIsWrittenToTheTableNeitherAppliedNorReplayed() {
+        String sent = InfinoSkeletonAdopter.marked(SENT);
+        Engine.Operation.Origin primary = Engine.Operation.Origin.PRIMARY;
+        Engine.Operation.Origin replay = Engine.Operation.Origin.LOCAL_TRANSLOG_RECOVERY;
+        Map<String, String> inFlight = new ConcurrentHashMap<>(Map.of(ID, sent));
+        InfinoSkeletonAdopter.track(SHARD, inFlight);
+        try {
+            InfinoSkeletonAdopter.Kind rebuild = InfinoSkeletonAdopter.kind(SHARD, primaryCreate(ID, sent));
+            assertFalse("the primary's rebuild create", InfinoEngine.writesRow(primary, true, rebuild));
+            InfinoSkeletonAdopter.Kind client = InfinoSkeletonAdopter.kind(SHARD, primaryCreate("a2", SENT));
+            assertTrue("the primary's client write", InfinoEngine.writesRow(primary, true, client));
+        } finally {
+            InfinoSkeletonAdopter.untrack(SHARD, inFlight);
+        }
+        InfinoSkeletonAdopter.Kind replayedRebuild = InfinoSkeletonAdopter.kind(SHARD, replayed(ID, sent));
+        assertFalse("the primary's replay of a rebuild create", InfinoEngine.writesRow(replay, true, replayedRebuild));
+        InfinoSkeletonAdopter.Kind replayedClient = InfinoSkeletonAdopter.kind(SHARD, replayed(ID, SENT));
+        assertTrue("the primary's replay of a client write", InfinoEngine.writesRow(replay, true, replayedClient));
+        assertFalse("a replica's replay", InfinoEngine.writesRow(replay, false, replayedClient));
+        assertFalse("a replica's write", InfinoEngine.writesRow(Engine.Operation.Origin.REPLICA, false, replayedClient));
+        assertFalse("a recovering copy's write", InfinoEngine.writesRow(Engine.Operation.Origin.PEER_RECOVERY, false, replayedClient));
+    }
+
     public void testACreateRunsNoPipeline() throws Exception {
         IndexRequest create = InfinoSkeletonAdopter.createOf("logs", ID, null, InfinoSkeletonAdopter.marked(SENT));
         assertEquals("_none", create.getPipeline());

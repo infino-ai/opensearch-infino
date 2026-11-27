@@ -1277,11 +1277,28 @@ public class InfinoEngine extends InternalEngine {
      * has written.
      */
     private boolean writesTable(Operation.Origin origin) {
+        return writesTable(origin, primaryCopy());
+    }
+
+    /** {@link #writesTable(Operation.Origin)} for a copy that is the shard's primary or not ({@code primary}). */
+    static boolean writesTable(Operation.Origin origin, boolean primary) {
         return switch (origin) {
             case PRIMARY -> true;
-            case LOCAL_TRANSLOG_RECOVERY -> primaryCopy();
+            case LOCAL_TRANSLOG_RECOVERY -> primary;
             default -> false;
         };
+    }
+
+    /**
+     * Whether an index operation of this origin, which
+     * {@link InfinoSkeletonAdopter#kind} takes for {@code kind}, is written to
+     * the table by a copy that is the shard's primary or not
+     * ({@code primary}). A skeleton rebuild's create never is, whether the
+     * primary applies it or replays it from its translog after a restart:
+     * the table holds its row already.
+     */
+    static boolean writesRow(Operation.Origin origin, boolean primary, InfinoSkeletonAdopter.Kind kind) {
+        return writesTable(origin, primary) && kind != InfinoSkeletonAdopter.Kind.REBUILD;
     }
 
     /** The lock that orders the writes of {@code id}. */
@@ -1338,7 +1355,7 @@ public class InfinoEngine extends InternalEngine {
                 index.version()
             );
         }
-        boolean toTable = writesTable(index.origin()) && kind != InfinoSkeletonAdopter.Kind.REBUILD;
+        boolean toTable = writesRow(index.origin(), primaryCopy(), kind);
         if (toTable) {
             refuseWhileBacklogged(index.origin());
         }
