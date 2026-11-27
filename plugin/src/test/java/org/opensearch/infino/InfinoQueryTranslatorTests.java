@@ -1940,6 +1940,41 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * An ip field reads only an address (or a CIDR block), never a word as a
+     * keyword field reads one: a query string's words reach it only where
+     * one is an address. So no read of the table asks whether it holds a
+     * word before the search, and words that reach the text field alone
+     * rank there as one clause.
+     */
+    public void testAnIpFieldIsNoKeywordField() {
+        Map<String, Column> cols = new LinkedHashMap<>();
+        cols.put("osid", new Column("osid", "str", false, false));
+        cols.put("message", new Column("message", "str", true, false));
+        cols.put("addr", new Column("addr", "str", false, false).typed(new InfinoNative.FieldType("ip", 0)));
+        List<String> reads = new java.util.ArrayList<>();
+        java.util.function.Function<String, List<Map<String, Object>>> recorded = sql -> {
+            reads.add(sql);
+            return List.of();
+        };
+        Translation t = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("disk full"), cols, TABLE, NOW, recorded);
+        assertEquals(List.of(), reads);
+        assertEquals(new InfinoQueryTranslator.TextClause("message", "disk full", "or"), t.principal());
+        // An address is read on it, as before.
+        assertEquals(
+            "(\"addr\" = '10.0.0.1' OR text_match(\"message\", '10.0.0.1', 'or'))",
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("10.0.0.1"), cols, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).where()
+        );
+        // Optional words over the text field and the ip field reach the text field alone: one ranked clause.
+        t = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("disk OR full"), cols, TABLE, NOW, recorded);
+        assertEquals(new InfinoQueryTranslator.TextClause("message", "disk full", "or"), t.principal());
+        // In a filter, where no such read narrows the fields, words joined by AND still go to the
+        // engine as one query over the text field: the ip field could take none of them.
+        t = InfinoQueryTranslator.translate(QueryBuilders.boolQuery().filter(QueryBuilders.queryStringQuery("disk AND full")), cols, TABLE, NOW, recorded);
+        assertEquals(new InfinoQueryTranslator.TextClause("message", "+disk +full", "or"), t.principal());
+        assertEquals(List.of(), reads);
+    }
+
     public void testQueryStringClausesReadAsLuceneReadsThem() {
         // Terms on the default fields go to the engine as one query with Lucene's occurrences as sigils.
         assertEquals("token_match('os_logs_0', 'message', '+disk +cache', 'or')", translate(QueryBuilders.queryStringQuery("disk AND cache").defaultField("message")).from());

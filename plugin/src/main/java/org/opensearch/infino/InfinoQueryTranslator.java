@@ -3248,7 +3248,7 @@ final class InfinoQueryTranslator {
         List<String> out = new ArrayList<>();
         for (String f : targets) {
             Column c = column(f);
-            if (c == null || c.fts() || c.element().isString() || readable(c.element(), word)) {
+            if (c == null || c.fts() || keyword(c.element()) || readable(c.element(), word)) {
                 out.add(f);
             }
         }
@@ -3270,7 +3270,7 @@ final class InfinoQueryTranslator {
             if (c == null || c.fts()) {
                 continue;
             }
-            if (c.element().isString()) {
+            if (keyword(c.element())) {
                 return true;
             }
             for (String w : words) {
@@ -3282,12 +3282,25 @@ final class InfinoQueryTranslator {
         return false;
     }
 
+    /**
+     * Whether a column with no text index reads any text as a value, as a
+     * keyword field does: a string column other than an ip address, which
+     * reads only an address or a CIDR block ({@link #readable}).
+     */
+    private static boolean keyword(Column t) {
+        return t.isString() && !ip(t);
+    }
+
+    /** Whether a column holds an ip field's addresses. */
+    private static boolean ip(Column t) {
+        return t.fieldType() != null && t.fieldType().isIp();
+    }
+
     /** Whether a column with no text index reads {@code value} as one of its values, as stock's term query on its field would. */
     private boolean readable(Column t, String value) {
         if (t.isString()) {
             // A CIDR block is a value of an ip field too, the addresses in it.
-            boolean ip = t.fieldType() != null && t.fieldType().isIp();
-            return !ip || value.indexOf('/') >= 0 || InetAddresses.isInetAddress(value);
+            return !ip(t) || value.indexOf('/') >= 0 || InetAddresses.isInetAddress(value);
         }
         if (t.isNumeric()) {
             String n = number(value);
@@ -3837,7 +3850,7 @@ final class InfinoQueryTranslator {
             String p;
             if (c.fts()) {
                 p = onText.apply(c);
-            } else if (t.isString() && (t.fieldType() == null || !t.fieldType().isIp())) {
+            } else if (keyword(t)) {
                 p = onValue.apply(c);
             } else if (lenient) {
                 continue;
