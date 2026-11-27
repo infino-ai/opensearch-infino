@@ -493,11 +493,20 @@ public class InfinoAggregationProcessor {
      * keyword "5" and a long 5 as two values, while the union holds one type.
      * Integers of any width are one kind, as stock reads them all as longs.
      * Such a column is left out, so a script cannot read it either.
+     *
+     * <p>A field every table holds as numbers, of different kinds (a long in
+     * one, a float or double in another), is read as doubles instead, as
+     * stock merges such parts: a terms level's long keys become double keys,
+     * and a percentile reads every value as a double. Only an aggregation
+     * keyed on the exact value of each kind is refused on it: a cardinality,
+     * which counts a long 5 and a double 5.0 as two values, and a composite.
      */
     static Map<String, Column> columnsOver(Collection<AggregationBuilder> builders, List<Plan> plans) {
         Map<String, Column> cols = new LinkedHashMap<>();
         Set<String> mixed = new HashSet<>();
+        List<Map<String, Column>> each = new ArrayList<>(plans.size());
         for (Plan p : plans) {
+            each.add(p.cols());
             for (Column c : p.cols().values()) {
                 Column seen = cols.putIfAbsent(c.name(), c);
                 if (seen != null && !sameKind(seen, c)) {
@@ -505,9 +514,60 @@ public class InfinoAggregationProcessor {
                 }
             }
         }
-        refuseMixed(builders, plans, cols, mixed);
+        Set<String> numbers = new HashSet<>();
+        for (String name : mixed) {
+            if (numbersOnly(name, each)) {
+                numbers.add(name);
+            }
+        }
+        refuseMixed(builders, plans, cols, mixed, numbers);
+        for (String name : numbers) {
+            cols.put(name, asDouble(cols.get(name)));
+        }
+        mixed.removeAll(numbers);
         cols.keySet().removeAll(mixed);
         return cols;
+    }
+
+    /**
+     * Whether every table of {@code tables} that has column {@code name}
+     * holds numbers in it, one value or several alike: read as doubles, one
+     * union column carries them all.
+     */
+    static boolean numbersOnly(String name, List<Map<String, Column>> tables) {
+        Column first = null;
+        for (Map<String, Column> cols : tables) {
+            Column c = cols.get(name);
+            if (c == null) {
+                continue;
+            }
+            if (!c.isNumeric() || c.fts() || c.vector()) {
+                return false;
+            }
+            if (first == null) {
+                first = c;
+            } else if (!Objects.equals(first.elem(), c.elem())) {
+                return false;
+            }
+        }
+        return first != null;
+    }
+
+    /** {@code c} read as doubles, of no narrower mapping type. */
+    private static Column asDouble(Column c) {
+        return new Column(
+            c.name(),
+            "f64",
+            c.fts(),
+            c.vector(),
+            c.mask(),
+            c.dateFormat(),
+            c.elem(),
+            c.similarity(),
+            c.otherSimilarity(),
+            c.ranged(),
+            null
+        );
     }
 
     /** Whether two tables' columns of one field hold the same kind of value, which one union column can carry for both. */
@@ -521,9 +581,16 @@ public class InfinoAggregationProcessor {
     /**
      * Refuses an aggregation of {@code builders}, at any depth, whose field
      * is of {@code mixed} (see {@link #columnsOver}) or is one a plan's table
-     * does not serve.
+     * does not serve. A field of {@code numbers}, read as doubles, is refused
+     * only to an aggregation keyed on each kind's exact value.
      */
-    private static void refuseMixed(Collection<AggregationBuilder> builders, List<Plan> plans, Map<String, Column> cols, Set<String> mixed) {
+    private static void refuseMixed(
+        Collection<AggregationBuilder> builders,
+        List<Plan> plans,
+        Map<String, Column> cols,
+        Set<String> mixed,
+        Set<String> numbers
+    ) {
         for (AggregationBuilder b : builders) {
             List<String> fields = new ArrayList<>();
             if (b instanceof ValuesSourceAggregationBuilder<?> v && v.field() != null) {
@@ -544,13 +611,17 @@ public class InfinoAggregationProcessor {
                     refuseUnserved("aggregation [" + b.getName() + "]", p.table(), field);
                 }
                 Column c = InfinoSearch.columnFor(cols, field);
-                if (c != null && mixed.contains(c.name())) {
+                boolean asDoubles = c != null
+                    && numbers.contains(c.name())
+                    && !(b instanceof CardinalityAggregationBuilder)
+                    && !(b instanceof CompositeAggregationBuilder);
+                if (c != null && mixed.contains(c.name()) && !asDoubles) {
                     throw new Unsupported(
                         "aggregation [" + b.getName() + "] on [" + field + "] over several indices that map it as different types is not served"
                     );
                 }
             }
-            refuseMixed(b.getSubAggregations(), plans, cols, mixed);
+            refuseMixed(b.getSubAggregations(), plans, cols, mixed, numbers);
         }
     }
 
@@ -674,13 +745,27 @@ public class InfinoAggregationProcessor {
                 }
             }
         }
+        // A field the tables hold as numbers of different kinds is read as doubles (see columnsOver).
+        Set<String> doubles = new HashSet<>();
+        for (Map<String, Column> cols : each) {
+            for (Column c : cols.values()) {
+                Column seen = all.get(c.name());
+                if (seen != null && !sameKind(seen, c) && numbersOnly(c.name(), each)) {
+                    doubles.add(c.name());
+                }
+            }
+        }
+        for (String name : doubles) {
+            all.put(name, asDouble(all.get(name)));
+        }
         List<String> branches = new ArrayList<>();
         for (int i = 0; i < plans.size(); i++) {
             List<String> select = new ArrayList<>();
             select.add(i + " AS " + quoteIdent(SHARD_COLUMN));
             select.add(literal(indices.get(i)) + " AS " + quoteIdent(INDEX_COLUMN));
             for (String name : all.keySet()) {
-                select.add(each.get(i).containsKey(name) ? quoteIdent(name) : nullOf(all.get(name)) + " AS " + quoteIdent(name));
+                String held = doubles.contains(name) ? "CAST(" + quoteIdent(name) + " AS DOUBLE)" : quoteIdent(name);
+                select.add((each.get(i).containsKey(name) ? held : nullOf(all.get(name))) + " AS " + quoteIdent(name));
             }
             Translation q = plans.get(i).query();
             branches.add("SELECT " + String.join(", ", select) + " FROM " + q.from() + " WHERE " + q.where());
