@@ -2199,7 +2199,9 @@ public final class InfinoSearch {
      * the fields' order, so a band's ranked search reads {@code window}
      * candidates rather than the page: the hits it cuts off score no more
      * than its last, and those tied with the page's last could still come
-     * before it. Each hit carries the greatest score such a cut-off hit could
+     * before it. Under {@link Scoring#best} the same holds unsorted: a
+     * band's hits whose BM25 is below its bonus all score the bonus, and
+     * stock orders them as they were written, not by their BM25. Each hit carries the greatest score such a cut-off hit could
      * have, as {@link #SCORE_FLOOR}, for the caller to rank every candidate
      * when the page reaches it ({@link #windowCutsPage}).
      */
@@ -2253,8 +2255,11 @@ public final class InfinoSearch {
         boolean afterRanking = narrowsAfterRanking(q, where);
         // Each branch's columns past the hit's; a ranked band's carry its
         // number, so its cut can be told where it matters: under a sort by
-        // the score then fields, or a step after the ranking.
-        boolean banded = sorted || afterRanking;
+        // the score then fields, a step after the ranking, or a dis_max
+        // (Scoring#best), where every hit of a band whose BM25 is below its
+        // bonus scores that bonus alike, so those hits tie and come in the
+        // order they were written, not by BM25.
+        boolean banded = sorted || afterRanking || scoring.best();
         String unbanded = banded ? ", -1 AS infino_band" : "";
         List<String> branches = new ArrayList<>();
         int k = window;
@@ -2288,7 +2293,7 @@ public final class InfinoSearch {
                         + q.rankedFrom(text, window) + joins + " WHERE " + ranked
                 );
             } else {
-                k = sorted || afterRanking ? window : fetch;
+                k = banded ? window : fetch;
                 for (int i = 0; i < sums.size(); i++) {
                     // The band around this sum: from halfway to the one below, to halfway to the one above.
                     List<String> band = new ArrayList<>();

@@ -119,7 +119,7 @@ setup:
 teardown:
   - do:
       indices.delete:
-        index: dfs_luc,dfs_prx,dfs_def,dfr_luc,dfr_prx,dfr_def,dfm_luc,dfm_prx,dfm_def
+        index: dfs_luc,dfs_prx,dfs_def,dfr_luc,dfr_prx,dfr_def,dfm_luc,dfm_prx,dfm_def,dft_luc,dft_prx,dft_def
         ignore_unavailable: true
 
 ---
@@ -1468,3 +1468,151 @@ teardown:
   - do:
       search: { index: dfm_luc, body: { query: { multi_match: { query: disk, fields: [ "title.*" ] } } } }
   - match: { hits.total.value: 1 }
+
+---
+"Hits that tie at a keyword match's score come in the order they were written":
+  # Every message holds disk, so its BM25 stays below 1, and documents 1
+  # and 2 hold it as their level too: under the dis_max both score the
+  # keyword match's 1. Stock orders the tie as the documents were written,
+  # so a page of one is document 1, though document 2 has the higher BM25.
+  - do:
+      indices.create:
+        index: dft_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, level: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dft_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, level: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dft_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, level: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: dft_luc
+        body:
+          - index: { _id: "1" }
+          - { "message": "disk alpha beta gamma delta epsilon", "level": "disk" }
+          - index: { _id: "2" }
+          - { "message": "disk", "level": "disk" }
+          - index: { _id: "3" }
+          - { "message": "disk one", "level": "a" }
+          - index: { _id: "4" }
+          - { "message": "disk two", "level": "b" }
+          - index: { _id: "5" }
+          - { "message": "disk three", "level": "c" }
+          - index: { _id: "6" }
+          - { "message": "disk four", "level": "d" }
+  - do:
+      bulk:
+        refresh: true
+        index: dft_prx
+        body:
+          - index: { _id: "1" }
+          - { "message": "disk alpha beta gamma delta epsilon", "level": "disk" }
+          - index: { _id: "2" }
+          - { "message": "disk", "level": "disk" }
+          - index: { _id: "3" }
+          - { "message": "disk one", "level": "a" }
+          - index: { _id: "4" }
+          - { "message": "disk two", "level": "b" }
+          - index: { _id: "5" }
+          - { "message": "disk three", "level": "c" }
+          - index: { _id: "6" }
+          - { "message": "disk four", "level": "d" }
+  - do:
+      bulk:
+        refresh: true
+        index: dft_def
+        body:
+          - index: { _id: "1" }
+          - { "message": "disk alpha beta gamma delta epsilon", "level": "disk" }
+          - index: { _id: "2" }
+          - { "message": "disk", "level": "disk" }
+          - index: { _id: "3" }
+          - { "message": "disk one", "level": "a" }
+          - index: { _id: "4" }
+          - { "message": "disk two", "level": "b" }
+          - index: { _id: "5" }
+          - { "message": "disk three", "level": "c" }
+          - index: { _id: "6" }
+          - { "message": "disk four", "level": "d" }
+  - do:
+      search:
+        index: dft_luc
+        body: { query: { query_string: { query: disk } }, size: 1 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dft_luc
+        body: { query: { multi_match: { query: disk } }, size: 1 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dft_luc
+        body: { query: { query_string: { query: disk } }, size: 3 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - do:
+      search:
+        index: dft_prx
+        body: { query: { query_string: { query: disk } }, size: 1 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dft_prx
+        body: { query: { multi_match: { query: disk } }, size: 1 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dft_prx
+        body: { query: { query_string: { query: disk } }, size: 3 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - do:
+      search:
+        index: dft_def
+        body: { query: { query_string: { query: disk } }, size: 1 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dft_def
+        body: { query: { multi_match: { query: disk } }, size: 1 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dft_def
+        body: { query: { query_string: { query: disk } }, size: 3 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }

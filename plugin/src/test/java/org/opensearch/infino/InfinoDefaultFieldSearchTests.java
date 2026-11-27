@@ -40,6 +40,15 @@ public class InfinoDefaultFieldSearchTests extends OpenSearchTestCase {
         "full",
         "disk disk disk" };
     private static final String[] LEVELS = { "info", "disk", "disk", "warn", "info", "warn", "info" };
+    /**
+     * A table where every message holds "disk", so its BM25 stays below the
+     * keyword match's score, and the first two documents hold it as their
+     * level too: both score the keyword match's 1, the first with the lower
+     * BM25.
+     */
+    private static final String TIES = "value_ranking_ties";
+    private static final String[] TIE_MESSAGES = { "disk alpha beta gamma delta epsilon", "disk", "disk one", "disk two", "disk three", "disk four" };
+    private static final String[] TIE_LEVELS = { "disk", "disk", "a", "b", "c", "d" };
 
     @Override
     public void setUp() throws Exception {
@@ -59,11 +68,16 @@ public class InfinoDefaultFieldSearchTests extends OpenSearchTestCase {
     public void tearDown() throws Exception {
         InfinoNative.dropTable(TABLE);
         InfinoNative.dropTable(MULTI);
+        InfinoNative.dropTable(TIES);
         super.tearDown();
     }
 
     private static InfinoSearch.Plan plan(QueryBuilder query) {
-        return InfinoSearch.plan(TABLE, new SearchSourceBuilder().query(query), System.currentTimeMillis());
+        return plan(TABLE, query);
+    }
+
+    private static InfinoSearch.Plan plan(String table, QueryBuilder query) {
+        return InfinoSearch.plan(table, new SearchSourceBuilder().query(query), System.currentTimeMillis());
     }
 
     /** The page of {@code query}, unsorted: id to score, best first. */
@@ -119,6 +133,39 @@ public class InfinoDefaultFieldSearchTests extends OpenSearchTestCase {
         );
         // most_fields sums its fields (tie_breaker 1).
         assertRanked(stock("disk", false), page(QueryBuilders.multiMatchQuery("disk").type(MultiMatchQueryBuilder.Type.MOST_FIELDS)));
+    }
+
+    /**
+     * Hits that tie at the keyword match's score come in the order they were
+     * written, as stock orders them, not by their BM25: on a page of one the
+     * first document, though the second has the higher BM25. Each band of
+     * the ranked read takes its window, not just the page.
+     */
+    public void testTiesAtTheKeywordScoreComeInTheOrderWritten() {
+        InfinoNative.dropTable(TIES);
+        InfinoNative.ensureTable(TIES, "{\"properties\":{\"message\":{\"type\":\"text\"},\"level\":{\"type\":\"keyword\"}}}");
+        String[] ids = new String[TIE_MESSAGES.length];
+        String[] sources = new String[TIE_MESSAGES.length];
+        for (int i = 0; i < TIE_MESSAGES.length; i++) {
+            ids[i] = Integer.toString(i);
+            sources[i] = "{\"message\":\"" + TIE_MESSAGES[i] + "\",\"level\":\"" + TIE_LEVELS[i] + "\"}";
+        }
+        assertEquals(TIE_MESSAGES.length, InfinoNative.indexBatch(TIES, ids, sources, TIE_MESSAGES.length).ok());
+        Map<String, Double> bm25 = new LinkedHashMap<>();
+        for (Map<String, Object> row : InfinoNative.sqlRows(InfinoSearch.hitStatement(plan(TIES, QueryBuilders.matchQuery("message", "disk")), TIE_MESSAGES.length, false))) {
+            bm25.put(row.get(InfinoQueryTranslator.OSID).toString(), ((Number) row.get(InfinoSearch.SCORE)).doubleValue());
+        }
+        assertTrue(bm25.toString(), bm25.get("0") < bm25.get("1") && bm25.get("1") < KEYWORD_MATCH);
+        for (QueryBuilder query : List.of(QueryBuilders.queryStringQuery("disk"), QueryBuilders.multiMatchQuery("disk"))) {
+            for (int size = 1; size <= 2; size++) {
+                List<String> got = new ArrayList<>();
+                for (Map<String, Object> row : InfinoNative.sqlRows(InfinoSearch.hitStatement(plan(TIES, query), size, false))) {
+                    got.add(row.get(InfinoQueryTranslator.OSID).toString());
+                    assertEquals(query + " " + row, KEYWORD_MATCH, ((Number) row.get(InfinoSearch.SCORE)).doubleValue(), 1e-6);
+                }
+                assertEquals(query.toString(), List.of("0", "1").subList(0, size), got);
+            }
+        }
     }
 
     /** No keyword value matches: the hits rank by their text BM25 alone, the same order and scores as a match on the text field. */
