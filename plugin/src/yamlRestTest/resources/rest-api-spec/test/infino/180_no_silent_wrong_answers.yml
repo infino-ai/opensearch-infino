@@ -650,11 +650,13 @@
   - length: { aggregations.h.buckets: 3 }
   - match: { aggregations.h.buckets.0.doc_count: 2 }
   - do:
-      catch: bad_request
       search: { index: w56dr_def, body: { size: 0, aggs: { h: { date_histogram: { field: range, calendar_interval: month } } } } }
+  - length: { aggregations.h.buckets: 3 }
+  - match: { aggregations.h.buckets.0.doc_count: 2 }
   - do:
-      catch: bad_request
       search: { index: w56dr_prx, body: { size: 0, aggs: { h: { date_histogram: { field: range, calendar_interval: month } } } } }
+  - length: { aggregations.h.buckets: 3 }
+  - match: { aggregations.h.buckets.0.doc_count: 2 }
 
 ---
 "stored_fields without _source, and a docvalue_fields number format, as on a Lucene twin":
