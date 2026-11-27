@@ -372,3 +372,153 @@
       search:
         index: "aovt_z_prx,aovt_n_prx"
         body: { size: 0, aggs: { t: { terms: { field: latency_ms }, aggs: { c: { cardinality: { field: user } } } } } }
+
+---
+"Over several indices through a filtering alias, a Lucene twin":
+  - do:
+      indices.create:
+        index: aofa_x_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { team: { type: keyword }, user: { type: keyword }, latency_ms: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aofa_x_luc
+        body:
+          - index: { _id: "1" }
+          - { team: a, user: u0, latency_ms: 10 }
+          - index: { _id: "2" }
+          - { team: a, user: u1, latency_ms: 20 }
+          - index: { _id: "3" }
+          - { team: b, user: u2, latency_ms: 500 }
+  - do:
+      indices.create:
+        index: aofa_y_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { team: { type: keyword }, user: { type: keyword }, latency_ms: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aofa_y_luc
+        body:
+          - index: { _id: "1" }
+          - { team: a, user: u1, latency_ms: 30 }
+          - index: { _id: "2" }
+          - { team: a, user: u3, latency_ms: 40 }
+          - index: { _id: "3" }
+          - { team: b, user: u4, latency_ms: 600 }
+  - do:
+      indices.put_alias:
+        index: "aofa_x_luc,aofa_y_luc"
+        name: aofa_team_a_luc
+        body: { filter: { term: { team: a } } }
+  - do:
+      search:
+        index: aofa_team_a_luc
+        body: { size: 0, aggs: { c: { cardinality: { field: user } }, p: { percentiles: { field: latency_ms, percents: [ 0, 100 ] } } } }
+  - match: { hits.total.value: 4 }
+  - match: { aggregations.c.value: 3 }
+  - match: { aggregations.p.values.0\.0: 10.0 }
+  - match: { aggregations.p.values.100\.0: 40.0 }
+
+---
+"Over several indices through a filtering alias, default mode":
+  - do:
+      indices.create:
+        index: aofa_x_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { team: { type: keyword }, user: { type: keyword }, latency_ms: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aofa_x_def
+        body:
+          - index: { _id: "1" }
+          - { team: a, user: u0, latency_ms: 10 }
+          - index: { _id: "2" }
+          - { team: a, user: u1, latency_ms: 20 }
+          - index: { _id: "3" }
+          - { team: b, user: u2, latency_ms: 500 }
+  - do:
+      indices.create:
+        index: aofa_y_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { team: { type: keyword }, user: { type: keyword }, latency_ms: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aofa_y_def
+        body:
+          - index: { _id: "1" }
+          - { team: a, user: u1, latency_ms: 30 }
+          - index: { _id: "2" }
+          - { team: a, user: u3, latency_ms: 40 }
+          - index: { _id: "3" }
+          - { team: b, user: u4, latency_ms: 600 }
+  - do:
+      indices.put_alias:
+        index: "aofa_x_def,aofa_y_def"
+        name: aofa_team_a_def
+        body: { filter: { term: { team: a } } }
+  - do:
+      search:
+        index: aofa_team_a_def
+        body: { size: 0, aggs: { c: { cardinality: { field: user } }, p: { percentiles: { field: latency_ms, percents: [ 0, 100 ] } } } }
+  - match: { hits.total.value: 4 }
+  - match: { aggregations.c.value: 3 }
+  - match: { aggregations.p.values.0\.0: 10.0 }
+  - match: { aggregations.p.values.100\.0: 40.0 }
+
+---
+"Over several indices through a filtering alias, proxy mode":
+  - do:
+      indices.create:
+        index: aofa_x_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { team: { type: keyword }, user: { type: keyword }, latency_ms: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aofa_x_prx
+        body:
+          - index: { _id: "1" }
+          - { team: a, user: u0, latency_ms: 10 }
+          - index: { _id: "2" }
+          - { team: a, user: u1, latency_ms: 20 }
+          - index: { _id: "3" }
+          - { team: b, user: u2, latency_ms: 500 }
+  - do:
+      indices.create:
+        index: aofa_y_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { team: { type: keyword }, user: { type: keyword }, latency_ms: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aofa_y_prx
+        body:
+          - index: { _id: "1" }
+          - { team: a, user: u1, latency_ms: 30 }
+          - index: { _id: "2" }
+          - { team: a, user: u3, latency_ms: 40 }
+          - index: { _id: "3" }
+          - { team: b, user: u4, latency_ms: 600 }
+  - do:
+      indices.put_alias:
+        index: "aofa_x_prx,aofa_y_prx"
+        name: aofa_team_a_prx
+        body: { filter: { term: { team: a } } }
+  - do:
+      search:
+        index: aofa_team_a_prx
+        body: { size: 0, aggs: { c: { cardinality: { field: user } }, p: { percentiles: { field: latency_ms, percents: [ 0, 100 ] } } } }
+  - match: { hits.total.value: 4 }
+  - match: { aggregations.c.value: 3 }
+  - match: { aggregations.p.values.0\.0: 10.0 }
+  - match: { aggregations.p.values.100\.0: 40.0 }
