@@ -37,6 +37,10 @@ public class InfinoHdrPercentilesTests extends OpenSearchTestCase {
     private static final double[] PERCENTS = { 0, 0.1, 1, 5, 25, 33.3, 50, 75, 90, 95, 99, 99.9, 100 };
     /** Shards stock would spread the values over, at most. */
     private static final int MAX_SHARDS = 5;
+    /** Decades a field's values span at most: a five-digit histogram covers about 13. */
+    private static final int MAX_DECADES = 12;
+    /** The least decade a double field's values start at. */
+    private static final int MIN_DOUBLE_DECADE = -3;
 
     @Override
     public void setUp() throws Exception {
@@ -152,10 +156,15 @@ public class InfinoHdrPercentilesTests extends OpenSearchTestCase {
         }
     }
 
-    /** The values of a field over every magnitude, repeats and zeros among them. */
+    /**
+     * The values of a field over many magnitudes, repeats and zeros among
+     * them, spanning at most {@link #MAX_DECADES} decades: past about 2^46
+     * between the least and the greatest, a five-digit histogram cannot
+     * cover them and stock refuses the aggregation.
+     */
     private List<Double> spread(boolean whole) {
         int n = randomIntBetween(500, 3000);
-        int maxExponent = randomIntBetween(2, 15);
+        int maxExponent = randomIntBetween(2, whole ? MAX_DECADES : MAX_DECADES + MIN_DOUBLE_DECADE);
         List<Double> out = new ArrayList<>();
         for (int i = 0; i < n; i++) {
             double v;
@@ -164,7 +173,7 @@ public class InfinoHdrPercentilesTests extends OpenSearchTestCase {
             } else if (!out.isEmpty() && rarely()) {
                 v = randomFrom(out);
             } else {
-                v = Math.pow(10, randomDoubleBetween(whole ? 0 : -4, maxExponent, true));
+                v = Math.pow(10, randomDoubleBetween(whole ? 0 : MIN_DOUBLE_DECADE, maxExponent, true));
             }
             out.add(whole ? Math.floor(v) : v);
         }
@@ -241,6 +250,16 @@ public class InfinoHdrPercentilesTests extends OpenSearchTestCase {
         );
         assertEquals(2, missing.getState().getTotalCount());
         assertEquals(stock(List.of(1.5, 1.5), 3).getValueAtPercentile(50), missing.percentile(50), 0.0);
+    }
+
+    /** Values too far apart for the histogram's range are refused, as stock's histogram refuses them. */
+    public void testTooWideARangeIsRefused() {
+        index(List.of(new Doc("a", 1L, null), new Doc("a", 1_000_000_000_000_000L, null)));
+        expectThrows(ArrayIndexOutOfBoundsException.class, () -> stock(List.of(1.0, 1e18), 5));
+        expectThrows(
+            ArrayIndexOutOfBoundsException.class,
+            () -> run(AggregationBuilders.percentiles("p").field("l").percentiles(50).percentilesConfig(new PercentilesConfig.Hdr(5)))
+        );
     }
 
     /** A negative value is refused, as stock's histogram refuses it, rather than left out. */
