@@ -27,7 +27,7 @@ setup:
 teardown:
   - do:
       indices.delete:
-        index: gq_inf,gq_luc,sec_gq
+        index: gq_inf,gq_luc,sec_gq,gq_px
         ignore_unavailable: true
 
 ---
@@ -523,3 +523,257 @@ teardown:
         index: sec_gq
         id: c1
         realtime: false
+
+---
+"Default mode: a scripted update, a delete and a re-create report the twin's numbers":
+  - do:
+      indices.put_settings:
+        index: gq_inf,gq_luc
+        body: { index.refresh_interval: -1 }
+  - do:
+      index:
+        index: gq_inf
+        id: s
+        refresh: true
+        body: { n: 1 }
+  - do:
+      index:
+        index: gq_luc
+        id: s
+        refresh: true
+        body: { n: 1 }
+  # A scripted update on each, not refreshed.
+  - do:
+      update:
+        index: gq_inf
+        id: s
+        body: { script: { source: "ctx._source.n += 1" } }
+  - match: { _version: 2 }
+  - do:
+      update:
+        index: gq_luc
+        id: s
+        body: { script: { source: "ctx._source.n += 1" } }
+  - do:
+      get:
+        index: gq_luc
+        id: s
+  - set: { _seq_no: luc_seq, _version: luc_version, _primary_term: luc_term }
+  - do:
+      get:
+        index: gq_inf
+        id: s
+  - match: { _source.n: 2 }
+  - match: { _version: $luc_version }
+  - match: { _seq_no: $luc_seq }
+  - match: { _primary_term: $luc_term }
+
+  # A delete, then the same id written again, neither refreshed: the version
+  # carries on from the deleted document's, as on the plain index.
+  - do:
+      delete:
+        index: gq_inf
+        id: s
+  - do:
+      delete:
+        index: gq_luc
+        id: s
+  - do:
+      index:
+        index: gq_inf
+        id: s
+        body: { n: 5 }
+  - do:
+      index:
+        index: gq_luc
+        id: s
+        body: { n: 5 }
+  - do:
+      get:
+        index: gq_luc
+        id: s
+  - match: { _version: 4 }
+  - set: { _seq_no: luc_seq2, _version: luc_version2, _primary_term: luc_term2 }
+  - do:
+      get:
+        index: gq_inf
+        id: s
+  - match: { _source.n: 5 }
+  - match: { _version: $luc_version2 }
+  - match: { _seq_no: $luc_seq2 }
+  - match: { _primary_term: $luc_term2 }
+  - do:
+      mget:
+        body: { docs: [ { _index: gq_inf, _id: s } ] }
+  - match: { docs.0._version: $luc_version2 }
+  - match: { docs.0._seq_no: $luc_seq2 }
+  # A write conditioned on what the get reported is applied.
+  - do:
+      index:
+        index: gq_inf
+        id: s
+        if_seq_no: $luc_seq2
+        if_primary_term: $luc_term2
+        body: { n: 6 }
+  - match: { result: updated }
+
+---
+"Default mode: a realtime get finds a document created moments before, with no refresh":
+  - do:
+      indices.put_settings:
+        index: gq_inf,gq_luc
+        body: { index.refresh_interval: -1 }
+  - do:
+      index:
+        index: gq_inf
+        id: new
+        body: { n: 1 }
+  - do:
+      index:
+        index: gq_luc
+        id: new
+        body: { n: 1 }
+  - do:
+      get:
+        index: gq_luc
+        id: new
+  - set: { _seq_no: luc_seq, _version: luc_version, _primary_term: luc_term }
+  - do:
+      get:
+        index: gq_inf
+        id: new
+  - match: { _source.n: 1 }
+  - match: { _version: $luc_version }
+  - match: { _seq_no: $luc_seq }
+  - match: { _primary_term: $luc_term }
+  - do:
+      mget:
+        body: { docs: [ { _index: gq_inf, _id: new } ] }
+  - is_true: docs.0.found
+  - match: { docs.0._seq_no: $luc_seq }
+  # Not refreshed yet: a read that is not realtime misses it on both.
+  - do:
+      catch: missing
+      get:
+        index: gq_luc
+        id: new
+        realtime: false
+  - do:
+      catch: missing
+      get:
+        index: gq_inf
+        id: new
+        realtime: false
+
+---
+"Proxy mode: each edit reads what the edit before wrote":
+  # Proxy mode keeps no per-document version (every document is at version 1),
+  # and reports the sequence number the table stored with the latest write, so
+  # a write conditioned on what a get reported is applied, edit after edit.
+  - do:
+      indices.create:
+        index: gq_px
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: long }
+  # A get right after the create, with no refresh, finds the document.
+  - do:
+      index:
+        index: gq_px
+        id: p
+        body: { n: 0 }
+  - set: { _seq_no: w0 }
+  - do:
+      get:
+        index: gq_px
+        id: p
+  - match: { _source.n: 0 }
+  - match: { _version: 1 }
+  - match: { _seq_no: $w0 }
+  - set: { _seq_no: s0, _primary_term: t0 }
+  - do:
+      index:
+        index: gq_px
+        id: p
+        if_seq_no: $s0
+        if_primary_term: $t0
+        body: { n: 1 }
+  - match: { result: updated }
+  - set: { _seq_no: w1 }
+  - do:
+      get:
+        index: gq_px
+        id: p
+  - match: { _source.n: 1 }
+  - match: { _seq_no: $w1 }
+  - set: { _seq_no: s1, _primary_term: t1 }
+  # A partial update, then a scripted one, each conditioned on the get before.
+  - do:
+      update:
+        index: gq_px
+        id: p
+        if_seq_no: $s1
+        if_primary_term: $t1
+        body: { doc: { n: 2 } }
+  - match: { result: updated }
+  - set: { _seq_no: w2 }
+  - do:
+      get:
+        index: gq_px
+        id: p
+  - match: { _source.n: 2 }
+  - match: { _seq_no: $w2 }
+  - set: { _seq_no: s2, _primary_term: t2 }
+  - do:
+      update:
+        index: gq_px
+        id: p
+        if_seq_no: $s2
+        if_primary_term: $t2
+        body: { script: { source: "ctx._source.n += 1" } }
+  - match: { result: updated }
+  - set: { _seq_no: w3 }
+  - do:
+      get:
+        index: gq_px
+        id: p
+  - match: { _source.n: 3 }
+  - match: { _seq_no: $w3 }
+  - set: { _seq_no: s3, _primary_term: t3 }
+  # The number before is refused.
+  - do:
+      catch: conflict
+      index:
+        index: gq_px
+        id: p
+        if_seq_no: $s2
+        if_primary_term: $t2
+        body: { n: 9 }
+  # A delete, then the same id written again: the get reports the new write.
+  - do:
+      delete:
+        index: gq_px
+        id: p
+  - do:
+      catch: missing
+      get:
+        index: gq_px
+        id: p
+  - do:
+      index:
+        index: gq_px
+        id: p
+        body: { n: 7 }
+  - set: { _seq_no: w4 }
+  - do:
+      get:
+        index: gq_px
+        id: p
+  - match: { _source.n: 7 }
+  - match: { _seq_no: $w4 }
+  - do:
+      mget:
+        body: { docs: [ { _index: gq_px, _id: p } ] }
+  - match: { docs.0._seq_no: $w4 }
