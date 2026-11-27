@@ -184,7 +184,10 @@ public class InfinoScriptedUpdateTests extends OpenSearchTestCase {
         assertEquals("the run found it compiled", 1, scripts.stats().getCompilations());
 
         RuntimeException failed = InfinoScriptedUpdate.compileAhead(scripts, new UpdateRequest("logs", "1").script(script("no_such_script")));
-        assertNotNull(failed);
+        // Wrapped as stock's update wraps a compile failure: a 400 that says the script failed.
+        assertTrue(failed instanceof IllegalArgumentException);
+        assertEquals("failed to execute script", failed.getMessage());
+        assertEquals(RestStatus.BAD_REQUEST, ExceptionsHelper.status(failed));
         assertNull(InfinoScriptedUpdate.compileAhead(scripts, new UpdateRequest("logs", "1").doc("{\"a\":1}", MediaTypeRegistry.JSON)));
     }
 

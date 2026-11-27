@@ -42,6 +42,9 @@ import java.util.function.LongSupplier;
  */
 final class InfinoScriptedUpdate {
 
+    /** The message stock's update wraps a script's failure in, its compile's included. */
+    private static final String SCRIPT_FAILED = "failed to execute script";
+
     private InfinoScriptedUpdate() {}
 
     /** What the script asks for. */
@@ -92,7 +95,8 @@ final class InfinoScriptedUpdate {
             scripts.compile(update.script(), UpdateScript.CONTEXT);
             return null;
         } catch (RuntimeException e) {
-            return e;
+            // Wrapped as stock's update wraps what its compile throws.
+            return new IllegalArgumentException(SCRIPT_FAILED, e);
         }
     }
 
