@@ -707,3 +707,138 @@
       search:
         index: "aonm_x_prx,aonm_y_prx"
         body: { size: 0, aggs: { c: { cardinality: { field: latency_ms } } } }
+
+---
+"Over several indices, a field of several values and a filter, a Lucene twin":
+  - do:
+      indices.create:
+        index: aomv_x_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { team: { type: keyword }, user: { type: keyword }, latency_ms: { type: long }, other: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aomv_x_luc
+        body:
+          - index: { _id: "1" }
+          - { team: a, user: u1, latency_ms: [ 10, 20 ], other: o }
+          - index: { _id: "2" }
+          - { team: b, user: u3, latency_ms: [ 30 ] }
+  - do:
+      indices.create:
+        index: aomv_y_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { team: { type: keyword }, user: { type: keyword }, latency_ms: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aomv_y_luc
+        body:
+          - index: { _id: "1" }
+          - { team: a, user: u2, latency_ms: [ 40 ] }
+  - do:
+      search:
+        index: "aomv_x_luc,aomv_y_luc"
+        body: { size: 0, aggs: { c: { cardinality: { field: user } }, f: { filter: { term: { team: a } }, aggs: { c: { cardinality: { field: user } } } } } }
+  - match: { aggregations.c.value: 3 }
+  - match: { aggregations.f.doc_count: 2 }
+  - match: { aggregations.f.c.value: 2 }
+  - do:
+      search:
+        index: "aomv_x_luc,aomv_y_luc"
+        body: { size: 0, aggs: { t: { terms: { field: team }, aggs: { c: { cardinality: { field: user } }, s: { sum: { field: latency_ms } } } } } }
+  - match: { aggregations.t.buckets.0.key: a }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.0.c.value: 2 }
+  - match: { aggregations.t.buckets.0.s.value: 70.0 }
+  - match: { aggregations.t.buckets.1.key: b }
+  - match: { aggregations.t.buckets.1.c.value: 1 }
+  - match: { aggregations.t.buckets.1.s.value: 30.0 }
+
+---
+"Over several indices, a field of several values and a filter, default mode":
+  - do:
+      indices.create:
+        index: aomv_x_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { team: { type: keyword }, user: { type: keyword }, latency_ms: { type: long }, other: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aomv_x_def
+        body:
+          - index: { _id: "1" }
+          - { team: a, user: u1, latency_ms: [ 10, 20 ], other: o }
+          - index: { _id: "2" }
+          - { team: b, user: u3, latency_ms: [ 30 ] }
+  - do:
+      indices.create:
+        index: aomv_y_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { team: { type: keyword }, user: { type: keyword }, latency_ms: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aomv_y_def
+        body:
+          - index: { _id: "1" }
+          - { team: a, user: u2, latency_ms: [ 40 ] }
+  - do:
+      search:
+        index: "aomv_x_def,aomv_y_def"
+        body: { size: 0, aggs: { c: { cardinality: { field: user } }, f: { filter: { term: { team: a } }, aggs: { c: { cardinality: { field: user } } } } } }
+  - match: { aggregations.c.value: 3 }
+  - match: { aggregations.f.doc_count: 2 }
+  - match: { aggregations.f.c.value: 2 }
+  - do:
+      catch: /which documents give several values, over several indices read as one is not served/
+      search:
+        index: "aomv_x_def,aomv_y_def"
+        body: { size: 0, aggs: { t: { terms: { field: team }, aggs: { c: { cardinality: { field: user } }, s: { sum: { field: latency_ms } } } } } }
+
+---
+"Over several indices, a field of several values and a filter, proxy mode":
+  - do:
+      indices.create:
+        index: aomv_x_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { team: { type: keyword }, user: { type: keyword }, latency_ms: { type: long }, other: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aomv_x_prx
+        body:
+          - index: { _id: "1" }
+          - { team: a, user: u1, latency_ms: [ 10, 20 ], other: o }
+          - index: { _id: "2" }
+          - { team: b, user: u3, latency_ms: [ 30 ] }
+  - do:
+      indices.create:
+        index: aomv_y_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { team: { type: keyword }, user: { type: keyword }, latency_ms: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aomv_y_prx
+        body:
+          - index: { _id: "1" }
+          - { team: a, user: u2, latency_ms: [ 40 ] }
+  - do:
+      search:
+        index: "aomv_x_prx,aomv_y_prx"
+        body: { size: 0, aggs: { c: { cardinality: { field: user } }, f: { filter: { term: { team: a } }, aggs: { c: { cardinality: { field: user } } } } } }
+  - match: { aggregations.c.value: 3 }
+  - match: { aggregations.f.doc_count: 2 }
+  - match: { aggregations.f.c.value: 2 }
+  - do:
+      catch: /which documents give several values, over several indices read as one is not served/
+      search:
+        index: "aomv_x_prx,aomv_y_prx"
+        body: { size: 0, aggs: { t: { terms: { field: team }, aggs: { c: { cardinality: { field: user } }, s: { sum: { field: latency_ms } } } } } }

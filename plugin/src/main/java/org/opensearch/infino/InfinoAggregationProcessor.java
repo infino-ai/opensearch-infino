@@ -465,16 +465,16 @@ public class InfinoAggregationProcessor {
      * count, added up), else null: it is then counted over the union.
      */
     Counted evaluateOver(Collection<AggregationBuilder> builders, Plan plan, List<Plan> shardPlans, List<String> shardIndices, Long total) {
-        String from = unionOf(shardPlans, shardIndices);
+        // The aggregations read every plan's columns, and _index from the
+        // union's own column rather than as the first plan's name.
+        Map<String, Column> cols = columnsOver(builders, shardPlans);
+        String from = unionOf(shardPlans, shardIndices, columnsRead(builders, cols));
         List<String> shardTables = new ArrayList<>();
         for (Plan p : shardPlans) {
             shardTables.add(p.table());
         }
         Function<QueryBuilder, String> predicates = qb -> perShard(qb, shardPlans);
         Supplier<Long> counter = total != null ? () -> total : () -> asLong(oneRow("SELECT COUNT(*) AS c FROM " + from).get("c"));
-        // The aggregations read every plan's columns, and _index from the
-        // union's own column rather than as the first plan's name.
-        Map<String, Column> cols = columnsOver(builders, shardPlans);
         cols.put(INDEX_COLUMN, new Column(INDEX_COLUMN, "str", false, false));
         // One answer for the whole index: each terms level at its final size.
         return evaluate(builders, plan, cols, shardTables, from, InfinoQueryTranslator.ALL, predicates, counter, null, false, null);
@@ -659,6 +659,13 @@ public class InfinoAggregationProcessor {
         // document's figures over them, joined in once for the whole request.
         List<Source> figured = new ArrayList<>();
         multiMetricSources(specs, figured);
+        if (!figured.isEmpty() && tables.size() > 1) {
+            // The figures join on a document's id over one table; over several
+            // tables read as one the same id names a document of each.
+            throw new Unsupported(
+                "a metric over " + figured.get(0).label() + ", which documents give several values, over several indices read as one is not served"
+            );
+        }
         String relation = figured.isEmpty() ? from : perDocument(from, figured);
         Map<String, InternalAggregation> byName = new HashMap<>();
         List<Metric> rootMetrics = new ArrayList<>();
@@ -728,6 +735,69 @@ public class InfinoAggregationProcessor {
     }
 
     /**
+     * The columns of {@link #unionOf} that {@code builders} read, at any
+     * depth, planned against {@code cols}: each field's column and, where some
+     * document gives the field several values, its list column, with the id
+     * column a metric over such a field joins on. Null when an aggregation
+     * reads what is not told apart here (a script, a query of its own such as
+     * a filter or a significant_terms background, several sources): the union
+     * then carries every column. Over many indices of many fields the union is
+     * otherwise a statement of indices times fields columns to parse and plan.
+     */
+    static Set<String> columnsRead(Collection<AggregationBuilder> builders, Map<String, Column> cols) {
+        Set<String> read = new HashSet<>();
+        read.add(InfinoQueryTranslator.OSID);
+        return columnsRead(builders, cols, read) ? read : null;
+    }
+
+    /** Adds to {@code read} the columns {@code builders} read; false when one reads what is not told apart. */
+    private static boolean columnsRead(Collection<AggregationBuilder> builders, Map<String, Column> cols, Set<String> read) {
+        for (AggregationBuilder b : builders) {
+            List<String> fields = new ArrayList<>();
+            if (b instanceof SignificantTermsAggregationBuilder st && st.backgroundFilter() != null) {
+                return false;
+            }
+            if (b instanceof ValuesSourceAggregationBuilder<?> v) {
+                if (v.script() != null) {
+                    return false;
+                }
+                if (v.field() != null) {
+                    fields.add(v.field());
+                }
+            } else if (b instanceof CompositeAggregationBuilder c) {
+                for (CompositeValuesSourceBuilder<?> source : c.sources()) {
+                    if (source.script() != null) {
+                        return false;
+                    }
+                    if (source.field() != null) {
+                        fields.add(source.field());
+                    }
+                }
+            } else {
+                return false;
+            }
+            for (String field : fields) {
+                if (InfinoIndexField.NAME.equals(field)) {
+                    continue; // the union's own column
+                }
+                Column c = InfinoSearch.columnFor(cols, field);
+                if (c == null) {
+                    continue; // no table maps it: read as no value
+                }
+                read.add(c.name());
+                Column list = c.isList() ? null : InfinoQueryTranslator.listOf(cols, c);
+                if (list != null) {
+                    read.add(list.name());
+                }
+            }
+            if (!columnsRead(b.getSubAggregations(), cols, read)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * The rows of each plan's relation, every column any of the tables has
      * but vectors (which no aggregation reads), as one relation: a column a
      * table lacks is null in its rows, typed as the column ({@link #nullOf}),
@@ -736,13 +806,18 @@ public class InfinoAggregationProcessor {
      * per plan).
      */
     static String unionOf(List<Plan> plans, List<String> indices) {
+        return unionOf(plans, indices, null);
+    }
+
+    /** {@link #unionOf(List, List)} carrying only the columns of {@code only} (see {@link #columnsRead}); every column when it is null. */
+    static String unionOf(List<Plan> plans, List<String> indices, Set<String> only) {
         Map<String, Column> all = new LinkedHashMap<>();
         List<Map<String, Column>> each = new ArrayList<>();
         for (Plan p : plans) {
             Map<String, Column> cols = InfinoNative.columns(p.table());
             each.add(cols);
             for (Column c : cols.values()) {
-                if (!c.vector()) {
+                if (!c.vector() && (only == null || only.contains(c.name()))) {
                     all.putIfAbsent(c.name(), c);
                 }
             }
