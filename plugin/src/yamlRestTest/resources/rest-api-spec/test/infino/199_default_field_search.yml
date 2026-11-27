@@ -119,7 +119,7 @@ setup:
 teardown:
   - do:
       indices.delete:
-        index: dfs_luc,dfs_prx,dfs_def,dfr_luc,dfr_prx,dfr_def,dfm_luc,dfm_prx,dfm_def,dft_luc,dft_prx,dft_def,dfz_luc,dfz_prx,dfz_def
+        index: dfs_luc,dfs_prx,dfs_def,dfr_luc,dfr_prx,dfr_def,dfm_luc,dfm_prx,dfm_def,dft_luc,dft_prx,dft_def,dfz_luc,dfz_prx,dfz_def,dfb_luc,dfb_prx,dfb_def
         ignore_unavailable: true
 
 ---
@@ -1759,3 +1759,103 @@ teardown:
   - match: { hits.total.value: 2 }
   - match: { hits.hits.0._id: "2" }
   - match: { hits.hits.1._id: "3" }
+
+---
+"A boost in index.query.default_field weighs the field it names":
+  # index.query.default_field [title^2, body] is the field title, weighing
+  # 2, and body: a word only the title holds (document 1) is found. The
+  # boost is a weighing the plugin's ranking does not make, so the hits are
+  # compared in a fixed order here.
+  - do:
+      indices.create:
+        index: dfb_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0, index.query.default_field: [ "title^2", body ] }
+          mappings: { properties: { title: { type: text }, body: { type: text }, n: { type: integer } } }
+  - do:
+      indices.create:
+        index: dfb_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0, index.query.default_field: [ "title^2", body ] }
+          mappings: { properties: { title: { type: text }, body: { type: text }, n: { type: integer } } }
+  - do:
+      indices.create:
+        index: dfb_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0, index.query.default_field: [ "title^2", body ] }
+          mappings: { properties: { title: { type: text }, body: { type: text }, n: { type: integer } } }
+  - do:
+      bulk:
+        refresh: true
+        index: dfb_luc
+        body:
+          - index: { _id: "1" }
+          - { "title": "disk", "body": "nothing here", "n": 1 }
+          - index: { _id: "2" }
+          - { "title": "other", "body": "disk is full", "n": 2 }
+          - index: { _id: "3" }
+          - { "title": "none", "body": "none", "n": 3 }
+  - do:
+      bulk:
+        refresh: true
+        index: dfb_prx
+        body:
+          - index: { _id: "1" }
+          - { "title": "disk", "body": "nothing here", "n": 1 }
+          - index: { _id: "2" }
+          - { "title": "other", "body": "disk is full", "n": 2 }
+          - index: { _id: "3" }
+          - { "title": "none", "body": "none", "n": 3 }
+  - do:
+      bulk:
+        refresh: true
+        index: dfb_def
+        body:
+          - index: { _id: "1" }
+          - { "title": "disk", "body": "nothing here", "n": 1 }
+          - index: { _id: "2" }
+          - { "title": "other", "body": "disk is full", "n": 2 }
+          - index: { _id: "3" }
+          - { "title": "none", "body": "none", "n": 3 }
+  - do:
+      search:
+        index: dfb_luc
+        body: { query: { query_string: { query: disk } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfb_luc
+        body: { query: { multi_match: { query: disk } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfb_prx
+        body: { query: { query_string: { query: disk } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfb_prx
+        body: { query: { multi_match: { query: disk } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfb_def
+        body: { query: { query_string: { query: disk } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfb_def
+        body: { query: { multi_match: { query: disk } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }

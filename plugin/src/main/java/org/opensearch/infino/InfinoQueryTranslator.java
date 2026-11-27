@@ -46,6 +46,7 @@ import org.opensearch.index.query.SimpleQueryStringBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.index.query.WildcardQueryBuilder;
+import org.opensearch.index.search.QueryParserHelper;
 import org.opensearch.infino.InfinoLuceneQuery.All;
 import org.opensearch.infino.InfinoLuceneQuery.Bool;
 import org.opensearch.infino.InfinoLuceneQuery.Node;
@@ -889,7 +890,11 @@ final class InfinoQueryTranslator {
     private ValueRanking valueRanking(QueryBuilder qb) {
         Float tieBreaker = null;
         if (qb instanceof QueryStringQueryBuilder qs) {
-            if (qs.minimumShouldMatch() == null && BEST_FIELDS.matcher(qs.toString()).find() && qs.analyzer() == null && qs.boost() == 1f && unboosted(qs.fields())) {
+            if (qs.minimumShouldMatch() == null
+                && BEST_FIELDS.matcher(qs.toString()).find()
+                && qs.analyzer() == null
+                && qs.boost() == 1f
+                && (qs.defaultField() != null || unboosted(weighted(qs.fields())))) {
                 tieBreaker = qs.tieBreaker() == null ? 0f : qs.tieBreaker();
             }
         } else if (qb instanceof MultiMatchQueryBuilder mm) {
@@ -900,7 +905,7 @@ final class InfinoQueryTranslator {
                 && mm.slop() == 0
                 && mm.cutoffFrequency() == null
                 && mm.boost() == 1f
-                && unboosted(mm.fields())) {
+                && unboosted(weighted(mm.fields()))) {
                 tieBreaker = mm.tieBreaker() != null ? mm.tieBreaker() : type.tieBreaker();
             }
         }
@@ -970,10 +975,8 @@ final class InfinoQueryTranslator {
             || qs.queryString() == null) {
             return null;
         }
-        for (float b : qs.fields().values()) {
-            if (b != 1f) {
-                return null;
-            }
+        if (qs.defaultField() == null && !unboosted(weighted(qs.fields()))) {
+            return null;
         }
         // The predicate the query string is; one that set a principal is ranked by it.
         InfinoQueryTranslator alone = alone();
@@ -3134,9 +3137,32 @@ final class InfinoQueryTranslator {
         return fields.isEmpty() ? defaultFields() : fields;
     }
 
-    /** The fields a query naming none searches: the index's {@code index.query.default_field}. */
+    /** The fields a query naming none searches: the index's {@code index.query.default_field}, without their boosts. */
     private List<String> defaultFields() {
-        return IndexSettings.DEFAULT_FIELD_SETTING.get(indexSettings());
+        return new ArrayList<>(defaultFieldWeights().keySet());
+    }
+
+    /**
+     * The index's {@code index.query.default_field}, each name (or pattern)
+     * with its boost, as stock reads the setting: an entry {@code title^2}
+     * is the field {@code title} weighing 2, any other weighing 1. In the
+     * setting's order.
+     */
+    private Map<String, Float> defaultFieldWeights() {
+        List<String> entries = IndexSettings.DEFAULT_FIELD_SETTING.get(indexSettings());
+        Map<String, Float> weights = QueryParserHelper.parseFieldsAndWeights(entries);
+        Map<String, Float> ordered = new LinkedHashMap<>();
+        for (String entry : entries) {
+            int caret = entry.indexOf('^');
+            String name = caret < 0 ? entry : entry.substring(0, caret);
+            ordered.putIfAbsent(name, weights.get(name));
+        }
+        return ordered;
+    }
+
+    /** The fields a full-text query searches with their boosts: those it names, else the index's default ones. */
+    private Map<String, Float> weighted(Map<String, Float> named) {
+        return named.isEmpty() ? defaultFieldWeights() : named;
     }
 
     /** The settings of the index the table backs, as the node last saw them; empty (every setting its default) when it knows none. */

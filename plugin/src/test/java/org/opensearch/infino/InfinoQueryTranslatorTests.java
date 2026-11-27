@@ -1876,6 +1876,49 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
     }
 
     /**
+     * index.query.default_field may weigh a field ({@code level^2}), as
+     * stock's parseFieldsAndWeights reads the setting: the field is
+     * searched, under its own name. A boost is a weighing the table's
+     * ranking does not make, so such a query is left unranked.
+     */
+    public void testABoostInTheIndexsDefaultFieldIsReadOffTheName() {
+        String index = "dflt_boost";
+        String table = InfinoNative.tableFor(index);
+        org.opensearch.cluster.metadata.IndexMetadata md = org.opensearch.cluster.metadata.IndexMetadata.builder(index)
+            .settings(
+                org.opensearch.common.settings.Settings.builder()
+                    .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_VERSION_CREATED, org.opensearch.Version.CURRENT)
+                    .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                    .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                    .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_INDEX_UUID, "dflt-boost-uuid")
+                    .put(InfinoPlugin.INFINO_ENABLED.getKey(), true)
+                    .put(InfinoPlugin.INFINO_MODE.getKey(), InfinoPlugin.MODE_PROXY)
+                    .putList(org.opensearch.index.IndexSettings.DEFAULT_FIELD_SETTING.getKey(), "level^2", "mess*^1.5")
+            )
+            .build();
+        InfinoPlugin.tables().observe(org.opensearch.cluster.metadata.Metadata.builder().put(md, false).build());
+        try {
+            String levelOrMessage = "(\"level\" = 'disk' OR text_match(\"message\", 'disk', 'or'))";
+            for (org.opensearch.index.query.QueryBuilder qb : List.of(QueryBuilders.multiMatchQuery("disk"), QueryBuilders.queryStringQuery("disk"))) {
+                Translation t = InfinoQueryTranslator.translate(qb, columns(), table, NOW, InfinoQueryTranslatorTests::aRowMatches);
+                assertEquals(qb.toString(), levelOrMessage, t.where());
+                assertTrue(qb.toString(), t.scoring().unrankable());
+            }
+            // Over the text fields alone (no keyword value matches) the boost still leaves it unranked.
+            java.util.function.Function<String, List<Map<String, Object>>> none = sql -> List.of();
+            Map<String, Column> cols = columns();
+            cols.put("title", new Column("title", "str", true, false));
+            assertTrue(
+                InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("disk OR full").field("message", 2f).field("title"), cols, table, NOW, none)
+                    .scoring()
+                    .unrankable()
+            );
+        } finally {
+            InfinoPlugin.tables().observe(org.opensearch.cluster.metadata.Metadata.EMPTY_METADATA);
+        }
+    }
+
+    /**
      * A date word reads in the query string's time_zone only where stock's
      * parser reads it as a range there: on the one field its default_field
      * names, unquoted. Over several fields (no fields named) stock reads it
