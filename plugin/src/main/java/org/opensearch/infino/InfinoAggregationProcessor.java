@@ -460,16 +460,18 @@ public class InfinoAggregationProcessor {
      * whose access and time the aggregations are planned under; they read
      * the columns of every plan ({@link #columnsOver}). {@code shardIndices}
      * names the index of each plan's table, which an aggregation on
-     * {@code _index} reads per row.
+     * {@code _index} reads per row. {@code total} is the number of rows the
+     * union holds when the caller has counted them already (each plan's own
+     * count, added up), else null: it is then counted over the union.
      */
-    Counted evaluateOver(Collection<AggregationBuilder> builders, Plan plan, List<Plan> shardPlans, List<String> shardIndices) {
+    Counted evaluateOver(Collection<AggregationBuilder> builders, Plan plan, List<Plan> shardPlans, List<String> shardIndices, Long total) {
         String from = unionOf(shardPlans, shardIndices);
         List<String> shardTables = new ArrayList<>();
         for (Plan p : shardPlans) {
             shardTables.add(p.table());
         }
         Function<QueryBuilder, String> predicates = qb -> perShard(qb, shardPlans);
-        Supplier<Long> counter = () -> asLong(oneRow("SELECT COUNT(*) AS c FROM " + from).get("c"));
+        Supplier<Long> counter = total != null ? () -> total : () -> asLong(oneRow("SELECT COUNT(*) AS c FROM " + from).get("c"));
         // The aggregations read every plan's columns, and _index from the
         // union's own column rather than as the first plan's name.
         Map<String, Column> cols = columnsOver(builders, shardPlans);

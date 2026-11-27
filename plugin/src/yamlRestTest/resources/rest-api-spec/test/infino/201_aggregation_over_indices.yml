@@ -427,6 +427,14 @@
   - match: { aggregations.c.value: 3 }
   - match: { aggregations.p.values.0\.0: 10.0 }
   - match: { aggregations.p.values.100\.0: 40.0 }
+  - do:
+      search:
+        index: aofa_team_a_luc
+        body: { size: 0, aggs: { t: { terms: { field: user, size: 1 }, aggs: { c: { cardinality: { field: team } } } } } }
+  - match: { aggregations.t.buckets.0.key: u1 }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.0.c.value: 1 }
+  - match: { aggregations.t.sum_other_doc_count: 2 }
 
 ---
 "Over several indices through a filtering alias, default mode":
@@ -477,6 +485,13 @@
   - match: { aggregations.c.value: 3 }
   - match: { aggregations.p.values.0\.0: 10.0 }
   - match: { aggregations.p.values.100\.0: 40.0 }
+  - do:
+      search:
+        index: aofa_team_a_def
+        body: { size: 0, aggs: { t: { terms: { field: user, size: 1 }, aggs: { c: { cardinality: { field: team } } } } } }
+  - match: { aggregations.t.buckets.0.key: u1 }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.0.c.value: 1 }
 
 ---
 "Over several indices through a filtering alias, proxy mode":
@@ -527,6 +542,14 @@
   - match: { aggregations.c.value: 3 }
   - match: { aggregations.p.values.0\.0: 10.0 }
   - match: { aggregations.p.values.100\.0: 40.0 }
+  - do:
+      search:
+        index: aofa_team_a_prx
+        body: { size: 0, aggs: { t: { terms: { field: user, size: 1 }, aggs: { c: { cardinality: { field: team } } } } } }
+  - match: { aggregations.t.buckets.0.key: u1 }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.0.c.value: 1 }
+  - match: { aggregations.t.sum_other_doc_count: 2 }
 
 ---
 "Over several indices, a field mapped as a long in one and a float in another, a Lucene twin":

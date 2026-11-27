@@ -94,7 +94,7 @@ public class InfinoAggregationOverSeveralTests extends OpenSearchTestCase {
             plans.add(InfinoSearch.plan(t, source, now));
             indices.add(t);
         }
-        return new InfinoAggregationProcessor(new Index(tables[0], "_na_")).evaluateOver(List.of(agg), plans.get(0), plans, indices)
+        return new InfinoAggregationProcessor(new Index(tables[0], "_na_")).evaluateOver(List.of(agg), plans.get(0), plans, indices, null)
             .aggregations();
     }
 

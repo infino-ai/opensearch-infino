@@ -186,7 +186,7 @@ final class InfinoExactAggregation extends InternalAggregation {
         }
         Part first = all.get(0);
         InfinoAggregationProcessor processor = new InfinoAggregationProcessor(new Index(first.index(), first.indexUuid()), false);
-        return processor.evaluateOver(List.of(builder), plans.get(0), plans, indices).aggregations().get(getName());
+        return processor.evaluateOver(List.of(builder), plans.get(0), plans, indices, null).aggregations().get(getName());
     }
 
     /** Refuses an aggregation over several indices' rows read as one when a top_hits is under it: its hits name one index. */

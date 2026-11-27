@@ -2959,6 +2959,9 @@ public final class InfinoSearch {
             }
         }
         List<Plan> readPlans = new ArrayList<>();
+        // The rows the indices read match, each counted by its own aggregations
+        // below: the population of an aggregation over all of them (overAll).
+        long readTotal = 0;
         List<SortSpec> sorts = List.of();
         boolean terminatedEarly = false;
         for (Index index : indices) {
@@ -2990,6 +2993,9 @@ public final class InfinoSearch {
                     sharedTotal && !countWithAggs ? page.total() : null
                 );
                 aggs.add(counted.aggregations());
+                if (read.contains(index)) {
+                    readTotal += counted.total();
+                }
                 if (countWithAggs) {
                     page = new Page(page.hits(), counted.total(), page.exact(), page.maxScore(), page.unsourced(), page.chosen());
                 }
@@ -3022,7 +3028,7 @@ public final class InfinoSearch {
             hits = withoutIds(hits);
         }
         if (!overAll.isEmpty()) {
-            aggs.set(0, withOverAll(aggs.get(0), overAll, builders, read, readPlans, accessOf));
+            aggs.set(0, withOverAll(aggs.get(0), overAll, builders, read, readPlans, accessOf, readTotal));
         }
         InternalAggregations reduced = null;
         if (!aggs.isEmpty()) {
@@ -3059,7 +3065,8 @@ public final class InfinoSearch {
      * the search reads rows of) matches under its plan, of {@code plans},
      * read as one ({@link InfinoAggregationProcessor#evaluateOver}), all in the
      * order {@code builders} names them. No other index holds a part of those
-     * answers, so the reduce takes each as it is. Refused as over default-mode
+     * answers, so the reduce takes each as it is. {@code total} is the rows
+     * they match, as each index counted its own. Refused as over default-mode
      * shards: with a top_hits under it, or over an index read under a
      * document, field or masking rule.
      */
@@ -3069,7 +3076,8 @@ public final class InfinoSearch {
         Collection<AggregationBuilder> builders,
         List<Index> indices,
         List<Plan> plans,
-        Function<Index, InfinoAccess> accessOf
+        Function<Index, InfinoAccess> accessOf,
+        long total
     ) {
         List<String> names = new ArrayList<>(indices.size());
         for (Index index : indices) {
@@ -3081,7 +3089,7 @@ public final class InfinoSearch {
                 InfinoExactAggregation.refuseRestrictedOverSeveral(b, index.getName(), accessOf.apply(index));
             }
         }
-        InternalAggregations answered = new InfinoAggregationProcessor(indices.get(0)).evaluateOver(overAll, plans.get(0), plans, names).aggregations();
+        InternalAggregations answered = new InfinoAggregationProcessor(indices.get(0)).evaluateOver(overAll, plans.get(0), plans, names, total).aggregations();
         List<InternalAggregation> ordered = new ArrayList<>(builders.size());
         for (AggregationBuilder b : builders) {
             InternalAggregation a = overAll.contains(b) ? answered.get(b.getName()) : first.get(b.getName());
