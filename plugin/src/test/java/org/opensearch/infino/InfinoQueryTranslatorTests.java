@@ -3486,4 +3486,102 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             translate(QueryBuilders.matchQuery("message", "disk").fuzziness(org.opensearch.common.unit.Fuzziness.ZERO)).where()
         );
     }
+
+    /** A should of {@code n} bools, each a filter of a term on level and a term on status. */
+    private static BoolQueryBuilder pairs(int n, java.util.function.IntFunction<String> level) {
+        BoolQueryBuilder b = QueryBuilders.boolQuery();
+        for (int i = 0; i < n; i++) {
+            b.should(QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", level.apply(i))).filter(QueryBuilders.termQuery("status", i)));
+        }
+        return b;
+    }
+
+    /** The AND / OR connectives in {@code sql}, as the engine counts them against its limit. */
+    private static int connectives(String sql) {
+        return sql.split(" (AND|OR) ", -1).length - 1;
+    }
+
+    public void testShouldPairsSharingATermRequireItOnce() {
+        // 600 pairs under one should: stock serves them, as each bool holds fewer
+        // clauses than its limit; the engine would refuse 1,799 connectives.
+        String where = translate(pairs(600, i -> "test")).where();
+        StringBuilder ids = new StringBuilder();
+        for (int i = 0; i < 600; i++) {
+            ids.append(i == 0 ? "" : ", ").append(i);
+        }
+        assertEquals("((\"level\" = 'test' AND \"status\" IN (" + ids + ")))", where);
+        assertEquals(1, connectives(where));
+    }
+
+    public void testShouldPairsSharingNoTermAreOneTupleList() {
+        String where = translate(pairs(600, i -> "n" + i)).where();
+        assertEquals(0, connectives(where));
+        assertTrue(where, where.startsWith("((\"level\", \"status\") IN (('n0', 0), ('n1', 1), "));
+        // The columns in either order are one list, each tuple in the list's order.
+        BoolQueryBuilder b = QueryBuilders.boolQuery()
+            .should(QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "a")).filter(QueryBuilders.termQuery("status", 1)))
+            .should(QueryBuilders.boolQuery().must(QueryBuilders.termQuery("status", 2)).must(QueryBuilders.termQuery("level", "b")));
+        assertEquals("((\"level\", \"status\") IN (('a', 1), ('b', 2)))", translate(b).where());
+    }
+
+    public void testShouldTermsOnOneFieldAreOneInList() {
+        BoolQueryBuilder b = QueryBuilders.boolQuery()
+            .should(QueryBuilders.termQuery("level", "a"))
+            .should(QueryBuilders.termsQuery("level", "b", "a"))
+            .should(QueryBuilders.rangeQuery("status").gte(500))
+            .should(QueryBuilders.termQuery("level", "c"));
+        assertEquals("((\"level\" IN ('a', 'b', 'c') OR (\"status\" >= 500)))", translate(b).where());
+        // A clause that is the common one alone holds wherever any does.
+        b = QueryBuilders.boolQuery()
+            .should(QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "a")).filter(QueryBuilders.termQuery("status", 1)))
+            .should(QueryBuilders.termQuery("level", "a"));
+        assertEquals("(\"level\" = 'a')", translate(b).where());
+        // Clauses with nothing to share or merge read as written.
+        b = QueryBuilders.boolQuery().should(QueryBuilders.termQuery("level", "a")).should(QueryBuilders.rangeQuery("status").gte(500));
+        assertEquals("((\"level\" = 'a' OR (\"status\" >= 500)))", translate(b).where());
+        // A text column's term is its terms, never an IN list of values.
+        b = QueryBuilders.boolQuery().should(QueryBuilders.termQuery("message", "disk")).should(QueryBuilders.termQuery("message", "full"));
+        assertFalse(translate(b).where(), translate(b).where().contains(" IN ("));
+    }
+
+    public void testShouldPairsOnAListColumnStayApart() {
+        // A field some document gives several values is compared through its
+        // list column too, which no tuple of column values reads.
+        Map<String, Column> cols = columns();
+        cols.put("level[]", Column.list("level[]", "str"));
+        String where = InfinoQueryTranslator.translate(pairs(3, i -> "n" + i), cols, TABLE, NOW).where();
+        assertFalse(where, where.contains("(\"level\", \"status\") IN"));
+        assertEquals(3, where.split("\"level\\[\\]\" IS NULL", -1).length - 1);
+    }
+
+    public void testABoolPastTheClauseLimitIsRefusedAsStockRefusesIt() {
+        int limit = org.apache.lucene.search.IndexSearcher.getMaxClauseCount();
+        BoolQueryBuilder at = QueryBuilders.boolQuery();
+        BoolQueryBuilder past = QueryBuilders.boolQuery();
+        for (int i = 0; i <= limit; i++) {
+            if (i < limit) {
+                at.should(QueryBuilders.termQuery("status", i));
+            }
+            past.should(QueryBuilders.termQuery("status", i));
+        }
+        assertEquals(0, connectives(translate(at).where()));
+        QueryShardException e = expectThrows(QueryShardException.class, () -> translate(past));
+        assertEquals("failed to create query: maxClauseCount is set to " + limit, e.getMessage());
+        assertEquals(RestStatus.BAD_REQUEST, e.status());
+        assertTrue(e.getCause() instanceof org.apache.lucene.search.IndexSearcher.TooManyClauses);
+        // Inside a should clause too, where the clause is read as what it requires.
+        BoolQueryBuilder nested = QueryBuilders.boolQuery().should(QueryBuilders.termQuery("level", "a")).should(QueryBuilders.boolQuery().filter(past));
+        expectThrows(QueryShardException.class, () -> translate(nested));
+        // Must_not clauses alone take one more, the match_all stock adds beside them.
+        BoolQueryBuilder excluded = QueryBuilders.boolQuery();
+        BoolQueryBuilder narrowed = QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("level", "a"));
+        for (int i = 0; i < limit; i++) {
+            excluded.mustNot(QueryBuilders.termQuery("status", i));
+            if (i < limit - 1) {
+                narrowed.mustNot(QueryBuilders.termQuery("status", i));
+            }
+        }
+        expectThrows(QueryShardException.class, () -> translate(excluded));
+        assertNotNull(translate(narrowed));
+    }
 }
