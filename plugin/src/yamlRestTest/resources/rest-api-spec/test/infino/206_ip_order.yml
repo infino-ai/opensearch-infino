@@ -6,7 +6,7 @@
 "An ip field is ordered by address in ranges, sorts and terms keys, as a Lucene twin orders it":
   - do:
       indices.create:
-        index: ipo_luc
+        index: ipord_luc
         body:
           settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
           mappings:
@@ -15,7 +15,7 @@
               n: { type: long }
   - do:
       indices.create:
-        index: ipo_def
+        index: ipord_def
         body:
           settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
           mappings:
@@ -24,7 +24,7 @@
               n: { type: long }
   - do:
       indices.create:
-        index: ipo_prx
+        index: ipord_prx
         body:
           settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
           mappings:
@@ -35,7 +35,7 @@
   - do:
       bulk:
         refresh: true
-        index: ipo_luc
+        index: ipord_luc
         body:
           - index: { _id: "a1" }
           - {n: 0, addr: "1.0.179.100"}
@@ -78,7 +78,7 @@
   - do:
       bulk:
         refresh: true
-        index: ipo_def
+        index: ipord_def
         body:
           - index: { _id: "a1" }
           - {n: 0, addr: "1.0.179.100"}
@@ -121,7 +121,7 @@
   - do:
       bulk:
         refresh: true
-        index: ipo_prx
+        index: ipord_prx
         body:
           - index: { _id: "a1" }
           - {n: 0, addr: "1.0.179.100"}
@@ -163,236 +163,236 @@
   # A range on an ip field keeps the addresses in it as numbers.
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "10.0.0.0", lte: "10.255.255.255" } } } }
   - match: { hits.total.value: 4 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "10.0.0.0", lte: "10.255.255.255" } } } }
   - match: { hits.total.value: 4 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "10.0.0.0", lte: "10.255.255.255" } } } }
   - match: { hits.total.value: 4 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "100.0.0.0" } } } }
   - match: { hits.total.value: 5 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "100.0.0.0" } } } }
   - match: { hits.total.value: 5 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "100.0.0.0" } } } }
   - match: { hits.total.value: 5 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "100.0.0.0" } } } }
   - match: { hits.total.value: 11 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "100.0.0.0" } } } }
   - match: { hits.total.value: 11 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "100.0.0.0" } } } }
   - match: { hits.total.value: 11 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::1", lt: "::ffff:0.0.0.0" } } } }
   - match: { hits.total.value: 1 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::1", lt: "::ffff:0.0.0.0" } } } }
   - match: { hits.total.value: 1 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::1", lt: "::ffff:0.0.0.0" } } } }
   - match: { hits.total.value: 1 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "2001:db8::", lte: "2001:db8::ffff" } } } }
   - match: { hits.total.value: 2 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "2001:db8::", lte: "2001:db8::ffff" } } } }
   - match: { hits.total.value: 2 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "2001:db8::", lte: "2001:db8::ffff" } } } }
   - match: { hits.total.value: 2 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "255.255.255.255" } } } }
   - match: { hits.total.value: 3 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "255.255.255.255" } } } }
   - match: { hits.total.value: 3 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "255.255.255.255" } } } }
   - match: { hits.total.value: 3 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "1.0.6.192", lte: "1.0.61.206" } } } }
   - match: { hits.total.value: 2 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "1.0.6.192", lte: "1.0.61.206" } } } }
   - match: { hits.total.value: 2 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "1.0.6.192", lte: "1.0.61.206" } } } }
   - match: { hits.total.value: 2 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { query_string: { query: "addr:[10.0.0.0 TO 10.255.255.255]" } } }
   - match: { hits.total.value: 4 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { query_string: { query: "addr:[10.0.0.0 TO 10.255.255.255]" } } }
   - match: { hits.total.value: 4 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { query_string: { query: "addr:[10.0.0.0 TO 10.255.255.255]" } } }
   - match: { hits.total.value: 4 }
 
   # A range across the IPv4-mapped block's edge, one with an IPv4 and an IPv6 bound, and bounds in mapped form.
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::1", lte: "::ffff:1.0.255.255" } } } }
   - match: { hits.total.value: 5 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::1", lte: "::ffff:1.0.255.255" } } } }
   - match: { hits.total.value: 5 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::1", lte: "::ffff:1.0.255.255" } } } }
   - match: { hits.total.value: 5 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "::", lte: "::ffff:3.3.3.3" } } } }
   - match: { hits.total.value: 6 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "::", lte: "::ffff:3.3.3.3" } } } }
   - match: { hits.total.value: 6 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "::", lte: "::ffff:3.3.3.3" } } } }
   - match: { hits.total.value: 6 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "::ffff:255.255.255.255", lt: "2001:db8::2" } } } }
   - match: { hits.total.value: 1 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "::ffff:255.255.255.255", lt: "2001:db8::2" } } } }
   - match: { hits.total.value: 1 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "::ffff:255.255.255.255", lt: "2001:db8::2" } } } }
   - match: { hits.total.value: 1 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "200.0.0.0", lt: "fe80::" } } } }
   - match: { hits.total.value: 3 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "200.0.0.0", lt: "fe80::" } } } }
   - match: { hits.total.value: 3 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "200.0.0.0", lt: "fe80::" } } } }
   - match: { hits.total.value: 3 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::ffff:10.0.0.0", lte: "::ffff:10.255.255.255" } } } }
   - match: { hits.total.value: 4 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::ffff:10.0.0.0", lte: "::ffff:10.255.255.255" } } } }
   - match: { hits.total.value: 4 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "::ffff:10.0.0.0", lte: "::ffff:10.255.255.255" } } } }
   - match: { hits.total.value: 4 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { lte: "1.0.61.206" } } } }
   - match: { hits.total.value: 3 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { lte: "1.0.61.206" } } } }
   - match: { hits.total.value: 3 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { lte: "1.0.61.206" } } } }
   - match: { hits.total.value: 3 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "2001:db8::2" } } } }
   - match: { hits.total.value: 2 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "2001:db8::2" } } } }
   - match: { hits.total.value: 2 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "2001:db8::2" } } } }
   - match: { hits.total.value: 2 }
 
   # A sort on an ip field orders the addresses as numbers and pages on with search_after.
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body:
           size: 6
           sort: [ { addr: asc }, { n: asc } ]
@@ -413,7 +413,7 @@
   - set: { hits.hits.5.sort: after_asc_luc_0 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body:
           size: 6
           sort: [ { addr: asc }, { n: asc } ]
@@ -435,7 +435,7 @@
   - set: { hits.hits.5.sort: after_asc_luc_1 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body:
           size: 6
           sort: [ { addr: asc }, { n: asc } ]
@@ -456,7 +456,7 @@
   - set: { hits.hits.5.sort: after_asc_def_0 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body:
           size: 6
           sort: [ { addr: asc }, { n: asc } ]
@@ -478,7 +478,7 @@
   - set: { hits.hits.5.sort: after_asc_def_1 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body:
           size: 6
           sort: [ { addr: asc }, { n: asc } ]
@@ -499,7 +499,7 @@
   - set: { hits.hits.5.sort: after_asc_prx_0 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body:
           size: 6
           sort: [ { addr: asc }, { n: asc } ]
@@ -521,7 +521,7 @@
   - set: { hits.hits.5.sort: after_asc_prx_1 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body:
           size: 6
           sort: [ { addr: desc }, { n: asc } ]
@@ -542,7 +542,7 @@
   - set: { hits.hits.5.sort: after_desc_luc_0 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body:
           size: 6
           sort: [ { addr: desc }, { n: asc } ]
@@ -564,7 +564,7 @@
   - set: { hits.hits.5.sort: after_desc_luc_1 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body:
           size: 6
           sort: [ { addr: desc }, { n: asc } ]
@@ -585,7 +585,7 @@
   - set: { hits.hits.5.sort: after_desc_def_0 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body:
           size: 6
           sort: [ { addr: desc }, { n: asc } ]
@@ -607,7 +607,7 @@
   - set: { hits.hits.5.sort: after_desc_def_1 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body:
           size: 6
           sort: [ { addr: desc }, { n: asc } ]
@@ -628,7 +628,7 @@
   - set: { hits.hits.5.sort: after_desc_prx_0 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body:
           size: 6
           sort: [ { addr: desc }, { n: asc } ]
@@ -651,7 +651,7 @@
   # The document with no address sorts first or last as asked, in either direction.
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 3, sort: [ { addr: { order: asc, missing: _first } }, { n: asc } ], _source: false }
   - length: { hits.hits: 3 }
   - set: { hits.hits.0._id: mfa_0_id }
@@ -659,7 +659,7 @@
   - set: { hits.hits.2._id: mfa_2_id }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 3, sort: [ { addr: { order: asc, missing: _first } }, { n: asc } ], _source: false }
   - length: { hits.hits: 3 }
   - match: { hits.hits.0._id: $mfa_0_id }
@@ -667,7 +667,7 @@
   - match: { hits.hits.2._id: $mfa_2_id }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 3, sort: [ { addr: { order: asc, missing: _first } }, { n: asc } ], _source: false }
   - length: { hits.hits: 3 }
   - match: { hits.hits.0._id: $mfa_0_id }
@@ -675,7 +675,7 @@
   - match: { hits.hits.2._id: $mfa_2_id }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 18, sort: [ { addr: asc }, { n: asc } ], _source: false }
   - length: { hits.hits: 18 }
   - set: { hits.hits.15._id: mla_15_id }
@@ -683,7 +683,7 @@
   - set: { hits.hits.17._id: mla_17_id }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 18, sort: [ { addr: asc }, { n: asc } ], _source: false }
   - length: { hits.hits: 18 }
   - match: { hits.hits.15._id: $mla_15_id }
@@ -691,7 +691,7 @@
   - match: { hits.hits.17._id: $mla_17_id }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 18, sort: [ { addr: asc }, { n: asc } ], _source: false }
   - length: { hits.hits: 18 }
   - match: { hits.hits.15._id: $mla_15_id }
@@ -699,7 +699,7 @@
   - match: { hits.hits.17._id: $mla_17_id }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 3, sort: [ { addr: { order: desc, missing: _first } }, { n: asc } ], _source: false }
   - length: { hits.hits: 3 }
   - set: { hits.hits.0._id: mfd_0_id }
@@ -707,7 +707,7 @@
   - set: { hits.hits.2._id: mfd_2_id }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 3, sort: [ { addr: { order: desc, missing: _first } }, { n: asc } ], _source: false }
   - length: { hits.hits: 3 }
   - match: { hits.hits.0._id: $mfd_0_id }
@@ -715,7 +715,7 @@
   - match: { hits.hits.2._id: $mfd_2_id }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 3, sort: [ { addr: { order: desc, missing: _first } }, { n: asc } ], _source: false }
   - length: { hits.hits: 3 }
   - match: { hits.hits.0._id: $mfd_0_id }
@@ -723,7 +723,7 @@
   - match: { hits.hits.2._id: $mfd_2_id }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 18, sort: [ { addr: desc }, { n: asc } ], _source: false }
   - length: { hits.hits: 18 }
   - set: { hits.hits.15._id: mld_15_id }
@@ -731,7 +731,7 @@
   - set: { hits.hits.17._id: mld_17_id }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 18, sort: [ { addr: desc }, { n: asc } ], _source: false }
   - length: { hits.hits: 18 }
   - match: { hits.hits.15._id: $mld_15_id }
@@ -739,7 +739,7 @@
   - match: { hits.hits.17._id: $mld_17_id }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 18, sort: [ { addr: desc }, { n: asc } ], _source: false }
   - length: { hits.hits: 18 }
   - match: { hits.hits.15._id: $mld_15_id }
@@ -747,7 +747,7 @@
   - match: { hits.hits.17._id: $mld_17_id }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 18, sort: [ { addr: desc }, { n: asc } ], _source: false }
   - match: { hits.hits.8._id: a5 }
   - match: { hits.hits.9._id: a18 }
@@ -756,7 +756,7 @@
   # The issue's addresses in number order, and ::1 before every IPv4 address.
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 6, sort: [ { addr: asc }, { n: asc } ], _source: false }
   - match: { hits.hits.0._id: a10 }
   - match: { hits.hits.1._id: a3 }
@@ -769,13 +769,13 @@
   # A mapped or upper-case address comes back as stock prints it.
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 2, sort: [ { addr: desc }, { n: asc } ], query: { ids: { values: [ a12, a13 ] } }, _source: false }
   - match: { hits.hits.0.sort.0: "2001:db8::2" }
   - match: { hits.hits.1.sort.0: "10.1.2.3" }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 2, sort: [ { addr: desc }, { n: asc } ], query: { ids: { values: [ a12, a13 ] } }, _source: false }
   - match: { hits.hits.0.sort.0: "2001:db8::2" }
   - match: { hits.hits.1.sort.0: "10.1.2.3" }
@@ -783,7 +783,7 @@
   # A terms aggregation on an ip field orders its keys as numbers.
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 8, order: { _key: asc } } } } }
   - length: { aggregations.t.buckets: 8 }
   - set: { aggregations.t.buckets.0.key: key_asc_0_k }
@@ -805,7 +805,7 @@
   - set: { aggregations.t.sum_other_doc_count: key_asc_other }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 8, order: { _key: asc } } } } }
   - length: { aggregations.t.buckets: 8 }
   - match: { aggregations.t.buckets.0.key: $key_asc_0_k }
@@ -827,7 +827,7 @@
   - match: { aggregations.t.sum_other_doc_count: $key_asc_other }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 8, order: { _key: asc } } } } }
   - length: { aggregations.t.buckets: 8 }
   - match: { aggregations.t.buckets.0.key: $key_asc_0_k }
@@ -849,7 +849,7 @@
   - match: { aggregations.t.sum_other_doc_count: $key_asc_other }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 8, order: { _key: desc } } } } }
   - length: { aggregations.t.buckets: 8 }
   - set: { aggregations.t.buckets.0.key: key_desc_0_k }
@@ -871,7 +871,7 @@
   - set: { aggregations.t.sum_other_doc_count: key_desc_other }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 8, order: { _key: desc } } } } }
   - length: { aggregations.t.buckets: 8 }
   - match: { aggregations.t.buckets.0.key: $key_desc_0_k }
@@ -893,7 +893,7 @@
   - match: { aggregations.t.sum_other_doc_count: $key_desc_other }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 8, order: { _key: desc } } } } }
   - length: { aggregations.t.buckets: 8 }
   - match: { aggregations.t.buckets.0.key: $key_desc_0_k }
@@ -915,7 +915,7 @@
   - match: { aggregations.t.sum_other_doc_count: $key_desc_other }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 5 } } } }
   - length: { aggregations.t.buckets: 5 }
   - set: { aggregations.t.buckets.0.key: count_0_k }
@@ -931,7 +931,7 @@
   - set: { aggregations.t.sum_other_doc_count: count_other }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 5 } } } }
   - length: { aggregations.t.buckets: 5 }
   - match: { aggregations.t.buckets.0.key: $count_0_k }
@@ -947,7 +947,7 @@
   - match: { aggregations.t.sum_other_doc_count: $count_other }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 5 } } } }
   - length: { aggregations.t.buckets: 5 }
   - match: { aggregations.t.buckets.0.key: $count_0_k }
@@ -963,7 +963,7 @@
   - match: { aggregations.t.sum_other_doc_count: $count_other }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 4, order: { _key: asc } } } } }
   - match: { aggregations.t.buckets.0.key: "::1" }
   - match: { aggregations.t.buckets.1.key: "1.0.6.192" }
@@ -973,23 +973,23 @@
   # The least and greatest address: a one-hit sort, a one-bucket key order and top_hits; min and max are refused as stock refuses them.
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 1, sort: [ { addr: asc } ], _source: false }
   - match: { hits.hits.0.sort.0: "::1" }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 1, sort: [ { addr: desc } ], _source: false }
   - match: { hits.hits.0.sort.0: "fe80::1" }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { lo: { terms: { field: addr, size: 1, order: { _key: asc } } }, hi: { terms: { field: addr, size: 1, order: { _key: desc } } } } }
   - match: { aggregations.lo.buckets.0.key: "::1" }
   - match: { aggregations.hi.buckets.0.key: "fe80::1" }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { top: { top_hits: { size: 2, sort: [ { addr: desc } ], _source: false } } } }
   - match: { aggregations.top.hits.hits.0._id: a17 }
   - match: { aggregations.top.hits.hits.1._id: a12 }
@@ -997,32 +997,32 @@
   - do:
       catch: bad_request
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { m: { min: { field: addr } } } }
   - do:
       catch: bad_request
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { m: { max: { field: addr } } } }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 1, sort: [ { addr: asc } ], _source: false }
   - match: { hits.hits.0.sort.0: "::1" }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 1, sort: [ { addr: desc } ], _source: false }
   - match: { hits.hits.0.sort.0: "fe80::1" }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { lo: { terms: { field: addr, size: 1, order: { _key: asc } } }, hi: { terms: { field: addr, size: 1, order: { _key: desc } } } } }
   - match: { aggregations.lo.buckets.0.key: "::1" }
   - match: { aggregations.hi.buckets.0.key: "fe80::1" }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { top: { top_hits: { size: 2, sort: [ { addr: desc } ], _source: false } } } }
   - match: { aggregations.top.hits.hits.0._id: a17 }
   - match: { aggregations.top.hits.hits.1._id: a12 }
@@ -1030,32 +1030,32 @@
   - do:
       catch: bad_request
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { m: { min: { field: addr } } } }
   - do:
       catch: bad_request
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { m: { max: { field: addr } } } }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 1, sort: [ { addr: asc } ], _source: false }
   - match: { hits.hits.0.sort.0: "::1" }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 1, sort: [ { addr: desc } ], _source: false }
   - match: { hits.hits.0.sort.0: "fe80::1" }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { lo: { terms: { field: addr, size: 1, order: { _key: asc } } }, hi: { terms: { field: addr, size: 1, order: { _key: desc } } } } }
   - match: { aggregations.lo.buckets.0.key: "::1" }
   - match: { aggregations.hi.buckets.0.key: "fe80::1" }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { top: { top_hits: { size: 2, sort: [ { addr: desc } ], _source: false } } } }
   - match: { aggregations.top.hits.hits.0._id: a17 }
   - match: { aggregations.top.hits.hits.1._id: a12 }
@@ -1063,153 +1063,153 @@
   - do:
       catch: bad_request
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { m: { min: { field: addr } } } }
   - do:
       catch: bad_request
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { m: { max: { field: addr } } } }
 
   # A composite source on an ip field groups and pages by address, as stock does.
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ] } } } }
   - set: { aggregations.c.buckets: ca_p0 }
   - set: { aggregations.c.after_key: ca_luc_after0 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ] } } } }
   - match: { aggregations.c.buckets: $ca_p0 }
   - set: { aggregations.c.after_key: ca_ipo_def_after0 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ] } } } }
   - match: { aggregations.c.buckets: $ca_p0 }
   - set: { aggregations.c.after_key: ca_ipo_prx_after0 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ], after: $ca_luc_after0 } } } }
   - set: { aggregations.c.buckets: ca_p1 }
   - set: { aggregations.c.after_key: ca_luc_after1 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ], after: $ca_ipo_def_after0 } } } }
   - match: { aggregations.c.buckets: $ca_p1 }
   - set: { aggregations.c.after_key: ca_ipo_def_after1 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ], after: $ca_ipo_prx_after0 } } } }
   - match: { aggregations.c.buckets: $ca_p1 }
   - set: { aggregations.c.after_key: ca_ipo_prx_after1 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ], after: $ca_luc_after1 } } } }
   - set: { aggregations.c.buckets: ca_p2 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ], after: $ca_ipo_def_after1 } } } }
   - match: { aggregations.c.buckets: $ca_p2 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ], after: $ca_ipo_prx_after1 } } } }
   - match: { aggregations.c.buckets: $ca_p2 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ] } } } }
   - set: { aggregations.c.buckets: cd_p0 }
   - set: { aggregations.c.after_key: cd_luc_after0 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ] } } } }
   - match: { aggregations.c.buckets: $cd_p0 }
   - set: { aggregations.c.after_key: cd_ipo_def_after0 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ] } } } }
   - match: { aggregations.c.buckets: $cd_p0 }
   - set: { aggregations.c.after_key: cd_ipo_prx_after0 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ], after: $cd_luc_after0 } } } }
   - set: { aggregations.c.buckets: cd_p1 }
   - set: { aggregations.c.after_key: cd_luc_after1 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ], after: $cd_ipo_def_after0 } } } }
   - match: { aggregations.c.buckets: $cd_p1 }
   - set: { aggregations.c.after_key: cd_ipo_def_after1 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ], after: $cd_ipo_prx_after0 } } } }
   - match: { aggregations.c.buckets: $cd_p1 }
   - set: { aggregations.c.after_key: cd_ipo_prx_after1 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ], after: $cd_luc_after1 } } } }
   - set: { aggregations.c.buckets: cd_p2 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ], after: $cd_ipo_def_after1 } } } }
   - match: { aggregations.c.buckets: $cd_p2 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ], after: $cd_ipo_prx_after1 } } } }
   - match: { aggregations.c.buckets: $cd_p2 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { c: { composite: { size: 9, sources: [ { a: { terms: { field: addr, missing_bucket: true } } } ] } } } }
   - set: { aggregations.c.buckets: cm_p0 }
   - set: { aggregations.c.after_key: cm_luc_after0 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { c: { composite: { size: 9, sources: [ { a: { terms: { field: addr, missing_bucket: true } } } ] } } } }
   - match: { aggregations.c.buckets: $cm_p0 }
   - set: { aggregations.c.after_key: cm_ipo_def_after0 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { c: { composite: { size: 9, sources: [ { a: { terms: { field: addr, missing_bucket: true } } } ] } } } }
   - match: { aggregations.c.buckets: $cm_p0 }
   - set: { aggregations.c.after_key: cm_ipo_prx_after0 }
   - do:
       search:
-        index: ipo_luc
+        index: ipord_luc
         body: { size: 0, aggs: { c: { composite: { size: 9, sources: [ { a: { terms: { field: addr, missing_bucket: true } } } ], after: $cm_luc_after0 } } } }
   - set: { aggregations.c.buckets: cm_p1 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { c: { composite: { size: 9, sources: [ { a: { terms: { field: addr, missing_bucket: true } } } ], after: $cm_ipo_def_after0 } } } }
   - match: { aggregations.c.buckets: $cm_p1 }
   - do:
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { size: 0, aggs: { c: { composite: { size: 9, sources: [ { a: { terms: { field: addr, missing_bucket: true } } } ], after: $cm_ipo_prx_after0 } } } }
   - match: { aggregations.c.buckets: $cm_p1 }
   - do:
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ] } } } }
   - match: { aggregations.c.buckets.0.key.a: "::1" }
   - match: { aggregations.c.buckets.1.key.a: "1.0.6.192" }
@@ -1218,19 +1218,19 @@
   - do:
       catch: bad_request
       search:
-        index: ipo_def
+        index: ipord_def
         body: { size: 0, aggs: { c: { composite: { sources: [ { a: { terms: { field: addr } } } ], after: { a: "not-an-address" } } } } }
   # A missing value on an ip sort is refused: stock compares its text with the addresses' 16-byte form.
   - do:
       catch: bad_request
       search:
-        index: ipo_def
+        index: ipord_def
         body: { sort: [ { addr: { order: asc, missing: "1.2.3.4" } } ] }
   - match: { error.root_cause.0.reason: "/.*sort.missing.value..1.2.3.4..on..addr...an.ip.field,.is.not.served.*/" }
   - do:
       catch: bad_request
       search:
-        index: ipo_prx
+        index: ipord_prx
         body: { sort: [ { addr: { order: asc, missing: "1.2.3.4" } } ] }
   - match: { error.root_cause.0.reason: "/.*sort.missing.value..1.2.3.4..on..addr...an.ip.field,.is.not.served.*/" }
 
@@ -1238,14 +1238,14 @@
 "A range and a composite over documents with several addresses match a Lucene twin, and a sort over them is refused":
   - do:
       indices.create:
-        index: ipm_luc
+        index: ipordm_luc
         body:
           settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
           mappings: { properties: { addr: { type: ip } } }
   - do:
       bulk:
         refresh: true
-        index: ipm_luc
+        index: ipordm_luc
         body:
           - index: { _id: "s1" }
           - { addr: [ "3.3.3.3", "200.1.1.1" ] }
@@ -1256,14 +1256,14 @@
   - match: { errors: false }
   - do:
       indices.create:
-        index: ipm_def
+        index: ipordm_def
         body:
           settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
           mappings: { properties: { addr: { type: ip } } }
   - do:
       bulk:
         refresh: true
-        index: ipm_def
+        index: ipordm_def
         body:
           - index: { _id: "s1" }
           - { addr: [ "3.3.3.3", "200.1.1.1" ] }
@@ -1274,14 +1274,14 @@
   - match: { errors: false }
   - do:
       indices.create:
-        index: ipm_prx
+        index: ipordm_prx
         body:
           settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
           mappings: { properties: { addr: { type: ip } } }
   - do:
       bulk:
         refresh: true
-        index: ipm_prx
+        index: ipordm_prx
         body:
           - index: { _id: "s1" }
           - { addr: [ "3.3.3.3", "200.1.1.1" ] }
@@ -1292,93 +1292,93 @@
   - match: { errors: false }
   - do:
       search:
-        index: ipm_luc
+        index: ipordm_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "100.0.0.0" } } } }
   - match: { hits.total.value: 2 }
   - do:
       search:
-        index: ipm_def
+        index: ipordm_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "100.0.0.0" } } } }
   - match: { hits.total.value: 2 }
   - do:
       search:
-        index: ipm_prx
+        index: ipordm_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gt: "100.0.0.0" } } } }
   - match: { hits.total.value: 2 }
   - do:
       search:
-        index: ipm_luc
+        index: ipordm_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "10.0.0.0", lte: "10.255.255.255" } } } }
   - match: { hits.total.value: 1 }
   - do:
       search:
-        index: ipm_def
+        index: ipordm_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "10.0.0.0", lte: "10.255.255.255" } } } }
   - match: { hits.total.value: 1 }
   - do:
       search:
-        index: ipm_prx
+        index: ipordm_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { gte: "10.0.0.0", lte: "10.255.255.255" } } } }
   - match: { hits.total.value: 1 }
   - do:
       search:
-        index: ipm_luc
+        index: ipordm_luc
         body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "10.0.0.0" } } } }
   - match: { hits.total.value: 1 }
   - do:
       search:
-        index: ipm_def
+        index: ipordm_def
         body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "10.0.0.0" } } } }
   - match: { hits.total.value: 1 }
   - do:
       search:
-        index: ipm_prx
+        index: ipordm_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "10.0.0.0" } } } }
   - match: { hits.total.value: 1 }
   # A composite source buckets each of a document's addresses, in address order.
   - do:
       search:
-        index: ipm_luc
+        index: ipordm_luc
         body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ] } } } }
   - set: { aggregations.c.buckets: cmv_p0 }
   - set: { aggregations.c.after_key: cmv_luc_after0 }
   - do:
       search:
-        index: ipm_def
+        index: ipordm_def
         body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ] } } } }
   - match: { aggregations.c.buckets: $cmv_p0 }
   - set: { aggregations.c.after_key: cmv_ipm_def_after0 }
   - do:
       search:
-        index: ipm_prx
+        index: ipordm_prx
         body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ] } } } }
   - match: { aggregations.c.buckets: $cmv_p0 }
   - set: { aggregations.c.after_key: cmv_ipm_prx_after0 }
   - do:
       search:
-        index: ipm_luc
+        index: ipordm_luc
         body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ], after: $cmv_luc_after0 } } } }
   - set: { aggregations.c.buckets: cmv_p1 }
   - do:
       search:
-        index: ipm_def
+        index: ipordm_def
         body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ], after: $cmv_ipm_def_after0 } } } }
   - match: { aggregations.c.buckets: $cmv_p1 }
   - do:
       search:
-        index: ipm_prx
+        index: ipordm_prx
         body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ], after: $cmv_ipm_prx_after0 } } } }
   - match: { aggregations.c.buckets: $cmv_p1 }
   - do:
       catch: bad_request
       search:
-        index: ipm_def
+        index: ipordm_def
         body: { sort: [ { addr: asc } ] }
   - match: { error.root_cause.0.reason: "/.*an.ip.field.some.documents.give.several.values,.is.not.served.*/" }
   - do:
       catch: bad_request
       search:
-        index: ipm_prx
+        index: ipordm_prx
         body: { sort: [ { addr: asc } ] }
   - match: { error.root_cause.0.reason: "/.*an.ip.field.some.documents.give.several.values,.is.not.served.*/" }
 
@@ -1386,7 +1386,7 @@
 "Across three shards, an ip sort, a terms key order and composite pages merge in address order, as a Lucene twin merges them":
   - do:
       indices.create:
-        index: ips_luc
+        index: ipords_luc
         body:
           settings: { index.infino.enabled: false, number_of_shards: 3, number_of_replicas: 0 }
           mappings: { properties: { addr: { type: ip }, n: { type: long } } }
@@ -1394,7 +1394,7 @@
   - do:
       bulk:
         refresh: true
-        index: ips_luc
+        index: ipords_luc
         body:
           - index: { _id: "b1" }
           - {n: 0, addr: "1.0.179.100"}
@@ -1423,7 +1423,7 @@
   - match: { errors: false }
   - do:
       indices.create:
-        index: ips_def
+        index: ipords_def
         body:
           settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 3, number_of_replicas: 0 }
           mappings: { properties: { addr: { type: ip }, n: { type: long } } }
@@ -1431,7 +1431,7 @@
   - do:
       bulk:
         refresh: true
-        index: ips_def
+        index: ipords_def
         body:
           - index: { _id: "b1" }
           - {n: 0, addr: "1.0.179.100"}
@@ -1460,7 +1460,7 @@
   - match: { errors: false }
   - do:
       indices.create:
-        index: ips_prx
+        index: ipords_prx
         body:
           settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 3, number_of_replicas: 0 }
           mappings: { properties: { addr: { type: ip }, n: { type: long } } }
@@ -1468,7 +1468,7 @@
   - do:
       bulk:
         refresh: true
-        index: ips_prx
+        index: ipords_prx
         body:
           - index: { _id: "b1" }
           - {n: 0, addr: "1.0.179.100"}
@@ -1497,7 +1497,7 @@
   - match: { errors: false }
   - do:
       search:
-        index: ips_luc
+        index: ipords_luc
         body: { size: 12, sort: [ { addr: asc }, { n: asc } ], _source: false }
   - length: { hits.hits: 12 }
   - set: { hits.hits.0._id: sasc_0 }
@@ -1514,7 +1514,7 @@
   - set: { hits.hits.11._id: sasc_11 }
   - do:
       search:
-        index: ips_def
+        index: ipords_def
         body: { size: 12, sort: [ { addr: asc }, { n: asc } ], _source: false }
   - length: { hits.hits: 12 }
   - match: { hits.hits.0._id: $sasc_0 }
@@ -1531,7 +1531,7 @@
   - match: { hits.hits.11._id: $sasc_11 }
   - do:
       search:
-        index: ips_prx
+        index: ipords_prx
         body: { size: 12, sort: [ { addr: asc }, { n: asc } ], _source: false }
   - length: { hits.hits: 12 }
   - match: { hits.hits.0._id: $sasc_0 }
@@ -1548,7 +1548,7 @@
   - match: { hits.hits.11._id: $sasc_11 }
   - do:
       search:
-        index: ips_luc
+        index: ipords_luc
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 6, order: { _key: asc } } } } }
   - length: { aggregations.t.buckets: 6 }
   - set: { aggregations.t.buckets.0.key: kasc_0 }
@@ -1559,7 +1559,7 @@
   - set: { aggregations.t.buckets.5.key: kasc_5 }
   - do:
       search:
-        index: ips_def
+        index: ipords_def
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 6, order: { _key: asc } } } } }
   - length: { aggregations.t.buckets: 6 }
   - match: { aggregations.t.buckets.0.key: $kasc_0 }
@@ -1570,7 +1570,7 @@
   - match: { aggregations.t.buckets.5.key: $kasc_5 }
   - do:
       search:
-        index: ips_prx
+        index: ipords_prx
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 6, order: { _key: asc } } } } }
   - length: { aggregations.t.buckets: 6 }
   - match: { aggregations.t.buckets.0.key: $kasc_0 }
@@ -1581,7 +1581,7 @@
   - match: { aggregations.t.buckets.5.key: $kasc_5 }
   - do:
       search:
-        index: ips_luc
+        index: ipords_luc
         body: { size: 12, sort: [ { addr: desc }, { n: asc } ], _source: false }
   - length: { hits.hits: 12 }
   - set: { hits.hits.0._id: sdesc_0 }
@@ -1598,7 +1598,7 @@
   - set: { hits.hits.11._id: sdesc_11 }
   - do:
       search:
-        index: ips_def
+        index: ipords_def
         body: { size: 12, sort: [ { addr: desc }, { n: asc } ], _source: false }
   - length: { hits.hits: 12 }
   - match: { hits.hits.0._id: $sdesc_0 }
@@ -1615,7 +1615,7 @@
   - match: { hits.hits.11._id: $sdesc_11 }
   - do:
       search:
-        index: ips_prx
+        index: ipords_prx
         body: { size: 12, sort: [ { addr: desc }, { n: asc } ], _source: false }
   - length: { hits.hits: 12 }
   - match: { hits.hits.0._id: $sdesc_0 }
@@ -1632,7 +1632,7 @@
   - match: { hits.hits.11._id: $sdesc_11 }
   - do:
       search:
-        index: ips_luc
+        index: ipords_luc
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 6, order: { _key: desc } } } } }
   - length: { aggregations.t.buckets: 6 }
   - set: { aggregations.t.buckets.0.key: kdesc_0 }
@@ -1643,7 +1643,7 @@
   - set: { aggregations.t.buckets.5.key: kdesc_5 }
   - do:
       search:
-        index: ips_def
+        index: ipords_def
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 6, order: { _key: desc } } } } }
   - length: { aggregations.t.buckets: 6 }
   - match: { aggregations.t.buckets.0.key: $kdesc_0 }
@@ -1654,7 +1654,7 @@
   - match: { aggregations.t.buckets.5.key: $kdesc_5 }
   - do:
       search:
-        index: ips_prx
+        index: ipords_prx
         body: { size: 0, aggs: { t: { terms: { field: addr, size: 6, order: { _key: desc } } } } }
   - length: { aggregations.t.buckets: 6 }
   - match: { aggregations.t.buckets.0.key: $kdesc_0 }
@@ -1666,58 +1666,58 @@
   # Composite pages across the shards follow address order.
   - do:
       search:
-        index: ips_luc
+        index: ipords_luc
         body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ] } } } }
   - set: { aggregations.c.buckets: cs_p0 }
   - set: { aggregations.c.after_key: cs_luc_after0 }
   - do:
       search:
-        index: ips_def
+        index: ipords_def
         body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ] } } } }
   - match: { aggregations.c.buckets: $cs_p0 }
   - set: { aggregations.c.after_key: cs_ips_def_after0 }
   - do:
       search:
-        index: ips_prx
+        index: ipords_prx
         body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ] } } } }
   - match: { aggregations.c.buckets: $cs_p0 }
   - set: { aggregations.c.after_key: cs_ips_prx_after0 }
   - do:
       search:
-        index: ips_luc
+        index: ipords_luc
         body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ], after: $cs_luc_after0 } } } }
   - set: { aggregations.c.buckets: cs_p1 }
   - set: { aggregations.c.after_key: cs_luc_after1 }
   - do:
       search:
-        index: ips_def
+        index: ipords_def
         body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ], after: $cs_ips_def_after0 } } } }
   - match: { aggregations.c.buckets: $cs_p1 }
   - set: { aggregations.c.after_key: cs_ips_def_after1 }
   - do:
       search:
-        index: ips_prx
+        index: ipords_prx
         body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ], after: $cs_ips_prx_after0 } } } }
   - match: { aggregations.c.buckets: $cs_p1 }
   - set: { aggregations.c.after_key: cs_ips_prx_after1 }
   - do:
       search:
-        index: ips_luc
+        index: ipords_luc
         body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ], after: $cs_luc_after1 } } } }
   - set: { aggregations.c.buckets: cs_p2 }
   - do:
       search:
-        index: ips_def
+        index: ipords_def
         body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ], after: $cs_ips_def_after1 } } } }
   - match: { aggregations.c.buckets: $cs_p2 }
   - do:
       search:
-        index: ips_prx
+        index: ipords_prx
         body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ], after: $cs_ips_prx_after1 } } } }
   - match: { aggregations.c.buckets: $cs_p2 }
   - do:
       search:
-        index: ips_def
+        index: ipords_def
         body: { size: 3, sort: [ { addr: asc }, { n: asc } ], _source: false }
   - match: { hits.hits.0._id: b6 }
   - match: { hits.hits.1._id: b2 }
