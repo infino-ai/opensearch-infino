@@ -4,6 +4,10 @@
 
 package org.opensearch.infino;
 
+import org.apache.lucene.document.DoubleRange;
+import org.apache.lucene.document.FloatRange;
+import org.apache.lucene.document.IntRange;
+import org.apache.lucene.document.LongRange;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.IndexableField;
 import org.opensearch.common.xcontent.json.JsonXContent;
@@ -19,6 +23,8 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.NumberFieldMapper;
 import org.opensearch.index.mapper.ParseContext;
 import org.opensearch.index.mapper.ParsedDocument;
+import org.opensearch.index.mapper.RangeFieldMapper;
+import org.opensearch.index.mapper.RangeType;
 import org.opensearch.index.mapper.SourceToParse;
 import org.opensearch.indices.IndicesService;
 
@@ -69,12 +75,14 @@ final class InfinoMappedValues {
         if (doc == null || mappers == null || doc.rootDoc() == null) {
             return null;
         }
-        Map<String, List<Long>> values = new LinkedHashMap<>();
+        Map<String, List<Number>> values = new LinkedHashMap<>();
         collect(doc.rootDoc(), mappers, values, Map.of());
-        Map<String, List<Long>> root = Map.copyOf(values);
+        collectRanges(doc.rootDoc(), mappers, values, Map.of());
+        Map<String, List<Number>> root = Map.copyOf(values);
         for (ParseContext.Document nested : doc.docs()) {
             if (nested != doc.rootDoc()) {
                 collect(nested, mappers, values, root);
+                collectRanges(nested, mappers, values, root);
             }
         }
         if (values.isEmpty()) {
@@ -82,10 +90,14 @@ final class InfinoMappedValues {
         }
         try (XContentBuilder b = JsonXContent.contentBuilder()) {
             b.startObject();
-            for (Map.Entry<String, List<Long>> e : values.entrySet()) {
+            for (Map.Entry<String, List<Number>> e : values.entrySet()) {
                 b.startArray(e.getKey());
-                for (long v : e.getValue()) {
-                    b.value(v);
+                for (Number v : e.getValue()) {
+                    if (v instanceof Double d) {
+                        b.value(d.doubleValue());
+                    } else {
+                        b.value(v.longValue());
+                    }
                 }
                 b.endArray();
             }
@@ -102,7 +114,7 @@ final class InfinoMappedValues {
      * read from the field's doc values, else its point, else its stored
      * field: the one kind each value is indexed as once.
      */
-    private static void collect(ParseContext.Document d, MapperService mappers, Map<String, List<Long>> into, Map<String, List<Long>> skip) {
+    private static void collect(ParseContext.Document d, MapperService mappers, Map<String, List<Number>> into, Map<String, List<Number>> skip) {
         Map<String, List<IndexableField>> byName = new LinkedHashMap<>();
         for (IndexableField f : d.getFields()) {
             if (!skip.containsKey(f.name()) && f.numericValue() != null) {
@@ -130,12 +142,80 @@ final class InfinoMappedValues {
             if (chosen.isEmpty()) {
                 continue;
             }
-            List<Long> out = into.computeIfAbsent(e.getKey(), n -> new ArrayList<>());
+            List<Number> out = into.computeIfAbsent(e.getKey(), n -> new ArrayList<>());
             for (IndexableField f : chosen) {
                 long v = f.numericValue().longValue();
                 out.add(nanos ? Math.floorDiv(v, 1_000_000L) : v);
             }
         }
+    }
+
+    /**
+     * Each range field's ranges in one Lucene document, added to
+     * {@code into} as the lowest and highest value of each, both inclusive,
+     * one after the other: the bridge keeps a range as those two ends. A
+     * range is read from the field the mapper indexes it as, one per range in
+     * the order the document gives them, else from its doc values. A bound
+     * left out is the type's least or greatest value; a float or double
+     * one's infinity is the greatest finite double, as the bridge keeps it.
+     * An {@code ip_range} has no columns, and a field {@code skip} holds is
+     * left as it is.
+     */
+    private static void collectRanges(ParseContext.Document d, MapperService mappers, Map<String, List<Number>> into, Map<String, List<Number>> skip) {
+        Map<String, List<IndexableField>> byName = new LinkedHashMap<>();
+        for (IndexableField f : d.getFields()) {
+            if (!skip.containsKey(f.name())
+                && mappers.fieldType(f.name()) instanceof RangeFieldMapper.RangeFieldType range
+                && range.rangeType() != RangeType.IP) {
+                byName.computeIfAbsent(f.name(), n -> new ArrayList<>()).add(f);
+            }
+        }
+        for (Map.Entry<String, List<IndexableField>> e : byName.entrySet()) {
+            List<Number> ends = new ArrayList<>();
+            for (IndexableField f : e.getValue()) {
+                if (f instanceof LongRange r) {
+                    ends.add(r.getMin(0));
+                    ends.add(r.getMax(0));
+                } else if (f instanceof IntRange r) {
+                    ends.add((long) r.getMin(0));
+                    ends.add((long) r.getMax(0));
+                } else if (f instanceof FloatRange r) {
+                    ends.add(finite(r.getMin(0)));
+                    ends.add(finite(r.getMax(0)));
+                } else if (f instanceof DoubleRange r) {
+                    ends.add(finite(r.getMin(0)));
+                    ends.add(finite(r.getMax(0)));
+                }
+            }
+            if (ends.isEmpty()) {
+                RangeType type = ((RangeFieldMapper.RangeFieldType) mappers.fieldType(e.getKey())).rangeType();
+                for (IndexableField f : e.getValue()) {
+                    if (f.fieldType().docValuesType() == DocValuesType.BINARY && f.binaryValue() != null) {
+                        try {
+                            for (RangeFieldMapper.Range r : type.decodeRanges(f.binaryValue())) {
+                                ends.add(end(r.getFrom()));
+                                ends.add(end(r.getTo()));
+                            }
+                        } catch (IOException ex) {
+                            throw new UncheckedIOException(ex);
+                        }
+                    }
+                }
+            }
+            if (!ends.isEmpty()) {
+                into.put(e.getKey(), ends);
+            }
+        }
+    }
+
+    /** One end of a range from its doc values, as {@link #collectRanges} gives it. */
+    private static Number end(Object v) {
+        return v instanceof Double || v instanceof Float ? finite(((Number) v).doubleValue()) : (Number) ((Number) v).longValue();
+    }
+
+    /** {@code v}, an infinity kept as the greatest finite double of its sign. */
+    private static Double finite(double v) {
+        return Double.isInfinite(v) ? Math.copySign(Double.MAX_VALUE, v) : v;
     }
 
     /** The integer types: an {@code unsigned_long} past the signed range is no value a column of longs holds. */

@@ -13,7 +13,7 @@
 use infino::arrow_schema::DataType;
 use infino::serde_json::{json, Map, Value};
 
-use crate::{conform_date, date_type, DateFormat, DEFAULT_DATE_FORMAT};
+use crate::{conform_date, date_type, mapping_flag, DateFormat, DEFAULT_DATE_FORMAT};
 
 /// The hidden column under a range field's path holding each range's lowest
 /// value, inclusive.
@@ -27,13 +27,18 @@ pub(crate) const TO: &str = "to";
 /// row cannot carry.
 const DOUBLE_LIMIT: f64 = f64::MAX;
 
-/// The type of a range field, as its mapping names it.
+/// The type of a range field, as its mapping names it, with whether its
+/// numbers are read under `coerce` (a mapping's default): a number's
+/// fraction dropped for a whole-number type, and digits in a string read as
+/// a number.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RangeKind {
-    Long,
-    Integer,
-    Float,
-    Double,
+    Long { coerce: bool },
+    Integer { coerce: bool },
+    /// Its values kept as floats, as OpenSearch keeps them: each bound is
+    /// rounded to a float and held exactly in the column's double.
+    Float { coerce: bool },
+    Double { coerce: bool },
     /// A `date_range`, its bounds read by the formats its mapping declares.
     Date(Vec<DateFormat>),
 }
@@ -42,11 +47,12 @@ impl RangeKind {
     /// The range type a field definition names, if it names one that has
     /// columns. `ip_range` is not one ([`is_range_type`]).
     pub(crate) fn of(ty: &str, def: &Map<String, Value>) -> Option<Self> {
+        let coerce = mapping_flag(def.get("coerce")) != Some(false);
         Some(match ty {
-            "long_range" => Self::Long,
-            "integer_range" => Self::Integer,
-            "float_range" => Self::Float,
-            "double_range" => Self::Double,
+            "long_range" => Self::Long { coerce },
+            "integer_range" => Self::Integer { coerce },
+            "float_range" => Self::Float { coerce },
+            "double_range" => Self::Double { coerce },
             "date_range" => Self::Date(DateFormat::parse_all(
                 def.get("format")
                     .and_then(Value::as_str)
@@ -59,8 +65,8 @@ impl RangeKind {
     /// The type of the field's two columns.
     pub(crate) fn data_type(&self) -> DataType {
         match self {
-            Self::Long | Self::Integer => DataType::Int64,
-            Self::Float | Self::Double => DataType::Float64,
+            Self::Long { .. } | Self::Integer { .. } => DataType::Int64,
+            Self::Float { .. } | Self::Double { .. } => DataType::Float64,
             Self::Date(_) => date_type(),
         }
     }
@@ -68,10 +74,10 @@ impl RangeKind {
     /// The type's name, as a mapping gives it.
     fn name(&self) -> &'static str {
         match self {
-            Self::Long => "long_range",
-            Self::Integer => "integer_range",
-            Self::Float => "float_range",
-            Self::Double => "double_range",
+            Self::Long { .. } => "long_range",
+            Self::Integer { .. } => "integer_range",
+            Self::Float { .. } => "float_range",
+            Self::Double { .. } => "double_range",
             Self::Date(_) => "date_range",
         }
     }
@@ -79,27 +85,51 @@ impl RangeKind {
     /// The least value of the type: a lower bound left out.
     fn min(&self) -> Bound {
         match self {
-            Self::Long | Self::Date(_) => Bound::Int(i64::MIN),
-            Self::Integer => Bound::Int(i64::from(i32::MIN)),
-            Self::Float | Self::Double => Bound::Float(-DOUBLE_LIMIT),
+            Self::Long { .. } | Self::Date(_) => Bound::Int(i64::MIN),
+            Self::Integer { .. } => Bound::Int(i64::from(i32::MIN)),
+            Self::Float { .. } | Self::Double { .. } => Bound::Float(-DOUBLE_LIMIT),
         }
     }
 
     /// The greatest value of the type: an upper bound left out.
     fn max(&self) -> Bound {
         match self {
-            Self::Long | Self::Date(_) => Bound::Int(i64::MAX),
-            Self::Integer => Bound::Int(i64::from(i32::MAX)),
-            Self::Float | Self::Double => Bound::Float(DOUBLE_LIMIT),
+            Self::Long { .. } | Self::Date(_) => Bound::Int(i64::MAX),
+            Self::Integer { .. } => Bound::Int(i64::from(i32::MAX)),
+            Self::Float { .. } | Self::Double { .. } => Bound::Float(DOUBLE_LIMIT),
+        }
+    }
+
+    /// The next value of the type above `b`, as OpenSearch reads a `gt`
+    /// bound: the next float for a `float_range`.
+    fn next_up(&self, b: Bound) -> Bound {
+        match (self, b) {
+            (Self::Float { .. }, Bound::Float(f)) => Bound::Float(widen((f as f32).next_up())),
+            (_, b) => b.next_up(),
+        }
+    }
+
+    /// The next value of the type below `b`, as OpenSearch reads an `lt`
+    /// bound: the next float for a `float_range`.
+    fn next_down(&self, b: Bound) -> Bound {
+        match (self, b) {
+            (Self::Float { .. }, Bound::Float(f)) => Bound::Float(widen((f as f32).next_down())),
+            (_, b) => b.next_down(),
         }
     }
 
     /// One bound as written, as a value of the type.
     fn parse(&self, field: &str, v: &Value) -> Result<Bound, String> {
         match self {
-            Self::Long => whole(v, i64::MIN, i64::MAX).map(Bound::Int),
-            Self::Integer => whole(v, i64::from(i32::MIN), i64::from(i32::MAX)).map(Bound::Int),
-            Self::Float | Self::Double => float(v).map(Bound::Float),
+            Self::Long { coerce } => whole(v, i64::MIN, i64::MAX, *coerce, "Long").map(Bound::Int),
+            Self::Integer { coerce } => {
+                whole(v, i64::from(i32::MIN), i64::from(i32::MAX), *coerce, "Integer").map(Bound::Int)
+            }
+            Self::Float { coerce } => {
+                let f = float(v, *coerce, "Float")? as f32;
+                finite(f64::from(f), "float").map(Bound::Float)
+            }
+            Self::Double { coerce } => finite(float(v, *coerce, "Double")?, "double").map(Bound::Float),
             Self::Date(formats) => {
                 let millis = conform_date(v.clone(), formats)?;
                 millis
@@ -164,10 +194,42 @@ impl Bound {
     }
 }
 
-/// A whole number from `lo` to `hi`, as OpenSearch's range mapper reads one
-/// under `coerce` (the default): a number, its fraction dropped, or its
-/// digits in a string.
-fn whole(v: &Value, lo: i64, hi: i64) -> Result<i64, String> {
+/// A float as the column holds it: exactly, as a double. An infinity, which
+/// only the next float past the greatest is, is kept as the greatest double,
+/// as a missing bound is.
+fn widen(f: f32) -> f64 {
+    if f.is_infinite() {
+        DOUBLE_LIMIT.copysign(f64::from(f))
+    } else {
+        f64::from(f)
+    }
+}
+
+/// `f`, refused as OpenSearch refuses a bound that is not finite: a number
+/// past the type's greatest.
+fn finite(f: f64, ty: &str) -> Result<f64, String> {
+    if f.is_finite() {
+        Ok(f)
+    } else {
+        Err(format!("[{ty}] supports only finite values, but got [{f}]"))
+    }
+}
+
+/// A whole number from `lo` to `hi`, as OpenSearch's range mapper reads one:
+/// a number, or under `coerce` (the default) its fraction dropped or its
+/// digits in a string. Without `coerce` a fraction or a string is refused
+/// with OpenSearch's reason, naming the value's Java type `java`.
+fn whole(v: &Value, lo: i64, hi: i64, coerce: bool, java: &str) -> Result<i64, String> {
+    if !coerce {
+        if v.is_string() {
+            return Err(format!("{java} value passed as String"));
+        }
+        if let Some(f) = v.as_f64().filter(|_| v.as_i64().is_none() && v.as_u64().is_none()) {
+            if f.fract() != 0.0 {
+                return Err(format!("{f} cannot be converted to {java} without data loss"));
+            }
+        }
+    }
     let n = match v {
         Value::Number(n) => match n.as_i64() {
             Some(i) => Some(i),
@@ -197,10 +259,12 @@ fn whole(v: &Value, lo: i64, hi: i64) -> Result<i64, String> {
     }
 }
 
-/// A number, or its digits in a string.
-fn float(v: &Value) -> Result<f64, String> {
+/// A number, or under `coerce` its digits in a string; without it a string
+/// is refused with OpenSearch's reason, naming the Java type `java`.
+fn float(v: &Value, coerce: bool, java: &str) -> Result<f64, String> {
     match v {
         Value::Number(n) => n.as_f64(),
+        Value::String(_) if !coerce => return Err(format!("{java} value passed as String")),
         Value::String(s) => s.trim().parse::<f64>().ok(),
         _ => None,
     }
@@ -220,6 +284,17 @@ pub(crate) fn ranges(
     let mut out = Vec::new();
     collect(field, kind, v, &mut out)?;
     Ok(out)
+}
+
+/// The ranges OpenSearch's mapper read from a range field, as the caller
+/// sends them ([`crate::mapped_values`]): each range's lowest and highest
+/// value, both inclusive, one after the other. None when `v` is no such list.
+pub(crate) fn from_mapper(v: Option<&Value>) -> Option<Vec<(Value, Value)>> {
+    let ends = v?.as_array()?;
+    if ends.is_empty() || ends.len() % 2 != 0 || !ends.iter().all(Value::is_number) {
+        return None;
+    }
+    Some(ends.chunks(2).map(|pair| (pair[0].clone(), pair[1].clone())).collect())
 }
 
 fn collect(
@@ -247,9 +322,9 @@ fn collect(
                 };
                 match name.as_str() {
                     "gte" if !bound.is_null() => from = read(bound)?,
-                    "gt" if !bound.is_null() => from = read(bound)?.next_up(),
+                    "gt" if !bound.is_null() => from = kind.next_up(read(bound)?),
                     "lte" if !bound.is_null() => to = read(bound)?,
-                    "lt" if !bound.is_null() => to = read(bound)?.next_down(),
+                    "lt" if !bound.is_null() => to = kind.next_down(read(bound)?),
                     "gte" | "gt" | "lte" | "lt" => {}
                     other => {
                         return Err(format!(
@@ -279,8 +354,12 @@ fn collect(
 mod tests {
     use super::*;
 
+    fn kind(ty: &str) -> RangeKind {
+        RangeKind::of(ty, &Map::new()).unwrap()
+    }
+
     fn long(v: Value) -> Result<Vec<(Value, Value)>, String> {
-        ranges("r", &RangeKind::Long, &v)
+        ranges("r", &kind("long_range"), &v)
     }
 
     #[test]
@@ -297,7 +376,7 @@ mod tests {
             long(json!({"gt": 1, "lt": 5})).unwrap(),
             [(json!(2), json!(4))]
         );
-        let d = ranges("r", &RangeKind::Double, &json!({"gt": 1.0})).unwrap();
+        let d = ranges("r", &kind("double_range"), &json!({"gt": 1.0})).unwrap();
         assert_eq!(d[0].0, json!(1.0_f64.next_up()));
     }
 
@@ -311,7 +390,7 @@ mod tests {
             long(json!({"gte": 15})).unwrap(),
             [(json!(15), json!(i64::MAX))]
         );
-        let i = ranges("r", &RangeKind::Integer, &json!({})).unwrap();
+        let i = ranges("r", &kind("integer_range"), &json!({})).unwrap();
         assert_eq!(i, [(json!(i32::MIN), json!(i32::MAX))]);
         assert_eq!(
             long(json!({"gte": null, "lte": 3})).unwrap(),
@@ -334,8 +413,43 @@ mod tests {
             long(json!({"gte": "7", "lte": 9.8})).unwrap(),
             [(json!(7), json!(9))]
         );
-        assert!(ranges("r", &RangeKind::Integer, &json!({"gte": 3_000_000_000_i64})).is_err());
+        assert!(ranges("r", &kind("integer_range"), &json!({"gte": 3_000_000_000_i64})).is_err());
         assert!(long(json!({"gte": "x"})).is_err());
+    }
+
+    /// Under `coerce: false` a fraction a whole-number range would drop, and
+    /// any number given as a string, are refused with OpenSearch's reason; a
+    /// whole number written with a fraction of zero is taken.
+    #[test]
+    fn without_coerce_a_fraction_or_a_string_is_refused() {
+        let def = json!({"coerce": false});
+        let def = def.as_object().unwrap();
+        let int = RangeKind::of("integer_range", def).unwrap();
+        let e = ranges("r", &int, &json!({"gte": 9.8})).unwrap_err();
+        assert!(e.ends_with("9.8 cannot be converted to Integer without data loss"), "{e}");
+        let e = ranges("r", &int, &json!({"gte": "7"})).unwrap_err();
+        assert!(e.ends_with("Integer value passed as String"), "{e}");
+        assert_eq!(ranges("r", &int, &json!({"lte": 2.0})).unwrap(), [(json!(i32::MIN), json!(2))]);
+        let long = RangeKind::of("long_range", def).unwrap();
+        assert!(ranges("r", &long, &json!({"lt": 1.5})).unwrap_err().ends_with("1.5 cannot be converted to Long without data loss"));
+        let double = RangeKind::of("double_range", def).unwrap();
+        assert!(ranges("r", &double, &json!({"gte": "1.5"})).unwrap_err().ends_with("Double value passed as String"));
+        assert_eq!(ranges("r", &double, &json!({"gte": 1.5, "lte": 2})).unwrap(), [(json!(1.5), json!(2.0))]);
+    }
+
+    /// A `float_range` keeps floats, as OpenSearch does: a bound is rounded
+    /// to the nearest float, and an exclusive one moves to the next float,
+    /// not the next double, so the column compares with what stock keeps.
+    #[test]
+    fn a_float_range_keeps_floats() {
+        let f = kind("float_range");
+        let r = ranges("r", &f, &json!({"gt": 1, "lte": 0.1e1})).unwrap_err();
+        assert!(r.ends_with("min value (1.0000001192092896) is greater than max value (1.0)"), "{r}");
+        let r = ranges("r", &f, &json!({"gt": 1, "lt": 2})).unwrap();
+        assert_eq!(r, [(json!(f64::from(1.0_f32.next_up())), json!(f64::from(2.0_f32.next_down())))]);
+        let r = ranges("r", &f, &json!({"gte": 0.1, "lte": 0.1})).unwrap();
+        assert_eq!(r, [(json!(f64::from(0.1_f32)), json!(f64::from(0.1_f32)))]);
+        assert!(ranges("r", &f, &json!({"gte": 1e39})).unwrap_err().contains("[float] supports only finite values"));
     }
 
     #[test]
@@ -353,7 +467,7 @@ mod tests {
 
     #[test]
     fn a_date_range_reads_its_formats_and_an_exclusive_bound_moves_a_millisecond() {
-        let kind = RangeKind::of("date_range", &Map::new()).unwrap();
+        let kind = kind("date_range");
         let r = ranges(
             "d",
             &kind,
@@ -367,6 +481,18 @@ mod tests {
         let r = ranges("d", &kind, &json!({"gt": 0})).unwrap();
         assert_eq!(r, [(json!(1), json!(i64::MAX))]);
         assert!(ranges("d", &kind, &json!({"gte": "yesterday"})).is_err());
+    }
+
+    #[test]
+    fn the_mappers_ranges_are_read_pair_by_pair() {
+        let ends = json!([1, 4, 8, 9223372036854775807_i64]);
+        assert_eq!(
+            from_mapper(Some(&ends)).unwrap(),
+            [(json!(1), json!(4)), (json!(8), json!(i64::MAX))]
+        );
+        assert!(from_mapper(Some(&json!([1, 2, 3]))).is_none());
+        assert!(from_mapper(Some(&json!(["1", "2"]))).is_none());
+        assert!(from_mapper(None).is_none());
     }
 
     #[test]

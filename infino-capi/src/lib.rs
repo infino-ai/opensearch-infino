@@ -2763,9 +2763,26 @@ fn declare_table(
                 }
                 return Ok(json!({ "created": false, "added": 0 }));
             }
+            // A range field's two ends are added only to a table that holds no
+            // row yet. A table with rows lacks them because its documents were
+            // written before range fields had columns (or before the field was
+            // mapped): its rows would read as having no range, and a query or
+            // histogram would leave them out without a word. Without the
+            // columns the plugin refuses the field, and documents written
+            // later keep it in `_source` only, until the index is reindexed.
+            let ends_missing = mapped
+                .iter()
+                .any(|f| f.range_end && schema.field_with_name(&f.path).is_err());
+            let holds_rows = ends_missing
+                && table
+                    .count_where(&[lit(true)])
+                    .map_err(|e| e.to_string())?
+                    .first()
+                    .is_some_and(|n| *n > 0);
             let mut patches: Vec<FieldPatch> = mapped
                 .iter()
                 .filter(|f| schema.field_with_name(&f.path).is_err())
+                .filter(|f| !(f.range_end && holds_rows))
                 .map(|f| {
                     let patch = FieldPatch::named(f.path.clone())
                         .with_type(f.data_type.clone())
@@ -3839,15 +3856,27 @@ fn conform_doc(
             let Some(value) = flat.remove(path) else {
                 continue;
             };
-            let ends = range_field::ranges(path, kind, &value)?;
+            // The mapper's ranges, when the caller sent them, stand in for the
+            // bridge's own reading: a date in a format of the field's own, or
+            // date math, is read as OpenSearch reads it.
+            let ends = match mapped.as_ref().and_then(|m| range_field::from_mapper(m.get(path.as_str()))) {
+                Some(ends) => ends,
+                None => range_field::ranges(path, kind, &value)?,
+            };
             let (from, to): (Vec<Value>, Vec<Value>) = ends.into_iter().unzip();
             for (end, mut values) in [(range_field::FROM, from), (range_field::TO, to)] {
+                let column = range_field::column(path, end);
+                // A table that held rows before range fields had columns has
+                // none ([`declare_table`]): the field stays in `_source` only.
+                if !columns.has(&column) {
+                    continue;
+                }
                 let value = match values.len() {
                     0 => continue,
                     1 => values.pop().unwrap_or(Value::Null),
                     _ => Value::Array(values),
                 };
-                flat.insert(range_field::column(path, end), value);
+                flat.insert(column, value);
             }
         }
     }
@@ -14353,6 +14382,66 @@ mod tests {
         assert_eq!(check(h, r#"{"r":5}"#), "error parsing field [r], expected an object but got r");
         assert!(check(h, r#"{"d":{"gte":"not a date"}}"#).contains("failed to parse date field"));
         assert_eq!(check(h, r#"{"ip":"bad"}"#), "");
+        close(h);
+    }
+
+    /// A range in a date format of the field's own, or with date math, is
+    /// one only OpenSearch's mapper reads: the bridge refuses it alone, and
+    /// keeps the ranges the mapper read when the caller sends them (#314).
+    #[test]
+    fn a_range_field_keeps_the_ranges_the_mapper_read() {
+        let h = open_storage();
+        assert!(ensure(h, r#"{"properties":{"d":{"type":"date_range","format":"yyyy-MM-dd"}}}"#).contains("\"created\":true"));
+        let doc = r#"{"d":[{"gte":"2016-01-01","lt":"2016-01-03"},{"gte":"2016-02-01||+1d"}]}"#;
+        assert!(check(h, doc).contains("failed to parse date field"), "{}", check(h, doc));
+        let framed = format!("{doc}\u{1e}{}", r#"{"d":[1451606400000,1451779199999,1454371200000,9223372036854775807]}"#);
+        assert_eq!(check(h, &framed), "");
+        assert_eq!(index(h, &[("a", &framed)])["ok"], 1);
+        assert_eq!(get(h, "a"), doc);
+        let rows = sql(
+            h,
+            r#"SELECT arrow_cast(l, 'Int64') AS l, arrow_cast(u, 'Int64') AS u FROM (SELECT unnest("d.from[]") AS l, unnest("d.to[]") AS u FROM logs) ORDER BY l"#,
+        );
+        assert_eq!(rows, json!([{"l": 1451606400000_i64, "u": 1451779199999_i64}, {"l": 1454371200000_i64, "u": i64::MAX}]));
+        close(h);
+    }
+
+    /// A table that already holds rows when a range field is declared gains
+    /// no columns for it: its rows were written before range fields had
+    /// columns (or before the field was mapped), so they would read as having
+    /// no range, and a query or histogram would leave them out without a
+    /// word. Documents written later keep the field in `_source` only, and
+    /// the plugin refuses the field until the index is reindexed. A table
+    /// with no row yet gains the two columns (#314).
+    #[test]
+    fn a_table_that_holds_rows_gains_no_range_columns() {
+        let h = open_storage();
+        let range = |names: &Value| {
+            names
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| c["name"].as_str())
+                .filter(|n| n.starts_with("r.") || *n == "r")
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert!(ensure(h, r#"{"properties":{"k":{"type":"keyword"}}}"#).contains("\"created\":true"));
+        assert_eq!(index(h, &[("a", r#"{"k":"a"}"#)])["ok"], 1);
+        let mapping = r#"{"properties":{"k":{"type":"keyword"},"r":{"type":"long_range"}}}"#;
+        assert!(ensure(h, mapping).contains("\"added\":0"), "{}", ensure(h, mapping));
+        assert!(range(&columns(h)).is_empty(), "{}", columns(h));
+        let doc = r#"{"k":"b","r":[{"gte":2,"lte":3},{"gt":7}]}"#;
+        assert_eq!(index(h, &[("b", doc)])["ok"], 1);
+        assert_eq!(get(h, "b"), doc);
+        assert!(range(&columns(h)).is_empty(), "{}", columns(h));
+        assert_eq!(sql(h, "SELECT COUNT(*) AS c FROM logs"), json!([{"c": 2}]));
+        close(h);
+        // Declared before any row is written, the field gets its two columns.
+        let h = open_storage();
+        assert!(ensure(h, r#"{"properties":{"k":{"type":"keyword"}}}"#).contains("\"created\":true"));
+        assert!(ensure(h, mapping).contains("\"added\":2"), "{}", ensure(h, mapping));
+        assert_eq!(range(&columns(h)), ["r.from", "r.to"]);
         close(h);
     }
 
