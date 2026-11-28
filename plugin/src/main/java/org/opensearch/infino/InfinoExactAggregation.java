@@ -13,6 +13,7 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.InternalAggregation;
+import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.bucket.terms.SignificantTermsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.TopHitsAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
@@ -133,7 +134,11 @@ final class InfinoExactAggregation extends InternalAggregation {
         if (!reduceContext.isFinalReduce()) {
             return new InfinoExactAggregation(getName(), getMetadata(), request, all);
         }
-        return answer(all);
+        // The answer is built as one shard's part would be, every bucket kept;
+        // reduced alone as stock's final reduce reduces the shards' parts, a
+        // terms level keeps its size buckets and counts the rest as other documents.
+        InternalAggregation answered = answer(all);
+        return InternalAggregations.reduce(List.of(InternalAggregations.from(List.of(answered))), reduceContext).get(getName());
     }
 
     private InternalAggregation answer(List<Part> all) {
