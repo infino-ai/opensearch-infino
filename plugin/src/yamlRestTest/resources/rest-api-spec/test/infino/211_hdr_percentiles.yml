@@ -1,0 +1,230 @@
+# percentiles and percentile_ranks by the HDR method give stock's values:
+# stock records each value into an HdrHistogram at the request's significant
+# digits and reads its percentiles off that histogram, whose buckets the
+# digits set, so a value read any other way would differ. The same documents
+# go to a Lucene twin, a default-mode and a proxy-mode index, two shards
+# each, so the default-mode index answers over both shards at once.
+---
+"HDR percentiles and percentile ranks match a Lucene twin":
+  - do:
+      indices.create:
+        index: hdr_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 2, number_of_replicas: 0 }
+          mappings:
+            properties:
+              g: { type: keyword }
+              bytes: { type: long }
+              lat: { type: double }
+  - do:
+      indices.create:
+        index: hdr_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 2, number_of_replicas: 0 }
+          mappings:
+            properties:
+              g: { type: keyword }
+              bytes: { type: long }
+              lat: { type: double }
+  - do:
+      indices.create:
+        index: hdr_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 2, number_of_replicas: 0 }
+          mappings:
+            properties:
+              g: { type: keyword }
+              bytes: { type: long }
+              lat: { type: double }
+  - do:
+      bulk:
+        refresh: true
+        index: hdr_luc
+        body:
+          - index: { _id: "d0" }
+          - { g: a, bytes: 10, lat: 0.5 }
+          - index: { _id: "d1" }
+          - { g: a, bytes: 20, lat: 1.25 }
+          - index: { _id: "d2" }
+          - { g: b, bytes: 30, lat: 1000.75 }
+          - index: { _id: "d3" }
+          - { g: b, lat: 3.0 }
+          - index: { _id: "d4" }
+          - { g: c }
+  - do:
+      bulk:
+        refresh: true
+        index: hdr_def
+        body:
+          - index: { _id: "d0" }
+          - { g: a, bytes: 10, lat: 0.5 }
+          - index: { _id: "d1" }
+          - { g: a, bytes: 20, lat: 1.25 }
+          - index: { _id: "d2" }
+          - { g: b, bytes: 30, lat: 1000.75 }
+          - index: { _id: "d3" }
+          - { g: b, lat: 3.0 }
+          - index: { _id: "d4" }
+          - { g: c }
+  - do:
+      bulk:
+        refresh: true
+        index: hdr_prx
+        body:
+          - index: { _id: "d0" }
+          - { g: a, bytes: 10, lat: 0.5 }
+          - index: { _id: "d1" }
+          - { g: a, bytes: 20, lat: 1.25 }
+          - index: { _id: "d2" }
+          - { g: b, bytes: 30, lat: 1000.75 }
+          - index: { _id: "d3" }
+          - { g: b, lat: 3.0 }
+          - index: { _id: "d4" }
+          - { g: c }
+  # hdr_luc: the 95th percentile of 10, 20 and 30 at three digits is the
+  # top of 30's bucket; a missing value stands in for every document; a
+  # field no document gives has no value.
+  - do:
+      search:
+        index: hdr_luc
+        body:
+          size: 0
+          aggs:
+            p95: { percentiles: { field: bytes, percents: [95], hdr: { number_of_significant_value_digits: 3 } } }
+            lat: { percentiles: { field: lat, percents: [1, 50, 99], keyed: false, hdr: { number_of_significant_value_digits: 2 } } }
+            ranks: { percentile_ranks: { field: bytes, values: [15, 30], hdr: { number_of_significant_value_digits: 3 } } }
+            filled: { percentiles: { field: absent, missing: 7, percents: [50], hdr: {} } }
+            none: { percentiles: { field: absent, percents: [50], hdr: {} } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.p95.values.95\.0: 30.0078125 }
+  - match: { aggregations.lat.values.0.key: 1.0 }
+  - match: { aggregations.lat.values.0.value: 0.5 }
+  - match: { aggregations.lat.values.1.key: 50.0 }
+  - match: { aggregations.lat.values.1.value: 1.25390625 }
+  - match: { aggregations.lat.values.2.key: 99.0 }
+  - match: { aggregations.lat.values.2.value: 1003.99609375 }
+  - match: { aggregations.ranks.values.15\.0: 33.333333333333336 }
+  - match: { aggregations.ranks.values.30\.0: 100.0 }
+  - match: { aggregations.filled.values.50\.0: 7.0 }
+  - match: { aggregations.none.values.50\.0: null }
+  # Under a terms bucket each bucket's histogram holds its own values only;
+  # a bucket with none has no value.
+  - do:
+      search:
+        index: hdr_luc
+        body:
+          size: 0
+          aggs:
+            t:
+              terms: { field: g, order: { _key: asc } }
+              aggs:
+                lat: { percentiles: { field: lat, percents: [50], hdr: { number_of_significant_value_digits: 1 } } }
+                ranks: { percentile_ranks: { field: bytes, values: [20], hdr: { number_of_significant_value_digits: 3 } } }
+  - length: { aggregations.t.buckets: 3 }
+  - match: { aggregations.t.buckets.0.key: a }
+  - match: { aggregations.t.buckets.0.lat.values.50\.0: 0.5 }
+  - match: { aggregations.t.buckets.0.ranks.values.20\.0: 100.0 }
+  - match: { aggregations.t.buckets.1.key: b }
+  - match: { aggregations.t.buckets.1.lat.values.50\.0: 3.0 }
+  - match: { aggregations.t.buckets.1.ranks.values.20\.0: 0.0 }
+  - match: { aggregations.t.buckets.2.key: c }
+  - match: { aggregations.t.buckets.2.lat.values.50\.0: null }
+  - match: { aggregations.t.buckets.2.ranks.values.20\.0: null }
+  # hdr_def: the 95th percentile of 10, 20 and 30 at three digits is the
+  # top of 30's bucket; a missing value stands in for every document; a
+  # field no document gives has no value.
+  - do:
+      search:
+        index: hdr_def
+        body:
+          size: 0
+          aggs:
+            p95: { percentiles: { field: bytes, percents: [95], hdr: { number_of_significant_value_digits: 3 } } }
+            lat: { percentiles: { field: lat, percents: [1, 50, 99], keyed: false, hdr: { number_of_significant_value_digits: 2 } } }
+            ranks: { percentile_ranks: { field: bytes, values: [15, 30], hdr: { number_of_significant_value_digits: 3 } } }
+            filled: { percentiles: { field: absent, missing: 7, percents: [50], hdr: {} } }
+            none: { percentiles: { field: absent, percents: [50], hdr: {} } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.p95.values.95\.0: 30.0078125 }
+  - match: { aggregations.lat.values.0.key: 1.0 }
+  - match: { aggregations.lat.values.0.value: 0.5 }
+  - match: { aggregations.lat.values.1.key: 50.0 }
+  - match: { aggregations.lat.values.1.value: 1.25390625 }
+  - match: { aggregations.lat.values.2.key: 99.0 }
+  - match: { aggregations.lat.values.2.value: 1003.99609375 }
+  - match: { aggregations.ranks.values.15\.0: 33.333333333333336 }
+  - match: { aggregations.ranks.values.30\.0: 100.0 }
+  - match: { aggregations.filled.values.50\.0: 7.0 }
+  - match: { aggregations.none.values.50\.0: null }
+  # Under a terms bucket each bucket's histogram holds its own values only;
+  # a bucket with none has no value.
+  - do:
+      search:
+        index: hdr_def
+        body:
+          size: 0
+          aggs:
+            t:
+              terms: { field: g, order: { _key: asc } }
+              aggs:
+                lat: { percentiles: { field: lat, percents: [50], hdr: { number_of_significant_value_digits: 1 } } }
+                ranks: { percentile_ranks: { field: bytes, values: [20], hdr: { number_of_significant_value_digits: 3 } } }
+  - length: { aggregations.t.buckets: 3 }
+  - match: { aggregations.t.buckets.0.key: a }
+  - match: { aggregations.t.buckets.0.lat.values.50\.0: 0.5 }
+  - match: { aggregations.t.buckets.0.ranks.values.20\.0: 100.0 }
+  - match: { aggregations.t.buckets.1.key: b }
+  - match: { aggregations.t.buckets.1.lat.values.50\.0: 3.0 }
+  - match: { aggregations.t.buckets.1.ranks.values.20\.0: 0.0 }
+  - match: { aggregations.t.buckets.2.key: c }
+  - match: { aggregations.t.buckets.2.lat.values.50\.0: null }
+  - match: { aggregations.t.buckets.2.ranks.values.20\.0: null }
+  # hdr_prx: the 95th percentile of 10, 20 and 30 at three digits is the
+  # top of 30's bucket; a missing value stands in for every document; a
+  # field no document gives has no value.
+  - do:
+      search:
+        index: hdr_prx
+        body:
+          size: 0
+          aggs:
+            p95: { percentiles: { field: bytes, percents: [95], hdr: { number_of_significant_value_digits: 3 } } }
+            lat: { percentiles: { field: lat, percents: [1, 50, 99], keyed: false, hdr: { number_of_significant_value_digits: 2 } } }
+            ranks: { percentile_ranks: { field: bytes, values: [15, 30], hdr: { number_of_significant_value_digits: 3 } } }
+            filled: { percentiles: { field: absent, missing: 7, percents: [50], hdr: {} } }
+            none: { percentiles: { field: absent, percents: [50], hdr: {} } }
+  - match: { hits.total.value: 5 }
+  - match: { aggregations.p95.values.95\.0: 30.0078125 }
+  - match: { aggregations.lat.values.0.key: 1.0 }
+  - match: { aggregations.lat.values.0.value: 0.5 }
+  - match: { aggregations.lat.values.1.key: 50.0 }
+  - match: { aggregations.lat.values.1.value: 1.25390625 }
+  - match: { aggregations.lat.values.2.key: 99.0 }
+  - match: { aggregations.lat.values.2.value: 1003.99609375 }
+  - match: { aggregations.ranks.values.15\.0: 33.333333333333336 }
+  - match: { aggregations.ranks.values.30\.0: 100.0 }
+  - match: { aggregations.filled.values.50\.0: 7.0 }
+  - match: { aggregations.none.values.50\.0: null }
+  # Under a terms bucket each bucket's histogram holds its own values only;
+  # a bucket with none has no value.
+  - do:
+      search:
+        index: hdr_prx
+        body:
+          size: 0
+          aggs:
+            t:
+              terms: { field: g, order: { _key: asc } }
+              aggs:
+                lat: { percentiles: { field: lat, percents: [50], hdr: { number_of_significant_value_digits: 1 } } }
+                ranks: { percentile_ranks: { field: bytes, values: [20], hdr: { number_of_significant_value_digits: 3 } } }
+  - length: { aggregations.t.buckets: 3 }
+  - match: { aggregations.t.buckets.0.key: a }
+  - match: { aggregations.t.buckets.0.lat.values.50\.0: 0.5 }
+  - match: { aggregations.t.buckets.0.ranks.values.20\.0: 100.0 }
+  - match: { aggregations.t.buckets.1.key: b }
+  - match: { aggregations.t.buckets.1.lat.values.50\.0: 3.0 }
+  - match: { aggregations.t.buckets.1.ranks.values.20\.0: 0.0 }
+  - match: { aggregations.t.buckets.2.key: c }
+  - match: { aggregations.t.buckets.2.lat.values.50\.0: null }
+  - match: { aggregations.t.buckets.2.ranks.values.20\.0: null }

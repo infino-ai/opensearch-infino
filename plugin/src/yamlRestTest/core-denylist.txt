@@ -133,23 +133,8 @@ search.aggregation/170_cardinality_metric_unsigned/Filtered test  # [gap] not se
 search.aggregation/180_percentiles_tdigest_metric/Filtered test  # [gap] not served: query constant_score
 search.aggregation/180_percentiles_tdigest_metric_unsigned/Filtered 2.x test  # [gap] not served: query constant_score
 search.aggregation/180_percentiles_tdigest_metric_unsigned/Filtered 3.x test  # [gap] not served: query constant_score
-search.aggregation/190_percentiles_hdr_metric/Basic test  # [gap] not served: HDR percentiles
-search.aggregation/190_percentiles_hdr_metric/Only aggs test  # [gap] not served: HDR percentiles
 search.aggregation/190_percentiles_hdr_metric/Filtered test  # [gap] not served: query constant_score
-search.aggregation/190_percentiles_hdr_metric/Missing field with missing param  # [gap] not served: HDR percentiles
-search.aggregation/190_percentiles_hdr_metric/Missing field without missing param  # [gap] not served: HDR percentiles
-search.aggregation/190_percentiles_hdr_metric/Metadata test  # [gap] not served: HDR percentiles
-search.aggregation/190_percentiles_hdr_metric/Explicit Percents test  # [gap] not served: HDR percentiles
-search.aggregation/190_percentiles_hdr_metric/Non-keyed test  # [gap] not served: HDR percentiles
-search.aggregation/190_percentiles_hdr_metric/Negative values test  # [gap] not served: HDR percentiles
-search.aggregation/190_percentiles_hdr_metric_unsigned/Basic test  # [gap] not served: HDR percentiles
-search.aggregation/190_percentiles_hdr_metric_unsigned/Only aggs test  # [gap] not served: HDR percentiles
 search.aggregation/190_percentiles_hdr_metric_unsigned/Filtered test  # [gap] not served: query constant_score
-search.aggregation/190_percentiles_hdr_metric_unsigned/Missing field with missing param  # [gap] not served: HDR percentiles
-search.aggregation/190_percentiles_hdr_metric_unsigned/Missing field without missing param  # [gap] not served: HDR percentiles
-search.aggregation/190_percentiles_hdr_metric_unsigned/Metadata test  # [gap] not served: HDR percentiles
-search.aggregation/190_percentiles_hdr_metric_unsigned/Explicit Percents test  # [gap] not served: HDR percentiles
-search.aggregation/190_percentiles_hdr_metric_unsigned/Non-keyed test  # [gap] not served: HDR percentiles
 search.aggregation/200_top_hits_metric/top_hits aggregation with nested documents  # [gap] not served: aggregation nested
 search.aggregation/200_top_hits_metric/top_hits aggregation with nested documents and disabled _source  # [gap] not served: aggregation nested
 search.aggregation/20_terms/IP test  # [gap] not served: terms include/exclude
@@ -388,3 +373,6 @@ get/60_realtime_refresh/Realtime Refresh  # [by-design:proxy] proxy mode refresh
 get_source/60_realtime_refresh/Realtime  # [by-design:proxy] proxy mode refreshes every acknowledged write, so realtime=false finds a write sent without refresh; the test expects a miss until a refresh
 exists/60_realtime_refresh/Realtime Refresh  # [by-design:proxy] proxy mode refreshes every acknowledged write, so realtime=false finds a write sent without refresh; the test expects a miss until a refresh
 mget/60_realtime_refresh/Realtime Refresh  # [by-design:proxy] proxy mode refreshes every acknowledged write, so realtime=false finds a write sent without refresh; the test expects a miss until a refresh
+
+# --- A negative value fails the whole search, not one shard
+search.aggregation/190_percentiles_hdr_metric/Negative values test  # [by-design] HDR percentiles over every shard are one histogram, so a negative value fails the search with the histogram's error rather than dropping the shard that holds it; the test expects that shard's failure and the other shards' answer
