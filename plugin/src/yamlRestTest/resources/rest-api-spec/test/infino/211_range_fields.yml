@@ -1,0 +1,525 @@
+# Range fields (long_range, date_range and the other numeric range types)
+# are kept as two hidden columns, each range's lowest and highest value,
+# both inclusive, so a range query with each relation, a term, terms and
+# exists, and a histogram or date_histogram that counts a document in every
+# bucket its range reaches, answer as stock does. Before, the field had no
+# column: a range query matched nothing and a histogram was refused. What
+# the columns cannot answer (a prefix query, any query on an ip_range, a
+# histogram over a range that reaches more buckets than one request may
+# build) is refused with 400, never answered with no hits. Each request runs
+# on a Lucene twin, a proxy-mode index and a default-mode index.
+setup:
+  - do:
+      indices.create:
+        index: rgf_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              r: { type: long_range }
+              span: { type: date_range }
+              ip: { type: ip_range }
+              tag: { type: keyword }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: rgf_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              r: { type: long_range }
+              span: { type: date_range }
+              ip: { type: ip_range }
+              tag: { type: keyword }
+              k: { type: keyword }
+  - do:
+      indices.create:
+        index: rgf_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              r: { type: long_range }
+              span: { type: date_range }
+              ip: { type: ip_range }
+              tag: { type: keyword }
+              k: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: rgf_luc
+        body:
+          - index: { _id: d0 }
+          - { "k": "d0", "r": { "gte": 1000000, "lte": 1600000 }, "span": { "gte": "2016-01-01", "lt": "2016-01-02" }, "ip": "10.0.0.0/8", "tag": "a" }
+          - index: { _id: d1 }
+          - { "k": "d1", "r": { "gt": 1300000, "lt": 1400000 }, "span": { "gte": "2016-01-02", "lt": "2016-01-03" }, "tag": "b" }
+          - index: { _id: d2 }
+          - { "k": "d2", "r": { "gte": 1700000 }, "span": { "gte": "2016-04-01" }, "tag": "a" }
+          - index: { _id: d3 }
+          - { "k": "d3", "r": [ { "gte": 0, "lte": 10 }, { "gte": 1250000, "lte": 1250000 } ], "span": { "lt": "2016-02-01" }, "tag": "b" }
+          - index: { _id: d4 }
+          - { "k": "d4", "tag": "c" }
+  - do:
+      bulk:
+        refresh: true
+        index: rgf_prx
+        body:
+          - index: { _id: d0 }
+          - { "k": "d0", "r": { "gte": 1000000, "lte": 1600000 }, "span": { "gte": "2016-01-01", "lt": "2016-01-02" }, "ip": "10.0.0.0/8", "tag": "a" }
+          - index: { _id: d1 }
+          - { "k": "d1", "r": { "gt": 1300000, "lt": 1400000 }, "span": { "gte": "2016-01-02", "lt": "2016-01-03" }, "tag": "b" }
+          - index: { _id: d2 }
+          - { "k": "d2", "r": { "gte": 1700000 }, "span": { "gte": "2016-04-01" }, "tag": "a" }
+          - index: { _id: d3 }
+          - { "k": "d3", "r": [ { "gte": 0, "lte": 10 }, { "gte": 1250000, "lte": 1250000 } ], "span": { "lt": "2016-02-01" }, "tag": "b" }
+          - index: { _id: d4 }
+          - { "k": "d4", "tag": "c" }
+  - do:
+      bulk:
+        refresh: true
+        index: rgf_def
+        body:
+          - index: { _id: d0 }
+          - { "k": "d0", "r": { "gte": 1000000, "lte": 1600000 }, "span": { "gte": "2016-01-01", "lt": "2016-01-02" }, "ip": "10.0.0.0/8", "tag": "a" }
+          - index: { _id: d1 }
+          - { "k": "d1", "r": { "gt": 1300000, "lt": 1400000 }, "span": { "gte": "2016-01-02", "lt": "2016-01-03" }, "tag": "b" }
+          - index: { _id: d2 }
+          - { "k": "d2", "r": { "gte": 1700000 }, "span": { "gte": "2016-04-01" }, "tag": "a" }
+          - index: { _id: d3 }
+          - { "k": "d3", "r": [ { "gte": 0, "lte": 10 }, { "gte": 1250000, "lte": 1250000 } ], "span": { "lt": "2016-02-01" }, "tag": "b" }
+          - index: { _id: d4 }
+          - { "k": "d4", "tag": "c" }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: rgf_luc,rgf_prx,rgf_def
+        ignore_unavailable: true
+
+---
+"A range query on a long_range field reads each relation as stock does":
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { gte: 1200000, lte: 1300000 } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d3 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { gte: 1200000, lte: 1300000 } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d3 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { gte: 1200000, lte: 1300000 } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d3 }
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { gte: 1000000, lte: 1600000, relation: within } } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - match: { hits.hits.2._id: d3 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { gte: 1000000, lte: 1600000, relation: within } } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - match: { hits.hits.2._id: d3 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { gte: 1000000, lte: 1600000, relation: within } } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - match: { hits.hits.2._id: d3 }
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { gte: 1300000, lte: 1300000, relation: contains } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d0 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { gte: 1300000, lte: 1300000, relation: contains } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d0 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { gte: 1300000, lte: 1300000, relation: contains } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d0 }
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { gt: 1600000 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d2 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { gt: 1600000 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d2 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { gt: 1600000 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d2 }
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { lt: 1000000 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d3 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { lt: 1000000 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d3 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { range: { r: { lt: 1000000 } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d3 }
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { bool: { filter: [ { term: { tag: a } }, { range: { r: { gte: 1200000 } } } ] } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d2 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { bool: { filter: [ { term: { tag: a } }, { range: { r: { gte: 1200000 } } } ] } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d2 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { bool: { filter: [ { term: { tag: a } }, { range: { r: { gte: 1200000 } } } ] } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d2 }
+
+---
+"A term, terms or exists on a long_range field reads the ranges holding the value":
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { term: { r: 1350000 } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { term: { r: 1350000 } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { term: { r: 1350000 } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { terms: { r: [ 5, 1700000 ] } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d2 }
+  - match: { hits.hits.1._id: d3 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { terms: { r: [ 5, 1700000 ] } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d2 }
+  - match: { hits.hits.1._id: d3 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { terms: { r: [ 5, 1700000 ] } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d2 }
+  - match: { hits.hits.1._id: d3 }
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { exists: { field: r } } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - match: { hits.hits.2._id: d2 }
+  - match: { hits.hits.3._id: d3 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { exists: { field: r } } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - match: { hits.hits.2._id: d2 }
+  - match: { hits.hits.3._id: d3 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { exists: { field: r } } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - match: { hits.hits.2._id: d2 }
+  - match: { hits.hits.3._id: d3 }
+
+---
+"A date_range field reads its dates as stock does":
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { term: { span: "2016-01-02" } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.1._id: d3 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { term: { span: "2016-01-02" } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.1._id: d3 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { term: { span: "2016-01-02" } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d1 }
+  - match: { hits.hits.1._id: d3 }
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { range: { span: { gte: "2016-01-01||/M", lt: "2016-02-01" } } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - match: { hits.hits.2._id: d3 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { range: { span: { gte: "2016-01-01||/M", lt: "2016-02-01" } } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - match: { hits.hits.2._id: d3 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { range: { span: { gte: "2016-01-01||/M", lt: "2016-02-01" } } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - match: { hits.hits.2._id: d3 }
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { range: { span: { gte: "2016-01-01", lte: "2016-01-31", relation: within } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { range: { span: { gte: "2016-01-01", lte: "2016-01-31", relation: within } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { range: { span: { gte: "2016-01-01", lte: "2016-01-31", relation: within } } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: d0 }
+  - match: { hits.hits.1._id: d1 }
+  - do:
+      search: { index: rgf_luc, body: { size: 10, sort: [ { k: asc } ], query: { range: { span: { gte: "2016-05-01", lte: "2016-05-01", relation: contains } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d2 }
+  - do:
+      search: { index: rgf_prx, body: { size: 10, sort: [ { k: asc } ], query: { range: { span: { gte: "2016-05-01", lte: "2016-05-01", relation: contains } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d2 }
+  - do:
+      search: { index: rgf_def, body: { size: 10, sort: [ { k: asc } ], query: { range: { span: { gte: "2016-05-01", lte: "2016-05-01", relation: contains } } } } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: d2 }
+
+---
+"A histogram on a long_range field counts a document in every bucket its range reaches":
+  - do:
+      search: { index: rgf_luc, body: { size: 0, query: { range: { r: { lte: 1650000, relation: within } } }, aggs: { h: { histogram: { field: r, interval: 200000, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 5 }
+  - match: { aggregations.h.buckets.0.key: 0 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 1000000 }
+  - match: { aggregations.h.buckets.1.doc_count: 1 }
+  - match: { aggregations.h.buckets.2.key: 1200000 }
+  - match: { aggregations.h.buckets.2.doc_count: 3 }
+  - match: { aggregations.h.buckets.3.key: 1400000 }
+  - match: { aggregations.h.buckets.3.doc_count: 1 }
+  - match: { aggregations.h.buckets.4.key: 1600000 }
+  - match: { aggregations.h.buckets.4.doc_count: 1 }
+  - do:
+      search: { index: rgf_prx, body: { size: 0, query: { range: { r: { lte: 1650000, relation: within } } }, aggs: { h: { histogram: { field: r, interval: 200000, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 5 }
+  - match: { aggregations.h.buckets.0.key: 0 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 1000000 }
+  - match: { aggregations.h.buckets.1.doc_count: 1 }
+  - match: { aggregations.h.buckets.2.key: 1200000 }
+  - match: { aggregations.h.buckets.2.doc_count: 3 }
+  - match: { aggregations.h.buckets.3.key: 1400000 }
+  - match: { aggregations.h.buckets.3.doc_count: 1 }
+  - match: { aggregations.h.buckets.4.key: 1600000 }
+  - match: { aggregations.h.buckets.4.doc_count: 1 }
+  - do:
+      search: { index: rgf_def, body: { size: 0, query: { range: { r: { lte: 1650000, relation: within } } }, aggs: { h: { histogram: { field: r, interval: 200000, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 5 }
+  - match: { aggregations.h.buckets.0.key: 0 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 1000000 }
+  - match: { aggregations.h.buckets.1.doc_count: 1 }
+  - match: { aggregations.h.buckets.2.key: 1200000 }
+  - match: { aggregations.h.buckets.2.doc_count: 3 }
+  - match: { aggregations.h.buckets.3.key: 1400000 }
+  - match: { aggregations.h.buckets.3.doc_count: 1 }
+  - match: { aggregations.h.buckets.4.key: 1600000 }
+  - match: { aggregations.h.buckets.4.doc_count: 1 }
+  - do:
+      search: { index: rgf_luc, body: { size: 0, aggs: { h: { histogram: { field: r, interval: 200000, hard_bounds: { min: 1000000, max: 1400000 } } } } } }
+  - length: { aggregations.h.buckets: 3 }
+  - match: { aggregations.h.buckets.0.key: 1000000 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 1200000 }
+  - match: { aggregations.h.buckets.1.doc_count: 3 }
+  - match: { aggregations.h.buckets.2.key: 1400000 }
+  - match: { aggregations.h.buckets.2.doc_count: 1 }
+  - do:
+      search: { index: rgf_prx, body: { size: 0, aggs: { h: { histogram: { field: r, interval: 200000, hard_bounds: { min: 1000000, max: 1400000 } } } } } }
+  - length: { aggregations.h.buckets: 3 }
+  - match: { aggregations.h.buckets.0.key: 1000000 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 1200000 }
+  - match: { aggregations.h.buckets.1.doc_count: 3 }
+  - match: { aggregations.h.buckets.2.key: 1400000 }
+  - match: { aggregations.h.buckets.2.doc_count: 1 }
+  - do:
+      search: { index: rgf_def, body: { size: 0, aggs: { h: { histogram: { field: r, interval: 200000, hard_bounds: { min: 1000000, max: 1400000 } } } } } }
+  - length: { aggregations.h.buckets: 3 }
+  - match: { aggregations.h.buckets.0.key: 1000000 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 1200000 }
+  - match: { aggregations.h.buckets.1.doc_count: 3 }
+  - match: { aggregations.h.buckets.2.key: 1400000 }
+  - match: { aggregations.h.buckets.2.doc_count: 1 }
+  - do:
+      search: { index: rgf_luc, body: { size: 0, query: { range: { r: { lte: 1650000, relation: within } } }, aggs: { h: { histogram: { field: r, interval: 200000, offset: 50000, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 5 }
+  - match: { aggregations.h.buckets.0.key: -150000 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 850000 }
+  - match: { aggregations.h.buckets.1.doc_count: 1 }
+  - match: { aggregations.h.buckets.2.key: 1050000 }
+  - match: { aggregations.h.buckets.2.doc_count: 1 }
+  - match: { aggregations.h.buckets.3.key: 1250000 }
+  - match: { aggregations.h.buckets.3.doc_count: 3 }
+  - match: { aggregations.h.buckets.4.key: 1450000 }
+  - match: { aggregations.h.buckets.4.doc_count: 1 }
+  - do:
+      search: { index: rgf_prx, body: { size: 0, query: { range: { r: { lte: 1650000, relation: within } } }, aggs: { h: { histogram: { field: r, interval: 200000, offset: 50000, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 5 }
+  - match: { aggregations.h.buckets.0.key: -150000 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 850000 }
+  - match: { aggregations.h.buckets.1.doc_count: 1 }
+  - match: { aggregations.h.buckets.2.key: 1050000 }
+  - match: { aggregations.h.buckets.2.doc_count: 1 }
+  - match: { aggregations.h.buckets.3.key: 1250000 }
+  - match: { aggregations.h.buckets.3.doc_count: 3 }
+  - match: { aggregations.h.buckets.4.key: 1450000 }
+  - match: { aggregations.h.buckets.4.doc_count: 1 }
+  - do:
+      search: { index: rgf_def, body: { size: 0, query: { range: { r: { lte: 1650000, relation: within } } }, aggs: { h: { histogram: { field: r, interval: 200000, offset: 50000, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 5 }
+  - match: { aggregations.h.buckets.0.key: -150000 }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 850000 }
+  - match: { aggregations.h.buckets.1.doc_count: 1 }
+  - match: { aggregations.h.buckets.2.key: 1050000 }
+  - match: { aggregations.h.buckets.2.doc_count: 1 }
+  - match: { aggregations.h.buckets.3.key: 1250000 }
+  - match: { aggregations.h.buckets.3.doc_count: 3 }
+  - match: { aggregations.h.buckets.4.key: 1450000 }
+  - match: { aggregations.h.buckets.4.doc_count: 1 }
+
+---
+"A date_histogram on a date_range field counts a document in every bucket its range reaches":
+  - do:
+      search: { index: rgf_luc, body: { size: 0, query: { range: { span: { gte: "2015-12-01", lte: "2016-03-31", relation: within } } }, aggs: { h: { date_histogram: { field: span, calendar_interval: day, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2016-01-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2016-01-02T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.1.doc_count: 1 }
+  - do:
+      search: { index: rgf_prx, body: { size: 0, query: { range: { span: { gte: "2015-12-01", lte: "2016-03-31", relation: within } } }, aggs: { h: { date_histogram: { field: span, calendar_interval: day, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2016-01-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2016-01-02T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.1.doc_count: 1 }
+  - do:
+      search: { index: rgf_def, body: { size: 0, query: { range: { span: { gte: "2015-12-01", lte: "2016-03-31", relation: within } } }, aggs: { h: { date_histogram: { field: span, calendar_interval: day, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 2 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2016-01-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2016-01-02T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.1.doc_count: 1 }
+  - do:
+      search: { index: rgf_luc, body: { size: 0, aggs: { h: { date_histogram: { field: span, calendar_interval: month, hard_bounds: { min: "2015-10-01", max: "2016-05-01" } } } } } }
+  - length: { aggregations.h.buckets: 8 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2015-10-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2015-11-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.1.doc_count: 1 }
+  - match: { aggregations.h.buckets.2.key_as_string: "2015-12-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.2.doc_count: 1 }
+  - match: { aggregations.h.buckets.3.key_as_string: "2016-01-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.3.doc_count: 3 }
+  - match: { aggregations.h.buckets.4.key_as_string: "2016-02-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.4.doc_count: 0 }
+  - match: { aggregations.h.buckets.5.key_as_string: "2016-03-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.5.doc_count: 0 }
+  - match: { aggregations.h.buckets.6.key_as_string: "2016-04-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.6.doc_count: 1 }
+  - match: { aggregations.h.buckets.7.key_as_string: "2016-05-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.7.doc_count: 1 }
+  - do:
+      search: { index: rgf_prx, body: { size: 0, aggs: { h: { date_histogram: { field: span, calendar_interval: month, hard_bounds: { min: "2015-10-01", max: "2016-05-01" } } } } } }
+  - length: { aggregations.h.buckets: 8 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2015-10-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2015-11-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.1.doc_count: 1 }
+  - match: { aggregations.h.buckets.2.key_as_string: "2015-12-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.2.doc_count: 1 }
+  - match: { aggregations.h.buckets.3.key_as_string: "2016-01-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.3.doc_count: 3 }
+  - match: { aggregations.h.buckets.4.key_as_string: "2016-02-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.4.doc_count: 0 }
+  - match: { aggregations.h.buckets.5.key_as_string: "2016-03-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.5.doc_count: 0 }
+  - match: { aggregations.h.buckets.6.key_as_string: "2016-04-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.6.doc_count: 1 }
+  - match: { aggregations.h.buckets.7.key_as_string: "2016-05-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.7.doc_count: 1 }
+  - do:
+      search: { index: rgf_def, body: { size: 0, aggs: { h: { date_histogram: { field: span, calendar_interval: month, hard_bounds: { min: "2015-10-01", max: "2016-05-01" } } } } } }
+  - length: { aggregations.h.buckets: 8 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2015-10-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2015-11-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.1.doc_count: 1 }
+  - match: { aggregations.h.buckets.2.key_as_string: "2015-12-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.2.doc_count: 1 }
+  - match: { aggregations.h.buckets.3.key_as_string: "2016-01-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.3.doc_count: 3 }
+  - match: { aggregations.h.buckets.4.key_as_string: "2016-02-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.4.doc_count: 0 }
+  - match: { aggregations.h.buckets.5.key_as_string: "2016-03-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.5.doc_count: 0 }
+  - match: { aggregations.h.buckets.6.key_as_string: "2016-04-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.6.doc_count: 1 }
+  - match: { aggregations.h.buckets.7.key_as_string: "2016-05-01T00:00:00.000Z" }
+  - match: { aggregations.h.buckets.7.doc_count: 1 }
+
+---
+"What the columns cannot answer on a range field is refused, never answered with no hits":
+  - do:
+      catch: bad_request
+      search: { index: rgf_luc, body: { query: { prefix: { r: "1" } } } }
+  - do:
+      catch: bad_request
+      search: { index: rgf_prx, body: { query: { prefix: { r: "1" } } } }
+  - do:
+      catch: bad_request
+      search: { index: rgf_def, body: { query: { prefix: { r: "1" } } } }
+  - do:
+      search: { index: rgf_luc, body: { query: { term: { ip: 10.1.2.3 } } } }
+  - match: { hits.total.value: 1 }
+  - do:
+      catch: /a query on \[ip\], a field of type \[ip_range\], is not served/
+      search: { index: rgf_prx, body: { query: { term: { ip: 10.1.2.3 } } } }
+  - do:
+      catch: /over the range field \[r\] would create too many buckets/
+      search: { index: rgf_prx, body: { size: 0, aggs: { h: { histogram: { field: r, interval: 200000 } } } } }
+  - do:
+      catch: bad_request
+      search: { index: rgf_prx, body: { size: 0, aggs: { t: { terms: { field: r } } } } }
+  - do:
+      catch: /a query on \[ip\], a field of type \[ip_range\], is not served/
+      search: { index: rgf_def, body: { query: { term: { ip: 10.1.2.3 } } } }
+  - do:
+      catch: /over the range field \[r\] would create too many buckets/
+      search: { index: rgf_def, body: { size: 0, aggs: { h: { histogram: { field: r, interval: 200000 } } } } }
+  - do:
+      catch: bad_request
+      search: { index: rgf_def, body: { size: 0, aggs: { t: { terms: { field: r } } } } }

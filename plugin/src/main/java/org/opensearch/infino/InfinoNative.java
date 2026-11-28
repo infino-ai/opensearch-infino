@@ -1119,6 +1119,15 @@ public final class InfinoNative {
             InfinoRequestCache.changed(name);
             wrote(name);
         }
+        keepMapping(name, mappingJson, defaultBm25);
+    }
+
+    /**
+     * Keep what {@code mappingJson} declares beyond the columns of table
+     * {@code name} ({@link Mapping}), read under the index's default
+     * similarity being the default BM25 when {@code defaultBm25}.
+     */
+    static void keepMapping(String name, String mappingJson, boolean defaultBm25) {
         MAPPINGS.put(name, Mapping.of(mappingJson, defaultBm25));
         // A lookup while the table was declared cached its columns without what the mapping adds.
         COLUMNS.remove(name);
@@ -1154,6 +1163,7 @@ public final class InfinoNative {
         Map<String, FieldType> fieldTypes,
         Set<String> multiFields,
         Set<String> normalized,
+        Map<String, InfinoRangeField.Declared> rangeFields,
         boolean defaultBm25
     ) {
         /** {@link #of(String, boolean)} under the default BM25 similarity. */
@@ -1181,6 +1191,7 @@ public final class InfinoNative {
                 new LinkedHashMap<>(),
                 new HashSet<>(),
                 new HashSet<>(),
+                new LinkedHashMap<>(),
                 defaultBm25
             );
             Object root = object(mappingJson);
@@ -1218,6 +1229,9 @@ public final class InfinoNative {
                 FieldType fieldType = FieldType.of(field);
                 if (fieldType != null) {
                     fieldTypes.put(path, fieldType);
+                }
+                if (field.get(TYPE) instanceof String type && InfinoRangeField.TYPES.contains(type)) {
+                    rangeFields.put(path, new InfinoRangeField.Declared(path, type, field.get(FORMAT) instanceof String format ? format : null));
                 }
                 if (scoresBySimilarity(field)) {
                     similarityFields.add(path);
@@ -1289,6 +1303,23 @@ public final class InfinoNative {
     }
 
     /**
+     * The range field {@code field} of {@code table} names, directly or
+     * through a field alias ({@link InfinoRangeField}); null when its
+     * mapping declares none there, or no mapping has been declared yet.
+     */
+    static InfinoRangeField.Declared rangeField(String table, String field) {
+        Mapping mapping = table == null ? null : MAPPINGS.get(table);
+        if (mapping == null || field == null) {
+            return null;
+        }
+        InfinoRangeField.Declared declared = mapping.rangeFields().get(field);
+        if (declared == null && mapping.aliases().get(field) instanceof String target) {
+            declared = mapping.rangeFields().get(target);
+        }
+        return declared;
+    }
+
+    /**
      * Why a query on {@code field} of {@code table} cannot be answered from
      * its columns, or null when it can: a keyword or wildcard field with a
      * normalizer, whose column holds the values as written, not as the
@@ -1307,6 +1338,9 @@ public final class InfinoNative {
         }
         if (mapping.multiFields().contains(field) && !columns(table).containsKey(field)) {
             return "a multi-field the table keeps no column of";
+        }
+        if (rangeField(table, field) instanceof InfinoRangeField.Declared range) {
+            return "a field of type [" + range.type() + "]";
         }
         return null;
     }

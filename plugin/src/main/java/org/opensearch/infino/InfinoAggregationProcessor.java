@@ -195,6 +195,9 @@ public class InfinoAggregationProcessor {
     private static final String UNMAPPED_DATE_TYPE = "Timestamp(ms, \"UTC\")";
     /** How bucket keys are printed when the request names no format. */
     private static final String DEFAULT_DATE_FORMAT = "strict_date_optional_time||epoch_millis";
+
+    /** An hour in milliseconds: what a daylight-saving change adds to a date bucket at most. */
+    private static final long HOUR_MILLIS = 3_600_000L;
     /** The t-digest compression OpenSearch uses when the request names none. */
     private static final double DEFAULT_TDIGEST_COMPRESSION = 100.0;
     /** OpenSearch's page size for top hits when the request names none. */
@@ -682,8 +685,12 @@ public class InfinoAggregationProcessor {
             if (done.contains(s.expr())) {
                 continue;
             }
-            relation = "(SELECT * EXCLUDE (" + s.expr() + "), unnest(" + s.values().each(s.expr()) + ") AS " + s.expr() + " FROM " + relation + " " + VALUE_LAYER
-                + done.size() + ")";
+            InfinoRangeField.Samples samples = s.values().samples();
+            relation = samples != null
+                // A range field has no column of its own: its values are read beside the row's columns.
+                ? samples.relation(relation, s.expr(), VALUE_LAYER + done.size())
+                : "(SELECT * EXCLUDE (" + s.expr() + "), unnest(" + s.values().each(s.expr()) + ") AS " + s.expr() + " FROM " + relation + " " + VALUE_LAYER
+                    + done.size() + ")";
             done.add(s.expr());
         }
         return relation;
@@ -1072,7 +1079,16 @@ public class InfinoAggregationProcessor {
      * field from each document's own figures over its values, which
      * {@link #perDocument} joins in under {@link #figure}.
      */
-    record Values(String field, String list, boolean listOnly, String table) {
+    record Values(String field, String list, boolean listOnly, String table, InfinoRangeField.Samples samples) {
+        Values(String field, String list, boolean listOnly, String table) {
+            this(field, list, listOnly, table, null);
+        }
+
+        /** A range field's values as a histogram reads them ({@link InfinoRangeField#samples}): no list of its own. */
+        static Values ofRanges(InfinoRangeField.Samples samples) {
+            return new Values(samples.range().field, null, false, samples.range().table, samples);
+        }
+
         /** A document's figure over its values, as the column {@link #perDocument} names it. */
         String figure(String what) {
             return quoteIdent(field + PER_DOCUMENT + what);
@@ -1819,12 +1835,45 @@ public class InfinoAggregationProcessor {
             BucketSpec child,
             long now
         ) {
-            Source c = sourceOf(dh, cols, table, now);
+            ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
+            // The hard bounds as epoch milliseconds, read by the request's format, else the field's.
+            InfinoRangeField.Declared declared = dh.field() == null || dh.script() != null ? null : InfinoNative.rangeField(table, dh.field());
+            Column column = dh.field() == null ? null : InfinoSearch.columnFor(cols, dh.field());
+            String boundsFormat = dh.format() != null ? dh.format()
+                : declared != null ? declared.format()
+                : column == null ? null
+                : column.dateFormat();
+            Long hardMin = dateBound(dh, "min", boundsFormat, tz, now);
+            Long hardMax = dateBound(dh, "max", boundsFormat, tz, now);
+            Source c = rangeSource(dh, cols, table, now, (ranges, maxBuckets) -> {
+                if (ranges.kind != InfinoRangeField.Kind.DATE) {
+                    throw new Unsupported("aggregation [" + dh.getName() + "] needs a date value, [" + dh.field() + "] is of type [" + ranges.type + "]");
+                }
+                Rounding.Prepared rounding = dateExpr(dh.getName(), Source.unmapped(dh.field(), SqlType.DATE), tz, dh.getFixedInterval(), dh.getCalendarInterval(), dh.offset())
+                    .rounding()
+                    .prepareForUnknown();
+                double step = narrowestBucketMillis(dh.getFixedInterval(), dh.getCalendarInterval(), tz);
+                // A bucket the hard bounds keep starts at the lower one or after, and ends by the bucket after the upper one's.
+                Double low = hardMin == null ? null : (double) hardMin;
+                Double high = hardMax == null ? null : (double) (rounding.nextRoundingValue(rounding.round(hardMax)) - 1);
+                long perBucket = (long) Math.ceil(widestBucketMillis(dh.getFixedInterval(), dh.getCalendarInterval()) / step);
+                return ranges.samples(dh.getName(), step, low, high, (maxBuckets + 1) * perBucket, maxBuckets);
+            });
             if (c.masked()) {
                 throw masked(dh, c);
             }
-            ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
             DateExpr expr = dateExpr(dh.getName(), c, tz, dh.getFixedInterval(), dh.getCalendarInterval(), dh.offset());
+            if (hardMin != null || hardMax != null) {
+                // As stock: a bucket is kept when its key is inside the hard bounds.
+                List<String> inside = new ArrayList<>();
+                if (hardMin != null) {
+                    inside.add(expr.keyExpr() + " >= " + timestampLiteral(hardMin));
+                }
+                if (hardMax != null) {
+                    inside.add(expr.keyExpr() + " <= " + timestampLiteral(hardMax));
+                }
+                expr = new DateExpr("CASE WHEN " + String.join(" AND ", inside) + " THEN " + expr.keyExpr() + " END", expr.rounding());
+            }
             DocValueFormat format = dateFormat(dh.format(), c, tz);
             LongBounds bounds = null;
             if (dh.extendedBounds() != null) {
@@ -1843,7 +1892,15 @@ public class InfinoAggregationProcessor {
         }
 
         static Grouped histogram(HistogramAggregationBuilder h, Map<String, Column> cols, String table, Leaves leaves, BucketSpec child, long now) {
-            Source c = sourceOf(h, cols, table, now);
+            DoubleBounds hardBounds = histBounds(h, Histogram.HARD_BOUNDS_FIELD.getPreferredName());
+            Source c = rangeSource(h, cols, table, now, (ranges, maxBuckets) -> {
+                // Every bucket is the interval wide: one value per interval reaches each.
+                double interval = h.interval();
+                Double low = hardBounds == null || hardBounds.getMin() == null ? null : hardBounds.getMin() + h.offset();
+                Double high = hardBounds == null || hardBounds.getMax() == null ? null
+                    : (Math.floor(hardBounds.getMax() / interval) + 1) * interval + h.offset();
+                return ranges.samples(h.getName(), interval, low, high, maxBuckets + 1, maxBuckets);
+            });
             if (c.masked()) {
                 throw masked(h, c);
             }
@@ -1851,7 +1908,7 @@ public class InfinoAggregationProcessor {
             if (h.order() != null && !InternalOrder.isKeyOrder(h.order())) {
                 throw new Unsupported("aggregation [" + h.getName() + "] has an order other than by key");
             }
-            DoubleBounds hard = histBounds(h, Histogram.HARD_BOUNDS_FIELD.getPreferredName());
+            DoubleBounds hard = hardBounds;
             if (hard != null) {
                 checkInside(hard, histBounds(h, Histogram.EXTENDED_BOUNDS_FIELD.getPreferredName()));
                 // As stock: a bucket is kept when its start, before the offset is added back,
@@ -1876,6 +1933,92 @@ public class InfinoAggregationProcessor {
                 : new DocValueFormat.Decimal(h.format());
             HistKey hist = new HistKey(h.interval(), h.offset(), h.keyed(), format, h.minBound(), h.maxBound());
             return new Grouped(h, leaves, child, c, keyExpr, KeyKind.DOUBLE, false, Integer.MAX_VALUE, h.minDocCount(), order, null, hist);
+        }
+
+        /** How a histogram reads a range field's values, given the field and the most buckets one request may build. */
+        @FunctionalInterface
+        interface RangeSampling {
+            InfinoRangeField.Samples of(InfinoRangeField ranges, long maxBuckets);
+        }
+
+        /**
+         * What a histogram reads ({@link #sourceOf}), or for a range field
+         * ({@link InfinoRangeField}) the values {@code sampling} reads from
+         * each document's ranges, so the document counts once in each bucket
+         * a range of it reaches, as stock counts it.
+         */
+        static Source rangeSource(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols, String table, long now, RangeSampling sampling) {
+            InfinoRangeField ranges = b.field() == null || b.script() != null ? null : InfinoRangeField.of(table, cols, b.field());
+            if (ranges == null) {
+                return sourceOf(b, cols, table, now);
+            }
+            if (b.missing() != null) {
+                throw new Unsupported("aggregation [" + b.getName() + "] has [missing] over the range field [" + b.field() + "], which is not served");
+            }
+            InfinoRangeField.Samples samples = sampling.of(ranges, InfinoSearch.maxBuckets());
+            SqlType type = ranges.kind == InfinoRangeField.Kind.DATE ? SqlType.DATE : SqlType.FLOAT;
+            return new Source(quoteIdent(b.field()), type, "[" + b.field() + "]", null, null, ranges.format, Values.ofRanges(samples), null);
+        }
+
+        /**
+         * A date histogram's hard bound {@code end} ({@code min} or
+         * {@code max}) as epoch milliseconds, a date read by {@code format};
+         * null when none is given. The builder keeps its bounds without a
+         * getter for one given as a date, so they are read back from its own
+         * JSON form.
+         */
+        private static Long dateBound(DateHistogramAggregationBuilder dh, String end, String format, ZoneId tz, long now) {
+            Object bounds = bodyOf(dh, DateHistogramAggregationBuilder.NAME).get(Histogram.HARD_BOUNDS_FIELD.getPreferredName());
+            if (!(bounds instanceof Map<?, ?> m) || m.get(end) == null) {
+                return null;
+            }
+            Object v = m.get(end);
+            if (v instanceof Number n) {
+                return n.longValue();
+            }
+            DocValueFormat read = new DocValueFormat.DateTime(
+                DateFormatter.forPattern(format != null ? format : DEFAULT_DATE_FORMAT),
+                tz,
+                DateFieldMapper.Resolution.MILLISECONDS
+            );
+            return read.parseLong(v.toString(), false, () -> now);
+        }
+
+        /**
+         * The narrowest bucket a date histogram makes at its interval, in
+         * milliseconds: a fixed interval is its length and a calendar one
+         * its shortest unit (a month of 28 days), halved in a zone other
+         * than UTC, where a daylight-saving change shortens a bucket by up to
+         * half its unit.
+         */
+        static double narrowestBucketMillis(DateHistogramInterval fixed, DateHistogramInterval calendar, ZoneId tz) {
+            double ms = fixed != null ? fixed.estimateMillis() : calendarMillis(calendar, true);
+            boolean zoned = !ZoneOffset.UTC.equals(tz) && !"UTC".equals(tz.getId());
+            return zoned ? ms / 2 : ms;
+        }
+
+        /** The widest bucket a date histogram makes at its interval, in milliseconds, a daylight-saving change's hour included. */
+        static double widestBucketMillis(DateHistogramInterval fixed, DateHistogramInterval calendar) {
+            double ms = fixed != null ? fixed.estimateMillis() : calendarMillis(calendar, false);
+            return ms + HOUR_MILLIS;
+        }
+
+        /** A calendar interval's shortest ({@code shortest}) or longest unit in milliseconds. */
+        private static double calendarMillis(DateHistogramInterval calendar, boolean shortest) {
+            String unit = calendar == null ? null : calendarUnit(calendar);
+            if (unit == null) {
+                throw new Unsupported("date_histogram names no interval served over a range field");
+            }
+            long day = 86_400_000L;
+            return switch (unit) {
+                case "minute" -> 60_000L;
+                case "hour" -> HOUR_MILLIS;
+                case "day" -> day;
+                case "week" -> 7 * day;
+                case "month" -> (shortest ? 28 : 31) * day;
+                case "quarter" -> (shortest ? 90 : 92) * day;
+                default -> (shortest ? 365 : 366) * day;
+            };
         }
 
         /**
@@ -2167,6 +2310,19 @@ public class InfinoAggregationProcessor {
         String docPredicate(Object key) {
             if (!source.multi()) {
                 return rowPredicate(key);
+            }
+            InfinoRangeField.Samples samples = source.values().samples();
+            if (samples != null) {
+                // A document's range reaches the bucket.
+                if (key == null) {
+                    return samples.noValue();
+                }
+                if (date != null) {
+                    long start = asLong(key);
+                    return samples.reaching(start, date.rounding().prepareForUnknown().nextRoundingValue(start));
+                }
+                double low = asDouble(key, 0.0);
+                return samples.reaching(low, low + hist.interval());
             }
             if (key == null) {
                 return source.noValue();
@@ -3695,6 +3851,12 @@ public class InfinoAggregationProcessor {
             cursor = g.child;
         }
         BucketSpec leafChild = cursor;
+        for (Grouped level : chain) {
+            InfinoRangeField.Samples samples = level.source.multi() ? level.source.values().samples() : null;
+            if (samples != null) {
+                samples.refuseWide(from, where);
+            }
+        }
 
         List<List<Map<String, Object>>> rowsByLevel = new ArrayList<>();
         List<Map<String, List<List<Map<String, Object>>>>> hitsByLevel = new ArrayList<>();

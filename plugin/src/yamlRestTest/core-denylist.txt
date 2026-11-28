@@ -91,8 +91,6 @@ scroll/12_slices/*  # [gap] not served: sliced scroll
 search.aggregation/100_avg_metric/Filtered test  # [gap] not served: query constant_score
 search.aggregation/100_avg_metric_unsigned/Filtered test  # [gap] not served: query constant_score
 search.aggregation/10_histogram/date_histogram  # [gap] aggregation on a date_nanos multi-field, which has no column
-search.aggregation/10_histogram/date_histogram on range  # [gap] date_histogram on a date_range field
-search.aggregation/10_histogram/date_histogram on range with offset  # [gap] date_histogram on a date_range field
 search.aggregation/10_histogram/date_histogram with pre-epoch daylight savings time transition  # [gap] aggregation on a date_nanos multi-field, which has no column
 search.aggregation/110_max_metric/Filtered test  # [gap] not served: query constant_score
 search.aggregation/110_max_metric_unsigned/Filtered test  # [gap] not served: query constant_score
@@ -174,7 +172,6 @@ search.aggregation/320_missing/*  # [gap] not served: aggregation missing
 search.aggregation/330_auto_date_histogram/*  # [gap] not served: aggregation auto_date_histogram
 search.aggregation/340_geo_distance/*  # [gap] not served: aggregation geo_distance
 search.aggregation/350_variable_width_histogram/*  # [gap] not served: aggregation variable_width_histogram
-search.aggregation/360_date_histogram/date_histogram on range with hard bounds  # [gap] date_histogram on a date_range field
 search.aggregation/370_multi_terms/*  # [gap] not served: aggregation multi_terms
 search.aggregation/40_range/IP range  # [gap] not served: aggregation ip_range
 search.aggregation/40_range/IP Range Key Generation  # [gap] not served: aggregation ip_range
@@ -275,7 +272,7 @@ mget/20_stored_fields/Stored fields  # [gap] not served: stored_fields; the tabl
 get/70_source_filtering/Source filtering  # [gap] not served: stored_fields; the table keeps no stored fields
 search/200_ignore_malformed/_ignored is still returned with explicit list of stored fields  # [gap] not served: stored_fields; the table keeps no stored fields
 search/330_fetch_fields/Test disable _source loading  # [gap] not served: stored_fields; the table keeps no stored fields
-search/330_fetch_fields/Test basic field retrieval  # [gap] fields on a range field, which has no column
+search/330_fetch_fields/Test basic field retrieval  # [gap] fields on a range field: its value is read from the source flattened, which splits a range into its bounds
 search/350_matched_queries/*  # [gap] not served: matched_queries
 search/40_indices_boost/Indices boost using object  # [gap] not served: indices_boost
 search/40_indices_boost/Indices boost using array  # [gap] not served: indices_boost
@@ -334,7 +331,6 @@ search/380_bitmap_filtering/Terms query accepting bitmap as value  # [gap] not s
 search/381_bitmap_filtering_long/Terms query accepting bitmap as value (long)  # [gap] not served: terms with a bitmap value, refused as a bad request
 search/95_search_after_shard_doc/accept _shard_doc with PIT + paginate with search_after (multi-shard)  # [gap] not served: sort on _shard_doc
 search.aggregation/400_inner_hits/Include inner hits in top hits  # [gap] not served: inner_hits on a nested query
-search.aggregation/10_histogram/histogram with hard bounds  # [gap] aggregation on a range field, which has no column
 search.aggregation/170_cardinality_metric/Missing field with missing param  # [gap] not served: missing on an unmapped field
 search.aggregation/230_composite/date_histogram on date_nanos  # [gap] not served: avg over a date field
 search.aggregation/50_filter/Sorting terms  # [gap] not served: terms ordered by a sub-aggregation path

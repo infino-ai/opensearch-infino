@@ -1271,6 +1271,10 @@ final class InfinoQueryTranslator {
         if (meta != null) {
             return meta;
         }
+        InfinoRangeField ranges = rangeField(field);
+        if (ranges != null) {
+            return ranges.exists();
+        }
         // Whether a field has a value tells nothing of a masked one's: its hash is shown.
         Column c = resolve(field);
         List<String> present = new ArrayList<>();
@@ -1392,6 +1396,10 @@ final class InfinoQueryTranslator {
             return NONE;
         }
         if (qb instanceof TermQueryBuilder t) {
+            InfinoRangeField ranges = rangeField(t.fieldName());
+            if (ranges != null) {
+                return ranges.term(t.value(), nowMillis, columnValuesOnly);
+            }
             // A term on a text column is one indexed term, as in Lucene; on an exact column the value.
             Column c = column(t.fieldName());
             if (c != null && c.fts()) {
@@ -1406,13 +1414,15 @@ final class InfinoQueryTranslator {
         }
         if (qb instanceof TermsQueryBuilder ts) {
             refuseBitmap(ts);
+            List<Object> values = ts.values();
             if (ts.termsLookup() != null) {
                 if (!trusted) {
                     throw new IllegalArgumentException("[infino] a terms lookup into [" + ts.termsLookup().index() + "] is not served by the table");
                 }
-                return inList(ts.fieldName(), InfinoTermsLookup.values(ts.termsLookup()));
+                values = InfinoTermsLookup.values(ts.termsLookup());
             }
-            return inList(ts.fieldName(), ts.values());
+            InfinoRangeField ranges = rangeField(ts.fieldName());
+            return ranges != null ? rangesHolding(ranges, values) : inList(ts.fieldName(), values);
         }
         if (qb instanceof RangeQueryBuilder r) {
             return range(r);
@@ -3429,7 +3439,38 @@ final class InfinoQueryTranslator {
         return "array_to_string(" + column + ", chr(10)) AS " + column;
     }
 
+    /**
+     * The range field {@code field} names ({@link InfinoRangeField}), or
+     * null for a field of any other type.
+     */
+    private InfinoRangeField rangeField(String field) {
+        return InfinoRangeField.of(table, cols, field);
+    }
+
+    /** The rows a terms query on a range field matches: a range holding any of {@code values}. */
+    private String rangesHolding(InfinoRangeField ranges, List<Object> values) {
+        if (values == null || values.isEmpty()) {
+            return NONE;
+        }
+        List<String> any = new ArrayList<>(values.size());
+        for (Object v : values) {
+            String one = ranges.term(v, nowMillis, columnValuesOnly);
+            if (one == null) {
+                return null;
+            }
+            if (!one.equals(NONE)) {
+                any.add(one);
+            }
+        }
+        return any.isEmpty() ? NONE : "(" + String.join(" OR ", any) + ")";
+    }
+
     private String range(RangeQueryBuilder r) {
+        InfinoRangeField ranges = rangeField(r.fieldName());
+        if (ranges != null) {
+            ZoneId zone = r.timeZone() == null ? null : ZoneId.of(r.timeZone());
+            return ranges.range(r.from(), r.to(), r.includeLower(), r.includeUpper(), r.relation(), r.format(), zone, nowMillis, columnValuesOnly);
+        }
         Column c = column(r.fieldName());
         if (c == null) {
             return NONE;

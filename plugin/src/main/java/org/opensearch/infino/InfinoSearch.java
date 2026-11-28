@@ -2904,7 +2904,7 @@ public final class InfinoSearch {
     }
 
     /** The buckets one request may build, as the cluster sets {@code search.max_buckets}. */
-    private static int maxBuckets() {
+    static int maxBuckets() {
         ClusterService clusters = InfinoServices.clusterService();
         return clusters == null
             ? MultiBucketConsumerService.DEFAULT_MAX_BUCKETS
