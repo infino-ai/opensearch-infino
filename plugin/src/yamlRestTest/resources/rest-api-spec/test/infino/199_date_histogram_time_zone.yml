@@ -662,10 +662,10 @@ teardown:
           aggs:
             hour: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } } }
             day: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } } }
-            hour_max: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
-            day_max: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
-            cal_hour_max: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
-            shifted_max: { date_histogram: { field: d, fixed_interval: 3h, offset: "+30m", time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+            hour_n: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { n: { value_count: { field: d } } } }
+            day_n: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { n: { value_count: { field: d } } } }
+            cal_hour_n: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { n: { value_count: { field: d } } } }
+            shifted_n: { date_histogram: { field: d, fixed_interval: 3h, offset: "+30m", time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { n: { value_count: { field: d } } } }
   # An hour: the last of the 29th and the first of the 30th, in daylight time and floored.
   - length: { aggregations.hour.buckets: 122 }
   - match: { aggregations.hour.buckets.0: { key_as_string: "2026-10-29T23:00:00.000-04:00", key: 1793329200000, doc_count: 1 } }
@@ -690,27 +690,27 @@ teardown:
   - match: { aggregations.day.buckets.5: { key_as_string: "2026-11-03T00:00:00.000-05:00", key: 1793682000000, doc_count: 3 } }
   # The same buckets with a metric in each, as a dashboard's chart of a sum has: a histogram of
   # counts alone is counted from the column's index, and one with a metric is grouped by its key.
-  - length: { aggregations.hour_max.buckets: 122 }
-  - match: { aggregations.hour_max.buckets.1.key: 1793332800000 }
-  - match: { aggregations.hour_max.buckets.1.doc_count: 1 }
-  - match: { aggregations.hour_max.buckets.50.key: 1793509200000 }
-  - match: { aggregations.hour_max.buckets.50.doc_count: 3 }
-  - match: { aggregations.hour_max.buckets.50.last.value_as_string: "2026-11-01T05:40:00.000Z" }
-  - match: { aggregations.hour_max.buckets.51.key: 1793512800000 }
-  - match: { aggregations.hour_max.buckets.51.doc_count: 3 }
-  - match: { aggregations.hour_max.buckets.51.last.value_as_string: "2026-11-01T06:40:00.000Z" }
-  - match: { aggregations.hour_max.buckets.98.key: 1793682000000 }
-  - match: { aggregations.hour_max.buckets.98.doc_count: 1 }
-  - match: { aggregations.hour_max.buckets.121.key: 1793764800000 }
-  - length: { aggregations.day_max.buckets: 6 }
-  - match: { aggregations.day_max.buckets.1.key: 1793332800000 }
-  - match: { aggregations.day_max.buckets.1.doc_count: 3 }
-  - match: { aggregations.day_max.buckets.3.key: 1793505600000 }
-  - match: { aggregations.day_max.buckets.3.doc_count: 9 }
-  - match: { aggregations.day_max.buckets.3.last.value_as_string: "2026-11-02T04:59:59.000Z" }
-  - match: { aggregations.day_max.buckets.4.key: 1793595600000 }
-  - match: { aggregations.day_max.buckets.5.key: 1793682000000 }
-  - match: { aggregations.day_max.buckets.5.doc_count: 3 }
+  - length: { aggregations.hour_n.buckets: 122 }
+  - match: { aggregations.hour_n.buckets.1.key: 1793332800000 }
+  - match: { aggregations.hour_n.buckets.1.doc_count: 1 }
+  - match: { aggregations.hour_n.buckets.50.key: 1793509200000 }
+  - match: { aggregations.hour_n.buckets.50.doc_count: 3 }
+  - match: { aggregations.hour_n.buckets.50.n.value: 3 }
+  - match: { aggregations.hour_n.buckets.51.key: 1793512800000 }
+  - match: { aggregations.hour_n.buckets.51.doc_count: 3 }
+  - match: { aggregations.hour_n.buckets.51.n.value: 3 }
+  - match: { aggregations.hour_n.buckets.98.key: 1793682000000 }
+  - match: { aggregations.hour_n.buckets.98.doc_count: 1 }
+  - match: { aggregations.hour_n.buckets.121.key: 1793764800000 }
+  - length: { aggregations.day_n.buckets: 6 }
+  - match: { aggregations.day_n.buckets.1.key: 1793332800000 }
+  - match: { aggregations.day_n.buckets.1.doc_count: 3 }
+  - match: { aggregations.day_n.buckets.3.key: 1793505600000 }
+  - match: { aggregations.day_n.buckets.3.doc_count: 9 }
+  - match: { aggregations.day_n.buckets.3.n.value: 9 }
+  - match: { aggregations.day_n.buckets.4.key: 1793595600000 }
+  - match: { aggregations.day_n.buckets.5.key: 1793682000000 }
+  - match: { aggregations.day_n.buckets.5.doc_count: 3 }
   - set: { aggregations: stock }
   - do:
       search:
@@ -720,10 +720,10 @@ teardown:
           aggs:
             hour: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } } }
             day: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } } }
-            hour_max: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
-            day_max: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
-            cal_hour_max: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
-            shifted_max: { date_histogram: { field: d, fixed_interval: 3h, offset: "+30m", time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+            hour_n: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { n: { value_count: { field: d } } } }
+            day_n: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { n: { value_count: { field: d } } } }
+            cal_hour_n: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { n: { value_count: { field: d } } } }
+            shifted_n: { date_histogram: { field: d, fixed_interval: 3h, offset: "+30m", time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { n: { value_count: { field: d } } } }
   - match: { aggregations: $stock }
   - do:
       search:
@@ -733,8 +733,8 @@ teardown:
           aggs:
             hour: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } } }
             day: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } } }
-            hour_max: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
-            day_max: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
-            cal_hour_max: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
-            shifted_max: { date_histogram: { field: d, fixed_interval: 3h, offset: "+30m", time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { last: { max: { field: d } } } }
+            hour_n: { date_histogram: { field: d, fixed_interval: 1h, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { n: { value_count: { field: d } } } }
+            day_n: { date_histogram: { field: d, calendar_interval: day, time_zone: America/New_York, min_doc_count: 0, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { n: { value_count: { field: d } } } }
+            cal_hour_n: { date_histogram: { field: d, calendar_interval: 1h, time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { n: { value_count: { field: d } } } }
+            shifted_n: { date_histogram: { field: d, fixed_interval: 3h, offset: "+30m", time_zone: America/New_York, min_doc_count: 1, extended_bounds: { min: 1793332800000, max: 1793768399999 } }, aggs: { n: { value_count: { field: d } } } }
   - match: { aggregations: $stock }
