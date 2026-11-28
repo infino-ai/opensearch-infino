@@ -3738,8 +3738,9 @@ final class InfinoQueryTranslator {
             if (!t.quoted() && QUERY_WHITESPACE.matcher(t.text()).find() && !"_exists_".equals(t.field()) && !"_id".equals(t.field())) {
                 // A run on a named field (field:(disk full)), read as stock reads
                 // it there: a text field's words under the default operator, any
-                // other field the whole run as its one value.
-                return textOnFields(List.of(t.field()), t.text(), op, false, false, true);
+                // other field the whole run as its one value. On a text field the
+                // run ranks by its BM25 where a clause there may, as its words would.
+                return textOnFields(List.of(t.field()), t.text(), op, positive, false, true);
             }
             return fieldAtom(new Atom((char) 0, t.field(), t.text(), t.quoted()));
         }

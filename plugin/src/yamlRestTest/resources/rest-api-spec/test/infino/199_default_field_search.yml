@@ -1859,3 +1859,108 @@ teardown:
   - match: { hits.total.value: 2 }
   - match: { hits.hits.0._id: "1" }
   - match: { hits.hits.1._id: "2" }
+
+---
+"A run of words on a named text field ranks by its BM25":
+  # message:(timeout lock) is the field's words, scored by their BM25 as stock
+  # scores them, on an index with keyword fields too, where the run is kept as
+  # one term. Before, every hit scored the same.
+  - do:
+      search:
+        index: dfs_luc
+        body: {"query": {"query_string": {"query": "message:(timeout lock)"}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4900 }
+  - lt: { hits.hits.1._score: 0.4920 }
+  - do:
+      search:
+        index: dfs_prx
+        body: {"query": {"query_string": {"query": "message:(timeout lock)"}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4900 }
+  - lt: { hits.hits.1._score: 0.4920 }
+  - do:
+      search:
+        index: dfs_def
+        body: {"query": {"query_string": {"query": "message:(timeout lock)"}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4900 }
+  - lt: { hits.hits.1._score: 0.4920 }
+  - do:
+      search:
+        index: dfs_luc
+        body: {"query": {"query_string": {"query": "message:(timeout lock)", "default_operator": "AND"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - do:
+      search:
+        index: dfs_prx
+        body: {"query": {"query_string": {"query": "message:(timeout lock)", "default_operator": "AND"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - do:
+      search:
+        index: dfs_def
+        body: {"query": {"query_string": {"query": "message:(timeout lock)", "default_operator": "AND"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - do:
+      search:
+        index: dfs_luc
+        body: {"query": {"bool": {"must": [{"query_string": {"query": "message:(timeout upstream)"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}]}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.4900 }
+  - lt: { hits.hits.1._score: 0.4920 }
+  - do:
+      search:
+        index: dfs_prx
+        body: {"query": {"bool": {"must": [{"query_string": {"query": "message:(timeout upstream)"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}]}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.4900 }
+  - lt: { hits.hits.1._score: 0.4920 }
+  - do:
+      search:
+        index: dfs_def
+        body: {"query": {"bool": {"must": [{"query_string": {"query": "message:(timeout upstream)"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}]}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.4900 }
+  - lt: { hits.hits.1._score: 0.4920 }

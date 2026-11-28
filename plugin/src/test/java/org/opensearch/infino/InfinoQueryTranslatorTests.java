@@ -1592,6 +1592,29 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
     }
 
     /**
+     * A run on a named text field ({@code message:(disk full)}) ranks by the
+     * field's BM25 for its words, as stock scores it, on an index with a
+     * keyword field too, where the tree keeps the run as one term. Before,
+     * it was a row predicate and every hit scored the same.
+     */
+    public void testARunOnANamedTextFieldRanks() {
+        assertEquals(
+            new InfinoQueryTranslator.TextClause("message", "disk full", "or"),
+            translate(QueryBuilders.queryStringQuery("message:(disk full)")).ranked()
+        );
+        assertEquals(
+            new InfinoQueryTranslator.TextClause("message", "disk full", "and"),
+            translate(QueryBuilders.queryStringQuery("message:(disk full)").defaultOperator(Operator.AND)).ranked()
+        );
+        // In filter context it still scores nothing.
+        assertNull(translate(QueryBuilders.boolQuery().filter(QueryBuilders.queryStringQuery("message:(disk full)"))).ranked());
+        // On a keyword field the run is still the one value, which ranks nothing.
+        Translation level = translate(QueryBuilders.queryStringQuery("level:(disk full)"));
+        assertNull(level.ranked());
+        assertEquals("\"level\" = 'disk full'", level.where());
+    }
+
+    /**
      * A keyword, number or date field that none of a query string's clauses
      * on the default fields matches in any row adds no hit and no score in
      * stock, so the query is read over the text columns, which rank it as
