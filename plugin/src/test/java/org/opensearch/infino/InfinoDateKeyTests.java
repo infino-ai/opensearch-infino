@@ -16,6 +16,7 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.time.Instant;
 import java.time.ZoneId;
+import java.time.zone.ZoneOffsetTransition;
 import java.util.List;
 import java.util.Map;
 
@@ -143,7 +144,9 @@ public class InfinoDateKeyTests extends OpenSearchTestCase {
     public void testAZoneThatNoLongerChangesFloorsInUtc() {
         InfinoAggregationProcessor.Source ts = new InfinoAggregationProcessor.Source("ts", SqlType.DATE, "[ts]", null);
         ZoneId tz = ZoneId.of("Asia/Kolkata");
-        long lastChange = Instant.parse("1945-10-14T17:30:00Z").toEpochMilli();
+        // Read from this JVM's zone data (1945-10-14T17:30:00Z in most): builds differ on old dates.
+        List<ZoneOffsetTransition> changes = tz.getRules().getTransitions();
+        long lastChange = changes.get(changes.size() - 1).getInstant().toEpochMilli();
         long plusFiveThirty = 19_800_000L;
         assertEquals(List.of(new InfinoAggregationProcessor.Grouped.Steady(lastChange, null, plusFiveThirty)), InfinoAggregationProcessor.Grouped.steady(tz, null, null));
 
@@ -251,7 +254,13 @@ public class InfinoDateKeyTests extends OpenSearchTestCase {
                             floored++;
                             String what = change[0] + " " + Instant.ofEpochMilli(u) + (fixed ? " every " + ms : " calendar " + ms) + " offset " + offset;
                             assertEquals(what, stock.round(u), key.longValue());
-                            assertTrue(what + " is floored within a day after the change", u < at || u >= at + 24 * HOUR);
+                            // The zone's last change before the date, as this JVM's zone data has it: the
+                            // data differs between JDK builds, so the instants above only place the window.
+                            ZoneOffsetTransition last = tz.getRules().previousTransition(Instant.ofEpochMilli(u + 1));
+                            assertTrue(
+                                what + " is floored within a day after the change",
+                                last == null || u >= last.getInstant().toEpochMilli() + 24 * HOUR
+                            );
                         }
                         assertTrue(change[0] + " floors most dates: " + floored + " of " + all, floored > all / 2);
                     }
