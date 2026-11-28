@@ -43,7 +43,9 @@ ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 # thread it did not create makes its first call into this library; 2.x serves
 # those threads and is as fast here. Cargo builds the binding once with the
 # union of every dependent's features, so naming it here moves the engine's too.
-libmimalloc-sys = { version = "0.1", features = ["v2"] }
+# `extended` binds `mi_option_set`, which the bridge uses to have freed memory
+# returned to the OS at once (see `purge_freed_memory_at_once`).
+libmimalloc-sys = { version = "0.1", features = ["v2", "extended"] }
 
 # The engine's own release profile: thin LTO across the engine and its
 # dependencies, one codegen unit. A dependency's profile does not apply to
