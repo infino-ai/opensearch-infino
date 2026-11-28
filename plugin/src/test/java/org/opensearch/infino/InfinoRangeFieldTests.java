@@ -192,7 +192,8 @@ public class InfinoRangeFieldTests extends OpenSearchTestCase {
         long until = Instant.parse("2016-01-05T00:00:00Z").toEpochMilli();
         assertEquals("\"ts\" >= " + InfinoAggregationProcessor.timestampLiteral(min) + " AND \"ts\" < " + InfinoAggregationProcessor.timestampLiteral(until), g.within);
         assertTrue(g.keyExpr, g.keyExpr.contains(" < " + InfinoAggregationProcessor.timestampLiteral(Instant.parse("2016-01-04T06:00:00Z").toEpochMilli())));
-        assertNull(Grouped.dateHistogram(dh.hardBounds(null), columns(false), TABLE, List.of(TABLE), Leaves.NONE, null, NOW).within);
+        DateHistogramAggregationBuilder unbounded = new DateHistogramAggregationBuilder("h").field("ts").calendarInterval(DateHistogramInterval.DAY);
+        assertNull(Grouped.dateHistogram(unbounded, columns(false), TABLE, List.of(TABLE), Leaves.NONE, null, NOW).within);
     }
 
     public void testWhatTheColumnsCannotAnswerIsRefused() {
