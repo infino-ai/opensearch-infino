@@ -74,6 +74,7 @@ import java.util.Map;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.function.ToIntFunction;
 import java.util.regex.Pattern;
 
@@ -467,6 +468,8 @@ final class InfinoQueryTranslator {
     private final Map<NestedQueryBuilder, Map<String, Double>> nestedScores = new java.util.IdentityHashMap<>();
     /** Each BM25-scored term clause's score ({@link #bm25TermScore}), read once per clause. */
     private final Map<QueryBuilder, Double> termScores = new java.util.IdentityHashMap<>();
+    /** Whether each value given to a clause on {@code _index} matches the table's index, resolved once per value ({@link #onIndex}). */
+    private final Map<String, Boolean> indexMatched = new java.util.HashMap<>();
 
     private InfinoQueryTranslator(Map<String, Column> cols, String table, long nowMillis, boolean trusted) {
         this(cols, table, nowMillis, trusted, false);
@@ -1174,6 +1177,12 @@ final class InfinoQueryTranslator {
      * rule or an alias filter, which the user did not write, compares them.
      */
     Column column(String field) {
+        if (InfinoIndexField.NAME.equals(field)) {
+            // The field has no column: read as one, it would be unmapped and match nothing.
+            throw new IllegalArgumentException(
+                "[infino] this query on [" + field + "] is not served; term, terms, prefix, wildcard, match, match_phrase and exists are"
+            );
+        }
         refuseColumnless(field);
         Column c = resolve(field);
         if (c != null && c.masked() && !trusted) {
@@ -1337,6 +1346,64 @@ final class InfinoQueryTranslator {
     }
 
     /**
+     * The rows a clause on the {@code _index} metadata field matches, as
+     * stock's: the field has one value over the table, its index's name
+     * ({@link InfinoIndexField}), so a term, terms, prefix or wildcard
+     * matches every row or none. A match or match_phrase reads the field
+     * as a keyword reads it, as one term. Null for a clause on another
+     * field; any other clause on the field is refused by {@link #column}.
+     */
+    private String indexField(QueryBuilder qb) {
+        if (qb instanceof TermQueryBuilder t && InfinoIndexField.NAME.equals(t.fieldName())) {
+            return indexMatches(t.value(), t.caseInsensitive());
+        }
+        if (qb instanceof TermsQueryBuilder ts && InfinoIndexField.NAME.equals(ts.fieldName())) {
+            for (Object value : termsOf(ts)) {
+                if (onIndex(String.valueOf(value), false)) {
+                    return ALL;
+                }
+            }
+            return NONE;
+        }
+        if (qb instanceof PrefixQueryBuilder p && InfinoIndexField.NAME.equals(p.fieldName())) {
+            return indexMatches(p.value() + "*", p.caseInsensitive());
+        }
+        if (qb instanceof WildcardQueryBuilder w && InfinoIndexField.NAME.equals(w.fieldName())) {
+            return indexMatches(w.value(), w.caseInsensitive());
+        }
+        if (qb instanceof MatchQueryBuilder m && InfinoIndexField.NAME.equals(m.fieldName())) {
+            unfuzzy("match", m.fieldName(), m.fuzziness());
+            return indexMatches(m.value(), false);
+        }
+        if (qb instanceof MatchPhraseQueryBuilder mp && InfinoIndexField.NAME.equals(mp.fieldName())) {
+            return indexMatches(mp.value(), false);
+        }
+        return null;
+    }
+
+    /** Every row when {@code value} on {@code _index} matches the table's index ({@link InfinoIndexField#matches}), else none. */
+    private String indexMatches(Object value, boolean caseInsensitive) {
+        return onIndex(String.valueOf(value), caseInsensitive) ? ALL : NONE;
+    }
+
+    /** {@link InfinoIndexField#matches} for this table, each value resolved against the cluster's indices once. */
+    private boolean onIndex(String value, boolean caseInsensitive) {
+        return indexMatched.computeIfAbsent((caseInsensitive ? "i:" : "s:") + value, k -> InfinoIndexField.matches(table, value, caseInsensitive));
+    }
+
+    /** The values a terms query names: its own, or a terms lookup's, which only a trusted query (a security rule) reads. */
+    private List<Object> termsOf(TermsQueryBuilder ts) {
+        refuseBitmap(ts);
+        if (ts.termsLookup() == null) {
+            return ts.values();
+        }
+        if (!trusted) {
+            throw new IllegalArgumentException("[infino] a terms lookup into [" + ts.termsLookup().index() + "] is not served by the table");
+        }
+        return InfinoTermsLookup.values(ts.termsLookup());
+    }
+
+    /**
      * Refuses a query on a field the index maps but the table keeps no
      * column of (a multi-field of another type or with a normalizer), or
      * whose values the mapping normalizes: answered over the raw values or
@@ -1396,6 +1463,10 @@ final class InfinoQueryTranslator {
         if (qb instanceof MatchNoneQueryBuilder) {
             return NONE;
         }
+        String onIndex = indexField(qb);
+        if (onIndex != null) {
+            return onIndex;
+        }
         if (qb instanceof TermQueryBuilder t) {
             // A term on a text column is one indexed term, as in Lucene; on an exact column the value.
             Column c = column(t.fieldName());
@@ -1410,14 +1481,7 @@ final class InfinoQueryTranslator {
             return equality(t.fieldName(), t.value());
         }
         if (qb instanceof TermsQueryBuilder ts) {
-            refuseBitmap(ts);
-            if (ts.termsLookup() != null) {
-                if (!trusted) {
-                    throw new IllegalArgumentException("[infino] a terms lookup into [" + ts.termsLookup().index() + "] is not served by the table");
-                }
-                return inList(ts.fieldName(), InfinoTermsLookup.values(ts.termsLookup()));
-            }
-            return inList(ts.fieldName(), ts.values());
+            return inList(ts.fieldName(), termsOf(ts));
         }
         if (qb instanceof RangeQueryBuilder r) {
             return range(r);
@@ -2793,6 +2857,17 @@ final class InfinoQueryTranslator {
         List<String> indexed = new ArrayList<>();
         List<String> exact = new ArrayList<>();
         for (String f : fields) {
+            if (InfinoIndexField.NAME.equals(f)) {
+                // As stock reads _index among a query's fields: one keyword value,
+                // the index's name. Where it is another index's name the field
+                // matches nothing and adds nothing, so the text fields still rank
+                // the hits. A composed query reaches here only when none of its
+                // words is this index's name (see composable).
+                if (exactToo && !composed && onIndex(value, false)) {
+                    exact.add(ALL);
+                }
+                continue;
+            }
             Column c = column(f);
             if (c == null) {
                 continue;
@@ -3067,7 +3142,7 @@ final class InfinoQueryTranslator {
             return false;
         }
         for (String f : fields) {
-            Column c = column(f);
+            Column c = InfinoIndexField.NAME.equals(f) ? null : column(f);
             if (c == null || !c.fts()) {
                 return false;
             }
@@ -3079,6 +3154,9 @@ final class InfinoQueryTranslator {
     private boolean textTerm(Term t, List<String> targets) {
         if (t.field() == null) {
             return textTargets(targets);
+        }
+        if (InfinoIndexField.NAME.equals(t.field())) {
+            return false;
         }
         Column c = column(t.field());
         return c != null && c.fts();
@@ -3094,6 +3172,9 @@ final class InfinoQueryTranslator {
             return true;
         }
         for (String f : targets) {
+            if (InfinoIndexField.NAME.equals(f)) {
+                continue; // one keyword value, never text
+            }
             Column c = column(f);
             if (c == null || c.fts()) {
                 return true;
@@ -3175,7 +3256,7 @@ final class InfinoQueryTranslator {
             optional.add(p);
         }
         String count = atLeast(optional, required);
-        String engine = engineQuery(b);
+        String engine = composable(b, targets) ? engineQuery(b) : null;
         if (engine != null) {
             String ranked = textOnFields(targets, engine, Operator.OR, positive, false, false, true);
             return ranked == null ? null : "(" + ranked + " AND " + count + ")";
@@ -3218,6 +3299,9 @@ final class InfinoQueryTranslator {
             String word = plainTerms(t.text());
             if (!oneToken(word)) {
                 return null;
+            }
+            if (t.field() == null ? targets.contains(InfinoIndexField.NAME) : InfinoIndexField.NAME.equals(t.field())) {
+                return null; // the word may match the index's name, which no text column holds
             }
             String reached = t.field() == null ? onlyTextColumn(targets) : onlyTextColumn(List.of(t.field()));
             if (reached == null || (column != null && !column.equals(reached))) {
@@ -3284,7 +3368,7 @@ final class InfinoQueryTranslator {
             return ALL;
         }
         if (n instanceof Bool b) {
-            String engine = engineQuery(b);
+            String engine = composable(b, targets) ? engineQuery(b) : null;
             if (engine != null) {
                 return textOnFields(targets, engine, Operator.OR, positive, false, false, true);
             }
@@ -3344,8 +3428,12 @@ final class InfinoQueryTranslator {
             if (w.field() == null) {
                 return anyOf(
                     targets,
-                    c -> c.fts() ? termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*")) : like(c, wildcardToLike(w.pattern()))
+                    c -> c.fts() ? termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*")) : like(c, wildcardToLike(w.pattern())),
+                    () -> indexMatches(w.pattern(), false)
                 );
+            }
+            if (InfinoIndexField.NAME.equals(w.field())) {
+                return indexMatches(w.pattern(), false);
             }
             Column c = column(w.field());
             if (c == null) {
@@ -3359,7 +3447,7 @@ final class InfinoQueryTranslator {
         }
         if (n instanceof Regex r) {
             if (r.field() == null) {
-                return anyOf(targets, c -> c.fts() ? termPattern(c, "(?:" + r.pattern() + ")", false) : wholeValueMatches(c, r.pattern()));
+                return anyOf(targets, c -> c.fts() ? termPattern(c, "(?:" + r.pattern() + ")", false) : wholeValueMatches(c, r.pattern()), null);
             }
             Column c = column(r.field());
             if (c == null) {
@@ -3392,6 +3480,31 @@ final class InfinoQueryTranslator {
             return range(rb);
         }
         return null;
+    }
+
+    /**
+     * Whether {@code b}'s clauses may be sent as one engine query over the
+     * text fields of {@code targets} ({@link #engineQuery}): unless
+     * {@code _index} is among the fields and one of the words is this
+     * table's index's name. The engine query reads text columns only, so the
+     * word would match the index's rows only where it is also in their
+     * text; the clauses are then read one by one, each word matching the
+     * index's name as a lone term does. Where no word is the name,
+     * {@code _index} matches none of them and the engine query is the
+     * whole answer, ranked.
+     */
+    private boolean composable(Bool b, List<String> targets) {
+        if (!targets.contains(InfinoIndexField.NAME)) {
+            return true;
+        }
+        for (List<Node> group : List.of(b.must(), b.should(), b.mustNot())) {
+            for (Node n : group) {
+                if (n instanceof Term t && t.field() == null && onIndex(t.text(), false)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /**
@@ -3433,11 +3546,17 @@ final class InfinoQueryTranslator {
      * The predicate over the text and string columns named, any of them
      * matching; none matches nothing. A keyword field is reached as a bare
      * term reaches it ({@link #textOnFields}): a pattern on the default
-     * fields matches its values whole.
+     * fields matches its values whole. {@code _index} among them, which has
+     * no column, matches as {@code onIndex} says (the index's name matched
+     * as stock's field matches a shard's); with none, it is refused.
      */
-    private String anyOf(List<String> targets, Function<Column, String> perColumn) {
+    private String anyOf(List<String> targets, Function<Column, String> perColumn, Supplier<String> onIndex) {
         List<String> or = new ArrayList<>();
         for (String f : targets) {
+            if (InfinoIndexField.NAME.equals(f) && onIndex != null) {
+                or.add(onIndex.get());
+                continue;
+            }
             Column c = column(f);
             if (c != null && (c.fts() || c.element().isString())) {
                 String p = perColumn.apply(c);
@@ -3513,6 +3632,10 @@ final class InfinoQueryTranslator {
         }
         if ("_id".equals(a.field())) {
             return OSID + " = " + literal(a.text());
+        }
+        if (InfinoIndexField.NAME.equals(a.field())) {
+            // As stock: a term or phrase is one value, a wildcard one a pattern, either matched against the index.
+            return indexMatches(a.text(), false);
         }
         Column c = column(a.field());
         if (c == null) {

@@ -13,6 +13,8 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.InternalAggregation;
+import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.aggregations.bucket.terms.SignificantTermsAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.TopHitsAggregationBuilder;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
@@ -132,7 +134,11 @@ final class InfinoExactAggregation extends InternalAggregation {
         if (!reduceContext.isFinalReduce()) {
             return new InfinoExactAggregation(getName(), getMetadata(), request, all);
         }
-        return answer(all);
+        // The answer is built as one shard's part would be, every bucket kept;
+        // reduced alone as stock's final reduce reduces the shards' parts, a
+        // terms level keeps its size buckets and counts the rest as other documents.
+        InternalAggregation answered = answer(all);
+        return InternalAggregations.reduce(List.of(InternalAggregations.from(List.of(answered))), reduceContext).get(getName());
     }
 
     private InternalAggregation answer(List<Part> all) {
@@ -165,39 +171,73 @@ final class InfinoExactAggregation extends InternalAggregation {
         // One order whatever order the shards answered in, so the statement is the same.
         all.sort(Comparator.comparing(Part::index).thenComparing(Part::table));
         boolean severalIndices = all.stream().map(Part::index).distinct().count() > 1;
-        if (severalIndices && holdsTopHits(builder)) {
-            throw new InfinoAggregationProcessor.Unsupported("top_hits under [" + getName() + "] over several indices is not served");
+        if (severalIndices) {
+            refuseTopHitsOverSeveral(builder);
         }
         List<InfinoSearch.Plan> plans = new ArrayList<>(all.size());
+        List<String> indices = new ArrayList<>(all.size());
         for (Part p : all) {
             // Fail closed: a part of an index the routing node did not record the user's access to is not read.
             InfinoAccess access = routed.access().get(p.index());
             if (access == null) {
                 throw InfinoAccess.refused("the access to [" + p.index() + "] was not recorded for the search");
             }
-            // The aggregation is planned under one index's access (its masked keys, a
-            // significant_terms background's rule), which would read the others' rows
-            // under the wrong rules.
-            if (severalIndices && !access.unrestricted()) {
-                throw InfinoAccess.refused(
-                    "[" + getName() + "] over several indices, one of them [" + p.index() + "] under a document, field or masking rule, is not served"
-                );
+            if (severalIndices) {
+                refuseRestrictedOverSeveral(builder, p.index(), access);
             }
             InfinoSearch.Plan plan = InfinoSearch.plan(p.table(), routed.source(), routed.nowMillis(), access);
             plans.add(InfinoQueryPhaseSearcher.visibleTo(plan, p.cut(), p.generation()));
+            indices.add(p.index());
         }
         Part first = all.get(0);
         InfinoAggregationProcessor processor = new InfinoAggregationProcessor(new Index(first.index(), first.indexUuid()), false);
-        return processor.evaluateOver(List.of(builder), plans.get(0), plans).aggregations().get(getName());
+        return processor.evaluateOver(List.of(builder), plans.get(0), plans, indices, null).aggregations().get(getName());
+    }
+
+    /** Refuses an aggregation over several indices' rows read as one when a top_hits is under it: its hits name one index. */
+    static void refuseTopHitsOverSeveral(AggregationBuilder builder) {
+        if (holdsTopHits(builder)) {
+            throw new InfinoAggregationProcessor.Unsupported("top_hits under [" + builder.getName() + "] over several indices is not served");
+        }
+    }
+
+    /**
+     * Refuses an aggregation over several indices' rows read as one when
+     * {@code index} is read under a rule the union cannot hold per index. Each
+     * index's rows come from its own plan, whose WHERE holds that index's
+     * document rule and filtering alias, so those hold per index; but the
+     * columns are planned under one index's access (its visible and masked
+     * fields), and a significant_terms background reads one index's document
+     * rule and alias filter over every table. A field or masking rule is then
+     * refused, and so is a document rule or a filtering alias under which a
+     * significant_terms is read.
+     */
+    static void refuseRestrictedOverSeveral(AggregationBuilder builder, String index, InfinoAccess access) {
+        if (access.restrictsFields() || access.masks()) {
+            throw InfinoAccess.refused(
+                "[" + builder.getName() + "] over several indices, one of them [" + index + "] under a field or masking rule, is not served"
+            );
+        }
+        if (access.restrictsDocuments() && holds(builder, SignificantTermsAggregationBuilder.class)) {
+            throw InfinoAccess.refused(
+                "[" + builder.getName() + "] with a significant_terms over several indices, one of them [" + index
+                    + "] under a document rule or filtering alias, is not served"
+            );
+        }
     }
 
     /** Whether {@code builder} or one under it is a top_hits, whose hits name one index. */
     private static boolean holdsTopHits(AggregationBuilder builder) {
-        if (builder instanceof TopHitsAggregationBuilder) {
+        return holds(builder, TopHitsAggregationBuilder.class);
+    }
+
+    /** Whether {@code builder} or one under it is of {@code kind}. */
+    private static boolean holds(AggregationBuilder builder, Class<? extends AggregationBuilder> kind) {
+        if (kind.isInstance(builder)) {
             return true;
         }
         for (AggregationBuilder b : builder.getSubAggregations()) {
-            if (holdsTopHits(b)) {
+            if (holds(b, kind)) {
                 return true;
             }
         }

@@ -2934,11 +2934,43 @@ public final class InfinoSearch {
         List<Page> pages = new ArrayList<>();
         List<InternalAggregations> aggs = new ArrayList<>();
         Collection<AggregationBuilder> builders = builders(source);
+        // A cardinality or percentiles result is built from the engine's exact
+        // values, and two indices' results cannot be merged into the exact one
+        // over both: over several indices such an aggregation is answered once,
+        // over every index's rows read as one (overAll), as the coordinating
+        // node answers it over default-mode shards (InfinoExactAggregation).
+        // An index the search reads no row of (the security plugin's own index)
+        // adds nothing to such an answer, so it takes no part in it: over one
+        // index that reads rows, each index answers its own, as for any other
+        // aggregation.
+        List<Index> read = new ArrayList<>();
+        for (Index index : indices) {
+            if (!accessOf.apply(index).readsNothing()) {
+                read.add(index);
+            }
+        }
+        Set<Index> reads = new HashSet<>(read);
+        List<AggregationBuilder> perIndexBuilders = new ArrayList<>();
+        List<AggregationBuilder> overAll = new ArrayList<>();
+        for (AggregationBuilder b : builders) {
+            if (read.size() > 1 && InfinoAggregationProcessor.needsExactValues(List.of(b))) {
+                overAll.add(b);
+            } else {
+                perIndexBuilders.add(b);
+            }
+        }
+        List<Plan> readPlans = new ArrayList<>();
+        // The rows the indices read match, each counted by its own aggregations
+        // below: the population of an aggregation over all of them (overAll).
+        long readTotal = 0;
         List<SortSpec> sorts = List.of();
         boolean terminatedEarly = false;
         for (Index index : indices) {
             SearchSourceBuilder perIndex = after == null || after.get(index) == null ? source : withSearchAfter(source, after.get(index));
             Plan plan = plan(tableOf.apply(index), perIndex, now, accessOf.apply(index));
+            if (reads.contains(index)) {
+                readPlans.add(plan);
+            }
             if (after != null && plan.ranksByScore()) {
                 throw new IllegalArgumentException(SCORE_SORT_SCROLL);
             }
@@ -2957,11 +2989,14 @@ public final class InfinoSearch {
             Page page = page(index, plan, perIndex, !countWithAggs, scrollId == null && !sharedTotal, after != null, sourceFrom);
             if (!builders.isEmpty()) {
                 InfinoAggregationProcessor.Counted counted = new InfinoAggregationProcessor(index).evaluate(
-                    builders,
+                    perIndexBuilders,
                     plan,
                     sharedTotal && !countWithAggs ? page.total() : null
                 );
                 aggs.add(counted.aggregations());
+                if (reads.contains(index)) {
+                    readTotal += counted.total();
+                }
                 if (countWithAggs) {
                     page = new Page(page.hits(), counted.total(), page.exact(), page.maxScore(), page.unsourced(), page.chosen());
                 }
@@ -2993,6 +3028,9 @@ public final class InfinoSearch {
         if (source.storedFields() != null && !source.storedFields().fetchFields()) {
             hits = withoutIds(hits);
         }
+        if (!overAll.isEmpty()) {
+            aggs.set(0, withOverAll(aggs.get(0), overAll, builders, read, readPlans, accessOf, readTotal));
+        }
         InternalAggregations reduced = null;
         if (!aggs.isEmpty()) {
             // The buckets are counted against search.max_buckets as a stock reduce
@@ -3020,6 +3058,47 @@ public final class InfinoSearch {
             SearchResponse.Clusters.EMPTY
         );
         return new Searched(response, cursor);
+    }
+
+    /**
+     * {@code first}, the first index's aggregations, with each of
+     * {@code overAll} answered over the rows each of {@code indices} (those
+     * the search reads rows of) matches under its plan, of {@code plans},
+     * read as one ({@link InfinoAggregationProcessor#evaluateOver}), all in the
+     * order {@code builders} names them. No other index holds a part of those
+     * answers, so the reduce takes each as it is. {@code total} is the rows
+     * they match, as each index counted its own. Refused as over default-mode
+     * shards: with a top_hits under it, over an index read under a field or
+     * masking rule, or with a significant_terms over an index read under a
+     * document rule (see {@link InfinoExactAggregation#refuseRestrictedOverSeveral}).
+     * A document rule otherwise holds in each index's plan.
+     */
+    private static InternalAggregations withOverAll(
+        InternalAggregations first,
+        List<AggregationBuilder> overAll,
+        Collection<AggregationBuilder> builders,
+        List<Index> indices,
+        List<Plan> plans,
+        Function<Index, InfinoAccess> accessOf,
+        long total
+    ) {
+        List<String> names = new ArrayList<>(indices.size());
+        for (Index index : indices) {
+            names.add(index.getName());
+        }
+        for (AggregationBuilder b : overAll) {
+            InfinoExactAggregation.refuseTopHitsOverSeveral(b);
+            for (Index index : indices) {
+                InfinoExactAggregation.refuseRestrictedOverSeveral(b, index.getName(), accessOf.apply(index));
+            }
+        }
+        InternalAggregations answered = new InfinoAggregationProcessor(indices.get(0)).evaluateOver(overAll, plans.get(0), plans, names, total).aggregations();
+        List<InternalAggregation> ordered = new ArrayList<>(builders.size());
+        for (AggregationBuilder b : builders) {
+            InternalAggregation a = overAll.contains(b) ? answered.get(b.getName()) : first.get(b.getName());
+            ordered.add(a);
+        }
+        return InternalAggregations.from(ordered);
     }
 
     /**

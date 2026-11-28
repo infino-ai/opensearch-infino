@@ -117,11 +117,13 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.function.Function;
@@ -219,8 +221,12 @@ public class InfinoAggregationProcessor {
     private static final String NULL_KEY = "\u0000";
     /** The column of {@link #unionOf} naming which shard's table a row came from. */
     private static final String SHARD_COLUMN = "_infino_shard";
+    /** The column of {@link #unionOf} holding the name of the index a row's table backs: its {@code _index}. */
+    private static final String INDEX_COLUMN = "_infino_index";
     /** The alias of {@link #unionOf}'s relation. */
     private static final String UNION_ALIAS = "_infino_shards";
+    /** How {@link #unionOf}'s relation ends: its alias, which {@link #aliased} swaps for another. */
+    private static final String UNION_AS = " AS " + quoteIdent(UNION_ALIAS);
     /** The alias of a significant_terms level's background rows. */
     private static final String BACKGROUND_ALIAS = "_infino_background";
     /** What separates a field's name from the name of one of its per-document figures ({@link Values#figure}). */
@@ -444,7 +450,19 @@ public class InfinoAggregationProcessor {
      */
     Counted evaluate(Collection<AggregationBuilder> builders, Plan plan, Long total) {
         Translation q = plan.query();
-        return evaluate(builders, plan, List.of(plan.table()), q.from(), q.where(), predicates(plan), () -> InfinoSearch.count(plan.table(), q), q, shardOfMany, total);
+        return evaluate(
+            builders,
+            plan,
+            plan.cols(),
+            List.of(plan.table()),
+            q.from(),
+            q.where(),
+            predicates(plan),
+            () -> InfinoSearch.count(plan.table(), q),
+            q,
+            shardOfMany,
+            total
+        );
     }
 
     /**
@@ -455,29 +473,256 @@ public class InfinoAggregationProcessor {
      * values, which cannot be merged from the shards' parts; the
      * coordinating node answers such an aggregation once this way (see
      * {@link InfinoExactAggregation}). {@code plan} is the first shard's,
-     * which the aggregations are planned against.
+     * whose access and time the aggregations are planned under; they read
+     * the columns of every plan ({@link #columnsOver}). {@code shardIndices}
+     * names the index of each plan's table, which an aggregation on
+     * {@code _index} reads per row. {@code total} is the number of rows the
+     * union holds when the caller has counted them already (each plan's own
+     * count, added up), else null: each plan then counts its own, when the
+     * count is needed.
      */
-    Counted evaluateOver(Collection<AggregationBuilder> builders, Plan plan, List<Plan> shardPlans) {
-        String from = unionOf(shardPlans);
+    Counted evaluateOver(Collection<AggregationBuilder> builders, Plan plan, List<Plan> shardPlans, List<String> shardIndices, Long total) {
+        // The aggregations read every plan's columns, and _index from the
+        // union's own column rather than as the first plan's name.
+        Map<String, Column> cols = columnsOver(builders, shardPlans);
+        String from = unionOf(shardPlans, shardIndices, columnsRead(builders, cols));
         List<String> shardTables = new ArrayList<>();
         for (Plan p : shardPlans) {
             shardTables.add(p.table());
         }
         Function<QueryBuilder, String> predicates = qb -> perShard(qb, shardPlans);
-        Supplier<Long> counter = () -> asLong(oneRow("SELECT COUNT(*) AS c FROM " + from).get("c"));
+        // Uncounted, each plan counts its own rows, as a search of each index
+        // would: a count over the union would read every branch's columns.
+        Supplier<Long> counter = total != null ? () -> total : () -> {
+            long sum = 0;
+            for (Plan p : shardPlans) {
+                sum += InfinoSearch.count(p.table(), p.query());
+            }
+            return sum;
+        };
+        cols.put(INDEX_COLUMN, new Column(INDEX_COLUMN, "str", false, false));
         // One answer for the whole index: each terms level at its final size.
-        return evaluate(builders, plan, shardTables, from, InfinoQueryTranslator.ALL, predicates, counter, null, false, null);
+        return evaluate(builders, plan, cols, shardTables, from, InfinoQueryTranslator.ALL, predicates, counter, null, false, null);
+    }
+
+    /**
+     * The columns aggregations over several plans' tables read as one
+     * ({@link #unionOf}) are planned against: every column any of the plans
+     * has. A field one index does not map is then read from the indices that
+     * map it, as stock reads a field unmapped in some of the indices it
+     * searches; planned against one plan's columns, the field read as
+     * unmapped in all of them and the answer came back empty.
+     *
+     * <p>A field the aggregations read that two of the tables hold as
+     * different kinds of value (a keyword in one, a number in the other; a
+     * long and a double) is refused: stock answers each index by its own
+     * mapping and merges the parts by value type, so a cardinality counts a
+     * keyword "5" and a long 5 as two values, while the union holds one type.
+     * Integers of any width are one kind, as stock reads them all as longs.
+     * Such a column is left out, so a script cannot read it either.
+     *
+     * <p>A field every table holds as numbers, of different kinds (a long in
+     * one, a float or double in another), is read as doubles instead, as
+     * stock merges such parts: a terms level's long keys become double keys,
+     * and a percentile reads every value as a double. Only an aggregation
+     * keyed on the exact value of each kind is refused on it: a cardinality,
+     * which counts a long 5 and a double 5.0 as two values, and a composite.
+     * A field some document of each table gives several values of, as longs
+     * in one and doubles in another, is refused: its list column cannot be
+     * read as doubles, and without it a metric would leave out every
+     * document that gave the field several values.
+     *
+     * <p>A field that names different columns in different tables (a field
+     * renamed in one index, with an alias under its old name; an alias to
+     * one field here and to another there), or that one table maps and
+     * another does not while holding the column it reads, is refused
+     * whatever its kind. The union carries one column per name, so the
+     * field would read one table's values and nothing, or a column that
+     * does not exist, for the others; stock reads each index's own column.
+     */
+    static Map<String, Column> columnsOver(Collection<AggregationBuilder> builders, List<Plan> plans) {
+        Map<String, Column> cols = new LinkedHashMap<>();
+        Set<String> mixed = new HashSet<>();
+        Set<String> apart = new HashSet<>();
+        List<Map<String, Column>> each = new ArrayList<>(plans.size());
+        List<Set<String>> held = new ArrayList<>(plans.size());
+        for (Plan p : plans) {
+            each.add(p.cols());
+            Set<String> names = new HashSet<>();
+            held.add(names);
+            // Keyed as the plan keys them, by field: a keyword multi-field
+            // (user.keyword) and a field alias name a column under their own key.
+            for (Map.Entry<String, Column> e : p.cols().entrySet()) {
+                names.add(e.getValue().name());
+                Column seen = cols.putIfAbsent(e.getKey(), e.getValue());
+                if (seen == null) {
+                    continue;
+                }
+                if (!seen.name().equals(e.getValue().name())) {
+                    apart.add(e.getKey());
+                } else if (!sameKind(seen, e.getValue())) {
+                    mixed.add(e.getKey());
+                }
+            }
+        }
+        // The union carries one column per name. A key one table lacks while
+        // that table holds its column under another key (user.keyword where
+        // the field is a plain keyword; an alias one index does not map)
+        // would read that table's values, which stock reads as unmapped.
+        for (Map.Entry<String, Column> e : cols.entrySet()) {
+            for (int i = 0; i < each.size(); i++) {
+                if (!each.get(i).containsKey(e.getKey()) && held.get(i).contains(e.getValue().name())) {
+                    apart.add(e.getKey());
+                }
+            }
+        }
+        Set<String> numbers = new HashSet<>();
+        for (String name : mixed) {
+            String list = cols.get(name).name() + InfinoQueryTranslator.LIST_SUFFIX;
+            if (!apart.contains(name) && numbersOnly(name, each) && !mixed.contains(list)) {
+                numbers.add(name);
+            }
+        }
+        refuseMixed(builders, plans, cols, mixed, numbers, apart);
+        for (String name : numbers) {
+            cols.put(name, asDouble(cols.get(name)));
+        }
+        mixed.removeAll(numbers);
+        cols.keySet().removeAll(mixed);
+        cols.keySet().removeAll(apart);
+        return cols;
+    }
+
+    /**
+     * Whether every table of {@code tables} that has column {@code name}
+     * holds numbers in it, one value or several alike: read as doubles, one
+     * union column carries them all.
+     */
+    static boolean numbersOnly(String name, List<Map<String, Column>> tables) {
+        Column first = null;
+        for (Map<String, Column> cols : tables) {
+            Column c = cols.get(name);
+            if (c == null) {
+                continue;
+            }
+            if (!c.isNumeric() || c.fts() || c.vector()) {
+                return false;
+            }
+            if (first == null) {
+                first = c;
+            } else if (!Objects.equals(first.elem(), c.elem())) {
+                return false;
+            }
+        }
+        return first != null;
+    }
+
+    /**
+     * The key of {@code cols} an aggregation on {@code field} reads, as
+     * {@link InfinoSearch#columnFor} finds it: the field's own, else for
+     * {@code name.keyword} the string field {@code name}'s.
+     */
+    private static String keyOf(Map<String, Column> cols, String field) {
+        if (!cols.containsKey(field) && field.endsWith(".keyword")) {
+            String base = field.substring(0, field.length() - ".keyword".length());
+            Column c = cols.get(base);
+            if (c != null && c.isString()) {
+                return base;
+            }
+        }
+        return field;
+    }
+
+    /** {@code c} read as doubles, of no narrower mapping type. */
+    private static Column asDouble(Column c) {
+        return new Column(
+            c.name(),
+            "f64",
+            c.fts(),
+            c.vector(),
+            c.mask(),
+            c.dateFormat(),
+            c.elem(),
+            c.similarity(),
+            c.otherSimilarity(),
+            c.ranged(),
+            null
+        );
+    }
+
+    /** Whether two tables' columns of one field hold the same kind of value, which one union column can carry for both. */
+    static boolean sameKind(Column a, Column b) {
+        return a.type().equals(b.type())
+            && Objects.equals(a.elem(), b.elem())
+            && a.fts() == b.fts()
+            && Objects.equals(a.fieldType(), b.fieldType());
+    }
+
+    /**
+     * Refuses an aggregation of {@code builders}, at any depth, whose field
+     * is of {@code mixed} (see {@link #columnsOver}) or is one a plan's table
+     * does not serve. A field of {@code numbers}, read as doubles, is refused
+     * only to an aggregation keyed on each kind's exact value. A field of
+     * {@code apart}, which the tables do not map to one column, is refused
+     * to every aggregation.
+     */
+    private static void refuseMixed(
+        Collection<AggregationBuilder> builders,
+        List<Plan> plans,
+        Map<String, Column> cols,
+        Set<String> mixed,
+        Set<String> numbers,
+        Set<String> apart
+    ) {
+        for (AggregationBuilder b : builders) {
+            List<String> fields = new ArrayList<>();
+            if (b instanceof ValuesSourceAggregationBuilder<?> v && v.field() != null) {
+                fields.add(v.field());
+            }
+            if (b instanceof CompositeAggregationBuilder c) {
+                for (CompositeValuesSourceBuilder<?> s : c.sources()) {
+                    if (s.field() != null) {
+                        fields.add(s.field());
+                    }
+                }
+            }
+            for (String field : fields) {
+                if (InfinoIndexField.NAME.equals(field)) {
+                    continue;
+                }
+                for (Plan p : plans) {
+                    refuseUnserved("aggregation [" + b.getName() + "]", p.table(), field);
+                }
+                String key = keyOf(cols, field);
+                if (apart.contains(key)) {
+                    throw new Unsupported(
+                        "aggregation [" + b.getName() + "] on [" + field + "] over several indices that do not map it to the same field is not served"
+                    );
+                }
+                boolean asDoubles = numbers.contains(key)
+                    && !(b instanceof CardinalityAggregationBuilder)
+                    && !(b instanceof CompositeAggregationBuilder);
+                if (mixed.contains(key) && !asDoubles) {
+                    throw new Unsupported(
+                        "aggregation [" + b.getName() + "] on [" + field + "] over several indices that map it as different types is not served"
+                    );
+                }
+            }
+            refuseMixed(b.getSubAggregations(), plans, cols, mixed, numbers, apart);
+        }
     }
 
     /**
      * The aggregations over {@code from WHERE where}. When the count is
      * needed it comes from a top terms level's own groups if the relation is
      * the plan's own query ({@code own}, null when it is not; see
-     * {@link #totalFromTopTerms}), else from {@code counter}.
+     * {@link #totalFromTopTerms}), else from {@code counter}. The
+     * aggregations are planned against {@code cols}.
      */
     private Counted evaluate(
         Collection<AggregationBuilder> builders,
         Plan plan,
+        Map<String, Column> cols,
         List<String> tables,
         String from,
         String where,
@@ -493,7 +738,7 @@ public class InfinoAggregationProcessor {
         List<Spec> specs = new ArrayList<>();
         int position = 0;
         for (AggregationBuilder b : builders) {
-            specs.add(Spec.of(b, plan.cols(), plan.table(), predicates, plan.access(), position++, shardSized, plan.nowMillis()));
+            specs.add(Spec.of(b, cols, plan.table(), predicates, plan.access(), position++, shardSized, plan.nowMillis()));
         }
         // A metric over a field some document gives several values reads each
         // document's figures over them, joined in once for the whole request.
@@ -569,34 +814,130 @@ public class InfinoAggregationProcessor {
     }
 
     /**
+     * The columns of {@link #unionOf} that {@code builders} read, at any
+     * depth, planned against {@code cols}: each field's column and, where some
+     * document gives the field several values, its list column, with the id
+     * column a metric over such a field joins on. Null when an aggregation
+     * reads what is not told apart here (a script, a query of its own such as
+     * a filter or a significant_terms background, several sources): the union
+     * then carries every column. Over many indices of many fields the union is
+     * otherwise a statement of indices times fields columns to parse and plan.
+     */
+    static Set<String> columnsRead(Collection<AggregationBuilder> builders, Map<String, Column> cols) {
+        Set<String> read = new HashSet<>();
+        read.add(InfinoQueryTranslator.OSID);
+        return columnsRead(builders, cols, read) ? read : null;
+    }
+
+    /** Adds to {@code read} the columns {@code builders} read; false when one reads what is not told apart. */
+    private static boolean columnsRead(Collection<AggregationBuilder> builders, Map<String, Column> cols, Set<String> read) {
+        for (AggregationBuilder b : builders) {
+            List<String> fields = new ArrayList<>();
+            if (b instanceof SignificantTermsAggregationBuilder st && st.backgroundFilter() != null) {
+                return false;
+            }
+            if (b instanceof ValuesSourceAggregationBuilder<?> v) {
+                if (v.script() != null) {
+                    return false;
+                }
+                if (v.field() != null) {
+                    fields.add(v.field());
+                }
+            } else if (b instanceof CompositeAggregationBuilder c) {
+                for (CompositeValuesSourceBuilder<?> source : c.sources()) {
+                    if (source.script() != null) {
+                        return false;
+                    }
+                    if (source.field() != null) {
+                        fields.add(source.field());
+                    }
+                }
+            } else {
+                return false;
+            }
+            for (String field : fields) {
+                if (InfinoIndexField.NAME.equals(field)) {
+                    continue; // the union's own column
+                }
+                Column c = InfinoSearch.columnFor(cols, field);
+                if (c == null) {
+                    continue; // no table maps it: read as no value
+                }
+                read.add(c.name());
+                Column list = c.isList() ? null : InfinoQueryTranslator.listOf(cols, c);
+                if (list != null) {
+                    read.add(list.name());
+                }
+            }
+            if (!columnsRead(b.getSubAggregations(), cols, read)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * The rows of each plan's relation, every column any of the tables has
      * but vectors (which no aggregation reads), as one relation: a column a
-     * table lacks is null in its rows, and {@link #SHARD_COLUMN} says which
-     * plan a row came from.
+     * table lacks is null in its rows, typed as the column ({@link #nullOf}),
+     * {@link #SHARD_COLUMN} says which plan a row came from, and
+     * {@link #INDEX_COLUMN} holds its index's name, of {@code indices} (one
+     * per plan).
      */
-    static String unionOf(List<Plan> plans) {
+    static String unionOf(List<Plan> plans, List<String> indices) {
+        return unionOf(plans, indices, null);
+    }
+
+    /** {@link #unionOf(List, List)} carrying only the columns of {@code only} (see {@link #columnsRead}); every column when it is null. */
+    static String unionOf(List<Plan> plans, List<String> indices, Set<String> only) {
         Map<String, Column> all = new LinkedHashMap<>();
         List<Map<String, Column>> each = new ArrayList<>();
         for (Plan p : plans) {
             Map<String, Column> cols = InfinoNative.columns(p.table());
             each.add(cols);
             for (Column c : cols.values()) {
-                if (!c.vector()) {
+                if (!c.vector() && (only == null || only.contains(c.name()))) {
                     all.putIfAbsent(c.name(), c);
                 }
             }
+        }
+        // A field the tables hold as numbers of different kinds is read as doubles (see columnsOver).
+        Set<String> doubles = new HashSet<>();
+        for (Map<String, Column> cols : each) {
+            for (Column c : cols.values()) {
+                Column seen = all.get(c.name());
+                if (seen != null && !sameKind(seen, c) && numbersOnly(c.name(), each)) {
+                    doubles.add(c.name());
+                }
+            }
+        }
+        for (String name : doubles) {
+            all.put(name, asDouble(all.get(name)));
         }
         List<String> branches = new ArrayList<>();
         for (int i = 0; i < plans.size(); i++) {
             List<String> select = new ArrayList<>();
             select.add(i + " AS " + quoteIdent(SHARD_COLUMN));
+            select.add(literal(indices.get(i)) + " AS " + quoteIdent(INDEX_COLUMN));
             for (String name : all.keySet()) {
-                select.add(each.get(i).containsKey(name) ? quoteIdent(name) : "NULL AS " + quoteIdent(name));
+                String held = doubles.contains(name) ? "CAST(" + quoteIdent(name) + " AS DOUBLE)" : quoteIdent(name);
+                select.add((each.get(i).containsKey(name) ? held : nullOf(all.get(name))) + " AS " + quoteIdent(name));
             }
             Translation q = plans.get(i).query();
             branches.add("SELECT " + String.join(", ", select) + " FROM " + q.from() + " WHERE " + q.where());
         }
-        return "(" + String.join(" UNION ALL ", branches) + ") AS " + quoteIdent(UNION_ALIAS);
+        return "(" + String.join(" UNION ALL ", branches) + ")" + UNION_AS;
+    }
+
+    /**
+     * A null of {@code c}'s type, which a table without the column gives in
+     * {@link #unionOf}. An untyped null in the union's first branch would type
+     * the column as null, which a numeric function such as a percentile
+     * refuses to read.
+     */
+    private static String nullOf(Column c) {
+        SqlType type = InfinoScriptTranslator.typeOf(c);
+        return type == SqlType.UNKNOWN ? "NULL" : Source.unmapped(c.name(), type).expr();
     }
 
     /**
@@ -648,6 +989,13 @@ public class InfinoAggregationProcessor {
      * multi-valued field's values per document.
      */
     static String perDocument(String from, Collection<Source> fields) {
+        List<String> key = documentKey(from);
+        List<String> docs = new ArrayList<>(key.size());
+        List<String> docsAs = new ArrayList<>(key.size());
+        for (int j = 0; j < key.size(); j++) {
+            docs.add(FIGURE_DOC + j);
+            docsAs.add(key.get(j) + " AS " + FIGURE_DOC + j);
+        }
         StringBuilder select = new StringBuilder("SELECT " + METRIC_DOCS + ".*");
         StringBuilder joins = new StringBuilder();
         List<String> done = new ArrayList<>();
@@ -673,12 +1021,44 @@ public class InfinoAggregationProcessor {
                 computed.add(figure.getValue() + " AS " + v.figure(figure.getKey()));
                 select.append(", ").append(alias).append('.').append(v.figure(figure.getKey()));
             }
-            String values = "SELECT " + InfinoQueryTranslator.OSID + " AS " + FIGURE_DOC + ", unnest(" + v.each(s.expr()) + ") AS " + FIGURE_VALUE + " FROM "
-                + quoteIdent(v.table());
-            joins.append(" LEFT JOIN (SELECT " + FIGURE_DOC + ", " + String.join(", ", computed) + " FROM (" + values + ") GROUP BY " + FIGURE_DOC + ") " + alias)
-                .append(" ON " + alias + "." + FIGURE_DOC + " = " + METRIC_DOCS + "." + InfinoQueryTranslator.OSID);
+            // Over one table its every row; over several read as one, the union's rows, each table's own.
+            String values = "SELECT " + String.join(", ", docsAs) + ", unnest(" + v.each(s.expr()) + ") AS " + FIGURE_VALUE + " FROM "
+                + (v.table() == null ? from : quoteIdent(v.table()));
+            joins.append(
+                " LEFT JOIN (SELECT " + String.join(", ", docs) + ", " + String.join(", ", computed) + " FROM (" + values + ") GROUP BY "
+                    + String.join(", ", docs) + ") " + alias
+            ).append(" ON " + sameDocument(alias, docs, METRIC_DOCS, key));
         }
-        return "(" + select + " FROM " + from + " " + METRIC_DOCS + joins + ")";
+        // Still the union's rows, under its alias, so what reads them tells its documents apart the same way.
+        return "(" + select + " FROM " + aliased(from, METRIC_DOCS) + joins + ")" + (isUnion(from) ? UNION_AS : "");
+    }
+
+    /**
+     * The columns naming one document of {@code from}: its id, and over
+     * several tables read as one ({@link #unionOf}) the table it came from
+     * too, as one id can name a document of each index.
+     */
+    static List<String> documentKey(String from) {
+        return isUnion(from) ? List.of(quoteIdent(SHARD_COLUMN), InfinoQueryTranslator.OSID) : List.of(InfinoQueryTranslator.OSID);
+    }
+
+    /** {@code left.leftCols[j] = right.rightCols[j]} for every j: the same document on both sides. */
+    private static String sameDocument(String left, List<String> leftCols, String right, List<String> rightCols) {
+        List<String> eq = new ArrayList<>(leftCols.size());
+        for (int j = 0; j < leftCols.size(); j++) {
+            eq.add(left + "." + leftCols.get(j) + " = " + right + "." + rightCols.get(j));
+        }
+        return String.join(" AND ", eq);
+    }
+
+    /** Whether {@code from} is several tables read as one ({@link #unionOf}). */
+    static boolean isUnion(String from) {
+        return from.endsWith(UNION_AS);
+    }
+
+    /** {@code from} read under {@code alias}: a table's name, or the union under that alias in place of its own. */
+    static String aliased(String from, String alias) {
+        return (isUnion(from) ? from.substring(0, from.length() - UNION_AS.length()) : from) + " " + alias;
     }
 
     /**
@@ -695,8 +1075,8 @@ public class InfinoAggregationProcessor {
             if (done.contains(s.expr())) {
                 continue;
             }
-            relation = "(SELECT * EXCLUDE (" + s.expr() + "), unnest(" + s.values().each(s.expr()) + ") AS " + s.expr() + " FROM " + relation + " " + VALUE_LAYER
-                + done.size() + ")";
+            relation = "(SELECT * EXCLUDE (" + s.expr() + "), unnest(" + s.values().each(s.expr()) + ") AS " + s.expr() + " FROM "
+                + aliased(relation, VALUE_LAYER + done.size()) + ")";
             done.add(s.expr());
         }
         return relation;
@@ -725,11 +1105,17 @@ public class InfinoAggregationProcessor {
         for (int j = 0; j < keyCols.size(); j++) {
             keys.add(BUCKET_KEYS + ".k" + j + " AS k" + j);
         }
-        String perDocument = "SELECT DISTINCT " + InfinoQueryTranslator.OSID + " AS " + BUCKET_DOC + ", " + String.join(", ", keyCols) + " FROM "
+        // A document is its id, and over several tables read as one its table too.
+        List<String> key = documentKey(from);
+        List<String> docs = new ArrayList<>(key.size());
+        List<String> docsAs = new ArrayList<>(key.size());
+        for (int j = 0; j < key.size(); j++) {
+            docs.add(BUCKET_DOC + j);
+            docsAs.add(key.get(j) + " AS " + BUCKET_DOC + j);
+        }
+        String perDocument = "SELECT DISTINCT " + String.join(", ", docsAs) + ", " + String.join(", ", keyCols) + " FROM "
             + valuesRelation(from, multi) + " " + VALUE_ROWS + " WHERE " + where;
-        String documents = metrics.isEmpty()
-            ? ""
-            : " JOIN " + from + " " + BUCKET_DOCS + " ON " + BUCKET_DOCS + "." + InfinoQueryTranslator.OSID + " = " + BUCKET_KEYS + "." + BUCKET_DOC;
+        String documents = metrics.isEmpty() ? "" : " JOIN " + aliased(from, BUCKET_DOCS) + " ON " + sameDocument(BUCKET_DOCS, key, BUCKET_KEYS, docs);
         return "SELECT " + String.join(", ", keys) + ", COUNT(*) AS doc_count" + tail + " FROM (" + perDocument + ") " + BUCKET_KEYS + documents + " GROUP BY "
             + positions + having;
     }
@@ -875,6 +1261,16 @@ public class InfinoAggregationProcessor {
          * cannot be read.
          */
         static Source sourceOf(ValuesSourceAggregationBuilder<?> b, Map<String, Column> cols, String table, long now) {
+            if (InfinoIndexField.NAME.equals(b.field())) {
+                if (b.script() != null) {
+                    throw new Unsupported("aggregation [" + b.getName() + "] has a script beside [" + b.field() + "], which is not served");
+                }
+                if (!(b instanceof TermsAggregationBuilder || b instanceof ValueCountAggregationBuilder || b instanceof CardinalityAggregationBuilder)) {
+                    throw new Unsupported("aggregation [" + b.getName() + "] of type [" + b.getType() + "] on [" + b.field() + "] is not served");
+                }
+                // Every document has one, so a missing value never stands in.
+                return indexSource(cols, table);
+            }
             Column c = null;
             if (b.field() != null) {
                 refuseUnserved("aggregation [" + b.getName() + "]", table, b.field());
@@ -896,6 +1292,24 @@ public class InfinoAggregationProcessor {
                 throw new Unsupported("aggregation [" + b.getName() + "] needs a field or a script");
             }
             return withMissing(b, Source.of(c, cols, table), now);
+        }
+
+        /**
+         * What an aggregation on the {@code _index} metadata field reads, as
+         * stock reads it: the name of the index each row belongs to. Over one
+         * table that is one value ({@link InfinoIndexField}), so a terms level
+         * keys one bucket holding every row, a value_count counts every row
+         * and a cardinality is 1 where any row is. Over several shards' tables
+         * read as one ({@link #unionOf}) each row's own index's, from the
+         * column the relation carries it in.
+         */
+        static Source indexSource(Map<String, Column> cols, String table) {
+            String label = "[" + InfinoIndexField.NAME + "]";
+            Column perRow = cols.get(INDEX_COLUMN);
+            if (perRow != null) {
+                return new Source(quoteIdent(perRow.name()), SqlType.STRING, label, null);
+            }
+            return new Source(literal(InfinoIndexField.indexOf(table)), SqlType.STRING, label, null);
         }
 
         /**
@@ -978,7 +1392,9 @@ public class InfinoAggregationProcessor {
         /** A field's column, and the list column it keeps several values in when a document gives it some. */
         static Source of(Column c, Map<String, Column> cols, String table) {
             Column list = c.isList() ? c : InfinoQueryTranslator.listOf(cols, c);
-            Values values = list == null ? null : new Values(c.name(), quoteIdent(list.name()), c.isList(), table);
+            // Over several tables read as one (which carries the index column) no one table holds the values.
+            String valuesTable = cols.containsKey(INDEX_COLUMN) ? null : table;
+            Values values = list == null ? null : new Values(c.name(), quoteIdent(list.name()), c.isList(), valuesTable);
             return new Source(
                 quoteIdent(c.name()),
                 InfinoScriptTranslator.typeOf(c.element()),
@@ -1004,6 +1420,12 @@ public class InfinoAggregationProcessor {
         String anyValue(Function<String, String> test) {
             if (values == null) {
                 return test.apply(expr);
+            }
+            if (values.table() == null) {
+                // The subquery reads one table's lists by id; over several read as one an id names a document of each.
+                throw new Unsupported(
+                    "a bucket over " + label + ", which documents give several values, read per document over several indices read as one is not served"
+                );
             }
             return InfinoQueryTranslator.anyValue(values.table(), values.listOnly() ? null : expr, values.list(), test);
         }
@@ -1081,7 +1503,9 @@ public class InfinoAggregationProcessor {
      * {@code field} its name, {@code list} its list column (quoted),
      * {@code listOnly} whether the field has no column of its own (one the
      * mapping does not name, which the engine made a list), and the
-     * {@code table} a subquery over the list reads. A metric reads such a
+     * {@code table} a subquery over the list reads (null over several
+     * tables read as one, {@link #unionOf}, whose rows are read in place of
+     * it). A metric reads such a
      * field from each document's own figures over its values, which
      * {@link #perDocument} joins in under {@link #figure}.
      */
@@ -3054,7 +3478,13 @@ public class InfinoAggregationProcessor {
         private static CompositeSource source(String agg, CompositeValuesSourceBuilder<?> s, Map<String, Column> cols, String table, long now) {
             Column column = null;
             Source unmapped = null;
-            if (s.field() != null) {
+            Source onIndex = null;
+            if (InfinoIndexField.NAME.equals(s.field())) {
+                if (s.script() != null || !(s instanceof TermsValuesSourceBuilder)) {
+                    throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] on [" + s.field() + "] is not served; a terms source without a script is");
+                }
+                onIndex = Spec.indexSource(cols, table);
+            } else if (s.field() != null) {
                 refuseUnserved("aggregation [" + agg + "] source [" + s.name() + "]", table, s.field());
                 column = InfinoSearch.columnFor(cols, s.field());
                 if (column == null && !InfinoNative.maps(table, s.field())) {
@@ -3067,7 +3497,9 @@ public class InfinoAggregationProcessor {
                 }
             }
             Source c;
-            if (unmapped != null) {
+            if (onIndex != null) {
+                c = onIndex;
+            } else if (unmapped != null) {
                 c = unmapped;
             } else if (s.script() != null) {
                 // A script reads values themselves, so it sees no masked column, the value script's included.

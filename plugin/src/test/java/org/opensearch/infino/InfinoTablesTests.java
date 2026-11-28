@@ -272,6 +272,19 @@ public class InfinoTablesTests extends OpenSearchTestCase {
         assertTrue(tables.keptAfterDelete("os_logs_app", owner.getIndex()));
     }
 
+    /** A table's index is the one served from it, as the metadata applied names it: never one created refused beside it. */
+    public void testTheIndexATableBacks() {
+        InfinoTables tables = new InfinoTables();
+        assertNull(tables.indexOf("os_logs_app"));
+        IndexMetadata owner = index("logs.app", "u1", 1);
+        IndexMetadata refused = index("logs_app", "u2", 2, CREATED_REFUSED);
+        tables.observe(Metadata.builder().put(owner, false).put(refused, false).build());
+        assertEquals("logs.app", tables.indexOf("os_logs_app"));
+        assertNull(tables.indexOf("os_other"));
+        tables.observe(Metadata.builder().put(refused, false).build());
+        assertNull(tables.indexOf("os_logs_app"));
+    }
+
     /** The settings of a request for an index attached to {@code table} (none when null), with {@code extra}. */
     private static Settings attaching(String table, Settings extra) {
         Settings.Builder out = Settings.builder().put(InfinoPlugin.INFINO_ATTACHED.getKey(), true).put(extra);
