@@ -384,6 +384,9 @@ public final class InfinoWriter {
         }
         boolean changed = false;
         for (InfinoNative.Failure f : failed) {
+            if (InfinoNative.notMappedYet(f.reason())) {
+                continue; // its field is not mapped yet: no value the mapper reads makes a column for it
+            }
             int at = rows.get(f.index());
             Outcome o = outcomes.get(at);
             Write w = o.write();
@@ -836,7 +839,11 @@ public final class InfinoWriter {
                                             rejection = e;
                                         }
                                     }
-                                    if (rejection == null && why != null) {
+                                    if (rejection == null && InfinoNative.notMappedYet(why)) {
+                                        // The document the update made adds a field the table's mapping does
+                                        // not hold yet: sent again, with that document's fields mapped first.
+                                        rejection = new InfinoDynamicMapping.NotMappedYet(why, document);
+                                    } else if (rejection == null && why != null) {
                                         rejection = refused(why);
                                     } else if (rejection == null) {
                                         merged.put(o, document);
@@ -1098,6 +1105,11 @@ public final class InfinoWriter {
      * did not answer is a 503, which a client sends again too.
      */
     static BulkItemResponse.Failure notTaken(String index, String id, InfinoNative.PreparedFailure f) {
+        if (InfinoNative.notMappedYet(f.reason())) {
+            // Refused before the append, for a field its table's mapping does not hold yet: sent again once it does.
+            InfinoDynamicMapping.NotMappedYet cause = new InfinoDynamicMapping.NotMappedYet(f.reason(), null);
+            return new BulkItemResponse.Failure(index, id, cause, cause.status());
+        }
         if (f.status() == null) {
             return new BulkItemResponse.Failure(index, id, refused(f.reason()), RestStatus.BAD_REQUEST);
         }

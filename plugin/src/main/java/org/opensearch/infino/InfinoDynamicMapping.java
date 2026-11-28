@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.DocWriteRequest;
 import org.opensearch.action.bulk.BulkItemResponse;
 import org.opensearch.action.bulk.BulkRequest;
@@ -22,7 +23,9 @@ import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.MediaType;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
@@ -82,8 +85,11 @@ final class InfinoDynamicMapping {
 
     private static final Logger log = LogManager.getLogger(InfinoDynamicMapping.class);
     /**
-     * How many rounds a document's update may go in: a document whose fields are
-     * still new after that is left to the table, as before this rule.
+     * How many rounds a document's update may go in. A document that would
+     * still add a field after that is refused, never written with a field the
+     * mapping does not hold yet: the table would give that field a column of
+     * its own typing, which the mapping, once it holds the field, could not
+     * be applied over.
      */
     private static final int MAX_ROUNDS = 3;
     /** The id a document is parsed under when the bulk has not given it one yet: the mapping does not depend on it. */
@@ -99,18 +105,46 @@ final class InfinoDynamicMapping {
     private record Doc(int slot, String index, String id, String routing, BytesReference source, MediaType type, boolean answers) {}
 
     /**
+     * A write the bridge refused because its document gives a value to a
+     * field the mapping its table was declared from does not hold yet
+     * ({@link InfinoNative#notMappedYet}): nothing of it was written, and
+     * the bulk sends it again once its fields are mapped
+     * ({@link InfinoBulkActionFilter#serve}). For an update, {@code document}
+     * is the document the update made, which that round maps; null for an
+     * index request, whose own source is mapped. Answered to a client once
+     * the tries run out, as a 429 it sends again.
+     */
+    static final class NotMappedYet extends OpenSearchStatusException {
+        private final String document;
+
+        NotMappedYet(String reason, String document) {
+            super("[infino] " + reason, RestStatus.TOO_MANY_REQUESTS);
+            this.document = document;
+        }
+
+        /** The document an update made, or null for an index request. */
+        String document() {
+            return document;
+        }
+    }
+
+    /**
      * Map the new fields of the documents {@code bulk} writes to the indices
      * in {@code infino}, then hand {@code then} those indices as the cluster
      * state now holds them, on the write pool. An item whose document the
      * mapper refuses, or whose mapping update fails, gets its answer in
      * {@code answered} and is not written. With no node services (a unit
-     * test) or no local index service, nothing is mapped.
+     * test) or no local index service, nothing is mapped. {@code made} holds,
+     * by slot, the document an update made when it was written before and
+     * refused for a field not mapped yet ({@link NotMappedYet}): its new
+     * fields are mapped too.
      */
     static void apply(
         BulkRequest bulk,
         List<String> concrete,
         Map<String, IndexMetadata> infino,
         BulkItemResponse[] answered,
+        Map<Integer, String> made,
         ActionListener<Map<String, IndexMetadata>> then
     ) {
         ClusterService clusters = InfinoServices.clusterService();
@@ -141,6 +175,10 @@ final class InfinoDynamicMapping {
                     IndexRequest upsert = update.upsertRequest();
                     docs.add(new Doc(slot, index, update.id(), update.routing(), upsert.source(), upsert.getContentType(), false));
                 }
+                String document = made.get(slot);
+                if (document != null) {
+                    docs.add(new Doc(slot, index, update.id(), update.routing(), new BytesArray(document), MediaTypeRegistry.JSON, false));
+                }
             }
         }
         if (docs.isEmpty()) {
@@ -163,6 +201,13 @@ final class InfinoDynamicMapping {
      * refused then, as stock refuses the later document. An index in
      * {@code single} sends one document's update per round, so a refused
      * update is answered to its own document.
+     *
+     * <p>Every document whose update went is parsed again in the next round,
+     * against the mapping this node then holds. The wait for an update ends
+     * at the first newer mapping this node applies ({@link #awaitMappings}),
+     * which may be another bulk's: this node may not hold this update yet, so
+     * a document parsed again that still adds a field sends its update again,
+     * which the cluster manager takes as a no-op once it holds it.
      */
     private static void round(
         List<Doc> docs,
@@ -184,6 +229,9 @@ final class InfinoDynamicMapping {
         Map<String, Unmapped> unmapped = new HashMap<>();
         List<Doc> waiting = new ArrayList<>();
         for (Doc doc : docs) {
+            if (answered[doc.slot()] != null) {
+                continue; // refused in an earlier round
+            }
             IndexMetadata md = state.metadata().index(doc.index());
             IndexService service = md == null ? null : indices.indexService(md.getIndex());
             if (service == null) {
@@ -204,7 +252,15 @@ final class InfinoDynamicMapping {
                 }
                 continue;
             }
-            if (update == null || rounds.getOrDefault(doc, 0) >= MAX_ROUNDS) {
+            if (update == null) {
+                continue;
+            }
+            if (rounds.getOrDefault(doc, 0) >= MAX_ROUNDS) {
+                if (doc.answers()) {
+                    answered[doc.slot()] = failure(bulk, doc, stillUnmapped(doc.index()));
+                } else {
+                    log.debug("[infino] the update of {} in {} still adds a field after {} rounds", doc.id(), doc.index(), MAX_ROUNDS);
+                }
                 continue;
             }
             Mapping merged = byIndex.get(doc.index());
@@ -224,15 +280,21 @@ final class InfinoDynamicMapping {
             versions.putIfAbsent(doc.index(), md.getMappingVersion());
         }
         if (byIndex.isEmpty()) {
-            then.onResponse(current(clusters.state(), infino));
+            // Every field is mapped as this node's mappers hold it, and they may be ahead
+            // of the cluster state the tables are declared from: the state is handed on
+            // once it holds at least the mapping the mappers held ({@link #checkedVersions}).
+            Map<String, Long> checked = checkedVersions(clusters.state(), infino, indices);
+            if (applied(clusters.state(), checked)) {
+                then.onResponse(current(clusters.state(), infino));
+            } else {
+                awaitMappings(checked, bulk.timeout(), clusters, then, () -> then.onResponse(current(clusters.state(), infino)));
+            }
             return;
         }
         AtomicInteger pending = new AtomicInteger(byIndex.size());
         Map<String, Long> sent = new HashMap<>();
-        for (Map.Entry<String, List<Doc>> e : contributors.entrySet()) {
-            if (e.getValue().size() > 1) {
-                waiting.addAll(e.getValue());
-            }
+        for (List<Doc> from : contributors.values()) {
+            waiting.addAll(from);
         }
         Runnable sentAll = () -> awaitMappings(
             sent,
@@ -246,7 +308,8 @@ final class InfinoDynamicMapping {
             IndexMetadata md = state.metadata().index(index);
             send(updates, md, e.getValue(), ActionListener.wrap(ok -> {
                 synchronized (sent) {
-                    sent.put(index, versions.get(index));
+                    // The update makes a mapping newer than the one it was parsed against.
+                    sent.put(index, versions.get(index) + 1);
                 }
                 if (pending.decrementAndGet() == 0) {
                     sentAll.run();
@@ -260,6 +323,8 @@ final class InfinoDynamicMapping {
                         log.debug("[infino] mapping update for {} refused, retried per document: {}", index, failure.getMessage());
                         single.add(index);
                     } else {
+                        // Its own update was refused: nothing to parse it again for.
+                        waiting.removeAll(from);
                         for (Doc doc : from) {
                             if (doc.answers()) {
                                 answered[doc.slot()] = failure(bulk, doc, failure);
@@ -516,14 +581,40 @@ final class InfinoDynamicMapping {
     }
 
     /**
-     * Wait until this node holds a mapping newer than the one each index in
-     * {@code sent} was parsed against, then run {@code next} on the write
-     * pool; past {@code timeout}, fail. The update is acknowledged once the
-     * cluster manager has published it, not once this node applied it, so
-     * the bulk waits for that as a stock shard does.
+     * The mapping version of each index of {@code infino} this node holds an
+     * index service for, as that service holds it now, read after the
+     * documents were checked against its mappers. A node applying a new
+     * cluster state gives the index service the new metadata, then merges
+     * its mapping into the mappers, and only then makes the state the one
+     * {@link ClusterService#state} returns. So a document checked meanwhile
+     * may find its field mapped while that state's mapping does not hold it
+     * yet: a table declared from that mapping would get the field from the
+     * document instead, typed by the table (a column without a text index,
+     * or a list column), and once the mapping holds the field the table could
+     * no longer take the mapping. The version read here is at least the one
+     * the mappers held during the check, since the metadata is set first.
+     */
+    private static Map<String, Long> checkedVersions(ClusterState state, Map<String, IndexMetadata> infino, IndicesService indices) {
+        Map<String, Long> checked = new HashMap<>();
+        for (String name : infino.keySet()) {
+            IndexMetadata md = state.metadata().index(name);
+            IndexService service = md == null ? null : indices.indexService(md.getIndex());
+            if (service != null) {
+                checked.put(name, service.getMetadata().getMappingVersion());
+            }
+        }
+        return checked;
+    }
+
+    /**
+     * Wait until this node's cluster state holds, for each index in
+     * {@code atLeast}, a mapping at least that version, then run
+     * {@code next} on the write pool; past {@code timeout}, fail. An update
+     * is acknowledged once the cluster manager has published it, not once
+     * this node applied it, so the bulk waits for that as a stock shard does.
      */
     private static void awaitMappings(
-        Map<String, Long> sent,
+        Map<String, Long> atLeast,
         TimeValue timeout,
         ClusterService clusters,
         ActionListener<Map<String, IndexMetadata>> then,
@@ -531,8 +622,8 @@ final class InfinoDynamicMapping {
     ) {
         Runnable onWritePool = () -> InfinoServices.fork(ThreadPool.Names.WRITE, then::onFailure, next);
         Map<String, Long> versions;
-        synchronized (sent) {
-            versions = Map.copyOf(sent);
+        synchronized (atLeast) {
+            versions = Map.copyOf(atLeast);
         }
         if (versions.isEmpty() || applied(clusters.state(), versions)) {
             onWritePool.run();
@@ -558,11 +649,11 @@ final class InfinoDynamicMapping {
         }, state -> applied(state, versions));
     }
 
-    /** Whether {@code state} holds, for each index, a mapping newer than the version given (or the index is gone). */
+    /** Whether {@code state} holds, for each index, a mapping at least the version given (or the index is gone). */
     private static boolean applied(ClusterState state, Map<String, Long> versions) {
         for (Map.Entry<String, Long> e : versions.entrySet()) {
             IndexMetadata md = state.metadata().index(e.getKey());
-            if (md != null && md.getMappingVersion() <= e.getValue()) {
+            if (md != null && md.getMappingVersion() < e.getValue()) {
                 return false;
             }
         }
@@ -577,6 +668,18 @@ final class InfinoDynamicMapping {
             out.put(e.getKey(), md != null && md.getIndexUUID().equals(e.getValue().getIndexUUID()) ? md : e.getValue());
         }
         return out;
+    }
+
+    /**
+     * Why a document that still adds a field after {@link #MAX_ROUNDS} is
+     * refused: the mapping kept moving under it. A retry finds the fields
+     * mapped, so it is answered as a rejection the client retries.
+     */
+    static OpenSearchStatusException stillUnmapped(String index) {
+        return new OpenSearchStatusException(
+            "[infino] the mapping of [" + index + "] kept changing while this document's new fields were mapped; retry the document",
+            RestStatus.TOO_MANY_REQUESTS
+        );
     }
 
     private static BulkItemResponse failure(BulkRequest bulk, Doc doc, Exception cause) {

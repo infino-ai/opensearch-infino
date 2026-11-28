@@ -1573,9 +1573,25 @@ public final class InfinoNative {
      * answer a call, which may have written it. {@code staleSchema} marks a
      * 503 for a document the hosted service refused for a column its batch
      * was typed without: the service did not write it either, and a later
-     * try types it afresh.
+     * try types it afresh. It marks a 429 too, for a document the bridge
+     * refused because its table's mapping does not hold one of its fields
+     * yet ({@link #notMappedYet}): nothing of it was written either.
      */
     public record PreparedFailure(int batch, int index, String reason, boolean permanent, RestStatus status, boolean staleSchema) {}
+
+    /**
+     * How the bridge starts the reason it refuses a document with when the
+     * document gives a value to a field its table has no column for and the
+     * table's mapping does not hold yet (the bridge's {@code NOT_MAPPED_YET}):
+     * nothing of it was written, and it is written once the table is declared
+     * from a mapping that holds the field.
+     */
+    static final String NOT_MAPPED_YET = "not mapped yet: ";
+
+    /** Whether the bridge refused a document for {@code reason} as one whose field is not mapped yet ({@link #NOT_MAPPED_YET}). */
+    static boolean notMappedYet(String reason) {
+        return reason != null && reason.startsWith(NOT_MAPPED_YET);
+    }
 
     /** Outcome of appending prepared batches. */
     public record PreparedResult(int ok, List<PreparedFailure> failed) {}

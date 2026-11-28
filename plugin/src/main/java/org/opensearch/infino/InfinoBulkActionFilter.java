@@ -153,6 +153,13 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
     private static final long DROPPED_PRIMARY_TERM = 0L;
     /** How long an update whose primary is not yet ready to take its writes waits before it is sent on again. */
     private static final TimeValue MERGE_WAIT = TimeValue.timeValueMillis(100);
+    /**
+     * How many times in all a proxy bulk's item is written while the bridge
+     * refuses it for a field its table's mapping does not hold yet
+     * ({@link InfinoDynamicMapping.NotMappedYet}); past that, it is answered
+     * with that refusal, a 429 the client sends again.
+     */
+    private static final int NOT_MAPPED_TRIES = 3;
 
     private final Supplier<ClusterService> clusterService;
     private final InfinoTables tables;
@@ -1591,7 +1598,10 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
      * the thread that delivered the bulk; a write pool whose queue is full
      * refuses the bulk with 429, as a stock bulk's is. The fields the
      * documents add to the mapping are mapped before that, as a shard maps
-     * them ({@link InfinoDynamicMapping}).
+     * them ({@link InfinoDynamicMapping}). An item the bridge refused because
+     * its table's mapping did not hold one of its fields yet
+     * ({@link InfinoDynamicMapping.NotMappedYet}) goes round again, its
+     * fields mapped first, up to {@link #NOT_MAPPED_TRIES} times in all.
      */
     static void serve(
         BulkRequest bulk,
@@ -1604,7 +1614,65 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
     ) {
         long start = System.nanoTime();
         ActionListener<BulkResponse> listener = refreshing(bulk.getRefreshPolicy(), answered, infino.values(), tables, client);
-        InfinoServices.fork(ThreadPool.Names.WRITE, listener::onFailure, () -> {
+        write(bulk, concrete, infino, answered, Map.of(), NOT_MAPPED_TRIES, writes, tables, start, listener);
+    }
+
+    /**
+     * One try of {@link #serve}: map the documents' new fields, write the
+     * items, and send again those refused for a field not mapped yet while
+     * {@code tries} allows, each in its own slot. {@code made} holds, by slot,
+     * the document an update made on the try before ({@link InfinoDynamicMapping#apply}).
+     */
+    private static void write(
+        BulkRequest bulk,
+        List<String> concrete,
+        Map<String, IndexMetadata> infino,
+        BulkItemResponse[] answered,
+        Map<Integer, String> made,
+        int tries,
+        InfinoWriter writes,
+        InfinoTables tables,
+        long start,
+        ActionListener<BulkResponse> listener
+    ) {
+        ActionListener<BulkResponse> again = ActionListener.wrap(response -> {
+            BulkItemResponse[] items = response.getItems();
+            List<Integer> slots = new ArrayList<>();
+            Map<Integer, String> documents = new HashMap<>();
+            for (int slot = 0; tries > 1 && slot < items.length; slot++) {
+                BulkItemResponse item = items[slot];
+                if (item != null
+                    && item.isFailed()
+                    && ExceptionsHelper.unwrapCause(item.getFailure().getCause()) instanceof InfinoDynamicMapping.NotMappedYet refused) {
+                    if (refused.document() != null) {
+                        documents.put(slots.size(), refused.document());
+                    }
+                    slots.add(slot);
+                }
+            }
+            if (slots.isEmpty()) {
+                listener.onResponse(response);
+                return;
+            }
+            log.debug("[infino] {} items of a bulk wait for their fields to be mapped and go again", slots.size());
+            List<String> partConcrete = new ArrayList<>(slots.size());
+            for (int slot : slots) {
+                partConcrete.add(concrete.get(slot));
+            }
+            write(
+                partOf(bulk, slots),
+                partConcrete,
+                infino,
+                new BulkItemResponse[slots.size()],
+                documents,
+                tries - 1,
+                writes,
+                tables,
+                start,
+                slotted(bulk, concrete, slots, items, new AtomicInteger(1), start, listener)
+            );
+        }, listener::onFailure);
+        InfinoServices.fork(ThreadPool.Names.WRITE, again::onFailure, () -> {
             // The fields the documents add are mapped first, as a shard maps them, so
             // each table is declared from the mapping that holds them before its rows land.
             BulkItemResponse[] items = answered.clone();
@@ -1613,7 +1681,8 @@ public class InfinoBulkActionFilter extends InfinoActionFilter {
                 concrete,
                 infino,
                 items,
-                ActionListener.wrap(mapped -> stageAndSubmit(bulk, concrete, mapped, items, writes, tables, listener, start), listener::onFailure)
+                made,
+                ActionListener.wrap(mapped -> stageAndSubmit(bulk, concrete, mapped, items, writes, tables, again, start), again::onFailure)
             );
         });
     }
