@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ExecutorService;
@@ -27,10 +28,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class InfinoConcurrentDynamicMappingIT extends InfinoRestTestCase {
 
-    /** The clients that write at once. */
-    private static final int CLIENTS = 2;
-    /** Fresh indices written, one after another: a broken one shows in some, not all. */
-    private static final int TRIALS = 8;
+    /** The clients that write at once; {@code -Dtests.infino.race.clients} raises it for a stress run. */
+    private static final int CLIENTS = Integer.getInteger("tests.infino.race.clients", 2);
+    /** Fresh indices written, one after another: a broken one shows in some, not all; {@code -Dtests.infino.race.trials} for more. */
+    private static final int TRIALS = Integer.getInteger("tests.infino.race.trials", 8);
     /** The bulks each client sends to an index. */
     private static final int BULKS_PER_CLIENT = 40;
     /** The documents in each bulk. */
@@ -49,12 +50,19 @@ public class InfinoConcurrentDynamicMappingIT extends InfinoRestTestCase {
     private static final double SPARSE_SHARE = 0.2;
     /** Values a generated number or suffix is drawn below. */
     private static final int VALUES = 1000;
+    /**
+     * The length of the name each run gives its indices: a run repeated in
+     * one cluster ({@code -Dtests.iters}) never meets an index an earlier run
+     * left behind.
+     */
+    private static final int RUN_NAME = 8;
     /** How long the clients may take on one index, together. */
     private static final long TIMEOUT_MINUTES = 5;
 
     public void testConcurrentFirstWritesLeaveTheIndexHealthy() throws Exception {
+        String run = randomAlphaOfLength(RUN_NAME).toLowerCase(Locale.ROOT);
         for (int trial = 0; trial < TRIALS; trial++) {
-            assertHealthyAfterConcurrentFirstWrites("dyn_race_" + trial, trial, false);
+            assertHealthyAfterConcurrentFirstWrites("dyn_race_" + run + "_" + trial, trial, false);
         }
     }
 
@@ -66,9 +74,34 @@ public class InfinoConcurrentDynamicMappingIT extends InfinoRestTestCase {
      * typing that the mapping could not then be applied over.
      */
     public void testConcurrentNewArrayFieldsLeaveTheIndexHealthy() throws Exception {
+        String run = randomAlphaOfLength(RUN_NAME).toLowerCase(Locale.ROOT);
         for (int trial = 0; trial < TRIALS; trial++) {
-            assertHealthyAfterConcurrentFirstWrites("dyn_arrays_" + trial, trial, true);
+            assertHealthyAfterConcurrentFirstWrites("dyn_arrays_" + run + "_" + trial, trial, true);
         }
+    }
+
+    /**
+     * A field a scripted update adds is mapped before the document is
+     * written, as a stock shard maps it: it is searched as text, and a later
+     * document that brings the same field is written to a table that holds it
+     * as the mapping does, rather than to one that typed it from the update's
+     * document and so can no longer take the mapping.
+     */
+    public void testAFieldAScriptedUpdateAddsIsMappedFirst() throws Exception {
+        String index = "dyn_script_" + randomAlphaOfLength(RUN_NAME).toLowerCase(Locale.ROOT);
+        call(
+            "PUT",
+            "/" + index,
+            "{\"settings\":{\"index.infino.enabled\":true,\"index.infino.mode\":\"proxy\",\"number_of_shards\":1,\"number_of_replicas\":0},"
+                + "\"mappings\":{\"dynamic\":true}}"
+        );
+        call("PUT", "/" + index + "/_doc/1?refresh=true", "{\"n\":1}");
+        call("POST", "/" + index + "/_update/1", "{\"script\":{\"source\":\"ctx._source.note = params.v\",\"params\":{\"v\":\"wool coat\"}}}");
+        call("PUT", "/" + index + "/_doc/2", "{\"n\":2,\"note\":\"wool hat\"}");
+        call("POST", "/" + index + "/_refresh", null);
+        Map<String, Object> found = call("POST", "/" + index + "/_count", "{\"query\":{\"match\":{\"note\":\"wool\"}}}");
+        assertEquals(2, ((Number) found.get("count")).intValue());
+        call("DELETE", "/" + index, null);
     }
 
     private void assertHealthyAfterConcurrentFirstWrites(String index, int trial, boolean arrays) throws Exception {

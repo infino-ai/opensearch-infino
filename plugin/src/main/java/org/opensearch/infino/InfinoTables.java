@@ -70,6 +70,15 @@ public final class InfinoTables {
     private static final String PROPERTIES = "properties";
     /** Where a table's mapping declares the columns its engine writes, which the bridge keeps apart from the fields. */
     private static final String ENGINE_COLUMNS = "_engine_columns";
+    /**
+     * Set on the mapping of a proxy index's table: every new field a document
+     * brings is mapped before the document is written ({@link InfinoDynamicMapping}),
+     * so the bridge refuses a document that still gives a value to a field the
+     * table has no column for and the mapping would map, rather than let the
+     * table type that field itself, which the mapping, once it holds the field,
+     * could not be applied over (the bridge's {@code MAPPED_FIRST}).
+     */
+    static final String MAPPED_FIRST = "_mapped_first";
     private static final String TYPE = "type";
     /**
      * The root settings of a mapping that say what it indexes of a document
@@ -89,8 +98,23 @@ public final class InfinoTables {
     private static final List<String> EDGE_TABLES = List.of("src_table", "dst_table");
     private static final List<String> EDGE_IDS = List.of("src_id", "dst_id");
 
-    /** The mapping version each table was last declared from, by table. */
-    private final Map<String, Long> declared = new ConcurrentHashMap<>();
+    /** The index and mapping version each table was last declared from, by table. */
+    private final Map<String, Declared> declared = new ConcurrentHashMap<>();
+
+    /** The index a table was declared for, by its UUID (null in a test), and the mapping version it was declared from. */
+    private record Declared(String uuid, long version) {
+        /**
+         * Whether the table holds {@code md}'s mapping already: declared for
+         * the same index from that mapping or a later one. A table is never
+         * declared from an older mapping than the one it holds: a bulk that
+         * read the cluster state before a newer mapping was applied would
+         * otherwise put the older mapping's rules back over the newer one's
+         * while a bulk checked against the newer one is written.
+         */
+        boolean covers(IndexMetadata md) {
+            return md.getIndexUUID().equals(uuid) && version >= md.getMappingVersion();
+        }
+    }
 
     /** The connection {@link #declared} was filled over, as {@link InfinoNative#opens} counts them. */
     private volatile long declaredOver = -1;
@@ -335,8 +359,8 @@ public final class InfinoTables {
         claim(table, md, known == null ? Map.of() : known.byTable());
         long version = md.getMappingVersion();
         forgetOver(InfinoNative.opens());
-        Long last = declared.get(table);
-        if (last != null && last == version) {
+        Declared last = declared.get(table);
+        if (last != null && last.covers(md)) {
             return table;
         }
         synchronized (declaring.computeIfAbsent(table, t -> new Object())) {
@@ -345,11 +369,11 @@ public final class InfinoTables {
             long over = InfinoNative.opens();
             forgetOver(over);
             last = declared.get(table);
-            if (last != null && last == version) {
+            if (last != null && last.covers(md)) {
                 return table;
             }
             InfinoNative.ensureTable(table, tableMapping(md), defaultBm25(md.getSettings()), InfinoPlugin.INFINO_ATTACHED.get(md.getSettings()));
-            noteDeclared(table, version, over);
+            noteDeclared(table, md.getIndexUUID(), version, over);
             log.info("[infino] table {} declared from mapping version {} of {}", table, version, md.getIndex().getName());
         }
         return table;
@@ -362,9 +386,9 @@ public final class InfinoTables {
      * next use declares it again. Under the lock {@link #forgetOver} clears
      * under, so no declaration over an old connection is kept past a clear.
      */
-    private synchronized void noteDeclared(String table, long version, long over) {
+    private synchronized void noteDeclared(String table, String uuid, long version, long over) {
         if (declaredOver == over && InfinoNative.opens() == over) {
-            declared.put(table, version);
+            declared.put(table, new Declared(uuid, version));
         }
     }
 
@@ -389,7 +413,9 @@ public final class InfinoTables {
      * declares its edge columns as the engine's graph walks read them,
      * whatever the mapping says of them: the tables as strings, the ids as
      * the engine's id type. The mapping's root {@code dynamic} and
-     * {@code enabled} go along ({@link #INDEXING_SETTINGS}).
+     * {@code enabled} go along ({@link #INDEXING_SETTINGS}). A proxy index's
+     * table is marked as one whose new fields are mapped first
+     * ({@link #MAPPED_FIRST}).
      */
     @SuppressWarnings("unchecked")
     static String tableMapping(IndexMetadata md) {
@@ -397,7 +423,9 @@ public final class InfinoTables {
         boolean stamped = InfinoPlugin.inDefaultMode(md.getSettings());
         boolean edges = InfinoPlugin.INFINO_EDGES.get(md.getSettings());
         if (!stamped && !edges) {
-            return mapping == null ? "{}" : mapping.source().string();
+            Map<String, Object> table = new LinkedHashMap<>(mapping == null ? Map.of() : mapping.sourceAsMap());
+            table.put(MAPPED_FIRST, true);
+            return json(table);
         }
         Map<String, Object> source = mapping == null ? Map.of() : mapping.sourceAsMap();
         Map<String, Object> properties = new LinkedHashMap<>();
@@ -429,8 +457,15 @@ public final class InfinoTables {
         if (stream != null) {
             table.put(DataStreamFieldMapper.NAME, stream);
         }
+        if (!stamped) {
+            table.put(MAPPED_FIRST, true);
+        }
+        return json(table);
+    }
+
+    private static String json(Map<String, Object> map) {
         try (XContentBuilder b = XContentFactory.jsonBuilder()) {
-            b.map(table);
+            b.map(map);
             return BytesReference.bytes(b).utf8ToString();
         } catch (IOException e) {
             throw new UncheckedIOException(e);
@@ -458,13 +493,13 @@ public final class InfinoTables {
 
     /** Note the table as declared from mapping {@code version}, as {@link #ensure} does once it has declared it; for tests. */
     void declaredForTest(String table, long version) {
-        declared.put(table, version);
+        declared.put(table, new Declared(null, version));
     }
 
     /** Whether the table is declared from mapping {@code version} over the current connection. */
     boolean declaredAt(String table, long version) {
-        Long last = declared.get(table);
-        return last != null && last == version;
+        Declared last = declared.get(table);
+        return last != null && last.version() == version;
     }
 
     /** The table is gone; a later index under the same name declares afresh. */

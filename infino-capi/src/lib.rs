@@ -112,6 +112,12 @@ const OWN_COLUMN_PREFIX: &str = ".";
 /// mode ([`ROUTING`], [`OP`], [`GEN`]). Like [`RESERVED`], they hold no
 /// field: a document's field of the same name gets a column of its own.
 const ENGINE_COLUMNS: &str = "_engine_columns";
+/// Set (true) at the root of a table's mapping when every new field a
+/// document brings is mapped before the document is written, as a proxy
+/// index maps it: a document that still gives a value to a path the table
+/// has no column for and the mapping would map is refused for a later try
+/// ([`not_mapped_yet`]) instead of the path being typed by the engine.
+const MAPPED_FIRST: &str = "_mapped_first";
 /// Separator used when a multi-valued string field lands in a scalar string
 /// column: the values are joined so a text index sees every token. A
 /// `keyword` field's values are never joined ([`LIST_SUFFIX`]). The
@@ -2245,6 +2251,9 @@ struct Indexed {
     /// Whether this object, or one under it, leaves anything out or keeps a
     /// field whole: when none does, a row is flattened as it comes.
     acts: bool,
+    /// At the root: the mapping maps every new field before its document is
+    /// written ([`MAPPED_FIRST`]).
+    mapped_first: bool,
 }
 
 /// One property of an object of a mapping ([`Indexed`]).
@@ -2330,12 +2339,18 @@ enum Step<'a> {
     Held,
     /// Flattened by this rule.
     Into(Rule<'a>),
+    /// No property maps it, and the `dynamic` in force maps a new field: the
+    /// document's mapping update maps it before it is written. Flattened as
+    /// it comes.
+    New,
 }
 
 impl Indexed {
     /// What `mapping` indexes, from its root object ([`root_of`]).
     fn of(mapping: &Value) -> Self {
-        root_of(mapping).map(Self::object).unwrap_or_default()
+        let mut rule: Self = root_of(mapping).map(Self::object).unwrap_or_default();
+        rule.mapped_first = mapping.get(MAPPED_FIRST).and_then(Value::as_bool) == Some(true);
+        rule
     }
 
     /// The rule of one object of the mapping, or of its root.
@@ -2363,6 +2378,7 @@ impl Indexed {
             dynamic,
             properties,
             acts: false,
+            mapped_first: false,
         };
         rule.acts = rule.acting();
         rule
@@ -2440,7 +2456,7 @@ impl Indexed {
             match found {
                 None => {
                     return match dynamic {
-                        Dynamic::Kept => Step::Into(Rule::All),
+                        Dynamic::Kept => Step::New,
                         Dynamic::Dropped => Step::Drop,
                         Dynamic::Held => Step::Held,
                     }
@@ -2462,6 +2478,18 @@ impl Indexed {
                 }
             }
         }
+    }
+
+    /// Whether the flattened `path` is a new field to this mapping, one
+    /// the document's mapping update maps before it is written
+    /// ([`Step::New`]): no property maps it or any path above it, and the
+    /// `dynamic` in force there maps a new field.
+    fn maps_new(&self, path: &str) -> bool {
+        !self.disabled
+            && matches!(
+                self.step(path, self.dynamic.unwrap_or(Dynamic::Kept)),
+                Step::New
+            )
     }
 
     /// Whether the flattened `path` is indexed at all.
@@ -3077,6 +3105,7 @@ fn flatten_by(
                     continue;
                 }
                 Step::Into(next) => next,
+                Step::New => Rule::All,
             },
         };
         flatten_value(path(), v, next, out, f);
@@ -3871,6 +3900,9 @@ fn conform_doc(
         }
     }
     let mut lists: Vec<(String, Value)> = Vec::new();
+    // The paths with no value and no column that a new field's mapping would
+    // give one ([`MAPPED_FIRST`]), left out of the row.
+    let mut valueless: Vec<String> = Vec::new();
     for (path, value) in flat.iter_mut() {
         let field = columns.field(path);
         // A field the mapping declares with a scalar or string column reads
@@ -3902,6 +3934,25 @@ fn conform_doc(
                 return Err(format!(
                     "field [{path}]: the table holds [{column}] as a column of its own, and no field can be added beneath it"
                 ));
+            }
+            // Where every new field is mapped before its document is written
+            // ([`MAPPED_FIRST`]), a value at a path the mapping would map and
+            // the table has no column for means the table was declared from a
+            // mapping older than the one the document was checked against.
+            // Typed here, the column would be the engine's (a string without a
+            // text index, or a list), and the mapping, once it holds the
+            // field, could no longer be applied to the table: every later
+            // request on it would fail. The document is refused for a later
+            // try instead, when the table holds the field. A path with no value
+            // there (a null, or an array of nothing else) adds nothing to the
+            // mapping, as in OpenSearch, and is left out of the row so the
+            // engine types no column from it either.
+            let own = path.strip_prefix(OWN_COLUMN_PREFIX).unwrap_or(path);
+            if indexed.mapped_first && indexed.maps_new(own) {
+                if given_values(value) > 0 {
+                    return Err(not_mapped_yet(path));
+                }
+                valueless.push(path.clone());
             }
             continue;
         };
@@ -3975,10 +4026,38 @@ fn conform_doc(
             other => fit(other).map_err(why)?,
         };
     }
+    for path in valueless {
+        flat.remove(&path);
+    }
     for (path, values) in lists {
         flat.insert(path, values);
     }
     Ok(flat)
+}
+
+/// What starts the reason a document is refused with when it gives a value
+/// to a path its table has no column for, in a table whose mapping maps every
+/// new field first ([`MAPPED_FIRST`]): the caller tries the document again
+/// once the table is declared from a mapping that holds the field. The
+/// plugin reads a refusal by this start.
+const NOT_MAPPED_YET: &str = "not mapped yet: ";
+
+/// The status a document refused as [`not_mapped_yet`] is reported under
+/// when the caller does not try it again itself: too many requests, which a
+/// client sends again.
+const NOT_MAPPED_YET_STATUS: u16 = 429;
+
+/// Why a document is refused for a value at `path`, which its table has no
+/// column for and its mapping does not hold yet ([`NOT_MAPPED_YET`]).
+fn not_mapped_yet(path: &str) -> String {
+    format!(
+        "{NOT_MAPPED_YET}field [{path}] is not in the mapping its table was declared from; the document is written once it is"
+    )
+}
+
+/// Whether `why` is a refusal of [`not_mapped_yet`].
+fn is_not_mapped_yet(why: &str) -> bool {
+    why.starts_with(NOT_MAPPED_YET)
 }
 
 /// Declare the list columns ([`LIST_SUFFIX`]) the rows need and the table
@@ -5279,8 +5358,9 @@ struct NotTaken {
     /// weighs; None for any other failure.
     mismatched: Option<String>,
     /// Whether it was refused for a column its batch's schemas lacked
-    /// ([`Recheck`]): the service stored nothing of it, so a later
-    /// commit need not look its id up, as after a rate limit.
+    /// ([`Recheck`]), or for a field its table's mapping does not hold yet
+    /// ([`not_mapped_yet`]): nothing of it was stored, so a later commit
+    /// need not look its id up, as after a rate limit.
     stale_schema: bool,
 }
 
@@ -5610,9 +5690,18 @@ fn append_prepared(
 ) -> Result<Vec<NotTaken>, InfinoError> {
     let mut failed: Vec<NotTaken> = Vec::new();
     for (b, p) in prepared.iter_mut().enumerate() {
-        // Refused by the columns before conversion, as every try would be.
+        // Refused by the columns before conversion, as every try would be;
+        // except a document whose field the table's mapping does not hold
+        // yet, which a later try writes, and which nothing was written of.
         for (i, why) in &p.failed {
-            failed.push(NotTaken::new(b, *i, why.clone(), true, None));
+            if is_not_mapped_yet(why) {
+                failed.push(NotTaken {
+                    stale_schema: true,
+                    ..NotTaken::new(b, *i, why.clone(), false, Some(NOT_MAPPED_YET_STATUS))
+                });
+            } else {
+                failed.push(NotTaken::new(b, *i, why.clone(), true, None));
+            }
         }
         if let Some(seqs) = seqs.get(b) {
             if let Err(why) = stamp_seqs(p, seqs) {
@@ -9389,6 +9478,104 @@ mod tests {
         let out = ensure(h, r#"{"properties":{"level":{"type":"text"}}}"#);
         assert!(out.contains("without a text index"), "{out}");
         close(h);
+    }
+
+    /// A table whose mapping maps every new field before its document is
+    /// written ([`MAPPED_FIRST`]) never types a column from a document: a
+    /// document giving a value to a field the declared mapping lacks is
+    /// refused for a later try, and once the mapping holds the field as text
+    /// the table takes that mapping, its text index, and the document. A
+    /// field with no value adds nothing; one a mapping maps without a column
+    /// of its own, or leaves out, is kept or left out as before.
+    #[test]
+    fn a_field_the_declared_mapping_lacks_is_never_typed_by_the_table() {
+        let h = open_logs();
+        let declared = r#"{"_mapped_first":true,"dynamic":true,"properties":{"level":{"type":"keyword"},
+            "loc":{"type":"geo_point"},"quiet":{"type":"object","dynamic":false}}}"#;
+        let out = ensure(h, declared);
+        assert!(!out.contains("error"), "{out}");
+        let p = prepared(
+            h,
+            &[
+                ("a", r#"{"level":"x","t_a":"wool coat"}"#),
+                ("b", r#"{"level":"y","x":{"h1":{"k2":["silk","wool"]}}}"#),
+                ("c", r#"{"level":"z","none":null,"empty":[],"nulls":[null],"loc":"1,2","quiet":{"q":1}}"#),
+            ],
+        );
+        let out = append_replacing(h, p, &[]);
+        assert_eq!(out["ok"], 1, "{out}");
+        let failed = out["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 2, "{out}");
+        for (f, path) in failed.iter().zip(["t_a", "x.h1.k2"]) {
+            let reason = f["reason"].as_str().unwrap();
+            assert!(is_not_mapped_yet(reason) && reason.contains(&format!("[{path}]")), "{f}");
+            assert_eq!(f["permanent"], false, "{f}");
+            assert_eq!(f["status"], NOT_MAPPED_YET_STATUS, "{f}");
+            assert_eq!(f["stale_schema"], true, "{f}");
+        }
+        let held = columns(h).to_string();
+        for path in ["t_a", "x.h1.k2", "none", "empty", "nulls", "quiet.q"] {
+            assert!(!held.contains(&format!("\"{path}\"")), "{path}: {held}");
+        }
+        // The check of one document, as an update's is checked, reaches the same verdict.
+        assert!(is_not_mapped_yet(&check(h, r#"{"t_a":"wool"}"#)));
+        // Once the mapping holds the fields, the table takes it and the documents.
+        let out = ensure(
+            h,
+            r#"{"_mapped_first":true,"dynamic":true,"properties":{"level":{"type":"keyword"},
+            "loc":{"type":"geo_point"},"quiet":{"type":"object","dynamic":false},"t_a":{"type":"text"},
+            "x":{"properties":{"h1":{"properties":{"k2":{"type":"text"}}}}}}}"#,
+        );
+        assert!(!out.contains("error"), "{out}");
+        let p = prepared(
+            h,
+            &[
+                ("a", r#"{"level":"x","t_a":"wool coat"}"#),
+                ("b", r#"{"level":"y","x":{"h1":{"k2":["silk","wool"]}}}"#),
+            ],
+        );
+        let out = append_replacing(h, p, &[]);
+        assert_eq!(out["ok"], 2, "{out}");
+        let hits = bm25(h, "t_a", "wool");
+        assert!(hits.contains("\"a\""), "{hits}");
+        close(h);
+
+        // Without the setting, such a field is typed by the table, as before.
+        let h = open_logs();
+        let out = ensure(h, r#"{"properties":{"level":{"type":"keyword"}}}"#);
+        assert!(!out.contains("error"), "{out}");
+        assert_eq!(check(h, r#"{"t_a":"wool"}"#), "");
+        close(h);
+    }
+
+    /// Which paths are new to a mapping: none a property maps, at or above
+    /// them, and none where `dynamic` maps no new field.
+    #[test]
+    fn a_path_is_new_where_no_property_maps_it_and_dynamic_maps_one() {
+        let rule = Indexed::of(&json!({
+            "_mapped_first": true,
+            "properties": {
+                "o": {"properties": {"a": {"type": "keyword"}, "a.b": {"type": "keyword"}}},
+                "off": {"type": "object", "dynamic": false},
+                "templated": {"type": "object", "dynamic": "false_allow_templates"},
+                "strict": {"type": "object", "dynamic": "strict"},
+                "flat": {"type": "flat_object"},
+                "loc": {"type": "geo_point"},
+                "gone": {"type": "object", "enabled": false}
+            }
+        }));
+        assert!(rule.mapped_first);
+        for new in ["n", "n.m", "o.b", "o.a2", "strict.s"] {
+            assert!(rule.maps_new(new), "{new}");
+        }
+        for old in ["o", "o.a", "o.a.b", "off.x", "templated.x", "flat.k.j", "loc", "loc.lat", "gone.x"] {
+            assert!(!rule.maps_new(old), "{old}");
+        }
+        assert!(!Indexed::of(&json!({"properties": {}})).mapped_first);
+        let off = Indexed::of(&json!({"_mapped_first": true, "dynamic": false, "properties": {}}));
+        assert!(!off.maps_new("n"));
+        let disabled = Indexed::of(&json!({"_mapped_first": true, "enabled": false}));
+        assert!(!disabled.maps_new("n"));
     }
 
     /// A keyword field gets an index without positions, at creation and when

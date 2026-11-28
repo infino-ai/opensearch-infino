@@ -493,6 +493,65 @@ public class InfinoTablesTests extends OpenSearchTestCase {
         declared = XContentHelper.convertToMap(JsonXContent.jsonXContent, InfinoTables.tableMapping(off), false);
         assertEquals(false, declared.get("enabled"));
         assertFalse(declared.containsKey("dynamic"));
+        // Its engine maps a new field as a shard does: the bridge may type one the mapping lacks.
+        assertFalse(declared.containsKey(InfinoTables.MAPPED_FIRST));
+    }
+
+    /**
+     * A proxy index's table is declared from its mapping as it is, marked as
+     * one whose new fields are mapped before their documents are written: the
+     * bridge then never types a field the mapping lacks from a document.
+     */
+    public void testAProxyTableMappingMarksItsNewFieldsMappedFirst() throws Exception {
+        IndexMetadata logs = IndexMetadata.builder(index("logs", "u1", 1))
+            .putMapping("{\"_doc\":{\"dynamic\":\"true\",\"properties\":{\"tag\":{\"type\":\"keyword\"}}}}")
+            .build();
+        Map<String, Object> declared = XContentHelper.convertToMap(JsonXContent.jsonXContent, InfinoTables.tableMapping(logs), false);
+        assertEquals(true, declared.get(InfinoTables.MAPPED_FIRST));
+        assertEquals("true", declared.get("dynamic"));
+        assertEquals(Map.of("tag", Map.of("type", "keyword")), declared.get("properties"));
+        // An index with no mapping yet is marked too.
+        declared = XContentHelper.convertToMap(JsonXContent.jsonXContent, InfinoTables.tableMapping(index("fresh", "u2", 2)), false);
+        assertEquals(Map.of(InfinoTables.MAPPED_FIRST, true), declared);
+    }
+
+    /**
+     * A table is never declared from a mapping older than the one it holds:
+     * a bulk that read the cluster state before a newer mapping was applied
+     * would put the older mapping's rules back while a bulk checked against
+     * the newer one is written. A newer mapping, or another index under the
+     * same table name, is declared.
+     */
+    public void testATableIsNeverDeclaredFromAnOlderMapping() {
+        AtomicInteger declarations = new AtomicInteger();
+        InfinoNative.useLib((InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> {
+            switch (method.getName()) {
+                case "infino_open_with":
+                    return new Memory(1);
+                case "infino_ensure_table":
+                    declarations.incrementAndGet();
+                    return nativeString("{}");
+                default:
+                    return null;
+            }
+        }));
+        try {
+            InfinoTables tables = new InfinoTables();
+            IndexMetadata v3 = IndexMetadata.builder(index("logs", "u1", 1)).mappingVersion(3).build();
+            assertEquals("os_logs", tables.ensure(v3));
+            assertEquals(1, declarations.get());
+            tables.ensure(IndexMetadata.builder(v3).mappingVersion(2).build());
+            tables.ensure(v3);
+            assertEquals(1, declarations.get());
+            tables.ensure(IndexMetadata.builder(v3).mappingVersion(4).build());
+            assertEquals(2, declarations.get());
+            assertTrue(tables.declaredAt("os_logs", 4));
+            tables.ensure(IndexMetadata.builder(index("logs", "u2", 2)).mappingVersion(1).build());
+            assertEquals(3, declarations.get());
+            assertTrue(tables.declaredAt("os_logs", 1));
+        } finally {
+            InfinoNative.useLib(null);
+        }
     }
 
     private static Pointer nativeString(String s) {
