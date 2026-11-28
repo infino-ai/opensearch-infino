@@ -637,3 +637,291 @@
       search:
         index: mppr_prx
         body: { query: { match_phrase_prefix: { title: { query: "logs", analyzer: whitespace } } } }
+---
+"match_phrase_prefix reads underscores, slop on one word and max_expansions as a Lucene twin does":
+  # Saved objects as Dashboards maps them: each type's title under the type's name.
+  - do:
+      indices.create:
+        index: mppu_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: integer }
+              type: { type: keyword }
+              index-pattern: { properties: { title: { type: text } } }
+              dashboard: { properties: { title: { type: text } } }
+  - do:
+      indices.create:
+        index: mppu_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: integer }
+              type: { type: keyword }
+              index-pattern: { properties: { title: { type: text } } }
+              dashboard: { properties: { title: { type: text } } }
+  - do:
+      indices.create:
+        index: mppu_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              n: { type: integer }
+              type: { type: keyword }
+              index-pattern: { properties: { title: { type: text } } }
+              dashboard: { properties: { title: { type: text } } }
+  - do:
+      bulk:
+        refresh: true
+        index: mppu_luc
+        body:
+          - index: { _id: "1" }
+          - { n: 1, type: index-pattern, index-pattern: { title: "web_traffic sample_data view" } }
+          - index: { _id: "2" }
+          - { n: 2, type: index-pattern, index-pattern: { title: "sample data logs" } }
+          - index: { _id: "3" }
+          - { n: 3, type: dashboard, dashboard: { title: "my_dashboard" } }
+          - index: { _id: "4" }
+          - { n: 4, type: dashboard, dashboard: { title: "dash board" } }
+          - index: { _id: "5" }
+          - { n: 5, type: dashboard, dashboard: { title: "Dashboard of traffic" } }
+  - do:
+      bulk:
+        refresh: true
+        index: mppu_def
+        body:
+          - index: { _id: "1" }
+          - { n: 1, type: index-pattern, index-pattern: { title: "web_traffic sample_data view" } }
+          - index: { _id: "2" }
+          - { n: 2, type: index-pattern, index-pattern: { title: "sample data logs" } }
+          - index: { _id: "3" }
+          - { n: 3, type: dashboard, dashboard: { title: "my_dashboard" } }
+          - index: { _id: "4" }
+          - { n: 4, type: dashboard, dashboard: { title: "dash board" } }
+          - index: { _id: "5" }
+          - { n: 5, type: dashboard, dashboard: { title: "Dashboard of traffic" } }
+  - do:
+      bulk:
+        refresh: true
+        index: mppu_prx
+        body:
+          - index: { _id: "1" }
+          - { n: 1, type: index-pattern, index-pattern: { title: "web_traffic sample_data view" } }
+          - index: { _id: "2" }
+          - { n: 2, type: index-pattern, index-pattern: { title: "sample data logs" } }
+          - index: { _id: "3" }
+          - { n: 3, type: dashboard, dashboard: { title: "my_dashboard" } }
+          - index: { _id: "4" }
+          - { n: 4, type: dashboard, dashboard: { title: "dash board" } }
+          - index: { _id: "5" }
+          - { n: 5, type: dashboard, dashboard: { title: "Dashboard of traffic" } }
+  # match_phrase_prefix of a word with underscores matches as on a Lucene twin
+  # An underscore joins two words into one, so "traffic" starts no word of web_traffic.
+  - do:
+      search:
+        index: mppu_luc
+        body: { query: { match_phrase_prefix: { index-pattern.title: "sample_da" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      count:
+        index: mppu_luc
+        body: { query: { match_phrase_prefix: { index-pattern.title: "sample_da" } } }
+  - match: { count: 1 }
+  - do:
+      search:
+        index: mppu_def
+        body: { query: { match_phrase_prefix: { index-pattern.title: "sample_da" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      count:
+        index: mppu_def
+        body: { query: { match_phrase_prefix: { index-pattern.title: "sample_da" } } }
+  - match: { count: 1 }
+  - do:
+      search:
+        index: mppu_prx
+        body: { query: { match_phrase_prefix: { index-pattern.title: "sample_da" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      count:
+        index: mppu_prx
+        body: { query: { match_phrase_prefix: { index-pattern.title: "sample_da" } } }
+  - match: { count: 1 }
+  # match_phrase_prefix of a word with underscores starts no word inside another, as on a Lucene twin
+  - do:
+      search:
+        index: mppu_luc
+        body: { query: { match_phrase_prefix: { index-pattern.title: "traffic" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 0 }
+  - do:
+      count:
+        index: mppu_luc
+        body: { query: { match_phrase_prefix: { index-pattern.title: "traffic" } } }
+  - match: { count: 0 }
+  - do:
+      search:
+        index: mppu_def
+        body: { query: { match_phrase_prefix: { index-pattern.title: "traffic" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 0 }
+  - do:
+      count:
+        index: mppu_def
+        body: { query: { match_phrase_prefix: { index-pattern.title: "traffic" } } }
+  - match: { count: 0 }
+  - do:
+      search:
+        index: mppu_prx
+        body: { query: { match_phrase_prefix: { index-pattern.title: "traffic" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 0 }
+  - do:
+      count:
+        index: mppu_prx
+        body: { query: { match_phrase_prefix: { index-pattern.title: "traffic" } } }
+  - match: { count: 0 }
+  # match_phrase_prefix of several words with underscores matches as on a Lucene twin
+  - do:
+      search:
+        index: mppu_luc
+        body: { query: { match_phrase_prefix: { index-pattern.title: "web_traffic sam" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      count:
+        index: mppu_luc
+        body: { query: { match_phrase_prefix: { index-pattern.title: "web_traffic sam" } } }
+  - match: { count: 1 }
+  - do:
+      search:
+        index: mppu_def
+        body: { query: { match_phrase_prefix: { index-pattern.title: "web_traffic sam" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      count:
+        index: mppu_def
+        body: { query: { match_phrase_prefix: { index-pattern.title: "web_traffic sam" } } }
+  - match: { count: 1 }
+  - do:
+      search:
+        index: mppu_prx
+        body: { query: { match_phrase_prefix: { index-pattern.title: "web_traffic sam" } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      count:
+        index: mppu_prx
+        body: { query: { match_phrase_prefix: { index-pattern.title: "web_traffic sam" } } }
+  - match: { count: 1 }
+  # match_phrase_prefix of one word with a slop matches as without it, as on a Lucene twin
+  - do:
+      search:
+        index: mppu_luc
+        body: { query: { match_phrase_prefix: { dashboard.title: { query: "my_dash", slop: 3 } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - do:
+      count:
+        index: mppu_luc
+        body: { query: { match_phrase_prefix: { dashboard.title: { query: "my_dash", slop: 3 } } } }
+  - match: { count: 1 }
+  - do:
+      search:
+        index: mppu_def
+        body: { query: { match_phrase_prefix: { dashboard.title: { query: "my_dash", slop: 3 } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - do:
+      count:
+        index: mppu_def
+        body: { query: { match_phrase_prefix: { dashboard.title: { query: "my_dash", slop: 3 } } } }
+  - match: { count: 1 }
+  - do:
+      search:
+        index: mppu_prx
+        body: { query: { match_phrase_prefix: { dashboard.title: { query: "my_dash", slop: 3 } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - do:
+      count:
+        index: mppu_prx
+        body: { query: { match_phrase_prefix: { dashboard.title: { query: "my_dash", slop: 3 } } } }
+  - match: { count: 1 }
+  # match_phrase_prefix with max_expansions above the words it starts matches every such word, as on a Lucene twin
+  # dash and dashboard start with "dash"; my_dashboard does not.
+  - do:
+      search:
+        index: mppu_luc
+        body: { query: { match_phrase_prefix: { dashboard.title: { query: "dash", max_expansions: 2 } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "4" }
+  - match: { hits.hits.1._id: "5" }
+  - do:
+      count:
+        index: mppu_luc
+        body: { query: { match_phrase_prefix: { dashboard.title: { query: "dash", max_expansions: 2 } } } }
+  - match: { count: 2 }
+  - do:
+      search:
+        index: mppu_def
+        body: { query: { match_phrase_prefix: { dashboard.title: { query: "dash", max_expansions: 2 } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "4" }
+  - match: { hits.hits.1._id: "5" }
+  - do:
+      count:
+        index: mppu_def
+        body: { query: { match_phrase_prefix: { dashboard.title: { query: "dash", max_expansions: 2 } } } }
+  - match: { count: 2 }
+  - do:
+      search:
+        index: mppu_prx
+        body: { query: { match_phrase_prefix: { dashboard.title: { query: "dash", max_expansions: 2 } } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "4" }
+  - match: { hits.hits.1._id: "5" }
+  - do:
+      count:
+        index: mppu_prx
+        body: { query: { match_phrase_prefix: { dashboard.title: { query: "dash", max_expansions: 2 } } } }
+  - match: { count: 2 }
+  # match_phrase_prefix of a word with underscores in Dashboards' saved-object search matches as on a Lucene twin
+  # Its fields are every type's title, mapped or not, as Dashboards sends them.
+  - do:
+      search:
+        index: mppu_luc
+        body: { query: { bool: { should: [ { simple_query_string: { query: "sample_da*", fields: [ config.title, index-pattern.title, dashboard.title ], default_operator: OR } }, { match_phrase_prefix: { config.title: { query: "sample_da", boost: 1 } } }, { match_phrase_prefix: { index-pattern.title: { query: "sample_da", boost: 1 } } }, { match_phrase_prefix: { dashboard.title: { query: "sample_da", boost: 1 } } } ], minimum_should_match: 1, filter: [ { terms: { type: [ config, index-pattern, dashboard ] } } ] } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      count:
+        index: mppu_luc
+        body: { query: { bool: { should: [ { simple_query_string: { query: "sample_da*", fields: [ config.title, index-pattern.title, dashboard.title ], default_operator: OR } }, { match_phrase_prefix: { config.title: { query: "sample_da", boost: 1 } } }, { match_phrase_prefix: { index-pattern.title: { query: "sample_da", boost: 1 } } }, { match_phrase_prefix: { dashboard.title: { query: "sample_da", boost: 1 } } } ], minimum_should_match: 1, filter: [ { terms: { type: [ config, index-pattern, dashboard ] } } ] } } }
+  - match: { count: 1 }
+  - do:
+      search:
+        index: mppu_def
+        body: { query: { bool: { should: [ { simple_query_string: { query: "sample_da*", fields: [ config.title, index-pattern.title, dashboard.title ], default_operator: OR } }, { match_phrase_prefix: { config.title: { query: "sample_da", boost: 1 } } }, { match_phrase_prefix: { index-pattern.title: { query: "sample_da", boost: 1 } } }, { match_phrase_prefix: { dashboard.title: { query: "sample_da", boost: 1 } } } ], minimum_should_match: 1, filter: [ { terms: { type: [ config, index-pattern, dashboard ] } } ] } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      count:
+        index: mppu_def
+        body: { query: { bool: { should: [ { simple_query_string: { query: "sample_da*", fields: [ config.title, index-pattern.title, dashboard.title ], default_operator: OR } }, { match_phrase_prefix: { config.title: { query: "sample_da", boost: 1 } } }, { match_phrase_prefix: { index-pattern.title: { query: "sample_da", boost: 1 } } }, { match_phrase_prefix: { dashboard.title: { query: "sample_da", boost: 1 } } } ], minimum_should_match: 1, filter: [ { terms: { type: [ config, index-pattern, dashboard ] } } ] } } }
+  - match: { count: 1 }
+  - do:
+      search:
+        index: mppu_prx
+        body: { query: { bool: { should: [ { simple_query_string: { query: "sample_da*", fields: [ config.title, index-pattern.title, dashboard.title ], default_operator: OR } }, { match_phrase_prefix: { config.title: { query: "sample_da", boost: 1 } } }, { match_phrase_prefix: { index-pattern.title: { query: "sample_da", boost: 1 } } }, { match_phrase_prefix: { dashboard.title: { query: "sample_da", boost: 1 } } } ], minimum_should_match: 1, filter: [ { terms: { type: [ config, index-pattern, dashboard ] } } ] } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - do:
+      count:
+        index: mppu_prx
+        body: { query: { bool: { should: [ { simple_query_string: { query: "sample_da*", fields: [ config.title, index-pattern.title, dashboard.title ], default_operator: OR } }, { match_phrase_prefix: { config.title: { query: "sample_da", boost: 1 } } }, { match_phrase_prefix: { index-pattern.title: { query: "sample_da", boost: 1 } } }, { match_phrase_prefix: { dashboard.title: { query: "sample_da", boost: 1 } } } ], minimum_should_match: 1, filter: [ { terms: { type: [ config, index-pattern, dashboard ] } } ] } } }
+  - match: { count: 1 }

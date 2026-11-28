@@ -2381,6 +2381,16 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
                 + "'\\bnode[^\\w\\p{Extended_Pictographic}]+3[^\\w\\p{Extended_Pictographic}]+dis', 'i'))",
             t.where()
         );
+        // An underscore stays inside a word, to both analyzers and to the pattern.
+        assertEquals(
+            "regexp_like(\"message\", '\\bsample_da', 'i')",
+            translate(QueryBuilders.matchPhrasePrefixQuery("message", "sample_da")).where()
+        );
+        assertEquals(
+            "(osid IN (SELECT osid FROM token_match('os_logs_0', 'message', '\"web_traffic\"', 'and')) AND regexp_like(\"message\", "
+                + "'\\bweb_traffic[^\\w\\p{Extended_Pictographic}]+sam', 'i'))",
+            translate(QueryBuilders.matchPhrasePrefixQuery("message", "web_traffic sam")).where()
+        );
         // No word: zero_terms_query decides, none by default.
         assertEquals("1=0", translate(QueryBuilders.matchPhrasePrefixQuery("message", "-- !")).where());
         assertEquals(
@@ -2432,7 +2442,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         );
         e = expectThrows(IllegalArgumentException.class, () -> translate(QueryBuilders.matchPhrasePrefixQuery("message", "caf\u00e9")));
         assertEquals(
-            "[infino] match_phrase_prefix on [message] is not served for the word [caf\u00e9]: only words of ASCII letters and digits are read as stock reads them",
+            "[infino] match_phrase_prefix on [message] is not served for the word [caf\u00e9]: only words of ASCII letters, digits and underscores are read as stock reads them",
             e.getMessage()
         );
         // Inside a bool it is refused as well, not left out.

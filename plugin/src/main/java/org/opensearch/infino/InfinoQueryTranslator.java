@@ -2642,7 +2642,7 @@ final class InfinoQueryTranslator {
      * otherwise: an analyzer other than the standard one, a slop over
      * several words (the token index finds the words adjacent only), or a
      * word the engine's analyzer and Lucene's may split apart (any but ASCII
-     * letters and digits, {@link #oneToken}). Stock reads the last word as
+     * letters, digits and underscores, {@link #phrasePrefixWord}). Stock reads the last word as
      * at most {@code max_expansions} of the words the shard's index holds
      * that start with it, the first in each segment's order; the table has
      * no such order, so it reads every word that does.
@@ -2671,15 +2671,19 @@ final class InfinoQueryTranslator {
             return q.zeroTermsQuery() == ZeroTermsQuery.ALL ? ALL : NONE;
         }
         for (String w : words) {
-            if (!oneToken(w)) {
+            if (!phrasePrefixWord(w)) {
                 throw new IllegalArgumentException(
-                    "[infino] match_phrase_prefix on [" + field + "] is not served for the word [" + w + "]: only words of ASCII letters and digits are read as stock reads them"
+                    "[infino] match_phrase_prefix on ["
+                        + field
+                        + "] is not served for the word ["
+                        + w
+                        + "]: only words of ASCII letters, digits and underscores are read as stock reads them"
                 );
             }
         }
         String last = words.get(words.size() - 1);
         if (words.size() == 1) {
-            // A word of ASCII letters and digits holds no character a pattern reads otherwise.
+            // A word of ASCII letters, digits and underscores holds no character a pattern reads otherwise.
             return termPattern(c, last, true);
         }
         if (q.slop() > 0) {
@@ -2692,6 +2696,19 @@ final class InfinoQueryTranslator {
             return null;
         }
         return "(" + textClause(c.name(), phrase(String.join(" ", leading)), "and", false) + " AND " + inOneValue + ")";
+    }
+
+    /**
+     * Whether a word of a match_phrase_prefix is one token to both analyzers,
+     * so the table finds it where stock does: a word {@link #oneToken} takes,
+     * or one with underscores in it. Lucene's tokenizer and the engine's both
+     * keep an underscore inside a word ({@code my_dash} is one token to each,
+     * the UAX #29 rule for a connector such as {@code _}), and a pattern
+     * reads it as a word character too, so {@code \bdash} does not start
+     * inside {@code my_dashboard}, as stock's prefix does not.
+     */
+    static boolean phrasePrefixWord(String word) {
+        return oneToken(word.replace('_', 'a'));
     }
 
     /** The words Lucene's standard tokenizer makes of {@code text}, in order. */
