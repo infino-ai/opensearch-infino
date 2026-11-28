@@ -81,7 +81,7 @@ search/30_limits/Regexp length limit  # [bug] the error message differs from sto
 # --- Gaps: tests that need a feature Infino does not have yet. Remove the entry when the feature lands.
 # Derived from the stock tests' own requests, checked against what the query and aggregation translators serve;
 # the inventory is in the parent issue (https://github.com/infino-ai/opensearch-infino/issues/51).
-get/90_versions/*  # [gap] the table keeps no per-document version, so a get with a version is not checked (default) or reports another _version (proxy)
+get/90_versions/*  # [gap:proxy] proxy mode keeps no per-document version, so a get with a version is checked against version 1
 index/80_geo_point/*  # [gap] not served: query geo_shape
 index/90_flat_object/Supported queries  # [gap] not served: query terms_set
 index/92_flat_object_support_doc_values/*  # [gap] not served: query fuzzy

@@ -110,6 +110,28 @@ public class InfinoReadByIdTests extends OpenSearchTestCase {
         assertEquals(List.of("infino_get_docs_latest"), bridge.reads);
     }
 
+    /**
+     * A get or multi-get in proxy mode on a node that has not read the
+     * writer's last commit (here no cluster names this node the writer)
+     * reads the table's latest commit, realtime or not: the node's own view
+     * may trail it, and miss a document written moments before or report an
+     * older write's sequence number. Proxy mode has no refresh for a get
+     * that is not realtime to stop at.
+     */
+    public void testAProxyReadOffTheWriterReadsTheLatestCommit() {
+        IndexMetadata md = index(InfinoPlugin.MODE_PROXY);
+        for (boolean realtime : new boolean[] { true, false }) {
+            FakeBridge bridge = new FakeBridge("{\"docs\":{\"1\":{\"source\":\"{}\",\"seq\":3}}}");
+            InfinoNative.useLib(bridge.lib());
+            assertEquals(new InfinoNative.Doc("{}", 3, null), InfinoGetActionFilter.docOf(md, "os_logs", "1", realtime));
+            assertEquals(
+                Map.of("1", new InfinoNative.Doc("{}", 3, null)),
+                InfinoGetActionFilter.proxyDocs(md, "os_logs", List.of("1"), InfinoAccess.NONE)
+            );
+            assertEquals("realtime=" + realtime, List.of("infino_get_docs_latest", "infino_get_docs_latest"), bridge.reads);
+        }
+    }
+
     /** A lookup the bridge fails, or answers with nothing at all, throws with 503 from both reads. */
     public void testAFailedLookupThrowsARetryableStatus() {
         for (String answer : new String[] { FAILED, null }) {

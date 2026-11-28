@@ -43,6 +43,8 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
 
     /** The admin user of the test cluster's internal user database. */
     private static final String ADMIN_BASIC = "admin:admin";
+    /** The user who reads {@code sec*} under the document rule {@code tag: x} (the security configuration's {@code sec_dls}). */
+    private static final String DLS_BASIC = "dls_user:admin";
     /** The nodes of the test cluster. */
     private static final int NODES = 2;
     /** Writes sent one at a time, alternating between the nodes. */
@@ -57,6 +59,10 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
     private static final int CONFLICT = 409;
     /** The status of a get of a document the index does not hold. */
     private static final int NOT_FOUND = 404;
+    /** Documents a test creates and gets at once through the node that does not write their table. */
+    private static final int FRESH_GETS = 20;
+    /** Edits a test makes one after another, each conditioned on the get before it. */
+    private static final int CONDITIONED_SAVES = 10;
     /** Rounds of a write and a get of it on each node, in the get test. */
     private static final int GET_ROUNDS = 30;
     /** Settings that keep a write out of the table until a refresh: the table takes a write once the copies hold it durably, and the translog syncs only hourly. */
@@ -88,7 +94,12 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
 
     /** The Authorization header of the admin user. */
     private static String adminAuthorization() {
-        return "Basic " + Base64.getEncoder().encodeToString(ADMIN_BASIC.getBytes(StandardCharsets.UTF_8));
+        return authorization(ADMIN_BASIC);
+    }
+
+    /** The Authorization header of {@code basic}, a user and password joined by a colon. */
+    private static String authorization(String basic) {
+        return "Basic " + Base64.getEncoder().encodeToString(basic.getBytes(StandardCharsets.UTF_8));
     }
 
     @Override
@@ -184,6 +195,188 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
                 assertEquals("round " + i + ", node " + node, i, ((Map<String, Object>) got.get("_source")).get("n"));
             }
         }
+    }
+
+    /**
+     * A get and a multi-get sent to the node that does not hold the primary
+     * report the version, sequence number and primary term of the latest
+     * write, as the primary's node does, so a write conditioned on them,
+     * sent through that node, is applied. That node sends the read on to
+     * the primary's: only there are the writes the table has not taken yet.
+     */
+    @SuppressWarnings("unchecked")
+    public void testAReadThroughTheNodeWithoutThePrimaryReportsTheLatestWritesNumbers() throws IOException {
+        String index = "multi_get_numbers";
+        createIndex(index);
+        int primary = primaryNode(index);
+        int other = 1 - primary;
+        Request first = new Request("PUT", "/" + index + "/_doc/x");
+        first.setJsonEntity("{\"n\":1}");
+        on(other, first);
+        Request second = new Request("PUT", "/" + index + "/_doc/x");
+        second.setJsonEntity("{\"n\":2}");
+        Map<String, Object> written = on(primary, second);
+        assertEquals(2, ((Number) written.get("_version")).intValue());
+
+        for (int node : new int[] { other, primary }) {
+            Map<String, Object> got = on(node, new Request("GET", "/" + index + "/_doc/x"));
+            assertEquals("node " + node + ": " + got, 2, ((Map<String, Object>) got.get("_source")).get("n"));
+            assertNumbers("node " + node, written, got);
+            Request mget = new Request("POST", "/" + index + "/_mget");
+            mget.setJsonEntity("{\"ids\":[\"x\"]}");
+            Map<String, Object> item = (Map<String, Object>) ((List<?>) on(node, mget).get("docs")).get(0);
+            assertNumbers("node " + node + ", mget", written, item);
+        }
+        client().performRequest(new Request("POST", "/" + index + "/_refresh"));
+        Request notRealtime = new Request("GET", "/" + index + "/_doc/x");
+        notRealtime.addParameter("realtime", "false");
+        assertNumbers("not realtime", written, on(other, notRealtime));
+
+        Request cas = conditioned(
+            new Request("PUT", "/" + index + "/_doc/x"),
+            ((Number) written.get("_seq_no")).longValue(),
+            ((Number) written.get("_primary_term")).longValue()
+        );
+        cas.setJsonEntity("{\"n\":3}");
+        assertEquals("updated", on(other, cas).get("result"));
+    }
+
+    /**
+     * A multi-get through one node of documents whose primaries are on both
+     * nodes, and of one whose shard has no active primary: each item reports
+     * its own primary's numbers, and the item without a primary fails
+     * alone.
+     */
+    @SuppressWarnings("unchecked")
+    public void testAMultiGetSplitAcrossTheNodesAnswersEachItem() throws IOException {
+        List<String> indices = new ArrayList<>();
+        List<Map<String, Object>> written = new ArrayList<>();
+        for (int node = 0; node < NODES; node++) {
+            String index = "multi_mget_" + node;
+            createIndex(index, ",\"index.routing.allocation.require._name\":\"" + nodeNames.get(node) + "\"");
+            assertEquals(node, primaryNode(index));
+            // Written through the other node, once per node number, so the two
+            // documents stand at different versions.
+            Map<String, Object> last = null;
+            for (int i = 0; i <= node; i++) {
+                Request put = new Request("PUT", "/" + index + "/_doc/x");
+                put.setJsonEntity("{\"n\":" + i + "}");
+                last = on(1 - node, put);
+            }
+            written.add(last);
+            indices.add(index);
+        }
+        String unassigned = "multi_mget_unassigned";
+        Request create = new Request("PUT", "/" + unassigned);
+        create.addParameter("wait_for_active_shards", "0");
+        create.setJsonEntity(
+            "{\"settings\":{\"index.infino.enabled\":true,\"number_of_shards\":1,\"number_of_replicas\":0,"
+                + "\"index.routing.allocation.require._name\":\"no_such_node\"}}"
+        );
+        client().performRequest(create);
+
+        for (int node = 0; node < NODES; node++) {
+            Request mget = new Request("POST", "/_mget");
+            mget.setJsonEntity(
+                "{\"docs\":[{\"_index\":\""
+                    + indices.get(0)
+                    + "\",\"_id\":\"x\"},{\"_index\":\""
+                    + unassigned
+                    + "\",\"_id\":\"x\"},{\"_index\":\""
+                    + indices.get(1)
+                    + "\",\"_id\":\"x\"}]}"
+            );
+            List<?> docs = (List<?>) on(node, mget).get("docs");
+            assertNumbers("node " + node + ", first index", written.get(0), (Map<String, Object>) docs.get(0));
+            assertNumbers("node " + node + ", second index", written.get(1), (Map<String, Object>) docs.get(2));
+            Map<String, Object> failed = (Map<String, Object>) docs.get(1);
+            assertNotNull("node " + node + ": the item without a primary fails: " + failed, failed.get("error"));
+        }
+    }
+
+    /**
+     * In either mode, a realtime get and multi-get through the node that does
+     * not write the table find a document created moments before, with the
+     * numbers its write reported, and a write conditioned on what such a get
+     * reported is applied, edit after edit. In proxy mode that node's own view
+     * of the table may trail the writer's commits, so it reads the latest one.
+     */
+    @SuppressWarnings("unchecked")
+    public void testAGetThroughTheOtherNodeFindsADocumentCreatedMomentsBefore() throws IOException {
+        for (String mode : new String[] { "default", "proxy" }) {
+            String index = "multi_fresh_get_" + mode;
+            createIndex(index, ",\"index.infino.mode\":\"" + mode + "\"");
+            int writer = primaryNode(index);
+            int other = 1 - writer;
+            for (int i = 0; i < FRESH_GETS; i++) {
+                Request put = new Request("PUT", "/" + index + "/_doc/u" + i);
+                put.setJsonEntity("{\"n\":" + i + "}");
+                Map<String, Object> written = on(writer, put);
+                assertNumbers(mode + ", get of u" + i, written, on(other, new Request("GET", "/" + index + "/_doc/u" + i)));
+                Request mget = new Request("POST", "/" + index + "/_mget");
+                mget.setJsonEntity("{\"ids\":[\"u" + i + "\"]}");
+                assertNumbers(mode + ", mget of u" + i, written, (Map<String, Object>) ((List<?>) on(other, mget).get("docs")).get(0));
+            }
+            for (int i = 0; i < CONDITIONED_SAVES; i++) {
+                Map<String, Object> got = on(other, new Request("GET", "/" + index + "/_doc/u0"));
+                Request save = conditioned(
+                    new Request("PUT", "/" + index + "/_doc/u0"),
+                    ((Number) got.get("_seq_no")).longValue(),
+                    ((Number) got.get("_primary_term")).longValue()
+                );
+                save.setJsonEntity("{\"n\":" + (FRESH_GETS + i) + "}");
+                assertEquals(mode + ", save " + i, "updated", on(writer, save).get("result"));
+            }
+        }
+    }
+
+    /**
+     * A user under a document rule (whose gets the security plugin sends as
+     * not realtime) and a get with {@code realtime=false}, through the node
+     * that does not write the table, each find the edit just acknowledged
+     * through the other node, with its numbers, so a save conditioned on
+     * them is applied. In proxy mode they read through that node's own view
+     * of the table before, which can trail the writer's last commit, and
+     * reported the edit before the latest.
+     */
+    @SuppressWarnings("unchecked")
+    public void testAGetUnderADocumentRuleOrNotRealtimeThroughTheOtherNodeFindsTheLatestEdit() throws IOException {
+        for (String mode : new String[] { "default", "proxy" }) {
+            String index = "sec_multi_rule_get_" + mode;
+            createIndex(index, ",\"index.infino.mode\":\"" + mode + "\"");
+            int writer = primaryNode(index);
+            int other = 1 - writer;
+            // Made visible first: a get that is not realtime finds only what a refresh made visible, as a stock one does.
+            Request create = new Request("PUT", "/" + index + "/_doc/r");
+            create.addParameter("refresh", "true");
+            create.setJsonEntity("{\"tag\":\"x\",\"n\":-1}");
+            on(writer, create);
+            for (int i = 0; i < FRESH_GETS; i++) {
+                Request put = new Request("PUT", "/" + index + "/_doc/r");
+                put.setJsonEntity("{\"tag\":\"x\",\"n\":" + i + "}");
+                Map<String, Object> written = on(writer, put);
+                Map<String, Object> ruled = entityAsMap(performOnAs(other, new Request("GET", "/" + index + "/_doc/r"), DLS_BASIC));
+                assertNumbers(mode + ", rule user's get of edit " + i, written, ruled);
+                assertEquals(mode + ", rule user's get of edit " + i, i, ((Map<String, Object>) ruled.get("_source")).get("n"));
+                Request notRealtime = new Request("GET", "/" + index + "/_doc/r");
+                notRealtime.addParameter("realtime", "false");
+                Map<String, Object> got = on(other, notRealtime);
+                assertNumbers(mode + ", realtime=false get of edit " + i, written, got);
+                assertEquals(mode + ", realtime=false get of edit " + i, i, ((Map<String, Object>) got.get("_source")).get("n"));
+                Request mget = new Request("POST", "/" + index + "/_mget");
+                mget.setJsonEntity("{\"ids\":[\"r\"]}");
+                mget.addParameter("realtime", "false");
+                assertNumbers(mode + ", rule user's realtime=false mget of edit " + i, written, (Map<String, Object>) ((List<?>) entityAsMap(performOnAs(other, mget, DLS_BASIC)).get("docs")).get(0));
+            }
+        }
+    }
+
+    /** {@code got} reports the version, sequence number and primary term {@code written} was acknowledged with. */
+    private static void assertNumbers(String what, Map<String, Object> written, Map<String, Object> got) {
+        assertEquals(what + ": " + got, true, got.get("found"));
+        assertEquals(what + ": " + got, written.get("_version"), got.get("_version"));
+        assertEquals(what + ": " + got, written.get("_seq_no"), got.get("_seq_no"));
+        assertEquals(what + ": " + got, written.get("_primary_term"), got.get("_primary_term"));
     }
 
     /**
@@ -649,8 +842,13 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
      * names the same node throughout a test.
      */
     private Response performOn(int node, Request request) throws IOException {
+        return performOnAs(node, request, ADMIN_BASIC);
+    }
+
+    /** {@link #performOn} as the user {@code basic}, a user and password joined by a colon. */
+    private Response performOnAs(int node, Request request, String basic) throws IOException {
         RequestOptions.Builder options = request.getOptions().toBuilder();
-        options.addHeader("Authorization", adminAuthorization());
+        options.addHeader("Authorization", authorization(basic));
         request.setOptions(options);
         assertEquals("a client per node", NODES, nodeClients.size());
         return nodeClients.get(node).performRequest(request);

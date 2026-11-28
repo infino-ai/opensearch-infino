@@ -1978,6 +1978,15 @@ public final class InfinoNative {
      * scans the id column, as {@link #prefetchSources} does.
      */
     public static Map<String, Doc> docs(String name, Collection<String> osids, String where) {
+        return docs(name, osids, where, false);
+    }
+
+    /**
+     * {@link #docs(String, Collection, String)}, as of the table's latest
+     * commit when {@code latest} ({@link #latestRows}): for a node that may
+     * not have read the last commit another node made.
+     */
+    public static Map<String, Doc> docs(String name, Collection<String> osids, String where, boolean latest) {
         Map<String, Doc> out = new HashMap<>();
         if (osids.isEmpty()) {
             return out;
@@ -1986,7 +1995,8 @@ public final class InfinoNative {
         if (columns(name).containsKey(InfinoQueryTranslator.ROUTING)) {
             columns += ", " + InfinoQueryTranslator.quoteIdent(InfinoQueryTranslator.ROUTING);
         }
-        for (Map<String, Object> row : sqlRows(byIds(name, columns, osids, where))) {
+        String q = byIds(name, columns, osids, where);
+        for (Map<String, Object> row : latest ? latestRows(q) : sqlRows(q)) {
             Object id = row.get(InfinoQueryTranslator.OSID);
             Object source = row.get(InfinoQueryTranslator.SOURCE);
             Object routing = row.get(InfinoQueryTranslator.ROUTING);

@@ -11,6 +11,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.Term;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.util.BytesRef;
@@ -29,9 +30,11 @@ import org.opensearch.index.engine.EngineCreationFailureException;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.FlushFailedEngineException;
 import org.opensearch.index.engine.InternalEngine;
+import org.opensearch.index.mapper.IdFieldMapper;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.ParseContext.Document;
 import org.opensearch.index.mapper.SourceFieldMapper;
+import org.opensearch.index.mapper.Uid;
 import org.opensearch.index.seqno.ReplicationTracker;
 import org.opensearch.index.seqno.RetentionLease;
 import org.opensearch.index.seqno.SequenceNumbers;
@@ -989,7 +992,7 @@ public class InfinoEngine extends InternalEngine {
     static String sourceForMerge(String table, String id, boolean shardHoldsId) {
         InfinoEngine engine = BY_TABLE.get(table);
         if (engine == null) {
-            throw new InfinoNative.InfinoException("the shard of " + table + " is not open on this node", RestStatus.SERVICE_UNAVAILABLE);
+            throw notOpen(table);
         }
         Version pending;
         synchronized (engine.idLock(id)) {
@@ -1029,6 +1032,11 @@ public class InfinoEngine extends InternalEngine {
      * The ids with no pending write are read from the table in one call,
      * through this node's own connection when it has read every commit
      * ({@link #readsEveryCommit(String)}), else from the table's latest commit.
+     * On the hosted service that read first waits out the read window since
+     * this node's last commit to the table ({@link InfinoNative#awaitVisible}):
+     * a write commits as it is synced, before any refresh, and a read inside
+     * the window may be answered from before it, which would pair the row
+     * of an older write with the numbers of the latest.
      */
     static Map<String, InfinoNative.Doc> currentDocs(String table, Collection<String> ids) {
         Map<String, InfinoNative.Doc> out = new HashMap<>();
@@ -1041,15 +1049,28 @@ public class InfinoEngine extends InternalEngine {
                 out.put(id, new InfinoNative.Doc(v.source(), v.seq(), v.routing()));
             }
         }
-        if (committed.isEmpty()) {
-            return out;
+        if (!committed.isEmpty()) {
+            InfinoNative.awaitVisible(table);
         }
-        boolean latest = readsEveryCommit(table) == false;
-        if (latest) {
+        out.putAll(committedDocs(table, committed, readsEveryCommit(table)));
+        return out;
+    }
+
+    /**
+     * The documents of {@code ids} as {@code table}'s commits hold them, by
+     * id, for a realtime read: through this node's own connection when it
+     * {@code readsEveryCommit}, else from the table's latest commit, holding
+     * that connection open for the realtime reads that follow. An id the
+     * table does not hold is absent.
+     */
+    static Map<String, InfinoNative.Doc> committedDocs(String table, Collection<String> ids, boolean readsEveryCommit) {
+        if (ids.isEmpty()) {
+            return new HashMap<>();
+        }
+        if (readsEveryCommit == false) {
             holdLatestForRealtime(table);
         }
-        out.putAll(InfinoNative.docsOf(table, committed, latest));
-        return out;
+        return InfinoNative.docsOf(table, ids, readsEveryCommit == false);
     }
 
     /**
@@ -1249,6 +1270,138 @@ public class InfinoEngine extends InternalEngine {
     /** The lock that orders the writes of {@code id}. */
     private Object idLock(String id) {
         return idLocks[Math.floorMod(id.hashCode(), ID_LOCK_STRIPES)];
+    }
+
+    /**
+     * The version, sequence number and primary term of a document's latest
+     * write, as its shard's skeleton holds them and a stock get reports them.
+     */
+    record WrittenNumbers(long version, long seqNo, long primaryTerm) {}
+
+    /**
+     * What a default-mode get reads of the shard behind a table on this
+     * node's copy of it ({@link #shardReads}).
+     */
+    interface ShardReads {
+        /**
+         * {@code id}'s {@link WrittenNumbers}, as a stock get reads them:
+         * realtime, from the shard's live version map and translog, or from
+         * what the latest refresh made visible; null when the shard holds no
+         * such document.
+         */
+        WrittenNumbers written(String id, boolean realtime);
+
+        /**
+         * Wait until every write of {@code id} the shard has applied on this
+         * node is recorded for the table: a read of the document after this
+         * sees every write a {@link #written} before it found.
+         */
+        void awaitRecorded(String id);
+
+        /**
+         * Whether a document the shard does not hold is one the table does
+         * not hold either: not while a rebuilt index's skeleton is rebuilt.
+         */
+        boolean knowsIds();
+    }
+
+    /** The answer to a read of a shard this node does not hold open (yet, or any more), which the client tries again. */
+    static InfinoNative.InfinoException notOpen(String table) {
+        return new InfinoNative.InfinoException("the shard of " + table + " is not open on this node", RestStatus.SERVICE_UNAVAILABLE);
+    }
+
+    /**
+     * The answer to a read of a shard whose copy here is not yet, or no
+     * longer, the primary whose table holds its history, which the client
+     * tries again.
+     */
+    static InfinoNative.InfinoException notServingReads(String table) {
+        return new InfinoNative.InfinoException(
+            "the primary of " + table + " on this node is taking over or handing off, and its table may not hold every write yet; try again shortly",
+            RestStatus.SERVICE_UNAVAILABLE
+        );
+    }
+
+    /**
+     * The {@link ShardReads} of {@code table}'s shard on this node, or a 503
+     * when its engine is not open here (the cluster state may name this
+     * node as the primary's while the engine is still opening, closing or
+     * being reset), or when its copy here does not take updates
+     * ({@link #mergesHere}): a promoted replica's skeleton holds writes its
+     * old primary never committed until the promotion writes them into the
+     * table, so a read before then would pair an older row with newer
+     * numbers; and a copy that has handed the shard off sees no new writes.
+     */
+    static ShardReads shardReads(String table) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine == null) {
+            throw notOpen(table);
+        }
+        if (!mergesHere(table)) {
+            throw notServingReads(table);
+        }
+        return new ShardReads() {
+            @Override
+            public WrittenNumbers written(String id, boolean realtime) {
+                return engine.writtenNumbers(id, realtime);
+            }
+
+            @Override
+            public void awaitRecorded(String id) {
+                synchronized (engine.idLock(id)) {
+                    // Taken and let go: a write holds the id's lock from its apply to
+                    // its record, so one that held it has recorded itself by now.
+                    assert Thread.holdsLock(engine.idLock(id));
+                }
+            }
+
+            @Override
+            public boolean knowsIds() {
+                return engine.skeletonKnowsIds();
+            }
+        };
+    }
+
+    /**
+     * {@link ShardReads#written}, read through the engine's own searcher, not
+     * the shard's: the security plugin wraps the shard's searcher with the
+     * user's document rule, which the skeleton cannot answer (it holds no
+     * user field); the plugin applies that rule to the table's row instead.
+     * An engine that closes meanwhile answers 503, as one not open does.
+     */
+    private WrittenNumbers writtenNumbers(String id, boolean realtime) {
+        Get get = new Get(realtime, true, id, new Term(IdFieldMapper.NAME, Uid.encodeId(id)));
+        try (GetResult got = get(get, this::acquireSearcher)) {
+            return got.exists() ? new WrittenNumbers(got.version(), got.docIdAndVersion().seqNo, got.docIdAndVersion().primaryTerm) : null;
+        } catch (AlreadyClosedException e) {
+            throw notOpen(table);
+        }
+    }
+
+    /**
+     * Commit {@code table}'s pending writes of {@code ids} on this node's
+     * copy, without refreshing its skeleton, and wait until reads of the
+     * table see them: for a read that only the table can answer (one through
+     * a document rule), which must not find a row older than the numbers it
+     * reports. A write that still waits for the shard's copies after the
+     * commit answers 503, which the client tries again, rather than an
+     * older row.
+     */
+    static void commitForRead(String table, Collection<String> ids) {
+        InfinoEngine engine = BY_TABLE.get(table);
+        if (engine == null) {
+            throw notOpen(table);
+        }
+        engine.commitThrough(engine.getProcessedLocalCheckpoint());
+        for (String id : ids) {
+            if (latestPending(table, id) != null) {
+                throw new InfinoNative.InfinoException(
+                    "a write of [" + id + "] to " + table + " is not in the table yet; try again shortly",
+                    RestStatus.SERVICE_UNAVAILABLE
+                );
+            }
+        }
+        InfinoNative.awaitVisible(table);
     }
 
     /**
