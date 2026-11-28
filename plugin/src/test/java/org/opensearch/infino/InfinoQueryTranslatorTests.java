@@ -1592,6 +1592,48 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
     }
 
     /**
+     * A word over every field reaches a long field only where stock's long
+     * field reads it: a plain number, not a Java double literal such as
+     * {@code 7d}, {@code 30d} or {@code 1D}, and every digit of a 19-digit id
+     * kept. A long id read as a date past what the table compares adds
+     * nothing on the date field, where it failed the statement before.
+     */
+    public void testAWordReadsAsANumberOrADateAsStockReadsIt() {
+        for (String javaDouble : List.of("7d", "30d", "7f", "1D")) {
+            String where = translate(QueryBuilders.multiMatchQuery(javaDouble)).where();
+            assertFalse(where, where.contains("\"status\""));
+        }
+        assertTrue(translate(QueryBuilders.multiMatchQuery("30")).where().contains("\"status\" = 30"));
+        assertTrue(translate(QueryBuilders.multiMatchQuery("3e1")).where().contains("\"status\" = 30"));
+        assertTrue(translate(QueryBuilders.multiMatchQuery("7.0")).where().contains("\"status\" = 7"));
+        String id = translate(QueryBuilders.multiMatchQuery("1234567890123456789")).where();
+        assertTrue(id, id.contains("\"status\" = 1234567890123456789"));
+        assertFalse(id, id.contains("@timestamp"));
+        // A term on a long keeps every digit too, given as text or as a number.
+        assertEquals("\"status\" = 1234567890123456789", translate(QueryBuilders.termQuery("status", "1234567890123456789")).where());
+        assertEquals("\"status\" = 1234567890123456789", translate(QueryBuilders.termQuery("status", 1234567890123456789L)).where());
+        // A date the table compares is still read as one.
+        assertTrue(translate(QueryBuilders.multiMatchQuery("1700000000000")).where().contains("\"@timestamp\" >="));
+    }
+
+    /**
+     * A boost or a fuzziness on a word ({@code 500^2}) is no part of its
+     * value: on an index with text and number fields and no keyword field,
+     * {@code 500^2 OR timeout} still reaches the number field. Before, the
+     * word was judged as {@code 500^2}, no number, and the query read the
+     * text field alone.
+     */
+    public void testABoostedWordStillReachesANumberField() {
+        Map<String, Column> numbers = new LinkedHashMap<>();
+        numbers.put("status", columns().get("status"));
+        numbers.put("message", columns().get("message"));
+        for (String q : List.of("500^2 OR timeout", "(500)^2 OR timeout", "500^2.5 timeout")) {
+            String where = InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery(q), numbers, TABLE, NOW, InfinoQueryTranslatorTests::aRowMatches).where();
+            assertTrue(q + " -> " + where, where.contains("\"status\" = 500"));
+        }
+    }
+
+    /**
      * A run on a named text field ({@code message:(disk full)}) ranks by the
      * field's BM25 for its words, as stock scores it, on an index with a
      * keyword field too, where the tree keeps the run as one term. Before,

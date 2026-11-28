@@ -2867,8 +2867,23 @@ final class InfinoQueryTranslator {
     /** A closed phrase of a simple_query_string with no escape in it, whose words are no operators in either syntax. */
     private static final Pattern SIMPLE_PHRASE = Pattern.compile("\"[^\"\\\\]*\"");
 
-    /** A query string word's syntax around its text: sigils, parentheses and quotes, which no value holds. */
-    private static final Pattern QUERY_WORD_EDGES = Pattern.compile("^[-+!(\"]+|[)\"]+$");
+    /**
+     * A query string word's syntax around its text: sigils, parentheses and
+     * quotes, and a trailing boost or fuzziness ({@code 500^2}, {@code 500~}),
+     * which no value holds: the parser reads {@code 500^2} as the word 500.
+     */
+    private static final Pattern QUERY_WORD_EDGES = Pattern.compile("^[-+!(\"]+|(?:[)\"]*[\\^~][0-9.]*)?[)\"]*$");
+
+    /**
+     * The farthest from the epoch, either way, a date in a statement may be,
+     * in milliseconds: the engine compares a date literal as nanoseconds in a
+     * long, which reach from 1677 to 2262. A word read as a date past it (a
+     * long id read as epoch milliseconds) fails the statement.
+     */
+    private static final long COMPARABLE_MILLIS = Long.MAX_VALUE / 1_000_000L;
+
+    private static final BigDecimal LONG_MIN = BigDecimal.valueOf(Long.MIN_VALUE);
+    private static final BigDecimal LONG_MAX = BigDecimal.valueOf(Long.MAX_VALUE);
 
     /** What separates the runs of an engine text query: Unicode white space, as the engine splits it. */
     private static final Pattern QUERY_WHITESPACE = Pattern.compile("(?U)\\s+");
@@ -3312,6 +3327,13 @@ final class InfinoQueryTranslator {
             return !ip(t) || value.indexOf('/') >= 0 || InetAddresses.isInetAddress(value);
         }
         if (t.isNumeric()) {
+            if (wholeNumbers(t)) {
+                // A long field reads a term as a whole number in its range ("7d" is none); a
+                // decimal it reads too, and matches nothing.
+                BigDecimal d = decimal(value);
+                return d != null && (d.stripTrailingZeros().scale() > 0 || fitsLong(d));
+            }
+            // A double, float or scaled_float field reads a term as Java reads a double, "7d" included.
             String n = number(value);
             return n != null && Double.isFinite(Double.parseDouble(n));
         }
@@ -3334,12 +3356,19 @@ final class InfinoQueryTranslator {
      * in {@code zone} (UTC when null). A value the field's type cannot read
      * ({@code timeout} on a number field) is null when the query is
      * {@link #lenient}, so the field adds nothing, and otherwise refused, as
-     * stock fails the request.
+     * stock fails the request. A date the table cannot compare
+     * ({@link #COMPARABLE_MILLIS}: a long id read as epoch milliseconds) is
+     * null too: stock's date field matches no document there, without an error.
      */
     private String exactValue(String field, Column c, String value, ZoneId zone) {
         Column t = c.element();
         if (readable(t, value)) {
             if (t.isTimestamp()) {
+                Long fromMillis = dateMillis(value, t.dateFormat(), false, zone, nowMillis);
+                Long toMillis = dateMillis(value, t.dateFormat(), true, zone, nowMillis);
+                if ((fromMillis != null && Math.abs(fromMillis) > COMPARABLE_MILLIS) || (toMillis != null && Math.abs(toMillis) > COMPARABLE_MILLIS)) {
+                    return null;
+                }
                 String from = dateLiteral(value, t.dateFormat(), false, zone);
                 String to = dateLiteral(value, t.dateFormat(), true, zone);
                 return anyValue(c, v -> "(" + v + " >= " + from + " AND " + v + " <= " + to + ")");
@@ -4284,12 +4313,42 @@ final class InfinoQueryTranslator {
                 Double kept = kept(c, value);
                 return kept == null ? null : number(kept);
             }
+            if (wholeNumbers(c)) {
+                // Every digit of a long, which a double keeps only up to 2^53 (a 17 to 19 digit id).
+                BigDecimal d = value instanceof Number n && !(n instanceof Double) && !(n instanceof Float) ? new BigDecimal(n.toString()) : decimal(value.toString());
+                if (d != null && d.stripTrailingZeros().scale() <= 0 && fitsLong(d)) {
+                    return d.toBigInteger().toString();
+                }
+            }
             return number(value);
         }
         if (c.isTimestamp()) {
             return dateLiteral(value, c.dateFormat(), roundUp, null);
         }
         return null;
+    }
+
+    /** Whether a number column holds whole numbers: a long, integer, short or byte field's, not a double's or a scaled one's. */
+    private static boolean wholeNumbers(Column c) {
+        return "i64".equals(c.type()) && c.fieldType() == null;
+    }
+
+    /**
+     * {@code value} as the number stock's long field reads a term as: a plain
+     * decimal ({@code 30}, {@code 7.0}, {@code 3e1}), not a Java double
+     * literal ({@code 7d}, {@code 1F}, {@code 0x1p3}); null when it is none.
+     */
+    private static BigDecimal decimal(String value) {
+        try {
+            return new BigDecimal(value);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** Whether a whole number fits in a long, as a long field's term must. */
+    private static boolean fitsLong(BigDecimal d) {
+        return d.compareTo(LONG_MIN) >= 0 && d.compareTo(LONG_MAX) <= 0;
     }
 
     private static String number(Object v) {

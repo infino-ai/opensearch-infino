@@ -119,7 +119,7 @@ setup:
 teardown:
   - do:
       indices.delete:
-        index: dfs_luc,dfs_prx,dfs_def,dfr_luc,dfr_prx,dfr_def,dfm_luc,dfm_prx,dfm_def,dft_luc,dft_prx,dft_def,dfz_luc,dfz_prx,dfz_def,dfb_luc,dfb_prx,dfb_def
+        index: dfs_luc,dfs_prx,dfs_def,dfr_luc,dfr_prx,dfr_def,dfm_luc,dfm_prx,dfm_def,dft_luc,dft_prx,dft_def,dfz_luc,dfz_prx,dfz_def,dfb_luc,dfb_prx,dfb_def,dfn_luc,dfn_prx,dfn_def
         ignore_unavailable: true
 
 ---
@@ -1964,3 +1964,223 @@ teardown:
   - match: { hits.hits.1._id: "3" }
   - gt: { hits.hits.1._score: 0.4900 }
   - lt: { hits.hits.1._score: 0.4920 }
+
+---
+"A word reaches a number field only as stock's number field reads it":
+  # A long field reads a plain number (3e1 is 30), not a Java double literal
+  # (7d, 30d), and keeps every digit of a 19-digit id; a 14 or 19-digit word
+  # read as a date past what the table compares matches nothing there. A boost
+  # on a word (500^2) is no part of its value.
+  - do:
+      indices.create:
+        index: dfn_luc
+        body: { settings: {"index.infino.enabled": false, "number_of_shards": 1, "number_of_replicas": 0}, mappings: {"properties": {"message": {"type": "text"}, "status": {"type": "long"}, "id": {"type": "long"}, "ts": {"type": "date"}}} }
+  - do:
+      indices.create:
+        index: dfn_prx
+        body: { settings: {"index.infino.enabled": true, "index.infino.mode": "proxy", "number_of_shards": 1, "number_of_replicas": 0}, mappings: {"properties": {"message": {"type": "text"}, "status": {"type": "long"}, "id": {"type": "long"}, "ts": {"type": "date"}}} }
+  - do:
+      indices.create:
+        index: dfn_def
+        body: { settings: {"index.infino.enabled": true, "number_of_shards": 1, "number_of_replicas": 0}, mappings: {"properties": {"message": {"type": "text"}, "status": {"type": "long"}, "id": {"type": "long"}, "ts": {"type": "date"}}} }
+  - do:
+      bulk:
+        refresh: true
+        index: dfn_luc
+        body:
+          - index: { _id: "1" }
+          - {"message": "request timeout", "status": 200, "id": 1234567890123456789, "ts": "2026-10-24T10:00:00Z"}
+          - index: { _id: "2" }
+          - {"message": "fine", "status": 500, "id": 1234567890123456788, "ts": "2026-10-24T10:01:00Z"}
+          - index: { _id: "3" }
+          - {"message": "fine too", "status": 404, "id": 7, "ts": "2026-10-24T10:02:00Z"}
+          - index: { _id: "4" }
+          - {"message": "timeout again timeout", "status": 500, "id": 30, "ts": "2026-10-24T10:03:00Z"}
+  - do:
+      bulk:
+        refresh: true
+        index: dfn_prx
+        body:
+          - index: { _id: "1" }
+          - {"message": "request timeout", "status": 200, "id": 1234567890123456789, "ts": "2026-10-24T10:00:00Z"}
+          - index: { _id: "2" }
+          - {"message": "fine", "status": 500, "id": 1234567890123456788, "ts": "2026-10-24T10:01:00Z"}
+          - index: { _id: "3" }
+          - {"message": "fine too", "status": 404, "id": 7, "ts": "2026-10-24T10:02:00Z"}
+          - index: { _id: "4" }
+          - {"message": "timeout again timeout", "status": 500, "id": 30, "ts": "2026-10-24T10:03:00Z"}
+  - do:
+      bulk:
+        refresh: true
+        index: dfn_def
+        body:
+          - index: { _id: "1" }
+          - {"message": "request timeout", "status": 200, "id": 1234567890123456789, "ts": "2026-10-24T10:00:00Z"}
+          - index: { _id: "2" }
+          - {"message": "fine", "status": 500, "id": 1234567890123456788, "ts": "2026-10-24T10:01:00Z"}
+          - index: { _id: "3" }
+          - {"message": "fine too", "status": 404, "id": 7, "ts": "2026-10-24T10:02:00Z"}
+          - index: { _id: "4" }
+          - {"message": "timeout again timeout", "status": 500, "id": 30, "ts": "2026-10-24T10:03:00Z"}
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"multi_match": {"query": "7d"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"multi_match": {"query": "7d"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"multi_match": {"query": "7d"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"multi_match": {"query": "30d"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"multi_match": {"query": "30d"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"multi_match": {"query": "30d"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"multi_match": {"query": "3e1"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"multi_match": {"query": "3e1"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"multi_match": {"query": "3e1"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"multi_match": {"query": "1234567890123456789"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"multi_match": {"query": "1234567890123456789"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"multi_match": {"query": "1234567890123456789"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"query_string": {"query": "99999999999999"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"query_string": {"query": "99999999999999"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"query_string": {"query": "99999999999999"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"term": {"id": "1234567890123456789"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"term": {"id": "1234567890123456789"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"term": {"id": "1234567890123456789"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"query_string": {"query": "500^2 OR timeout"}}, "sort": [{"ts": "asc"}]}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "4" }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"query_string": {"query": "500^2 OR timeout"}}, "sort": [{"ts": "asc"}]}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "4" }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"query_string": {"query": "500^2 OR timeout"}}, "sort": [{"ts": "asc"}]}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "4" }
