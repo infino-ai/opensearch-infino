@@ -518,18 +518,40 @@ public class InfinoAggregationProcessor {
      * and a percentile reads every value as a double. Only an aggregation
      * keyed on the exact value of each kind is refused on it: a cardinality,
      * which counts a long 5 and a double 5.0 as two values, and a composite.
+     * A field some document of each table gives several values of, as longs
+     * in one and doubles in another, is refused: its list column cannot be
+     * read as doubles, and without it a metric would leave out every
+     * document that gave the field several values.
+     *
+     * <p>A field that names different columns in different tables (a field
+     * renamed in one index, with an alias under its old name; an alias to
+     * one field here and to another there), or that one table maps and
+     * another does not while holding the column it reads, is refused
+     * whatever its kind. The union carries one column per name, so the
+     * field would read one table's values and nothing, or a column that
+     * does not exist, for the others; stock reads each index's own column.
      */
     static Map<String, Column> columnsOver(Collection<AggregationBuilder> builders, List<Plan> plans) {
         Map<String, Column> cols = new LinkedHashMap<>();
         Set<String> mixed = new HashSet<>();
+        Set<String> apart = new HashSet<>();
         List<Map<String, Column>> each = new ArrayList<>(plans.size());
+        List<Set<String>> held = new ArrayList<>(plans.size());
         for (Plan p : plans) {
             each.add(p.cols());
+            Set<String> names = new HashSet<>();
+            held.add(names);
             // Keyed as the plan keys them, by field: a keyword multi-field
             // (user.keyword) and a field alias name a column under their own key.
             for (Map.Entry<String, Column> e : p.cols().entrySet()) {
+                names.add(e.getValue().name());
                 Column seen = cols.putIfAbsent(e.getKey(), e.getValue());
-                if (seen != null && !sameKind(seen, e.getValue())) {
+                if (seen == null) {
+                    continue;
+                }
+                if (!seen.name().equals(e.getValue().name())) {
+                    apart.add(e.getKey());
+                } else if (!sameKind(seen, e.getValue())) {
                     mixed.add(e.getKey());
                 }
             }
@@ -539,24 +561,26 @@ public class InfinoAggregationProcessor {
         // the field is a plain keyword; an alias one index does not map)
         // would read that table's values, which stock reads as unmapped.
         for (Map.Entry<String, Column> e : cols.entrySet()) {
-            for (Map<String, Column> table : each) {
-                if (!table.containsKey(e.getKey()) && holdsColumn(table, e.getValue().name())) {
-                    mixed.add(e.getKey());
+            for (int i = 0; i < each.size(); i++) {
+                if (!each.get(i).containsKey(e.getKey()) && held.get(i).contains(e.getValue().name())) {
+                    apart.add(e.getKey());
                 }
             }
         }
         Set<String> numbers = new HashSet<>();
         for (String name : mixed) {
-            if (numbersOnly(name, each)) {
+            String list = cols.get(name).name() + InfinoQueryTranslator.LIST_SUFFIX;
+            if (!apart.contains(name) && numbersOnly(name, each) && !mixed.contains(list)) {
                 numbers.add(name);
             }
         }
-        refuseMixed(builders, plans, cols, mixed, numbers);
+        refuseMixed(builders, plans, cols, mixed, numbers, apart);
         for (String name : numbers) {
             cols.put(name, asDouble(cols.get(name)));
         }
         mixed.removeAll(numbers);
         cols.keySet().removeAll(mixed);
+        cols.keySet().removeAll(apart);
         return cols;
     }
 
@@ -600,16 +624,6 @@ public class InfinoAggregationProcessor {
         return field;
     }
 
-    /** Whether a column of {@code table} is named {@code name}, under whatever key. */
-    private static boolean holdsColumn(Map<String, Column> table, String name) {
-        for (Column c : table.values()) {
-            if (c.name().equals(name)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     /** {@code c} read as doubles, of no narrower mapping type. */
     private static Column asDouble(Column c) {
         return new Column(
@@ -639,14 +653,17 @@ public class InfinoAggregationProcessor {
      * Refuses an aggregation of {@code builders}, at any depth, whose field
      * is of {@code mixed} (see {@link #columnsOver}) or is one a plan's table
      * does not serve. A field of {@code numbers}, read as doubles, is refused
-     * only to an aggregation keyed on each kind's exact value.
+     * only to an aggregation keyed on each kind's exact value. A field of
+     * {@code apart}, which the tables do not map to one column, is refused
+     * to every aggregation.
      */
     private static void refuseMixed(
         Collection<AggregationBuilder> builders,
         List<Plan> plans,
         Map<String, Column> cols,
         Set<String> mixed,
-        Set<String> numbers
+        Set<String> numbers,
+        Set<String> apart
     ) {
         for (AggregationBuilder b : builders) {
             List<String> fields = new ArrayList<>();
@@ -668,6 +685,11 @@ public class InfinoAggregationProcessor {
                     refuseUnserved("aggregation [" + b.getName() + "]", p.table(), field);
                 }
                 String key = keyOf(cols, field);
+                if (apart.contains(key)) {
+                    throw new Unsupported(
+                        "aggregation [" + b.getName() + "] on [" + field + "] over several indices that do not map it to the same field is not served"
+                    );
+                }
                 boolean asDoubles = numbers.contains(key)
                     && !(b instanceof CardinalityAggregationBuilder)
                     && !(b instanceof CompositeAggregationBuilder);
@@ -677,7 +699,7 @@ public class InfinoAggregationProcessor {
                     );
                 }
             }
-            refuseMixed(b.getSubAggregations(), plans, cols, mixed, numbers);
+            refuseMixed(b.getSubAggregations(), plans, cols, mixed, numbers, apart);
         }
     }
 

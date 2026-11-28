@@ -379,6 +379,125 @@
         body: { size: 0, aggs: { t: { terms: { field: latency_ms }, aggs: { c: { cardinality: { field: user } } } } } }
 
 ---
+# A field that names different columns in different indices (renamed in one,
+# with an alias under its old name), a number alias one index maps (the
+# other holding its field), and a
+# field of several values held as longs in one index and floats in the other
+# are refused over several indices: the union reads one column per name, so
+# each would leave out one index's values or read the wrong ones.
+"Over several indices, a field not mapped to one field, or lists of longs and floats, is refused":
+  - do:
+      indices.create:
+        index: aovr_p_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { hostname: { type: keyword }, user: { type: keyword }, m: { type: long }, a: { type: alias, path: m }, n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aovr_p_def
+        body:
+          - index: { _id: "1" }
+          - { hostname: a1, user: u1, m: 1, n: [ 1, 2 ] }
+          - index: { _id: "2" }
+          - { hostname: a2, user: u2, m: 2, n: 3 }
+  - do:
+      indices.create:
+        index: aovr_r_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { host: { properties: { name: { type: keyword } } }, hostname: { type: alias, path: host.name }, user: { type: keyword }, m: { type: long }, n: { type: float } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aovr_r_def
+        body:
+          - index: { _id: "1" }
+          - { host: { name: b1 }, user: u2, m: 10, n: [ 1.5, 2.5 ] }
+          - index: { _id: "2" }
+          - { host: { name: b2 }, user: u3, m: 20, n: 4.5 }
+  - do:
+      catch: /over several indices that do not map it to the same field is not served/
+      search:
+        index: "aovr_p_def,aovr_r_def"
+        body: { size: 0, aggs: { c: { cardinality: { field: hostname } } } }
+  - do:
+      catch: /over several indices that do not map it to the same field is not served/
+      search:
+        index: "aovr_r_def,aovr_p_def"
+        body: { size: 0, aggs: { t: { terms: { field: user }, aggs: { c: { cardinality: { field: hostname } } } } } }
+  - do:
+      catch: /over several indices that do not map it to the same field is not served/
+      search:
+        index: "aovr_p_def,aovr_r_def"
+        body: { size: 0, aggs: { p: { percentiles: { field: a, percents: [ 50 ] } } } }
+  - do:
+      catch: /over several indices that map it as different types is not served/
+      search:
+        index: "aovr_p_def,aovr_r_def"
+        body: { size: 0, aggs: { t: { terms: { field: user }, aggs: { c: { cardinality: { field: user } }, s: { sum: { field: n } } } } } }
+  - do:
+      search:
+        index: "aovr_p_def,aovr_r_def"
+        body: { size: 0, aggs: { c: { cardinality: { field: user } } } }
+  - match: { aggregations.c.value: 3 }
+  - do:
+      indices.create:
+        index: aovr_p_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { hostname: { type: keyword }, user: { type: keyword }, m: { type: long }, a: { type: alias, path: m }, n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aovr_p_prx
+        body:
+          - index: { _id: "1" }
+          - { hostname: a1, user: u1, m: 1, n: [ 1, 2 ] }
+          - index: { _id: "2" }
+          - { hostname: a2, user: u2, m: 2, n: 3 }
+  - do:
+      indices.create:
+        index: aovr_r_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { host: { properties: { name: { type: keyword } } }, hostname: { type: alias, path: host.name }, user: { type: keyword }, m: { type: long }, n: { type: float } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aovr_r_prx
+        body:
+          - index: { _id: "1" }
+          - { host: { name: b1 }, user: u2, m: 10, n: [ 1.5, 2.5 ] }
+          - index: { _id: "2" }
+          - { host: { name: b2 }, user: u3, m: 20, n: 4.5 }
+  - do:
+      catch: /over several indices that do not map it to the same field is not served/
+      search:
+        index: "aovr_p_prx,aovr_r_prx"
+        body: { size: 0, aggs: { c: { cardinality: { field: hostname } } } }
+  - do:
+      catch: /over several indices that do not map it to the same field is not served/
+      search:
+        index: "aovr_r_prx,aovr_p_prx"
+        body: { size: 0, aggs: { t: { terms: { field: user }, aggs: { c: { cardinality: { field: hostname } } } } } }
+  - do:
+      catch: /over several indices that do not map it to the same field is not served/
+      search:
+        index: "aovr_p_prx,aovr_r_prx"
+        body: { size: 0, aggs: { p: { percentiles: { field: a, percents: [ 50 ] } } } }
+  - do:
+      catch: /over several indices that map it as different types is not served/
+      search:
+        index: "aovr_p_prx,aovr_r_prx"
+        body: { size: 0, aggs: { t: { terms: { field: user }, aggs: { c: { cardinality: { field: user } }, s: { sum: { field: n } } } } } }
+  - do:
+      search:
+        index: "aovr_p_prx,aovr_r_prx"
+        body: { size: 0, aggs: { c: { cardinality: { field: user } } } }
+  - match: { aggregations.c.value: 3 }
+
+---
 "Over several indices through a filtering alias, a Lucene twin":
   - do:
       indices.create:

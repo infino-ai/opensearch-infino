@@ -59,7 +59,36 @@ public class InfinoAggregationOverSeveralTests extends OpenSearchTestCase {
     private static final int SHIFT = 5;
     /** Every third document of each gives n two values: its own and this one's (A) or twice it (B). */
     private static final int SECOND_N = 10;
-    private static final List<String> TABLES = List.of(WITHOUT, WITH, USER_LONG, LATENCY_INT, MULTI_A, MULTI_B);
+    /** Maps hostname as a keyword. */
+    private static final String HOSTNAME = "over_several_hostname";
+    /** Maps host.name as a keyword, with hostname an alias of it: the field renamed, its old name kept. */
+    private static final String RENAMED = "over_several_renamed";
+    /** Maps n as a long and a as an alias of it. */
+    private static final String N_ALIASED = "over_several_n_aliased";
+    /** Maps n as a long, and no alias. */
+    private static final String N_PLAIN = "over_several_n_plain";
+    /** Map p and q as longs, x an alias of p in one and of q in the other. */
+    private static final String X_TO_P = "over_several_x_to_p";
+    private static final String X_TO_Q = "over_several_x_to_q";
+    /** Maps n as a long and a float, some documents of each giving it several values. */
+    private static final String LIST_LONG = "over_several_list_long";
+    private static final String LIST_FLOAT = "over_several_list_float";
+    private static final List<String> TABLES = List.of(
+        WITHOUT,
+        WITH,
+        USER_LONG,
+        LATENCY_INT,
+        MULTI_A,
+        MULTI_B,
+        HOSTNAME,
+        RENAMED,
+        N_ALIASED,
+        N_PLAIN,
+        X_TO_P,
+        X_TO_Q,
+        LIST_LONG,
+        LIST_FLOAT
+    );
     /** Rows of {@link #WITH}: user u(i mod USERS), latency i. */
     private static final int ROWS = 100;
     private static final int USERS = 10;
@@ -99,6 +128,27 @@ public class InfinoAggregationOverSeveralTests extends OpenSearchTestCase {
         }
         index(MULTI_A, a);
         index(MULTI_B, b);
+        InfinoNative.ensureTable(HOSTNAME, "{\"properties\":{\"hostname\":{\"type\":\"keyword\"},\"user\":{\"type\":\"keyword\"}}}");
+        InfinoNative.ensureTable(
+            RENAMED,
+            "{\"properties\":{\"host\":{\"properties\":{\"name\":{\"type\":\"keyword\"}}},"
+                + "\"hostname\":{\"type\":\"alias\",\"path\":\"host.name\"},\"user\":{\"type\":\"keyword\"}}}"
+        );
+        index(HOSTNAME, List.of("{\"hostname\":\"a1\",\"user\":\"u1\"}", "{\"hostname\":\"a2\",\"user\":\"u2\"}"));
+        index(RENAMED, List.of("{\"host\":{\"name\":\"b1\"},\"user\":\"u2\"}", "{\"host\":{\"name\":\"b2\"},\"user\":\"u3\"}"));
+        InfinoNative.ensureTable(N_ALIASED, "{\"properties\":{\"n\":{\"type\":\"long\"},\"a\":{\"type\":\"alias\",\"path\":\"n\"}}}");
+        InfinoNative.ensureTable(N_PLAIN, "{\"properties\":{\"n\":{\"type\":\"long\"}}}");
+        index(N_ALIASED, List.of("{\"n\":1}", "{\"n\":2}"));
+        index(N_PLAIN, List.of("{\"n\":100}"));
+        String pq = "\"p\":{\"type\":\"long\"},\"q\":{\"type\":\"long\"}";
+        InfinoNative.ensureTable(X_TO_P, "{\"properties\":{" + pq + ",\"x\":{\"type\":\"alias\",\"path\":\"p\"}}}");
+        InfinoNative.ensureTable(X_TO_Q, "{\"properties\":{" + pq + ",\"x\":{\"type\":\"alias\",\"path\":\"q\"}}}");
+        index(X_TO_P, List.of("{\"p\":1,\"q\":10}"));
+        index(X_TO_Q, List.of("{\"p\":2,\"q\":20}"));
+        InfinoNative.ensureTable(LIST_LONG, "{\"properties\":{\"n\":{\"type\":\"long\"}}}");
+        InfinoNative.ensureTable(LIST_FLOAT, "{\"properties\":{\"n\":{\"type\":\"float\"}}}");
+        index(LIST_LONG, List.of("{\"n\":1}", "{\"n\":[2,3]}"));
+        index(LIST_FLOAT, List.of("{\"n\":1.5}", "{\"n\":[2.5,3.5]}"));
     }
 
     @Override
@@ -323,5 +373,71 @@ public class InfinoAggregationOverSeveralTests extends OpenSearchTestCase {
             "[infino] a bucket over [n], which documents give several values, read per document over several indices read as one is not served",
             e.getMessage()
         );
+    }
+
+    /** The message an aggregation on {@code field} over indices that do not map it to one field is refused with. */
+    private static String notOneField(String agg, String field) {
+        return "[infino] aggregation [" + agg + "] on [" + field + "] over several indices that do not map it to the same field is not served";
+    }
+
+    /**
+     * A field renamed in one index, with an alias under its old name: the
+     * name reads column hostname in one table and host.name in the other.
+     * The union carries one column per name, so whichever plan came first,
+     * the other index's values were left out, or its branch named a column
+     * its table does not have. Refused, either way round; a field both map
+     * alike is still served beside it.
+     */
+    public void testAFieldNamingDifferentColumnsIsRefused() {
+        CardinalityAggregationBuilder byHost = AggregationBuilders.cardinality("c").field("hostname");
+        for (String[] tables : List.of(new String[] { HOSTNAME, RENAMED }, new String[] { RENAMED, HOSTNAME })) {
+            InfinoAggregationProcessor.Unsupported e = expectThrows(InfinoAggregationProcessor.Unsupported.class, () -> over(byHost, tables));
+            assertEquals(notOneField("c", "hostname"), e.getMessage());
+            e = expectThrows(
+                InfinoAggregationProcessor.Unsupported.class,
+                () -> over(AggregationBuilders.terms("t").field("user").subAggregation(byHost), tables)
+            );
+            assertEquals(notOneField("c", "hostname"), e.getMessage());
+            assertEquals(3, ((InternalCardinality) over(AggregationBuilders.cardinality("c").field("user"), tables).get("c")).getValue());
+        }
+        // An alias to p in one index and to q in the other.
+        InfinoAggregationProcessor.Unsupported e = expectThrows(
+            InfinoAggregationProcessor.Unsupported.class,
+            () -> over(AggregationBuilders.sum("s").field("x"), X_TO_P, X_TO_Q)
+        );
+        assertEquals(notOneField("s", "x"), e.getMessage());
+    }
+
+    /**
+     * A number alias one index maps and the other does not, though it holds
+     * the column: stock reads the alias as unmapped there. Read as doubles
+     * like a field of numbers of two kinds, a percentile of it took in the
+     * other index's n. Refused, and n itself is still served.
+     */
+    public void testANumberAliasOneIndexMapsIsRefused() {
+        for (String[] tables : List.of(new String[] { N_ALIASED, N_PLAIN }, new String[] { N_PLAIN, N_ALIASED })) {
+            InfinoAggregationProcessor.Unsupported e = expectThrows(
+                InfinoAggregationProcessor.Unsupported.class,
+                () -> over(AggregationBuilders.percentiles("p").field("a").percentiles(100), tables)
+            );
+            assertEquals(notOneField("p", "a"), e.getMessage());
+            InternalTDigestPercentiles p = (InternalTDigestPercentiles) over(AggregationBuilders.percentiles("p").field("n").percentiles(100), tables)
+                .get("p");
+            assertEquals(100, p.percentile(100), 0);
+        }
+    }
+
+    /**
+     * A field mapped as a long in one index and a float in the other, some
+     * documents of each giving it several values: their lists, of longs and
+     * of doubles, cannot be read as one, and without them a metric left out
+     * every document of several values. Refused.
+     */
+    public void testListsOfLongsAndOfDoublesAreRefused() {
+        InfinoAggregationProcessor.Unsupported e = expectThrows(
+            InfinoAggregationProcessor.Unsupported.class,
+            () -> over(AggregationBuilders.sum("s").field("n"), LIST_LONG, LIST_FLOAT)
+        );
+        assertEquals("[infino] aggregation [s] on [n] over several indices that map it as different types is not served", e.getMessage());
     }
 }
