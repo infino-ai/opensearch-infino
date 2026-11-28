@@ -126,6 +126,15 @@ public final class InfinoNative {
      * it again. Never the answer of a missing document.
      */
     private static final RestStatus READ_FAILED = RestStatus.SERVICE_UNAVAILABLE;
+    /**
+     * What the engine's error says when it refuses a statement past its
+     * limit of AND / OR connectives ({@link #MAX_CONNECTIVES}): too large a
+     * query, a caller's mistake, so a 400 rather than the engine's internal
+     * error.
+     */
+    static final String CONNECTIVE_LIMIT = "AND/OR connectives";
+    /** The most AND / OR connectives the engine takes in one statement. */
+    static final int MAX_CONNECTIVES = 1024;
 
     private static volatile InfinoLib lib;
     /** Where the engine caches what it reads from the node's own storage (see {@link InfinoPlugin#CACHE_DIR}); null for none. */
@@ -2078,9 +2087,34 @@ public final class InfinoNative {
 
     public static String sql(String q) {
         init();
-        String out = takeOrThrow(lib.infino_sql(conn, q));
+        String out;
+        try {
+            out = takeOrThrow(lib.infino_sql(conn, q));
+        } catch (InfinoException e) {
+            throw tooManyConnectives(e);
+        }
         log.debug("[infino] sql: {} -> {} chars", q, out.length());
         return out;
+    }
+
+    /**
+     * {@code e} as a 400 naming the limit when the engine refused the
+     * statement for its count of AND / OR connectives, which a query past
+     * what the plugin can write short reaches (a few hundred pairs of text
+     * matches under one should, say); {@code e} itself otherwise. Stock
+     * limits each bool's clauses instead, so it may serve such a query.
+     */
+    static InfinoException tooManyConnectives(InfinoException e) {
+        String message = e.getMessage();
+        if (message == null || !message.contains(CONNECTIVE_LIMIT) || e.status() != RestStatus.INTERNAL_SERVER_ERROR) {
+            return e;
+        }
+        return new InfinoException(
+            "[infino] query too large for the table: written as SQL it has more than "
+                + MAX_CONNECTIVES
+                + " AND/OR connectives, the engine's limit per statement; use terms queries or fewer clauses",
+            RestStatus.BAD_REQUEST
+        );
     }
 
     /**

@@ -1,18 +1,22 @@
 # A bool whose should holds a few hundred small bools, each a filter of a
 # term on a node and a term on a file, as an application's test suite sends
-# to restrict a search to a set of files. Stock limits the clauses of each
-# bool (indices.query.bool.max_clause_count, 1024), so it serves 601 pairs.
-# The table's engine refuses a statement past 1024 AND / OR connectives, so
-# the plugin writes the pairs short: a term every pair shares is required
-# once, beside one IN list of the files, and pairs that share no term are
-# one IN list of (node, file) tuples. A bool past stock's own limit gets
-# stock's error.
+# to restrict a search to a set of files. Each bool holds fewer clauses than
+# stock's limit per bool (indices.query.bool.max_clause_count, 1024), and we
+# serve it. The table's engine refuses a statement past 1024 AND / OR
+# connectives, so the plugin writes the pairs short: a term every pair
+# shares is required once, beside one IN list of the files, and pairs that
+# share no term are one IN list of (node, file) tuples; a match on an exact
+# field reads as the term does. Pairs it cannot write short, such as a text
+# match beside a term, get a 400 naming the engine's limit. A bool past
+# stock's own limit gets stock's error.
 #
 # Each query is a search template repeating its clause for each id of a
 # list, read from a stock index of id lists. Stock also counts the clauses
 # of the whole query once Lucene has rewritten it, where a term on a number
-# outside a shard's values drops out; the documents here keep the files in
-# a narrow range, so stock serves every query below but the last.
+# outside a shard's values drops out, so on data where every file exists
+# stock may refuse a query we serve. The documents here keep the files in
+# a narrow range, so the stock index answers each query below but the last
+# and its hits can be compared.
 
 ---
 "Pairs under one should are served with stock's hits, and a bool past stock's limit gets its error":
@@ -25,6 +29,7 @@
             properties:
               node: { type: keyword }
               fileId: { type: long }
+              msg: { type: text }
   - do:
       indices.create:
         index: bsp_px
@@ -34,6 +39,7 @@
             properties:
               node: { type: keyword }
               fileId: { type: long }
+              msg: { type: text }
   - do:
       indices.create:
         index: bsp_def
@@ -43,19 +49,20 @@
             properties:
               node: { type: keyword }
               fileId: { type: long }
+              msg: { type: text }
   - do:
       bulk:
         index: bsp_luc
         refresh: true
         body:
           - '{"index": {"_id": "1"}}'
-          - '{"node": "test", "fileId": 5}'
+          - '{"node": "test", "fileId": 5, "msg": "test five"}'
           - '{"index": {"_id": "2"}}'
-          - '{"node": "n5", "fileId": 5}'
+          - '{"node": "n5", "fileId": 5, "msg": "n5 five"}'
           - '{"index": {"_id": "3"}}'
-          - '{"node": "n5", "fileId": 6}'
+          - '{"node": "n5", "fileId": 6, "msg": "n5 six"}'
           - '{"index": {"_id": "4"}}'
-          - '{"node": "other", "fileId": 6}'
+          - '{"node": "other", "fileId": 6, "msg": "other six"}'
   - match: { errors: false }
   - do:
       bulk:
@@ -63,13 +70,13 @@
         refresh: true
         body:
           - '{"index": {"_id": "1"}}'
-          - '{"node": "test", "fileId": 5}'
+          - '{"node": "test", "fileId": 5, "msg": "test five"}'
           - '{"index": {"_id": "2"}}'
-          - '{"node": "n5", "fileId": 5}'
+          - '{"node": "n5", "fileId": 5, "msg": "n5 five"}'
           - '{"index": {"_id": "3"}}'
-          - '{"node": "n5", "fileId": 6}'
+          - '{"node": "n5", "fileId": 6, "msg": "n5 six"}'
           - '{"index": {"_id": "4"}}'
-          - '{"node": "other", "fileId": 6}'
+          - '{"node": "other", "fileId": 6, "msg": "other six"}'
   - match: { errors: false }
   - do:
       bulk:
@@ -77,13 +84,13 @@
         refresh: true
         body:
           - '{"index": {"_id": "1"}}'
-          - '{"node": "test", "fileId": 5}'
+          - '{"node": "test", "fileId": 5, "msg": "test five"}'
           - '{"index": {"_id": "2"}}'
-          - '{"node": "n5", "fileId": 5}'
+          - '{"node": "n5", "fileId": 5, "msg": "n5 five"}'
           - '{"index": {"_id": "3"}}'
-          - '{"node": "n5", "fileId": 6}'
+          - '{"node": "n5", "fileId": 6, "msg": "n5 six"}'
           - '{"index": {"_id": "4"}}'
-          - '{"node": "other", "fileId": 6}'
+          - '{"node": "other", "fileId": 6, "msg": "other six"}'
   - match: { errors: false }
   - do:
       indices.create:
@@ -169,6 +176,72 @@
             ids: $ids
   - match: { hits.total.value: 1 }
   - match: { hits.hits.0._id: "2" }
+
+  # The same pairs written as matches on exact fields are written short too.
+  - do:
+      get:
+        index: bsp_ids
+        id: "600"
+  - set: { _source.ids: ids }
+  - do:
+      search_template:
+        index: bsp_luc
+        body:
+          source: '{"query":{"bool":{"should":[{"bool":{"filter":[{"match":{"node":"n600"}},{"match":{"fileId":600}}]}}{{#ids}},{"bool":{"filter":[{"match":{"node":"n{{.}}"}},{"match":{"fileId":{{.}}}}]}}{{/ids}}]}}}'
+          params:
+            ids: $ids
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do:
+      search_template:
+        index: bsp_px
+        body:
+          source: '{"query":{"bool":{"should":[{"bool":{"filter":[{"match":{"node":"n600"}},{"match":{"fileId":600}}]}}{{#ids}},{"bool":{"filter":[{"match":{"node":"n{{.}}"}},{"match":{"fileId":{{.}}}}]}}{{/ids}}]}}}'
+          params:
+            ids: $ids
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do:
+      search_template:
+        index: bsp_def
+        body:
+          source: '{"query":{"bool":{"should":[{"bool":{"filter":[{"match":{"node":"n600"}},{"match":{"fileId":600}}]}}{{#ids}},{"bool":{"filter":[{"match":{"node":"n{{.}}"}},{"match":{"fileId":{{.}}}}]}}{{/ids}}]}}}'
+          params:
+            ids: $ids
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+
+  # Pairs of a text match and a term cannot be written short: a text match
+  # is a search of the token index, not a value a list holds. Past the
+  # engine's limit of connectives they get a 400 naming it, where stock,
+  # limiting each bool's clauses, serves them.
+  - do:
+      search_template:
+        index: bsp_luc
+        body:
+          source: '{"query":{"bool":{"should":[{"bool":{"filter":[{"match":{"msg":"n600"}},{"term":{"fileId":600}}]}}{{#ids}},{"bool":{"filter":[{"match":{"msg":"n{{.}}"}},{"term":{"fileId":{{.}}}}]}}{{/ids}}]}}}'
+          params:
+            ids: $ids
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "2" }
+  - do:
+      catch: bad_request
+      search_template:
+        index: bsp_px
+        body:
+          source: '{"query":{"bool":{"should":[{"bool":{"filter":[{"match":{"msg":"n600"}},{"term":{"fileId":600}}]}}{{#ids}},{"bool":{"filter":[{"match":{"msg":"n{{.}}"}},{"term":{"fileId":{{.}}}}]}}{{/ids}}]}}}'
+          params:
+            ids: $ids
+  - match: { error.root_cause.0.reason: "/more.than.1024.AND.OR.connectives/" }
+  - do:
+      catch: bad_request
+      search_template:
+        index: bsp_def
+        body:
+          source: '{"query":{"bool":{"should":[{"bool":{"filter":[{"match":{"msg":"n600"}},{"term":{"fileId":600}}]}}{{#ids}},{"bool":{"filter":[{"match":{"msg":"n{{.}}"}},{"term":{"fileId":{{.}}}}]}}{{/ids}}]}}}'
+          params:
+            ids: $ids
+  - match: { error.root_cause.0.reason: "/more.than.1024.AND.OR.connectives/" }
 
   # A bool past stock's clause limit gets stock's error.
   - do:

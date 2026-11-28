@@ -2938,6 +2938,24 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertFalse(translate(b).where(), translate(b).where().contains(" IN ("));
     }
 
+    public void testShouldMatchPairsOnExactFieldsAreWrittenShortToo() {
+        // A match on an exact field is the equality a term is, so pairs of
+        // matches are written short as pairs of terms are.
+        BoolQueryBuilder shared = QueryBuilders.boolQuery();
+        BoolQueryBuilder apart = QueryBuilders.boolQuery();
+        for (int i = 0; i < 600; i++) {
+            shared.should(QueryBuilders.boolQuery().filter(QueryBuilders.matchQuery("level", "test")).filter(QueryBuilders.matchQuery("status", i)));
+            apart.should(QueryBuilders.boolQuery().filter(QueryBuilders.matchQuery("level", "n" + i)).filter(QueryBuilders.termQuery("status", i)));
+        }
+        assertEquals(translate(pairs(600, i -> "test")).where(), translate(shared).where());
+        assertEquals(translate(pairs(600, i -> "n" + i)).where(), translate(apart).where());
+        BoolQueryBuilder single = QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("status", 1)).should(QueryBuilders.termQuery("status", 2));
+        assertEquals("(\"status\" IN (1, 2))", translate(single).where());
+        // A match on a text column is its terms, never an IN list of values.
+        BoolQueryBuilder text = QueryBuilders.boolQuery().should(QueryBuilders.matchQuery("message", "disk")).should(QueryBuilders.matchQuery("message", "full"));
+        assertFalse(translate(text).where(), translate(text).where().contains(" IN ("));
+    }
+
     public void testShouldPairsOnAListColumnStayApart() {
         // A field some document gives several values is compared through its
         // list column too, which no tuple of column values reads.
