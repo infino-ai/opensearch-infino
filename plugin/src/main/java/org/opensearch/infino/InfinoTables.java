@@ -264,6 +264,25 @@ public final class InfinoTables {
         namingOf(metadata);
     }
 
+    /**
+     * The settings of the index {@code table} backs, as the metadata the node
+     * last applied holds them ({@link #observe}): what a query reads from
+     * the index rather than the request, such as the fields a query naming
+     * none searches ({@code index.query.default_field}). Empty, so every
+     * setting at its default, when the node knows no such index.
+     */
+    Settings indexSettings(String table) {
+        Naming known = naming;
+        List<IndexMetadata> backing = known == null ? List.of() : known.byTable().getOrDefault(table, List.of());
+        Index owner = owner(backing);
+        for (IndexMetadata md : backing) {
+            if (md.getIndex().equals(owner)) {
+                return md.getSettings();
+            }
+        }
+        return Settings.EMPTY;
+    }
+
     /** Whether every table of {@code md} is its own, as {@code metadata} names them (see {@link #claim}). */
     boolean owns(IndexMetadata md, Metadata metadata) {
         if (!free(md)) {

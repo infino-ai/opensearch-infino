@@ -1312,6 +1312,16 @@ public final class InfinoNative {
     }
 
     /**
+     * The multi-fields of {@code table}'s mapping, each named by its path
+     * ({@code title.raw}); empty for a table no mapping has declared yet.
+     * Those the table keeps no column of are {@link #unservedField}s.
+     */
+    static Set<String> multiFields(String table) {
+        Mapping mapping = MAPPINGS.get(table);
+        return mapping == null ? Set.of() : mapping.multiFields();
+    }
+
+    /**
      * The fields of {@code table} its mapping declares {@code float} or
      * {@code half_float}, which a sort compares as 32-bit floats; empty for
      * a table no mapping has declared yet.

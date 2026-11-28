@@ -1,0 +1,2783 @@
+# A query naming no field (a multi_match with no fields, as Dashboards'
+# Discover sends a word typed into its search bar, or a query string with no
+# fields or default_field) searches the index's default fields
+# (index.query.default_field, every field unless set), as stock does: a text
+# field by its words, a keyword field by its whole value, a number or date
+# field by the value read as its type, skipped where it cannot be read
+# (lenient, which a query over every field is unless it says not). A
+# wildcard a query string's fields point at a keyword field matches its
+# whole value, as host:pay* written in the query does. Each query runs on a
+# Lucene twin too, so the counts are stock's. Before, the first matched
+# nothing, the second searched the text fields alone, and the wildcard
+# matched nothing.
+setup:
+  - do:
+      indices.create:
+        index: dfs_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text, fields: { keyword: { type: keyword, ignore_above: 256 } } }
+              host: { type: keyword }
+              service: { type: keyword }
+              level: { type: keyword }
+              status: { type: integer }
+              "@timestamp": { type: date }
+  - do:
+      indices.create:
+        index: dfs_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text, fields: { keyword: { type: keyword, ignore_above: 256 } } }
+              host: { type: keyword }
+              service: { type: keyword }
+              level: { type: keyword }
+              status: { type: integer }
+              "@timestamp": { type: date }
+  - do:
+      indices.create:
+        index: dfs_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              message: { type: text, fields: { keyword: { type: keyword, ignore_above: 256 } } }
+              host: { type: keyword }
+              service: { type: keyword }
+              level: { type: keyword }
+              status: { type: integer }
+              "@timestamp": { type: date }
+  # One bulk per index: a bulk mixing an Infino-backed index with others is refused.
+  - do:
+      bulk:
+        refresh: true
+        index: dfs_luc
+        body:
+          - index: { _id: "1" }
+          - { "message": "request timeout on upstream", "host": "pay-1", "service": "payments", "level": "error", "status": 504, "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _id: "2" }
+          - { "message": "payment accepted", "host": "pay-2", "service": "payments", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:02:00Z" }
+          - index: { _id: "3" }
+          - { "message": "timeout waiting for lock", "host": "db-1", "service": "storage", "level": "warn", "status": 500, "@timestamp": "2026-10-24T10:03:00Z" }
+          - index: { _id: "4" }
+          - { "message": "user login", "host": "web-1", "service": "auth", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:04:00Z" }
+          - index: { _id: "5" }
+          - { "message": "payments queue drained", "host": "web-2", "service": "checkout", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:05:00Z" }
+          - index: { _id: "6" }
+          - { "message": "disk full", "host": "db-2", "service": "timeout", "level": "error", "status": 507, "@timestamp": "2026-10-24T10:06:00Z" }
+          - index: { _id: "7" }
+          - { "message": "cache miss", "host": "payments", "service": "cache", "level": "debug", "status": 404, "@timestamp": "2026-10-24T10:07:00Z" }
+          - index: { _id: "8" }
+          - { "message": "500 errors rising", "host": "mon-1", "service": "monitor", "level": "warn", "status": 200, "@timestamp": "2026-10-25T10:08:00Z" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfs_prx
+        body:
+          - index: { _id: "1" }
+          - { "message": "request timeout on upstream", "host": "pay-1", "service": "payments", "level": "error", "status": 504, "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _id: "2" }
+          - { "message": "payment accepted", "host": "pay-2", "service": "payments", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:02:00Z" }
+          - index: { _id: "3" }
+          - { "message": "timeout waiting for lock", "host": "db-1", "service": "storage", "level": "warn", "status": 500, "@timestamp": "2026-10-24T10:03:00Z" }
+          - index: { _id: "4" }
+          - { "message": "user login", "host": "web-1", "service": "auth", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:04:00Z" }
+          - index: { _id: "5" }
+          - { "message": "payments queue drained", "host": "web-2", "service": "checkout", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:05:00Z" }
+          - index: { _id: "6" }
+          - { "message": "disk full", "host": "db-2", "service": "timeout", "level": "error", "status": 507, "@timestamp": "2026-10-24T10:06:00Z" }
+          - index: { _id: "7" }
+          - { "message": "cache miss", "host": "payments", "service": "cache", "level": "debug", "status": 404, "@timestamp": "2026-10-24T10:07:00Z" }
+          - index: { _id: "8" }
+          - { "message": "500 errors rising", "host": "mon-1", "service": "monitor", "level": "warn", "status": 200, "@timestamp": "2026-10-25T10:08:00Z" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfs_def
+        body:
+          - index: { _id: "1" }
+          - { "message": "request timeout on upstream", "host": "pay-1", "service": "payments", "level": "error", "status": 504, "@timestamp": "2026-10-24T10:01:00Z" }
+          - index: { _id: "2" }
+          - { "message": "payment accepted", "host": "pay-2", "service": "payments", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:02:00Z" }
+          - index: { _id: "3" }
+          - { "message": "timeout waiting for lock", "host": "db-1", "service": "storage", "level": "warn", "status": 500, "@timestamp": "2026-10-24T10:03:00Z" }
+          - index: { _id: "4" }
+          - { "message": "user login", "host": "web-1", "service": "auth", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:04:00Z" }
+          - index: { _id: "5" }
+          - { "message": "payments queue drained", "host": "web-2", "service": "checkout", "level": "info", "status": 200, "@timestamp": "2026-10-24T10:05:00Z" }
+          - index: { _id: "6" }
+          - { "message": "disk full", "host": "db-2", "service": "timeout", "level": "error", "status": 507, "@timestamp": "2026-10-24T10:06:00Z" }
+          - index: { _id: "7" }
+          - { "message": "cache miss", "host": "payments", "service": "cache", "level": "debug", "status": 404, "@timestamp": "2026-10-24T10:07:00Z" }
+          - index: { _id: "8" }
+          - { "message": "500 errors rising", "host": "mon-1", "service": "monitor", "level": "warn", "status": 200, "@timestamp": "2026-10-25T10:08:00Z" }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: dfs_luc,dfs_prx,dfs_def,dfr_luc,dfr_prx,dfr_def,dfm_luc,dfm_prx,dfm_def,dft_luc,dft_prx,dft_def,dfz_luc,dfz_prx,dfz_def,dfb_luc,dfb_prx,dfb_def,dfn_luc,dfn_prx,dfn_def
+        ignore_unavailable: true
+
+---
+"A multi_match naming no field searches every field, each as stock reads the word on it":
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout, fields: [ "*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout, fields: [ "*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout, fields: [ "*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { type: best_fields, query: timeout, lenient: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { type: best_fields, query: timeout, lenient: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { type: best_fields, query: timeout, lenient: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { bool: { must: [ { multi_match: { type: best_fields, query: timeout, lenient: true } } ], filter: [ { range: { "@timestamp": { gte: "2026-10-24T00:00:00Z", lte: "2026-10-24T23:59:59Z" } } } ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { bool: { must: [ { multi_match: { type: best_fields, query: timeout, lenient: true } } ], filter: [ { range: { "@timestamp": { gte: "2026-10-24T00:00:00Z", lte: "2026-10-24T23:59:59Z" } } } ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { bool: { must: [ { multi_match: { type: best_fields, query: timeout, lenient: true } } ], filter: [ { range: { "@timestamp": { gte: "2026-10-24T00:00:00Z", lte: "2026-10-24T23:59:59Z" } } } ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { bool: { should: [ { multi_match: { type: best_fields, query: payments, lenient: true } } ], minimum_should_match: 1 } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { bool: { should: [ { multi_match: { type: best_fields, query: payments, lenient: true } } ], minimum_should_match: 1 } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { bool: { should: [ { multi_match: { type: best_fields, query: payments, lenient: true } } ], minimum_should_match: 1 } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: "500" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "8" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: "500" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "8" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: "500" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "8" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: "2026-10-25" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "8" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: "2026-10-25" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "8" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: "2026-10-25" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "8" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: "disk full" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: "disk full" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: "disk full" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: "disk full", type: phrase } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: "disk full", type: phrase } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: "disk full", type: phrase } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+
+---
+"A query string with no fields searches every field, keyword fields by their whole value":
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: payments, default_field: "*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: payments, default_field: "*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: payments, default_field: "*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "500" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "8" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "500" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "8" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "500" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "8" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "payments OR timeout" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "6" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "3" }
+  - match: { hits.hits.4._id: "2" }
+  - match: { hits.hits.5._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "payments OR timeout" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "6" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "3" }
+  - match: { hits.hits.4._id: "2" }
+  - match: { hits.hits.5._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "payments OR timeout" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "6" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "3" }
+  - match: { hits.hits.4._id: "2" }
+  - match: { hits.hits.5._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "payments AND level:info" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "payments AND level:info" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "payments AND level:info" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "disk full" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "disk full" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "disk full" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "6" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { simple_query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { simple_query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { simple_query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+
+---
+"A wildcard a query string's fields point at a keyword field matches its whole value":
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "pay*", fields: [ host ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "pay*", fields: [ host ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "pay*", fields: [ host ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "pay*", fields: [ host ], analyze_wildcard: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "pay*", fields: [ host ], analyze_wildcard: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "pay*", fields: [ host ], analyze_wildcard: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "host:pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "host:pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "host:pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "/pay-[0-9]/", fields: [ host ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "/pay-[0-9]/", fields: [ host ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "/pay-[0-9]/", fields: [ host ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "pay*", fields: [ "ho*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "pay*", fields: [ "ho*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "pay*", fields: [ "ho*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+
+---
+"A field pattern among the fields searches every field it matches, beside named fields too":
+  # me* is the text field message (and its keyword sub-field), se* the keyword
+  # field service, matched by its whole value. Before, a pattern matched
+  # nothing: the pattern list found no document and the mixed list only the
+  # named field's.
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout, fields: [ "me*", "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout, fields: [ "me*", "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout, fields: [ "me*", "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout, fields: [ message, "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout, fields: [ message, "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout, fields: [ message, "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: timeout, fields: [ "me*", "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: timeout, fields: [ "me*", "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: timeout, fields: [ "me*", "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: timeout, fields: [ message, "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: timeout, fields: [ message, "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: timeout, fields: [ message, "se*" ] } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+
+---
+"index.query.default_field names the fields a query naming none searches":
+  - do:
+      indices.put_settings:
+        index: dfs_luc,dfs_prx,dfs_def
+        body: { index.query.default_field: [ message ] }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "5" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "5" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: "5" }
+  - do:
+      indices.put_settings:
+        index: dfs_luc,dfs_prx,dfs_def
+        body: { index.query.default_field: [ message, service ] }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { query_string: { query: "pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { query_string: { query: "pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: payments } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { query_string: { query: "pay*" } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "1" }
+  - do:
+      indices.put_settings:
+        index: dfs_luc,dfs_prx,dfs_def
+        body: { index.query.default_field: [ message, status ] }
+  - do:
+      catch: bad_request
+      search: { index: dfs_luc, body: { query: { multi_match: { query: timeout } } } }
+  - do:
+      search:
+        index: dfs_luc
+        body: { query: { multi_match: { query: timeout, lenient: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      catch: bad_request
+      search: { index: dfs_prx, body: { query: { multi_match: { query: timeout } } } }
+  - do:
+      search:
+        index: dfs_prx
+        body: { query: { multi_match: { query: timeout, lenient: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      catch: bad_request
+      search: { index: dfs_def, body: { query: { multi_match: { query: timeout } } } }
+  - do:
+      search:
+        index: dfs_def
+        body: { query: { multi_match: { query: timeout, lenient: true } }, sort: [ { "@timestamp": desc } ], size: 10 }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "1" }
+
+---
+"A run of words is one value on a keyword field, beside other clauses too":
+  # A run of words beside another clause: stock reads "disk full" as one value on
+  # the keyword fields (message.keyword holds it), the words on the text field.
+  - do:
+      search: { index: dfs_luc, body: { query: { query_string: { query: "level:error disk full" } }, sort: [ { "@timestamp": desc } ] } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search: { index: dfs_prx, body: { query: { query_string: { query: "level:error disk full" } }, sort: [ { "@timestamp": desc } ] } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search: { index: dfs_def, body: { query: { query_string: { query: "level:error disk full" } }, sort: [ { "@timestamp": desc } ] } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "1" }
+  # On a keyword field a group's run is its one value: no host is "pay-1 pay-2".
+  - do:
+      search: { index: dfs_luc, body: { query: { query_string: { query: "host:(pay-1 pay-2)" } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: dfs_prx, body: { query: { query_string: { query: "host:(pay-1 pay-2)" } } } }
+  - match: { hits.total.value: 0 }
+  - do:
+      search: { index: dfs_def, body: { query: { query_string: { query: "host:(pay-1 pay-2)" } } } }
+  - match: { hits.total.value: 0 }
+
+---
+"What the table cannot tell apart is refused, never answered differently":
+  # A word on a number field the query names, not lenient: stock fails it too.
+  - do:
+      catch: bad_request
+      search: { index: dfs_luc, body: { query: { multi_match: { query: timeout, fields: [ message, status ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfs_luc, body: { query: { query_string: { query: "5*", fields: [ status ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfs_prx, body: { query: { multi_match: { query: timeout, fields: [ message, status ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfs_prx, body: { query: { query_string: { query: "5*", fields: [ status ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfs_def, body: { query: { multi_match: { query: timeout, fields: [ message, status ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfs_def, body: { query: { query_string: { query: "5*", fields: [ status ] } } } }
+
+---
+"A query naming no field ranks as stock's dis_max does, whether a keyword value matches or not":
+  # Stock scores one clause over every field as a dis_max of its fields:
+  # the text field's BM25, and a keyword field's match its boost, 1. So a
+  # hit scores the better of the two (most_fields, tie_breaker 1: the sum).
+  # The text hits keep their BM25 order whether a keyword value matches
+  # (disk: documents 2 and 3 hold it in level, 2 in host too) or not (full). Every
+  # document is under 16 tokens, so the engine keeps Lucene's lengths and
+  # the scores agree.
+  - do:
+      indices.create:
+        index: dfr_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, level: { type: keyword }, host: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dfr_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, level: { type: keyword }, host: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dfr_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, level: { type: keyword }, host: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: dfr_luc
+        body:
+          - index: { _id: "1" }
+          - { "message": "disk full disk", "level": "info", "host": "web-1" }
+          - index: { _id: "2" }
+          - { "message": "disk", "level": "disk", "host": "disk" }
+          - index: { _id: "3" }
+          - { "message": "memory full", "level": "disk", "host": "web-3" }
+          - index: { _id: "4" }
+          - { "message": "cpu hot", "level": "warn", "host": "web-4" }
+          - index: { _id: "5" }
+          - { "message": "disk failure on the second volume", "level": "info", "host": "web-5" }
+          - index: { _id: "6" }
+          - { "message": "full", "level": "warn", "host": "web-6" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfr_prx
+        body:
+          - index: { _id: "1" }
+          - { "message": "disk full disk", "level": "info", "host": "web-1" }
+          - index: { _id: "2" }
+          - { "message": "disk", "level": "disk", "host": "disk" }
+          - index: { _id: "3" }
+          - { "message": "memory full", "level": "disk", "host": "web-3" }
+          - index: { _id: "4" }
+          - { "message": "cpu hot", "level": "warn", "host": "web-4" }
+          - index: { _id: "5" }
+          - { "message": "disk failure on the second volume", "level": "info", "host": "web-5" }
+          - index: { _id: "6" }
+          - { "message": "full", "level": "warn", "host": "web-6" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfr_def
+        body:
+          - index: { _id: "1" }
+          - { "message": "disk full disk", "level": "info", "host": "web-1" }
+          - index: { _id: "2" }
+          - { "message": "disk", "level": "disk", "host": "disk" }
+          - index: { _id: "3" }
+          - { "message": "memory full", "level": "disk", "host": "web-3" }
+          - index: { _id: "4" }
+          - { "message": "cpu hot", "level": "warn", "host": "web-4" }
+          - index: { _id: "5" }
+          - { "message": "disk failure on the second volume", "level": "info", "host": "web-5" }
+          - index: { _id: "6" }
+          - { "message": "full", "level": "warn", "host": "web-6" }
+  # A keyword value matches: 2 and 3 score the keyword match, 1 and 5 their BM25.
+  - do:
+      search:
+        index: dfr_luc
+        body: { query: { query_string: { query: disk } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_prx
+        body: { query: { query_string: { query: disk } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_def
+        body: { query: { query_string: { query: disk } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  # A multi_match naming no field, alone and as Discover sends it, beside a filter.
+  - do:
+      search:
+        index: dfr_luc
+        body: { query: { multi_match: { query: disk } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_prx
+        body: { query: { multi_match: { query: disk } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_def
+        body: { query: { multi_match: { query: disk } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_luc
+        body: { query: { bool: { must: [ { multi_match: { query: disk, type: best_fields, lenient: true } } ], filter: [ { exists: { field: level } } ] } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_prx
+        body: { query: { bool: { must: [ { multi_match: { query: disk, type: best_fields, lenient: true } } ], filter: [ { exists: { field: level } } ] } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_def
+        body: { query: { bool: { must: [ { multi_match: { query: disk, type: best_fields, lenient: true } } ], filter: [ { exists: { field: level } } ] } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  # most_fields sums the fields: 2 matches message, level and host, each keyword field adding 1.
+  - do:
+      search:
+        index: dfr_luc
+        body: { query: { multi_match: { query: disk, type: most_fields } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 2.4166 }
+  - lt: { hits.hits.0._score: 2.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_prx
+        body: { query: { multi_match: { query: disk, type: most_fields } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 2.4166 }
+  - lt: { hits.hits.0._score: 2.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  - do:
+      search:
+        index: dfr_def
+        body: { query: { multi_match: { query: disk, type: most_fields } } }
+  - match: { hits.total.value: 4 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 2.4166 }
+  - lt: { hits.hits.0._score: 2.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.9990 }
+  - lt: { hits.hits.1._score: 1.0010 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.4091 }
+  - lt: { hits.hits.2._score: 0.4111 }
+  - match: { hits.hits.3._id: "5" }
+  - gt: { hits.hits.3._score: 0.1993 }
+  - lt: { hits.hits.3._score: 0.2013 }
+  # No keyword value matches: the text's BM25 alone, the same either way.
+  - do:
+      search:
+        index: dfr_luc
+        body: { query: { query_string: { query: full } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - gt: { hits.hits.0._score: 0.4166 }
+  - lt: { hits.hits.0._score: 0.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.3421 }
+  - lt: { hits.hits.1._score: 0.3441 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.2902 }
+  - lt: { hits.hits.2._score: 0.2922 }
+  - do:
+      search:
+        index: dfr_prx
+        body: { query: { query_string: { query: full } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - gt: { hits.hits.0._score: 0.4166 }
+  - lt: { hits.hits.0._score: 0.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.3421 }
+  - lt: { hits.hits.1._score: 0.3441 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.2902 }
+  - lt: { hits.hits.2._score: 0.2922 }
+  - do:
+      search:
+        index: dfr_def
+        body: { query: { query_string: { query: full } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - gt: { hits.hits.0._score: 0.4166 }
+  - lt: { hits.hits.0._score: 0.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.3421 }
+  - lt: { hits.hits.1._score: 0.3441 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.2902 }
+  - lt: { hits.hits.2._score: 0.2922 }
+  - do:
+      search:
+        index: dfr_luc
+        body: { query: { multi_match: { query: full } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - gt: { hits.hits.0._score: 0.4166 }
+  - lt: { hits.hits.0._score: 0.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.3421 }
+  - lt: { hits.hits.1._score: 0.3441 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.2902 }
+  - lt: { hits.hits.2._score: 0.2922 }
+  - do:
+      search:
+        index: dfr_prx
+        body: { query: { multi_match: { query: full } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - gt: { hits.hits.0._score: 0.4166 }
+  - lt: { hits.hits.0._score: 0.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.3421 }
+  - lt: { hits.hits.1._score: 0.3441 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.2902 }
+  - lt: { hits.hits.2._score: 0.2922 }
+  - do:
+      search:
+        index: dfr_def
+        body: { query: { multi_match: { query: full } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - gt: { hits.hits.0._score: 0.4166 }
+  - lt: { hits.hits.0._score: 0.4186 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.3421 }
+  - lt: { hits.hits.1._score: 0.3441 }
+  - match: { hits.hits.2._id: "1" }
+  - gt: { hits.hits.2._score: 0.2902 }
+  - lt: { hits.hits.2._score: 0.2922 }
+
+---
+"A multi-field the table keeps no column of is left out of every field, and refused where named":
+  # title.english (its own analyzer) and title.lower (a normalizer) have no
+  # column of their own. A query naming no field reads the fields the table
+  # can rather than failing; here their matches are title's own, so the hits
+  # and scores are the twin's. A pattern or a name the request gives that
+  # reaches one is refused, as a query on the field is.
+  - do:
+      indices.create:
+        index: dfm_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { title: { type: text, fields: { english: { type: text, analyzer: english }, lower: { type: keyword, normalizer: lowercase } } }, level: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dfm_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { title: { type: text, fields: { english: { type: text, analyzer: english }, lower: { type: keyword, normalizer: lowercase } } }, level: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dfm_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { title: { type: text, fields: { english: { type: text, analyzer: english }, lower: { type: keyword, normalizer: lowercase } } }, level: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: dfm_luc
+        body:
+          - index: { _id: "1" }
+          - { "title": "disk full", "level": "error" }
+          - index: { _id: "2" }
+          - { "title": "user login", "level": "disk" }
+          - index: { _id: "3" }
+          - { "title": "cache miss", "level": "info" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfm_prx
+        body:
+          - index: { _id: "1" }
+          - { "title": "disk full", "level": "error" }
+          - index: { _id: "2" }
+          - { "title": "user login", "level": "disk" }
+          - index: { _id: "3" }
+          - { "title": "cache miss", "level": "info" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfm_def
+        body:
+          - index: { _id: "1" }
+          - { "title": "disk full", "level": "error" }
+          - index: { _id: "2" }
+          - { "title": "user login", "level": "disk" }
+          - index: { _id: "3" }
+          - { "title": "cache miss", "level": "info" }
+  - do:
+      search:
+        index: dfm_luc
+        body: { query: { multi_match: { query: disk } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4448 }
+  - lt: { hits.hits.1._score: 0.4468 }
+  - do:
+      search:
+        index: dfm_prx
+        body: { query: { multi_match: { query: disk } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4448 }
+  - lt: { hits.hits.1._score: 0.4468 }
+  - do:
+      search:
+        index: dfm_def
+        body: { query: { multi_match: { query: disk } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4448 }
+  - lt: { hits.hits.1._score: 0.4468 }
+  - do:
+      search:
+        index: dfm_luc
+        body: { query: { query_string: { query: disk } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4448 }
+  - lt: { hits.hits.1._score: 0.4468 }
+  - do:
+      search:
+        index: dfm_prx
+        body: { query: { query_string: { query: disk } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4448 }
+  - lt: { hits.hits.1._score: 0.4468 }
+  - do:
+      search:
+        index: dfm_def
+        body: { query: { query_string: { query: disk } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4448 }
+  - lt: { hits.hits.1._score: 0.4468 }
+  - do:
+      catch: bad_request
+      search: { index: dfm_prx, body: { query: { multi_match: { query: disk, fields: [ "title.*" ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfm_prx, body: { query: { query_string: { query: disk, fields: [ title.english ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfm_def, body: { query: { multi_match: { query: disk, fields: [ "title.*" ] } } } }
+  - do:
+      catch: bad_request
+      search: { index: dfm_def, body: { query: { query_string: { query: disk, fields: [ title.english ] } } } }
+  - do:
+      search: { index: dfm_luc, body: { query: { multi_match: { query: disk, fields: [ "title.*" ] } } } }
+  - match: { hits.total.value: 1 }
+
+---
+"Hits that tie at a keyword match's score come in the order they were written":
+  # Every message holds disk, so its BM25 stays below 1, and documents 1
+  # and 2 hold it as their level too: under the dis_max both score the
+  # keyword match's 1. Stock orders the tie as the documents were written,
+  # so a page of one is document 1, though document 2 has the higher BM25.
+  - do:
+      indices.create:
+        index: dft_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, level: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dft_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, level: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dft_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, level: { type: keyword } } }
+  - do:
+      bulk:
+        refresh: true
+        index: dft_luc
+        body:
+          - index: { _id: "1" }
+          - { "message": "disk alpha beta gamma delta epsilon", "level": "disk" }
+          - index: { _id: "2" }
+          - { "message": "disk", "level": "disk" }
+          - index: { _id: "3" }
+          - { "message": "disk one", "level": "a" }
+          - index: { _id: "4" }
+          - { "message": "disk two", "level": "b" }
+          - index: { _id: "5" }
+          - { "message": "disk three", "level": "c" }
+          - index: { _id: "6" }
+          - { "message": "disk four", "level": "d" }
+  - do:
+      bulk:
+        refresh: true
+        index: dft_prx
+        body:
+          - index: { _id: "1" }
+          - { "message": "disk alpha beta gamma delta epsilon", "level": "disk" }
+          - index: { _id: "2" }
+          - { "message": "disk", "level": "disk" }
+          - index: { _id: "3" }
+          - { "message": "disk one", "level": "a" }
+          - index: { _id: "4" }
+          - { "message": "disk two", "level": "b" }
+          - index: { _id: "5" }
+          - { "message": "disk three", "level": "c" }
+          - index: { _id: "6" }
+          - { "message": "disk four", "level": "d" }
+  - do:
+      bulk:
+        refresh: true
+        index: dft_def
+        body:
+          - index: { _id: "1" }
+          - { "message": "disk alpha beta gamma delta epsilon", "level": "disk" }
+          - index: { _id: "2" }
+          - { "message": "disk", "level": "disk" }
+          - index: { _id: "3" }
+          - { "message": "disk one", "level": "a" }
+          - index: { _id: "4" }
+          - { "message": "disk two", "level": "b" }
+          - index: { _id: "5" }
+          - { "message": "disk three", "level": "c" }
+          - index: { _id: "6" }
+          - { "message": "disk four", "level": "d" }
+  - do:
+      search:
+        index: dft_luc
+        body: { query: { query_string: { query: disk } }, size: 1 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dft_luc
+        body: { query: { multi_match: { query: disk } }, size: 1 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dft_luc
+        body: { query: { query_string: { query: disk } }, size: 3 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - do:
+      search:
+        index: dft_prx
+        body: { query: { query_string: { query: disk } }, size: 1 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dft_prx
+        body: { query: { multi_match: { query: disk } }, size: 1 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dft_prx
+        body: { query: { query_string: { query: disk } }, size: 3 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+  - do:
+      search:
+        index: dft_def
+        body: { query: { query_string: { query: disk } }, size: 1 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dft_def
+        body: { query: { multi_match: { query: disk } }, size: 1 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dft_def
+        body: { query: { query_string: { query: disk } }, size: 3 }
+  - match: { hits.total.value: 6 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "3" }
+
+---
+"A date word reads in the query's time_zone on its one default_field, and in UTC over every field":
+  # Stock's query string parser reads a word on its one default_field, a
+  # date field, as a range in the query's time_zone: 2026-10-25 at +05:30
+  # runs from 18:30 UTC the day before (documents 1 and 2). Over every
+  # field it reads the word through the date field's term query, in UTC,
+  # time_zone or not (documents 2 and 3); so does a quoted word.
+  - do:
+      indices.create:
+        index: dfz_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, ts: { type: date } } }
+  - do:
+      indices.create:
+        index: dfz_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, ts: { type: date } } }
+  - do:
+      indices.create:
+        index: dfz_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { message: { type: text }, ts: { type: date } } }
+  - do:
+      bulk:
+        refresh: true
+        index: dfz_luc
+        body:
+          - index: { _id: "1" }
+          - { "message": "one", "ts": "2026-10-24T20:00:00Z" }
+          - index: { _id: "2" }
+          - { "message": "two", "ts": "2026-10-25T10:00:00Z" }
+          - index: { _id: "3" }
+          - { "message": "three", "ts": "2026-10-25T20:00:00Z" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfz_prx
+        body:
+          - index: { _id: "1" }
+          - { "message": "one", "ts": "2026-10-24T20:00:00Z" }
+          - index: { _id: "2" }
+          - { "message": "two", "ts": "2026-10-25T10:00:00Z" }
+          - index: { _id: "3" }
+          - { "message": "three", "ts": "2026-10-25T20:00:00Z" }
+  - do:
+      bulk:
+        refresh: true
+        index: dfz_def
+        body:
+          - index: { _id: "1" }
+          - { "message": "one", "ts": "2026-10-24T20:00:00Z" }
+          - index: { _id: "2" }
+          - { "message": "two", "ts": "2026-10-25T10:00:00Z" }
+          - index: { _id: "3" }
+          - { "message": "three", "ts": "2026-10-25T20:00:00Z" }
+  - do:
+      search:
+        index: dfz_luc
+        body: { query: { query_string: { query: "2026-10-25", default_field: ts, time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfz_luc
+        body: { query: { query_string: { query: "2026-10-25", default_field: ts } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_luc
+        body: { query: { query_string: { query: "2026-10-25", time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_luc
+        body: { query: { query_string: { query: "\"2026-10-25\"", default_field: ts, time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_prx
+        body: { query: { query_string: { query: "2026-10-25", default_field: ts, time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfz_prx
+        body: { query: { query_string: { query: "2026-10-25", default_field: ts } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_prx
+        body: { query: { query_string: { query: "2026-10-25", time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_prx
+        body: { query: { query_string: { query: "\"2026-10-25\"", default_field: ts, time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_def
+        body: { query: { query_string: { query: "2026-10-25", default_field: ts, time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfz_def
+        body: { query: { query_string: { query: "2026-10-25", default_field: ts } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_def
+        body: { query: { query_string: { query: "2026-10-25", time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+  - do:
+      search:
+        index: dfz_def
+        body: { query: { query_string: { query: "\"2026-10-25\"", default_field: ts, time_zone: "+05:30" } }, sort: [ { ts: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "3" }
+
+---
+"A boost in index.query.default_field weighs the field it names":
+  # index.query.default_field [title^2, body] is the field title, weighing
+  # 2, and body: a word only the title holds (document 1) is found. The
+  # boost is a weighing the plugin's ranking does not make, so the hits are
+  # compared in a fixed order here.
+  - do:
+      indices.create:
+        index: dfb_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0, index.query.default_field: [ "title^2", body ] }
+          mappings: { properties: { title: { type: text }, body: { type: text }, n: { type: integer } } }
+  - do:
+      indices.create:
+        index: dfb_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0, index.query.default_field: [ "title^2", body ] }
+          mappings: { properties: { title: { type: text }, body: { type: text }, n: { type: integer } } }
+  - do:
+      indices.create:
+        index: dfb_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0, index.query.default_field: [ "title^2", body ] }
+          mappings: { properties: { title: { type: text }, body: { type: text }, n: { type: integer } } }
+  - do:
+      bulk:
+        refresh: true
+        index: dfb_luc
+        body:
+          - index: { _id: "1" }
+          - { "title": "disk", "body": "nothing here", "n": 1 }
+          - index: { _id: "2" }
+          - { "title": "other", "body": "disk is full", "n": 2 }
+          - index: { _id: "3" }
+          - { "title": "none", "body": "none", "n": 3 }
+  - do:
+      bulk:
+        refresh: true
+        index: dfb_prx
+        body:
+          - index: { _id: "1" }
+          - { "title": "disk", "body": "nothing here", "n": 1 }
+          - index: { _id: "2" }
+          - { "title": "other", "body": "disk is full", "n": 2 }
+          - index: { _id: "3" }
+          - { "title": "none", "body": "none", "n": 3 }
+  - do:
+      bulk:
+        refresh: true
+        index: dfb_def
+        body:
+          - index: { _id: "1" }
+          - { "title": "disk", "body": "nothing here", "n": 1 }
+          - index: { _id: "2" }
+          - { "title": "other", "body": "disk is full", "n": 2 }
+          - index: { _id: "3" }
+          - { "title": "none", "body": "none", "n": 3 }
+  - do:
+      search:
+        index: dfb_luc
+        body: { query: { query_string: { query: disk } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfb_luc
+        body: { query: { multi_match: { query: disk } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfb_prx
+        body: { query: { query_string: { query: disk } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfb_prx
+        body: { query: { multi_match: { query: disk } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfb_def
+        body: { query: { query_string: { query: disk } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - do:
+      search:
+        index: dfb_def
+        body: { query: { multi_match: { query: disk } }, sort: [ { n: asc } ] }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+
+---
+"A run of words on a named text field ranks by its BM25":
+  # message:(timeout lock) is the field's words, scored by their BM25 as stock
+  # scores them, on an index with keyword fields too, where the run is kept as
+  # one term. Before, every hit scored the same.
+  - do:
+      search:
+        index: dfs_luc
+        body: {"query": {"query_string": {"query": "message:(timeout lock)"}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4900 }
+  - lt: { hits.hits.1._score: 0.4920 }
+  - do:
+      search:
+        index: dfs_prx
+        body: {"query": {"query_string": {"query": "message:(timeout lock)"}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4900 }
+  - lt: { hits.hits.1._score: 0.4920 }
+  - do:
+      search:
+        index: dfs_def
+        body: {"query": {"query_string": {"query": "message:(timeout lock)"}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - match: { hits.hits.1._id: "1" }
+  - gt: { hits.hits.1._score: 0.4900 }
+  - lt: { hits.hits.1._score: 0.4920 }
+  - do:
+      search:
+        index: dfs_luc
+        body: {"query": {"query_string": {"query": "message:(timeout lock)", "default_operator": "AND"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - do:
+      search:
+        index: dfs_prx
+        body: {"query": {"query_string": {"query": "message:(timeout lock)", "default_operator": "AND"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - do:
+      search:
+        index: dfs_def
+        body: {"query": {"query_string": {"query": "message:(timeout lock)", "default_operator": "AND"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "3" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - do:
+      search:
+        index: dfs_luc
+        body: {"query": {"bool": {"must": [{"query_string": {"query": "message:(timeout upstream)"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}]}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.4900 }
+  - lt: { hits.hits.1._score: 0.4920 }
+  - do:
+      search:
+        index: dfs_prx
+        body: {"query": {"bool": {"must": [{"query_string": {"query": "message:(timeout upstream)"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}]}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.4900 }
+  - lt: { hits.hits.1._score: 0.4920 }
+  - do:
+      search:
+        index: dfs_def
+        body: {"query": {"bool": {"must": [{"query_string": {"query": "message:(timeout upstream)"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}]}}}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 1.1767 }
+  - lt: { hits.hits.0._score: 1.1787 }
+  - match: { hits.hits.1._id: "3" }
+  - gt: { hits.hits.1._score: 0.4900 }
+  - lt: { hits.hits.1._score: 0.4920 }
+
+---
+"A word reaches a number field only as stock's number field reads it":
+  # A long field reads a plain number (3e1 is 30), not a Java double literal
+  # (7d, 30d), and keeps every digit of a 19-digit id; a 14 or 19-digit word
+  # read as a date past what the table compares matches nothing there. A boost
+  # on a word (500^2) is no part of its value.
+  - do:
+      indices.create:
+        index: dfn_luc
+        body: { settings: {"index.infino.enabled": false, "number_of_shards": 1, "number_of_replicas": 0}, mappings: {"properties": {"message": {"type": "text"}, "status": {"type": "long"}, "id": {"type": "long"}, "ts": {"type": "date"}}} }
+  - do:
+      indices.create:
+        index: dfn_prx
+        body: { settings: {"index.infino.enabled": true, "index.infino.mode": "proxy", "number_of_shards": 1, "number_of_replicas": 0}, mappings: {"properties": {"message": {"type": "text"}, "status": {"type": "long"}, "id": {"type": "long"}, "ts": {"type": "date"}}} }
+  - do:
+      indices.create:
+        index: dfn_def
+        body: { settings: {"index.infino.enabled": true, "number_of_shards": 1, "number_of_replicas": 0}, mappings: {"properties": {"message": {"type": "text"}, "status": {"type": "long"}, "id": {"type": "long"}, "ts": {"type": "date"}}} }
+  - do:
+      bulk:
+        refresh: true
+        index: dfn_luc
+        body:
+          - index: { _id: "1" }
+          - {"message": "request timeout", "status": 200, "id": 1234567890123456789, "ts": "2026-10-24T10:00:00Z"}
+          - index: { _id: "2" }
+          - {"message": "fine", "status": 500, "id": 1234567890123456788, "ts": "2026-10-24T10:01:00Z"}
+          - index: { _id: "3" }
+          - {"message": "fine too", "status": 404, "id": 7, "ts": "2026-10-24T10:02:00Z"}
+          - index: { _id: "4" }
+          - {"message": "timeout again timeout", "status": 500, "id": 30, "ts": "2026-10-24T10:03:00Z"}
+  - do:
+      bulk:
+        refresh: true
+        index: dfn_prx
+        body:
+          - index: { _id: "1" }
+          - {"message": "request timeout", "status": 200, "id": 1234567890123456789, "ts": "2026-10-24T10:00:00Z"}
+          - index: { _id: "2" }
+          - {"message": "fine", "status": 500, "id": 1234567890123456788, "ts": "2026-10-24T10:01:00Z"}
+          - index: { _id: "3" }
+          - {"message": "fine too", "status": 404, "id": 7, "ts": "2026-10-24T10:02:00Z"}
+          - index: { _id: "4" }
+          - {"message": "timeout again timeout", "status": 500, "id": 30, "ts": "2026-10-24T10:03:00Z"}
+  - do:
+      bulk:
+        refresh: true
+        index: dfn_def
+        body:
+          - index: { _id: "1" }
+          - {"message": "request timeout", "status": 200, "id": 1234567890123456789, "ts": "2026-10-24T10:00:00Z"}
+          - index: { _id: "2" }
+          - {"message": "fine", "status": 500, "id": 1234567890123456788, "ts": "2026-10-24T10:01:00Z"}
+          - index: { _id: "3" }
+          - {"message": "fine too", "status": 404, "id": 7, "ts": "2026-10-24T10:02:00Z"}
+          - index: { _id: "4" }
+          - {"message": "timeout again timeout", "status": 500, "id": 30, "ts": "2026-10-24T10:03:00Z"}
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"multi_match": {"query": "7d"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"multi_match": {"query": "7d"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"multi_match": {"query": "7d"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"multi_match": {"query": "30d"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"multi_match": {"query": "30d"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"multi_match": {"query": "30d"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"multi_match": {"query": "3e1"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"multi_match": {"query": "3e1"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"multi_match": {"query": "3e1"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "4" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"multi_match": {"query": "1234567890123456789"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"multi_match": {"query": "1234567890123456789"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"multi_match": {"query": "1234567890123456789"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"query_string": {"query": "99999999999999"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"query_string": {"query": "99999999999999"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"query_string": {"query": "99999999999999"}}}
+  - match: { hits.total.value: 0 }
+  - length: { hits.hits: 0 }
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"term": {"id": "1234567890123456789"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"term": {"id": "1234567890123456789"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"term": {"id": "1234567890123456789"}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - gt: { hits.hits.0._score: 0.9990 }
+  - lt: { hits.hits.0._score: 1.0010 }
+  - do:
+      search:
+        index: dfn_luc
+        body: {"query": {"query_string": {"query": "500^2 OR timeout"}}, "sort": [{"ts": "asc"}]}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "4" }
+  - do:
+      search:
+        index: dfn_prx
+        body: {"query": {"query_string": {"query": "500^2 OR timeout"}}, "sort": [{"ts": "asc"}]}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "4" }
+  - do:
+      search:
+        index: dfn_def
+        body: {"query": {"query_string": {"query": "500^2 OR timeout"}}, "sort": [{"ts": "asc"}]}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "4" }
+
+---
+"Discover's default requests answer as stock, in DQL and in Lucene mode":
+  - skip:
+      features: allowed_warnings
+  # What Discover sends for a word typed in its search bar. In DQL the word is a
+  # lenient best_fields multi_match in filter context beside the time range; in
+  # Lucene mode a query_string in must with analyze_wildcard and the browser's
+  # time_zone. Each comes with the hits sorted by time and the histogram.
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_luc
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "timeout", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - length: { aggregations.2.buckets: 3 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:03:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_prx
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "timeout", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - length: { aggregations.2.buckets: 3 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:03:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_def
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "timeout", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - length: { aggregations.2.buckets: 3 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:03:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_luc
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "payments", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - length: { aggregations.2.buckets: 4 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:02:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:05:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
+  - match: { aggregations.2.buckets.3.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_prx
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "payments", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - length: { aggregations.2.buckets: 4 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:02:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:05:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
+  - match: { aggregations.2.buckets.3.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_def
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "payments", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - length: { aggregations.2.buckets: 4 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:02:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:05:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
+  - match: { aggregations.2.buckets.3.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_luc
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "504", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - length: { aggregations.2.buckets: 1 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_prx
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "504", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - length: { aggregations.2.buckets: 1 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_def
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [], "filter": [{"multi_match": {"type": "best_fields", "query": "504", "lenient": true}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 1 }
+  - length: { hits.hits: 1 }
+  - match: { hits.hits.0._id: "1" }
+  - length: { aggregations.2.buckets: 1 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_luc
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "timeout", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - length: { aggregations.2.buckets: 3 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:03:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_prx
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "timeout", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - length: { aggregations.2.buckets: 3 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:03:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_def
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "timeout", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 3 }
+  - match: { hits.hits.0._id: "6" }
+  - match: { hits.hits.1._id: "3" }
+  - match: { hits.hits.2._id: "1" }
+  - length: { aggregations.2.buckets: 3 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:03:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_luc
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "payments", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - length: { aggregations.2.buckets: 4 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:02:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:05:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
+  - match: { aggregations.2.buckets.3.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_prx
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "payments", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - length: { aggregations.2.buckets: 4 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:02:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:05:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
+  - match: { aggregations.2.buckets.3.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_def
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "payments", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - length: { aggregations.2.buckets: 4 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:02:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:05:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
+  - match: { aggregations.2.buckets.3.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_luc
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "pay*", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - length: { aggregations.2.buckets: 4 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:02:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:05:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
+  - match: { aggregations.2.buckets.3.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_prx
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "pay*", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - length: { aggregations.2.buckets: 4 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:02:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:05:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
+  - match: { aggregations.2.buckets.3.doc_count: 1 }
+  - do:
+      allowed_warnings:
+        - "Expected at least one value for an array of [excludes]"
+        - "An empty object was provided as [_source]. Provide at least one of [includes] or [excludes] or use `_source: true` to fetch the entire source."
+      search:
+        index: dfs_def
+        body: {"size": 500, "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "boolean"}}], "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}, "stored_fields": ["*"], "script_fields": {}, "docvalue_fields": [{"field": "@timestamp", "format": "date_time"}], "_source": {"excludes": []}, "query": {"bool": {"must": [{"query_string": {"query": "pay*", "analyze_wildcard": true, "time_zone": "Europe/Paris"}}], "filter": [{"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}], "should": [], "must_not": []}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "7" }
+  - match: { hits.hits.1._id: "5" }
+  - match: { hits.hits.2._id: "2" }
+  - match: { hits.hits.3._id: "1" }
+  - length: { aggregations.2.buckets: 4 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:02:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:05:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
+  - match: { aggregations.2.buckets.3.doc_count: 1 }
+
+---
+"A query naming no field answers as stock under a histogram, must_not, _count and filter context":
+  # The other places a no-fields query reaches: a date_histogram with no hits, a
+  # must_not, _count (the form the issue reported), and a pattern or a regular
+  # expression in filter context, which match keyword values whole.
+  - do:
+      search:
+        index: dfs_luc
+        body: {"size": 0, "query": {"query_string": {"query": "timeout"}}, "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 0 }
+  - length: { aggregations.2.buckets: 3 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:03:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - do:
+      search:
+        index: dfs_prx
+        body: {"size": 0, "query": {"query_string": {"query": "timeout"}}, "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 0 }
+  - length: { aggregations.2.buckets: 3 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:03:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - do:
+      search:
+        index: dfs_def
+        body: {"size": 0, "query": {"query_string": {"query": "timeout"}}, "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}}
+  - match: { hits.total.value: 3 }
+  - length: { hits.hits: 0 }
+  - length: { aggregations.2.buckets: 3 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:03:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:06:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - do:
+      search:
+        index: dfs_luc
+        body: {"size": 0, "query": {"multi_match": {"query": "payments"}}, "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 0 }
+  - length: { aggregations.2.buckets: 4 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:02:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:05:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
+  - match: { aggregations.2.buckets.3.doc_count: 1 }
+  - do:
+      search:
+        index: dfs_prx
+        body: {"size": 0, "query": {"multi_match": {"query": "payments"}}, "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 0 }
+  - length: { aggregations.2.buckets: 4 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:02:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:05:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
+  - match: { aggregations.2.buckets.3.doc_count: 1 }
+  - do:
+      search:
+        index: dfs_def
+        body: {"size": 0, "query": {"multi_match": {"query": "payments"}}, "aggs": {"2": {"date_histogram": {"field": "@timestamp", "fixed_interval": "1m", "time_zone": "UTC", "min_doc_count": 1}}}}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 0 }
+  - length: { aggregations.2.buckets: 4 }
+  - match: { aggregations.2.buckets.0.key_as_string: "2026-10-24T10:01:00.000Z" }
+  - match: { aggregations.2.buckets.0.doc_count: 1 }
+  - match: { aggregations.2.buckets.1.key_as_string: "2026-10-24T10:02:00.000Z" }
+  - match: { aggregations.2.buckets.1.doc_count: 1 }
+  - match: { aggregations.2.buckets.2.key_as_string: "2026-10-24T10:05:00.000Z" }
+  - match: { aggregations.2.buckets.2.doc_count: 1 }
+  - match: { aggregations.2.buckets.3.key_as_string: "2026-10-24T10:07:00.000Z" }
+  - match: { aggregations.2.buckets.3.doc_count: 1 }
+  - do:
+      search:
+        index: dfs_luc
+        body: {"query": {"bool": {"must_not": [{"multi_match": {"query": "payments", "lenient": true}}]}}, "sort": [{"@timestamp": "asc"}]}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "6" }
+  - match: { hits.hits.3._id: "8" }
+  - do:
+      search:
+        index: dfs_prx
+        body: {"query": {"bool": {"must_not": [{"multi_match": {"query": "payments", "lenient": true}}]}}, "sort": [{"@timestamp": "asc"}]}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "6" }
+  - match: { hits.hits.3._id: "8" }
+  - do:
+      search:
+        index: dfs_def
+        body: {"query": {"bool": {"must_not": [{"multi_match": {"query": "payments", "lenient": true}}]}}, "sort": [{"@timestamp": "asc"}]}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "6" }
+  - match: { hits.hits.3._id: "8" }
+  - do:
+      search:
+        index: dfs_luc
+        body: {"query": {"bool": {"must_not": [{"query_string": {"query": "timeout"}}]}}, "sort": [{"@timestamp": "asc"}]}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "7" }
+  - match: { hits.hits.4._id: "8" }
+  - do:
+      search:
+        index: dfs_prx
+        body: {"query": {"bool": {"must_not": [{"query_string": {"query": "timeout"}}]}}, "sort": [{"@timestamp": "asc"}]}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "7" }
+  - match: { hits.hits.4._id: "8" }
+  - do:
+      search:
+        index: dfs_def
+        body: {"query": {"bool": {"must_not": [{"query_string": {"query": "timeout"}}]}}, "sort": [{"@timestamp": "asc"}]}
+  - match: { hits.total.value: 5 }
+  - length: { hits.hits: 5 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "7" }
+  - match: { hits.hits.4._id: "8" }
+  - do:
+      count:
+        index: dfs_luc
+        body: {"query": {"multi_match": {"query": "timeout"}}}
+  - match: { count: 3 }
+  - do:
+      count:
+        index: dfs_prx
+        body: {"query": {"multi_match": {"query": "timeout"}}}
+  - match: { count: 3 }
+  - do:
+      count:
+        index: dfs_def
+        body: {"query": {"multi_match": {"query": "timeout"}}}
+  - match: { count: 3 }
+  - do:
+      count:
+        index: dfs_luc
+        body: {"query": {"multi_match": {"query": "pay-1"}}}
+  - match: { count: 1 }
+  - do:
+      count:
+        index: dfs_prx
+        body: {"query": {"multi_match": {"query": "pay-1"}}}
+  - match: { count: 1 }
+  - do:
+      count:
+        index: dfs_def
+        body: {"query": {"multi_match": {"query": "pay-1"}}}
+  - match: { count: 1 }
+  - do:
+      search:
+        index: dfs_luc
+        body: {"query": {"bool": {"filter": [{"query_string": {"query": "pay*"}}]}}, "sort": [{"@timestamp": "asc"}]}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "7" }
+  - do:
+      search:
+        index: dfs_prx
+        body: {"query": {"bool": {"filter": [{"query_string": {"query": "pay*"}}]}}, "sort": [{"@timestamp": "asc"}]}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "7" }
+  - do:
+      search:
+        index: dfs_def
+        body: {"query": {"bool": {"filter": [{"query_string": {"query": "pay*"}}]}}, "sort": [{"@timestamp": "asc"}]}
+  - match: { hits.total.value: 4 }
+  - length: { hits.hits: 4 }
+  - match: { hits.hits.0._id: "1" }
+  - match: { hits.hits.1._id: "2" }
+  - match: { hits.hits.2._id: "5" }
+  - match: { hits.hits.3._id: "7" }
+  - do:
+      search:
+        index: dfs_luc
+        body: {"query": {"bool": {"filter": [{"query_string": {"query": "/db-[12]/"}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}]}}, "sort": [{"@timestamp": "asc"}]}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "6" }
+  - do:
+      search:
+        index: dfs_prx
+        body: {"query": {"bool": {"filter": [{"query_string": {"query": "/db-[12]/"}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}]}}, "sort": [{"@timestamp": "asc"}]}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "6" }
+  - do:
+      search:
+        index: dfs_def
+        body: {"query": {"bool": {"filter": [{"query_string": {"query": "/db-[12]/"}}, {"range": {"@timestamp": {"gte": "2026-10-24T00:00:00.000Z", "lte": "2026-10-24T23:59:59.999Z", "format": "strict_date_optional_time"}}}]}}, "sort": [{"@timestamp": "asc"}]}
+  - match: { hits.total.value: 2 }
+  - length: { hits.hits: 2 }
+  - match: { hits.hits.0._id: "3" }
+  - match: { hits.hits.1._id: "6" }
