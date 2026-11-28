@@ -109,6 +109,8 @@ import java.io.UncheckedIOException;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.time.zone.ZoneOffsetTransition;
+import java.time.zone.ZoneRules;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -1906,7 +1908,18 @@ public class InfinoAggregationProcessor {
                 throw masked(dh, c);
             }
             ZoneId tz = dh.timeZone() == null ? ZoneOffset.UTC : dh.timeZone();
-            DateExpr expr = dateExpr(dh.getName(), c, tz, dh.getFixedInterval(), dh.getCalendarInterval(), dh.offset());
+            // Bounds in epoch milliseconds (what dashboards send) say where the request's dates fall.
+            LongBounds span = dh.extendedBounds();
+            DateExpr expr = dateExpr(
+                dh.getName(),
+                c,
+                tz,
+                dh.getFixedInterval(),
+                dh.getCalendarInterval(),
+                dh.offset(),
+                span == null ? null : span.getMin(),
+                span == null ? null : span.getMax()
+            );
             DocValueFormat format = dateFormat(dh.format(), c, tz);
             LongBounds bounds = null;
             if (dh.extendedBounds() != null) {
@@ -2002,16 +2015,41 @@ public class InfinoAggregationProcessor {
 
         /** The date bucket of {@code c} at the interval given, in the request's zone; the aggregation's name is for the refusal. */
         static DateExpr dateExpr(String agg, Source c, ZoneId tz, DateHistogramInterval fixed, DateHistogramInterval calendar, long offset) {
+            return dateExpr(agg, c, tz, fixed, calendar, offset, null, null);
+        }
+
+        /**
+         * As {@link #dateExpr(String, Source, ZoneId, DateHistogramInterval, DateHistogramInterval, long)},
+         * with the span of time the request says its dates fall in
+         * ({@code from} to {@code to}, epoch milliseconds, either null for
+         * unknown). The span only chooses which dates take the cheaper
+         * arithmetic of {@link #steadyBin}; a date outside it is bucketed all
+         * the same.
+         */
+        static DateExpr dateExpr(
+            String agg,
+            Source c,
+            ZoneId tz,
+            DateHistogramInterval fixed,
+            DateHistogramInterval calendar,
+            long offset,
+            Long from,
+            Long to
+        ) {
             if (!c.isTimestamp()) {
                 throw new Unsupported("aggregation [" + agg + "] needs a date value, " + c.label() + " is " + c.typeName());
             }
-            String source = "(" + c.expr() + ")";
+            String plain = "(" + c.expr() + ")";
+            String source = plain;
             boolean zoned = !ZoneOffset.UTC.equals(tz) && !"UTC".equals(tz.getId());
             String zone = "'Timestamp(Millisecond, Some(\"" + tz.getId() + "\"))'";
             if (zoned) {
                 // Bucket boundaries fall on local time in the request's zone; the
-                // epoch value of each boundary is unchanged.
-                source = "arrow_cast(" + source + ", " + zone + ")";
+                // epoch value of each boundary is unchanged. The date is read as
+                // UTC first: a table written elsewhere may keep its dates with no
+                // zone, and a cast straight to the zone would take such a date for
+                // local time there, and move every bucket by the zone's offset.
+                source = "arrow_cast(arrow_cast(" + source + ", " + UTC_MILLIS + "), " + zone + ")";
             }
             String keyExpr;
             DateIntervalWrapper wrapper = new DateIntervalWrapper();
@@ -2021,7 +2059,7 @@ public class InfinoAggregationProcessor {
                     throw new Unsupported("aggregation [" + agg + "] has an interval of no length");
                 }
                 if (zoned) {
-                    keyExpr = zonedBin(source, zone, ms, offset);
+                    keyExpr = steadyBin(plain, tz, zone, ms, offset, from, to, zonedBin(source, zone, ms, offset));
                 } else {
                     keyExpr = utcBin(source, ms, offset);
                 }
@@ -2043,11 +2081,135 @@ public class InfinoAggregationProcessor {
                     String shift = "INTERVAL '" + offset + " milliseconds'";
                     keyExpr = "(date_trunc('" + unit + "', " + source + " - " + shift + ") + " + shift + ")";
                 }
+                if (zoned && unitMillis > 0) {
+                    keyExpr = steadyBin(plain, tz, zone, unitMillis, offset, from, to, keyExpr);
+                }
                 wrapper.calendarInterval(calendar);
             } else {
                 throw new Unsupported("aggregation [" + agg + "] names no interval");
             }
             return new DateExpr(keyExpr, wrapper.createRounding(tz, offset));
+        }
+
+        /** The most stretches of a zone's time one key spells out; a date in none of them takes the zone's own reading. */
+        private static final int MAX_STEADY = 4;
+
+        /** The longest a zone's clocks have moved at one change, with room to spare. */
+        private static final long DAY_MILLIS = 86_400_000L;
+
+        /**
+         * A stretch of a zone's time over which its offset from UTC does not
+         * change: from {@code from} up to {@code until} (epoch milliseconds,
+         * null for no end on that side), at {@code offsetMillis}.
+         */
+        record Steady(Long from, Long until, long offsetMillis) {
+            /**
+             * The earliest date (epoch milliseconds) whose bucket of length
+             * {@code ms} surely starts in this stretch, the request's
+             * {@code offset} allowed for; null for no limit.
+             */
+            Long first(long ms, long offset) {
+                if (from == null) {
+                    return null;
+                }
+                try {
+                    return Math.addExact(from, Math.addExact(ms, Math.addExact(DAY_MILLIS, offset < 0 ? Math.negateExact(offset) : offset)));
+                } catch (ArithmeticException tooFar) {
+                    // An interval or offset longer than time itself: no date qualifies.
+                    return Long.MAX_VALUE;
+                }
+            }
+
+            /** The latest date (epoch milliseconds) that is in this stretch once moved by the request's {@code offset}; null for no limit. */
+            Long last(long offset) {
+                if (until == null) {
+                    return null;
+                }
+                try {
+                    return Math.subtractExact(until, Math.addExact(offset < 0 ? Math.negateExact(offset) : offset, 1L));
+                } catch (ArithmeticException tooFar) {
+                    return Long.MIN_VALUE;
+                }
+            }
+        }
+
+        /**
+         * The stretches of {@code tz} that {@link #steadyBin} spells out.
+         * With a span given, the ones it touches, earliest first, up to
+         * {@link #MAX_STEADY}. With none, the stretch that runs on from the
+         * zone's last change, for a zone that no longer changes its clocks;
+         * a zone that still does has no such stretch, and gets none.
+         */
+        static List<Steady> steady(ZoneId tz, Long from, Long to) {
+            ZoneRules rules = tz.getRules();
+            List<Steady> out = new ArrayList<>();
+            if (from != null && to != null && from <= to) {
+                Instant at = Instant.ofEpochMilli(from);
+                while (out.size() < MAX_STEADY) {
+                    // previousTransition reads strictly before, so a change at this very instant is found from a millisecond on.
+                    ZoneOffsetTransition before = rules.previousTransition(at.plusMillis(1));
+                    ZoneOffsetTransition after = rules.nextTransition(at);
+                    Long start = before == null ? null : before.getInstant().toEpochMilli();
+                    Long end = after == null ? null : after.getInstant().toEpochMilli();
+                    out.add(new Steady(start, end, rules.getOffset(at).getTotalSeconds() * 1000L));
+                    if (end == null || end > to) {
+                        break;
+                    }
+                    at = after.getInstant();
+                }
+                return out;
+            }
+            if (rules.getTransitionRules().isEmpty()) {
+                List<ZoneOffsetTransition> changes = rules.getTransitions();
+                if (changes.isEmpty()) {
+                    out.add(new Steady(null, null, rules.getOffset(Instant.EPOCH).getTotalSeconds() * 1000L));
+                } else {
+                    ZoneOffsetTransition last = changes.get(changes.size() - 1);
+                    out.add(new Steady(last.getInstant().toEpochMilli(), null, last.getOffsetAfter().getTotalSeconds() * 1000L));
+                }
+            }
+            return out;
+        }
+
+        /**
+         * The bucket of {@code plain}, a date not yet read in any zone, at a
+         * length of {@code ms} that is the same everywhere (a fixed interval,
+         * or a calendar minute, hour or day) with its boundaries on local
+         * time in {@code tz}: {@code zonedKey}, the key worked out through
+         * the zone, with a shortcut for the dates that need no zone.
+         *
+         * <p>Over a stretch where the zone keeps one offset from UTC, local
+         * time is the instant plus that offset, and the bucket's start is a
+         * floor in UTC with the origin moved by it: {@link #utcBin}, which
+         * reads no zone for any row. Reading each row's local time is by far
+         * the larger cost of a zoned histogram, so the dates inside such a
+         * stretch take the floor and only the rest go through the zone. The
+         * key is the same either way, and of the same type.
+         *
+         * <p>A date takes the floor only when its bucket's start falls in
+         * the stretch with it: an interval after the stretch begins, and a
+         * day more, which is longer than any zone's clocks have moved at one
+         * change, so that a local time that happened twice across the change
+         * is never the start. The request's offset moves the instant before
+         * it is floored, so it narrows both ends by its size.
+         */
+        static String steadyBin(String plain, ZoneId tz, String zone, long ms, long offset, Long from, Long to, String zonedKey) {
+            String epoch = epochMillis(plain);
+            StringBuilder cases = new StringBuilder();
+            for (Steady s : steady(tz, from, to)) {
+                String floor = "arrow_cast(" + utcBin(plain, ms, offset - s.offsetMillis()) + ", " + zone + ")";
+                Long lo = s.first(ms, offset);
+                Long hi = s.last(offset);
+                if (lo == null && hi == null) {
+                    return floor;
+                }
+                if (lo != null && hi != null && lo > hi) {
+                    continue;
+                }
+                String inside = lo == null ? epoch + " <= " + hi : hi == null ? epoch + " >= " + lo : epoch + " BETWEEN " + lo + " AND " + hi;
+                cases.append(" WHEN ").append(inside).append(" THEN ").append(floor);
+            }
+            return cases.length() == 0 ? zonedKey : "CASE" + cases + " ELSE " + zonedKey + " END";
         }
 
         /**

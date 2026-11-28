@@ -16,6 +16,7 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.time.Instant;
 import java.time.ZoneId;
+import java.time.zone.ZoneOffsetTransition;
 import java.util.List;
 import java.util.Map;
 
@@ -25,6 +26,8 @@ public class InfinoDateKeyTests extends OpenSearchTestCase {
     /** The source as UTC milliseconds, floored, which both branches read. */
     private static final String MILLIS = "arrow_cast(date_trunc('millisecond', (ts)), 'Timestamp(Millisecond, Some(\"UTC\"))')";
     private static final String KOLKATA = "'Timestamp(Millisecond, Some(\"Asia/Kolkata\"))'";
+    /** The source read as UTC, which a zoned key does before it reads it in the zone. */
+    private static final String AS_UTC = "arrow_cast((ts), 'Timestamp(Millisecond, Some(\"UTC\"))')";
 
     /**
      * date_bin takes only the dates an i64 of nanoseconds holds; the rest,
@@ -103,13 +106,185 @@ public class InfinoDateKeyTests extends OpenSearchTestCase {
         assertTrue(key, key.endsWith(" + (21600000), " + KOLKATA + ")"));
     }
 
-    /** dateExpr sends a zoned fixed interval through zonedBin, reading the source in the zone first. */
+    /**
+     * dateExpr sends a zoned fixed interval through zonedBin, reading the
+     * source in the zone first: alone, in a zone that still changes its
+     * clocks and with no word of where the dates fall.
+     */
     public void testDateExprSendsAZonedFixedIntervalThroughZonedBin() {
         InfinoAggregationProcessor.Source ts = new InfinoAggregationProcessor.Source("ts", SqlType.DATE, "[ts]", null);
+        String london = "'Timestamp(Millisecond, Some(\"Europe/London\"))'";
+        String key = InfinoAggregationProcessor.Grouped.dateExpr("h", ts, ZoneId.of("Europe/London"), new DateHistogramInterval("2h"), null, 0).keyExpr();
+        assertEquals(InfinoAggregationProcessor.Grouped.zonedBin("arrow_cast(" + AS_UTC + ", " + london + ")", london, 2 * HOUR, 0), key);
+    }
+
+    /**
+     * A date is read as UTC before it is read in the request's zone. A
+     * table written elsewhere may keep its dates with no zone, and a cast
+     * straight to the zone takes such a date for local time there, which
+     * moves every bucket by the zone's offset.
+     */
+    public void testAZonedKeyReadsTheDateAsUtcFirst() {
+        InfinoAggregationProcessor.Source ts = new InfinoAggregationProcessor.Source("ts", SqlType.DATE, "[ts]", null);
+        String london = "'Timestamp(Millisecond, Some(\"Europe/London\"))'";
+        for (DateHistogramInterval unit : List.of(DateHistogramInterval.HOUR, DateHistogramInterval.MONTH)) {
+            String key = InfinoAggregationProcessor.Grouped.dateExpr("h", ts, ZoneId.of("Europe/London"), null, unit, 0).keyExpr();
+            assertTrue(key, key.contains("arrow_cast(" + AS_UTC + ", " + london + ")"));
+            assertFalse(key, key.contains("arrow_cast((ts), " + london + ")"));
+        }
+    }
+
+    /**
+     * A zone that no longer changes its clocks keeps one offset from its
+     * last change on. Dates from then on, less an interval and a day, are
+     * floored in UTC with the origin moved by the offset, and read in no
+     * zone; only earlier dates go through the zone. Both give a key of the
+     * zone's type.
+     */
+    public void testAZoneThatNoLongerChangesFloorsInUtc() {
+        InfinoAggregationProcessor.Source ts = new InfinoAggregationProcessor.Source("ts", SqlType.DATE, "[ts]", null);
         ZoneId tz = ZoneId.of("Asia/Kolkata");
-        String key = InfinoAggregationProcessor.Grouped.dateExpr("h", ts, tz, new DateHistogramInterval("2h"), null, 0).keyExpr();
-        String expected = InfinoAggregationProcessor.Grouped.zonedBin("arrow_cast((ts), " + KOLKATA + ")", KOLKATA, 2 * HOUR, 0);
-        assertEquals(expected, key);
+        // Read from this JVM's zone data (1945-10-14T17:30:00Z in most): builds differ on old dates.
+        List<ZoneOffsetTransition> changes = tz.getRules().getTransitions();
+        long lastChange = changes.get(changes.size() - 1).getInstant().toEpochMilli();
+        long plusFiveThirty = 19_800_000L;
+        assertEquals(List.of(new InfinoAggregationProcessor.Grouped.Steady(lastChange, null, plusFiveThirty)), InfinoAggregationProcessor.Grouped.steady(tz, null, null));
+
+        String epoch = "arrow_cast(" + MILLIS + ", 'Int64')";
+        String floor = "arrow_cast(" + InfinoAggregationProcessor.Grouped.utcBin("(ts)", 2 * HOUR, -plusFiveThirty) + ", " + KOLKATA + ")";
+        String zoned = InfinoAggregationProcessor.Grouped.zonedBin("arrow_cast(" + AS_UTC + ", " + KOLKATA + ")", KOLKATA, 2 * HOUR, 0);
+        String fixed = InfinoAggregationProcessor.Grouped.dateExpr("h", ts, tz, new DateHistogramInterval("2h"), null, 0).keyExpr();
+        assertEquals("CASE WHEN " + epoch + " >= " + (lastChange + 2 * HOUR + 24 * HOUR) + " THEN " + floor + " ELSE " + zoned + " END", fixed);
+
+        String hour = InfinoAggregationProcessor.Grouped.dateExpr("h", ts, tz, null, DateHistogramInterval.HOUR, 0).keyExpr();
+        String hourFloor = "arrow_cast(" + InfinoAggregationProcessor.Grouped.utcBin("(ts)", HOUR, -plusFiveThirty) + ", " + KOLKATA + ")";
+        assertEquals(
+            "CASE WHEN " + epoch + " >= " + (lastChange + HOUR + 24 * HOUR) + " THEN " + hourFloor + " ELSE date_trunc('hour', arrow_cast(" + AS_UTC + ", " + KOLKATA + ")) END",
+            hour
+        );
+    }
+
+    /** A zone that is an offset and nothing else has no dates to send through a zone: the key is the floor alone. */
+    public void testAZoneOfOneOffsetIsTheFloorAlone() {
+        InfinoAggregationProcessor.Source ts = new InfinoAggregationProcessor.Source("ts", SqlType.DATE, "[ts]", null);
+        String zone = "'Timestamp(Millisecond, Some(\"-03:00\"))'";
+        String key = InfinoAggregationProcessor.Grouped.dateExpr("h", ts, ZoneId.of("-03:00"), null, DateHistogramInterval.DAY, 0).keyExpr();
+        assertEquals("arrow_cast(" + InfinoAggregationProcessor.Grouped.utcBin("(ts)", 24 * HOUR, 3 * HOUR) + ", " + zone + ")", key);
+        assertFalse(key, key.contains("to_local_time"));
+        assertFalse(key, key.contains("date_trunc('day'"));
+    }
+
+    /**
+     * In a zone that still changes its clocks, the span the request gives
+     * says which stretches its dates fall in: a week in one stretch floors
+     * between that stretch's ends, and a span across a change floors on each
+     * side of it. A week, month or year has no one length, and is always
+     * read in the zone.
+     */
+    public void testASpanChoosesTheStretchesOfAZoneThatChanges() {
+        InfinoAggregationProcessor.Source ts = new InfinoAggregationProcessor.Source("ts", SqlType.DATE, "[ts]", null);
+        ZoneId tz = ZoneId.of("America/Los_Angeles");
+        long from = Instant.parse("2025-12-01T08:00:00Z").toEpochMilli();
+        long to = Instant.parse("2025-12-08T08:00:00Z").toEpochMilli();
+        long pst = Instant.parse("2025-11-02T09:00:00Z").toEpochMilli();
+        long pdt = Instant.parse("2026-03-08T10:00:00Z").toEpochMilli();
+        assertEquals(List.of(new InfinoAggregationProcessor.Grouped.Steady(pst, pdt, -8 * HOUR)), InfinoAggregationProcessor.Grouped.steady(tz, from, to));
+        String week = InfinoAggregationProcessor.Grouped.dateExpr("h", ts, tz, null, DateHistogramInterval.HOUR, 0, from, to).keyExpr();
+        assertTrue(week, week.startsWith("CASE WHEN arrow_cast(" + MILLIS + ", 'Int64') BETWEEN " + (pst + 25 * HOUR) + " AND " + (pdt - 1) + " THEN arrow_cast("));
+        assertTrue(week, week.endsWith(" ELSE date_trunc('hour', arrow_cast(" + AS_UTC + ", 'Timestamp(Millisecond, Some(\"America/Los_Angeles\"))')) END"));
+
+        List<InfinoAggregationProcessor.Grouped.Steady> across = InfinoAggregationProcessor.Grouped.steady(tz, pst - 24 * HOUR, pst + 24 * HOUR);
+        assertEquals(2, across.size());
+        assertEquals(-7 * HOUR, across.get(0).offsetMillis());
+        assertEquals(Long.valueOf(pst), across.get(0).until());
+        assertEquals(new InfinoAggregationProcessor.Grouped.Steady(pst, pdt, -8 * HOUR), across.get(1));
+        assertEquals(4, InfinoAggregationProcessor.Grouped.steady(tz, 0L, to).size());
+        assertEquals(List.of(), InfinoAggregationProcessor.Grouped.steady(tz, null, null));
+
+        String month = InfinoAggregationProcessor.Grouped.dateExpr("h", ts, tz, null, DateHistogramInterval.MONTH, 0, from, to).keyExpr();
+        assertEquals("date_trunc('month', arrow_cast(" + AS_UTC + ", 'Timestamp(Millisecond, Some(\"America/Los_Angeles\"))'))", month);
+    }
+
+    /**
+     * The floor gives stock's key for every date it takes: minute by minute
+     * for four days around a change, with the request's span set across it,
+     * in zones whose clocks move an hour in the small hours, by half an hour
+     * (Lord Howe), at midnight (Santiago, Havana), and in one whose last
+     * change is long past (Kolkata), for fixed intervals and for a calendar
+     * minute, hour and day, with and without an offset. The dates nearest
+     * the change are not floored, and most of the rest are.
+     */
+    public void testFlooredKeysMatchStock() {
+        String[][] changes = {
+            { "Europe/London", "2026-03-29T01:00:00Z", "2026-10-25T01:00:00Z" },
+            { "America/Los_Angeles", "2026-03-08T10:00:00Z", "2026-11-01T09:00:00Z" },
+            { "Australia/Lord_Howe", "2026-04-04T15:00:00Z", "2026-10-03T15:30:00Z" },
+            { "America/Santiago", "2026-04-05T03:00:00Z", "2026-09-06T04:00:00Z" },
+            { "America/Havana", "2026-03-08T05:00:00Z", "2026-11-01T05:00:00Z" },
+            { "Asia/Kolkata", "1945-10-14T17:30:00Z" } };
+        long[] intervals = { HOUR / 2, HOUR, 3 * HOUR, 24 * HOUR };
+        DateHistogramInterval[] units = { DateHistogramInterval.MINUTE, DateHistogramInterval.HOUR, DateHistogramInterval.DAY };
+        long[] unitMillis = { 60_000L, HOUR, 24 * HOUR };
+        long[] offsets = { 0, HOUR / 2, -2 * HOUR };
+        for (String[] change : changes) {
+            ZoneId tz = ZoneId.of(change[0]);
+            for (int c = 1; c < change.length; c++) {
+                long at = Instant.parse(change[c]).toEpochMilli();
+                long from = at - 96 * HOUR;
+                long to = at + 96 * HOUR;
+                for (long offset : offsets) {
+                    for (int i = 0; i < intervals.length + units.length; i++) {
+                        boolean fixed = i < intervals.length;
+                        long ms = fixed ? intervals[i] : unitMillis[i - intervals.length];
+                        DateIntervalWrapper wrapper = new DateIntervalWrapper();
+                        if (fixed) {
+                            wrapper.fixedInterval(new DateHistogramInterval(ms + "ms"));
+                        } else {
+                            wrapper.calendarInterval(units[i - intervals.length]);
+                        }
+                        Rounding.Prepared stock = wrapper.createRounding(tz, offset).prepare(from - 50 * HOUR, to + 50 * HOUR);
+                        int floored = 0;
+                        int all = 0;
+                        for (long u = from; u <= to; u += 60_000L) {
+                            Long key = flooredKey(tz, u, ms, offset, from, to);
+                            all++;
+                            if (key == null) {
+                                continue;
+                            }
+                            floored++;
+                            String what = change[0] + " " + Instant.ofEpochMilli(u) + (fixed ? " every " + ms : " calendar " + ms) + " offset " + offset;
+                            assertEquals(what, stock.round(u), key.longValue());
+                            // The zone's last change before the date, as this JVM's zone data has it: the
+                            // data differs between JDK builds, so the instants above only place the window.
+                            ZoneOffsetTransition last = tz.getRules().previousTransition(Instant.ofEpochMilli(u + 1));
+                            assertTrue(
+                                what + " is floored within a day after the change",
+                                last == null || u >= last.getInstant().toEpochMilli() + 24 * HOUR
+                            );
+                        }
+                        assertTrue(change[0] + " floors most dates: " + floored + " of " + all, floored > all / 2);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * {@link InfinoAggregationProcessor.Grouped#steadyBin}'s choice and
+     * arithmetic in Java: the floor of {@code epoch} in the first stretch
+     * that takes it, or null for a date that goes through the zone.
+     */
+    private static Long flooredKey(ZoneId tz, long epoch, long ms, long offset, long from, long to) {
+        for (InfinoAggregationProcessor.Grouped.Steady s : InfinoAggregationProcessor.Grouped.steady(tz, from, to)) {
+            Long lo = s.first(ms, offset);
+            Long hi = s.last(offset);
+            if ((lo == null || epoch >= lo) && (hi == null || epoch <= hi)) {
+                long moved = offset - s.offsetMillis();
+                long shifted = epoch - moved;
+                return shifted - Math.floorMod(shifted, ms) + moved;
+            }
+        }
+        return null;
     }
 
     /**
