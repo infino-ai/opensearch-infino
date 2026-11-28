@@ -11,13 +11,19 @@ import org.opensearch.infino.InfinoNative.Column;
 import org.opensearch.search.SearchModule;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.AggregationBuilders;
+import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.aggregations.bucket.terms.Terms;
+import org.opensearch.search.aggregations.metrics.CardinalityAggregationBuilder;
 import org.opensearch.search.aggregations.metrics.InternalCardinality;
 import org.opensearch.search.aggregations.metrics.InternalTDigestPercentiles;
+import org.opensearch.search.aggregations.metrics.Sum;
+import org.opensearch.search.aggregations.metrics.ValueCount;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -38,7 +44,22 @@ public class InfinoAggregationOverSeveralTests extends OpenSearchTestCase {
     private static final String USER_LONG = "over_several_user_long";
     /** Maps latency as an integer. */
     private static final String LATENCY_INT = "over_several_latency_int";
-    private static final List<String> TABLES = List.of(WITHOUT, WITH, USER_LONG, LATENCY_INT);
+    /**
+     * Map name as text with a keyword multi-field, who as an alias of uid, and
+     * tags and n, which some documents give several values. Their documents
+     * have the same ids, as two indices' documents may.
+     */
+    private static final String MULTI_A = "over_several_multi_a";
+    private static final String MULTI_B = "over_several_multi_b";
+    private static final String MULTI_MAPPING = "{\"properties\":{\"name\":{\"type\":\"text\",\"fields\":{\"keyword\":{\"type\":\"keyword\"}}},"
+        + "\"uid\":{\"type\":\"keyword\"},\"who\":{\"type\":\"alias\",\"path\":\"uid\"},\"tags\":{\"type\":\"keyword\"},\"n\":{\"type\":\"long\"}}}";
+    /** Rows of each of {@link #MULTI_A} and {@link #MULTI_B}. */
+    private static final int MULTI_ROWS = 10;
+    /** How far {@link #MULTI_B}'s names and uids are shifted from {@link #MULTI_A}'s, so the two share half of them. */
+    private static final int SHIFT = 5;
+    /** Every third document of each gives n two values: its own and this one's (A) or twice it (B). */
+    private static final int SECOND_N = 10;
+    private static final List<String> TABLES = List.of(WITHOUT, WITH, USER_LONG, LATENCY_INT, MULTI_A, MULTI_B);
     /** Rows of {@link #WITH}: user u(i mod USERS), latency i. */
     private static final int ROWS = 100;
     private static final int USERS = 10;
@@ -64,6 +85,20 @@ public class InfinoAggregationOverSeveralTests extends OpenSearchTestCase {
         index(WITH, with);
         index(USER_LONG, List.of("{\"user\":5}"));
         index(LATENCY_INT, List.of("{\"latency\":" + ROWS + "}"));
+        InfinoNative.ensureTable(MULTI_A, MULTI_MAPPING);
+        InfinoNative.ensureTable(MULTI_B, MULTI_MAPPING);
+        List<String> a = new ArrayList<>();
+        List<String> b = new ArrayList<>();
+        for (int i = 0; i < MULTI_ROWS; i++) {
+            boolean even = i % 2 == 0;
+            String nA = i % 3 == 0 ? "[" + i + "," + SECOND_N + "]" : Integer.toString(i);
+            String nB = i % 3 == 0 ? "[" + i + "," + 2 * SECOND_N + "]" : Integer.toString(i);
+            a.add("{\"name\":\"n" + i + "\",\"uid\":\"u" + i + "\",\"tags\":" + (even ? "[\"red\",\"blue\"]" : "\"red\"") + ",\"n\":" + nA + "}");
+            int j = i + SHIFT;
+            b.add("{\"name\":\"n" + j + "\",\"uid\":\"u" + j + "\",\"tags\":" + (even ? "[\"red\",\"green\"]" : "\"blue\"") + ",\"n\":" + nB + "}");
+        }
+        index(MULTI_A, a);
+        index(MULTI_B, b);
     }
 
     @Override
@@ -179,5 +214,114 @@ public class InfinoAggregationOverSeveralTests extends OpenSearchTestCase {
             LATENCY_INT
         ).get("p");
         assertEquals(ROWS, p.percentile(100), 0);
+    }
+
+    /**
+     * A keyword multi-field and a field alias over several indices: the
+     * plan keys their columns by the field's name, so the union's columns
+     * are keyed so too. Keyed by the column's name, name.keyword met the
+     * text column name and was refused as mapped as different types, and
+     * the alias was not found at all.
+     */
+    public void testAKeywordSubfieldAndAnAliasAreReadOverSeveral() {
+        CardinalityAggregationBuilder byKeyword = AggregationBuilders.cardinality("c").field("name.keyword");
+        assertEquals(MULTI_ROWS, ((InternalCardinality) over(byKeyword, MULTI_A).get("c")).getValue());
+        assertEquals(MULTI_ROWS + SHIFT, ((InternalCardinality) over(byKeyword, MULTI_A, MULTI_B).get("c")).getValue());
+        // Two shards of one index: the same mapping twice.
+        assertEquals(MULTI_ROWS, ((InternalCardinality) over(byKeyword, MULTI_A, MULTI_A).get("c")).getValue());
+        CardinalityAggregationBuilder byAlias = AggregationBuilders.cardinality("c").field("who");
+        assertEquals(MULTI_ROWS + SHIFT, ((InternalCardinality) over(byAlias, MULTI_A, MULTI_B).get("c")).getValue());
+        Terms t = (Terms) over(
+            AggregationBuilders.terms("t").field("who").size(1).order(BucketOrder.key(true)).subAggregation(byKeyword),
+            MULTI_A,
+            MULTI_B
+        ).get("t");
+        assertEquals("u0", t.getBuckets().get(0).getKeyAsString());
+        assertEquals(1, ((InternalCardinality) t.getBuckets().get(0).getAggregations().get("c")).getValue());
+    }
+
+    /**
+     * A terms level over a field some documents give several values, with
+     * a cardinality and a sum over another such field under it, over two
+     * indices whose documents have the same ids: each document is told apart
+     * by its index as well as its id. By id alone, A's document 0 and B's
+     * document 0 both tagged red were one document, and B's documents read
+     * A's figures; the statement did not parse either, as the union was
+     * given a second alias.
+     */
+    public void testFieldsOfSeveralValuesAreReadPerDocumentOfEachIndex() {
+        Terms t = (Terms) over(
+            AggregationBuilders.terms("t")
+                .field("tags")
+                .subAggregation(AggregationBuilders.cardinality("c").field("uid"))
+                .subAggregation(AggregationBuilders.sum("s").field("n"))
+                .subAggregation(AggregationBuilders.count("v").field("n")),
+            MULTI_A,
+            MULTI_B
+        ).get("t");
+        Map<String, long[]> got = new HashMap<>();
+        for (Terms.Bucket b : t.getBuckets()) {
+            got.put(
+                b.getKeyAsString(),
+                new long[] {
+                    b.getDocCount(),
+                    ((InternalCardinality) b.getAggregations().get("c")).getValue(),
+                    (long) ((Sum) b.getAggregations().get("s")).getValue(),
+                    ((ValueCount) b.getAggregations().get("v")).getValue() }
+            );
+        }
+        // Worked out from the documents setUp writes: {documents, distinct uids, sum of n, values of n}.
+        assertArrayEquals(new long[] { 15, 12, 145, 21 }, got.get("red"));
+        assertArrayEquals(new long[] { 10, 8, 105, 14 }, got.get("blue"));
+        assertArrayEquals(new long[] { 5, 5, 60, 7 }, got.get("green"));
+        assertEquals(3, got.size());
+        // A sum alone over both, beside a cardinality, reads every index's values.
+        InternalAggregations top = over(AggregationBuilders.sum("s").field("n"), MULTI_A, MULTI_B);
+        assertEquals(210, ((Sum) top.get("s")).getValue(), 0);
+    }
+
+    /**
+     * A terms level under one over a field of several values, over two
+     * indices whose documents have the same ids: each index's documents
+     * count apart, so u5, tagged red in both, holds two documents.
+     */
+    public void testATermsLevelUnderOneOfSeveralValuesCountsEachIndexsDocuments() {
+        Terms t = (Terms) over(
+            AggregationBuilders.terms("t")
+                .field("tags")
+                .subAggregation(
+                    AggregationBuilders.terms("u").field("uid").size(MULTI_ROWS + SHIFT).subAggregation(AggregationBuilders.cardinality("c").field("name.keyword"))
+                ),
+            MULTI_A,
+            MULTI_B
+        ).get("t");
+        Terms red = t.getBucketByKey("red").getAggregations().get("u");
+        // A's ten documents and B's five even ones: u0 to u9, u11 and u13.
+        assertEquals(12, red.getBuckets().size());
+        assertEquals(2, red.getBucketByKey("u5").getDocCount());
+        assertEquals(1, ((InternalCardinality) red.getBucketByKey("u5").getAggregations().get("c")).getValue());
+        assertEquals(1, red.getBucketByKey("u11").getDocCount());
+        Terms blue = t.getBucketByKey("blue").getAggregations().get("u");
+        assertEquals(2, blue.getBucketByKey("u6").getDocCount());
+    }
+
+    /**
+     * A range over a field of several values, which reads the documents any
+     * of whose values falls in a range by id from one table, is refused over
+     * several indices rather than read from the first index's documents.
+     */
+    public void testARangeOverAFieldOfSeveralValuesIsRefusedOverSeveral() {
+        InfinoAggregationProcessor.Unsupported e = expectThrows(
+            InfinoAggregationProcessor.Unsupported.class,
+            () -> over(
+                AggregationBuilders.range("r").field("n").addRange(0, SHIFT).subAggregation(AggregationBuilders.cardinality("c").field("uid")),
+                MULTI_A,
+                MULTI_B
+            )
+        );
+        assertEquals(
+            "[infino] a bucket over [n], which documents give several values, read per document over several indices read as one is not served",
+            e.getMessage()
+        );
     }
 }

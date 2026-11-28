@@ -795,10 +795,16 @@
   - match: { aggregations.f.doc_count: 2 }
   - match: { aggregations.f.c.value: 2 }
   - do:
-      catch: /which documents give several values, over several indices read as one is not served/
       search:
         index: "aomv_x_def,aomv_y_def"
         body: { size: 0, aggs: { t: { terms: { field: team }, aggs: { c: { cardinality: { field: user } }, s: { sum: { field: latency_ms } } } } } }
+  - match: { aggregations.t.buckets.0.key: a }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.0.c.value: 2 }
+  - match: { aggregations.t.buckets.0.s.value: 70.0 }
+  - match: { aggregations.t.buckets.1.key: b }
+  - match: { aggregations.t.buckets.1.c.value: 1 }
+  - match: { aggregations.t.buckets.1.s.value: 30.0 }
 
 ---
 "Over several indices, a field of several values and a filter, proxy mode":
@@ -838,7 +844,346 @@
   - match: { aggregations.f.doc_count: 2 }
   - match: { aggregations.f.c.value: 2 }
   - do:
-      catch: /which documents give several values, over several indices read as one is not served/
       search:
         index: "aomv_x_prx,aomv_y_prx"
         body: { size: 0, aggs: { t: { terms: { field: team }, aggs: { c: { cardinality: { field: user } }, s: { sum: { field: latency_ms } } } } } }
+  - match: { aggregations.t.buckets.0.key: a }
+  - match: { aggregations.t.buckets.0.doc_count: 2 }
+  - match: { aggregations.t.buckets.0.c.value: 2 }
+  - match: { aggregations.t.buckets.0.s.value: 70.0 }
+  - match: { aggregations.t.buckets.1.key: b }
+  - match: { aggregations.t.buckets.1.c.value: 1 }
+  - match: { aggregations.t.buckets.1.s.value: 30.0 }
+
+# Over two indices of two shards each, whose documents have the same ids, as
+# the Lucene twins answer: a terms level with a cardinality under it keeps its
+# size buckets and counts the rest as other documents, ordered by count or by
+# the cardinality; a cardinality on a keyword multi-field or a field alias;
+# a terms level over a field of several values with a cardinality and a sum
+# over another such field under it, each document told apart by its index;
+# and a wildcard on fields that hold _index. A script reading doc['_index']
+# is refused rather than read as null.
+---
+"Over two indices of two shards each, a Lucene twin":
+  - do:
+      indices.create:
+        index: aosh_a_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { host: { type: keyword }, user: { type: keyword }, who: { type: alias, path: user }, name: { type: text, fields: { keyword: { type: keyword } } }, tags: { type: keyword }, n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aosh_a_luc
+        body:
+          - index: { _id: "1" }
+          - { host: h1, user: u1, name: n1, tags: [ red, blue ], n: [ 1, 10 ] }
+          - index: { _id: "2" }
+          - { host: h1, user: u2, name: n2, tags: red, n: 2 }
+          - index: { _id: "3" }
+          - { host: h2, user: u3, name: n3, tags: [ red, blue ], n: 3 }
+          - index: { _id: "4" }
+          - { host: h2, user: u1, name: n1, tags: blue, n: [ 4, 10 ] }
+          - index: { _id: "5" }
+          - { host: h3, user: u4, name: n4, tags: red, n: 5 }
+          - index: { _id: "6" }
+          - { host: h4, user: u5, name: n5, tags: green, n: 6 }
+  - do:
+      indices.create:
+        index: aosh_b_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { host: { type: keyword }, user: { type: keyword }, who: { type: alias, path: user }, name: { type: text, fields: { keyword: { type: keyword } } }, tags: { type: keyword }, n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aosh_b_luc
+        body:
+          - index: { _id: "1" }
+          - { host: h1, user: u6, name: n6, tags: [ red, green ], n: [ 1, 20 ] }
+          - index: { _id: "2" }
+          - { host: h2, user: u2, name: n2, tags: blue, n: 2 }
+          - index: { _id: "3" }
+          - { host: h1, user: u7, name: n7, tags: red, n: 3 }
+          - index: { _id: "4" }
+          - { host: h3, user: u1, name: n1, tags: red, n: 4 }
+  - do:
+      search:
+        index: "aosh_a_luc,aosh_b_luc"
+        body: { size: 0, aggs: { t: { terms: { field: host, size: 2 }, aggs: { c: { cardinality: { field: user } } } } } }
+  - length: { aggregations.t.buckets: 2 }
+  - match: { aggregations.t.sum_other_doc_count: 3 }
+  - match: { aggregations.t.buckets.0.key: h1 }
+  - match: { aggregations.t.buckets.0.doc_count: 4 }
+  - match: { aggregations.t.buckets.0.c.value: 4 }
+  - match: { aggregations.t.buckets.1.key: h2 }
+  - match: { aggregations.t.buckets.1.doc_count: 3 }
+  - match: { aggregations.t.buckets.1.c.value: 3 }
+  - do:
+      search:
+        index: "aosh_a_luc,aosh_b_luc"
+        body: { size: 0, aggs: { t: { terms: { field: host, size: 2, order: { c: asc } }, aggs: { c: { cardinality: { field: user } } } } } }
+  - length: { aggregations.t.buckets: 2 }
+  - match: { aggregations.t.sum_other_doc_count: 7 }
+  - match: { aggregations.t.buckets.0.key: h4 }
+  - match: { aggregations.t.buckets.0.c.value: 1 }
+  - match: { aggregations.t.buckets.1.key: h3 }
+  - match: { aggregations.t.buckets.1.c.value: 2 }
+  - do:
+      search:
+        index: "aosh_a_luc,aosh_b_luc"
+        body: { size: 0, aggs: { k: { cardinality: { field: name.keyword } }, w: { cardinality: { field: who } } } }
+  - match: { hits.total.value: 10 }
+  - match: { aggregations.k.value: 7 }
+  - match: { aggregations.w.value: 7 }
+  - do:
+      search:
+        index: aosh_a_luc
+        body: { size: 0, aggs: { k: { cardinality: { field: name.keyword } }, t: { terms: { field: host, size: 1 }, aggs: { k: { cardinality: { field: name.keyword } } } } } }
+  - match: { aggregations.k.value: 5 }
+  - length: { aggregations.t.buckets: 1 }
+  - match: { aggregations.t.sum_other_doc_count: 4 }
+  - do:
+      search:
+        index: "aosh_a_luc,aosh_b_luc"
+        body: { size: 0, aggs: { t: { terms: { field: tags }, aggs: { c: { cardinality: { field: user } }, s: { sum: { field: n } } } } } }
+  - length: { aggregations.t.buckets: 3 }
+  - match: { aggregations.t.buckets.0.key: red }
+  - match: { aggregations.t.buckets.0.doc_count: 7 }
+  - match: { aggregations.t.buckets.0.c.value: 6 }
+  - match: { aggregations.t.buckets.0.s.value: 49.0 }
+  - match: { aggregations.t.buckets.1.key: blue }
+  - match: { aggregations.t.buckets.1.doc_count: 4 }
+  - match: { aggregations.t.buckets.1.c.value: 3 }
+  - match: { aggregations.t.buckets.1.s.value: 30.0 }
+  - match: { aggregations.t.buckets.2.key: green }
+  - match: { aggregations.t.buckets.2.c.value: 2 }
+  - match: { aggregations.t.buckets.2.s.value: 27.0 }
+  - do:
+      count: { index: "aosh_a_luc,aosh_b_luc", body: { query: { query_string: { query: "n1*", fields: [ name, _index ] } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: "aosh_a_luc,aosh_b_luc", body: { query: { query_string: { query: "aosh_b*", fields: [ name, _index ] } } } }
+  - match: { count: 4 }
+  - do:
+      count: { index: "aosh_a_luc,aosh_b_luc", body: { query: { query_string: { query: "aosh_a_*", default_field: _index } } } }
+  - match: { count: 6 }
+  - do:
+      count: { index: "aosh_a_luc,aosh_b_luc", body: { query: { script: { script: "doc['_index'].value == 'aosh_a_luc'" } } } }
+  - match: { count: 6 }
+---
+"Over two indices of two shards each, default mode":
+  - do:
+      indices.create:
+        index: aosh_a_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { host: { type: keyword }, user: { type: keyword }, who: { type: alias, path: user }, name: { type: text, fields: { keyword: { type: keyword } } }, tags: { type: keyword }, n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aosh_a_def
+        body:
+          - index: { _id: "1" }
+          - { host: h1, user: u1, name: n1, tags: [ red, blue ], n: [ 1, 10 ] }
+          - index: { _id: "2" }
+          - { host: h1, user: u2, name: n2, tags: red, n: 2 }
+          - index: { _id: "3" }
+          - { host: h2, user: u3, name: n3, tags: [ red, blue ], n: 3 }
+          - index: { _id: "4" }
+          - { host: h2, user: u1, name: n1, tags: blue, n: [ 4, 10 ] }
+          - index: { _id: "5" }
+          - { host: h3, user: u4, name: n4, tags: red, n: 5 }
+          - index: { _id: "6" }
+          - { host: h4, user: u5, name: n5, tags: green, n: 6 }
+  - do:
+      indices.create:
+        index: aosh_b_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { host: { type: keyword }, user: { type: keyword }, who: { type: alias, path: user }, name: { type: text, fields: { keyword: { type: keyword } } }, tags: { type: keyword }, n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aosh_b_def
+        body:
+          - index: { _id: "1" }
+          - { host: h1, user: u6, name: n6, tags: [ red, green ], n: [ 1, 20 ] }
+          - index: { _id: "2" }
+          - { host: h2, user: u2, name: n2, tags: blue, n: 2 }
+          - index: { _id: "3" }
+          - { host: h1, user: u7, name: n7, tags: red, n: 3 }
+          - index: { _id: "4" }
+          - { host: h3, user: u1, name: n1, tags: red, n: 4 }
+  - do:
+      search:
+        index: "aosh_a_def,aosh_b_def"
+        body: { size: 0, aggs: { t: { terms: { field: host, size: 2 }, aggs: { c: { cardinality: { field: user } } } } } }
+  - length: { aggregations.t.buckets: 2 }
+  - match: { aggregations.t.sum_other_doc_count: 3 }
+  - match: { aggregations.t.buckets.0.key: h1 }
+  - match: { aggregations.t.buckets.0.doc_count: 4 }
+  - match: { aggregations.t.buckets.0.c.value: 4 }
+  - match: { aggregations.t.buckets.1.key: h2 }
+  - match: { aggregations.t.buckets.1.doc_count: 3 }
+  - match: { aggregations.t.buckets.1.c.value: 3 }
+  - do:
+      search:
+        index: "aosh_a_def,aosh_b_def"
+        body: { size: 0, aggs: { t: { terms: { field: host, size: 2, order: { c: asc } }, aggs: { c: { cardinality: { field: user } } } } } }
+  - length: { aggregations.t.buckets: 2 }
+  - match: { aggregations.t.sum_other_doc_count: 7 }
+  - match: { aggregations.t.buckets.0.key: h4 }
+  - match: { aggregations.t.buckets.0.c.value: 1 }
+  - match: { aggregations.t.buckets.1.key: h3 }
+  - match: { aggregations.t.buckets.1.c.value: 2 }
+  - do:
+      search:
+        index: "aosh_a_def,aosh_b_def"
+        body: { size: 0, aggs: { k: { cardinality: { field: name.keyword } }, w: { cardinality: { field: who } } } }
+  - match: { hits.total.value: 10 }
+  - match: { aggregations.k.value: 7 }
+  - match: { aggregations.w.value: 7 }
+  - do:
+      search:
+        index: aosh_a_def
+        body: { size: 0, aggs: { k: { cardinality: { field: name.keyword } }, t: { terms: { field: host, size: 1 }, aggs: { k: { cardinality: { field: name.keyword } } } } } }
+  - match: { aggregations.k.value: 5 }
+  - length: { aggregations.t.buckets: 1 }
+  - match: { aggregations.t.sum_other_doc_count: 4 }
+  - do:
+      search:
+        index: "aosh_a_def,aosh_b_def"
+        body: { size: 0, aggs: { t: { terms: { field: tags }, aggs: { c: { cardinality: { field: user } }, s: { sum: { field: n } } } } } }
+  - length: { aggregations.t.buckets: 3 }
+  - match: { aggregations.t.buckets.0.key: red }
+  - match: { aggregations.t.buckets.0.doc_count: 7 }
+  - match: { aggregations.t.buckets.0.c.value: 6 }
+  - match: { aggregations.t.buckets.0.s.value: 49.0 }
+  - match: { aggregations.t.buckets.1.key: blue }
+  - match: { aggregations.t.buckets.1.doc_count: 4 }
+  - match: { aggregations.t.buckets.1.c.value: 3 }
+  - match: { aggregations.t.buckets.1.s.value: 30.0 }
+  - match: { aggregations.t.buckets.2.key: green }
+  - match: { aggregations.t.buckets.2.c.value: 2 }
+  - match: { aggregations.t.buckets.2.s.value: 27.0 }
+  - do:
+      count: { index: "aosh_a_def,aosh_b_def", body: { query: { query_string: { query: "n1*", fields: [ name, _index ] } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: "aosh_a_def,aosh_b_def", body: { query: { query_string: { query: "aosh_b*", fields: [ name, _index ] } } } }
+  - match: { count: 4 }
+  - do:
+      count: { index: "aosh_a_def,aosh_b_def", body: { query: { query_string: { query: "aosh_a_*", default_field: _index } } } }
+  - match: { count: 6 }
+  - do:
+      catch: bad_request
+      count: { index: "aosh_a_def,aosh_b_def", body: { query: { script: { script: "doc['_index'].value == 'aosh_a_def'" } } } }
+---
+"Over two indices of two shards each, proxy mode":
+  - do:
+      indices.create:
+        index: aosh_a_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { host: { type: keyword }, user: { type: keyword }, who: { type: alias, path: user }, name: { type: text, fields: { keyword: { type: keyword } } }, tags: { type: keyword }, n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aosh_a_prx
+        body:
+          - index: { _id: "1" }
+          - { host: h1, user: u1, name: n1, tags: [ red, blue ], n: [ 1, 10 ] }
+          - index: { _id: "2" }
+          - { host: h1, user: u2, name: n2, tags: red, n: 2 }
+          - index: { _id: "3" }
+          - { host: h2, user: u3, name: n3, tags: [ red, blue ], n: 3 }
+          - index: { _id: "4" }
+          - { host: h2, user: u1, name: n1, tags: blue, n: [ 4, 10 ] }
+          - index: { _id: "5" }
+          - { host: h3, user: u4, name: n4, tags: red, n: 5 }
+          - index: { _id: "6" }
+          - { host: h4, user: u5, name: n5, tags: green, n: 6 }
+  - do:
+      indices.create:
+        index: aosh_b_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 2, number_of_replicas: 0 }
+          mappings: { properties: { host: { type: keyword }, user: { type: keyword }, who: { type: alias, path: user }, name: { type: text, fields: { keyword: { type: keyword } } }, tags: { type: keyword }, n: { type: long } } }
+  - do:
+      bulk:
+        refresh: true
+        index: aosh_b_prx
+        body:
+          - index: { _id: "1" }
+          - { host: h1, user: u6, name: n6, tags: [ red, green ], n: [ 1, 20 ] }
+          - index: { _id: "2" }
+          - { host: h2, user: u2, name: n2, tags: blue, n: 2 }
+          - index: { _id: "3" }
+          - { host: h1, user: u7, name: n7, tags: red, n: 3 }
+          - index: { _id: "4" }
+          - { host: h3, user: u1, name: n1, tags: red, n: 4 }
+  - do:
+      search:
+        index: "aosh_a_prx,aosh_b_prx"
+        body: { size: 0, aggs: { t: { terms: { field: host, size: 2 }, aggs: { c: { cardinality: { field: user } } } } } }
+  - length: { aggregations.t.buckets: 2 }
+  - match: { aggregations.t.sum_other_doc_count: 3 }
+  - match: { aggregations.t.buckets.0.key: h1 }
+  - match: { aggregations.t.buckets.0.doc_count: 4 }
+  - match: { aggregations.t.buckets.0.c.value: 4 }
+  - match: { aggregations.t.buckets.1.key: h2 }
+  - match: { aggregations.t.buckets.1.doc_count: 3 }
+  - match: { aggregations.t.buckets.1.c.value: 3 }
+  - do:
+      search:
+        index: "aosh_a_prx,aosh_b_prx"
+        body: { size: 0, aggs: { t: { terms: { field: host, size: 2, order: { c: asc } }, aggs: { c: { cardinality: { field: user } } } } } }
+  - length: { aggregations.t.buckets: 2 }
+  - match: { aggregations.t.sum_other_doc_count: 7 }
+  - match: { aggregations.t.buckets.0.key: h4 }
+  - match: { aggregations.t.buckets.0.c.value: 1 }
+  - match: { aggregations.t.buckets.1.key: h3 }
+  - match: { aggregations.t.buckets.1.c.value: 2 }
+  - do:
+      search:
+        index: "aosh_a_prx,aosh_b_prx"
+        body: { size: 0, aggs: { k: { cardinality: { field: name.keyword } }, w: { cardinality: { field: who } } } }
+  - match: { hits.total.value: 10 }
+  - match: { aggregations.k.value: 7 }
+  - match: { aggregations.w.value: 7 }
+  - do:
+      search:
+        index: aosh_a_prx
+        body: { size: 0, aggs: { k: { cardinality: { field: name.keyword } }, t: { terms: { field: host, size: 1 }, aggs: { k: { cardinality: { field: name.keyword } } } } } }
+  - match: { aggregations.k.value: 5 }
+  - length: { aggregations.t.buckets: 1 }
+  - match: { aggregations.t.sum_other_doc_count: 4 }
+  - do:
+      search:
+        index: "aosh_a_prx,aosh_b_prx"
+        body: { size: 0, aggs: { t: { terms: { field: tags }, aggs: { c: { cardinality: { field: user } }, s: { sum: { field: n } } } } } }
+  - length: { aggregations.t.buckets: 3 }
+  - match: { aggregations.t.buckets.0.key: red }
+  - match: { aggregations.t.buckets.0.doc_count: 7 }
+  - match: { aggregations.t.buckets.0.c.value: 6 }
+  - match: { aggregations.t.buckets.0.s.value: 49.0 }
+  - match: { aggregations.t.buckets.1.key: blue }
+  - match: { aggregations.t.buckets.1.doc_count: 4 }
+  - match: { aggregations.t.buckets.1.c.value: 3 }
+  - match: { aggregations.t.buckets.1.s.value: 30.0 }
+  - match: { aggregations.t.buckets.2.key: green }
+  - match: { aggregations.t.buckets.2.c.value: 2 }
+  - match: { aggregations.t.buckets.2.s.value: 27.0 }
+  - do:
+      count: { index: "aosh_a_prx,aosh_b_prx", body: { query: { query_string: { query: "n1*", fields: [ name, _index ] } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: "aosh_a_prx,aosh_b_prx", body: { query: { query_string: { query: "aosh_b*", fields: [ name, _index ] } } } }
+  - match: { count: 4 }
+  - do:
+      count: { index: "aosh_a_prx,aosh_b_prx", body: { query: { query_string: { query: "aosh_a_*", default_field: _index } } } }
+  - match: { count: 6 }
+  - do:
+      catch: bad_request
+      count: { index: "aosh_a_prx,aosh_b_prx", body: { query: { script: { script: "doc['_index'].value == 'aosh_a_prx'" } } } }

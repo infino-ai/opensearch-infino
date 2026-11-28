@@ -213,6 +213,8 @@ public class InfinoAggregationProcessor {
     private static final String INDEX_COLUMN = "_infino_index";
     /** The alias of {@link #unionOf}'s relation. */
     private static final String UNION_ALIAS = "_infino_shards";
+    /** How {@link #unionOf}'s relation ends: its alias, which {@link #aliased} swaps for another. */
+    private static final String UNION_AS = " AS " + quoteIdent(UNION_ALIAS);
     /** The alias of a significant_terms level's background rows. */
     private static final String BACKGROUND_ALIAS = "_infino_background";
     /** What separates a field's name from the name of one of its per-document figures ({@link Values#figure}). */
@@ -511,10 +513,23 @@ public class InfinoAggregationProcessor {
         List<Map<String, Column>> each = new ArrayList<>(plans.size());
         for (Plan p : plans) {
             each.add(p.cols());
-            for (Column c : p.cols().values()) {
-                Column seen = cols.putIfAbsent(c.name(), c);
-                if (seen != null && !sameKind(seen, c)) {
-                    mixed.add(c.name());
+            // Keyed as the plan keys them, by field: a keyword multi-field
+            // (user.keyword) and a field alias name a column under their own key.
+            for (Map.Entry<String, Column> e : p.cols().entrySet()) {
+                Column seen = cols.putIfAbsent(e.getKey(), e.getValue());
+                if (seen != null && !sameKind(seen, e.getValue())) {
+                    mixed.add(e.getKey());
+                }
+            }
+        }
+        // The union carries one column per name. A key one table lacks while
+        // that table holds its column under another key (user.keyword where
+        // the field is a plain keyword; an alias one index does not map)
+        // would read that table's values, which stock reads as unmapped.
+        for (Map.Entry<String, Column> e : cols.entrySet()) {
+            for (Map<String, Column> table : each) {
+                if (!table.containsKey(e.getKey()) && holdsColumn(table, e.getValue().name())) {
+                    mixed.add(e.getKey());
                 }
             }
         }
@@ -555,6 +570,32 @@ public class InfinoAggregationProcessor {
             }
         }
         return first != null;
+    }
+
+    /**
+     * The key of {@code cols} an aggregation on {@code field} reads, as
+     * {@link InfinoSearch#columnFor} finds it: the field's own, else for
+     * {@code name.keyword} the string field {@code name}'s.
+     */
+    private static String keyOf(Map<String, Column> cols, String field) {
+        if (!cols.containsKey(field) && field.endsWith(".keyword")) {
+            String base = field.substring(0, field.length() - ".keyword".length());
+            Column c = cols.get(base);
+            if (c != null && c.isString()) {
+                return base;
+            }
+        }
+        return field;
+    }
+
+    /** Whether a column of {@code table} is named {@code name}, under whatever key. */
+    private static boolean holdsColumn(Map<String, Column> table, String name) {
+        for (Column c : table.values()) {
+            if (c.name().equals(name)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** {@code c} read as doubles, of no narrower mapping type. */
@@ -614,12 +655,11 @@ public class InfinoAggregationProcessor {
                 for (Plan p : plans) {
                     refuseUnserved("aggregation [" + b.getName() + "]", p.table(), field);
                 }
-                Column c = InfinoSearch.columnFor(cols, field);
-                boolean asDoubles = c != null
-                    && numbers.contains(c.name())
+                String key = keyOf(cols, field);
+                boolean asDoubles = numbers.contains(key)
                     && !(b instanceof CardinalityAggregationBuilder)
                     && !(b instanceof CompositeAggregationBuilder);
-                if (c != null && mixed.contains(c.name()) && !asDoubles) {
+                if (mixed.contains(key) && !asDoubles) {
                     throw new Unsupported(
                         "aggregation [" + b.getName() + "] on [" + field + "] over several indices that map it as different types is not served"
                     );
@@ -661,13 +701,6 @@ public class InfinoAggregationProcessor {
         // document's figures over them, joined in once for the whole request.
         List<Source> figured = new ArrayList<>();
         multiMetricSources(specs, figured);
-        if (!figured.isEmpty() && tables.size() > 1) {
-            // The figures join on a document's id over one table; over several
-            // tables read as one the same id names a document of each.
-            throw new Unsupported(
-                "a metric over " + figured.get(0).label() + ", which documents give several values, over several indices read as one is not served"
-            );
-        }
         String relation = figured.isEmpty() ? from : perDocument(from, figured);
         Map<String, InternalAggregation> byName = new HashMap<>();
         List<Metric> rootMetrics = new ArrayList<>();
@@ -849,7 +882,7 @@ public class InfinoAggregationProcessor {
             Translation q = plans.get(i).query();
             branches.add("SELECT " + String.join(", ", select) + " FROM " + q.from() + " WHERE " + q.where());
         }
-        return "(" + String.join(" UNION ALL ", branches) + ") AS " + quoteIdent(UNION_ALIAS);
+        return "(" + String.join(" UNION ALL ", branches) + ")" + UNION_AS;
     }
 
     /**
@@ -912,6 +945,13 @@ public class InfinoAggregationProcessor {
      * multi-valued field's values per document.
      */
     static String perDocument(String from, Collection<Source> fields) {
+        List<String> key = documentKey(from);
+        List<String> docs = new ArrayList<>(key.size());
+        List<String> docsAs = new ArrayList<>(key.size());
+        for (int j = 0; j < key.size(); j++) {
+            docs.add(FIGURE_DOC + j);
+            docsAs.add(key.get(j) + " AS " + FIGURE_DOC + j);
+        }
         StringBuilder select = new StringBuilder("SELECT " + METRIC_DOCS + ".*");
         StringBuilder joins = new StringBuilder();
         List<String> done = new ArrayList<>();
@@ -937,12 +977,44 @@ public class InfinoAggregationProcessor {
                 computed.add(figure.getValue() + " AS " + v.figure(figure.getKey()));
                 select.append(", ").append(alias).append('.').append(v.figure(figure.getKey()));
             }
-            String values = "SELECT " + InfinoQueryTranslator.OSID + " AS " + FIGURE_DOC + ", unnest(" + v.each(s.expr()) + ") AS " + FIGURE_VALUE + " FROM "
-                + quoteIdent(v.table());
-            joins.append(" LEFT JOIN (SELECT " + FIGURE_DOC + ", " + String.join(", ", computed) + " FROM (" + values + ") GROUP BY " + FIGURE_DOC + ") " + alias)
-                .append(" ON " + alias + "." + FIGURE_DOC + " = " + METRIC_DOCS + "." + InfinoQueryTranslator.OSID);
+            // Over one table its every row; over several read as one, the union's rows, each table's own.
+            String values = "SELECT " + String.join(", ", docsAs) + ", unnest(" + v.each(s.expr()) + ") AS " + FIGURE_VALUE + " FROM "
+                + (v.table() == null ? from : quoteIdent(v.table()));
+            joins.append(
+                " LEFT JOIN (SELECT " + String.join(", ", docs) + ", " + String.join(", ", computed) + " FROM (" + values + ") GROUP BY "
+                    + String.join(", ", docs) + ") " + alias
+            ).append(" ON " + sameDocument(alias, docs, METRIC_DOCS, key));
         }
-        return "(" + select + " FROM " + from + " " + METRIC_DOCS + joins + ")";
+        // Still the union's rows, under its alias, so what reads them tells its documents apart the same way.
+        return "(" + select + " FROM " + aliased(from, METRIC_DOCS) + joins + ")" + (isUnion(from) ? UNION_AS : "");
+    }
+
+    /**
+     * The columns naming one document of {@code from}: its id, and over
+     * several tables read as one ({@link #unionOf}) the table it came from
+     * too, as one id can name a document of each index.
+     */
+    static List<String> documentKey(String from) {
+        return isUnion(from) ? List.of(quoteIdent(SHARD_COLUMN), InfinoQueryTranslator.OSID) : List.of(InfinoQueryTranslator.OSID);
+    }
+
+    /** {@code left.leftCols[j] = right.rightCols[j]} for every j: the same document on both sides. */
+    private static String sameDocument(String left, List<String> leftCols, String right, List<String> rightCols) {
+        List<String> eq = new ArrayList<>(leftCols.size());
+        for (int j = 0; j < leftCols.size(); j++) {
+            eq.add(left + "." + leftCols.get(j) + " = " + right + "." + rightCols.get(j));
+        }
+        return String.join(" AND ", eq);
+    }
+
+    /** Whether {@code from} is several tables read as one ({@link #unionOf}). */
+    static boolean isUnion(String from) {
+        return from.endsWith(UNION_AS);
+    }
+
+    /** {@code from} read under {@code alias}: a table's name, or the union under that alias in place of its own. */
+    static String aliased(String from, String alias) {
+        return (isUnion(from) ? from.substring(0, from.length() - UNION_AS.length()) : from) + " " + alias;
     }
 
     /**
@@ -959,8 +1031,8 @@ public class InfinoAggregationProcessor {
             if (done.contains(s.expr())) {
                 continue;
             }
-            relation = "(SELECT * EXCLUDE (" + s.expr() + "), unnest(" + s.values().each(s.expr()) + ") AS " + s.expr() + " FROM " + relation + " " + VALUE_LAYER
-                + done.size() + ")";
+            relation = "(SELECT * EXCLUDE (" + s.expr() + "), unnest(" + s.values().each(s.expr()) + ") AS " + s.expr() + " FROM "
+                + aliased(relation, VALUE_LAYER + done.size()) + ")";
             done.add(s.expr());
         }
         return relation;
@@ -989,11 +1061,17 @@ public class InfinoAggregationProcessor {
         for (int j = 0; j < keyCols.size(); j++) {
             keys.add(BUCKET_KEYS + ".k" + j + " AS k" + j);
         }
-        String perDocument = "SELECT DISTINCT " + InfinoQueryTranslator.OSID + " AS " + BUCKET_DOC + ", " + String.join(", ", keyCols) + " FROM "
+        // A document is its id, and over several tables read as one its table too.
+        List<String> key = documentKey(from);
+        List<String> docs = new ArrayList<>(key.size());
+        List<String> docsAs = new ArrayList<>(key.size());
+        for (int j = 0; j < key.size(); j++) {
+            docs.add(BUCKET_DOC + j);
+            docsAs.add(key.get(j) + " AS " + BUCKET_DOC + j);
+        }
+        String perDocument = "SELECT DISTINCT " + String.join(", ", docsAs) + ", " + String.join(", ", keyCols) + " FROM "
             + valuesRelation(from, multi) + " " + VALUE_ROWS + " WHERE " + where;
-        String documents = metrics.isEmpty()
-            ? ""
-            : " JOIN " + from + " " + BUCKET_DOCS + " ON " + BUCKET_DOCS + "." + InfinoQueryTranslator.OSID + " = " + BUCKET_KEYS + "." + BUCKET_DOC;
+        String documents = metrics.isEmpty() ? "" : " JOIN " + aliased(from, BUCKET_DOCS) + " ON " + sameDocument(BUCKET_DOCS, key, BUCKET_KEYS, docs);
         return "SELECT " + String.join(", ", keys) + ", COUNT(*) AS doc_count" + tail + " FROM (" + perDocument + ") " + BUCKET_KEYS + documents + " GROUP BY "
             + positions + having;
     }
@@ -1270,7 +1348,9 @@ public class InfinoAggregationProcessor {
         /** A field's column, and the list column it keeps several values in when a document gives it some. */
         static Source of(Column c, Map<String, Column> cols, String table) {
             Column list = c.isList() ? c : InfinoQueryTranslator.listOf(cols, c);
-            Values values = list == null ? null : new Values(c.name(), quoteIdent(list.name()), c.isList(), table);
+            // Over several tables read as one (which carries the index column) no one table holds the values.
+            String valuesTable = cols.containsKey(INDEX_COLUMN) ? null : table;
+            Values values = list == null ? null : new Values(c.name(), quoteIdent(list.name()), c.isList(), valuesTable);
             return new Source(
                 quoteIdent(c.name()),
                 InfinoScriptTranslator.typeOf(c.element()),
@@ -1296,6 +1376,12 @@ public class InfinoAggregationProcessor {
         String anyValue(Function<String, String> test) {
             if (values == null) {
                 return test.apply(expr);
+            }
+            if (values.table() == null) {
+                // The subquery reads one table's lists by id; over several read as one an id names a document of each.
+                throw new Unsupported(
+                    "a bucket over " + label + ", which documents give several values, read per document over several indices read as one is not served"
+                );
             }
             return InfinoQueryTranslator.anyValue(values.table(), values.listOnly() ? null : expr, values.list(), test);
         }
@@ -1373,7 +1459,9 @@ public class InfinoAggregationProcessor {
      * {@code field} its name, {@code list} its list column (quoted),
      * {@code listOnly} whether the field has no column of its own (one the
      * mapping does not name, which the engine made a list), and the
-     * {@code table} a subquery over the list reads. A metric reads such a
+     * {@code table} a subquery over the list reads (null over several
+     * tables read as one, {@link #unionOf}, whose rows are read in place of
+     * it). A metric reads such a
      * field from each document's own figures over its values, which
      * {@link #perDocument} joins in under {@link #figure}.
      */
