@@ -1,0 +1,331 @@
+# A histogram on a date field buckets the date's epoch milliseconds, as
+# stock's does: a date_nanos field's too, read in milliseconds. Each key
+# prints as a date in the field's format, or the aggregation's. Extended and
+# hard bounds apply as stock applies them, to a numeric field as well. Each
+# request runs on a Lucene twin too, so the answers are stock's.
+setup:
+  - do:
+      indices.create:
+        index: hd_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              t: { type: date }
+              n: { type: date_nanos }
+              f: { type: date, format: "yyyy/MM/dd HH:mm:ss||epoch_millis" }
+              p: { type: long }
+              ip: { type: keyword }
+  - do:
+      indices.create:
+        index: hd_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              t: { type: date }
+              n: { type: date_nanos }
+              f: { type: date, format: "yyyy/MM/dd HH:mm:ss||epoch_millis" }
+              p: { type: long }
+              ip: { type: keyword }
+  - do:
+      indices.create:
+        index: hd_def
+        body:
+          settings: { index.infino.enabled: true, number_of_shards: 1, number_of_replicas: 0 }
+          mappings:
+            properties:
+              t: { type: date }
+              n: { type: date_nanos }
+              f: { type: date, format: "yyyy/MM/dd HH:mm:ss||epoch_millis" }
+              p: { type: long }
+              ip: { type: keyword }
+  - do:
+      bulk:
+        refresh: true
+        index: hd_luc
+        body:
+          - index: { _id: "1" }
+          - { "t": 1600000000000, "n": "2020-09-13T12:26:40.123456789Z", "f": "2020/09/13 12:26:40", "p": 10, "ip": "a" }
+          - index: { _id: "2" }
+          - { "t": 1600000030000, "n": "2020-09-13T12:27:10.5Z", "f": "2020/09/13 12:27:10", "p": 5, "ip": "b" }
+          - index: { _id: "3" }
+          - { "t": 1600000061000, "n": "2020-09-13T12:27:41Z", "f": "2020/09/13 12:27:41", "p": 7, "ip": "a" }
+          - index: { _id: "4" }
+          - { "t": 1600010800005, "n": "2020-09-13T15:26:40Z", "f": "2020/09/13 15:26:40", "p": 1, "ip": "c" }
+          - index: { _id: "5" }
+          - { "p": 3, "ip": "d" }
+  - do:
+      bulk:
+        refresh: true
+        index: hd_prx
+        body:
+          - index: { _id: "1" }
+          - { "t": 1600000000000, "n": "2020-09-13T12:26:40.123456789Z", "f": "2020/09/13 12:26:40", "p": 10, "ip": "a" }
+          - index: { _id: "2" }
+          - { "t": 1600000030000, "n": "2020-09-13T12:27:10.5Z", "f": "2020/09/13 12:27:10", "p": 5, "ip": "b" }
+          - index: { _id: "3" }
+          - { "t": 1600000061000, "n": "2020-09-13T12:27:41Z", "f": "2020/09/13 12:27:41", "p": 7, "ip": "a" }
+          - index: { _id: "4" }
+          - { "t": 1600010800005, "n": "2020-09-13T15:26:40Z", "f": "2020/09/13 15:26:40", "p": 1, "ip": "c" }
+          - index: { _id: "5" }
+          - { "p": 3, "ip": "d" }
+  - do:
+      bulk:
+        refresh: true
+        index: hd_def
+        body:
+          - index: { _id: "1" }
+          - { "t": 1600000000000, "n": "2020-09-13T12:26:40.123456789Z", "f": "2020/09/13 12:26:40", "p": 10, "ip": "a" }
+          - index: { _id: "2" }
+          - { "t": 1600000030000, "n": "2020-09-13T12:27:10.5Z", "f": "2020/09/13 12:27:10", "p": 5, "ip": "b" }
+          - index: { _id: "3" }
+          - { "t": 1600000061000, "n": "2020-09-13T12:27:41Z", "f": "2020/09/13 12:27:41", "p": 7, "ip": "a" }
+          - index: { _id: "4" }
+          - { "t": 1600010800005, "n": "2020-09-13T15:26:40Z", "f": "2020/09/13 15:26:40", "p": 1, "ip": "c" }
+          - index: { _id: "5" }
+          - { "p": 3, "ip": "d" }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: hd_luc,hd_prx,hd_def
+        ignore_unavailable: true
+
+---
+"A histogram on a date buckets its epoch milliseconds, with sub-aggregations":
+  - do:
+      search: { index: hd_luc, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 60000, min_doc_count: 1 }, aggs: { tp: { sum: { field: p } }, ips: { cardinality: { field: ip } } } } } } }
+  - length: { aggregations.h.buckets: 3 }
+  - match: { aggregations.h.buckets.0.key: 1599999960000.0 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020-09-13T12:26:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.0.tp.value: 10.0 }
+  - match: { aggregations.h.buckets.1.key: 1600000020000.0 }
+  - match: { aggregations.h.buckets.1.doc_count: 2 }
+  - match: { aggregations.h.buckets.1.tp.value: 12.0 }
+  - match: { aggregations.h.buckets.1.ips.value: 2 }
+  - match: { aggregations.h.buckets.2.key: 1600010760000.0 }
+  - match: { aggregations.h.buckets.2.key_as_string: "2020-09-13T15:26:00.000Z" }
+  - do:
+      search: { index: hd_prx, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 60000, min_doc_count: 1 }, aggs: { tp: { sum: { field: p } }, ips: { cardinality: { field: ip } } } } } } }
+  - length: { aggregations.h.buckets: 3 }
+  - match: { aggregations.h.buckets.0.key: 1599999960000.0 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020-09-13T12:26:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.0.tp.value: 10.0 }
+  - match: { aggregations.h.buckets.1.key: 1600000020000.0 }
+  - match: { aggregations.h.buckets.1.doc_count: 2 }
+  - match: { aggregations.h.buckets.1.tp.value: 12.0 }
+  - match: { aggregations.h.buckets.1.ips.value: 2 }
+  - match: { aggregations.h.buckets.2.key: 1600010760000.0 }
+  - match: { aggregations.h.buckets.2.key_as_string: "2020-09-13T15:26:00.000Z" }
+  - do:
+      search: { index: hd_def, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 60000, min_doc_count: 1 }, aggs: { tp: { sum: { field: p } }, ips: { cardinality: { field: ip } } } } } } }
+  - length: { aggregations.h.buckets: 3 }
+  - match: { aggregations.h.buckets.0.key: 1599999960000.0 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020-09-13T12:26:00.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.0.tp.value: 10.0 }
+  - match: { aggregations.h.buckets.1.key: 1600000020000.0 }
+  - match: { aggregations.h.buckets.1.doc_count: 2 }
+  - match: { aggregations.h.buckets.1.tp.value: 12.0 }
+  - match: { aggregations.h.buckets.1.ips.value: 2 }
+  - match: { aggregations.h.buckets.2.key: 1600010760000.0 }
+  - match: { aggregations.h.buckets.2.key_as_string: "2020-09-13T15:26:00.000Z" }
+
+---
+"Extended bounds fill empty buckets on a date histogram":
+  - do:
+      search: { index: hd_luc, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 3600000, extended_bounds: { min: 1599992800000, max: 1600018000000 } } } } } }
+  - length: { aggregations.h.buckets: 8 }
+  - match: { aggregations.h.buckets.0.key: 1599991200000.0 }
+  - match: { aggregations.h.buckets.0.doc_count: 0 }
+  - match: { aggregations.h.buckets.2.doc_count: 3 }
+  - match: { aggregations.h.buckets.5.doc_count: 1 }
+  - match: { aggregations.h.buckets.7.key: 1600016400000.0 }
+  - match: { aggregations.h.buckets.7.key_as_string: "2020-09-13T17:00:00.000Z" }
+  - do:
+      search: { index: hd_prx, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 3600000, extended_bounds: { min: 1599992800000, max: 1600018000000 } } } } } }
+  - length: { aggregations.h.buckets: 8 }
+  - match: { aggregations.h.buckets.0.key: 1599991200000.0 }
+  - match: { aggregations.h.buckets.0.doc_count: 0 }
+  - match: { aggregations.h.buckets.2.doc_count: 3 }
+  - match: { aggregations.h.buckets.5.doc_count: 1 }
+  - match: { aggregations.h.buckets.7.key: 1600016400000.0 }
+  - match: { aggregations.h.buckets.7.key_as_string: "2020-09-13T17:00:00.000Z" }
+  - do:
+      search: { index: hd_def, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 3600000, extended_bounds: { min: 1599992800000, max: 1600018000000 } } } } } }
+  - length: { aggregations.h.buckets: 8 }
+  - match: { aggregations.h.buckets.0.key: 1599991200000.0 }
+  - match: { aggregations.h.buckets.0.doc_count: 0 }
+  - match: { aggregations.h.buckets.2.doc_count: 3 }
+  - match: { aggregations.h.buckets.5.doc_count: 1 }
+  - match: { aggregations.h.buckets.7.key: 1600016400000.0 }
+  - match: { aggregations.h.buckets.7.key_as_string: "2020-09-13T17:00:00.000Z" }
+
+---
+"Hard bounds keep only the buckets that start inside them":
+  - do:
+      search: { index: hd_luc, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 60000, min_doc_count: 1, hard_bounds: { min: 1600000000000, max: 1600000060000 } } } } } }
+  - length: { aggregations.h.buckets: 1 }
+  - match: { aggregations.h.buckets.0.key: 1600000020000.0 }
+  - match: { aggregations.h.buckets.0.doc_count: 2 }
+  - do:
+      search: { index: hd_prx, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 60000, min_doc_count: 1, hard_bounds: { min: 1600000000000, max: 1600000060000 } } } } } }
+  - length: { aggregations.h.buckets: 1 }
+  - match: { aggregations.h.buckets.0.key: 1600000020000.0 }
+  - match: { aggregations.h.buckets.0.doc_count: 2 }
+  - do:
+      search: { index: hd_def, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 60000, min_doc_count: 1, hard_bounds: { min: 1600000000000, max: 1600000060000 } } } } } }
+  - length: { aggregations.h.buckets: 1 }
+  - match: { aggregations.h.buckets.0.key: 1600000020000.0 }
+  - match: { aggregations.h.buckets.0.doc_count: 2 }
+
+---
+"An offset moves the buckets and a missing date stands in":
+  - do:
+      search: { index: hd_luc, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 60000, offset: 30000, min_doc_count: 1, missing: "2020-09-13T10:00:00Z" } } } } }
+  - length: { aggregations.h.buckets: 4 }
+  - match: { aggregations.h.buckets.0.key: 1599991170000.0 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020-09-13T09:59:30.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 1599999990000.0 }
+  - match: { aggregations.h.buckets.1.doc_count: 2 }
+  - match: { aggregations.h.buckets.3.key: 1600010790000.0 }
+  - do:
+      search: { index: hd_prx, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 60000, offset: 30000, min_doc_count: 1, missing: "2020-09-13T10:00:00Z" } } } } }
+  - length: { aggregations.h.buckets: 4 }
+  - match: { aggregations.h.buckets.0.key: 1599991170000.0 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020-09-13T09:59:30.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 1599999990000.0 }
+  - match: { aggregations.h.buckets.1.doc_count: 2 }
+  - match: { aggregations.h.buckets.3.key: 1600010790000.0 }
+  - do:
+      search: { index: hd_def, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 60000, offset: 30000, min_doc_count: 1, missing: "2020-09-13T10:00:00Z" } } } } }
+  - length: { aggregations.h.buckets: 4 }
+  - match: { aggregations.h.buckets.0.key: 1599991170000.0 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020-09-13T09:59:30.000Z" }
+  - match: { aggregations.h.buckets.0.doc_count: 1 }
+  - match: { aggregations.h.buckets.1.key: 1599999990000.0 }
+  - match: { aggregations.h.buckets.1.doc_count: 2 }
+  - match: { aggregations.h.buckets.3.key: 1600010790000.0 }
+
+---
+"A date_nanos field is bucketed in milliseconds":
+  - do:
+      search: { index: hd_luc, body: { size: 0, aggs: { h: { histogram: { field: n, interval: 1, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 4 }
+  - match: { aggregations.h.buckets.0.key: 1600000000123.0 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020-09-13T12:26:40.123Z" }
+  - match: { aggregations.h.buckets.1.key: 1600000030500.0 }
+  - do:
+      search: { index: hd_prx, body: { size: 0, aggs: { h: { histogram: { field: n, interval: 1, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 4 }
+  - match: { aggregations.h.buckets.0.key: 1600000000123.0 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020-09-13T12:26:40.123Z" }
+  - match: { aggregations.h.buckets.1.key: 1600000030500.0 }
+  - do:
+      search: { index: hd_def, body: { size: 0, aggs: { h: { histogram: { field: n, interval: 1, min_doc_count: 1 } } } } }
+  - length: { aggregations.h.buckets: 4 }
+  - match: { aggregations.h.buckets.0.key: 1600000000123.0 }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020-09-13T12:26:40.123Z" }
+  - match: { aggregations.h.buckets.1.key: 1600000030500.0 }
+
+---
+"A key prints in the field's format, or the aggregation's":
+  - do:
+      search: { index: hd_luc, body: { size: 0, aggs: { h: { histogram: { field: f, interval: 3600000, min_doc_count: 1 } }, s: { histogram: { field: f, interval: 3600000, min_doc_count: 1, format: epoch_second } } } } }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020/09/13 12:00:00" }
+  - match: { aggregations.h.buckets.0.doc_count: 3 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2020/09/13 15:00:00" }
+  - match: { aggregations.s.buckets.0.key_as_string: "1599998400" }
+  - do:
+      search: { index: hd_prx, body: { size: 0, aggs: { h: { histogram: { field: f, interval: 3600000, min_doc_count: 1 } }, s: { histogram: { field: f, interval: 3600000, min_doc_count: 1, format: epoch_second } } } } }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020/09/13 12:00:00" }
+  - match: { aggregations.h.buckets.0.doc_count: 3 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2020/09/13 15:00:00" }
+  - match: { aggregations.s.buckets.0.key_as_string: "1599998400" }
+  - do:
+      search: { index: hd_def, body: { size: 0, aggs: { h: { histogram: { field: f, interval: 3600000, min_doc_count: 1 } }, s: { histogram: { field: f, interval: 3600000, min_doc_count: 1, format: epoch_second } } } } }
+  - match: { aggregations.h.buckets.0.key_as_string: "2020/09/13 12:00:00" }
+  - match: { aggregations.h.buckets.0.doc_count: 3 }
+  - match: { aggregations.h.buckets.1.key_as_string: "2020/09/13 15:00:00" }
+  - match: { aggregations.s.buckets.0.key_as_string: "1599998400" }
+
+---
+"A keyed date histogram is keyed by the date, and a descending key order holds":
+  - do:
+      search: { index: hd_luc, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 3600000, min_doc_count: 1, keyed: true, format: yyyyMMddHH } }, d: { histogram: { field: t, interval: 3600000, min_doc_count: 1, order: { _key: desc } } } } } }
+  - match: { aggregations.h.buckets.2020091312.doc_count: 3 }
+  - match: { aggregations.h.buckets.2020091315.key: 1600009200000.0 }
+  - match: { aggregations.d.buckets.0.key: 1600009200000.0 }
+  - match: { aggregations.d.buckets.1.doc_count: 3 }
+  - do:
+      search: { index: hd_prx, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 3600000, min_doc_count: 1, keyed: true, format: yyyyMMddHH } }, d: { histogram: { field: t, interval: 3600000, min_doc_count: 1, order: { _key: desc } } } } } }
+  - match: { aggregations.h.buckets.2020091312.doc_count: 3 }
+  - match: { aggregations.h.buckets.2020091315.key: 1600009200000.0 }
+  - match: { aggregations.d.buckets.0.key: 1600009200000.0 }
+  - match: { aggregations.d.buckets.1.doc_count: 3 }
+  - do:
+      search: { index: hd_def, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 3600000, min_doc_count: 1, keyed: true, format: yyyyMMddHH } }, d: { histogram: { field: t, interval: 3600000, min_doc_count: 1, order: { _key: desc } } } } } }
+  - match: { aggregations.h.buckets.2020091312.doc_count: 3 }
+  - match: { aggregations.h.buckets.2020091315.key: 1600009200000.0 }
+  - match: { aggregations.d.buckets.0.key: 1600009200000.0 }
+  - match: { aggregations.d.buckets.1.doc_count: 3 }
+
+---
+"Extended and hard bounds apply to a numeric histogram too":
+  - do:
+      search: { index: hd_luc, body: { size: 0, aggs: { e: { histogram: { field: p, interval: 5, extended_bounds: { min: -10, max: 30 } } }, b: { histogram: { field: p, interval: 5, hard_bounds: { min: 2, max: 6 } } } } } }
+  - length: { aggregations.e.buckets: 9 }
+  - match: { aggregations.e.buckets.0.key: -10.0 }
+  - match: { aggregations.e.buckets.2.doc_count: 2 }
+  - match: { aggregations.e.buckets.8.key: 30.0 }
+  - length: { aggregations.b.buckets: 1 }
+  - match: { aggregations.b.buckets.0.key: 5.0 }
+  - match: { aggregations.b.buckets.0.doc_count: 2 }
+  - do:
+      search: { index: hd_prx, body: { size: 0, aggs: { e: { histogram: { field: p, interval: 5, extended_bounds: { min: -10, max: 30 } } }, b: { histogram: { field: p, interval: 5, hard_bounds: { min: 2, max: 6 } } } } } }
+  - length: { aggregations.e.buckets: 9 }
+  - match: { aggregations.e.buckets.0.key: -10.0 }
+  - match: { aggregations.e.buckets.2.doc_count: 2 }
+  - match: { aggregations.e.buckets.8.key: 30.0 }
+  - length: { aggregations.b.buckets: 1 }
+  - match: { aggregations.b.buckets.0.key: 5.0 }
+  - match: { aggregations.b.buckets.0.doc_count: 2 }
+  - do:
+      search: { index: hd_def, body: { size: 0, aggs: { e: { histogram: { field: p, interval: 5, extended_bounds: { min: -10, max: 30 } } }, b: { histogram: { field: p, interval: 5, hard_bounds: { min: 2, max: 6 } } } } } }
+  - length: { aggregations.e.buckets: 9 }
+  - match: { aggregations.e.buckets.0.key: -10.0 }
+  - match: { aggregations.e.buckets.2.doc_count: 2 }
+  - match: { aggregations.e.buckets.8.key: 30.0 }
+  - length: { aggregations.b.buckets: 1 }
+  - match: { aggregations.b.buckets.0.key: 5.0 }
+  - match: { aggregations.b.buckets.0.doc_count: 2 }
+
+---
+"Extended bounds outside the hard bounds are refused, as stock refuses them":
+  - do:
+      catch: /Extended bounds have to be inside hard bounds/
+      search: { index: hd_luc, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 3600000, hard_bounds: { min: 1600000000000, max: 1600003600000 }, extended_bounds: { min: 1599996400000, max: 1600000000000 } } } } } }
+  - do:
+      catch: /Extended bounds have to be inside hard bounds/
+      search: { index: hd_prx, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 3600000, hard_bounds: { min: 1600000000000, max: 1600003600000 }, extended_bounds: { min: 1599996400000, max: 1600000000000 } } } } } }
+  - do:
+      catch: /Extended bounds have to be inside hard bounds/
+      search: { index: hd_def, body: { size: 0, aggs: { h: { histogram: { field: t, interval: 3600000, hard_bounds: { min: 1600000000000, max: 1600003600000 }, extended_bounds: { min: 1599996400000, max: 1600000000000 } } } } } }
+
+---
+"A composite histogram source on a date is refused by name":
+  - do:
+      search: { index: hd_luc, body: { size: 0, aggs: { c: { composite: { sources: [ { h: { histogram: { field: t, interval: 3600000 } } } ] } } } } }
+  - match: { aggregations.c.buckets.0.key.h: "2020-09-13T12:00:00.000Z" }
+  - do:
+      catch: /source \[h\] needs a numeric value, \[t\] is date/
+      search: { index: hd_prx, body: { size: 0, aggs: { c: { composite: { sources: [ { h: { histogram: { field: t, interval: 3600000 } } } ] } } } } }
+  - do:
+      catch: /source \[h\] needs a numeric value, \[t\] is date/
+      search: { index: hd_def, body: { size: 0, aggs: { c: { composite: { sources: [ { h: { histogram: { field: t, interval: 3600000 } } } ] } } } } }

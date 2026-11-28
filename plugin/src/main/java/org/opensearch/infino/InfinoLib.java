@@ -64,9 +64,9 @@ public interface InfinoLib extends Library {
     Pointer infino_index_batch_buf(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int count);
 
     /**
-     * Parse and convert a batch ahead of its append; null when the table is unknown. With {@code igEnds}, each
-     * row's source is followed by the paths of its fields left out of the row, separated by newlines and ending
-     * at {@code igEnds} (null for none).
+     * Parse and convert a batch ahead of its append; null when it could not be, with the reason in
+     * {@link #infino_prepare_error()}. With {@code igEnds}, each row's source is followed by the paths of its
+     * fields left out of the row, separated by newlines and ending at {@code igEnds} (null for none).
      */
     Pointer infino_prepare_batch(Pointer h, String name, byte[] buf, long bufLen, int[] idEnds, int[] srcEnds, int[] igEnds, int count);
 
@@ -91,6 +91,9 @@ public interface InfinoLib extends Library {
         int count
     );
 
+    /** Why the last prepare on this thread returned null, as {@code {"error", "status"?}}; null when it did not fail. */
+    Pointer infino_prepare_error();
+
     /**
      * Append prepared batches in one commit and release them; the rows whose ids
      * are in {@code replaced} replace the table's rows under those ids in the
@@ -108,6 +111,12 @@ public interface InfinoLib extends Library {
      */
     Pointer infino_prepared_failed(Pointer prepared);
 
+    /**
+     * Tombstone every row under one of {@code osids}: 0, or a negative code,
+     * -3 when the hosted service turned the delete away for the account's
+     * request rate and -4 when it could not be reached or did not answer
+     * (see {@link InfinoNative#deleteFailed}).
+     */
     int infino_delete_osids(Pointer h, String name, String[] osids, int count);
 
     /** One id's source as {@code {"source": ..}}, null when the table holds no such id; {@code {"error": ..}} when the lookup fails. */

@@ -281,28 +281,74 @@
   - match: { hits.hits.0._id: c3 }
 
 ---
-"In proxy mode a field the table already holds unmapped stays as it is, and the new fields beside it are mapped":
-  # dynamic: false leaves note out of the mapping, and the table types its
-  # column from the document, as a table written before dynamic mapping ran
-  # in proxy mode did. Mapping note as text now would only make the table
-  # refuse the mapping (its column has no text index), so it stays unmapped.
+"A field left out under dynamic: false is mapped by a later document once dynamic is true, as on a Lucene twin":
+  # dynamic: false leaves note out of the mapping and out of the table: it
+  # is kept in the source only. Once dynamic is true, the next document
+  # that brings note maps it as text, as stock maps it, and only that
+  # document is indexed under it.
+  - do:
+      indices.create:
+        index: dh_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: false, properties: { k: { type: keyword } } }
   - do:
       indices.create:
         index: dh_px
         body:
           settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
           mappings: { dynamic: false, properties: { k: { type: keyword } } }
+  - do:
+      indices.create:
+        index: dh_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { dynamic: false, properties: { k: { type: keyword } } }
+  - do: { bulk: { refresh: true, index: dh_luc, body: [ {"index": {"_id": "h1"}}, {"k": "h1", "note": "old words"} ] } }
+  - match: { errors: false }
+  - do: { indices.put_mapping: { index: dh_luc, body: { dynamic: true } } }
+  - do: { bulk: { refresh: true, index: dh_luc, body: [ {"index": {"_id": "h2"}}, {"k": "h2", "note": "new words", "fresh": "grey wolf"} ] } }
+  - match: { errors: false }
+  - do: { indices.get_mapping: { index: dh_luc } }
+  - match: { dh_luc.mappings.properties.note.type: text }
+  - match: { dh_luc.mappings.properties.fresh.type: text }
+  - do: { search: { index: dh_luc, body: {"query": {"match": {"fresh": "wolf"}}} } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: h2 }
+  - do: { search: { index: dh_luc, body: {"query": {"match": {"note": "words"}}} } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: h2 }
+  - do: { get: { index: dh_luc, id: h1 } }
+  - match: { _source.note: old words }
   - do: { bulk: { refresh: true, index: dh_px, body: [ {"index": {"_id": "h1"}}, {"k": "h1", "note": "old words"} ] } }
   - match: { errors: false }
   - do: { indices.put_mapping: { index: dh_px, body: { dynamic: true } } }
   - do: { bulk: { refresh: true, index: dh_px, body: [ {"index": {"_id": "h2"}}, {"k": "h2", "note": "new words", "fresh": "grey wolf"} ] } }
   - match: { errors: false }
   - do: { indices.get_mapping: { index: dh_px } }
-  - is_false: dh_px.mappings.properties.note
+  - match: { dh_px.mappings.properties.note.type: text }
   - match: { dh_px.mappings.properties.fresh.type: text }
   - do: { search: { index: dh_px, body: {"query": {"match": {"fresh": "wolf"}}} } }
   - match: { hits.total.value: 1 }
   - match: { hits.hits.0._id: h2 }
-  - do: { search: { index: dh_px, body: {"query": {"term": {"note": "new words"}}} } }
+  - do: { search: { index: dh_px, body: {"query": {"match": {"note": "words"}}} } }
   - match: { hits.total.value: 1 }
   - match: { hits.hits.0._id: h2 }
+  - do: { get: { index: dh_px, id: h1 } }
+  - match: { _source.note: old words }
+  - do: { bulk: { refresh: true, index: dh_def, body: [ {"index": {"_id": "h1"}}, {"k": "h1", "note": "old words"} ] } }
+  - match: { errors: false }
+  - do: { indices.put_mapping: { index: dh_def, body: { dynamic: true } } }
+  - do: { bulk: { refresh: true, index: dh_def, body: [ {"index": {"_id": "h2"}}, {"k": "h2", "note": "new words", "fresh": "grey wolf"} ] } }
+  - match: { errors: false }
+  - do: { indices.get_mapping: { index: dh_def } }
+  - match: { dh_def.mappings.properties.note.type: text }
+  - match: { dh_def.mappings.properties.fresh.type: text }
+  - do: { search: { index: dh_def, body: {"query": {"match": {"fresh": "wolf"}}} } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: h2 }
+  - do: { search: { index: dh_def, body: {"query": {"match": {"note": "words"}}} } }
+  - match: { hits.total.value: 1 }
+  - match: { hits.hits.0._id: h2 }
+  - do: { get: { index: dh_def, id: h1 } }
+  - match: { _source.note: old words }

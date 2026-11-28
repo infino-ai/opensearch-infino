@@ -55,6 +55,8 @@ import org.opensearch.search.aggregations.bucket.filter.InternalFilters;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.histogram.DateIntervalWrapper;
+import org.opensearch.search.aggregations.bucket.histogram.DoubleBounds;
+import org.opensearch.search.aggregations.bucket.histogram.Histogram;
 import org.opensearch.search.aggregations.bucket.histogram.HistogramAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram;
 import org.opensearch.search.aggregations.bucket.histogram.InternalHistogram;
@@ -1011,6 +1013,26 @@ public class InfinoAggregationProcessor {
         return InfinoAccess.refused(
             "aggregation [" + b.getName() + "] reads " + c.label() + ", a field masked for this user; only terms over it are served, keyed by its hash"
         );
+    }
+
+    /**
+     * The body of {@code b} as its own JSON form writes it,
+     * {@code {name: {type: {...}}}}, for a setting the builder keeps without a
+     * getter; empty when it writes none.
+     */
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> bodyOf(AggregationBuilder b, String type) {
+        try (XContentBuilder xb = XContentFactory.jsonBuilder()) {
+            xb.startObject();
+            b.toXContent(xb, ToXContent.EMPTY_PARAMS);
+            xb.endObject();
+            Map<String, Object> map = XContentHelper.convertToMap(BytesReference.bytes(xb), false, MediaTypeRegistry.JSON).v2();
+            Map<String, Object> agg = (Map<String, Object>) map.get(b.getName());
+            Map<String, Object> body = agg == null ? null : (Map<String, Object>) agg.get(type);
+            return body == null ? Map.of() : body;
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     // ---- specs ----
@@ -1991,8 +2013,12 @@ public class InfinoAggregationProcessor {
     /** How a date histogram keys its buckets. */
     record DateKey(DocValueFormat format, Rounding rounding, LongBounds bounds, boolean keyed, long offset) {}
 
-    /** How a numeric histogram keys its buckets. */
-    record HistKey(double interval, double offset, boolean keyed) {}
+    /**
+     * How a numeric histogram keys its buckets: {@code format} prints a key
+     * (a date's for a date field), and {@code min} and {@code max} are its
+     * extended bounds, or infinities where none is given.
+     */
+    record HistKey(double interval, double offset, boolean keyed, DocValueFormat format, double min, double max) {}
 
     /** A grouped bucket level: terms, date_histogram or histogram. */
     static final class Grouped extends BucketSpec {
@@ -2130,9 +2156,68 @@ public class InfinoAggregationProcessor {
             if (h.order() != null && !InternalOrder.isKeyOrder(h.order())) {
                 throw new Unsupported("aggregation [" + h.getName() + "] has an order other than by key");
             }
+            DoubleBounds hard = histBounds(h, Histogram.HARD_BOUNDS_FIELD.getPreferredName());
+            if (hard != null) {
+                checkInside(hard, histBounds(h, Histogram.EXTENDED_BOUNDS_FIELD.getPreferredName()));
+                // As stock: a bucket is kept when its start, before the offset is added back,
+                // is inside the bounds. Outside them the key is null, which no bucket has.
+                String start = histStart(c, h.interval(), h.offset());
+                List<String> inside = new ArrayList<>();
+                if (hard.getMin() != null) {
+                    inside.add(start + " >= " + hard.getMin());
+                }
+                if (hard.getMax() != null) {
+                    inside.add(start + " <= " + hard.getMax());
+                }
+                if (!inside.isEmpty()) {
+                    keyExpr = "CASE WHEN " + String.join(" AND ", inside) + " THEN " + keyExpr + " END";
+                }
+            }
             String order = h.order() != null && InternalOrder.isKeyDesc(h.order()) ? "{key} DESC" : "{key} ASC";
-            HistKey hist = new HistKey(h.interval(), h.offset(), h.keyed());
+            // As stock: a date's key prints in the field's format (or the request's), in UTC,
+            // and a number's only in a format the request gives.
+            DocValueFormat format = c.isTimestamp() ? dateFormat(h.format(), c, ZoneOffset.UTC)
+                : h.format() == null ? DocValueFormat.RAW
+                : new DocValueFormat.Decimal(h.format());
+            HistKey hist = new HistKey(h.interval(), h.offset(), h.keyed(), format, h.minBound(), h.maxBound());
             return new Grouped(h, leaves, child, c, keyExpr, KeyKind.DOUBLE, false, Integer.MAX_VALUE, h.minDocCount(), order, null, hist);
+        }
+
+        /**
+         * The histogram's bounds named {@code field} ({@code hard_bounds} or
+         * {@code extended_bounds}), or null. The builder keeps hard bounds
+         * without a getter, so both are read back from its own JSON form.
+         */
+        private static DoubleBounds histBounds(HistogramAggregationBuilder h, String field) {
+            Object bounds = bodyOf(h, HistogramAggregationBuilder.NAME).get(field);
+            if (!(bounds instanceof Map<?, ?> m)) {
+                return null;
+            }
+            return new DoubleBounds(boundOf(m.get("min")), boundOf(m.get("max")));
+        }
+
+        private static Double boundOf(Object v) {
+            return v instanceof Number n ? n.doubleValue() : null;
+        }
+
+        /** Stock's refusal of {@code extended_bounds} that reach outside {@code hard_bounds}. */
+        private static void checkInside(DoubleBounds hard, DoubleBounds extended) {
+            if (extended == null) {
+                return;
+            }
+            boolean above = hard.getMax() != null && extended.getMax() != null && hard.getMax() < extended.getMax();
+            boolean below = hard.getMin() != null && extended.getMin() != null && hard.getMin() > extended.getMin();
+            if (above || below) {
+                throw new IllegalArgumentException(
+                    "Extended bounds have to be inside hard bounds, hard bounds: ["
+                        + hard
+                        + "], extended bounds: ["
+                        + extended.getMin()
+                        + "--"
+                        + extended.getMax()
+                        + "]"
+                );
+            }
         }
 
         /** The SQL expression of a date bucket's key and the rounding it stands for. */
@@ -2235,8 +2320,7 @@ public class InfinoAggregationProcessor {
          * {@code (L - m) - (local(c) - c)}, plus the offset.
          */
         static String zonedBin(String source, String zone, long ms, long offset) {
-            String epoch = "arrow_cast(arrow_cast(date_trunc('millisecond', " + source + "), " + UTC_MILLIS + "), 'Int64')";
-            String shifted = "(" + epoch + " - (" + offset + "))";
+            String shifted = "(" + epochMillis(source) + " - (" + offset + "))";
             String local = localMillis(shifted, zone);
             String past = "(((" + local + " % " + ms + ") + " + ms + ") % " + ms + ")";
             String start = "(" + shifted + " - " + past + ")";
@@ -2283,16 +2367,41 @@ public class InfinoAggregationProcessor {
             return new DocValueFormat.DateTime(DateFormatter.forPattern(dateFormatName(format, c)), tz, DateFieldMapper.Resolution.MILLISECONDS);
         }
 
-        /** The numeric bucket of {@code c} at the interval and offset given. */
+        /**
+         * The numeric bucket of {@code c} at the interval and offset given. A
+         * date is bucketed by its epoch milliseconds, as stock's histogram
+         * reads a date field (a date_nanos one too, whose values its
+         * aggregations read in milliseconds).
+         */
         static String histExpr(String agg, Source c, double interval, double offset) {
-            if (!c.isNumeric()) {
+            if (!c.isNumeric() && !c.isTimestamp()) {
                 throw new Unsupported("aggregation [" + agg + "] needs a numeric value, " + c.label() + " is " + c.typeName());
             }
             if (interval <= 0) {
                 throw new Unsupported("aggregation [" + agg + "] has an interval of no length");
             }
-            String f = "(" + c.expr() + ")";
-            return "floor((" + f + " - " + offset + ") / " + interval + ") * " + interval + " + " + offset;
+            return histStart(c, interval, offset) + " + " + offset;
+        }
+
+        /** The start of {@code c}'s bucket at the interval and offset given, before the offset is added back: stock's {@code key * interval}. */
+        private static String histStart(Source c, double interval, double offset) {
+            String f = "(" + histNumber(c, c.expr()) + ")";
+            return "floor((" + f + " - " + offset + ") / " + interval + ") * " + interval;
+        }
+
+        /** {@code value}, an expression of {@code c}'s type, as the number a histogram buckets: a date as its epoch milliseconds. */
+        static String histNumber(Source c, String value) {
+            return c.isTimestamp() ? epochMillis(value) : value;
+        }
+
+        /**
+         * {@code date} as an Int64 of UTC epoch milliseconds. It is floored to
+         * the millisecond first: a table written elsewhere may keep micro- or
+         * nanoseconds, and a cast alone would round a date before 1970 with a
+         * fraction of a millisecond toward zero.
+         */
+        private static String epochMillis(String date) {
+            return "arrow_cast(arrow_cast(date_trunc('millisecond', " + date + "), " + UTC_MILLIS + "), 'Int64')";
         }
 
         static KeyKind kindOf(Source c) {
@@ -2373,7 +2482,10 @@ public class InfinoAggregationProcessor {
             }
             if (hist != null) {
                 double low = asDouble(key, 0.0);
-                return source.anyValue(value -> "(" + value + " >= " + low + " AND " + value + " < " + (low + hist.interval()) + ")");
+                return source.anyValue(value -> {
+                    String number = histNumber(source, value);
+                    return "(" + number + " >= " + low + " AND " + number + " < " + (low + hist.interval()) + ")";
+                });
             }
             String literal = keyLiteral(keyKind, key);
             return source.anyValue(value -> value + " = " + literal);
@@ -2497,13 +2609,13 @@ public class InfinoAggregationProcessor {
                 if (key == null) {
                     continue;
                 }
-                buckets.add(new InternalHistogram.Bucket(asDouble(key, 0.0), asLong(row.get("doc_count")), hist.keyed(), DocValueFormat.RAW, subsOf.apply(row)));
+                buckets.add(new InternalHistogram.Bucket(asDouble(key, 0.0), asLong(row.get("doc_count")), hist.keyed(), hist.format(), subsOf.apply(row)));
             }
             InternalHistogram.EmptyBucketInfo empty = minDocCount == 0
-                ? new InternalHistogram.EmptyBucketInfo(hist.interval(), hist.offset(), Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, emptySubs())
+                ? new InternalHistogram.EmptyBucketInfo(hist.interval(), hist.offset(), hist.min(), hist.max(), emptySubs())
                 : null;
             HistogramAggregationBuilder h = (HistogramAggregationBuilder) builder;
-            return new InternalHistogram(h.getName(), buckets, h.order(), minDocCount, empty, DocValueFormat.RAW, hist.keyed(), metadataOf(h));
+            return new InternalHistogram(h.getName(), buckets, h.order(), minDocCount, empty, hist.format(), hist.keyed(), metadataOf(h));
         }
     }
 
@@ -2993,21 +3105,11 @@ public class InfinoAggregationProcessor {
         /**
          * The request's {@code after} key, or null. The builder keeps it
          * without a getter, so it is read back from the builder's own JSON
-         * form: {@code {name: {composite: {..., after: {...}}}}}.
+         * form ({@link #bodyOf}).
          */
         @SuppressWarnings("unchecked")
         private static Map<String, Object> afterOf(CompositeAggregationBuilder c) {
-            try (XContentBuilder xb = XContentFactory.jsonBuilder()) {
-                xb.startObject();
-                c.toXContent(xb, ToXContent.EMPTY_PARAMS);
-                xb.endObject();
-                Map<String, Object> map = XContentHelper.convertToMap(BytesReference.bytes(xb), false, MediaTypeRegistry.JSON).v2();
-                Map<String, Object> agg = (Map<String, Object>) map.get(c.getName());
-                Map<String, Object> body = agg == null ? null : (Map<String, Object>) agg.get(CompositeAggregationBuilder.NAME);
-                return body == null ? null : (Map<String, Object>) body.get(CompositeAggregationBuilder.AFTER_FIELD_NAME.getPreferredName());
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
-            }
+            return (Map<String, Object>) bodyOf(c, CompositeAggregationBuilder.NAME).get(CompositeAggregationBuilder.AFTER_FIELD_NAME.getPreferredName());
         }
 
         private static CompositeSource source(String agg, CompositeValuesSourceBuilder<?> s, Map<String, Column> cols, String table, long now) {
@@ -3075,6 +3177,10 @@ public class InfinoAggregationProcessor {
                 return new CompositeSource(s.name(), c, expr.keyExpr(), KeyKind.DATE, format, desc, s.missingBucket(), missing, expr.rounding());
             }
             if (s instanceof HistogramValuesSourceBuilder h) {
+                if (!c.isNumeric()) {
+                    // Stock keys such a source by the date's text in the field's format, which this does not build.
+                    throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] needs a numeric value, " + c.label() + " is " + c.typeName());
+                }
                 String keyExpr = Grouped.histExpr(agg, c, h.interval(), 0);
                 return new CompositeSource(s.name(), c, keyExpr, KeyKind.DOUBLE, DocValueFormat.RAW, desc, s.missingBucket(), missing, null);
             }

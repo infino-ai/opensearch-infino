@@ -20,6 +20,8 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataCreateIndexService;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.indices.InvalidIndexNameException;
 import org.opensearch.test.OpenSearchTestCase;
@@ -482,6 +484,28 @@ public class InfinoTablesTests extends OpenSearchTestCase {
             InfinoNative.configure(InfinoNative.Target.node());
             InfinoNative.useLib(null);
         }
+    }
+
+    /**
+     * A default-mode index's table is declared from a mapping the plugin
+     * builds, which carries the root {@code dynamic} and {@code enabled}: the
+     * bridge leaves out of the row a field they leave out of the index.
+     */
+    public void testADefaultModeTableMappingCarriesWhatTheMappingIndexes() throws Exception {
+        Settings inDefaultMode = Settings.builder().put(InfinoPlugin.INFINO_MODE.getKey(), InfinoPlugin.MODE_DEFAULT).build();
+        IndexMetadata loose = IndexMetadata.builder(index("loose", "u1", 1, inDefaultMode))
+            .putMapping("{\"_doc\":{\"dynamic\":\"false\",\"properties\":{\"tag\":{\"type\":\"keyword\"}}}}")
+            .build();
+        Map<String, Object> declared = XContentHelper.convertToMap(JsonXContent.jsonXContent, InfinoTables.tableMapping(loose), false);
+        assertEquals("false", declared.get("dynamic"));
+        assertEquals(Map.of("tag", Map.of("type", "keyword")), declared.get("properties"));
+        assertNotNull(declared.get("_engine_columns"));
+        assertFalse(declared.containsKey("enabled"));
+
+        IndexMetadata off = IndexMetadata.builder(index("off", "u2", 2, inDefaultMode)).putMapping("{\"_doc\":{\"enabled\":false}}").build();
+        declared = XContentHelper.convertToMap(JsonXContent.jsonXContent, InfinoTables.tableMapping(off), false);
+        assertEquals(false, declared.get("enabled"));
+        assertFalse(declared.containsKey("dynamic"));
     }
 
     private static Pointer nativeString(String s) {
