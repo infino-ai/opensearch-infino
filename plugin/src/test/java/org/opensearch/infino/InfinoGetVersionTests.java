@@ -24,9 +24,14 @@ import org.opensearch.index.VersionType;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.get.GetResult;
 import org.opensearch.index.seqno.SequenceNumbers;
+import org.opensearch.node.NodeClosedException;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.NodeDisconnectedException;
+import org.opensearch.transport.NodeNotConnectedException;
+import org.opensearch.transport.RemoteTransportException;
+import org.opensearch.transport.SendRequestTransportException;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -299,16 +304,28 @@ public class InfinoGetVersionTests extends OpenSearchTestCase {
     }
 
     /**
-     * Writes that keep landing: the last read stands, its row read after its
-     * numbers, so never older than them; a write conditioned on them meets
-     * the newer write as a conflict.
+     * Writes that keep landing through every try: the last row read can be
+     * newer than the numbers read before it, and a {@code version} check
+     * would pass against the older version, so the document answers a
+     * retryable 503 rather than that pair.
      */
-    public void testWritesThatKeepLandingLeaveTheLastRead() {
+    public void testWritesThatKeepLandingAnswerUnavailable() {
         FakeShard shard = new FakeShard(found(5, 2), found(6, 3), found(7, 4), found(8, 5));
         InfinoGetActionFilter.Read read = read(shard, true, rowsAnswering(shard.events, "{\"n\":3}", "{\"n\":4}", "{\"n\":5}"));
-        assertEquals(7, read.written().seqNo());
-        assertEquals("{\"n\":5}", read.doc().source());
+        assertNull(read.doc());
+        assertNull(read.written());
+        assertTrue(read.failure() instanceof InfinoNative.InfinoException);
+        assertEquals(RestStatus.SERVICE_UNAVAILABLE, ((InfinoNative.InfinoException) read.failure()).status());
         assertEquals(3, rowReads(shard.events).size());
+    }
+
+    /** A write that lands on the last try only, then stops: the read that settles on the third try is answered. */
+    public void testAReadThatSettlesOnTheLastTryIsAnswered() {
+        FakeShard shard = new FakeShard(found(5, 2), found(6, 3), found(7, 4), found(7, 4));
+        InfinoGetActionFilter.Read read = read(shard, true, rowsAnswering(shard.events, "{\"n\":3}", "{\"n\":4}", "{\"n\":4}"));
+        assertNull(read.failure());
+        assertEquals(7, read.written().seqNo());
+        assertEquals("{\"n\":4}", read.doc().source());
     }
 
     /** A read that is not realtime misses a document the latest refresh did not make visible, and reads no row. */
@@ -433,6 +450,28 @@ public class InfinoGetVersionTests extends OpenSearchTestCase {
         ExecutionException failed = expectThrows(ExecutionException.class, answer::get);
         assertTrue(failed.getCause() instanceof InfinoNative.InfinoException);
         assertEquals(RestStatus.SERVICE_UNAVAILABLE, ((InfinoNative.InfinoException) failed.getCause()).status());
+    }
+
+    /**
+     * A read sent on to the primary's node that cannot be reached (the node
+     * has gone and no copy is promoted yet) or is closing answers 503, which
+     * the client tries again, not the 500 the transport failure carries; any
+     * other failure passes through as it came.
+     */
+    public void testAReadWhosePrimarysNodeCannotBeReachedIsUnavailable() {
+        ClusterState elsewhere = stateWithPrimary(false, ShardRoutingState.STARTED);
+        DiscoveryNode gone = InfinoGetActionFilter.route(elsewhere, shardOf(elsewhere)).node();
+        for (Exception failure : List.of(
+            new NodeNotConnectedException(gone, "not connected"),
+            new SendRequestTransportException(gone, GetAction.NAME, new NodeDisconnectedException(gone, GetAction.NAME)),
+            new RemoteTransportException("remote", new NodeClosedException(gone))
+        )) {
+            Exception answered = InfinoGetActionFilter.unreachable(failure);
+            assertTrue(failure.toString(), answered instanceof InfinoNative.InfinoException);
+            assertEquals(RestStatus.SERVICE_UNAVAILABLE, ((InfinoNative.InfinoException) answered).status());
+        }
+        IllegalArgumentException other = new IllegalArgumentException("bad request");
+        assertSame(other, InfinoGetActionFilter.unreachable(other));
     }
 
     /**

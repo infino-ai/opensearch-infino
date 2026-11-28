@@ -1032,6 +1032,11 @@ public class InfinoEngine extends InternalEngine {
      * The ids with no pending write are read from the table in one call,
      * through this node's own connection when it has read every commit
      * ({@link #readsEveryCommit(String)}), else from the table's latest commit.
+     * On the hosted service that read first waits out the read window since
+     * this node's last commit to the table ({@link InfinoNative#awaitVisible}):
+     * a write commits as it is synced, before any refresh, and a read inside
+     * the window may be answered from before it, which would pair the row
+     * of an older write with the numbers of the latest.
      */
     static Map<String, InfinoNative.Doc> currentDocs(String table, Collection<String> ids) {
         Map<String, InfinoNative.Doc> out = new HashMap<>();
@@ -1043,6 +1048,9 @@ public class InfinoEngine extends InternalEngine {
             } else if (v.source() != null) {
                 out.put(id, new InfinoNative.Doc(v.source(), v.seq(), v.routing()));
             }
+        }
+        if (!committed.isEmpty()) {
+            InfinoNative.awaitVisible(table);
         }
         out.putAll(committedDocs(table, committed, readsEveryCommit(table)));
         return out;
@@ -1303,15 +1311,34 @@ public class InfinoEngine extends InternalEngine {
     }
 
     /**
+     * The answer to a read of a shard whose copy here is not yet, or no
+     * longer, the primary whose table holds its history, which the client
+     * tries again.
+     */
+    static InfinoNative.InfinoException notServingReads(String table) {
+        return new InfinoNative.InfinoException(
+            "the primary of " + table + " on this node is taking over or handing off, and its table may not hold every write yet; try again shortly",
+            RestStatus.SERVICE_UNAVAILABLE
+        );
+    }
+
+    /**
      * The {@link ShardReads} of {@code table}'s shard on this node, or a 503
-     * when its engine is not open here: the cluster state may name this
+     * when its engine is not open here (the cluster state may name this
      * node as the primary's while the engine is still opening, closing or
-     * being reset.
+     * being reset), or when its copy here does not take updates
+     * ({@link #mergesHere}): a promoted replica's skeleton holds writes its
+     * old primary never committed until the promotion writes them into the
+     * table, so a read before then would pair an older row with newer
+     * numbers; and a copy that has handed the shard off sees no new writes.
      */
     static ShardReads shardReads(String table) {
         InfinoEngine engine = BY_TABLE.get(table);
         if (engine == null) {
             throw notOpen(table);
+        }
+        if (!mergesHere(table)) {
+            throw notServingReads(table);
         }
         return new ShardReads() {
             @Override

@@ -4,7 +4,9 @@
 
 package org.opensearch.infino;
 
+import org.opensearch.client.Request;
 import org.opensearch.client.ResponseException;
+import org.opensearch.core.rest.RestStatus;
 
 import java.io.IOException;
 import java.time.Instant;
@@ -13,8 +15,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -56,6 +60,16 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
     private static final String CUSTOM_DATE = "yyyy/MM/dd HH:mm:ss";
     /** Documents written with a date in {@link #CUSTOM_DATE}, a second apart. */
     private static final int DATED = 5;
+    /**
+     * Documents the old primary never puts in the table before a takeover:
+     * enough that the new primary takes a while to write them, so gets land
+     * while it does.
+     */
+    private static final int TAKEOVER_DOCS = 5000;
+    /** Gets the takeover test waits to see answered once the new primary is green. */
+    private static final int GETS_AFTER_TAKEOVER = 100;
+    /** How many wrong answers a failure shows. */
+    private static final int WRONG_SHOWN = 10;
 
     public void testAReplicaAddedAfterUnflushedWritesRecoversFromThePrimarysHistory() throws IOException {
         String index = "eng_rep_recover";
@@ -81,6 +95,71 @@ public class InfinoEngineReplicaIT extends InfinoRestTestCase {
         write(index, DOCS, LATER);
         call("POST", "/" + index + "/_refresh", null);
         assertServesEvery(index, DOCS + LATER);
+        call("DELETE", "/" + index, null);
+    }
+
+    /**
+     * Gets sent while a replica takes over, whose skeleton holds writes the
+     * old primary never put in the table: the replica writes them into the
+     * table as it is promoted, and until it has, a get there would find the
+     * numbers of a write and no row, or an older one. Each get answers the
+     * acknowledged document with its write's numbers and row, or a
+     * retryable 503; never "not found", and never a row with another
+     * write's numbers.
+     */
+    @SuppressWarnings("unchecked")
+    public void testAGetDuringATakeoverAnswersTheAcknowledgedWriteOrUnavailable() throws Exception {
+        String index = "eng_rep_takeover_get";
+        createIndex(index, 1, HELD);
+        assertGreen(index);
+        StringBuilder bulk = new StringBuilder();
+        for (int i = 0; i < TAKEOVER_DOCS; i++) {
+            bulk.append("{\"index\":{\"_id\":\"d").append(i).append("\"}}\n{\"n\":").append(i).append("}\n");
+        }
+        Request write = new Request("POST", "/" + index + "/_bulk");
+        write.setJsonEntity(bulk.toString());
+        Map<String, Long> seqOf = new ConcurrentHashMap<>();
+        for (Object item : (List<Object>) entityAsMap(client().performRequest(write)).get("items")) {
+            Map<String, Object> written = (Map<String, Object>) ((Map<String, Object>) item).get("index");
+            seqOf.put(written.get("_id").toString(), ((Number) written.get("_seq_no")).longValue());
+        }
+        AtomicBoolean done = new AtomicBoolean();
+        List<String> wrong = new CopyOnWriteArrayList<>();
+        AtomicInteger unavailable = new AtomicInteger();
+        AtomicInteger answered = new AtomicInteger();
+        Thread getter = new Thread(() -> {
+            for (int i = 0; !done.get(); i = (i + 1) % TAKEOVER_DOCS) {
+                try {
+                    Map<String, Object> got = entityAsMap(client().performRequest(new Request("GET", "/" + index + "/_doc/d" + i)));
+                    Object n = ((Map<String, Object>) got.get("_source")).get("n");
+                    long seq = ((Number) got.get("_seq_no")).longValue();
+                    if (!Integer.valueOf(i).equals(n) || seq != seqOf.get("d" + i)) {
+                        wrong.add("d" + i + ": n " + n + " at seq " + seq + ", written at " + seqOf.get("d" + i));
+                    }
+                    answered.incrementAndGet();
+                } catch (ResponseException e) {
+                    int status = e.getResponse().getStatusLine().getStatusCode();
+                    if (status == RestStatus.SERVICE_UNAVAILABLE.getStatus()) {
+                        unavailable.incrementAndGet();
+                    } else {
+                        wrong.add("d" + i + ": " + status);
+                    }
+                } catch (IOException e) {
+                    wrong.add("d" + i + ": " + e);
+                }
+            }
+        });
+        getter.start();
+        try {
+            cancelPrimary(index);
+            assertGreen(index);
+            int before = answered.get();
+            assertBusy(() -> assertTrue("gets answered after the takeover", answered.get() > before + GETS_AFTER_TAKEOVER));
+        } finally {
+            done.set(true);
+            getter.join();
+        }
+        assertEquals("answered " + answered + ", unavailable " + unavailable, List.of(), wrong.subList(0, Math.min(wrong.size(), WRONG_SHOWN)));
         call("DELETE", "/" + index, null);
     }
 

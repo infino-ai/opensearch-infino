@@ -6,6 +6,7 @@ package org.opensearch.infino;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.ExceptionsHelper;
 import org.opensearch.action.ActionListenerResponseHandler;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionType;
@@ -37,9 +38,11 @@ import org.opensearch.index.get.GetResult;
 import org.opensearch.index.mapper.IgnoredFieldMapper;
 import org.opensearch.index.mapper.RoutingFieldMapper;
 import org.opensearch.index.seqno.SequenceNumbers;
+import org.opensearch.node.NodeClosedException;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.ConnectTransportException;
 import org.opensearch.transport.TransportService;
 
 import java.util.ArrayList;
@@ -166,7 +169,7 @@ public class InfinoGetActionFilter implements ActionFilter {
                         ? null
                         : versionConflict(shardOf(index, get.id(), get.routing()), get.id(), get.versionType(), get.version(), written.version());
                 } else {
-                    doc = access.restrictsDocuments() ? restrictedDocs(table, List.of(get.id()), access).get(get.id()) : docOf(index, table, get.id(), get.realtime());
+                    doc = proxyDocs(index, table, List.of(get.id()), access).get(get.id());
                     // A found document is at the version its writes report for every document.
                     conflict = doc == null
                         ? null
@@ -238,20 +241,39 @@ public class InfinoGetActionFilter implements ActionFilter {
      * Send {@code request} to {@code node}, which holds its shard's primary,
      * marked forwarded, so it is served there and sent on no further. It goes
      * as the caller: the node authorizes it again, and the answer comes back
-     * in the caller's context.
+     * in the caller's context. A node that cannot be reached, or is closing,
+     * answers 503 ({@link #unreachable}).
      */
     static <T extends ActionRequest, R extends ActionResponse> void forward(DiscoveryNode node, ActionType<R> action, T request, ActionListener<R> listener) {
         TransportService transport = InfinoServices.transportService();
         ThreadContext context = InfinoServices.threadContext();
         if (transport == null || context == null) {
-            listener.onFailure(new InfinoNative.InfinoException("[infino] the node that holds the primary cannot be reached", RestStatus.SERVICE_UNAVAILABLE));
+            listener.onFailure(new InfinoNative.InfinoException(PRIMARY_UNREACHABLE, RestStatus.SERVICE_UNAVAILABLE));
             return;
         }
-        ActionListener<R> inCallerContext = new ContextPreservingActionListener<>(context.newRestorableContext(false), listener);
+        ActionListener<R> answer = ActionListener.wrap(listener::onResponse, e -> listener.onFailure(unreachable(e)));
+        ActionListener<R> inCallerContext = new ContextPreservingActionListener<>(context.newRestorableContext(false), answer);
         try (ThreadContext.StoredContext ignored = context.newStoredContext(true)) {
             context.putHeader(FORWARDED, "true");
             transport.sendRequest(node, action.name(), request, new ActionListenerResponseHandler<>(inCallerContext, action.getResponseReader()));
         }
+    }
+
+    /** What a read sent on to the primary's node and not answered starts with. */
+    static final String PRIMARY_UNREACHABLE = "[infino] the node that holds the primary cannot be reached";
+
+    /**
+     * The failure a read sent on to another node is answered with: 503,
+     * which the client tries again, when that node could not be reached or
+     * is closing (the primary has gone and a copy is not yet promoted, as a
+     * stock read finds no copy to serve it); any other failure as it came.
+     */
+    static Exception unreachable(Exception e) {
+        Throwable cause = ExceptionsHelper.unwrapCause(e);
+        if (cause instanceof ConnectTransportException || cause instanceof NodeClosedException) {
+            return new InfinoNative.InfinoException(PRIMARY_UNREACHABLE + ": " + cause.getMessage(), RestStatus.SERVICE_UNAVAILABLE);
+        }
+        return e;
     }
 
     /**
@@ -272,12 +294,22 @@ public class InfinoGetActionFilter implements ActionFilter {
         + "yet tell whether it holds this document; try again shortly: ";
 
     /**
+     * The answer to a get of a document that writes reached on every try of
+     * its read, followed by the id: its row and numbers could not be read
+     * from one write, and the client tries again.
+     */
+    static final String WRITES_KEEP_LANDING = "[infino] writes kept landing on this document while it was read; try again shortly: ";
+
+    /**
      * How a default-mode get reads documents' rows from {@code table}, by id,
      * as the latest write of each left it (see {@link #reads}): a write the
      * shard has not committed yet is read from its batch. Under a document
      * rule the rows are read through the rule, which sees only what the
      * table holds, so a pending write of those ids is committed first
      * ({@link InfinoEngine#commitForRead}); the skeleton is not refreshed.
+     * On the hosted service the rule's read waits out the read window since
+     * this node's last commit to the table, as every read of committed rows
+     * does ({@link InfinoEngine#currentDocs}).
      */
     static Function<Collection<String>, Map<String, InfinoNative.Doc>> docReader(String table, InfinoAccess access) {
         if (access.restrictsDocuments()) {
@@ -285,7 +317,8 @@ public class InfinoGetActionFilter implements ActionFilter {
                 if (ids.stream().anyMatch(id -> InfinoEngine.pending(table, id) != null)) {
                     InfinoEngine.commitForRead(table, ids);
                 }
-                return restrictedDocs(table, ids, access);
+                InfinoNative.awaitVisible(table);
+                return restrictedDocs(table, ids, access, !InfinoEngine.readsEveryCommit(table));
             };
         }
         return ids -> InfinoEngine.currentDocs(table, ids);
@@ -315,10 +348,11 @@ public class InfinoGetActionFilter implements ActionFilter {
      * so a row is never older than the numbers reported with it; the
      * skeleton is read again after, and a document a write reached in
      * between is read again, so the row is the one those numbers belong to.
-     * Should writes keep landing, the last read stands, its row as new as
-     * its numbers or newer, which a write conditioned on them meets as a
-     * conflict. A document the skeleton does not hold is missing, unless the
-     * skeleton is being rebuilt and cannot tell, which answers 503.
+     * Should writes keep landing through every try, the document answers
+     * 503, which the client tries again, rather than a row and numbers that
+     * may come from different writes. A document the skeleton does not hold
+     * is missing, unless the skeleton is being rebuilt and cannot tell,
+     * which answers 503.
      */
     static Map<String, Read> reads(
         InfinoEngine.ShardReads shard,
@@ -347,10 +381,11 @@ public class InfinoGetActionFilter implements ActionFilter {
             Map<String, InfinoNative.Doc> rows = found.isEmpty() ? Map.of() : docs.apply(found);
             Map<String, InfinoEngine.WrittenNumbers> moved = new LinkedHashMap<>();
             for (String id : found) {
-                boolean last = tries == READ_TRIES;
-                InfinoEngine.WrittenNumbers after = last ? null : numbers(shard, id, realtime);
-                if (last || before.get(id).equals(after)) {
+                InfinoEngine.WrittenNumbers after = numbers(shard, id, realtime);
+                if (before.get(id).equals(after)) {
                     out.put(id, new Read(before.get(id), rows.get(id), null));
+                } else if (tries == READ_TRIES) {
+                    out.put(id, new Read(null, null, new InfinoNative.InfinoException(WRITES_KEEP_LANDING + id, RestStatus.SERVICE_UNAVAILABLE)));
                 } else {
                     moved.put(id, after);
                 }
@@ -383,10 +418,12 @@ public class InfinoGetActionFilter implements ActionFilter {
     /**
      * The documents of {@code ids} the document-level rule lets the user
      * see, by id: one statement over the table with the rule as its
-     * predicate. An id the rule hides is absent, as a missing document is.
+     * predicate, as of the table's {@code latest} commit when the node's own
+     * view may trail another node's commits. An id the rule hides is absent,
+     * as a missing document is.
      */
-    static Map<String, InfinoNative.Doc> restrictedDocs(String table, Collection<String> ids, InfinoAccess access) {
-        return InfinoNative.docs(table, ids, access.documentsWhere(InfinoNative.columns(table), table, System.currentTimeMillis()));
+    static Map<String, InfinoNative.Doc> restrictedDocs(String table, Collection<String> ids, InfinoAccess access, boolean latest) {
+        return InfinoNative.docs(table, ids, access.documentsWhere(InfinoNative.columns(table), table, System.currentTimeMillis()), latest);
     }
 
     /**
@@ -395,26 +432,33 @@ public class InfinoGetActionFilter implements ActionFilter {
      * committed counts when {@code realtime}, as a stock get reads the
      * translog, and otherwise only what the latest refresh made visible; in
      * proxy mode an acknowledged write is in the table, visible to searches,
-     * already, and a realtime read sees it from any node ({@link #proxyDocs}).
+     * already, and a read sees it from any node ({@link #proxyDocs}).
      * Null when it is missing or deleted.
      */
     static InfinoNative.Doc docOf(IndexMetadata index, String table, String id, boolean realtime) {
         if (!InfinoPlugin.inDefaultMode(index.getSettings())) {
-            return realtime ? proxyDocs(index, table, List.of(id)).get(id) : InfinoNative.getDoc(table, id);
+            return proxyDocs(index, table, List.of(id), InfinoAccess.NONE).get(id);
         }
         return realtime ? InfinoEngine.currentDoc(table, id) : InfinoEngine.refreshedDoc(table, id);
     }
 
     /**
-     * Proxy-mode documents of {@code ids} in {@code table}, by id, for a
-     * realtime get or multi-get: as of the writer's last commit. A node other
-     * than the one writing the table reads its latest commit, since its own
-     * view may trail that node's commits, and would miss a document written
-     * moments ago or report the sequence number of a write before the latest
-     * ({@link #proxyReadsEveryCommit}).
+     * Proxy-mode documents of {@code ids} in {@code table}, by id, for a get
+     * or multi-get, realtime or not, as {@code access} lets the user see
+     * them: as of the writer's last commit. Proxy mode has no refresh to
+     * wait for, as an acknowledged write is in the table already. A node
+     * other than the one writing the table reads its latest commit, since
+     * its own view may trail that node's commits, and would miss a document
+     * written moments ago or report the sequence number of a write before
+     * the latest ({@link #proxyReadsEveryCommit}); so does a read through a
+     * document rule (which the security plugin sends as not realtime).
      */
-    static Map<String, InfinoNative.Doc> proxyDocs(IndexMetadata index, String table, Collection<String> ids) {
-        return InfinoEngine.committedDocs(table, ids, proxyReadsEveryCommit(index, table));
+    static Map<String, InfinoNative.Doc> proxyDocs(IndexMetadata index, String table, Collection<String> ids, InfinoAccess access) {
+        boolean everyCommit = proxyReadsEveryCommit(index, table);
+        if (access.restrictsDocuments()) {
+            return restrictedDocs(table, ids, access, !everyCommit);
+        }
+        return InfinoEngine.committedDocs(table, ids, everyCommit);
     }
 
     /**

@@ -14,6 +14,8 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.ReaderManager;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.Directory;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.seqno.ReplicationTracker;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -349,6 +351,48 @@ public class InfinoEngineTests extends OpenSearchTestCase {
             assertEquals(Map.of("d1", new InfinoNative.Doc("{}", 3, "r")), docs);
             assertEquals("one call for both ids", List.of("infino_get_docs_latest [d1, d2]"), calls);
         } finally {
+            InfinoNative.useLib(null);
+        }
+    }
+
+    /** The read window of the hosted-like table in {@link #testARealtimeReadOfACommittedWriteWaitsOutTheReadWindow}. */
+    private static final TimeValue HOSTED_READ_WINDOW = TimeValue.timeValueMillis(300);
+
+    /**
+     * On the hosted service a read inside the read window after a commit may
+     * be answered from before it. A write commits as it is synced, before any
+     * refresh, so once it has left the batch a get reads its row from the
+     * table, while its numbers come from the skeleton: read inside the
+     * window, the row of the write before would go out with the numbers of
+     * this one, and a write conditioned on them would overwrite this one
+     * unseen. The fake table answers the older row until the window has
+     * passed since the commit; the read waits it out and finds the new row.
+     */
+    public void testARealtimeReadOfACommittedWriteWaitsOutTheReadWindow() {
+        String table = "hosted_window";
+        long committedAt = System.nanoTime();
+        InfinoLib bridge = (InfinoLib) Proxy.newProxyInstance(InfinoLib.class.getClassLoader(), new Class<?>[] { InfinoLib.class }, (proxy, method, args) -> {
+            switch (method.getName()) {
+                case "infino_open_with":
+                    return new Memory(1);
+                case "infino_get_docs":
+                case "infino_get_docs_latest":
+                    boolean inWindow = System.nanoTime() - committedAt < HOSTED_READ_WINDOW.nanos();
+                    return string("{\"docs\":{\"d1\":{\"source\":\"" + (inWindow ? "{\\\"n\\\":1}" : "{\\\"n\\\":2}") + "\",\"seq\":0}}}");
+                default:
+                    return null;
+            }
+        });
+        InfinoNative.useLib(bridge);
+        InfinoNative.readWindow(HOSTED_READ_WINDOW);
+        try {
+            InfinoNative.wrote(table, committedAt);
+            Map<String, InfinoNative.Doc> docs = InfinoEngine.currentDocs(table, List.of("d1"));
+            assertEquals("{\"n\":2}", docs.get("d1").source());
+            assertTrue(System.nanoTime() - committedAt >= HOSTED_READ_WINDOW.nanos());
+        } finally {
+            InfinoNative.awaitVisible(table);
+            InfinoNative.readWindow(InfinoPlugin.PLATFORM_READ_WINDOW.get(Settings.EMPTY));
             InfinoNative.useLib(null);
         }
     }

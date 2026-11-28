@@ -288,12 +288,8 @@ public class InfinoMultiGetActionFilter implements ActionFilter {
                 } catch (InfinoNative.InfinoException failure) {
                     tableFailed.put(table, failure);
                 }
-            } else if (access.restrictsDocuments()) {
-                docsOf.put(table, InfinoGetActionFilter.restrictedDocs(table, e.getValue(), access));
-            } else if (mget.realtime()) {
-                docsOf.put(table, InfinoGetActionFilter.proxyDocs(indices.get(indexOfTable.get(table)), table, e.getValue()));
             } else {
-                docsOf.put(table, InfinoNative.docs(table, e.getValue(), null));
+                docsOf.put(table, InfinoGetActionFilter.proxyDocs(indices.get(indexOfTable.get(table)), table, e.getValue(), access));
             }
         }
         // The ignored fields of each proxy-mode table's ids, read once per

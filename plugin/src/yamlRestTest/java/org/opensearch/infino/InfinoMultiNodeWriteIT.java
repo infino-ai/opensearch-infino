@@ -43,6 +43,8 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
 
     /** The admin user of the test cluster's internal user database. */
     private static final String ADMIN_BASIC = "admin:admin";
+    /** The user who reads {@code sec*} under the document rule {@code tag: x} (the security configuration's {@code sec_dls}). */
+    private static final String DLS_BASIC = "dls_user:admin";
     /** The nodes of the test cluster. */
     private static final int NODES = 2;
     /** Writes sent one at a time, alternating between the nodes. */
@@ -92,7 +94,12 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
 
     /** The Authorization header of the admin user. */
     private static String adminAuthorization() {
-        return "Basic " + Base64.getEncoder().encodeToString(ADMIN_BASIC.getBytes(StandardCharsets.UTF_8));
+        return authorization(ADMIN_BASIC);
+    }
+
+    /** The Authorization header of {@code basic}, a user and password joined by a colon. */
+    private static String authorization(String basic) {
+        return "Basic " + Base64.getEncoder().encodeToString(basic.getBytes(StandardCharsets.UTF_8));
     }
 
     @Override
@@ -319,6 +326,47 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
                 );
                 save.setJsonEntity("{\"n\":" + (FRESH_GETS + i) + "}");
                 assertEquals(mode + ", save " + i, "updated", on(writer, save).get("result"));
+            }
+        }
+    }
+
+    /**
+     * A user under a document rule (whose gets the security plugin sends as
+     * not realtime) and a get with {@code realtime=false}, through the node
+     * that does not write the table, each find the edit just acknowledged
+     * through the other node, with its numbers, so a save conditioned on
+     * them is applied. In proxy mode they read through that node's own view
+     * of the table before, which can trail the writer's last commit, and
+     * reported the edit before the latest.
+     */
+    @SuppressWarnings("unchecked")
+    public void testAGetUnderADocumentRuleOrNotRealtimeThroughTheOtherNodeFindsTheLatestEdit() throws IOException {
+        for (String mode : new String[] { "default", "proxy" }) {
+            String index = "sec_multi_rule_get_" + mode;
+            createIndex(index, ",\"index.infino.mode\":\"" + mode + "\"");
+            int writer = primaryNode(index);
+            int other = 1 - writer;
+            // Made visible first: a get that is not realtime finds only what a refresh made visible, as a stock one does.
+            Request create = new Request("PUT", "/" + index + "/_doc/r");
+            create.addParameter("refresh", "true");
+            create.setJsonEntity("{\"tag\":\"x\",\"n\":-1}");
+            on(writer, create);
+            for (int i = 0; i < FRESH_GETS; i++) {
+                Request put = new Request("PUT", "/" + index + "/_doc/r");
+                put.setJsonEntity("{\"tag\":\"x\",\"n\":" + i + "}");
+                Map<String, Object> written = on(writer, put);
+                Map<String, Object> ruled = entityAsMap(performOnAs(other, new Request("GET", "/" + index + "/_doc/r"), DLS_BASIC));
+                assertNumbers(mode + ", rule user's get of edit " + i, written, ruled);
+                assertEquals(mode + ", rule user's get of edit " + i, i, ((Map<String, Object>) ruled.get("_source")).get("n"));
+                Request notRealtime = new Request("GET", "/" + index + "/_doc/r");
+                notRealtime.addParameter("realtime", "false");
+                Map<String, Object> got = on(other, notRealtime);
+                assertNumbers(mode + ", realtime=false get of edit " + i, written, got);
+                assertEquals(mode + ", realtime=false get of edit " + i, i, ((Map<String, Object>) got.get("_source")).get("n"));
+                Request mget = new Request("POST", "/" + index + "/_mget");
+                mget.setJsonEntity("{\"ids\":[\"r\"]}");
+                mget.addParameter("realtime", "false");
+                assertNumbers(mode + ", rule user's realtime=false mget of edit " + i, written, (Map<String, Object>) ((List<?>) entityAsMap(performOnAs(other, mget, DLS_BASIC)).get("docs")).get(0));
             }
         }
     }
@@ -794,8 +842,13 @@ public class InfinoMultiNodeWriteIT extends OpenSearchRestTestCase {
      * names the same node throughout a test.
      */
     private Response performOn(int node, Request request) throws IOException {
+        return performOnAs(node, request, ADMIN_BASIC);
+    }
+
+    /** {@link #performOn} as the user {@code basic}, a user and password joined by a colon. */
+    private Response performOnAs(int node, Request request, String basic) throws IOException {
         RequestOptions.Builder options = request.getOptions().toBuilder();
-        options.addHeader("Authorization", adminAuthorization());
+        options.addHeader("Authorization", authorization(basic));
         request.setOptions(options);
         assertEquals("a client per node", NODES, nodeClients.size());
         return nodeClients.get(node).performRequest(request);
