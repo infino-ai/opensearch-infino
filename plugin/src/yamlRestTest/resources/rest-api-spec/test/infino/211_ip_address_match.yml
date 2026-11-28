@@ -1,0 +1,189 @@
+# A term, terms, match or query_string on an ip field compares addresses, as
+# stock does, not the text a document or a query spells an address in: an
+# IPv6 address compressed or in full, with or without leading zeros, in
+# either case, and an IPv4 address or its IPv4-mapped form (::ffff:a.b.c.d)
+# are each one address. A CIDR block, IPv4 or IPv6, is the addresses it
+# covers, and an IPv6 block over the IPv4-mapped range covers IPv4
+# addresses. Each document keeps its _source as written. Each query runs on
+# a Lucene twin too, so the counts are stock's.
+setup:
+  - do:
+      indices.create:
+        index: ipm_luc
+        body:
+          settings: { index.infino.enabled: false, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { src: { type: ip }, dst: { type: ip } } }
+  - do:
+      indices.create:
+        index: ipm_prx
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: proxy, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { src: { type: ip }, dst: { type: ip } } }
+  - do:
+      indices.create:
+        index: ipm_def
+        body:
+          settings: { index.infino.enabled: true, index.infino.mode: default, number_of_shards: 1, number_of_replicas: 0 }
+          mappings: { properties: { src: { type: ip }, dst: { type: ip } } }
+  - do:
+      bulk:
+        refresh: true
+        index: ipm_luc
+        body:
+          - index: { _id: "1" }
+          - { "src": "10.0.0.7", "dst": "2001:6f8:900:7c0::2" }
+          - index: { _id: "2" }
+          - { "src": "::ffff:10.0.0.8", "dst": "2001:DB8:0:0:0:0:0:2" }
+          - index: { _id: "3" }
+          - { "src": ["192.168.1.9", "fe80::1"], "dst": "ff02::1" }
+  - do:
+      bulk:
+        refresh: true
+        index: ipm_prx
+        body:
+          - index: { _id: "1" }
+          - { "src": "10.0.0.7", "dst": "2001:6f8:900:7c0::2" }
+          - index: { _id: "2" }
+          - { "src": "::ffff:10.0.0.8", "dst": "2001:DB8:0:0:0:0:0:2" }
+          - index: { _id: "3" }
+          - { "src": ["192.168.1.9", "fe80::1"], "dst": "ff02::1" }
+  - do:
+      bulk:
+        refresh: true
+        index: ipm_def
+        body:
+          - index: { _id: "1" }
+          - { "src": "10.0.0.7", "dst": "2001:6f8:900:7c0::2" }
+          - index: { _id: "2" }
+          - { "src": "::ffff:10.0.0.8", "dst": "2001:DB8:0:0:0:0:0:2" }
+          - index: { _id: "3" }
+          - { "src": ["192.168.1.9", "fe80::1"], "dst": "ff02::1" }
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: ipm_luc,ipm_prx,ipm_def
+        ignore_unavailable: true
+
+---
+"A term in any spelling of an address finds it":
+  - do: { count: { index: ipm_luc, body: { query: { term: { dst: "2001:6f8:900:7c0:0:0:0:2" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_prx, body: { query: { term: { dst: "2001:6f8:900:7c0:0:0:0:2" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_def, body: { query: { term: { dst: "2001:6f8:900:7c0:0:0:0:2" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_luc, body: { query: { term: { dst: "2001:06F8:0900:07C0::0002" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_prx, body: { query: { term: { dst: "2001:06F8:0900:07C0::0002" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_def, body: { query: { term: { dst: "2001:06F8:0900:07C0::0002" } } } } }
+  - match: { count: 1 }
+  # The document wrote this address in full and upper case.
+  - do: { count: { index: ipm_luc, body: { query: { term: { dst: "2001:db8::2" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_prx, body: { query: { term: { dst: "2001:db8::2" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_def, body: { query: { term: { dst: "2001:db8::2" } } } } }
+  - match: { count: 1 }
+
+---
+"An IPv4 address and its IPv4-mapped form are one address":
+  - do: { count: { index: ipm_luc, body: { query: { term: { src: "::ffff:10.0.0.7" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_prx, body: { query: { term: { src: "::ffff:10.0.0.7" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_def, body: { query: { term: { src: "::ffff:10.0.0.7" } } } } }
+  - match: { count: 1 }
+  # The document wrote this one in its mapped form.
+  - do: { count: { index: ipm_luc, body: { query: { term: { src: "10.0.0.8" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_prx, body: { query: { term: { src: "10.0.0.8" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_def, body: { query: { term: { src: "10.0.0.8" } } } } }
+  - match: { count: 1 }
+
+---
+"A terms, match or query_string compares addresses too":
+  - do: { count: { index: ipm_luc, body: { query: { terms: { dst: [ "2001:6f8:900:7c0:0:0:0:2", "2001:0db8::0002" ] } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: ipm_prx, body: { query: { terms: { dst: [ "2001:6f8:900:7c0:0:0:0:2", "2001:0db8::0002" ] } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: ipm_def, body: { query: { terms: { dst: [ "2001:6f8:900:7c0:0:0:0:2", "2001:0db8::0002" ] } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: ipm_luc, body: { query: { terms: { src: [ "::ffff:192.168.1.9", "FE80:0:0:0:0:0:0:1" ] } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_prx, body: { query: { terms: { src: [ "::ffff:192.168.1.9", "FE80:0:0:0:0:0:0:1" ] } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_def, body: { query: { terms: { src: [ "::ffff:192.168.1.9", "FE80:0:0:0:0:0:0:1" ] } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_luc, body: { query: { match: { dst: "2001:6f8:900:7c0:0:0:0:2" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_prx, body: { query: { match: { dst: "2001:6f8:900:7c0:0:0:0:2" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_def, body: { query: { match: { dst: "2001:6f8:900:7c0:0:0:0:2" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_luc, body: { query: { query_string: { query: 'dst:"2001:db8:0:0:0:0:0:2"' } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_prx, body: { query: { query_string: { query: 'dst:"2001:db8:0:0:0:0:0:2"' } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_def, body: { query: { query_string: { query: 'dst:"2001:db8:0:0:0:0:0:2"' } } } } }
+  - match: { count: 1 }
+
+---
+"An IPv6 CIDR block is the addresses it covers":
+  - do: { count: { index: ipm_luc, body: { query: { term: { dst: "2001::/16" } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: ipm_prx, body: { query: { term: { dst: "2001::/16" } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: ipm_def, body: { query: { term: { dst: "2001::/16" } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: ipm_luc, body: { query: { term: { dst: "ff00::/8" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_prx, body: { query: { term: { dst: "ff00::/8" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_def, body: { query: { term: { dst: "ff00::/8" } } } } }
+  - match: { count: 1 }
+  - do: { count: { index: ipm_luc, body: { query: { bool: { must_not: { term: { dst: "ff00::/8" } } } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: ipm_prx, body: { query: { bool: { must_not: { term: { dst: "ff00::/8" } } } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: ipm_def, body: { query: { bool: { must_not: { term: { dst: "ff00::/8" } } } } } } }
+  - match: { count: 2 }
+  # The block covers the IPv4-mapped range (::ffff:0:0/96), so every IPv4 address.
+  - do: { count: { index: ipm_luc, body: { query: { term: { src: "::/8" } } } } }
+  - match: { count: 3 }
+  - do: { count: { index: ipm_prx, body: { query: { term: { src: "::/8" } } } } }
+  - match: { count: 3 }
+  - do: { count: { index: ipm_def, body: { query: { term: { src: "::/8" } } } } }
+  - match: { count: 3 }
+  - do: { count: { index: ipm_luc, body: { query: { terms: { src: [ "fe80::/10", "10.0.0.8" ] } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: ipm_prx, body: { query: { terms: { src: [ "fe80::/10", "10.0.0.8" ] } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: ipm_def, body: { query: { terms: { src: [ "fe80::/10", "10.0.0.8" ] } } } } }
+  - match: { count: 2 }
+  # An IPv4 block finds an address written in its mapped form.
+  - do: { count: { index: ipm_luc, body: { query: { term: { src: "10.0.0.0/8" } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: ipm_prx, body: { query: { term: { src: "10.0.0.0/8" } } } } }
+  - match: { count: 2 }
+  - do: { count: { index: ipm_def, body: { query: { term: { src: "10.0.0.0/8" } } } } }
+  - match: { count: 2 }
+
+---
+"A document keeps its _source as written":
+  - do: { get: { index: ipm_luc, id: "2" } }
+  - match: { _source.src: "::ffff:10.0.0.8" }
+  - match: { _source.dst: "2001:DB8:0:0:0:0:0:2" }
+  - do: { get: { index: ipm_prx, id: "2" } }
+  - match: { _source.src: "::ffff:10.0.0.8" }
+  - match: { _source.dst: "2001:DB8:0:0:0:0:0:2" }
+  - do: { get: { index: ipm_def, id: "2" } }
+  - match: { _source.src: "::ffff:10.0.0.8" }
+  - match: { _source.dst: "2001:DB8:0:0:0:0:0:2" }
+  - do: { search: { index: ipm_prx, body: { query: { term: { dst: "2001:db8::2" } } } } }
+  - match: { hits.hits.0._source.dst: "2001:DB8:0:0:0:0:0:2" }
+  - do: { search: { index: ipm_def, body: { query: { term: { dst: "2001:db8::2" } } } } }
+  - match: { hits.hits.0._source.dst: "2001:DB8:0:0:0:0:0:2" }
