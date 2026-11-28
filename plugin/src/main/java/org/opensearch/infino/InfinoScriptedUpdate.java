@@ -11,14 +11,18 @@ import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.action.update.UpdateResponse;
 import org.opensearch.common.document.DocumentField;
 import org.opensearch.common.lucene.uid.Versions;
+import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.get.GetResult;
 import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.index.mapper.RoutingFieldMapper;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.script.ScriptService;
+import org.opensearch.script.UpdateScript;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.util.List;
@@ -37,6 +41,9 @@ import java.util.function.LongSupplier;
  * read from the table, and writes what the script made of it.
  */
 final class InfinoScriptedUpdate {
+
+    /** The message stock's update wraps a script's failure in, its compile's included. */
+    private static final String SCRIPT_FAILED = "failed to execute script";
 
     private InfinoScriptedUpdate() {}
 
@@ -65,6 +72,44 @@ final class InfinoScriptedUpdate {
         Result run(ShardId shardId, UpdateRequest update, GetResult current, LongSupplier now) {
             return prepare(shardId, update, current, now);
         }
+    }
+
+    /**
+     * Compile {@code update}'s script ahead of its run, outside any lock: the
+     * node's script service keeps what it compiles, so the run finds it
+     * compiled. Null when it compiled, or there is no script to compile;
+     * else what the compile threw (a script that does not parse, a script
+     * type or context the node does not allow, the compile rate exceeded),
+     * which the run raises where stock compiles the script ({@link #compiles}).
+     */
+    static RuntimeException compileAhead(UpdateRequest update) {
+        return compileAhead(InfinoServices.scriptService(), update);
+    }
+
+    /** {@link #compileAhead(UpdateRequest)} with the given script service. */
+    static RuntimeException compileAhead(ScriptService scripts, UpdateRequest update) {
+        if (update.script() == null || scripts == null) {
+            return null; // without the service the run refuses the update itself
+        }
+        try {
+            scripts.compile(update.script(), UpdateScript.CONTEXT);
+            return null;
+        } catch (RuntimeException e) {
+            // Wrapped as stock's update wraps what its compile throws.
+            return new IllegalArgumentException(SCRIPT_FAILED, e);
+        }
+    }
+
+    /**
+     * Whether stock's update compiles {@code update}'s script, given whether
+     * its document {@code exists}: it runs the script over a document that
+     * exists, and over a missing one only for a scripted upsert. A missing
+     * document is otherwise written from the upsert, or refused as missing,
+     * without the script.
+     */
+    static boolean compiles(UpdateRequest update, boolean exists) {
+        return update.script() != null
+            && (exists || (update.scriptedUpsert() && (update.upsertRequest() != null || update.docAsUpsert())));
     }
 
     /**
@@ -110,6 +155,26 @@ final class InfinoScriptedUpdate {
             throw new MapperParsingException(unreadable);
         }
         return new Change(Op.INDEX, document, null);
+    }
+
+    /**
+     * What stock's update answers under {@code get} when it asks for the
+     * source ({@code _source} on the update): the document it wrote,
+     * {@code written} (its JSON source), filtered as the update asks, under
+     * the sequence number, primary term and version the write took. A
+     * document the script deleted ({@code written} null) is answered without
+     * a source, as stock answers it. Null when the update asks for no source.
+     */
+    static GetResult writtenGetResult(UpdateRequest update, String index, long seqNo, long primaryTerm, long version, String written) {
+        if (update.fetchSource() == null || !update.fetchSource().fetchSource()) {
+            return null;
+        }
+        if (written == null) {
+            return new GetResult(index, update.id(), seqNo, primaryTerm, version, true, null, Map.of(), Map.of());
+        }
+        BytesReference bytes = new BytesArray(written);
+        Map<String, Object> source = XContentHelper.convertToMap(bytes, true, MediaTypeRegistry.JSON).v2();
+        return UpdateHelper.extractGetResult(update, index, seqNo, primaryTerm, version, source, MediaTypeRegistry.JSON, bytes);
     }
 
     /**

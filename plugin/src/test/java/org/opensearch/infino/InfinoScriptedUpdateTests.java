@@ -14,6 +14,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.engine.DocumentMissingException;
+import org.opensearch.index.get.GetResult;
 import org.opensearch.script.MockScriptEngine;
 import org.opensearch.script.Script;
 import org.opensearch.script.ScriptModule;
@@ -165,5 +166,70 @@ public class InfinoScriptedUpdateTests extends OpenSearchTestCase {
     public void testAScriptedUpsertRunsTheScriptOnTheUpsert() {
         UpdateRequest update = new UpdateRequest("logs", "1").script(script("count")).upsert("{\"count\":5}", MediaTypeRegistry.JSON).scriptedUpsert(true);
         assertEquals(Map.of("count", 6), asMap(run(update, null).document()));
+    }
+
+    /**
+     * A script is compiled as its update is staged, outside the table's lock;
+     * the node's script service keeps it, so the run compiles nothing more.
+     * A script that does not compile comes back as the failure, for the run
+     * to raise; an update with no script compiles nothing.
+     */
+    public void testAScriptCompiledAheadIsNotCompiledAgainByTheRun() {
+        ScriptService scripts = scripts();
+        UpdateRequest update = new UpdateRequest("logs", "1").script(script("count"));
+        assertNull(InfinoScriptedUpdate.compileAhead(scripts, update));
+        assertEquals(1, scripts.stats().getCompilations());
+        InfinoScriptedUpdate.Change change = InfinoScriptedUpdate.run(scripts, () -> NOW, SHARD, update, "{\"count\":1}", SEQ_NO, PRIMARY_TERM, VERSION);
+        assertEquals(Map.of("count", 2), asMap(change.document()));
+        assertEquals("the run found it compiled", 1, scripts.stats().getCompilations());
+
+        RuntimeException failed = InfinoScriptedUpdate.compileAhead(scripts, new UpdateRequest("logs", "1").script(script("no_such_script")));
+        // Wrapped as stock's update wraps a compile failure: a 400 that says the script failed.
+        assertTrue(failed instanceof IllegalArgumentException);
+        assertEquals("failed to execute script", failed.getMessage());
+        assertEquals(RestStatus.BAD_REQUEST, ExceptionsHelper.status(failed));
+        assertNull(InfinoScriptedUpdate.compileAhead(scripts, new UpdateRequest("logs", "1").doc("{\"a\":1}", MediaTypeRegistry.JSON)));
+    }
+
+    /**
+     * Stock compiles an update's script only to run it: over a document that
+     * exists, or a missing one in a scripted upsert. A missing document is
+     * otherwise written from its upsert, or refused as missing, and a script
+     * that does not compile changes neither answer.
+     */
+    public void testAScriptIsCompiledWhereStockRunsIt() {
+        UpdateRequest scripted = new UpdateRequest("logs", "1").script(script("count"));
+        assertTrue(InfinoScriptedUpdate.compiles(scripted, true));
+        assertFalse("missing, no upsert: refused as missing", InfinoScriptedUpdate.compiles(scripted, false));
+        UpdateRequest upsert = new UpdateRequest("logs", "1").script(script("count")).upsert("{\"count\":5}", MediaTypeRegistry.JSON);
+        assertFalse("missing: written from the upsert", InfinoScriptedUpdate.compiles(upsert, false));
+        assertTrue(InfinoScriptedUpdate.compiles(upsert, true));
+        assertTrue("a scripted upsert runs the script", InfinoScriptedUpdate.compiles(upsert.scriptedUpsert(true), false));
+        assertFalse(InfinoScriptedUpdate.compiles(new UpdateRequest("logs", "1").doc("{\"a\":1}", MediaTypeRegistry.JSON), true));
+    }
+
+    /**
+     * An update that asks for its source is answered with the document it
+     * wrote under {@code get}, filtered as it asks, as stock answers; one its
+     * script deleted is answered found without a source; one that asks for
+     * none has no {@code get}.
+     */
+    public void testAnUpdateThatAsksForItsSourceGetsTheDocumentItWrote() {
+        String written = "{\"n\":2,\"tags\":[\"a\"]}";
+        UpdateRequest asks = new UpdateRequest("logs", "1").script(script("count")).fetchSource(true);
+        GetResult get = InfinoScriptedUpdate.writtenGetResult(asks, "logs", SEQ_NO, PRIMARY_TERM, VERSION, written);
+        assertTrue(get.isExists());
+        assertEquals(Map.of("n", 2, "tags", List.of("a")), get.sourceAsMap());
+        assertEquals(SEQ_NO, get.getSeqNo());
+        assertEquals(PRIMARY_TERM, get.getPrimaryTerm());
+
+        UpdateRequest filtered = new UpdateRequest("logs", "1").script(script("count")).fetchSource(new String[] { "n" }, null);
+        assertEquals(Map.of("n", 2), InfinoScriptedUpdate.writtenGetResult(filtered, "logs", SEQ_NO, PRIMARY_TERM, VERSION, written).sourceAsMap());
+
+        GetResult deleted = InfinoScriptedUpdate.writtenGetResult(asks, "logs", SEQ_NO, PRIMARY_TERM, VERSION, null);
+        assertTrue(deleted.isExists());
+        assertNull(deleted.sourceRef());
+
+        assertNull(InfinoScriptedUpdate.writtenGetResult(new UpdateRequest("logs", "1").script(script("count")), "logs", SEQ_NO, PRIMARY_TERM, VERSION, written));
     }
 }
