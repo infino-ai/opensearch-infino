@@ -136,6 +136,11 @@ final class InfinoIp {
         return new BytesRef(bytesOf(value));
     }
 
+    /** The 16-byte form of the address a key holds. */
+    static BytesRef encodedKey(Object key) {
+        return new BytesRef(HEX.parseHex(checked(key)));
+    }
+
     /** The address a key holds, as stock prints it ({@code 1.2.3.4}, or IPv6 compressed). */
     static String shown(Object key) {
         return NetworkAddress.format(InetAddressPoint.decode(HEX.parseHex(checked(key))));

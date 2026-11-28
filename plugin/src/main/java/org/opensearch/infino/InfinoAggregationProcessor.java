@@ -1704,8 +1704,9 @@ public class InfinoAggregationProcessor {
         DOUBLE,
         DATE,
         /**
-         * An ip field's address, as the table holds it: grouped by its text,
-         * ordered by its key ({@link InfinoIp#key}) and bucketed by its
+         * An ip field's address: a terms bucket groups by the text the table
+         * holds and orders by its key ({@link InfinoIp#key}), a composite
+         * source groups by the key itself, and either carries the address's
          * 16-byte form, as stock orders and prints addresses.
          */
         IP
@@ -2870,8 +2871,10 @@ public class InfinoAggregationProcessor {
             }
             if (s instanceof TermsValuesSourceBuilder) {
                 if (column != null && s.script() == null && InfinoQueryTranslator.isIp(column)) {
-                    // Its pages run in the after key's order, which for an address is not its text's.
-                    throw new Unsupported("aggregation [" + agg + "] source [" + s.name() + "] on the ip field " + c.label() + " is not served");
+                    // Keyed by the address's key, so the buckets and the pages after a key run in
+                    // address order; a bucket carries the 16-byte form, which the format prints.
+                    String keyExpr = "(" + InfinoIp.key(c.expr()) + ")";
+                    return new CompositeSource(s.name(), c, keyExpr, KeyKind.IP, DocValueFormat.IP, desc, s.missingBucket(), missing, null);
                 }
                 KeyKind kind = Grouped.kindOf(c);
                 DocValueFormat format = kind == KeyKind.DATE
@@ -2916,6 +2919,10 @@ public class InfinoAggregationProcessor {
 
         /** The after value of a source as an SQL literal, read as the source's key kind. */
         private static String afterLiteral(String agg, CompositeSource s, Object v) {
+            if (s.keyKind() == KeyKind.IP) {
+                // An address, as stock reads one; text that is not one is refused with stock's message.
+                return InfinoIp.keyLiteral(v);
+            }
             if (s.keyKind() == KeyKind.DATE && v instanceof String text) {
                 // As stock: the source's format reads the key, so a date with no offset of
                 // its own is local time in the source's zone, a date histogram source with
@@ -2990,7 +2997,8 @@ public class InfinoAggregationProcessor {
                     continue;
                 }
                 key[i] = switch (sources.get(i).keyKind()) {
-                    case STR, IP -> new BytesRef(v.toString()); // no composite source keys an address
+                    case STR -> new BytesRef(v.toString());
+                    case IP -> InfinoIp.encodedKey(v);
                     case BOOL -> asBoolean(v) ? 1L : 0L;
                     case LONG, DATE -> asLong(v);
                     case DOUBLE -> asDouble(v, 0.0);
@@ -3697,7 +3705,9 @@ public class InfinoAggregationProcessor {
             Source source = s.source();
             if (source.multi()) {
                 String literal = key == null ? null : Grouped.keyLiteral(s.keyKind(), key);
-                ands.add(literal == null ? source.noValue() : source.anyValue(value -> value + " = " + literal));
+                // An address's bucket holds its key, so each value is keyed before the comparison.
+                boolean ip = s.keyKind() == KeyKind.IP;
+                ands.add(literal == null ? source.noValue() : source.anyValue(value -> (ip ? InfinoIp.key(value) : value) + " = " + literal));
                 continue;
             }
             ands.add(key == null ? s.keyExpr() + " IS NULL" : s.keyExpr() + " = " + Grouped.keyLiteral(s.keyKind(), key));

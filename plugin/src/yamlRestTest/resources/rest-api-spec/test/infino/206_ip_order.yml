@@ -1071,13 +1071,155 @@
         index: ipo_prx
         body: { size: 0, aggs: { m: { max: { field: addr } } } }
 
-  # A composite source on an ip field is refused, since its pages would follow the text.
+  # A composite source on an ip field groups and pages by address, as stock does.
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ] } } } }
+  - set: { aggregations.c.buckets: ca_p0 }
+  - set: { aggregations.c.after_key: ca_luc_after0 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ] } } } }
+  - match: { aggregations.c.buckets: $ca_p0 }
+  - set: { aggregations.c.after_key: ca_ipo_def_after0 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ] } } } }
+  - match: { aggregations.c.buckets: $ca_p0 }
+  - set: { aggregations.c.after_key: ca_ipo_prx_after0 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ], after: $ca_luc_after0 } } } }
+  - set: { aggregations.c.buckets: ca_p1 }
+  - set: { aggregations.c.after_key: ca_luc_after1 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ], after: $ca_ipo_def_after0 } } } }
+  - match: { aggregations.c.buckets: $ca_p1 }
+  - set: { aggregations.c.after_key: ca_ipo_def_after1 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ], after: $ca_ipo_prx_after0 } } } }
+  - match: { aggregations.c.buckets: $ca_p1 }
+  - set: { aggregations.c.after_key: ca_ipo_prx_after1 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ], after: $ca_luc_after1 } } } }
+  - set: { aggregations.c.buckets: ca_p2 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ], after: $ca_ipo_def_after1 } } } }
+  - match: { aggregations.c.buckets: $ca_p2 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr } } } ], after: $ca_ipo_prx_after1 } } } }
+  - match: { aggregations.c.buckets: $ca_p2 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ] } } } }
+  - set: { aggregations.c.buckets: cd_p0 }
+  - set: { aggregations.c.after_key: cd_luc_after0 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ] } } } }
+  - match: { aggregations.c.buckets: $cd_p0 }
+  - set: { aggregations.c.after_key: cd_ipo_def_after0 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ] } } } }
+  - match: { aggregations.c.buckets: $cd_p0 }
+  - set: { aggregations.c.after_key: cd_ipo_prx_after0 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ], after: $cd_luc_after0 } } } }
+  - set: { aggregations.c.buckets: cd_p1 }
+  - set: { aggregations.c.after_key: cd_luc_after1 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ], after: $cd_ipo_def_after0 } } } }
+  - match: { aggregations.c.buckets: $cd_p1 }
+  - set: { aggregations.c.after_key: cd_ipo_def_after1 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ], after: $cd_ipo_prx_after0 } } } }
+  - match: { aggregations.c.buckets: $cd_p1 }
+  - set: { aggregations.c.after_key: cd_ipo_prx_after1 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ], after: $cd_luc_after1 } } } }
+  - set: { aggregations.c.buckets: cd_p2 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ], after: $cd_ipo_def_after1 } } } }
+  - match: { aggregations.c.buckets: $cd_p2 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { c: { composite: { size: 6, sources: [ { a: { terms: { field: addr, order: desc } } } ], after: $cd_ipo_prx_after1 } } } }
+  - match: { aggregations.c.buckets: $cd_p2 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { c: { composite: { size: 9, sources: [ { a: { terms: { field: addr, missing_bucket: true } } } ] } } } }
+  - set: { aggregations.c.buckets: cm_p0 }
+  - set: { aggregations.c.after_key: cm_luc_after0 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { c: { composite: { size: 9, sources: [ { a: { terms: { field: addr, missing_bucket: true } } } ] } } } }
+  - match: { aggregations.c.buckets: $cm_p0 }
+  - set: { aggregations.c.after_key: cm_ipo_def_after0 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { c: { composite: { size: 9, sources: [ { a: { terms: { field: addr, missing_bucket: true } } } ] } } } }
+  - match: { aggregations.c.buckets: $cm_p0 }
+  - set: { aggregations.c.after_key: cm_ipo_prx_after0 }
+  - do:
+      search:
+        index: ipo_luc
+        body: { size: 0, aggs: { c: { composite: { size: 9, sources: [ { a: { terms: { field: addr, missing_bucket: true } } } ], after: $cm_luc_after0 } } } }
+  - set: { aggregations.c.buckets: cm_p1 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { c: { composite: { size: 9, sources: [ { a: { terms: { field: addr, missing_bucket: true } } } ], after: $cm_ipo_def_after0 } } } }
+  - match: { aggregations.c.buckets: $cm_p1 }
+  - do:
+      search:
+        index: ipo_prx
+        body: { size: 0, aggs: { c: { composite: { size: 9, sources: [ { a: { terms: { field: addr, missing_bucket: true } } } ], after: $cm_ipo_prx_after0 } } } }
+  - match: { aggregations.c.buckets: $cm_p1 }
+  - do:
+      search:
+        index: ipo_def
+        body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ] } } } }
+  - match: { aggregations.c.buckets.0.key.a: "::1" }
+  - match: { aggregations.c.buckets.1.key.a: "1.0.6.192" }
+  - match: { aggregations.c.buckets.2.key.a: "1.0.61.206" }
+  - match: { aggregations.c.after_key.a: "1.0.61.206" }
   - do:
       catch: bad_request
       search:
         index: ipo_def
-        body: { size: 0, aggs: { c: { composite: { sources: [ { a: { terms: { field: addr } } } ] } } } }
-  - match: { error.root_cause.0.reason: "/.*on.the.ip.field..addr..is.not.served.*/" }
+        body: { size: 0, aggs: { c: { composite: { sources: [ { a: { terms: { field: addr } } } ], after: { a: "not-an-address" } } } } }
   # A missing value on an ip sort is refused: stock compares its text with the addresses' 16-byte form.
   - do:
       catch: bad_request
@@ -1093,7 +1235,7 @@
   - match: { error.root_cause.0.reason: "/.*sort.missing.value..1.2.3.4..on..addr...an.ip.field,.is.not.served.*/" }
 
 ---
-"A range over documents with several addresses matches a Lucene twin, and a sort over them is refused":
+"A range and a composite over documents with several addresses match a Lucene twin, and a sort over them is refused":
   - do:
       indices.create:
         index: ipm_luc
@@ -1193,6 +1335,40 @@
         index: ipm_prx
         body: { size: 0, track_total_hits: true, query: { range: { addr: { lt: "10.0.0.0" } } } }
   - match: { hits.total.value: 1 }
+  # A composite source buckets each of a document's addresses, in address order.
+  - do:
+      search:
+        index: ipm_luc
+        body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ] } } } }
+  - set: { aggregations.c.buckets: cmv_p0 }
+  - set: { aggregations.c.after_key: cmv_luc_after0 }
+  - do:
+      search:
+        index: ipm_def
+        body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ] } } } }
+  - match: { aggregations.c.buckets: $cmv_p0 }
+  - set: { aggregations.c.after_key: cmv_ipm_def_after0 }
+  - do:
+      search:
+        index: ipm_prx
+        body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ] } } } }
+  - match: { aggregations.c.buckets: $cmv_p0 }
+  - set: { aggregations.c.after_key: cmv_ipm_prx_after0 }
+  - do:
+      search:
+        index: ipm_luc
+        body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ], after: $cmv_luc_after0 } } } }
+  - set: { aggregations.c.buckets: cmv_p1 }
+  - do:
+      search:
+        index: ipm_def
+        body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ], after: $cmv_ipm_def_after0 } } } }
+  - match: { aggregations.c.buckets: $cmv_p1 }
+  - do:
+      search:
+        index: ipm_prx
+        body: { size: 0, aggs: { c: { composite: { size: 3, sources: [ { a: { terms: { field: addr } } } ], after: $cmv_ipm_prx_after0 } } } }
+  - match: { aggregations.c.buckets: $cmv_p1 }
   - do:
       catch: bad_request
       search:
@@ -1207,7 +1383,7 @@
   - match: { error.root_cause.0.reason: "/.*an.ip.field.some.documents.give.several.values,.is.not.served.*/" }
 
 ---
-"Across three shards, an ip sort and a terms key order merge in address order, as a Lucene twin merges them":
+"Across three shards, an ip sort, a terms key order and composite pages merge in address order, as a Lucene twin merges them":
   - do:
       indices.create:
         index: ips_luc
@@ -1487,6 +1663,58 @@
   - match: { aggregations.t.buckets.3.key: $kdesc_3 }
   - match: { aggregations.t.buckets.4.key: $kdesc_4 }
   - match: { aggregations.t.buckets.5.key: $kdesc_5 }
+  # Composite pages across the shards follow address order.
+  - do:
+      search:
+        index: ips_luc
+        body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ] } } } }
+  - set: { aggregations.c.buckets: cs_p0 }
+  - set: { aggregations.c.after_key: cs_luc_after0 }
+  - do:
+      search:
+        index: ips_def
+        body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ] } } } }
+  - match: { aggregations.c.buckets: $cs_p0 }
+  - set: { aggregations.c.after_key: cs_ips_def_after0 }
+  - do:
+      search:
+        index: ips_prx
+        body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ] } } } }
+  - match: { aggregations.c.buckets: $cs_p0 }
+  - set: { aggregations.c.after_key: cs_ips_prx_after0 }
+  - do:
+      search:
+        index: ips_luc
+        body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ], after: $cs_luc_after0 } } } }
+  - set: { aggregations.c.buckets: cs_p1 }
+  - set: { aggregations.c.after_key: cs_luc_after1 }
+  - do:
+      search:
+        index: ips_def
+        body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ], after: $cs_ips_def_after0 } } } }
+  - match: { aggregations.c.buckets: $cs_p1 }
+  - set: { aggregations.c.after_key: cs_ips_def_after1 }
+  - do:
+      search:
+        index: ips_prx
+        body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ], after: $cs_ips_prx_after0 } } } }
+  - match: { aggregations.c.buckets: $cs_p1 }
+  - set: { aggregations.c.after_key: cs_ips_prx_after1 }
+  - do:
+      search:
+        index: ips_luc
+        body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ], after: $cs_luc_after1 } } } }
+  - set: { aggregations.c.buckets: cs_p2 }
+  - do:
+      search:
+        index: ips_def
+        body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ], after: $cs_ips_def_after1 } } } }
+  - match: { aggregations.c.buckets: $cs_p2 }
+  - do:
+      search:
+        index: ips_prx
+        body: { size: 0, aggs: { c: { composite: { size: 4, sources: [ { a: { terms: { field: addr } } } ], after: $cs_ips_prx_after1 } } } }
+  - match: { aggregations.c.buckets: $cs_p2 }
   - do:
       search:
         index: ips_def
