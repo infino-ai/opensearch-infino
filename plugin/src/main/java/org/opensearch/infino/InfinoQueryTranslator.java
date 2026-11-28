@@ -73,6 +73,7 @@ import java.util.Map;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.function.ToIntFunction;
 import java.util.regex.Pattern;
 
@@ -3203,7 +3204,8 @@ final class InfinoQueryTranslator {
             if (w.field() == null) {
                 return anyOf(
                     targets,
-                    c -> c.fts() ? termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*")) : like(c, wildcardToLike(w.pattern()))
+                    c -> c.fts() ? termPattern(c, wildcardToRegex(w.pattern()), w.pattern().endsWith("*")) : like(c, wildcardToLike(w.pattern())),
+                    () -> indexMatches(w.pattern(), false)
                 );
             }
             if (InfinoIndexField.NAME.equals(w.field())) {
@@ -3221,7 +3223,7 @@ final class InfinoQueryTranslator {
         }
         if (n instanceof Regex r) {
             if (r.field() == null) {
-                return anyOf(targets, c -> c.fts() ? termPattern(c, "(?:" + r.pattern() + ")", false) : wholeValueMatches(c, r.pattern()));
+                return anyOf(targets, c -> c.fts() ? termPattern(c, "(?:" + r.pattern() + ")", false) : wholeValueMatches(c, r.pattern()), null);
             }
             Column c = column(r.field());
             if (c == null) {
@@ -3295,11 +3297,17 @@ final class InfinoQueryTranslator {
      * The predicate over the text and string columns named, any of them
      * matching; none matches nothing. A keyword field is reached as a bare
      * term reaches it ({@link #textOnFields}): a pattern on the default
-     * fields matches its values whole.
+     * fields matches its values whole. {@code _index} among them, which has
+     * no column, matches as {@code onIndex} says (the index's name matched
+     * as stock's field matches a shard's); with none, it is refused.
      */
-    private String anyOf(List<String> targets, Function<Column, String> perColumn) {
+    private String anyOf(List<String> targets, Function<Column, String> perColumn, Supplier<String> onIndex) {
         List<String> or = new ArrayList<>();
         for (String f : targets) {
+            if (InfinoIndexField.NAME.equals(f) && onIndex != null) {
+                or.add(onIndex.get());
+                continue;
+            }
             Column c = column(f);
             if (c != null && (c.fts() || c.element().isString())) {
                 String p = perColumn.apply(c);

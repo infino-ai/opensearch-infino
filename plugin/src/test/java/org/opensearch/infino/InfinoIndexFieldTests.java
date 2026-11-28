@@ -106,6 +106,29 @@ public class InfinoIndexFieldTests extends OpenSearchTestCase {
         assertTrue(e.getMessage(), e.getMessage().contains("asks for fuzziness"));
     }
 
+    /**
+     * A wildcard on fields that hold {@code _index}, as a query string reads
+     * one without a field: on the field, the index's name matched against the
+     * pattern; on the others, as before. It used to be refused there.
+     */
+    public void testAWildcardOverFieldsHoldingTheFieldMatchesTheIndexName() {
+        assertEquals("1=1", where(QueryBuilders.queryStringQuery("logs*").defaultField("_index")));
+        assertEquals("1=0", where(QueryBuilders.queryStringQuery("metrics*").defaultField("_index")));
+        assertEquals("(1=0 OR regexp_like(\"msg\", '\\bsl[^\\s]*', 'i'))", where(QueryBuilders.queryStringQuery("sl*").field("msg").field("_index")));
+        assertEquals("(1=1 OR regexp_like(\"msg\", '\\blogs_[^\\s]*', 'i'))", where(QueryBuilders.queryStringQuery("logs_*").field("msg").field("_index")));
+        String onKeyword = where(QueryBuilders.queryStringQuery("sl*").field("service").field("_index"));
+        assertTrue(onKeyword, onKeyword.startsWith("(1=0 OR "));
+    }
+
+    /** A script reading {@code doc['_index']} is refused: no column holds it, and read as unmapped it would be null where stock reads the name. */
+    public void testAScriptReadingTheFieldIsRefused() {
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> where(QueryBuilders.scriptQuery(new Script("doc['_index'].value == 'logs_0'")))
+        );
+        assertEquals("[infino] script [doc['_index'].value == 'logs_0'] reads doc['_index'], which is not served", e.getMessage());
+    }
+
     public void testATableNoIndexIsServedFromIsRefusedNotReadAsUnmapped() {
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
