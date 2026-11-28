@@ -1220,6 +1220,19 @@ final class InfinoQueryTranslator {
     }
 
     /**
+     * One value of field {@code c} for each document: its own value, or for a
+     * document that gave the field several, which its list column
+     * {@code values} holds (the field's own column when that is the list) with
+     * its own column null, the least of them, or the greatest when
+     * {@code greatest}. Values compare as doc values sort them: numbers and
+     * dates by value, keywords by their UTF-8 bytes.
+     */
+    static String oneValue(Column c, Column values, boolean greatest) {
+        String pick = (greatest ? "array_max(" : "array_min(") + quoteIdent(values.name()) + ")";
+        return c.isList() ? pick : "CASE WHEN " + quoteIdent(values.name()) + " IS NULL THEN " + quoteIdent(c.name()) + " ELSE " + pick + " END";
+    }
+
+    /**
      * The rows where any value of a field passes {@code test}, a predicate
      * over a column expression of the field's own type: a document's own
      * value, or, where it gave the field several, any of the values its list

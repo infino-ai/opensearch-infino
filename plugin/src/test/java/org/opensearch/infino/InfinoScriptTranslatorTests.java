@@ -94,6 +94,28 @@ public class InfinoScriptTranslatorTests extends OpenSearchTestCase {
         assertEquals("(\"tags\" IS NULL AND \"tags[]\" IS NULL)", InfinoScriptTranslator.translate(empty, cols, null, NOW).expr());
     }
 
+    /**
+     * As stock, doc['f'].value is the first of a document's values in
+     * doc-values order, its least: from the list column when the document
+     * gave several (its own column is then null), else its own value. A
+     * keyword compares by its UTF-8 bytes, a number by its value.
+     */
+    public void testDocValueOfAListColumnIsItsLeastValue() {
+        Map<String, Column> cols = Map.of(
+            "tags", new Column("tags", "str", false, false),
+            "tags[]", Column.list("tags[]", "str"),
+            "nums", new Column("nums", "i64", false, false),
+            "nums[]", Column.list("nums[]", "i64")
+        );
+        Sql tags = InfinoScriptTranslator.translate(new Script(ScriptType.INLINE, "painless", "doc['tags'].value", Map.of()), cols, null, NOW);
+        assertEquals("CASE WHEN \"tags[]\" IS NULL THEN \"tags\" ELSE array_min(\"tags[]\") END", tags.expr());
+        assertEquals(SqlType.STRING, tags.type());
+        Sql nums = InfinoScriptTranslator.translate(new Script(ScriptType.INLINE, "painless", "doc['nums'].getValue() > 3", Map.of()), cols, null, NOW);
+        assertEquals("(CASE WHEN \"nums[]\" IS NULL THEN \"nums\" ELSE array_min(\"nums[]\") END > 3)", nums.expr());
+        // A field no document gives several values reads its own column, as before.
+        assertEquals("\"price\"", sql("doc['price'].value").expr());
+    }
+
     public void testStatementsBecomeOneExpression() {
         Sql s = sql("def t = doc['price'].value * params.rate; return t > params.min;", Map.of("rate", 2, "min", 200));
         assertEquals("((\"price\" * 2) > 200)", s.expr());
