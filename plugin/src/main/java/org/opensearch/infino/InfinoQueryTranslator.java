@@ -2858,9 +2858,13 @@ final class InfinoQueryTranslator {
         List<String> exact = new ArrayList<>();
         for (String f : fields) {
             if (InfinoIndexField.NAME.equals(f)) {
-                // As stock reads _index among a query's fields: one keyword value, the index's name.
-                if (exactToo && !composed) {
-                    exact.add(indexMatches(value, false));
+                // As stock reads _index among a query's fields: one keyword value,
+                // the index's name. Where it is another index's name the field
+                // matches nothing and adds nothing, so the text fields still rank
+                // the hits. A composed query reaches here only when none of its
+                // words is this index's name (see composable).
+                if (exactToo && !composed && onIndex(value, false)) {
+                    exact.add(ALL);
                 }
                 continue;
             }
@@ -3252,7 +3256,7 @@ final class InfinoQueryTranslator {
             optional.add(p);
         }
         String count = atLeast(optional, required);
-        String engine = engineQuery(b);
+        String engine = composable(b, targets) ? engineQuery(b) : null;
         if (engine != null) {
             String ranked = textOnFields(targets, engine, Operator.OR, positive, false, false, true);
             return ranked == null ? null : "(" + ranked + " AND " + count + ")";
@@ -3295,6 +3299,9 @@ final class InfinoQueryTranslator {
             String word = plainTerms(t.text());
             if (!oneToken(word)) {
                 return null;
+            }
+            if (t.field() == null ? targets.contains(InfinoIndexField.NAME) : InfinoIndexField.NAME.equals(t.field())) {
+                return null; // the word may match the index's name, which no text column holds
             }
             String reached = t.field() == null ? onlyTextColumn(targets) : onlyTextColumn(List.of(t.field()));
             if (reached == null || (column != null && !column.equals(reached))) {
@@ -3361,7 +3368,7 @@ final class InfinoQueryTranslator {
             return ALL;
         }
         if (n instanceof Bool b) {
-            String engine = engineQuery(b);
+            String engine = composable(b, targets) ? engineQuery(b) : null;
             if (engine != null) {
                 return textOnFields(targets, engine, Operator.OR, positive, false, false, true);
             }
@@ -3473,6 +3480,31 @@ final class InfinoQueryTranslator {
             return range(rb);
         }
         return null;
+    }
+
+    /**
+     * Whether {@code b}'s clauses may be sent as one engine query over the
+     * text fields of {@code targets} ({@link #engineQuery}): unless
+     * {@code _index} is among the fields and one of the words is this
+     * table's index's name. The engine query reads text columns only, so the
+     * word would match the index's rows only where it is also in their
+     * text; the clauses are then read one by one, each word matching the
+     * index's name as a lone term does. Where no word is the name,
+     * {@code _index} matches none of them and the engine query is the
+     * whole answer, ranked.
+     */
+    private boolean composable(Bool b, List<String> targets) {
+        if (!targets.contains(InfinoIndexField.NAME)) {
+            return true;
+        }
+        for (List<Node> group : List.of(b.must(), b.should(), b.mustNot())) {
+            for (Node n : group) {
+                if (n instanceof Term t && t.field() == null && onIndex(t.text(), false)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /**

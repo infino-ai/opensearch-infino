@@ -822,7 +822,7 @@
           - index: { _id: "1" }
           - { msg: slow request }
           - index: { _id: "2" }
-          - { msg: slow disk }
+          - { msg: slow slow disk }
           - index: { _id: "3" }
           - { msg: fast request }
   - do:
@@ -840,6 +840,35 @@
   - do:
       count: { index: ixfl_luc, body: { query: { query_string: { query: other_index, default_field: _index } } } }
   - match: { count: 0 }
+  # Several words: one that is the index's name matches every document, as a lone word does.
+  - do:
+      count: { index: ixfl_luc, body: { query: { query_string: { query: "ixfl_luc OR other_index", default_field: _index } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfl_luc, body: { query: { query_string: { query: "ixfl_luc AND other_index", default_field: _index } } } }
+  - match: { count: 0 }
+  - do:
+      count: { index: ixfl_luc, body: { query: { query_string: { query: "other_index OR fast", fields: [ msg, _index ] } } } }
+  - match: { count: 1 }
+  - do:
+      count: { index: ixfl_luc, body: { query: { query_string: { query: "ixfl_luc OR fast", fields: [ msg, _index ] } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfl_luc, body: { query: { query_string: { query: "+ixfl_luc +slow", fields: [ msg, _index ] } } } }
+  - match: { count: 2 }
+  - do:
+      count: { index: ixfl_luc, body: { query: { query_string: { query: "slow -ixfl_luc", fields: [ msg, _index ] } } } }
+  - match: { count: 0 }
+  # _index among the fields, matching nothing, leaves the ranking to the text field.
+  - do:
+      search: { index: ixfl_luc, body: { query: { multi_match: { query: slow, fields: [ msg, _index ] } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search: { index: ixfl_luc, body: { query: { query_string: { query: "slow OR request", fields: [ msg, _index ] } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "1" }
 
 ---
 "_index among a text query's fields, default mode":
@@ -857,7 +886,7 @@
           - index: { _id: "1" }
           - { msg: slow request }
           - index: { _id: "2" }
-          - { msg: slow disk }
+          - { msg: slow slow disk }
           - index: { _id: "3" }
           - { msg: fast request }
   - do:
@@ -875,6 +904,35 @@
   - do:
       count: { index: ixfl_def, body: { query: { query_string: { query: other_index, default_field: _index } } } }
   - match: { count: 0 }
+  # Several words: one that is the index's name matches every document, as a lone word does.
+  - do:
+      count: { index: ixfl_def, body: { query: { query_string: { query: "ixfl_def OR other_index", default_field: _index } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfl_def, body: { query: { query_string: { query: "ixfl_def AND other_index", default_field: _index } } } }
+  - match: { count: 0 }
+  - do:
+      count: { index: ixfl_def, body: { query: { query_string: { query: "other_index OR fast", fields: [ msg, _index ] } } } }
+  - match: { count: 1 }
+  - do:
+      count: { index: ixfl_def, body: { query: { query_string: { query: "ixfl_def OR fast", fields: [ msg, _index ] } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfl_def, body: { query: { query_string: { query: "+ixfl_def +slow", fields: [ msg, _index ] } } } }
+  - match: { count: 2 }
+  - do:
+      count: { index: ixfl_def, body: { query: { query_string: { query: "slow -ixfl_def", fields: [ msg, _index ] } } } }
+  - match: { count: 0 }
+  # _index among the fields, matching nothing, leaves the ranking to the text field.
+  - do:
+      search: { index: ixfl_def, body: { query: { multi_match: { query: slow, fields: [ msg, _index ] } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search: { index: ixfl_def, body: { query: { query_string: { query: "slow OR request", fields: [ msg, _index ] } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "1" }
 
 ---
 "_index among a text query's fields, proxy mode":
@@ -892,7 +950,7 @@
           - index: { _id: "1" }
           - { msg: slow request }
           - index: { _id: "2" }
-          - { msg: slow disk }
+          - { msg: slow slow disk }
           - index: { _id: "3" }
           - { msg: fast request }
   - do:
@@ -910,6 +968,35 @@
   - do:
       count: { index: ixfl_prx, body: { query: { query_string: { query: other_index, default_field: _index } } } }
   - match: { count: 0 }
+  # Several words: one that is the index's name matches every document, as a lone word does.
+  - do:
+      count: { index: ixfl_prx, body: { query: { query_string: { query: "ixfl_prx OR other_index", default_field: _index } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfl_prx, body: { query: { query_string: { query: "ixfl_prx AND other_index", default_field: _index } } } }
+  - match: { count: 0 }
+  - do:
+      count: { index: ixfl_prx, body: { query: { query_string: { query: "other_index OR fast", fields: [ msg, _index ] } } } }
+  - match: { count: 1 }
+  - do:
+      count: { index: ixfl_prx, body: { query: { query_string: { query: "ixfl_prx OR fast", fields: [ msg, _index ] } } } }
+  - match: { count: 3 }
+  - do:
+      count: { index: ixfl_prx, body: { query: { query_string: { query: "+ixfl_prx +slow", fields: [ msg, _index ] } } } }
+  - match: { count: 2 }
+  - do:
+      count: { index: ixfl_prx, body: { query: { query_string: { query: "slow -ixfl_prx", fields: [ msg, _index ] } } } }
+  - match: { count: 0 }
+  # _index among the fields, matching nothing, leaves the ranking to the text field.
+  - do:
+      search: { index: ixfl_prx, body: { query: { multi_match: { query: slow, fields: [ msg, _index ] } } } }
+  - match: { hits.total.value: 2 }
+  - match: { hits.hits.0._id: "2" }
+  - match: { hits.hits.1._id: "1" }
+  - do:
+      search: { index: ixfl_prx, body: { query: { query_string: { query: "slow OR request", fields: [ msg, _index ] } } } }
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "1" }
 
 ---
 "_index over indices of two shards each, Lucene twin":

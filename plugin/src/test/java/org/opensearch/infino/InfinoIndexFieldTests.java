@@ -120,6 +120,58 @@ public class InfinoIndexFieldTests extends OpenSearchTestCase {
         assertTrue(onKeyword, onKeyword.startsWith("(1=0 OR "));
     }
 
+    /**
+     * A query string of several plain words over fields that hold
+     * {@code _index}: a word that is the index's name matches every row, as
+     * a lone word does. Sent as one engine query over the text fields, the
+     * clauses dropped {@code _index}, so {@code logs_0 OR logs_1} matched
+     * nothing. Where no word is the name, the words are still one engine
+     * query, which ranks the hits.
+     */
+    public void testAQueryStringOfSeveralWordsMatchesTheIndexName() {
+        assertEquals("((1=1 OR 1=0))", where(QueryBuilders.queryStringQuery("logs_0 OR logs_1").defaultField("_index")));
+        assertEquals("(1=1 AND 1=0)", where(QueryBuilders.queryStringQuery("logs_0 AND logs_1").defaultField("_index")));
+        assertEquals("1=0", where(QueryBuilders.queryStringQuery("logs_1 OR logs_2").defaultField("_index")));
+        String either = where(QueryBuilders.queryStringQuery("logs_0 OR slow").field("msg").field("_index"));
+        assertTrue(either, either.startsWith("(((1=1 OR "));
+        String both = where(QueryBuilders.queryStringQuery("+logs_0 +slow").field("msg").field("_index"));
+        assertTrue(both, both.startsWith("((1=1 OR "));
+        assertTrue(both, both.contains(" AND "));
+        InfinoQueryTranslator.Translation ranked = InfinoQueryTranslator.translate(
+            QueryBuilders.queryStringQuery("slow OR timeout").field("msg").field("_index"),
+            columns(),
+            TABLE,
+            NOW
+        );
+        assertNotNull(ranked.principal());
+        assertEquals(
+            InfinoQueryTranslator.translate(QueryBuilders.queryStringQuery("slow OR timeout").field("msg"), columns(), TABLE, NOW).where(),
+            ranked.where()
+        );
+    }
+
+    /**
+     * {@code _index} among a multi_match's fields, where the query is not the
+     * index's name, adds nothing: the text field still ranks the hits, as
+     * stock's does. It added a clause matching nothing, which left the hits
+     * unranked.
+     */
+    public void testAMultiMatchOverTheFieldStillRanks() {
+        InfinoQueryTranslator.Translation withIndex = InfinoQueryTranslator.translate(
+            QueryBuilders.multiMatchQuery("slow", "msg", "_index"),
+            columns(),
+            TABLE,
+            NOW
+        );
+        InfinoQueryTranslator.Translation without = InfinoQueryTranslator.translate(QueryBuilders.multiMatchQuery("slow", "msg"), columns(), TABLE, NOW);
+        assertNotNull(withIndex.principal());
+        assertEquals(without.where(), withIndex.where());
+        assertEquals(without.scoring(), withIndex.scoring());
+        // The index's name matches every row.
+        String named = where(QueryBuilders.multiMatchQuery(INDEX, "msg", "_index"));
+        assertTrue(named, named.startsWith("(1=1 OR "));
+    }
+
     /** A script reading {@code doc['_index']} is refused: no column holds it, and read as unmapped it would be null where stock reads the name. */
     public void testAScriptReadingTheFieldIsRefused() {
         IllegalArgumentException e = expectThrows(
