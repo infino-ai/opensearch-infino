@@ -927,7 +927,7 @@ public class InfinoEngineTests extends OpenSearchTestCase {
 
     /** A document an append did not take, with {@code reason}. */
     private static InfinoNative.PreparedFailure failure(String reason, boolean permanent) {
-        return new InfinoNative.PreparedFailure(0, 0, reason, permanent);
+        return new InfinoNative.PreparedFailure(0, 0, reason, permanent, null, false);
     }
 
     /** A replay waiting for the hosted service stops once the engine closes. */
