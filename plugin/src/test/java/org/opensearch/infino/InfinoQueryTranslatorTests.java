@@ -3400,7 +3400,7 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
         assertEquals("(\"s\" <= 1.26)", typedWhere(QueryBuilders.rangeQuery("s").lte(1.259)));
     }
 
-    /** A CIDR block in a term on an ip field is the addresses it covers, a prefix of their text; an IPv6 block is refused. */
+    /** A CIDR block in a term on an ip field is the addresses it covers: an IPv4 block a prefix of their text, an IPv6 block a range of keys. */
     public void testCidrTermsOnAnIpField() {
         assertEquals("\"ip\" LIKE '10.%'", typedWhere(QueryBuilders.termQuery("ip", "10.0.0.0/8")));
         assertEquals("\"ip\" LIKE '10.%'", typedWhere(QueryBuilders.termQuery("ip", "10.9.8.7/8")));
@@ -3417,18 +3417,52 @@ public class InfinoQueryTranslatorTests extends OpenSearchTestCase {
             typedWhere(QueryBuilders.termQuery("ip", "192.168.1.9/30"))
         );
         assertEquals(
-            "(\"ip\" LIKE '10.%' OR \"ip\" = '192.168.1.9')",
+            "(\"ip\" = '192.168.1.9' OR \"ip\" LIKE '10.%')",
             typedWhere(QueryBuilders.termsQuery("ip", List.of("10.0.0.0/8", "192.168.1.9")))
         );
         assertEquals("\"ip\" = '10.0.0.1'", typedWhere(QueryBuilders.termQuery("ip", "10.0.0.1")));
-        IllegalArgumentException e = expectThrows(
-            IllegalArgumentException.class,
-            () -> typedWhere(QueryBuilders.termQuery("ip", "2001:db8::/32"))
+        String key = InfinoIp.key("\"ip\"");
+        assertEquals(
+            "(" + key + " BETWEEN '20010db8000000000000000000000000' AND '20010db8ffffffffffffffffffffffff')",
+            typedWhere(QueryBuilders.termQuery("ip", "2001:db8::/32"))
         );
-        assertEquals("[infino] a term with the IPv6 CIDR block [2001:db8::/32] on [ip] is not served", e.getMessage());
+        // The host bits are ignored, and a block over the IPv4-mapped range covers IPv4 addresses.
+        assertEquals(
+            "(" + key + " BETWEEN '20010000000000000000000000000000' AND '2001ffffffffffffffffffffffffffff')",
+            typedWhere(QueryBuilders.termQuery("ip", "2001:6f8::2/16"))
+        );
+        assertEquals(
+            "(" + key + " BETWEEN '" + "0".repeat(32) + "' AND '00" + "f".repeat(30) + "')",
+            typedWhere(QueryBuilders.termQuery("ip", "::/8"))
+        );
+        assertEquals(
+            "(" + key + " BETWEEN '00000000000000000000000000000000' AND 'ffffffffffffffffffffffffffffffff')",
+            typedWhere(QueryBuilders.termQuery("ip", "::/0"))
+        );
         expectThrows(IllegalArgumentException.class, () -> typedWhere(QueryBuilders.termQuery("ip", "10.0.0.0/33")));
         // On a keyword field the text is the value.
         assertEquals("\"level\" = 'a/8'", typedWhere(QueryBuilders.termQuery("level", "a/8")));
+    }
+
+    /**
+     * A term, terms or match on an ip field compares the address, not its
+     * text: any spelling becomes the one the column keeps the address in,
+     * and text that is no address matches nothing.
+     */
+    public void testAnIpTermComparesTheAddress() {
+        for (String spelling : List.of("2001:db8::2", "2001:db8:0:0:0:0:0:2", "2001:0DB8:0000:0000:0000:0000:0000:0002", "2001:DB8::0002")) {
+            assertEquals(spelling, "\"ip\" = '2001:db8::2'", typedWhere(QueryBuilders.termQuery("ip", spelling)));
+            assertEquals(spelling, "\"ip\" = '2001:db8::2'", typedWhere(QueryBuilders.matchQuery("ip", spelling)));
+        }
+        assertEquals("\"ip\" = '10.0.0.7'", typedWhere(QueryBuilders.termQuery("ip", "::ffff:10.0.0.7")));
+        assertEquals("\"ip\" = '10.0.0.7'", typedWhere(QueryBuilders.termQuery("ip", "::ffff:a00:7")));
+        assertEquals(
+            "\"ip\" IN ('2001:db8::2', '10.0.0.7')",
+            typedWhere(QueryBuilders.termsQuery("ip", List.of("2001:db8:0:0:0:0:0:2", "::ffff:10.0.0.7", "2001:db8::2")))
+        );
+        assertEquals("\"ip\" = '10.0.0.7'", typedWhere(QueryBuilders.termsQuery("ip", List.of("garbage", "10.0.0.7"))));
+        assertEquals("1=0", typedWhere(QueryBuilders.termQuery("ip", "garbage")));
+        assertEquals("1=0", typedWhere(QueryBuilders.termsQuery("ip", List.of("garbage"))));
     }
 
     /** A match asking for fuzziness is refused, naming it; a fuzziness of 0 asks for none and is served. */

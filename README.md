@@ -74,6 +74,7 @@ The plugin has two parts: a Java plugin (`plugin/`) and a native bridge (`infino
 | numeric types | a numeric column, with a range index unless the mapping says `"index": false` |
 | `text` | a string column with its own BM25 index |
 | `keyword` | a string column compared by exact value, with a term index that keeps each value whole (the engine's `keyword` analyzer), which counts its values for a terms aggregation. On a hosted account the column takes the default analyzer instead, and a terms aggregation counts with a statement, until the hosted service accepts the keyword analyzer ([#274](https://github.com/infino-ai/opensearch-infino/issues/274)) |
+| `ip` | a string column that keeps each address in the one spelling stock prints it in (IPv4 in dotted decimal, an IPv4-mapped `::ffff:a.b.c.d` as its IPv4 address, any other IPv6 address compressed and lowercase), so a `term`, `terms` or `match` in any spelling of an address finds it, and a CIDR block, IPv4 or IPv6, finds the addresses it covers; `_source` keeps the address as written. A row written by an earlier release keeps the spelling it was written in: a term, or an IPv4 block, misses it when that spelling is not the one above (an IPv6 address in full or upper case, an IPv4-mapped address) until the index is reindexed. An IPv6 block finds it either way |
 | `knn_vector` | a vector column, searched by the space type the mapping names |
 
 The document id is a column too, with a term index.
