@@ -478,7 +478,8 @@ public class InfinoAggregationProcessor {
      * names the index of each plan's table, which an aggregation on
      * {@code _index} reads per row. {@code total} is the number of rows the
      * union holds when the caller has counted them already (each plan's own
-     * count, added up), else null: it is then counted over the union.
+     * count, added up), else null: each plan then counts its own, when the
+     * count is needed.
      */
     Counted evaluateOver(Collection<AggregationBuilder> builders, Plan plan, List<Plan> shardPlans, List<String> shardIndices, Long total) {
         // The aggregations read every plan's columns, and _index from the
@@ -490,7 +491,15 @@ public class InfinoAggregationProcessor {
             shardTables.add(p.table());
         }
         Function<QueryBuilder, String> predicates = qb -> perShard(qb, shardPlans);
-        Supplier<Long> counter = total != null ? () -> total : () -> asLong(oneRow("SELECT COUNT(*) AS c FROM " + from).get("c"));
+        // Uncounted, each plan counts its own rows, as a search of each index
+        // would: a count over the union would read every branch's columns.
+        Supplier<Long> counter = total != null ? () -> total : () -> {
+            long sum = 0;
+            for (Plan p : shardPlans) {
+                sum += InfinoSearch.count(p.table(), p.query());
+            }
+            return sum;
+        };
         cols.put(INDEX_COLUMN, new Column(INDEX_COLUMN, "str", false, false));
         // One answer for the whole index: each terms level at its final size.
         return evaluate(builders, plan, cols, shardTables, from, InfinoQueryTranslator.ALL, predicates, counter, null, false, null);
