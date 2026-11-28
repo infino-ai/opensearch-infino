@@ -3366,7 +3366,7 @@ final class InfinoQueryTranslator {
             if (t.isTimestamp()) {
                 Long fromMillis = dateMillis(value, t.dateFormat(), false, zone, nowMillis);
                 Long toMillis = dateMillis(value, t.dateFormat(), true, zone, nowMillis);
-                if ((fromMillis != null && Math.abs(fromMillis) > COMPARABLE_MILLIS) || (toMillis != null && Math.abs(toMillis) > COMPARABLE_MILLIS)) {
+                if (!comparableDate(fromMillis) || !comparableDate(toMillis)) {
                     return null;
                 }
                 String from = dateLiteral(value, t.dateFormat(), false, zone);
@@ -3381,6 +3381,11 @@ final class InfinoQueryTranslator {
         throw new IllegalArgumentException(
             "[infino] [" + value + "] is no value of the field [" + field + "]; a query that should skip such fields sets lenient: true"
         );
+    }
+
+    /** Whether a statement can compare a date of {@code millis} ({@link #COMPARABLE_MILLIS}); a date not read is left to the caller. */
+    private static boolean comparableDate(Long millis) {
+        return millis == null || (millis >= -COMPARABLE_MILLIS && millis <= COMPARABLE_MILLIS);
     }
 
     /** Whether stock reads a query string over exactly one field: one named, with no pattern. */
